@@ -10,10 +10,9 @@ impl ModelRuntime {
         self.manifest.validate_requests(&requests)?;
         self.prepare_visual(&[], &[], &|| false)?;
         let manifest = &self.manifest;
-        let s = &mut self.execution.session;
+        let s = &self.execution.session;
         let pointers = &self.execution.pointers;
         let sizes = &self.execution.sizes;
-        let graphs = &self.execution.graphs;
         let stats = self.stats;
         let output_directory = requests
             .logits_output
@@ -121,11 +120,9 @@ impl ModelRuntime {
                         "prefill token upload",
                     )?;
                     check((s.driver.context_sync)(), "prefill upload dependency")?;
-                    check(
-                        (s.driver.graph_launch)(graphs[prefill_program], s.stream),
-                        "prefill graph",
-                    )?;
                 }
+                self.execution
+                    .submit_program(prefill_program, ExecutionPhase::Prefill)?;
             }
             // SAFETY: Synchronize before head timing and output download.
             unsafe {
@@ -133,12 +130,10 @@ impl ModelRuntime {
             }
             let prefill_s = request_start.elapsed().as_secs_f64();
             let head_start = Instant::now();
+            self.execution
+                .submit_program(head_program, ExecutionPhase::Prefill)?;
             // SAFETY: Head consumes last prefill graph's buffers on the same stream.
             unsafe {
-                check(
-                    (s.driver.graph_launch)(graphs[head_program], s.stream),
-                    "head graph",
-                )?;
                 check((s.driver.stream_sync)(s.stream), "head complete")?;
             }
             if read_i32(s, &manifest.status)? != 0 {
@@ -169,13 +164,10 @@ impl ModelRuntime {
                         check((s.driver.context_sync)(), "teacher-force dependency")?;
                     }
                 }
-                // SAFETY: Stable graph addresses, state updates and next token
-                // device-to-device copy are ordered inside this graph.
+                self.execution
+                    .submit_program("decode", ExecutionPhase::Decode)?;
+                // SAFETY: This session owns the live stream and all queued work.
                 unsafe {
-                    check(
-                        (s.driver.graph_launch)(graphs["decode"], s.stream),
-                        "decode graph",
-                    )?;
                     check((s.driver.stream_sync)(s.stream), "decode complete")?;
                 }
                 if read_i32(s, &manifest.status)? != 0 {
@@ -229,7 +221,7 @@ impl ModelRuntime {
                 fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
             }
         }
-        s.cleanup()?;
+        self.execution.session.cleanup()?;
         Ok(Report {
             manifest_sha256: stats.manifest_sha256,
             model: manifest.model.clone(),
@@ -239,6 +231,8 @@ impl ModelRuntime {
             weight_upload_s: stats.weight_upload_s,
             module_load_bind_s: stats.module_load_bind_s,
             graph_capture_s: stats.graph_capture_s,
+            cuda_graph: stats.cuda_graph,
+            captured_programs: stats.captured_programs,
             buffer_bytes: stats.buffer_bytes,
             weight_bytes: manifest.weight_bytes,
             effective_weight_bits: 8.0 * manifest.weight_bytes as f64

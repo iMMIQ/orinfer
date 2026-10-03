@@ -27,24 +27,27 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 type Result<T> = std::result::Result<T, String>;
+use orin_engine::execution::{CudaGraphMode, LoadOptions};
 struct Settings {
     manifest: PathBuf,
     tokenizer: PathBuf,
     model: String,
     listen: String,
     gpu_lock: PathBuf,
+    cuda_graph: CudaGraphMode,
 }
 impl Settings {
     fn parse(args: &[String]) -> Result<Self> {
         if args.is_empty() || !std::path::Path::new(&args[0]).is_dir() {
-            return Err("Usage: orin-llm serve MODEL_DIR [--listen 127.0.0.1:8088] [--model qwen3.8-27b] [--gpu-lock artifacts/gpu-experiment.lock]; MODEL_DIR must contain the prepared cache and checkpoint tokenizer".into());
+            return Err("Usage: orin-llm serve MODEL_DIR [--listen 0.0.0.0:8088] [--model qwen3.8-27b] [--cuda-graph decode_only|full|off] [--gpu-lock artifacts/gpu-experiment.lock]; MODEL_DIR must contain the prepared cache and checkpoint tokenizer".into());
         }
         let mut settings = Self {
             manifest: (&args[0]).into(),
             tokenizer: (&args[0]).into(),
             model: "qwen3.8-27b".into(),
-            listen: "127.0.0.1:8088".into(),
+            listen: "0.0.0.0:8088".into(),
             gpu_lock: "artifacts/gpu-experiment.lock".into(),
+            cuda_graph: CudaGraphMode::default(),
         };
         for pair in args[1..].chunks(2) {
             if pair.len() != 2 {
@@ -54,6 +57,7 @@ impl Settings {
                 "--listen" => settings.listen = pair[1].clone(),
                 "--model" => settings.model = pair[1].clone(),
                 "--gpu-lock" => settings.gpu_lock = (&pair[1]).into(),
+                "--cuda-graph" => settings.cuda_graph = pair[1].parse()?,
                 _ => return Err(format!("Unknown server option {}", pair[0])),
             }
         }
@@ -83,6 +87,21 @@ mod settings_tests {
         assert!(Settings::parse(&[directory.clone(), directory.clone()]).is_err());
         assert!(Settings::parse(&[directory, "--listen".into()]).is_err());
         assert!(Settings::parse(&["legacy-model.json".into(), "tokenizer".into()]).is_err());
+    }
+
+    #[test]
+    fn graph_mode_defaults_to_decode_only_and_rejects_invalid_options() {
+        let directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let settings = Settings::parse(std::slice::from_ref(&directory)).unwrap();
+        assert_eq!(settings.listen, "0.0.0.0:8088");
+        assert_eq!(settings.cuda_graph, CudaGraphMode::DecodeOnly);
+        for mode in ["decode_only", "full", "off"] {
+            let settings =
+                Settings::parse(&[directory.clone(), "--cuda-graph".into(), mode.into()]).unwrap();
+            assert_eq!(settings.cuda_graph.to_string(), mode);
+        }
+        assert!(Settings::parse(&[directory.clone(), "--cuda-graph".into()]).is_err());
+        assert!(Settings::parse(&[directory, "--cuda-graph".into(), "on".into()]).is_err());
     }
 }
 #[derive(Clone)]
@@ -150,7 +169,12 @@ async fn serve(settings: Settings) -> Result<()> {
                 if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                     return Err("GPU experiment lock is busy".into());
                 }
-                let model = Model::load(&settings.manifest)?;
+                let model = Model::load_with_options(
+                    &settings.manifest,
+                    LoadOptions {
+                        cuda_graph: settings.cuda_graph,
+                    },
+                )?;
                 if worker_codec.tokenizer.get_vocab_size(true) > model.vocab() {
                     return Err("Tokenizer exceeds model vocabulary".into());
                 }

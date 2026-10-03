@@ -1,19 +1,25 @@
 use super::*;
 
 impl ModelRuntime {
-    pub(super) fn mtp_capture(&self, spec: &crate::mtp::Spec, tokens: usize) -> Result<()> {
+    pub(super) fn mtp_capture(
+        &self,
+        spec: &crate::mtp::Spec,
+        tokens: usize,
+        phase: ExecutionPhase,
+    ) -> Result<()> {
         let plan = spec
             .capture_plans
             .iter()
             .find(|p| p.tokens == tokens)
             .ok_or("Missing MTP hidden capture shape")?;
-        self.launch_program(&plan.program)
+        self.launch_program(&plan.program, phase)
     }
     pub(super) fn mtp_warm(
         &self,
         spec: &crate::mtp::Spec,
         shifted_ids: &[u32],
         cancelled: &impl Fn() -> bool,
+        phase: ExecutionPhase,
     ) -> Result<()> {
         let mut offset = 0;
         while offset < shifted_ids.len() {
@@ -28,10 +34,10 @@ impl ModelRuntime {
                 .max_by_key(|p| p.tokens)
                 .ok_or("No compatible MTP warm plan")?;
             self.upload_ids(&spec.input, &shifted_ids[offset..offset + plan.tokens])?;
-            self.launch_program(&plan.program)?;
+            self.launch_program(&plan.program, phase)?;
             offset += plan.tokens;
             if offset == shifted_ids.len() {
-                self.launch_program(&plan.head_program)?;
+                self.launch_program(&plan.head_program, phase)?;
             }
         }
         Ok(())
@@ -55,7 +61,7 @@ impl ModelRuntime {
         let mut shifted = input[1..].to_vec();
         shifted.push(pending);
         let at = Instant::now();
-        self.mtp_warm(spec, &shifted, cancelled)?;
+        self.mtp_warm(spec, &shifted, cancelled, ExecutionPhase::Prefill)?;
         stats.initial_warm_s = at.elapsed().as_secs_f64();
         let mut generated = 1;
         if !emit(pending) || limit == 1 {
@@ -83,8 +89,8 @@ impl ModelRuntime {
                 // Final single-token tail or a context edge. The ordinary
                 // target graph preserves existing sampling/state semantics.
                 self.upload_ids(&self.manifest.token, &[pending])?;
-                self.launch_program("decode")?;
-                self.mtp_capture(spec, 1)?;
+                self.launch_program("decode", ExecutionPhase::Decode)?;
+                self.mtp_capture(spec, 1, ExecutionPhase::Decode)?;
                 let selected = self.read_control(&self.manifest.token)?;
                 if self.read_control(&self.manifest.status)? != 0
                     || selected < 0
@@ -96,7 +102,7 @@ impl ModelRuntime {
                 generated += 1;
                 let stopped = !emit(pending);
                 let at = Instant::now();
-                self.mtp_warm(spec, &[pending], cancelled)?;
+                self.mtp_warm(spec, &[pending], cancelled, ExecutionPhase::Decode)?;
                 stats.refresh_s += at.elapsed().as_secs_f64();
                 if stopped {
                     break;
@@ -110,7 +116,7 @@ impl ModelRuntime {
                     return Err("Request cancelled during MTP draft".into());
                 }
                 if i != 0 {
-                    self.launch_program(&spec.draft_program)?;
+                    self.launch_program(&spec.draft_program, ExecutionPhase::Decode)?;
                 }
                 let token = self.read_control(&spec.token)?;
                 if self.read_control(&spec.status)? != 0 || token < 0 || token as usize >= vocab {
@@ -124,8 +130,8 @@ impl ModelRuntime {
             verification_input.extend_from_slice(&drafts);
             let at = Instant::now();
             self.upload_ids(&self.manifest.input, &verification_input)?;
-            self.launch_program(&plan.program)?;
-            self.launch_program(&plan.capture_program)?;
+            self.launch_program(&plan.program, ExecutionPhase::Decode)?;
+            self.launch_program(&plan.capture_program, ExecutionPhase::Decode)?;
             let target = self.read_controls(&spec.verification_tokens, plan.tokens)?;
             let status = self.read_controls(&spec.verification_status, plan.tokens)?;
             if target.iter().any(|&x| x as usize >= vocab) || status.iter().any(|&x| x != 0) {
@@ -150,7 +156,7 @@ impl ModelRuntime {
             let at = Instant::now();
             if emitted < plan.tokens {
                 self.upload_ids(&spec.accepted_inputs, &[emitted as u32])?;
-                self.launch_program(&plan.restore_program)?;
+                self.launch_program(&plan.restore_program, ExecutionPhase::Decode)?;
                 self.upload_ids(&self.manifest.position, &[(position + emitted) as u32])?;
                 self.upload_ids(&spec.target_length, &[(position + emitted) as u32])?;
             }
@@ -164,7 +170,7 @@ impl ModelRuntime {
             // also produces the first draft of the next round.
             let at = Instant::now();
             self.upload_ids(&spec.position, &[position as u32])?;
-            self.mtp_warm(spec, &committed, cancelled)?;
+            self.mtp_warm(spec, &committed, cancelled, ExecutionPhase::Decode)?;
             stats.refresh_s += at.elapsed().as_secs_f64();
             if stopped || generated == limit {
                 break;

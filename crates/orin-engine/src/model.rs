@@ -1,5 +1,6 @@
 //! AOT model programs: architecture-specific plans, parameterized Rust runtime.
 use crate::artifact::{Access, Argument, Buffer, Kernel, Result};
+use crate::execution::{CudaGraphMode, LoadOptions};
 pub use crate::weights::TensorIdentity;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -388,6 +389,8 @@ pub struct Report {
     pub weight_upload_s: f64,
     pub module_load_bind_s: f64,
     pub graph_capture_s: f64,
+    pub cuda_graph: CudaGraphMode,
+    pub captured_programs: Vec<String>,
     pub buffer_bytes: usize,
     pub weight_bytes: usize,
     pub effective_weight_bits: f64,
@@ -398,7 +401,11 @@ pub struct Report {
 }
 
 pub fn run(manifest: &Path, requests: &Path) -> Result<Report> {
-    crate::runtime::run_model(manifest, requests)
+    run_with_options(manifest, requests, LoadOptions::default())
+}
+
+pub fn run_with_options(manifest: &Path, requests: &Path, options: LoadOptions) -> Result<Report> {
+    crate::runtime::run_model(manifest, requests, options)
 }
 
 /// A prepared HF-style directory contains the private execution cache.
@@ -498,7 +505,10 @@ pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
 pub struct Model(crate::runtime::ModelRuntime);
 impl Model {
     pub fn load(path: &Path) -> Result<Self> {
-        crate::runtime::ModelRuntime::load(path).map(Self)
+        Self::load_with_options(path, LoadOptions::default())
+    }
+    pub fn load_with_options(path: &Path, options: LoadOptions) -> Result<Self> {
+        crate::runtime::ModelRuntime::load_with_options(path, options).map(Self)
     }
     pub fn max_context(&self) -> usize {
         self.0.manifest.max_context

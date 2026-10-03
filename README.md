@@ -44,10 +44,17 @@ CLI接收token-ID请求，输出包含生成token、加载时间和请求时延�
 
 ```bash
 ./target/release/orin-llm serve /path/to/model-dir \
-  --listen 127.0.0.1:8088 --model qwen3.8-27b
+  --model qwen3.8-27b
 ```
 
-模型目录内保留与权重匹配的`tokenizer.json`、`chat_template.jinja`和`generation_config.json`。Rust直接渲染checkpoint模板并分词。服务只加载一次模型，通过一个GPU worker执行请求；最多128个等待请求，队列满返回429。GPU worker持有`artifacts/gpu-experiment.lock`；可用`--gpu-lock`指定共享锁路径。
+默认监听`0.0.0.0:8088`，可用`--listen HOST:PORT`覆盖。模型目录内保留与权重匹配的`tokenizer.json`、`chat_template.jinja`和`generation_config.json`。Rust直接渲染checkpoint模板并分词。服务只加载一次模型，通过一个GPU worker执行请求；最多128个等待请求，队列满返回429。GPU worker持有`artifacts/gpu-experiment.lock`；可用`--gpu-lock`指定共享锁路径。
+
+`serve`和`run-model`支持`--cuda-graph decode_only|full|off`，默认`decode_only`。`decode_only`只在生成阶段使用Graph，包含普通decode及MTP草稿、验证、恢复和短步刷新；文本prefill、视觉编码及MTP首次预热直接提交。prefill尾部即使复用decode计划也不使用Graph。`full`捕获并使用全部执行计划；`off`按相同计划逐个提交kernel、copy和memset。Graph模式通过显式加载配置传入引擎。
+
+```bash
+./target/release/orin-llm serve /path/to/model-dir --cuda-graph full
+./target/release/orin-llm run-model /path/to/model-dir requests.json --cuda-graph off
+```
 
 ```bash
 curl http://127.0.0.1:8088/v1/chat/completions \

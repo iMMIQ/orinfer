@@ -52,7 +52,7 @@ impl ModelRuntime {
                 &[image.grid_height as u32, image.grid_width as u32],
             )?;
             self.upload_ids(&v.length, &[patches as u32])?;
-            self.launch_program(&plan.program)?;
+            self.launch_program(&plan.program, ExecutionPhase::Vision)?;
             self.execution.copy_range(
                 &v.output,
                 &v.features,

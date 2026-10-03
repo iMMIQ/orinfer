@@ -209,7 +209,7 @@ pub(super) fn build(
     config: &Configuration,
     manifest: &mut Manifest,
     profiles: &[PrefillProfile],
-) -> Result<()> {
+) -> Result<std::collections::BTreeSet<String>> {
     if manifest.vocab != config.text.vocab_size || profiles.is_empty() {
         return Err("Model vocabulary or prefill profiles differ from configuration".into());
     }
@@ -360,5 +360,35 @@ pub(super) fn build(
         b.programs.insert("mtp_draft".into(), ops);
     }
     manifest.programs = b.programs;
-    Ok(())
+    // Declare decode candidates here, independent of kernel names. Some of
+    // these plans also run during prefill; the runtime supplies the call phase.
+    let mut decode = std::collections::BTreeSet::from(["decode".to_owned()]);
+    if let Some(mtp) = &manifest.mtp {
+        decode.insert(mtp.draft_program.clone());
+        let max_refresh = mtp
+            .verification_plans
+            .iter()
+            .map(|p| p.tokens)
+            .max()
+            .unwrap_or(1);
+        for plan in &mtp.warm_plans {
+            if plan.tokens <= max_refresh {
+                decode.insert(plan.program.clone());
+                decode.insert(plan.head_program.clone());
+            }
+        }
+        for plan in &mtp.capture_plans {
+            if plan.tokens == 1 {
+                decode.insert(plan.program.clone());
+            }
+        }
+        for plan in &mtp.verification_plans {
+            decode.extend([
+                plan.program.clone(),
+                plan.restore_program.clone(),
+                plan.capture_program.clone(),
+            ]);
+        }
+    }
+    Ok(decode)
 }

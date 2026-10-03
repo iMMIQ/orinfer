@@ -236,7 +236,7 @@ pub(crate) fn build(
     config: &Configuration,
     manifest: &mut Manifest,
     profiles: &[PrefillProfile],
-) -> Result<()> {
+) -> Result<std::collections::BTreeSet<String>> {
     match config.architecture {
         Architecture::Qwen3_5 => qwen3_5::build(config, manifest, profiles),
     }

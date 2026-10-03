@@ -1,4 +1,17 @@
 use super::*;
+use crate::execution::{CudaGraphMode, ExecutionPhase, LoadOptions};
+use std::cell::RefCell;
+
+struct DirectKernel {
+    spec: Kernel,
+    function: Handle,
+    values: Vec<Value>,
+}
+
+struct DirectPrograms {
+    kernels: RefCell<BTreeMap<String, DirectKernel>>,
+    programs: BTreeMap<String, Vec<crate::model::Operation>>,
+}
 
 /// Execute an architecture adapter's explicit programs with stable allocations.
 /// All handles, pointers and argument backing storage stay inside this session.
@@ -8,6 +21,8 @@ pub(crate) struct Executor {
     pub(crate) pointers: BTreeMap<String, u64>,
     pub(crate) sizes: BTreeMap<String, usize>,
     pub(crate) graphs: BTreeMap<String, Handle>,
+    direct: Option<DirectPrograms>,
+    cuda_graph: CudaGraphMode,
     pub(crate) allocations: Allocations,
 }
 
@@ -32,6 +47,8 @@ pub(crate) struct LoadStats {
     pub(crate) weight_upload_s: f64,
     pub(crate) module_load_bind_s: f64,
     pub(crate) graph_capture_s: f64,
+    pub(crate) cuda_graph: CudaGraphMode,
+    pub(crate) captured_programs: Vec<String>,
     pub(crate) buffer_bytes: usize,
 }
 impl Executor {
@@ -41,8 +58,17 @@ impl Executor {
         kernel_base: &std::path::Path,
         fingerprint: String,
         scopes: &BTreeMap<String, crate::loader::BufferScope>,
+        decode_programs: &std::collections::BTreeSet<String>,
+        options: LoadOptions,
     ) -> Result<(Self, LoadStats)> {
         use crate::model::Operation;
+        let cuda_graph = options.cuda_graph;
+        if decode_programs
+            .iter()
+            .any(|name| !manifest.programs.contains_key(name))
+        {
+            return Err("Architecture declares a missing decode program".into());
+        }
         let started = Instant::now();
         let buffer_bytes = manifest.validate()?;
         let mut s = Session::new(Driver::load()?);
@@ -257,6 +283,11 @@ impl Executor {
         let capture_started = Instant::now();
         let mut graphs = BTreeMap::new();
         for (phase, ops) in &manifest.programs {
+            if cuda_graph == CudaGraphMode::Off
+                || (cuda_graph == CudaGraphMode::DecodeOnly && !decode_programs.contains(phase))
+            {
+                continue;
+            }
             // SAFETY: Capture records operations against stable owned buffers.
             // Each copy/zero range and graph kernel reference was validated above.
             unsafe {
@@ -317,9 +348,35 @@ impl Executor {
             s.graph = ptr::null_mut();
             s.exec = ptr::null_mut();
         }
-        let graph_capture_s = capture_started.elapsed().as_secs_f64();
+        let graph_capture_s = if !graphs.is_empty() {
+            capture_started.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+        let direct = (cuda_graph != CudaGraphMode::Full).then(|| DirectPrograms {
+            kernels: RefCell::new(
+                launches
+                    .into_iter()
+                    .map(|(name, launch)| {
+                        (
+                            name,
+                            DirectKernel {
+                                spec: launch.spec.clone(),
+                                function: launch.function,
+                                values: launch.values,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            programs: manifest.programs.clone(),
+        });
         let load_to_ready_s = started.elapsed().as_secs_f64();
-        eprintln!("MODEL READY after {load_to_ready_s:.3}s; {buffer_bytes} buffer bytes");
+        let captured_programs: Vec<String> = graphs.keys().cloned().collect();
+        eprintln!(
+            "MODEL READY after {load_to_ready_s:.3}s; {buffer_bytes} buffer bytes; cuda_graph={cuda_graph}, {} captured programs",
+            captured_programs.len()
+        );
         let device = DeviceInfo {
             name: String::from_utf8_lossy(&name)
                 .trim_end_matches('\0')
@@ -333,6 +390,8 @@ impl Executor {
             pointers,
             sizes,
             graphs,
+            direct,
+            cuda_graph,
             allocations,
         };
         let stats = LoadStats {
@@ -343,6 +402,8 @@ impl Executor {
             weight_upload_s,
             module_load_bind_s,
             graph_capture_s,
+            cuda_graph,
+            captured_programs,
             buffer_bytes,
         };
         Ok((executor, stats))
@@ -420,19 +481,85 @@ impl Executor {
         }
         self.sync()
     }
-    pub(crate) fn launch_program(&self, name: &str) -> Result<()> {
-        let graph = *self
-            .graphs
-            .get(name)
-            .ok_or_else(|| format!("Missing program {name}"))?;
-        // SAFETY: Graphs and their stable addresses live in this thread's session.
-        unsafe {
-            check(
-                (self.session.driver.graph_launch)(graph, self.session.stream),
-                "model graph",
-            )?;
-        }
+    pub(crate) fn launch_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
+        self.submit_program(name, phase)?;
         self.sync()
+    }
+
+    /// Submit the same registered program without adding synchronization points.
+    pub(crate) fn submit_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
+        if self.cuda_graph.uses_graph(phase) {
+            let graph = *self
+                .graphs
+                .get(name)
+                .ok_or_else(|| format!("Missing captured program {name} for {phase:?}"))?;
+            // SAFETY: Graphs and their stable addresses live in this thread's session.
+            unsafe {
+                check(
+                    (self.session.driver.graph_launch)(graph, self.session.stream),
+                    "model graph",
+                )?;
+            }
+            return Ok(());
+        }
+        if let Some(direct) = &self.direct {
+            use crate::model::Operation;
+            let ops = direct
+                .programs
+                .get(name)
+                .ok_or_else(|| format!("Missing program {name}"))?;
+            let mut kernels = direct.kernels.borrow_mut();
+            for op in ops {
+                match op {
+                    Operation::Kernel { name } => {
+                        let kernel = kernels.get_mut(name).ok_or("Unbound kernel")?;
+                        launch_kernel(
+                            &kernel.spec,
+                            kernel.function,
+                            &mut kernel.values,
+                            &self.session.driver,
+                            self.session.stream,
+                        )?;
+                    }
+                    Operation::Copy {
+                        source,
+                        destination,
+                        bytes,
+                    } => {
+                        // SAFETY: The same validated ranges and session-owned
+                        // allocations are used by the captured program above.
+                        unsafe {
+                            check(
+                                (self.session.driver.copy)(
+                                    self.pointers[destination],
+                                    self.pointers[source],
+                                    *bytes,
+                                    self.session.stream,
+                                ),
+                                "direct state copy",
+                            )?;
+                        }
+                    }
+                    Operation::Zero { destination, bytes } => {
+                        // SAFETY: Validated writable range on the same stream as
+                        // its producers and consumers, with no extra sync.
+                        unsafe {
+                            check(
+                                (self.session.driver.memset)(
+                                    self.pointers[destination],
+                                    0,
+                                    *bytes,
+                                    self.session.stream,
+                                ),
+                                "direct residual reset",
+                            )?;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Err(format!("Missing direct execution bindings for {name}"))
     }
     pub(crate) fn upload_ids(&self, name: &str, ids: &[u32]) -> Result<()> {
         if ids.len() * 4 > self.sizes[name] {

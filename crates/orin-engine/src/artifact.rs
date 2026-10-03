@@ -22,7 +22,7 @@ pub struct Manifest {
     pub validation: Validation,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileIdentity {
     pub file: String,
@@ -84,7 +84,7 @@ impl<Data> Buffer<Data> {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Kernel {
     pub name: String,
@@ -98,7 +98,7 @@ pub struct Kernel {
     pub cooperative: bool,
     pub args: Vec<Argument>,
 }
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Argument {
     Buffer { name: String },

@@ -1,4 +1,25 @@
+use orin_engine::execution::LoadOptions;
 use std::process::ExitCode;
+
+fn model_options(args: &[String]) -> Result<LoadOptions, String> {
+    if args.len() < 2 {
+        return Err(
+            "Usage: orin-llm run-model MODEL_DIR REQUESTS.json [--cuda-graph decode_only|full|off]"
+                .into(),
+        );
+    }
+    let mut options = LoadOptions::default();
+    for pair in args[2..].chunks(2) {
+        if pair.len() != 2 {
+            return Err("Model option needs a value".into());
+        }
+        match pair[0].as_str() {
+            "--cuda-graph" => options.cuda_graph = pair[1].parse()?,
+            _ => return Err(format!("Unknown model option {}", pair[0])),
+        }
+    }
+    Ok(options)
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,13 +60,17 @@ fn main() -> ExitCode {
         };
     }
     if args.first().is_some_and(|c| c == "run-model") {
-        if args.len() != 3 {
-            eprintln!("Usage: orin-llm run-model MODEL_DIR REQUESTS.json");
-            return ExitCode::from(2);
-        }
-        return match orin_engine::model::run(
+        let options = match model_options(&args[1..]) {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
+        };
+        return match orin_engine::model::run_with_options(
             std::path::Path::new(&args[1]),
             std::path::Path::new(&args[2]),
+            options,
         )
         .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
         {
@@ -103,7 +128,7 @@ fn main() -> ExitCode {
         "plan" => println!("{}", orin_engine::BENCHMARK_PLAN),
         "--version" | "-V" => println!("orin-llm {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!(
-            "Usage: orin-llm [info | plan | --version | --help]\n       orin-llm <validate-artifact | run-artifact> MANIFEST.json\n       orin-llm run-model MODEL_DIR REQUESTS.json\n       orin-llm serve MODEL_DIR [--listen HOST:PORT] [--model MODEL_ID]\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nplan-model           Inspect the registered execution plan without CUDA\nvalidate-model       Verify model, operator package and tensor hashes without CUDA\nrun-model            Load custom model data and registered plans with private state"
+            "Usage: orin-llm [info | plan | --version | --help]\n       orin-llm <validate-artifact | run-artifact> MANIFEST.json\n       orin-llm run-model MODEL_DIR REQUESTS.json [--cuda-graph MODE]\n       orin-llm serve MODEL_DIR [--listen HOST:PORT] [--model MODEL_ID] [--cuda-graph MODE]\n\n--cuda-graph MODE     decode_only (default), full or off\n--listen HOST:PORT    Default: 0.0.0.0:8088\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nplan-model           Inspect the registered execution plan without CUDA\nvalidate-model       Verify model, operator package and tensor hashes without CUDA\nrun-model            Load custom model data and registered plans with private state"
         ),
         other => {
             eprintln!(
@@ -113,4 +138,37 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orin_engine::execution::CudaGraphMode;
+
+    #[test]
+    fn run_model_graph_modes_are_validated_before_loading() {
+        let required = vec!["model-dir".into(), "requests.json".into()];
+        assert_eq!(
+            model_options(&required).unwrap().cuda_graph,
+            CudaGraphMode::DecodeOnly
+        );
+        assert!(model_options(&[]).is_err());
+        assert!(model_options(&required[..1]).is_err());
+        for mode in ["decode_only", "full", "off"] {
+            let args = [required.clone(), vec!["--cuda-graph".into(), mode.into()]].concat();
+            assert_eq!(model_options(&args).unwrap().cuda_graph.to_string(), mode);
+        }
+        for options in [
+            vec!["--cuda-graph"],
+            vec!["--cuda-graph", "on"],
+            vec!["--unknown", "off"],
+        ] {
+            let args = [
+                required.clone(),
+                options.into_iter().map(String::from).collect(),
+            ]
+            .concat();
+            assert!(model_options(&args).is_err());
+        }
+    }
 }

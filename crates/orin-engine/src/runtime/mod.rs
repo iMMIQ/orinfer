@@ -1,5 +1,6 @@
 //! Generation orchestration, independent of API transport and CUDA graph binding.
 use crate::cuda::executor::{Executor, LoadStats};
+use crate::execution::{ExecutionPhase, LoadOptions};
 use crate::{
     artifact::Result,
     cuda::{Session, check, floats},
@@ -22,7 +23,11 @@ pub(crate) struct ModelRuntime {
     pub(crate) speculation_statistics: Option<crate::mtp::Statistics>,
 }
 impl ModelRuntime {
+    #[cfg(test)]
     pub(crate) fn load(path: &std::path::Path) -> Result<Self> {
+        Self::load_with_options(path, LoadOptions::default())
+    }
+    pub(crate) fn load_with_options(path: &std::path::Path, options: LoadOptions) -> Result<Self> {
         let started = Instant::now();
         let prepared = crate::loader::load(path)?;
         let (execution, mut stats) = Executor::load(
@@ -31,6 +36,8 @@ impl ModelRuntime {
             &prepared.kernel_root,
             prepared.fingerprint,
             &prepared.scopes,
+            &prepared.decode_programs,
+            options,
         )?;
         stats.load_to_ready_s = started.elapsed().as_secs_f64();
         Ok(Self {
@@ -40,8 +47,8 @@ impl ModelRuntime {
             speculation_statistics: None,
         })
     }
-    fn launch_program(&self, name: &str) -> Result<()> {
-        self.execution.launch_program(name)
+    fn launch_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
+        self.execution.launch_program(name, phase)
     }
     fn upload_ids(&self, name: &str, ids: &[u32]) -> Result<()> {
         self.execution.upload_ids(name, ids)
@@ -59,9 +66,10 @@ impl ModelRuntime {
 pub(crate) fn run_model(
     manifest_path: &std::path::Path,
     requests_path: &std::path::Path,
+    options: LoadOptions,
 ) -> Result<crate::model::Report> {
     let requests = crate::model::read(requests_path)?;
-    ModelRuntime::load(manifest_path)?.benchmark(requests)
+    ModelRuntime::load_with_options(manifest_path, options)?.benchmark(requests)
 }
 
 #[cfg(test)]

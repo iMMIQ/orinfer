@@ -41,6 +41,7 @@ pub(crate) struct PreparedModel {
     pub operator_package: String,
     pub architecture: Architecture,
     pub policy: ComputePolicy,
+    pub decode_programs: std::collections::BTreeSet<String>,
 }
 
 pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
@@ -81,7 +82,8 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
         &model.metadata.buffers,
     )?;
     validate_scopes(&model.metadata, &model.buffer_scopes)?;
-    architecture::build(&config, &mut model.metadata, &package.prefill_profiles)?;
+    let decode_programs =
+        architecture::build(&config, &mut model.metadata, &package.prefill_profiles)?;
     model.metadata.kernels = package.kernels;
     model.metadata.validate()?;
     // The descriptor pins the package; configuration also affects generated plans.
@@ -95,6 +97,7 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
         operator_package: model.operator_package,
         architecture: model.architecture,
         policy: model.compute_policy,
+        decode_programs,
     })
 }
 

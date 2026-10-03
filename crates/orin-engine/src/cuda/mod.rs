@@ -302,30 +302,39 @@ pub(crate) struct Launch<'a> {
 }
 impl Launch<'_> {
     fn execute(&mut self, driver: &Driver, stream: Handle) -> Result<()> {
-        let mut args: Vec<*mut c_void> = self.values.iter_mut().map(Value::address).collect();
-        let k = self.spec;
-        // SAFETY: Values remain at stable Vec addresses until cuLaunchKernel has
-        // copied each parameter. Device pointers refer to live session buffers;
-        // generated ABI order/types are supplied by the verified manifest.
-        // The module and explicit stream outlive all queued/captured work.
-        unsafe {
-            check(
-                (driver.launch)(
-                    self.function,
-                    k.grid[0],
-                    k.grid[1],
-                    k.grid[2],
-                    k.block[0],
-                    k.block[1],
-                    k.block[2],
-                    k.shared_memory_bytes,
-                    stream,
-                    args.as_mut_ptr(),
-                    ptr::null_mut(),
-                ),
-                &format!("launch {}", k.name),
-            )
-        }
+        launch_kernel(self.spec, self.function, &mut self.values, driver, stream)
+    }
+}
+
+fn launch_kernel(
+    k: &Kernel,
+    function: Handle,
+    values: &mut [Value],
+    driver: &Driver,
+    stream: Handle,
+) -> Result<()> {
+    let mut args: Vec<*mut c_void> = values.iter_mut().map(Value::address).collect();
+    // SAFETY: Values remain at stable Vec addresses until cuLaunchKernel has
+    // copied each parameter. Device pointers refer to live session buffers;
+    // generated ABI order/types are supplied by the verified manifest.
+    // The module and explicit stream outlive all queued/captured work.
+    unsafe {
+        check(
+            (driver.launch)(
+                function,
+                k.grid[0],
+                k.grid[1],
+                k.grid[2],
+                k.block[0],
+                k.block[1],
+                k.block[2],
+                k.shared_memory_bytes,
+                stream,
+                args.as_mut_ptr(),
+                ptr::null_mut(),
+            ),
+            &format!("launch {}", k.name),
+        )
     }
 }
 

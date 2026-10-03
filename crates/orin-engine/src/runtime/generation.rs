@@ -62,9 +62,9 @@ impl ModelRuntime {
                 });
             if let Some((chunk, program, head)) = selected {
                 self.upload_ids(&m.input, &input[offset..offset + chunk])?;
-                self.launch_program(program)?;
+                self.launch_program(program, ExecutionPhase::Prefill)?;
                 if let Some(spec) = &mtp {
-                    self.mtp_capture(spec, chunk)?;
+                    self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
                 }
                 offset += chunk;
                 last_head = Some(head);
@@ -74,9 +74,9 @@ impl ModelRuntime {
                         return Err("Request cancelled during prefill".into());
                     }
                     self.upload_ids(&m.token, std::slice::from_ref(id))?;
-                    self.launch_program("decode")?;
+                    self.launch_program("decode", ExecutionPhase::Prefill)?;
                     if let Some(spec) = &mtp {
-                        self.mtp_capture(spec, 1)?;
+                        self.mtp_capture(spec, 1, ExecutionPhase::Prefill)?;
                     }
                 }
                 offset = input.len();
@@ -84,7 +84,7 @@ impl ModelRuntime {
             }
         }
         if let Some(head) = last_head {
-            self.launch_program(head)?;
+            self.launch_program(head, ExecutionPhase::Prefill)?;
         }
         if self.read_control(&m.position)? as usize != input.len() {
             return Err("Prefill position mismatch".into());
@@ -121,7 +121,7 @@ impl ModelRuntime {
             if step + 1 < limit {
                 // Also overwrite the greedy graph selection for stochastic sampling.
                 self.upload_ids(&m.token, &[token])?;
-                self.launch_program("decode")?;
+                self.launch_program("decode", ExecutionPhase::Decode)?;
             }
         }
         if self.read_control(&m.position)? as usize != input.len() + generated - 1 {
