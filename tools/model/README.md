@@ -6,7 +6,7 @@
 
 checkpoint默认位于`/home/nvidia/model/vllm-comparison-20260930/awq-http/`。投影验证使用`artifacts/experimental-vllm/activations/`中的真实L0输入；运行前需准备这些外部数据，文件名见验证入口。LUT4验证支持`--activations-dir`。
 
-GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用本机NVIDIA Docker镜像和GPU锁；镜像名为`lada-orin-tilelang:0.11.0-exp7`，实际TileLang0.1.13/Torch2.9.1/CUDA12.6。镜像及checkpoint不随源码分发。CPU组装入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。
+GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用本机NVIDIA Docker镜像和GPU锁；镜像名为`lada-orin-tilelang:0.11.0-exp7`，实际TileLang0.1.13/Torch2.9.1/CUDA12.6。镜像及checkpoint不随源码分发。CPU组装入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
 
 ## 从checkpoint重建
 
@@ -84,8 +84,12 @@ bash tools/operators/run.sh tools/model/assemble_small_m.py \
 bash tools/operators/run.sh tools/model/assemble_mtp.py \
   artifacts/model/with-mtp --model artifacts/model/verification/model.json \
   --weights artifacts/model/mtp-weights --verification-tokens 4
-./target/release/orin-llm serve artifacts/model/with-mtp/model.json \
-  /path/to/tokenizer-dir --listen 127.0.0.1:8088 --model qwen3.8-27b
+python3 tools/model/prepare.py \
+  --model artifacts/model/with-mtp/model.json \
+  --checkpoint /path/to/checkpoint-dir --output artifacts/models/qwen3.8-27b
+./target/release/orin-llm validate-model artifacts/models/qwen3.8-27b
+./target/release/orin-llm serve artifacts/models/qwen3.8-27b \
+  --listen 127.0.0.1:8088 --model qwen3.8-27b
 ```
 
 `verification-tokens`包含一个已提交、尚未处理的输入token；4对应最多3个新草稿。验证图保存每个GDN/卷积前缀以恢复拒绝状态；主模型最终归一化hidden用于MTP预填充和验证后的KV更新。主模型embedding/head与MTP共享，不存第二份主模型权重。FP8 scale按原生语义相乘；norm保留zero-centered形式。`weights.json`和`mtp-build.json`记录权重身份、所有草稿参数字节数及合计平均bits。
@@ -95,3 +99,21 @@ bash tools/operators/run.sh tools/model/assemble_mtp.py \
 `run.sh MODEL REQUESTS NEW_OUTPUT`运行Rust完整模型并记录机器状态、源代码、二进制身份和报告。`scenarios.py prepare DIR`生成固定场景请求，`scenarios.py score INPUT_DIR REPORT OUTPUT`做任务判分。`score.py`提供同历史概率诊断；这些社区权重对照不替代BF16/FP8质量评估。
 
 `profile.sh MODEL REQUESTS NEW_OUTPUT`采集Nsight节点trace；`profile_summary.py`校验manifest映射。四输出profile不是正式TPS验收。
+
+## Safetensors模型目录
+
+离线编译、融合、视觉与MTP组装全部完成后，使用`prepare.py`发布新的模型目录。普通文本/视觉模型也使用同一入口；把`--model`替换为最终中间产物。无需GPU或PyTorch，只依赖Python的safetensors库。
+
+```bash
+python3 tools/model/prepare.py \
+  --model artifacts/model/rebuild-final/model.json \
+  --checkpoint /path/to/checkpoint-dir --output artifacts/models/qwen3.8-27b
+./target/release/orin-llm validate-model artifacts/models/qwen3.8-27b
+./target/release/orin-llm run-model artifacts/models/qwen3.8-27b examples/requests.json
+```
+
+工具检查checkpoint词表、所有源payload与构建资产的hash；不重新量化、不重编译kernel，包含只读权重以及RoPE/索引等可写buffer的初始值。默认每片约1 GiB，`--shard-mib`可调整；单个tensor不会拆分，转换内存由最大分片决定。写完并用标准safetensors reader校验后，才原子发布完整目录；已有输出不覆盖，失败时删除本次临时目录。
+
+目录根保留checkpoint配置、generation config、tokenizer、chat template和图片预处理配置；不复制原始checkpoint的大权重。内部`cache/weights/`保存带dtype/shape和物理layout元数据的safetensors及HF分片索引；`cache/manifest.json`只引用tensor名字及payload SHA256，由索引定位文件；`cache/kernels/`保存去重、独立复制的构建资产。文件在加载期间必须保持不变。原始checkpoint与此物理布局缓存用途不同，不能用Transformers直接执行缓存tensor。
+
+在线Rust不提供旧模型格式兼容分支，也不在首次请求中执行Python或量化。后续重新编译或改变布局时，完成离线组装后发布新的目录。GPU校验fixture的`model`字段可指向模型目录或schema-2执行计划；算子测试夹具仍采用独立的原格式。

@@ -756,7 +756,8 @@ impl ModelRuntime {
         use sha2::{Digest, Sha256};
         use std::fs;
         let started = Instant::now();
-        let manifest_raw = fs::read(manifest_path).map_err(|e| e.to_string())?;
+        let manifest_path = crate::model::resolve_manifest(manifest_path)?;
+        let manifest_raw = fs::read(&manifest_path).map_err(|e| e.to_string())?;
         let manifest_sha256 = format!("{:x}", Sha256::digest(&manifest_raw));
         let manifest: Manifest =
             serde_json::from_slice(&manifest_raw).map_err(|e| e.to_string())?;
@@ -804,6 +805,7 @@ impl ModelRuntime {
             }
         }
         let (mut weight_io_hash_s, mut weight_upload_s) = (0.0, 0.0);
+        let mut weights = crate::weights::Weights::open(base)?;
         for b in &manifest.buffers {
             let bytes = b.bytes()?;
             let mut address = 0;
@@ -821,9 +823,9 @@ impl ModelRuntime {
             }
             pointers.insert(b.name.clone(), address);
             sizes.insert(b.name.clone(), bytes);
-            if let Some(id) = &b.data {
+            if b.data.is_some() {
                 let t = Instant::now();
-                let raw = crate::artifact::read_identity(base, id)?;
+                let raw = weights.read(b)?;
                 weight_io_hash_s += t.elapsed().as_secs_f64();
                 if raw.len() != bytes {
                     return Err(format!("{} weight byte length mismatch", b.name));
@@ -848,6 +850,7 @@ impl ModelRuntime {
                 }
             }
         }
+        drop(weights);
         let module_started = Instant::now();
         let mut modules = BTreeMap::<String, Handle>::new();
         let mut functions = BTreeMap::<(String, String), Handle>::new();

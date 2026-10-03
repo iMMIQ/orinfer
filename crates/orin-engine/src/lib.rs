@@ -8,6 +8,7 @@ pub mod model;
 pub mod mtp;
 pub mod sampling;
 pub mod vision;
+mod weights;
 
 /// Build target; runtime device discovery must validate it before inference.
 pub const TARGET_DEVICE: &str = "Jetson AGX Orin 64GB";

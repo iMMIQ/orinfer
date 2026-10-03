@@ -23,7 +23,7 @@ ORIN_CHAT_REFERENCE="$PWD/artifacts/chat-reference.json" \
 
 ```bash
 python3 tools/api/template_reference.py --tokenizer-dir /path/to/tokenizer-dir \
-  --vision-model /path/to/vision/model.json --image /path/to/image.png \
+  --vision-model /path/to/prepared-model-dir --image /path/to/image.png \
   --output artifacts/chat-image-reference.json
 ORIN_TOKENIZER_DIR=/path/to/tokenizer-dir \
 ORIN_CHAT_REFERENCE="$PWD/artifacts/chat-image-reference.json" \

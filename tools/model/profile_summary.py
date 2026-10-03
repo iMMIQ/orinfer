@@ -14,6 +14,8 @@ import sqlite3
 
 
 def summarize(directory, manifest_path):
+    if manifest_path.is_dir():
+        manifest_path = manifest_path / 'cache/manifest.json'
     manifest_raw = manifest_path.read_bytes()
     model = json.loads(manifest_raw)
     report = json.loads((directory / "report.json").read_text())

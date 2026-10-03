@@ -12,6 +12,7 @@ check:
 	python3 -m unittest discover -s tools/bench -p 'test_*.py' -v
 	python3 -m unittest discover -s tools/operators -p 'test_abi.py' -v
 	python3 -m unittest discover -s tools/vision -p 'test_*.py' -v
+	python3 -m unittest tools.model.test_prepare -v
 	python3 tools/bench/validate_plan.py
 
 info:

@@ -14,12 +14,15 @@ make check
 make build
 ```
 
+模型目录使用checkpoint的配置、tokenizer和chat template；`cache/weights/`采用标准分片safetensors及`model.safetensors.index.json`，`cache/kernels/`保存cubin与构建资产，`cache/manifest.json`保存内部执行计划（schema 2）。packed W4、scale、zero和LUT等辅助tensor保留原始字节，layout以`orin.layout.<tensor>`元数据标注。这是引擎专用物理布局缓存，通用safetensors工具可读取，其他引擎需要适配布局才能执行。Rust加载器只接受新格式，按索引mmap并校验tensor hash、dtype、shape与layout；CPU `validate-model`检查完整模型及kernel资产。
+
 模型权重、cubin和编译缓存不包含在源码库中。[离线构建说明](tools/model/README.md)介绍checkpoint转换、kernel导出和模型组装。
 
 ## 运行
 
 ```bash
-./target/release/orin-llm run-model /path/to/model.json examples/requests.json
+./target/release/orin-llm validate-model /path/to/model-dir
+./target/release/orin-llm run-model /path/to/model-dir examples/requests.json
 ```
 
 CLI接收token-ID请求，输出包含生成token、加载时间和请求时延的JSON。`examples/requests.json`提供一个512-token文本请求。需要自行使用模型tokenizer准备其他输入。
@@ -37,11 +40,11 @@ CLI接收token-ID请求，输出包含生成token、加载时间和请求时延�
 ## Chat API
 
 ```bash
-./target/release/orin-llm serve /path/to/model.json /path/to/tokenizer-dir \
+./target/release/orin-llm serve /path/to/model-dir \
   --listen 127.0.0.1:8088 --model qwen3.8-27b
 ```
 
-Tokenizer目录需要与权重匹配的`tokenizer.json`、`chat_template.jinja`和`generation_config.json`。Rust直接渲染checkpoint模板并分词。服务只加载一次模型，通过一个GPU worker执行请求；最多128个等待请求，队列满返回429。GPU worker持有`artifacts/gpu-experiment.lock`；可用`--gpu-lock`指定共享锁路径。
+模型目录内保留与权重匹配的`tokenizer.json`、`chat_template.jinja`和`generation_config.json`。Rust直接渲染checkpoint模板并分词。服务只加载一次模型，通过一个GPU worker执行请求；最多128个等待请求，队列满返回429。GPU worker持有`artifacts/gpu-experiment.lock`；可用`--gpu-lock`指定共享锁路径。
 
 ```bash
 curl http://127.0.0.1:8088/v1/chat/completions \

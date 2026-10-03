@@ -63,16 +63,16 @@ pub enum Access {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Buffer {
+pub struct Buffer<Data = FileIdentity> {
     pub name: String,
     pub dtype: Dtype,
     pub shape: Vec<usize>,
     pub layout: String,
     pub alignment: u64,
     pub access: Access,
-    pub data: Option<FileIdentity>,
+    pub data: Option<Data>,
 }
-impl Buffer {
+impl<Data> Buffer<Data> {
     pub fn bytes(&self) -> Result<usize> {
         if self.shape.is_empty() || self.shape.contains(&0) {
             return Err(format!("{}: empty shape", self.name));
@@ -224,26 +224,31 @@ pub(crate) fn read_identity(base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
     {
         return Err(format!("{}: malformed sha256", id.file));
     }
-    let path = Path::new(&id.file);
-    if path.as_os_str().is_empty()
-        || path
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_)))
-    {
-        return Err(format!("{}: expected relative artifact path", id.file));
-    }
-    let canonical = base
-        .join(path)
-        .canonicalize()
-        .map_err(|e| format!("{}: {e}", id.file))?;
-    if !canonical.starts_with(base) {
-        return Err("Artifact symlink leaves fixture directory".into());
-    }
+    let canonical = resolve_file(base, &id.file)?;
     let data = fs::read(canonical).map_err(|e| format!("{}: {e}", id.file))?;
     if sha256(&data) != id.sha256 {
         return Err(format!("{}: sha256 mismatch", id.file));
     }
     Ok(data)
+}
+
+pub(crate) fn resolve_file(base: &Path, file: &str) -> Result<std::path::PathBuf> {
+    let path = Path::new(file);
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(format!("{file}: expected relative artifact path"));
+    }
+    let canonical = base
+        .join(path)
+        .canonicalize()
+        .map_err(|e| format!("{file}: {e}"))?;
+    if !canonical.starts_with(base) {
+        return Err("Artifact symlink leaves fixture directory".into());
+    }
+    Ok(canonical)
 }
 
 fn load(path: &Path) -> Result<Loaded> {

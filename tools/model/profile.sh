@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ $# != 3 ]]; then echo 'usage: profile.sh MODEL.json REQUESTS.json NEW_OUTPUT_DIR' >&2; exit 2; fi
+if [[ $# != 3 ]]; then echo 'usage: profile.sh MODEL_DIR REQUESTS.json NEW_OUTPUT_DIR' >&2; exit 2; fi
 model_manifest="$1"
 request_manifest="$2"
 output_arg="$3"
 cd "$repo_dir"
+if [[ -d "$model_manifest" ]]; then model_manifest="$model_manifest/cache/manifest.json"; fi
 if [[ "$output_arg" = /* ]]; then output_dir="$output_arg"; else output_dir="$repo_dir/$output_arg"; fi
 if [[ -e "$output_dir" ]]; then echo "Refusing existing output $output_dir" >&2; exit 2; fi
 mkdir -p "$output_dir/measurement-source"
-cp --parents "$model_manifest" "$request_manifest" tools/model/{profile.sh,profile_summary.py} \
-    crates/orin-engine/src/{cuda,model,artifact}.rs crates/orin-cli/src/main.rs \
+cp --parents "$model_manifest" "$(dirname -- "$model_manifest")/weights/model.safetensors.index.json" "$request_manifest" tools/model/{profile.sh,profile_summary.py} \
+    crates/orin-engine/src/{cuda,model,artifact,weights}.rs crates/orin-cli/src/main.rs \
     "$output_dir/measurement-source/"
 cp "$request_manifest" "$output_dir/requests.json"
 cp target/release/orin-llm "$output_dir/orin-llm"

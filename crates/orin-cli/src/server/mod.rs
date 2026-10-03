@@ -36,17 +36,17 @@ struct Settings {
 }
 impl Settings {
     fn parse(args: &[String]) -> Result<Self> {
-        if args.len() < 2 {
-            return Err("Usage: orin-llm serve MODEL.json TOKENIZER_DIR [--listen 127.0.0.1:8088] [--model qwen3.8-27b] [--gpu-lock artifacts/gpu-experiment.lock]".into());
+        if args.is_empty() || !std::path::Path::new(&args[0]).is_dir() {
+            return Err("Usage: orin-llm serve MODEL_DIR [--listen 127.0.0.1:8088] [--model qwen3.8-27b] [--gpu-lock artifacts/gpu-experiment.lock]; MODEL_DIR must contain the prepared cache and checkpoint tokenizer".into());
         }
         let mut settings = Self {
             manifest: (&args[0]).into(),
-            tokenizer: (&args[1]).into(),
+            tokenizer: (&args[0]).into(),
             model: "qwen3.8-27b".into(),
             listen: "127.0.0.1:8088".into(),
             gpu_lock: "artifacts/gpu-experiment.lock".into(),
         };
-        for pair in args[2..].chunks(2) {
+        for pair in args[1..].chunks(2) {
             if pair.len() != 2 {
                 return Err("Server option needs a value".into());
             }
@@ -61,6 +61,28 @@ impl Settings {
             return Err("Model ID cannot be empty".into());
         }
         Ok(settings)
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn directory_is_both_model_and_tokenizer_and_options_are_unambiguous() {
+        let directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let settings = Settings::parse(&[
+            directory.clone(),
+            "--listen".into(),
+            "127.0.0.1:9999".into(),
+        ])
+        .unwrap();
+        assert_eq!(settings.manifest, PathBuf::from(&directory));
+        assert_eq!(settings.tokenizer, PathBuf::from(&directory));
+        assert_eq!(settings.listen, "127.0.0.1:9999");
+        assert!(Settings::parse(&[directory.clone(), directory.clone()]).is_err());
+        assert!(Settings::parse(&[directory, "--listen".into()]).is_err());
+        assert!(Settings::parse(&["legacy-model.json".into(), "tokenizer".into()]).is_err());
     }
 }
 #[derive(Clone)]

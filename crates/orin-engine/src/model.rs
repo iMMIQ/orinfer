@@ -1,10 +1,12 @@
 //! AOT model programs: architecture-specific plans, parameterized Rust runtime.
 use crate::artifact::{Access, Argument, Buffer, Kernel, Result};
+pub use crate::weights::TensorIdentity;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
+    time::Instant,
 };
 
 #[derive(Debug, Deserialize)]
@@ -19,7 +21,7 @@ pub struct Manifest {
     pub max_context: usize,
     pub vocab: usize,
     pub toolchain: BTreeMap<String, String>,
-    pub buffers: Vec<Buffer>,
+    pub buffers: Vec<Buffer<TensorIdentity>>,
     pub kernels: Vec<Kernel>,
     pub programs: BTreeMap<String, Vec<Operation>>,
     pub reset_buffers: Vec<String>,
@@ -84,12 +86,12 @@ pub struct Request {
 
 impl Manifest {
     pub fn validate<'a>(&'a self) -> Result<usize> {
-        if self.schema_version != 1
+        if self.schema_version != 2
             || self.target != "sm_87"
             || self.model.is_empty()
             || self.toolchain.is_empty()
         {
-            return Err("Expected populated model schema 1 for SM87".into());
+            return Err("Expected safetensors model schema 2 for SM87; prepare the AOT model directory first".into());
         }
         if self.chunk_tokens == 0
             || self.chunk_tokens > self.max_context
@@ -118,13 +120,31 @@ impl Manifest {
             Ok(())
         };
         let mut buffers = BTreeMap::new();
+        let mut tensors = BTreeMap::new();
         let mut total = 0usize;
         let mut weights = 0usize;
         for b in &self.buffers {
             if let Some(id) = &b.data {
-                identity(id)?;
+                if id.tensor.is_empty()
+                    || id.sha256.len() != 64
+                    || !id
+                        .sha256
+                        .bytes()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                {
+                    return Err("Invalid tensor identity".into());
+                }
+                if let Some(previous) =
+                    tensors.insert(&id.tensor, (&id.sha256, b.dtype, &b.shape, &b.layout))
+                    && previous != (&id.sha256, b.dtype, &b.shape, &b.layout)
+                {
+                    return Err("Conflicting tensor identities".into());
+                }
             }
             let bytes = b.bytes()?;
+            if b.access == Access::Read && b.data.is_none() {
+                return Err(format!("{}: immutable tensor has no payload", b.name));
+            }
             if b.name.is_empty()
                 || b.layout.is_empty()
                 || !b.alignment.is_power_of_two()
@@ -141,7 +161,7 @@ impl Manifest {
         if weights != self.weight_bytes || self.weight_parameters == 0 {
             return Err("Weight accounting mismatch".into());
         }
-        let lookup = |name: &str| -> Result<&Buffer> {
+        let lookup = |name: &str| -> Result<&Buffer<TensorIdentity>> {
             buffers
                 .get(&name.to_string())
                 .copied()
@@ -378,6 +398,60 @@ pub struct Report {
 pub fn run(manifest: &Path, requests: &Path) -> Result<Report> {
     crate::cuda::run_model(manifest, requests)
 }
+
+/// A prepared HF-style directory contains the private execution cache.
+pub fn resolve_manifest(path: &Path) -> Result<PathBuf> {
+    let manifest = if path.is_dir() {
+        path.join("cache/manifest.json")
+    } else {
+        path.to_owned()
+    };
+    manifest.canonicalize().map_err(|e| format!(
+        "{}: {e}; prepare with python3 tools/model/prepare.py --model AOT_MODEL.json --checkpoint HF_DIR --output MODEL_DIR",
+        manifest.display()))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationReport {
+    pub manifest_sha256: String,
+    pub tensor_count: usize,
+    pub shard_count: usize,
+    pub weight_bytes: usize,
+    pub validation_s: f64,
+}
+
+/// Verify all container layouts and payloads without CUDA or resident weight copies.
+pub fn validate_model(path: &Path) -> Result<ValidationReport> {
+    let start = Instant::now();
+    let path = resolve_manifest(path)?;
+    let raw = fs::read(&path).map_err(|e| e.to_string())?;
+    let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    manifest.validate()?;
+    let base = path.parent().ok_or("Manifest needs parent directory")?;
+    let mut weights = crate::weights::Weights::open(base)?;
+    let mut tensor_count = 0;
+    for buffer in &manifest.buffers {
+        if buffer.data.is_some() {
+            weights.read(buffer)?;
+            tensor_count += 1;
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for kernel in &manifest.kernels {
+        for identity in [&kernel.module, &kernel.source, &kernel.host_abi] {
+            if seen.insert(&identity.file) {
+                crate::artifact::read_identity(base, identity)?;
+            }
+        }
+    }
+    Ok(ValidationReport {
+        manifest_sha256: crate::artifact::sha256(&raw),
+        tensor_count,
+        shard_count: weights.shard_count(),
+        weight_bytes: manifest.weight_bytes,
+        validation_s: start.elapsed().as_secs_f64(),
+    })
+}
 pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
     serde_json::from_slice(&fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?)
         .map_err(|e| format!("{}: {e}", p.display()))
@@ -434,9 +508,9 @@ mod tests {
             ("Weight", "f16", 2, "read"), ("Input", "i32", 2, "read_write"),
             ("Token", "i32", 1, "read_write"), ("Status", "i32", 1, "read_write"),
             ("Step", "i32", 1, "read_write"), ("Logits", "f16", 4, "read_write"),
-        ].map(|(name,dtype,rows,access)|serde_json::json!({"name":name,"dtype":dtype,"shape":[rows],"layout":"contiguous","alignment":256,"access":access,"data":null}));
+        ].map(|(name,dtype,rows,access)|serde_json::json!({"name":name,"dtype":dtype,"shape":[rows],"layout":"contiguous","alignment":256,"access":access,"data":if name=="Weight" { serde_json::json!({"tensor":"Weight","sha256":"0".repeat(64)}) } else { serde_json::Value::Null }}));
         let id = serde_json::json!({"file":"a.cubin","sha256":"0".repeat(64)});
-        serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_87","model":"test","chunk_tokens":2,"max_context":8,"vocab":4,"toolchain":{"test":"test"},
+        serde_json::from_value(serde_json::json!({"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":2,"max_context":8,"vocab":4,"toolchain":{"test":"test"},
             "buffers":buffers,"kernels":[{"name":"k","module":id,"source":id,"host_abi":id,"symbol":"k","grid":[1,1,1],"block":[32,1,1],"shared_memory_bytes":0,"cooperative":false,"args":[{"kind":"buffer","name":"Input"}]}],
             "programs":{"prefill":[{"kind":"kernel","name":"k"}],"head":[{"kind":"kernel","name":"k"}],"decode":[{"kind":"kernel","name":"k"}]},
             "reset_buffers":["Step"],"input":"Input","token":"Token","status":"Status","logits":"Logits","position":"Step","weight_bytes":4,"weight_parameters":2,"weight_scope":"test"})).unwrap()
@@ -462,6 +536,17 @@ mod tests {
             destination: "Weight".into(),
             bytes: 4,
         });
+        assert!(m.validate().is_err());
+    }
+    #[test]
+    fn rejects_legacy_schema_and_raw_buffer_identity() {
+        let mut m = fixture();
+        m.schema_version = 1;
+        assert!(m.validate().is_err());
+        let raw = serde_json::json!({"file":"weight.bin","sha256":"0".repeat(64)});
+        assert!(serde_json::from_value::<TensorIdentity>(raw).is_err());
+        m.schema_version = 2;
+        m.buffers[0].data = None;
         assert!(m.validate().is_err());
     }
     #[test]
