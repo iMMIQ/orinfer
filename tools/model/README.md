@@ -72,6 +72,26 @@ PYTHONPATH=. python3 tools/model/assemble_gdn_fusions.py \
 
 ## 运行与分析
 
+### 原生MTP
+
+Qwen3_5 adapter可在现有模型上添加单层MTP。准备包含checkpoint原生`mtp.*`参数的safetensors；支持BF16/FP16及带128×128块scale的FP8。社区AWQ文本checkpoint通常不包含MTP，需要另行提供同一原生模型的MTP参数。导入工具只转换草稿权重，主模型权重保持原来的单份常驻表示。
+
+```bash
+bash tools/operators/run.sh tools/model/mtp_weights.py \
+  artifacts/model/mtp-weights --checkpoint /path/to/mtp.safetensors --format w4
+bash tools/operators/run.sh tools/model/assemble_small_m.py \
+  artifacts/model/verification --model /path/to/model.json --tokens 2 4 8
+bash tools/operators/run.sh tools/model/assemble_mtp.py \
+  artifacts/model/with-mtp --model artifacts/model/verification/model.json \
+  --weights artifacts/model/mtp-weights --verification-tokens 4
+./target/release/orin-llm serve artifacts/model/with-mtp/model.json \
+  /path/to/tokenizer-dir --listen 127.0.0.1:8088 --model qwen3.8-27b
+```
+
+`verification-tokens`包含一个已提交、尚未处理的输入token；4对应最多3个新草稿。验证图保存每个GDN/卷积前缀以恢复拒绝状态；主模型最终归一化hidden用于MTP预填充和验证后的KV更新。主模型embedding/head与MTP共享，不存第二份主模型权重。FP8 scale按原生语义相乘；norm保留zero-centered形式。`weights.json`和`mtp-build.json`记录权重身份、所有草稿参数字节数及合计平均bits。
+
+算子验证使用`validate_mtp_kernels.py`，覆盖实际权重布局、因果注意力、GDN恢复、hidden捕获和改变输入后的graph replay。完整生成验证使用Rust ignored test `validate_mtp_generation`（环境变量`ORIN_MTP_FIXTURE`指向含model/output/cases/repetitions/eos的JSON）。先用CLI ignored test `export_mtp_chat_fixture`按原生Chat模板导出请求（`ORIN_MTP_FIXTURE_SPEC`），再在独占GPU锁下执行验证。测试对照关闭MTP的相同主模型，比较真实生成输出及全部有效主模型状态。HTTP计时工具`tools/bench/mtp_chat.py`通过主模型参考token IDs确认首个SSE片段的token数量，只统计最终交付输出。
+
 `run.sh MODEL REQUESTS NEW_OUTPUT`运行Rust完整模型并记录机器状态、源代码、二进制身份和报告。`scenarios.py prepare DIR`生成固定场景请求，`scenarios.py score INPUT_DIR REPORT OUTPUT`做任务判分。`score.py`提供同历史概率诊断；这些社区权重对照不替代BF16/FP8质量评估。
 
 `profile.sh MODEL REQUESTS NEW_OUTPUT`采集Nsight节点trace；`profile_summary.py`校验manifest映射。四输出profile不是正式TPS验收。

@@ -11,14 +11,17 @@ from kernels.operators.op22_attention_decode import _check
 
 @orin_jit
 def _compile_staged(max_pages:int,num_pages:int,block_size:int,block_n:int,
-                 nsplits:int,partials:bool):
+                 nsplits:int,partials:bool,queries:int|None=None):
     """Explicit KV reuse candidate: six Q heads share each staged KV tile.
 
     QK and PV accumulate FP32 on FP16 tensorcores. Softmax/max/denominator are
     FP32, but PV probability operands round FP16, as in FlashAttention. This
     extra rounding is separate from the strict FP32 SIMT baseline.
     """
-    batch=T.dynamic('batch')
+    # A sequence verification graph has several queries sharing one context.
+    # Their absolute QueryPos still applies a separate causal limit per row.
+    batch=T.dynamic('batch') if queries is None else queries
+    contexts=batch if queries is None else 1
 
     @T.macro
     def online(Q,K,V,Pages,SeqLen,QueryPos,b,kh,split,out,maximum,denom):
@@ -34,12 +37,13 @@ def _compile_staged(max_pages:int,num_pages:int,block_size:int,block_n:int,
         for i,d in T.Parallel(16,256):
             q[i,d]=0.0
             if i<6:q[i,d]=Q[b,kh*6+i,d]
-        valid=T.max(0,T.min(T.min(SeqLen[b],QueryPos[b]+1),max_pages*block_size))
+        context=b if queries is None else 0
+        valid=T.max(0,T.min(T.min(SeqLen[context],QueryPos[b]+1),max_pages*block_size))
         width=T.ceildiv(valid,nsplits);start=split*width;end=T.min(start+width,valid)
         for tile in T.serial(T.ceildiv(T.max(0,end-start),block_n)):
             base=start+tile*block_n
-            first=Pages[b,base//block_size]
-            second=Pages[b,(T.min(base+block_n,end)-1)//block_size]
+            first=Pages[context,base//block_size]
+            second=Pages[context,(T.min(base+block_n,end)-1)//block_size]
             if base+block_n<=end and base%block_size+block_n<=block_size and first>=0 and first<num_pages:
                 # The branch predicate is CTA-uniform but opaque to TileLang's
                 # async-copy synchronization analysis. Use synchronous vector
@@ -87,8 +91,8 @@ def _compile_staged(max_pages:int,num_pages:int,block_size:int,block_n:int,
         def kernel(Q:T.Tensor((batch,24,256),T.float16),
                    K:T.Tensor((num_pages,block_size,1024),T.float16),
                    V:T.Tensor((num_pages,block_size,1024),T.float16),
-                   Pages:T.Tensor((batch,max_pages),T.int32),
-                   SeqLen:T.Tensor((batch,),T.int32),QueryPos:T.Tensor((batch,),T.int32),
+                   Pages:T.Tensor((contexts,max_pages),T.int32),
+                   SeqLen:T.Tensor((contexts,),T.int32),QueryPos:T.Tensor((batch,),T.int32),
                    M:T.Tensor((batch,24,nsplits),T.float32),L:T.Tensor((batch,24,nsplits),T.float32),
                    O:T.Tensor((batch,24,nsplits,256),T.float32)):
             with T.Kernel(4,nsplits,batch,threads=128) as (kh,s,b):
@@ -107,8 +111,8 @@ def _compile_staged(max_pages:int,num_pages:int,block_size:int,block_n:int,
         def kernel(Q:T.Tensor((batch,24,256),T.float16),
                    K:T.Tensor((num_pages,block_size,1024),T.float16),
                    V:T.Tensor((num_pages,block_size,1024),T.float16),
-                   Pages:T.Tensor((batch,max_pages),T.int32),
-                   SeqLen:T.Tensor((batch,),T.int32),QueryPos:T.Tensor((batch,),T.int32),
+                   Pages:T.Tensor((contexts,max_pages),T.int32),
+                   SeqLen:T.Tensor((contexts,),T.int32),QueryPos:T.Tensor((batch,),T.int32),
                    RawGate:T.Tensor((batch,24,256),T.float16),Y:T.Tensor((batch,24,256),T.float16)):
             with T.Kernel(4,batch,threads=128) as (kh,b):
                 out=T.alloc_fragment((16,256),T.float32)
@@ -126,7 +130,9 @@ def _compile_staged(max_pages:int,num_pages:int,block_size:int,block_n:int,
 
 
 
-def paged_attention_partials_gqa_staged(max_pages,num_pages,nsplits=8,block_size=128,block_n=64):
+def paged_attention_partials_gqa_staged(max_pages,num_pages,nsplits=8,block_size=128,block_n=64,
+                                        queries=None):
     _check(max_pages,num_pages,block_size,32,nsplits)
     assert block_n in (32,64) and block_size==128
-    return _compile_staged(max_pages,num_pages,block_size,block_n,nsplits,True)
+    assert queries is None or 1 <= queries <= 16
+    return _compile_staged(max_pages,num_pages,block_size,block_n,nsplits,True,queries)

@@ -7,6 +7,31 @@ use tokenizers::Tokenizer;
 
 type Result<T> = std::result::Result<T, String>;
 
+#[cfg(test)]
+mod mtp_fixture_export {
+    use super::*;
+    #[test]
+    #[ignore = "Offline export of native chat-template code fixtures for the GPU MTP test"]
+    fn export_mtp_chat_fixture() {
+        let source = std::env::var("ORIN_MTP_FIXTURE_SPEC").unwrap();
+        let raw: Value = serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
+        let codec = ChatCodec::load(Path::new(raw["tokenizer"].as_str().unwrap())).unwrap();
+        let mut cases = vec![];
+        for case in raw["cases"].as_array().unwrap() {
+            let request: ChatRequest = serde_json::from_value(case["request"].clone()).unwrap();
+            let prepared = codec.prepare(request, "qwen3.8-27b", 8704, None).unwrap();
+            assert!(prepared.images.is_empty() && prepared.sampling.is_greedy());
+            cases.push(json!({"id":case["id"],"input_tokens":prepared.input,
+                "max_new_tokens":prepared.max_tokens}));
+        }
+        let fixture = json!({"model":raw["model"],"output":raw["result"],
+            "cases":cases,"eos":codec.eos,"repetitions":raw["repetitions"]});
+        let output = Path::new(raw["fixture"].as_str().unwrap());
+        assert!(!output.exists());
+        std::fs::write(output, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatRequest {

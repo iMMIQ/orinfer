@@ -422,5 +422,12 @@ fn generate_job(
         job.prepared.input.len(),
         start.elapsed().as_secs_f64()
     );
+    if let Some(stats) = model.speculation_statistics() {
+        eprintln!(
+            "{}: MTP {}",
+            job.id,
+            serde_json::to_string(stats).map_err(|e| e.to_string())?
+        );
+    }
     Ok(())
 }

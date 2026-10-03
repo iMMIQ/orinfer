@@ -5,6 +5,7 @@
 pub mod artifact;
 mod cuda;
 pub mod model;
+pub mod mtp;
 pub mod sampling;
 pub mod vision;
 

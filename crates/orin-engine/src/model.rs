@@ -33,6 +33,8 @@ pub struct Manifest {
     pub weight_scope: String,
     #[serde(default)]
     pub vision: Option<crate::vision::VisionSpec>,
+    #[serde(default)]
+    pub mtp: Option<crate::mtp::Spec>,
 }
 
 /// Fixed-shape graphs sharing one model's weights, workspace and private state.
@@ -147,6 +149,9 @@ impl Manifest {
         };
         if let Some(vision) = &self.vision {
             vision.validate(self)?;
+        }
+        if let Some(mtp) = &self.mtp {
+            mtp.validate(self)?;
         }
         for (name, minimum) in [
             (
@@ -392,6 +397,9 @@ impl Model {
     }
     pub fn vision(&self) -> Option<&crate::vision::VisionSpec> {
         self.0.manifest.vision.as_ref()
+    }
+    pub fn speculation_statistics(&self) -> Option<&crate::mtp::Statistics> {
+        self.0.speculation_statistics.as_ref()
     }
     pub fn generate(
         &mut self,

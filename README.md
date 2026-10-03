@@ -2,7 +2,7 @@
 
 用于 Jetson AGX Orin 64GB 的图文推理引擎。在线运行时用 Rust，GPU kernel 用 TileLang，目标固定为 CUDA SM87。
 
-当前支持 Qwen3.8-27B 的文本主干及图片、多图输入，checkpoint架构为 `Qwen3_5ForConditionalGeneration`：48层 Gated DeltaNet和16层 full attention。支持常驻模型、分块prefill、连续decode、请求状态重置，以及OpenAI Chat Completions API、流式输出和函数工具调用。
+当前支持 Qwen3.8-27B 的文本主干及图片、多图输入，checkpoint架构为 `Qwen3_5ForConditionalGeneration`：48层 Gated DeltaNet和16层 full attention。支持常驻模型、分块prefill、连续decode、请求状态重置、原生MTP，以及OpenAI Chat Completions API、流式输出和函数工具调用。
 
 ## 构建
 
@@ -32,7 +32,7 @@ CLI接收token-ID请求，输出包含生成token、加载时间和请求时延�
 }
 ```
 
-上面只展示字段格式。当前AOT计划要求实际输入长度为512的整数倍，优先选择512/2048/8192中能整除请求长度的最大计划。具体上下文容量由manifest声明；本机模型为8704 tokens。请求状态不复用。
+上面只展示字段格式。`run-model`是固定块、普通decode的诊断基准，输入长度须为某个声明prefill计划的整数倍，选择能整除请求长度的最大计划；基础计划为512/2048/8192。任意长度请求及MTP通过下述Chat API或Rust `Model::generate`执行。具体上下文容量由manifest声明；本机模型为8704 tokens。请求状态不复用。
 
 ## Chat API
 
@@ -51,9 +51,11 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 提供`GET /health`、`GET /v1/models`和`POST /v1/chat/completions`。设置`ORIN_API_KEY`后，`/v1`请求需要对应的Bearer token。支持文本和图片messages、`tools`、`tool_choice`、`parallel_tool_calls`、SSE deltas/`[DONE]`、usage、EOS、stop、temperature、top_p、top_k、presence/frequency penalties和seed。默认关闭thinking；`enable_thinking=true`启用`reasoning_content`输出。默认输出上限512 tokens，可通过`max_tokens`或`max_completion_tokens`调整。
 
+使用包含`mtp`执行计划的manifest时，纯文本、`temperature=0`且presence/frequency penalties为0的请求自动启用MTP。主模型验证草稿并提交匹配前缀及修正token；拒绝时恢复GDN、卷积、位置和有效KV状态。其他请求执行普通主模型路径。MTP复用主模型embedding/head，额外草稿权重采用W4；构建方式见[离线构建说明](tools/model/README.md)。API日志记录每个请求的MTP接受数、轮数和分段耗时。
+
 模型的XML工具调用会转换成标准`tool_calls`，arguments为JSON字符串。客户端执行工具，并将带`tool_call_id`的`role=tool`消息连同历史再次发送。函数调用完成后才发送该调用的流式delta；工具参数支持结构校验，暂不提供完整JSON Schema约束解码。`tool_choice=required`或指定函数会加入模板指令并校验结果，模型未遵守时返回生成错误。
 
-API支持任意提示长度：完整块走prefill图，尾部真实tokens走M=1图。尾部最多511 tokens，当前可能显著增加首token等待时间；不会用额外token填充提示。上下文和输出预算超过manifest容量时返回400。`run-model`仍保留固定块性能测试行为。暂不支持视频、音频、n>1、logprobs、JSON约束输出、prefix cache、MTP或同时驻留多个请求；等待请求串行执行，客户端断开后停止生成。
+API支持任意提示长度：优先选择能容纳剩余输入的最大prefill块，不足最小块的真实tokens走M=1图，不会用额外token填充提示。基础512-token计划的尾部最多511 tokens，可能显著增加首token等待时间；MTP manifest额外包含2/4/8-token计划，将M=1尾部缩小到最多1 token。上下文和输出预算超过manifest容量时返回400。`run-model`仍保留固定块性能测试行为。暂不支持视频、音频、n>1、logprobs、JSON约束输出、prefix cache或同时驻留多个请求；等待请求串行执行，客户端断开后停止生成。
 
 带视觉编码器的manifest接受用户消息中的`image_url`，支持PNG/JPEG/WebP、HTTP(S) URL和base64 data URI。可按内容顺序交错多张图片与文本，历史消息中的图片也会重新编码。每张图片独立做双向视觉attention，merger输出注入对应image tokens；文本full attention使用交错MRoPE，物理KV位置保持连续。
 
@@ -108,7 +110,9 @@ Prefill使用单份W4权重、临时W8/A8和INT8 Tensor Core；512的FFN使用LU
 | 2048 | 773.25 | 10.481 |
 | 8192 | 765.88 | 10.223 |
 
-Prefill计时包含输入复制和同步，排除末位置head；decode排除首token，包含逐token复制和同步。上表是固定块token-ID请求的引擎计时，不包含API分词、排队或M=1输入尾部。当前未提供prefix cache、并行batch或MTP。BF16/FP8量化质量评测尚待补充。
+Prefill计时包含输入复制和同步，排除末位置head；decode排除首token，包含逐token复制和同步。上表是关闭MTP时固定块token-ID请求的引擎计时，不包含API分词、排队或M=1输入尾部。当前未提供prefix cache或并行batch。BF16/FP8量化质量评测尚待补充。
+
+开启MTP后，固定seed20261002、greedy、关闭thinking、单请求128-token代码输出，预热后3次HTTP SSE decode中位数：Python合并排序26.04 TPS、Rust LRU缓存25.11 TPS、TypeScript异步并发映射25.82 TPS。计数通过关闭MTP时的主模型token IDs核对，排除首个输出片段和被拒绝的草稿；完整输出与主模型参考相同。额外MTP草稿权重222,342,144 bytes，含视觉与MTP的常驻权重合计约4.59 bits/parameter。
 
 ## 许可证
 
