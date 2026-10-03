@@ -1,0 +1,33 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "orin/qwen3.8-27b",
+  "small_model": "orin/qwen3.8-27b",
+  "provider": {
+    "orin": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Orin local",
+      "options": {"baseURL": "http://127.0.0.1:8088/v1"},
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Qwen3.8 27B Orin",
+          "limit": {"context": 8704, "output": 256},
+          "options": {"temperature": 0}
+        }
+      }
+    }
+  },
+  "agent": {
+    "orin": {
+      "description": "Local Orin model with file read/write tools",
+      "mode": "primary",
+      "model": "orin/qwen3.8-27b",
+      "temperature": 0,
+      "steps": 4,
+      "prompt": "You are a coding assistant. Follow the user instructions using read and write tools. Use absolute file paths. Keep replies brief.",
+      "tools": {"*": false, "read": true, "write": true},
+      "permission": {"*": "deny", "read": "allow", "edit": "ask"}
+    }
+  },
+  "compaction": {"auto": false},
+  "share": "disabled"
+}

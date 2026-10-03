@@ -1,7 +1,18 @@
+mod server;
+
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|c| c == "serve") {
+        return match server::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("serve: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if args.first().is_some_and(|c| c == "run-model") {
         if args.len() != 3 {
             eprintln!("Usage: orin-llm run-model MODEL.json REQUESTS.json");
@@ -67,7 +78,7 @@ fn main() -> ExitCode {
         "plan" => println!("{}", orin_engine::BENCHMARK_PLAN),
         "--version" | "-V" => println!("orin-llm {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!(
-            "Usage: orin-llm [info | plan | --version | --help]\n       orin-llm <validate-artifact | run-artifact> MANIFEST.json\n       orin-llm run-model MODEL.json REQUESTS.json\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nrun-model            Load and execute AOT text-model programs with private state"
+            "Usage: orin-llm [info | plan | --version | --help]\n       orin-llm <validate-artifact | run-artifact> MANIFEST.json\n       orin-llm run-model MODEL.json REQUESTS.json\n       orin-llm serve MODEL.json TOKENIZER_DIR [--listen HOST:PORT] [--model MODEL_ID]\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nrun-model            Load and execute AOT text-model programs with private state"
         ),
         other => {
             eprintln!(

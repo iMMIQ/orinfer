@@ -373,6 +373,30 @@ pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
         .map_err(|e| format!("{}: {e}", p.display()))
 }
 
+/// Thread-affine resident model. All CUDA resources remain on the creating thread.
+pub struct Model(crate::cuda::ModelRuntime);
+impl Model {
+    pub fn load(path: &Path) -> Result<Self> {
+        crate::cuda::ModelRuntime::load(path).map(Self)
+    }
+    pub fn max_context(&self) -> usize {
+        self.0.manifest.max_context
+    }
+    pub fn vocab(&self) -> usize {
+        self.0.manifest.vocab
+    }
+    pub fn generate(
+        &mut self,
+        input: &[u32],
+        limit: usize,
+        options: &crate::sampling::Options,
+        cancelled: impl Fn() -> bool,
+        emit: impl FnMut(u32) -> bool,
+    ) -> Result<usize> {
+        self.0.generate(input, limit, options, cancelled, emit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
