@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/orin-engine", "crates/orin-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "LGPL-3.0-or-later"
+
+[workspace.dependencies]
+orin-engine = { path = "crates/orin-engine" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,175 @@
+{
+  "version": 1,
+  "seed": 20261002,
+  "generation": {
+    "temperature": 0,
+    "top_p": 1,
+    "repetition_penalty": 1,
+    "frequency_penalty": 0,
+    "presence_penalty": 0,
+    "max_new_tokens": 48,
+    "enable_thinking": false,
+    "mtp": false
+  },
+  "cases": [
+    {
+      "id": "grounded_fact",
+      "messages": [
+        {
+          "role": "user",
+          "content": "只根据资料回答。资料：设备代号ORIN-64，内存64GB，模型层数64。问题：设备代号是什么？只输出代号。"
+        }
+      ],
+      "validation": {
+        "kind": "exact",
+        "expected": "ORIN-64"
+      }
+    },
+    {
+      "id": "unknown_fact",
+      "messages": [
+        {
+          "role": "user",
+          "content": "只根据资料回答。资料：设备代号ORIN-64，内存64GB。问题：设备序列号是什么？资料没有说明时只输出“资料未说明”。"
+        }
+      ],
+      "validation": {
+        "kind": "exact",
+        "expected": "资料未说明"
+      }
+    },
+    {
+      "id": "arithmetic",
+      "messages": [
+        {
+          "role": "user",
+          "content": "计算37×24−19×13。只输出整数结果。"
+        }
+      ],
+      "validation": {
+        "kind": "integer",
+        "expected": 641
+      }
+    },
+    {
+      "id": "json_format",
+      "messages": [
+        {
+          "role": "user",
+          "content": "只输出合法JSON，不要代码围栏。对象恰好包含两个键：ok为布尔值true，count为整数3。"
+        }
+      ],
+      "validation": {
+        "kind": "json_equal",
+        "expected": {
+          "ok": true,
+          "count": 3
+        }
+      }
+    },
+    {
+      "id": "instruction_order",
+      "messages": [
+        {
+          "role": "user",
+          "content": "第一条要求：输出RED。后续更正：忽略第一条要求，只输出BLUE。"
+        }
+      ],
+      "validation": {
+        "kind": "exact",
+        "expected": "BLUE"
+      }
+    },
+    {
+      "id": "table_lookup",
+      "messages": [
+        {
+          "role": "user",
+          "content": "表格：\nID,owner,status\nA17,Lin,pending\nB23,Chen,done\nC31,Wang,pending\n问题：B23的owner和status是什么？只输出Chen,done这种格式。"
+        }
+      ],
+      "validation": {
+        "kind": "exact",
+        "expected": "Chen,done"
+      }
+    },
+    {
+      "id": "python_code",
+      "messages": [
+        {
+          "role": "user",
+          "content": "写一个Python函数stable_unique(xs)，按首次出现顺序去重，要求支持可哈希元素。不调用set(xs)，只输出代码。"
+        }
+      ],
+      "validation": {
+        "kind": "manual",
+        "expected": "检查顺序、空输入、重复元素；执行测试由后续隔离任务验证。"
+      }
+    },
+    {
+      "id": "rust_code",
+      "messages": [
+        {
+          "role": "user",
+          "content": "写Rust函数sum_even(xs: &[i32]) -> i64，累加所有偶数，累加前转成i64，只输出代码。"
+        }
+      ],
+      "validation": {
+        "kind": "manual",
+        "expected": "检查类型转换发生在累加前，负偶数和空数组。"
+      }
+    },
+    {
+      "id": "english_summary",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Summarize in one English sentence: The prototype uses Rust for scheduling. GPU kernels are authored in TileLang. Weights are prepared offline. Avoid claiming any measured speedup."
+        }
+      ],
+      "validation": {
+        "kind": "manual",
+        "expected": "保留三个事实且不编造性能。"
+      }
+    },
+    {
+      "id": "translation",
+      "messages": [
+        {
+          "role": "user",
+          "content": "把这句话翻译为英文，只输出译文：首次请求需要预热，后续请求可以复用缓存。"
+        }
+      ],
+      "validation": {
+        "kind": "manual",
+        "expected": "保留首次预热与后续复用两个含义。"
+      }
+    },
+    {
+      "id": "chat_state",
+      "messages": [
+        {
+          "role": "user",
+          "content": "对话历史：用户：项目名是Falcon。助手：已记录。用户：更正，项目名改为Orchid。助手：已更新。用户：当前项目名是什么？只输出名字。"
+        }
+      ],
+      "validation": {
+        "kind": "exact",
+        "expected": "Orchid"
+      }
+    },
+    {
+      "id": "numeric_units",
+      "messages": [
+        {
+          "role": "user",
+          "content": "权重每步读取16GB，可用读取带宽200GB/s。忽略其他成本，输出理想每秒token数，只输出数字。"
+        }
+      ],
+      "validation": {
+        "kind": "number",
+        "expected": 12.5
+      }
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "seed": 20261002,
+  "reference": "Quantization quality: original BF16 of the same model; layer streaming/offload is allowed. If impractical on this Orin, use same-model FP8 and explicitly label the fallback. Community AWQ same-weight comparison is only an implementation diagnostic.",
+  "fast_suite": "12 short text scenarios, at most 48 generated tokens each. Freeze baseline token histories and top-3 probabilities once. Candidate runs reuse them.",
+  "extended_suite": [
+    "512/2K/8K contextual retrieval with seeded irrelevant records; select a small fixed answer-token window for scores.",
+    "Actual multi-turn extension, prefix reuse and branch-state checks."
+  ],
+  "pairing": "Both engines condition on exactly the same rendered/tokenized prompt and baseline teacher-forced output prefix at each scored position. Do not align different freely generated histories by index.",
+  "probability_queries": "Request candidate full-vocabulary-normalized log probabilities on baseline top-3 IDs. If absent from candidate top-k response, explicitly query the missing IDs via a scoring adapter or forced-token branch; never replace missing probability with zero.",
+  "two_execution_paths": [
+    "Batched teacher-forced prefill scoring for rapid format/kernel screening.",
+    "Sequential teacher-forced decode scoring for GDN/KV state updates and prefix restoration. Prefill-only scoring cannot validate decode."
+  ],
+  "free_generation": "Separately generate candidate output with the fixed seed and evaluate task checks. Divergence is reported, not treated as automatic task failure.",
+  "timing": "Cache baseline scores once; measure candidate evaluation separately from model startup.",
+  "determinism": "Record global and request seeds, model/tokenizer/template hashes, engine/kernel versions, numerical dtypes, KV format, batch membership/order and sampling configuration. Repeat baseline to quantify numerical nondeterminism.",
+  "quality_gates": "Do not require identical token choices or impose token-agreement/max-probability-error pass thresholds. Evaluate task correctness/answer quality, reference-answer target NLL/perplexity and long-context tasks versus BF16 (FP8 fallback). Token flips, confidence buckets and top3 probability changes are diagnostic signals, including high-confidence flips; a different valid answer is not a failure. Admit W4-resident/temporary-W8/A8 INT8 paths based on measured quality and full-chain speed.",
+  "required_record_fields": [
+    "case_id",
+    "execution_mode",
+    "position",
+    "seed",
+    "baseline_context_sha256",
+    "candidate_context_sha256",
+    "baseline_top3",
+    "candidate_top3",
+    "candidate_logprobs_on_baseline_top3",
+    "reference_token_id",
+    "baseline_reference_logprob",
+    "candidate_reference_logprob"
+  ],
+  "context_hash": "SHA256 over canonical serialized actual token IDs and positions; multimodal identity is a future extension.",
+  "top3_item": {
+    "token_id": "integer token ID, never decoded string identity",
+    "logprob": "finite natural-log probability normalized over the entire vocabulary"
+  },
+  "candidate_selected_token_id": "Optional; greedy fast suite requires top1 with stable token-ID tie breaking.",
+  "analyzer": "python3 tools/eval/quick_quality.py artifacts/probes.jsonl --output artifacts/quality-report.json",
+  "modalities": [
+    "text"
+  ],
+  "reference_candidates": [
+    {
+      "repository": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "format": "BF16"
+    },
+    {
+      "repository": "Qwen/Qwen3.8-27B-FP8",
+      "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+      "format": "FP8"
+    }
+  ]
+}

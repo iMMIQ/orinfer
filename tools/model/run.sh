@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [[ $# != 3 ]]; then echo 'usage: run.sh MODEL.json REQUESTS.json NEW_OUTPUT_DIR' >&2; exit 2; fi
+model_manifest="$1"
+request_manifest="$2"
+output_arg="$3"
+cd "$repo_dir"
+if [[ "$output_arg" = /* ]]; then output_dir="$output_arg"; else output_dir="$repo_dir/$output_arg"; fi
+if [[ -e "$output_dir" ]]; then echo "Refusing existing output $output_dir" >&2; exit 2; fi
+mkdir -p "$output_dir/measurement-source"
+cp --parents "$model_manifest" "$request_manifest" tools/model/run.sh crates/orin-engine/src/{cuda,model,artifact}.rs crates/orin-cli/src/main.rs "$output_dir/measurement-source/"
+rustc -Vv > "$output_dir/rustc.txt"
+cp --parents Cargo.lock Cargo.toml crates/orin-engine/Cargo.toml crates/orin-engine/src/lib.rs "$output_dir/measurement-source/"
+cp target/release/orin-llm "$output_dir/orin-llm"
+sha256sum "$output_dir/orin-llm" > "$output_dir/binary.sha256"
+exec 9>"$repo_dir/artifacts/gpu-experiment.lock"
+flock 9
+python3 tools/bench/sample_machine.py --output "$output_dir/machine-before.json"
+printf '%s\n' 'rust-model-load-and-inference' > "$output_dir/phase.txt"
+python3 tools/bench/sample_continuous.py --output "$output_dir/machine.jsonl" --phase "$output_dir/phase.txt" --stop "$output_dir/sampler.stop" &
+sampler_pid=$!
+cleanup() {
+    touch "$output_dir/sampler.stop"
+    wait "$sampler_pid" || true
+    python3 tools/bench/sample_machine.py --output "$output_dir/machine-after.json" || true
+}
+trap cleanup EXIT
+ORIN_MODEL_PROGRESS="$output_dir/progress.json" "$output_dir/orin-llm" run-model "$model_manifest" "$request_manifest" > "$output_dir/report.json" 2> "$output_dir/run.log"

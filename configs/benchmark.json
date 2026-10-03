@@ -1,0 +1,294 @@
+{
+  "status": "Engineering acceptance specification; full engine not implemented or measured.",
+  "requirements": {
+    "device": "Local Jetson AGX Orin 64GB",
+    "model": "Qwen3.8-27B",
+    "frontend_and_runtime": "Rust",
+    "kernels": "TileLang",
+    "quantization": "Any format, including custom; approximately 4-bit resident weight footprint",
+    "quality_preference": "Preserve quality; may slightly exceed 4-bit footprint",
+    "acceleration": "MTP is optional and selected per workload; not an engine requirement",
+    "queueing": "User explicitly allows queueing; report actual resident/running counts and queue delay.",
+    "performance_acceptance": {
+      "single_stream_prefill_tps": 800,
+      "single_stream_decode_tps": 10,
+      "mtp": false,
+      "input_tokens": [
+        512,
+        2048,
+        8192
+      ],
+      "reference": "Existing local experimental vLLM; exact version, weights and metric definition must be pinned before comparisons.",
+      "evaluation": "Report each input length separately. Client TTFT and executed-token model prefill TPS must not be mixed."
+    },
+    "modalities": [
+      "text"
+    ],
+    "excluded_from_phase_one": [
+      "image",
+      "video",
+      "vision encoder",
+      "multimodal processor"
+    ],
+    "future_architectures": "Multiple model architectures below 40B parameters on local Orin; phase one remains Qwen text only."
+  },
+  "weight_accounting": {
+    "average_bits_formula": "8 * resident_weight_bytes / included_parameter_count",
+    "included": [
+      "text trunk",
+      "embedding",
+      "LM head",
+      "scales",
+      "zero points",
+      "codebooks",
+      "outlier corrections",
+      "padding",
+      "duplicate persistent representations"
+    ],
+    "optional_accelerator_weights": "Report separately and in total resident bytes.",
+    "candidate_bits_per_parameter": [
+      4.125,
+      4.25,
+      4.5
+    ],
+    "excluded_from_phase_one": [
+      "vision weights and parameters"
+    ]
+  },
+  "metrics": {
+    "native_load": "Process launch or explicit model load start to executable model Ready; split IO, context, allocation, module load, graph setup; cold versus warm OS page cache.",
+    "import": "Original checkpoint to native quantized/prepacked artifacts; one-time calibration, conversion and kernel build reported separately.",
+    "first_request": "Cold engine request total TTFT, first-use initialization/compilation/capture, actual prefill; cold versus warm compiler cache.",
+    "warm_prefill": "Executed uncached input tokens divided by model prefill time; client TTFT reported separately.",
+    "warm_decode": "Committed final output tokens divided by decode wall time; proposed/rejected tokens excluded; first output chunk accounted separately.",
+    "prefix": "Request hit ratio, token reuse ratio, usable common prefix, lookup/restore/tail recompute/TTFT, checkpoint bytes and eviction.",
+    "concurrency": "Total prefill and committed decode TPS, E2E throughput, TTFT and inter-token P50/P95, actual running count, queue delay, preemption and peak memory."
+  },
+  "workloads": {
+    "input_tokens": [
+      512,
+      2048,
+      8192
+    ],
+    "submitted_concurrency": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95,
+      96,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      109,
+      110,
+      111,
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119,
+      120,
+      121,
+      122,
+      123,
+      124,
+      125,
+      126,
+      127,
+      128
+    ],
+    "single_stream": true,
+    "primary_optimized_rows": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "output_tokens_default": 256,
+    "early_eos_policy": "Fixed work performance suite and separate realistic EOS suite.",
+    "prefix_reuse_fractions": [
+      0,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "prefix_suffix_tokens": [
+      0,
+      1,
+      32,
+      128
+    ],
+    "prefix_cases": [
+      "shared system prompt",
+      "identical replay",
+      "chat extension",
+      "branching histories",
+      "working-set churn"
+    ],
+    "optional_optimized_rows": [
+      16,
+      32,
+      64,
+      128
+    ],
+    "modalities": [
+      "text"
+    ]
+  },
+  "dispatch": {
+    "key": [
+      "mode",
+      "runtime token rows M",
+      "N",
+      "K",
+      "dtype",
+      "weight format",
+      "context bucket"
+    ],
+    "primary": "Ahead-of-time common row kernels and graph buckets.",
+    "fallback": "Precompiled symbolic-M kernel plus non-graph explicit-stream launch when needed.",
+    "optional_jit": "Asynchronous shape specialization, persisted cubin cache; new shape and cold-cache latency measured."
+  },
+  "prefix_state_design": {
+    "separate_granularities": true,
+    "candidate_gdn_checkpoint_intervals": [
+      512,
+      1024,
+      2048
+    ],
+    "dense_state_checkpoint_bytes_per_prefix_endpoint": 150994944,
+    "cache_contents": [
+      "paged KV",
+      "FP32 GDN endpoint state",
+      "convolution endpoint state",
+      "position state",
+      "last hidden state for exact endpoint hit"
+    ],
+    "key": [
+      "model/quantization revision",
+      "token prefix",
+      "position/RoPE configuration"
+    ],
+    "correctness": "Match cold execution logits within declared numeric tolerance after reuse, branching and eviction."
+  },
+  "quality_evaluation": [
+    "Fixed scenario requests and seed; compare token choice and baseline top-3 probabilities under identical teacher-forced histories. Full LLM benchmarks provide final quality validation.",
+    "BF16 reference on representative text, code and long-state workloads",
+    "Same-quantized-weight reference to isolate kernel implementation bugs",
+    "Model-level probability/perplexity and task metrics; local tensor error alone is insufficient"
+  ],
+  "capacity": "128 requests is not equivalent to 128 resident contexts. KV and recurrent-state budgets, shared prefixes and scheduling must be reported explicitly.",
+  "fusion_candidates": {
+    "baseline": "Local fusion plus CUDA graph",
+    "experiments": [
+      "whole decoder layer persistent kernel",
+      "four-layer period persistent kernel",
+      "full decode-step persistent kernel for M=1/2/4/8"
+    ],
+    "decision": "Measured semantic equivalence, wall time, memory, occupancy and preparation cost.",
+    "generation_contract": "Model adapter -> semantic graph/explicit states -> TileLang lowering -> kernel graph or persistent schedule; no Qwen-specific common runtime."
+  }
+}
