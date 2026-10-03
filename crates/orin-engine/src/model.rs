@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -22,7 +22,9 @@ pub struct Manifest {
     pub vocab: usize,
     pub toolchain: BTreeMap<String, String>,
     pub buffers: Vec<Buffer<TensorIdentity>>,
+    #[serde(default)]
     pub kernels: Vec<Kernel>,
+    #[serde(default)]
     pub programs: BTreeMap<String, Vec<Operation>>,
     pub reset_buffers: Vec<String>,
     pub input: String,
@@ -40,7 +42,7 @@ pub struct Manifest {
 }
 
 /// Fixed-shape graphs sharing one model's weights, workspace and private state.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrefillPlan {
     pub chunk_tokens: usize,
@@ -48,7 +50,7 @@ pub struct PrefillPlan {
     pub head_program: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Kernel {
@@ -65,14 +67,14 @@ pub enum Operation {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Requests {
     pub requests: Vec<Request>,
     #[serde(default)]
     pub logits_output: Option<String>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub id: String,
@@ -396,24 +398,27 @@ pub struct Report {
 }
 
 pub fn run(manifest: &Path, requests: &Path) -> Result<Report> {
-    crate::cuda::run_model(manifest, requests)
+    crate::runtime::run_model(manifest, requests)
 }
 
 /// A prepared HF-style directory contains the private execution cache.
 pub fn resolve_manifest(path: &Path) -> Result<PathBuf> {
     let manifest = if path.is_dir() {
-        path.join("cache/manifest.json")
+        path.join("cache/model.json")
     } else {
         path.to_owned()
     };
     manifest.canonicalize().map_err(|e| format!(
-        "{}: {e}; prepare with python3 tools/model/prepare.py --model AOT_MODEL.json --checkpoint HF_DIR --output MODEL_DIR",
+        "{}: {e}; prepare with tools/model/prepare.py, or split an existing prepared cache with tools/model/package.py",
         manifest.display()))
 }
 
 #[derive(Debug, Serialize)]
 pub struct ValidationReport {
     pub manifest_sha256: String,
+    pub architecture: crate::architecture::Architecture,
+    pub compute_policy: crate::architecture::ComputePolicy,
+    pub operator_package: String,
     pub tensor_count: usize,
     pub shard_count: usize,
     pub weight_bytes: usize,
@@ -423,12 +428,9 @@ pub struct ValidationReport {
 /// Verify all container layouts and payloads without CUDA or resident weight copies.
 pub fn validate_model(path: &Path) -> Result<ValidationReport> {
     let start = Instant::now();
-    let path = resolve_manifest(path)?;
-    let raw = fs::read(&path).map_err(|e| e.to_string())?;
-    let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
-    manifest.validate()?;
-    let base = path.parent().ok_or("Manifest needs parent directory")?;
-    let mut weights = crate::weights::Weights::open(base)?;
+    let prepared = crate::loader::load(path)?;
+    let manifest = &prepared.plan;
+    let mut weights = crate::weights::Weights::open(&prepared.weights_root)?;
     let mut tensor_count = 0;
     for buffer in &manifest.buffers {
         if buffer.data.is_some() {
@@ -440,16 +442,51 @@ pub fn validate_model(path: &Path) -> Result<ValidationReport> {
     for kernel in &manifest.kernels {
         for identity in [&kernel.module, &kernel.source, &kernel.host_abi] {
             if seen.insert(&identity.file) {
-                crate::artifact::read_identity(base, identity)?;
+                crate::artifact::read_identity(&prepared.kernel_root, identity)?;
             }
         }
     }
     Ok(ValidationReport {
-        manifest_sha256: crate::artifact::sha256(&raw),
+        manifest_sha256: prepared.fingerprint,
+        architecture: prepared.architecture,
+        compute_policy: prepared.policy,
+        operator_package: prepared.operator_package,
         tensor_count,
         shard_count: weights.shard_count(),
         weight_bytes: manifest.weight_bytes,
         validation_s: start.elapsed().as_secs_f64(),
+    })
+}
+
+/// CPU-only inspection of the registered plan, without reading tensor payloads.
+/// Profiling and package validation use the same loader as real inference.
+#[derive(Debug, Serialize)]
+pub struct PlanReport {
+    pub manifest_sha256: String,
+    pub operator_package: String,
+    pub architecture: crate::architecture::Architecture,
+    pub compute_policy: crate::architecture::ComputePolicy,
+    pub allocation_bytes: BTreeMap<String, usize>,
+    pub manifest: Manifest,
+}
+pub fn inspect_plan(path: &Path) -> Result<PlanReport> {
+    let prepared = crate::loader::load(path)?;
+    let mut allocation_bytes = BTreeMap::new();
+    for buffer in &prepared.plan.buffers {
+        let key = match prepared.scopes[&buffer.name] {
+            crate::loader::BufferScope::Weights => "weights",
+            crate::loader::BufferScope::Sequence => "sequence",
+            crate::loader::BufferScope::Workspace => "workspace",
+        };
+        *allocation_bytes.entry(key.into()).or_insert(0) += buffer.bytes()?;
+    }
+    Ok(PlanReport {
+        manifest_sha256: prepared.fingerprint,
+        operator_package: prepared.operator_package,
+        architecture: prepared.architecture,
+        compute_policy: prepared.policy,
+        allocation_bytes,
+        manifest: prepared.plan,
     })
 }
 pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
@@ -458,10 +495,10 @@ pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
 }
 
 /// Thread-affine resident model. All CUDA resources remain on the creating thread.
-pub struct Model(crate::cuda::ModelRuntime);
+pub struct Model(crate::runtime::ModelRuntime);
 impl Model {
     pub fn load(path: &Path) -> Result<Self> {
-        crate::cuda::ModelRuntime::load(path).map(Self)
+        crate::runtime::ModelRuntime::load(path).map(Self)
     }
     pub fn max_context(&self) -> usize {
         self.0.manifest.max_context

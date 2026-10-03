@@ -2,14 +2,14 @@
 use crate::artifact::{Buffer, Dtype, Result, resolve_file, sha256};
 use memmap2::{Mmap, MmapOptions};
 use safetensors::{SafeTensors, tensor::Metadata};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::File,
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TensorIdentity {
     pub tensor: String,

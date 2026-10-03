@@ -14,12 +14,12 @@ import sqlite3
 
 
 def summarize(directory, manifest_path):
-    if manifest_path.is_dir():
-        manifest_path = manifest_path / 'cache/manifest.json'
-    manifest_raw = manifest_path.read_bytes()
-    model = json.loads(manifest_raw)
+    import subprocess
+    planned = json.loads(subprocess.check_output([str((directory / "orin-llm").resolve()),
+                                                 "plan-model", str(manifest_path)], text=True))
+    model = planned["manifest"]
     report = json.loads((directory / "report.json").read_text())
-    assert report["manifest_sha256"] == hashlib.sha256(manifest_raw).hexdigest()
+    assert report["manifest_sha256"] == planned["manifest_sha256"]
     requests = json.loads((directory / "requests.json").read_text())["requests"]
     assert len(requests) == len(report["requests"])
     connection = sqlite3.connect(f"file:{directory / 'trace.sqlite'}?mode=ro", uri=True)

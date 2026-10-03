@@ -1,11 +1,9 @@
-mod server;
-
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|c| c == "serve") {
-        return match server::run(&args[1..]) {
+        return match orin_api::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("serve: {error}");
@@ -13,20 +11,29 @@ fn main() -> ExitCode {
             }
         };
     }
-    if args.first().is_some_and(|c| c == "validate-model") {
+    if args
+        .first()
+        .is_some_and(|c| c == "validate-model" || c == "plan-model")
+    {
         if args.len() != 2 {
-            eprintln!("Usage: orin-llm validate-model MODEL_DIR");
+            eprintln!("Usage: orin-llm <validate-model | plan-model> MODEL_DIR");
             return ExitCode::from(2);
         }
-        return match orin_engine::model::validate_model(std::path::Path::new(&args[1]))
-            .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
-        {
+        let path = std::path::Path::new(&args[1]);
+        let result = if args[0] == "plan-model" {
+            orin_engine::model::inspect_plan(path)
+                .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
+        } else {
+            orin_engine::model::validate_model(path)
+                .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
+        };
+        return match result {
             Ok(json) => {
                 println!("{json}");
                 ExitCode::SUCCESS
             }
             Err(error) => {
-                eprintln!("validate-model: {error}");
+                eprintln!("{}: {error}", args[0]);
                 ExitCode::FAILURE
             }
         };
@@ -96,7 +103,7 @@ fn main() -> ExitCode {
         "plan" => println!("{}", orin_engine::BENCHMARK_PLAN),
         "--version" | "-V" => println!("orin-llm {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!(
-            "Usage: orin-llm [info | plan | --version | --help]\n       orin-llm <validate-artifact | run-artifact> MANIFEST.json\n       orin-llm run-model MODEL_DIR REQUESTS.json\n       orin-llm serve MODEL_DIR [--listen HOST:PORT] [--model MODEL_ID]\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nvalidate-model       Verify safetensors, layouts and hashes without CUDA\nrun-model            Load and execute safetensors model programs with private state"
+            "Usage: orin-llm [info | plan | --version | --help]\n       orin-llm <validate-artifact | run-artifact> MANIFEST.json\n       orin-llm run-model MODEL_DIR REQUESTS.json\n       orin-llm serve MODEL_DIR [--listen HOST:PORT] [--model MODEL_ID]\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nplan-model           Inspect the registered execution plan without CUDA\nvalidate-model       Verify model, operator package and tensor hashes without CUDA\nrun-model            Load custom model data and registered plans with private state"
         ),
         other => {
             eprintln!(

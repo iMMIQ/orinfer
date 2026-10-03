@@ -38,8 +38,9 @@ def main():
         from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
         if args.image is None:
             parser.error("--vision-model requires --image")
-        vision_model = args.vision_model / 'cache/manifest.json' if args.vision_model.is_dir() else args.vision_model
-        vision = json.loads(vision_model.read_text())["vision"]
+        vision_model = args.vision_model / 'cache/model.json' if args.vision_model.is_dir() else args.vision_model
+        data = json.loads(vision_model.read_text())
+        vision = data.get("metadata", data)["vision"]
         image_processor = Qwen2VLImageProcessor.from_pretrained(args.tokenizer_dir, local_files_only=True)
         image_processor.max_pixels = min(16777216, vision["max_patches"] * vision["patch_size"]**2)
         class ImagesProcessor(Qwen3VLProcessor):

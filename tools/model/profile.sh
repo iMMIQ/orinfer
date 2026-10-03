@@ -6,15 +6,17 @@ model_manifest="$1"
 request_manifest="$2"
 output_arg="$3"
 cd "$repo_dir"
-if [[ -d "$model_manifest" ]]; then model_manifest="$model_manifest/cache/manifest.json"; fi
+if [[ -d "$model_manifest" ]]; then model_manifest="$model_manifest/cache/model.json"; fi
 if [[ "$output_arg" = /* ]]; then output_dir="$output_arg"; else output_dir="$repo_dir/$output_arg"; fi
 if [[ -e "$output_dir" ]]; then echo "Refusing existing output $output_dir" >&2; exit 2; fi
 mkdir -p "$output_dir/measurement-source"
 cp --parents "$model_manifest" "$(dirname -- "$model_manifest")/weights/model.safetensors.index.json" "$request_manifest" tools/model/{profile.sh,profile_summary.py} \
-    crates/orin-engine/src/{cuda,model,artifact,weights}.rs crates/orin-cli/src/main.rs \
+    crates/orin-engine/src/{model,artifact,weights,loader,operators}.rs crates/orin-cli/src/main.rs \
     "$output_dir/measurement-source/"
 cp "$request_manifest" "$output_dir/requests.json"
+cp -r --parents crates/orin-engine/src/{cuda,runtime,architecture} "$output_dir/measurement-source/"
 cp target/release/orin-llm "$output_dir/orin-llm"
+"$output_dir/orin-llm" plan-model "$model_manifest" > "$output_dir/plan.json"
 sha256sum "$model_manifest" "$request_manifest" "$output_dir/orin-llm" > "$output_dir/identities.sha256"
 exec 9>"$repo_dir/artifacts/gpu-experiment.lock"
 flock 9

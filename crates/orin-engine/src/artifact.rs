@@ -11,7 +11,7 @@ use std::{
 pub type Result<T> = std::result::Result<T, String>;
 pub use crate::cuda::RunReport;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -22,14 +22,14 @@ pub struct Manifest {
     pub validation: Validation,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileIdentity {
     pub file: String,
     pub sha256: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dtype {
     U8,
@@ -53,7 +53,7 @@ impl Dtype {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Access {
     Read,
@@ -61,7 +61,7 @@ pub enum Access {
     ReadWrite,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Buffer<Data = FileIdentity> {
     pub name: String,
@@ -84,7 +84,7 @@ impl<Data> Buffer<Data> {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Kernel {
     pub name: String,
@@ -98,7 +98,7 @@ pub struct Kernel {
     pub cooperative: bool,
     pub args: Vec<Argument>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Argument {
     Buffer { name: String },
@@ -109,7 +109,7 @@ pub enum Argument {
     F32 { value: f32 },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Validation {
     pub output: String,

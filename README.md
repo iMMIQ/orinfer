@@ -14,8 +14,11 @@ make check
 make build
 ```
 
-模型目录使用checkpoint的配置、tokenizer和chat template；`cache/weights/`采用标准分片safetensors及`model.safetensors.index.json`，`cache/kernels/`保存cubin与构建资产，`cache/manifest.json`保存内部执行计划（schema 2）。packed W4、scale、zero和LUT等辅助tensor保留原始字节，layout以`orin.layout.<tensor>`元数据标注。这是引擎专用物理布局缓存，通用safetensors工具可读取，其他引擎需要适配布局才能执行。Rust加载器只接受新格式，按索引mmap并校验tensor hash、dtype、shape与layout；CPU `validate-model`检查完整模型及kernel资产。
+模型目录使用checkpoint的配置、tokenizer和chat template；`cache/weights/`采用标准分片safetensors及HF索引，`cache/model.json`只描述模型数据、状态作用域和算子包身份。packed W4、scale、zero和LUT保留原始字节及`orin.layout.<tensor>`元数据。这是引擎专用物理布局，通用safetensors工具可读取，其他引擎需要适配布局才能执行。
 
+Rust从配置识别注册架构，在代码中生成执行计划；算子包独立保存cubin、ABI、布局和形状契约。加载器先查`ORIN_OPERATOR_CACHE`或`$XDG_CACHE_HOME/orin-llm/operators`（默认`~/.cache/orin-llm/operators`），再查模型内的`cache/operators/`。第一阶段计算策略是INT8为主、质量优先的混合精度，关键路径保留FP16/FP32。`validate-model`校验完整模型；`plan-model`在CPU上输出实际生成的计划。
+
+服务协议位于`orin-api`，CLI只处理命令；`orin-engine`分为加载器、架构注册、算子包、CUDA执行器和生成/视觉/MTP控制模块。权重、请求状态和workspace按作用域分开管理，当前GPU仍逐个处理请求。
 模型权重、cubin和编译缓存不包含在源码库中。[离线构建说明](tools/model/README.md)介绍checkpoint转换、kernel导出和模型组装。
 
 ## 运行

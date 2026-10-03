@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from safetensors import safe_open
-from tools.model.prepare import prepare
+from tools.model.prepare import _prepare_containers as prepare
 
 
 class PrepareTests(unittest.TestCase):

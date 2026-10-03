@@ -11,7 +11,8 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);p.add_argument('--model',type=Path,required=True);a=p.parse_args()
     if a.output.exists():raise FileExistsError(a.output)
     a.output.mkdir(parents=True)
-    spec=json.loads(a.model.read_text())['vision']
+    path=a.model / 'cache/model.json' if a.model.is_dir() else a.model
+    data=json.loads(path.read_text());spec=data.get('metadata',data)['vision']
     processor=Qwen2VLImageProcessor(min_pixels=65536,max_pixels=min(16777216,spec['max_patches']*256),patch_size=16,temporal_patch_size=2,merge_size=2,image_mean=[.5]*3,image_std=[.5]*3)
     cases=[]
     for i,(h,w,fmt) in enumerate([(300,450,'PNG'),(99,133,'JPEG'),(256,256,'WEBP')]):

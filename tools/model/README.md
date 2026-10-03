@@ -102,7 +102,7 @@ python3 tools/model/prepare.py \
 
 ## Safetensors模型目录
 
-离线编译、融合、视觉与MTP组装全部完成后，使用`prepare.py`发布新的模型目录。普通文本/视觉模型也使用同一入口；把`--model`替换为最终中间产物。无需GPU或PyTorch，只依赖Python的safetensors库。
+离线编译、融合、视觉与MTP组装全部完成后，使用`prepare.py`发布新的模型目录。普通文本/视觉模型也使用同一入口；把`--model`替换为最终中间产物。无需GPU或PyTorch，依赖Python的safetensors库及已构建的Rust CLI（`make build`）；打包前用CPU `plan-model`逐项校验注册计划与离线原计划一致。
 
 ```bash
 python3 tools/model/prepare.py \
@@ -114,6 +114,28 @@ python3 tools/model/prepare.py \
 
 工具检查checkpoint词表、所有源payload与构建资产的hash；不重新量化、不重编译kernel，包含只读权重以及RoPE/索引等可写buffer的初始值。默认每片约1 GiB，`--shard-mib`可调整；单个tensor不会拆分，转换内存由最大分片决定。写完并用标准safetensors reader校验后，才原子发布完整目录；已有输出不覆盖，失败时删除本次临时目录。
 
-目录根保留checkpoint配置、generation config、tokenizer、chat template和图片预处理配置；不复制原始checkpoint的大权重。内部`cache/weights/`保存带dtype/shape和物理layout元数据的safetensors及HF分片索引；`cache/manifest.json`只引用tensor名字及payload SHA256，由索引定位文件；`cache/kernels/`保存去重、独立复制的构建资产。文件在加载期间必须保持不变。原始checkpoint与此物理布局缓存用途不同，不能用Transformers直接执行缓存tensor。
+目录根保留checkpoint配置、generation config、tokenizer、chat template和图片预处理配置；不复制原始checkpoint的大权重。内部`cache/weights/`保存带dtype/shape和物理layout元数据的safetensors及HF分片索引；`cache/model.json`引用tensor名字、payload SHA256及算子包digest，并声明weight/sequence/workspace作用域。`cache/operators/<digest>/`包含独立的`package.json`、cubin、源码和ABI；包不含权重payload或执行程序，执行顺序由Rust架构模块生成。文件在加载期间必须保持不变。原始checkpoint与此物理布局缓存用途不同，不能用Transformers直接执行缓存tensor。
 
-在线Rust不提供旧模型格式兼容分支，也不在首次请求中执行Python或量化。后续重新编译或改变布局时，完成离线组装后发布新的目录。GPU校验fixture的`model`字段可指向模型目录或schema-2执行计划；算子测试夹具仍采用独立的原格式。
+在线Rust不提供旧模型格式兼容分支，也不在首次请求中执行Python或量化。后续重新编译或改变布局时，完成离线组装后发布新的目录。GPU校验fixture的`model`字段可指向模型目录或新数据描述文件；算子测试夹具仍采用独立的原格式。
+
+## 独立算子包
+
+已有schema-2 safetensors缓存可离线拆分为新的目录；这是一次性构建工具，在线加载器不读取旧manifest。相同文件系统上的不可变权重与kernel资产通过hardlink复用，避免额外复制整套权重；配置和描述文件独立复制。相关目录在使用期间必须保持不变。
+
+```bash
+make build
+python3 tools/model/package.py split \
+  --model /path/to/old-prepared-model --output /path/to/new-model
+./target/release/orin-llm plan-model /path/to/new-model
+```
+
+算子包以内容hash命名，支持tar.gz归档和离线安装。安装器检查归档路径、package digest及全部kernel资产hash，校验完成后原子发布缓存；运行时再次检查ABI、配置、buffer布局与资产身份。包契约与权重payload身份分离，同配置和布局的不同checkpoint可以复用包。
+
+```bash
+python3 tools/model/package.py archive \
+  /path/to/new-model/cache/operators/PACKAGE_DIGEST operators.tar.gz
+python3 tools/model/package.py install operators.tar.gz ~/.cache/orin-llm/operators
+./target/release/orin-llm serve /path/to/new-model
+```
+
+可用`ORIN_OPERATOR_CACHE`指定共享缓存位置。只有一种`int8_quality`策略，暂不提供compute-dtype切换。配置或构建变体不受当前包/架构recipe支持时，在准备或加载阶段报错；不在首次请求中编译或重新量化。

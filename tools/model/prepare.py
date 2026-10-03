@@ -65,7 +65,7 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + '\n')
 
 
-def prepare(model, checkpoint, output, shard_bytes=1024**3):
+def _prepare_containers(model, checkpoint, output, shard_bytes=1024**3):
     started = time.monotonic()
     model = model.resolve(strict=True)
     checkpoint = checkpoint.resolve(strict=True)
@@ -189,6 +189,31 @@ def prepare(model, checkpoint, output, shard_bytes=1024**3):
             'weight_parameters': manifest['weight_parameters'],
             'effective_weight_bits': 8 * manifest['weight_bytes'] / manifest['weight_parameters'],
             'source_manifest_sha256': sha256(raw), 'prepare_s': time.monotonic() - started}
+
+
+def prepare(model, checkpoint, output, shard_bytes=1024**3):
+    # The inner container producer is a build intermediate. Publish only after
+    # the architecture plan and independent operator package have been checked.
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tools.model.package import publish
+    output = output.absolute()
+    if output.exists() or output.is_symlink():
+        raise ValueError(f'Output already exists: {output}')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f'.{output.name}-', dir=output.parent))
+    try:
+        directory = staging / 'model'
+        result = _prepare_containers(model, checkpoint, directory, shard_bytes)
+        package = publish(directory)
+        package.pop('binding_map')
+        result.update(package, output=str(output))
+        if output.exists() or output.is_symlink():
+            raise ValueError('Output appeared during preparation')
+        directory.rename(output)
+        return result
+    finally:
+        shutil.rmtree(staging)
 
 
 def main():

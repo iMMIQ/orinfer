@@ -2,10 +2,14 @@
 //!
 //! AOT fixtures and explicit text-model programs execute through the CUDA Driver.
 
+pub mod architecture;
 pub mod artifact;
 mod cuda;
+mod loader;
 pub mod model;
 pub mod mtp;
+pub mod operators;
+mod runtime;
 pub mod sampling;
 pub mod vision;
 mod weights;

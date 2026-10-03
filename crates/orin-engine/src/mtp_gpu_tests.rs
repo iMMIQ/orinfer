@@ -23,12 +23,16 @@ struct Case {
 }
 
 fn download(model: &ModelRuntime, name: &str, bytes: usize) -> Vec<u8> {
-    assert!(bytes <= model.sizes[name]);
+    assert!(bytes <= model.execution.sizes[name]);
     let mut raw = vec![0u8; bytes];
     // SAFETY: The completed graph owns the source; both extents are checked.
     unsafe {
         check(
-            (model.session.driver.download)(raw.as_mut_ptr().cast(), model.pointers[name], bytes),
+            (model.execution.session.driver.download)(
+                raw.as_mut_ptr().cast(),
+                model.execution.pointers[name],
+                bytes,
+            ),
             "MTP test state download",
         )
         .unwrap();
@@ -46,7 +50,7 @@ fn snapshot(model: &ModelRuntime, position: usize) -> BTreeMap<String, Vec<u8>> 
             let bytes = if name.ends_with("_KPages") || name.ends_with("_VPages") {
                 position * 4 * 256 * 2
             } else {
-                model.sizes[name]
+                model.execution.sizes[name]
             };
             (name.clone(), download(model, name, bytes))
         })
