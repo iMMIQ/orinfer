@@ -111,7 +111,7 @@ def scope(buffer, model):
         return 'weights'
     name = buffer['name']
     state = set(model['reset_buffers']) | {model[k] for k in ('input', 'token', 'status', 'position')}
-    state.update(('Features', 'FeatureIndex', 'MRopePositions', 'MtpCondition',
+    state.update(('Features', 'FeatureIndex', 'MtpFeatureIndex', 'MRopePositions', 'MtpCondition',
                   'MtpTargetHidden', 'MtpInput', 'MtpToken', 'MtpStatus', 'MtpSeqLength', 'MtpPositions',
                   'SeqLength', 'SequenceTokens', 'SequenceStatus', 'AcceptedInputs'))
     if name in state or re.match(r'L\d+_(Sequence|Saved|State|History|KPages|VPages)', name):

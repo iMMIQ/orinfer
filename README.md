@@ -62,9 +62,9 @@ curl http://127.0.0.1:8088/v1/chat/completions \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"2+3等于几？"}],"temperature":0,"max_tokens":64,"stream":true}'
 ```
 
-提供`GET /health`、`GET /v1/models`和`POST /v1/chat/completions`。设置`ORIN_API_KEY`后，`/v1`请求需要对应的Bearer token。支持文本和图片messages、`tools`、`tool_choice`、`parallel_tool_calls`、SSE deltas/`[DONE]`、usage、EOS、stop、temperature、top_p、top_k、presence/frequency penalties和seed。默认关闭thinking；`enable_thinking=true`启用`reasoning_content`输出。默认输出上限512 tokens，可通过`max_tokens`或`max_completion_tokens`调整。
+提供`GET /health`、`GET /v1/models`和`POST /v1/chat/completions`。设置`ORIN_API_KEY`后，`/v1`请求需要对应的Bearer token。支持文本和图片messages、`tools`、`tool_choice`、`parallel_tool_calls`、SSE deltas/`[DONE]`、usage、EOS、stop、temperature、top_p、top_k、presence/frequency/repetition penalties和seed。temperature、top_p、top_k和repetition_penalty默认采用模型`generation_config.json`，请求可覆盖；presence/frequency penalties默认0。默认关闭thinking；`enable_thinking=true`启用`reasoning_content`输出。默认输出上限512 tokens，可通过`max_tokens`或`max_completion_tokens`调整。
 
-使用包含`mtp`执行计划的manifest时，纯文本、`temperature=0`且presence/frequency penalties为0的请求自动启用MTP。主模型验证草稿并提交匹配前缀及修正token；拒绝时恢复GDN、卷积、位置和有效KV状态。其他请求执行普通主模型路径。MTP复用主模型embedding/head，额外草稿权重采用W4；构建方式见[离线构建说明](tools/model/README.md)。API日志记录每个请求的MTP接受数、轮数和分段耗时。
+使用包含`mtp`执行计划的模型时，所有支持的采样参数组合及文本、图片、多图请求自动启用MTP，thinking与工具调用沿用相同路径。无惩罚的greedy使用GPU top-1；其他组合对主模型与草稿分别应用相同的历史惩罚、temperature、top-k和top-p，再按`min(1,p/q)`接受草稿，拒绝后从归一化的`(p-q)+`采样修正token，保留主模型的采样分布（[算法来源](https://arxiv.org/abs/2211.17192)）。拒绝时恢复GDN、卷积、位置和有效KV状态。固定seed可复现同模式输出；随机MTP与普通decode不要求同seed输出逐token相同。图片草稿使用对应视觉embedding与MRoPE。输出尾部不足一个验证块时执行普通decode。MTP复用主模型embedding/head，额外草稿权重采用W4；构建方式见[离线构建说明](tools/model/README.md)。API日志记录每个请求的MTP接受数、轮数和分段耗时；是否加速取决于接受率及采样开销。
 
 模型的XML工具调用会转换成标准`tool_calls`，arguments为JSON字符串。客户端执行工具，并将带`tool_call_id`的`role=tool`消息连同历史再次发送。函数调用完成后才发送该调用的流式delta；工具参数支持结构校验，暂不提供完整JSON Schema约束解码。`tool_choice=required`或指定函数会加入模板指令并校验结果，模型未遵守时返回生成错误。
 

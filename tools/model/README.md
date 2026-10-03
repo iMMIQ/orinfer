@@ -94,7 +94,9 @@ python3 tools/model/prepare.py \
 
 `verification-tokens`包含一个已提交、尚未处理的输入token；4对应最多3个新草稿。验证图保存每个GDN/卷积前缀以恢复拒绝状态；主模型最终归一化hidden用于MTP预填充和验证后的KV更新。主模型embedding/head与MTP共享，不存第二份主模型权重。FP8 scale按原生语义相乘；norm保留zero-centered形式。`weights.json`和`mtp-build.json`记录权重身份、所有草稿参数字节数及合计平均bits。
 
-算子验证使用`validate_mtp_kernels.py`，覆盖实际权重布局、因果注意力、GDN恢复、hidden捕获和改变输入后的graph replay。完整生成验证使用Rust ignored test `validate_mtp_generation`（环境变量`ORIN_MTP_FIXTURE`指向含model/output/cases/repetitions/eos的JSON）。先用CLI ignored test `export_mtp_chat_fixture`按原生Chat模板导出请求（`ORIN_MTP_FIXTURE_SPEC`），再在独占GPU锁下执行验证。测试对照关闭MTP的相同主模型，比较真实生成输出及全部有效主模型状态。HTTP计时工具`tools/bench/mtp_chat.py`通过主模型参考token IDs确认首个SSE片段的token数量，只统计最终交付输出。
+算子验证使用`validate_mtp_kernels.py`，覆盖实际权重布局、因果注意力、GDN恢复、hidden捕获和改变输入后的graph replay。完整生成验证使用Rust ignored test `validate_mtp_generation`（环境变量`ORIN_MTP_FIXTURE`指向含model/output/cases/repetitions/eos及可选cuda_graph的JSON）。case可携带sampling、images、stop_after；未指定sampling时使用无惩罚greedy。先用API ignored test `export_mtp_chat_fixture`按原生Chat模板导出请求（`ORIN_MTP_FIXTURE_SPEC`），再在独占GPU锁下执行验证。greedy比较关闭MTP时的真实输出；随机采样验证固定seed复现，并把已提交的输出逐token重放到普通decode，对比全部有效KV、GDN和卷积状态。测试还覆盖取消后的请求隔离。计时只统计实际交付的token，拒绝草稿不计入TPS。
+
+已发布的早期greedy MTP模型可离线更新绑定，不改权重payload：`python3 tools/model/upgrade_mtp.py /path/to/prepared-model /path/to/new-model`。工具复用原算子包的视觉embedding和MRoPE导出ABI，添加移位feature index及完整验证logits的绑定，并用Rust加载器验证新目录后原子发布。在线加载器仅接受当前数据契约。
 
 `run.sh MODEL REQUESTS NEW_OUTPUT`运行Rust完整模型并记录机器状态、源代码、二进制身份和报告。`scenarios.py prepare DIR`生成固定场景请求，`scenarios.py score INPUT_DIR REPORT OUTPUT`做任务判分。`score.py`提供同历史概率诊断；这些社区权重对照不替代BF16/FP8质量评估。
 

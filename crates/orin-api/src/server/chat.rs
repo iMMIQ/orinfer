@@ -16,16 +16,26 @@ mod mtp_fixture_export {
         let source = std::env::var("ORIN_MTP_FIXTURE_SPEC").unwrap();
         let raw: Value = serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
         let codec = ChatCodec::load(Path::new(raw["tokenizer"].as_str().unwrap())).unwrap();
+        let descriptor: Value = serde_json::from_slice(
+            &std::fs::read(Path::new(raw["model"].as_str().unwrap()).join("cache/model.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        let vision: Option<orin_engine::vision::VisionSpec> =
+            serde_json::from_value(descriptor["metadata"]["vision"].clone()).unwrap();
         let mut cases = vec![];
         for case in raw["cases"].as_array().unwrap() {
             let request: ChatRequest = serde_json::from_value(case["request"].clone()).unwrap();
-            let prepared = codec.prepare(request, "qwen3.8-27b", 8704, None).unwrap();
-            assert!(prepared.images.is_empty() && prepared.sampling.is_greedy());
+            let prepared = codec
+                .prepare(request, "qwen3.8-27b", 8704, vision.as_ref())
+                .unwrap();
             cases.push(json!({"id":case["id"],"input_tokens":prepared.input,
-                "max_new_tokens":prepared.max_tokens}));
+                "max_new_tokens":prepared.max_tokens,"sampling":prepared.sampling,
+                "images":prepared.images,"stop_after":case["stop_after"]}));
         }
         let fixture = json!({"model":raw["model"],"output":raw["result"],
-            "cases":cases,"eos":codec.eos,"repetitions":raw["repetitions"]});
+            "cases":cases,"eos":codec.eos,"repetitions":raw["repetitions"],
+            "cuda_graph":raw.get("cuda_graph").cloned().unwrap_or(json!("decode_only"))});
         let output = Path::new(raw["fixture"].as_str().unwrap());
         assert!(!output.exists());
         std::fs::write(output, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
@@ -46,6 +56,7 @@ pub struct ChatRequest {
     pub top_k: Option<usize>,
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
+    pub repetition_penalty: Option<f64>,
     pub seed: Option<u64>,
     pub max_tokens: Option<usize>,
     pub max_completion_tokens: Option<usize>,
@@ -79,11 +90,15 @@ pub struct ChatCodec {
     pub tokenizer: Tokenizer,
     template: Environment<'static>,
     pub eos: BTreeSet<u32>,
+    sampling_defaults: Options,
 }
 impl ChatCodec {
     pub fn load(directory: &Path) -> Result<Self> {
-        let tokenizer =
+        let mut tokenizer =
             Tokenizer::from_file(directory.join("tokenizer.json")).map_err(|e| e.to_string())?;
+        // Checkpoint calibration can persist a training truncation limit.
+        // Serving validates the complete prompt against the engine context below.
+        tokenizer.with_truncation(None).map_err(|e| e.to_string())?;
         let template = std::fs::read_to_string(directory.join("chat_template.jinja"))
             .map_err(|e| e.to_string())?;
         let generation: Value = serde_json::from_slice(
@@ -91,6 +106,18 @@ impl ChatCodec {
         )
         .map_err(|e| e.to_string())?;
         let ids = &generation["eos_token_id"];
+        let sampling_defaults = Options {
+            temperature: generation["temperature"].as_f64().unwrap_or(1.0),
+            top_p: generation["top_p"].as_f64().unwrap_or(1.0),
+            top_k: generation["top_k"]
+                .as_u64()
+                .map(|n| usize::try_from(n).map_err(|e| e.to_string()))
+                .transpose()?
+                .unwrap_or(0),
+            repetition_penalty: generation["repetition_penalty"].as_f64().unwrap_or(1.0),
+            ..Options::default()
+        };
+        sampling_defaults.validate()?;
         let eos: BTreeSet<u32> = if let Some(id) = ids.as_u64() {
             [u32::try_from(id).map_err(|e| e.to_string())?]
                 .into_iter()
@@ -165,6 +192,7 @@ impl ChatCodec {
             .add_template_owned("chat", template)
             .map_err(|e| e.to_string())?;
         Ok(Self {
+            sampling_defaults,
             tokenizer,
             template: environment,
             eos,
@@ -200,9 +228,14 @@ impl ChatCodec {
             return Err("Output-token limit must be positive".into());
         }
         let sampling = Options {
-            temperature: request.temperature.unwrap_or(1.0),
-            top_p: request.top_p.unwrap_or(1.0),
-            top_k: request.top_k.unwrap_or(0),
+            temperature: request
+                .temperature
+                .unwrap_or(self.sampling_defaults.temperature),
+            top_p: request.top_p.unwrap_or(self.sampling_defaults.top_p),
+            top_k: request.top_k.unwrap_or(self.sampling_defaults.top_k),
+            repetition_penalty: request
+                .repetition_penalty
+                .unwrap_or(self.sampling_defaults.repetition_penalty),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             seed: request
@@ -441,6 +474,88 @@ fn normalize_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_calibration_truncation_does_not_discard_chat_history() {
+        use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
+        let directory = std::env::temp_dir().join(format!(
+            "orin-chat-truncation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("[UNK]".into(), 0),
+                    ("one".into(), 1),
+                    ("two".into(), 2),
+                    ("three".into(), 3),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: 2,
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_eq!(tokenizer.encode("one two three", false).unwrap().len(), 2);
+        tokenizer
+            .save(directory.join("tokenizer.json"), false)
+            .unwrap();
+        std::fs::write(
+            directory.join("generation_config.json"),
+            r#"{"eos_token_id":0,"temperature":0.7,"top_p":0.95,"top_k":20,"repetition_penalty":1.05}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("chat_template.jinja"),
+            "{{ messages[0].content }}",
+        )
+        .unwrap();
+        let codec = ChatCodec::load(&directory).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        let request = || {
+            serde_json::from_value(json!({
+                "model":"test", "messages":[{"role":"user","content":"one two three"}],
+                "max_tokens":1
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            codec.prepare(request(), "test", 4, None).unwrap().input,
+            [1, 2, 3]
+        );
+        assert!(codec.prepare(request(), "test", 3, None).is_err());
+        let prepared = codec.prepare(request(), "test", 4, None).unwrap();
+        assert_eq!(prepared.sampling.temperature, 0.7);
+        assert_eq!(prepared.sampling.top_p, 0.95);
+        assert_eq!(prepared.sampling.top_k, 20);
+        assert_eq!(prepared.sampling.repetition_penalty, 1.05);
+        let override_request = serde_json::from_value(json!({
+            "model":"test", "messages":[{"role":"user","content":"one"}],
+            "max_tokens":1,"temperature":0,"top_k":0,"top_p":1,
+            "repetition_penalty":1
+        }))
+        .unwrap();
+        assert!(
+            codec
+                .prepare(override_request, "test", 4, None)
+                .unwrap()
+                .sampling
+                .is_greedy()
+        );
+    }
+
     #[test]
     fn history_and_multimodal_validation() {
         let history = vec![

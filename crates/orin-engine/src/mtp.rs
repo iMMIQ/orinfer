@@ -1,4 +1,4 @@
-//! Manifest-defined MTP programs and greedy speculative acceptance.
+//! Manifest-defined MTP programs and distribution-preserving speculation.
 use crate::{
     artifact::{Access, Dtype, Result},
     model::Manifest,
@@ -15,6 +15,9 @@ pub struct Spec {
     pub status: String,
     pub verification_tokens: String,
     pub verification_status: String,
+    pub draft_logits: String,
+    pub verification_logits: String,
+    pub feature_index: Option<String>,
     pub accepted_inputs: String,
     pub target_length: String,
     pub draft_program: String,
@@ -98,6 +101,40 @@ impl Spec {
         }
         let max_warm = *warm_sizes.last().ok_or("No MTP warm plans")?;
         let max_verify = *verify_sizes.last().ok_or("No MTP verification plans")?;
+        for (name, rows) in [
+            (&self.draft_logits, 1),
+            (&self.verification_logits, max_verify),
+        ] {
+            let buffer = model
+                .buffers
+                .iter()
+                .find(|b| &b.name == name)
+                .ok_or("Missing MTP logits buffer")?;
+            if buffer.dtype != Dtype::F32
+                || buffer.access == Access::Read
+                || buffer.shape != [rows, model.vocab]
+            {
+                return Err(format!("Invalid MTP logits {name}"));
+            }
+        }
+        match (&model.vision, &self.feature_index) {
+            (Some(vision), Some(name)) => {
+                let buffer = model
+                    .buffers
+                    .iter()
+                    .find(|b| &b.name == name)
+                    .ok_or("Missing shifted MTP feature index")?;
+                if name == &vision.feature_index
+                    || buffer.dtype != Dtype::I32
+                    || buffer.access == Access::Read
+                    || buffer.shape != [model.max_context]
+                {
+                    return Err("Invalid shifted MTP feature index".into());
+                }
+            }
+            (None, None) => {}
+            _ => return Err("MTP multimodal inputs must match the vision adapter".into()),
+        }
         let mut controls = BTreeSet::new();
         for (name, words) in [
             (&self.position, 1),
@@ -159,6 +196,70 @@ pub fn greedy_commit(drafts: &[u32], target: &[u32]) -> Result<Vec<u32>> {
     Ok(committed)
 }
 
+// Separate counter streams keep proposal, acceptance and correction draws
+// independent. Counters follow committed output positions, never graph rows.
+pub const DRAFT_STREAM: u64 = 0x4d54_5001;
+const ACCEPT_STREAM: u64 = 0x4d54_5002;
+const CORRECTION_STREAM: u64 = 0x4d54_5003;
+
+pub struct Proposal {
+    pub token: u32,
+    pub distribution: crate::sampling::Distribution,
+}
+
+/// Exact rejection sampling: accept x with min(1,p(x)/q(x)); otherwise
+/// sample the positive residual. Discarded later rows have no authority.
+pub fn sampled_commit(
+    drafts: &[Proposal],
+    target_logits: &[f32],
+    history: &[u32],
+    options: &crate::sampling::Options,
+    step: usize,
+    vocab: usize,
+) -> Result<Vec<u32>> {
+    if vocab == 0 || target_logits.len() != (drafts.len() + 1) * vocab {
+        return Err("Invalid MTP verification logits extent".into());
+    }
+    let mut history = history.to_vec();
+    let mut committed = Vec::with_capacity(drafts.len() + 1);
+    for (i, draft) in drafts.iter().enumerate() {
+        let p = crate::sampling::Distribution::from_logits(
+            &target_logits[i * vocab..(i + 1) * vocab],
+            &history,
+            options,
+        )?;
+        let qx = draft.distribution.probability(draft.token);
+        if qx <= 0.0 {
+            return Err("MTP proposal outside its draft distribution".into());
+        }
+        let uniform =
+            crate::sampling::counter_uniform(options.seed, ACCEPT_STREAM, (step + i) as u64);
+        if uniform < (p.probability(draft.token) / qx).min(1.0) {
+            committed.push(draft.token);
+            history.push(draft.token);
+        } else {
+            let residual = p.residual(&draft.distribution)?;
+            committed.push(residual.draw(crate::sampling::counter_uniform(
+                options.seed,
+                CORRECTION_STREAM,
+                (step + i) as u64,
+            ))?);
+            return Ok(committed);
+        }
+    }
+    let p = crate::sampling::Distribution::from_logits(
+        &target_logits[drafts.len() * vocab..],
+        &history,
+        options,
+    )?;
+    committed.push(p.draw(crate::sampling::counter_uniform(
+        options.seed,
+        0,
+        (step + drafts.len()) as u64,
+    ))?);
+    Ok(committed)
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Statistics {
     pub rounds: usize,
@@ -168,6 +269,7 @@ pub struct Statistics {
     pub initial_warm_s: f64,
     pub draft_s: f64,
     pub verification_s: f64,
+    pub sampling_s: f64,
     pub restore_s: f64,
     pub refresh_s: f64,
 }
@@ -175,6 +277,61 @@ pub struct Statistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejection_preserves_target_distribution() {
+        use crate::sampling::{Distribution, Options, counter_uniform};
+        let q_logits = [0.7f32.ln(), 0.2f32.ln(), 0.1f32.ln()];
+        let p_logits = [0.1f32.ln(), 0.3f32.ln(), 0.6f32.ln()];
+        let mut counts = [0usize; 3];
+        for seed in 0..20000 {
+            let options = Options {
+                seed,
+                ..Options::default()
+            };
+            let q = Distribution::from_logits(&q_logits, &[], &options).unwrap();
+            let token = q.draw(counter_uniform(seed, DRAFT_STREAM, 0)).unwrap();
+            let drafts = [Proposal {
+                token,
+                distribution: q,
+            }];
+            let logits = [p_logits.as_slice(), p_logits.as_slice()].concat();
+            let first = sampled_commit(&drafts, &logits, &[], &options, 0, 3).unwrap()[0];
+            counts[first as usize] += 1;
+        }
+        for (actual, expected) in counts.iter().zip([0.1, 0.3, 0.6]) {
+            assert!(
+                (*actual as f64 / 20000.0 - expected).abs() < 0.015,
+                "{counts:?}"
+            );
+        }
+    }
+    #[test]
+    fn rejection_ignores_later_rows_and_penalties_use_committed_history() {
+        use crate::sampling::{Distribution, Options};
+        let options = Options {
+            temperature: 0.0,
+            repetition_penalty: 2.0,
+            ..Options::default()
+        };
+        let q = Distribution::from_logits(&[2., 1.], &[], &options).unwrap();
+        let drafts = [Proposal {
+            token: 0,
+            distribution: q,
+        }];
+        assert_eq!(
+            sampled_commit(&drafts, &[1., 2., f32::NAN, f32::NAN], &[], &options, 0, 2).unwrap(),
+            [1]
+        );
+        let q = Distribution::from_logits(&[3., 2.], &[], &options).unwrap();
+        let drafts = [Proposal {
+            token: 0,
+            distribution: q,
+        }];
+        assert_eq!(
+            sampled_commit(&drafts, &[3., 2., 3., 2.], &[], &options, 0, 2).unwrap(),
+            [0, 1]
+        );
+    }
     fn manifest() -> Manifest {
         let controls = [
             ("Step", 1),
@@ -190,7 +347,7 @@ mod tests {
             ("SequenceTokens", 4),
             ("SequenceStatus", 4),
         ];
-        let buffers: Vec<_> = controls
+        let mut buffers: Vec<_> = controls
             .iter()
             .map(|&(name, words)| {
                 serde_json::json!({
@@ -198,6 +355,12 @@ mod tests {
             "alignment":256,"access":"read_write","data":null})
             })
             .collect();
+        for (name, rows) in [("MtpLogits", 1), ("SequenceLogits", 4)] {
+            buffers.push(
+                serde_json::json!({"name":name,"dtype":"f32","shape":[rows,100],
+                "layout":"contiguous","alignment":256,"access":"read_write","data":null}),
+            );
+        }
         serde_json::from_value(serde_json::json!({
             "schema_version":1,"target":"sm_87","model":"test","chunk_tokens":8,
             "max_context":32,"vocab":100,"toolchain":{},"buffers":buffers,"kernels":[],
@@ -211,6 +374,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "position":"MtpStep","input":"MtpInput","token":"MtpToken","status":"MtpStatus",
             "verification_tokens":"SequenceTokens","verification_status":"SequenceStatus",
+            "draft_logits":"MtpLogits","verification_logits":"SequenceLogits","feature_index":null,
             "accepted_inputs":"Accepted","target_length":"Length","draft_program":"execute",
             "default_verification_tokens":4,
             "warm_plans":[{"tokens":1,"program":"execute","head_program":"execute"},

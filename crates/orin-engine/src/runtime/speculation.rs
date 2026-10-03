@@ -47,17 +47,17 @@ impl ModelRuntime {
         spec: &crate::mtp::Spec,
         input: &[u32],
         limit: usize,
+        options: &crate::sampling::Options,
         cancelled: &impl Fn() -> bool,
         emit: &mut impl FnMut(u32) -> bool,
     ) -> Result<usize> {
         use std::time::Instant;
         let vocab = self.manifest.vocab;
         let mut stats = crate::mtp::Statistics::default();
-        let first = self.read_control(&self.manifest.token)?;
-        if self.read_control(&self.manifest.status)? != 0 || first < 0 || first as usize >= vocab {
-            return Err("Invalid initial target token for MTP".into());
-        }
-        let mut pending = first as u32;
+        let mut pending = self.select_target(input, options, 0)?;
+        self.upload_ids(&self.manifest.token, &[pending])?;
+        let mut history = input.to_vec();
+        history.push(pending);
         let mut shifted = input[1..].to_vec();
         shifted.push(pending);
         let at = Instant::now();
@@ -91,14 +91,9 @@ impl ModelRuntime {
                 self.upload_ids(&self.manifest.token, &[pending])?;
                 self.launch_program("decode", ExecutionPhase::Decode)?;
                 self.mtp_capture(spec, 1, ExecutionPhase::Decode)?;
-                let selected = self.read_control(&self.manifest.token)?;
-                if self.read_control(&self.manifest.status)? != 0
-                    || selected < 0
-                    || selected as usize >= vocab
-                {
-                    return Err("Invalid MTP target fallback token".into());
-                }
-                pending = selected as u32;
+                pending = self.select_target(&history, options, generated)?;
+                self.upload_ids(&self.manifest.token, &[pending])?;
+                history.push(pending);
                 generated += 1;
                 let stopped = !emit(pending);
                 let at = Instant::now();
@@ -111,6 +106,8 @@ impl ModelRuntime {
             };
             let at = Instant::now();
             let mut drafts = Vec::with_capacity(plan.tokens - 1);
+            let mut proposals = Vec::with_capacity(plan.tokens - 1);
+            let mut draft_history = history.clone();
             for i in 0..plan.tokens - 1 {
                 if cancelled() {
                     return Err("Request cancelled during MTP draft".into());
@@ -122,7 +119,31 @@ impl ModelRuntime {
                 if self.read_control(&spec.status)? != 0 || token < 0 || token as usize >= vocab {
                     return Err("Invalid MTP draft token".into());
                 }
-                drafts.push(token as u32);
+                let token = if options.is_greedy() {
+                    token as u32
+                } else {
+                    let raw = self
+                        .execution
+                        .download_bytes(&spec.draft_logits, vocab * 4)?;
+                    let distribution = crate::sampling::Distribution::from_logits(
+                        &floats(&raw, crate::artifact::Dtype::F32),
+                        &draft_history,
+                        options,
+                    )?;
+                    let token = distribution.draw(crate::sampling::counter_uniform(
+                        options.seed,
+                        crate::mtp::DRAFT_STREAM,
+                        (generated + i) as u64,
+                    ))?;
+                    proposals.push(crate::mtp::Proposal {
+                        token,
+                        distribution,
+                    });
+                    self.upload_ids(&spec.token, &[token])?;
+                    token
+                };
+                drafts.push(token);
+                draft_history.push(token);
             }
             stats.draft_s += at.elapsed().as_secs_f64();
             stats.proposed_tokens += drafts.len();
@@ -139,11 +160,30 @@ impl ModelRuntime {
             }
             stats.verification_s += at.elapsed().as_secs_f64();
             stats.rounds += 1;
-            let mut committed = crate::mtp::greedy_commit(&drafts, &target)?;
+            let at = Instant::now();
+            let mut committed = if options.is_greedy() {
+                crate::mtp::greedy_commit(&drafts, &target)?
+            } else {
+                let raw = self
+                    .execution
+                    .download_bytes(&spec.verification_logits, plan.tokens * vocab * 4)?;
+                crate::mtp::sampled_commit(
+                    &proposals,
+                    &floats(&raw, crate::artifact::Dtype::F32),
+                    &history,
+                    options,
+                    generated,
+                    vocab,
+                )?
+            };
             let accepted_drafts = committed.len() - 1;
+            stats.sampling_s += at.elapsed().as_secs_f64();
             let mut emitted = 0;
             let mut stopped = false;
             for &token in &committed {
+                if cancelled() {
+                    return Err("Request cancelled during MTP commit".into());
+                }
                 emitted += 1;
                 generated += 1;
                 if !emit(token) {
@@ -152,6 +192,7 @@ impl ModelRuntime {
                 }
             }
             committed.truncate(emitted);
+            history.extend_from_slice(&committed);
             stats.accepted_draft_tokens += accepted_drafts.min(emitted);
             let at = Instant::now();
             if emitted < plan.tokens {

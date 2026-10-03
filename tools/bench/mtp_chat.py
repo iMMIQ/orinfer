@@ -1,4 +1,4 @@
-"""Measure committed Chat API output using token IDs from a target-only run.
+"""Measure committed Chat API output using validated native MTP token IDs.
 
 The expected report is produced by validate_mtp_generation. Exact decoded
 prefix matching determines the first chunk's real token count; SSE events,
@@ -59,11 +59,11 @@ def request(base_url, body, ids, tokenizer):
     if not done or not usage or finish != 'length' or not arrivals:
         raise ValueError('Expected complete fixed-length streaming output')
     if usage['completion_tokens'] != len(ids):
-        raise ValueError('Actual completion-token count differs from target reference')
+        raise ValueError('Actual completion-token count differs from native reference')
     content = ''.join(pieces)
     expected = tokenizer.decode(ids, skip_special_tokens=False)
     if content != expected:
-        raise ValueError('API code output differs from target-only token reference')
+        raise ValueError('API output differs from the validated native MTP reference')
     first_text = arrivals[0]['content']
     matches = [n for n in range(1, len(ids) + 1)
         if tokenizer.decode(ids[:n], skip_special_tokens=False) == first_text]
@@ -71,7 +71,7 @@ def request(base_url, body, ids, tokenizer):
         raise ValueError('Cannot uniquely determine real first-chunk token count')
     first_count = matches[0]
     interval = arrivals[-1]['elapsed_s'] - arrivals[0]['elapsed_s']
-    return dict(usage=usage, content=content, target_output_equal=True,
+    return dict(usage=usage, content=content, validated_output_equal=True,
         first_chunk_tokens=first_count, ttft_s=arrivals[0]['elapsed_s'],
         decode_s=interval, decode_tps=(len(ids) - first_count) / interval,
         wall_s=time.perf_counter() - start, arrivals=arrivals)
@@ -93,7 +93,7 @@ def main():
     if reference['status'] != 'passed':
         raise ValueError('Target/MTP verification must pass before API comparison')
     expected = {r['case']: r['output_tokens'] for r in reference['rows']
-        if not r['mtp'] and not r['warmup']}
+        if r['mtp'] and not r['warmup']}
     tokenizer = Tokenizer.from_file(str(args.tokenizer / 'tokenizer.json'))
     rows = []
     for repetition in range(args.repetitions + 1):

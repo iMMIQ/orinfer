@@ -25,12 +25,7 @@ impl ModelRuntime {
         }
         options.validate()?;
         self.speculation_statistics = None;
-        let mtp = self
-            .manifest
-            .mtp
-            .as_ref()
-            .filter(|_| options.is_greedy() && images.is_none_or(|images| images.is_empty()))
-            .cloned();
+        let mtp = self.manifest.mtp.clone();
         self.execution.reset_sequence(&m.reset_buffers)?;
         self.prepare_visual(input, images.unwrap_or(&[]), &cancelled)?;
         let mut offset = 0;
@@ -90,37 +85,22 @@ impl ModelRuntime {
             return Err("Prefill position mismatch".into());
         }
         if let Some(spec) = &mtp {
-            return self.mtp_generate(spec, input, limit, &cancelled, &mut emit);
+            return self.mtp_generate(spec, input, limit, options, &cancelled, &mut emit);
         }
         let mut generated = 0;
         let mut history = input.to_vec();
         for step in 0..limit {
-            if self.read_control(&m.status)? != 0 {
-                return Err("Model token status failure".into());
+            if cancelled() {
+                return Err("Request cancelled during decode".into());
             }
-            let token = if options.is_greedy() {
-                let value = self.read_control(&m.token)?;
-                if value < 0 || value as usize >= m.vocab {
-                    return Err("Selected token outside vocabulary".into());
-                }
-                value as u32
-            } else {
-                let spec = m
-                    .buffers
-                    .iter()
-                    .find(|b| b.name == m.logits)
-                    .ok_or("Missing logits")?;
-                let raw = self.execution.download_bytes(&m.logits, spec.bytes()?)?;
-                crate::sampling::sample(&floats(&raw, spec.dtype), &history, options, step)?
-            };
+            let token = self.select_target(&history, options, step)?;
+            self.upload_ids(&m.token, &[token])?;
             generated += 1;
             history.push(token);
             if !emit(token) {
                 break;
             }
             if step + 1 < limit {
-                // Also overwrite the greedy graph selection for stochastic sampling.
-                self.upload_ids(&m.token, &[token])?;
                 self.launch_program("decode", ExecutionPhase::Decode)?;
             }
         }
@@ -128,5 +108,32 @@ impl ModelRuntime {
             return Err("Decode position mismatch".into());
         }
         Ok(generated)
+    }
+
+    pub(super) fn select_target(
+        &self,
+        history: &[u32],
+        options: &crate::sampling::Options,
+        step: usize,
+    ) -> Result<u32> {
+        let m = &self.manifest;
+        if self.read_control(&m.status)? != 0 {
+            return Err("Model token status failure".into());
+        }
+        if options.is_greedy() {
+            let value = self.read_control(&m.token)?;
+            if value < 0 || value as usize >= m.vocab {
+                return Err("Selected token outside vocabulary".into());
+            }
+            Ok(value as u32)
+        } else {
+            let spec = m
+                .buffers
+                .iter()
+                .find(|b| b.name == m.logits)
+                .ok_or("Missing logits")?;
+            let raw = self.execution.download_bytes(&m.logits, spec.bytes()?)?;
+            crate::sampling::sample(&floats(&raw, spec.dtype), history, options, step)
+        }
     }
 }

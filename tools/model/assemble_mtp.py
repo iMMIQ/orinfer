@@ -2,8 +2,8 @@
 
 Embedding/head and target weights are shared. Shifted inputs use true target
 final hidden states during warm/refresh and previous MTP final hidden while
-drafting. The manifest enables greedy text speculation; stochastic and image
-requests retain the target path. All draft parameter bytes are accounted.
+drafting. Target verification supports exact speculative sampling and images.
+All draft parameter bytes are accounted.
 """
 import argparse
 import importlib
@@ -29,6 +29,7 @@ class Assembler(Builder):
         self.manifest = json.loads(source.read_text())
         self.buffers, self.kernels = self.manifest['buffers'], self.manifest['kernels']
         self.exports = {}
+        self.vision_exports = {}
         self.prefill_tokens, self.i8_grid_order = 512, 'nfirst'
         self.reuse_aot, self.reuse_weights = None, None
         self.dense_u4 = False
@@ -60,6 +61,16 @@ class Assembler(Builder):
         for k in self.kernels:
             for key in ('module', 'source', 'host_abi'): k[key] = adopt(k[key])
         kernels = {k['name']: k for k in self.kernels}
+        if self.manifest.get('vision'):
+            vision = self.manifest['vision']
+            for k in self.kernels:
+                names = {a.get('name') for a in k['args']}
+                name = ('embedding' if vision['feature_index'] in names else
+                        'fullprepare' if vision['mrope_positions'] in names else None)
+                if name and name not in self.vision_exports:
+                    abi = parse_host((output / k['host_abi']['file']).read_text())
+                    assert len(abi) == 1
+                    self.vision_exports[name] = {**abi[0], **{key: k[key] for key in ('module', 'source', 'host_abi')}}
         for operation in self.manifest['programs']['head_m512']:
             if operation['kind'] != 'kernel': continue
             k = kernels[operation['name']]
@@ -128,6 +139,9 @@ class Assembler(Builder):
         ): self.norm_weight(name, key)
         warm_sizes = [1, 2, 3, 4, 8, 16]
         maximum = max(warm_sizes)
+        vision = self.manifest.get('vision')
+        if vision:
+            self.buffer('MtpFeatureIndex', 'i32', (self.context,))
         for name, dtype, shape, reset in (
             ('MtpTargetHidden', 'f16', (self.context, self.H), False),
             ('MtpInput', 'i32', (maximum,), False),
@@ -166,10 +180,16 @@ class Assembler(Builder):
             ('MtpPrepareStatus', 'i32', (1,), True),
         ): self.buffer(name, dtype, shape, reset=reset)
         self.compile('mtp_capture', lambda: speculation.capture_target_hidden(self.H, self.context))
-        self.compile('mtp_embedding', lambda: op('01_embedding').embedding_u4(vocab=self.V, hidden=self.H))
+        if vision:
+            self.exports['mtp_embedding'] = self.vision_exports['embedding']
+        else:
+            self.compile('mtp_embedding', lambda: op('01_embedding').embedding_u4(vocab=self.V, hidden=self.H))
         self.compile('mtp_concat', lambda: speculation.mtp_norm_concat(self.H))
         self.compile('mtp_swiglu', lambda: op('04_swiglu').swiglu())
-        self.compile('mtp_fullprepare', lambda: op('20_full_prepare').full_prepare(1, self.pages, self.pages, max_position=self.context))
+        if vision:
+            self.exports['mtp_fullprepare'] = self.vision_exports['fullprepare']
+        else:
+            self.compile('mtp_fullprepare', lambda: op('20_full_prepare').full_prepare(1, self.pages, self.pages, max_position=self.context))
         self.compile('mtp_attentionmerge', lambda: op('28_attention_split_merge').attention_split_merge(splits=8))
         self.compile('mtp_head', lambda: w4_small_m(1, self.V, self.H, output_dtype='float32', TILE_N=128))
         capture_plans = []
@@ -210,13 +230,18 @@ class Assembler(Builder):
                     if split: emit('merge', P='MtpPartial', O=destination)
             emit('gather', Target='MtpTargetHidden', Step='MtpStep', Out='MtpCondition')
             emit('prepare', Step='MtpStep', Positions='MtpPositions', SeqLength='MtpSeqLength')
-            emit('embedding', P='Embedding_P', S='Embedding_S', Z='Embedding_Z', I='MtpInput', Y='MtpEmbedding')
+            embedding = dict(P='Embedding_P', S='Embedding_S', Z='Embedding_Z', I='MtpInput', Y='MtpEmbedding')
+            if vision:
+                embedding.update(Step='MtpStep', Index='MtpFeatureIndex', Features=vision['features'])
+            emit('embedding', **embedding)
             emit('concat', Embedding='MtpEmbedding', Target='MtpCondition', EmbeddingWeight='MtpEmbeddingWeight', HiddenWeight='MtpHiddenWeight', Out='MtpConcat')
             project('MtpFC', 'MtpConcat', 'MtpHidden')
             p.append(dict(kind='zero', destination='MtpR0', bytes=rows * self.H * 4))
             emit('norm', X='MtpHidden', R='MtpR0', W='MtpPreWeight', Y='MtpNorm', RO='MtpR1')
             project('MtpIn', 'MtpNorm', 'MtpFullX')
-            emit('fullprepare', X='MtpFullX', WQ='MtpQWeight', WK='MtpKWeight', Cache='Rotary', Req='Req', Pos='MtpPositions', Pages='Pages', Status='MtpPrepareStatus', Q='MtpFullQ', Gate='MtpGate', K='MtpKPages', V='MtpVPages')
+            prepare = dict(X='MtpFullX', WQ='MtpQWeight', WK='MtpKWeight', Cache='Rotary', Req='Req', Pos='MtpPositions', Pages='Pages', Status='MtpPrepareStatus', Q='MtpFullQ', Gate='MtpGate', K='MtpKPages', V='MtpVPages')
+            if vision: prepare['MRope'] = vision['mrope_positions']
+            emit('fullprepare', **prepare)
             emit('attention', Q='MtpFullQ', K='MtpKPages', V='MtpVPages', Pages='Pages', SeqLen='MtpSeqLength', QueryPos='MtpPositions', M='MtpAttM', L='MtpAttL', O='MtpAttO')
             emit('attentionmerge', M='MtpAttM', L='MtpAttL', O='MtpAttO', RawGate='MtpGate', Y='MtpMixer')
             project('MtpOut', 'MtpMixer', 'MtpMix')
@@ -247,7 +272,8 @@ class Assembler(Builder):
             rows = plan['tokens']
             verify_plans.append(dict(tokens=rows, program=plan['verify_program'], restore_program=plan['restore_program'], capture_program=f'mtp_capture_m{rows}'))
         self.manifest['mtp'] = dict(position='MtpStep', input='MtpInput', token='MtpToken', status='MtpStatus',
-            verification_tokens='SequenceTokens', verification_status='SequenceStatus', accepted_inputs='AcceptedInputs', target_length='SeqLength',
+            verification_tokens='SequenceTokens', verification_status='SequenceStatus', draft_logits='MtpLogits', verification_logits='SequenceLogits',
+            feature_index='MtpFeatureIndex' if vision else None, accepted_inputs='AcceptedInputs', target_length='SeqLength',
             draft_program='mtp_draft', default_verification_tokens=self.verification_tokens,
             warm_plans=warm_plans, capture_plans=capture_plans, verification_plans=verify_plans)
         sizes = dict(u8=1, i8=1, f16=2, f32=4, i32=4)

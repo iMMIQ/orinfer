@@ -15,6 +15,23 @@ impl ModelRuntime {
             };
         };
         let (index, positions) = v.layout(input, images, self.manifest.max_context)?;
+        if let Some(name) = self
+            .manifest
+            .mtp
+            .as_ref()
+            .and_then(|m| m.feature_index.as_ref())
+        {
+            // MTP pairs target h[t] with input embedding x[t+1], while RoPE
+            // positions and physical KV slots remain aligned to target t.
+            let shifted: Vec<u8> = index
+                .iter()
+                .skip(1)
+                .copied()
+                .chain(std::iter::once(-1))
+                .flat_map(i32::to_le_bytes)
+                .collect();
+            self.upload_bytes(name, &shifted)?;
+        }
         self.upload_bytes(
             &v.feature_index,
             &index
