@@ -18,3 +18,16 @@ ORIN_CHAT_REFERENCE="$PWD/artifacts/chat-reference.json" \
 ```
 
 [OpenCode配置](../../examples/opencode.json)包含本地provider与仅开放read/write的agent。将其复制为独立目录中的`opencode.json`，放入`input.txt`，从该目录运行`opencode run --pure --agent orin --model orin/qwen3.8-27b '读取input.txt并将内容写到output.txt'`。它通过客户端执行工具，再把工具结果发送回Chat API；测试目录、生成文件、会话数据库和日志都不提交源码库。
+
+增加图片、多图、图片历史和thinking模板对照时，使用已构建的视觉manifest和本机PNG图片：
+
+```bash
+python3 tools/api/template_reference.py --tokenizer-dir /path/to/tokenizer-dir \
+  --vision-model /path/to/vision/model.json --image /path/to/image.png \
+  --output artifacts/chat-image-reference.json
+ORIN_TOKENIZER_DIR=/path/to/tokenizer-dir \
+ORIN_CHAT_REFERENCE="$PWD/artifacts/chat-image-reference.json" \
+  cargo test --offline checkpoint_matches_reference_tokens -- --ignored
+```
+
+参考端由Transformers原始模板和Qwen3VLProcessor生成完整input IDs，包括其原生图片token展开；Rust端通过实际Chat请求处理路径做逐token比较。

@@ -1,4 +1,5 @@
 mod chat;
+mod image;
 mod output;
 
 use axum::{
@@ -68,6 +69,7 @@ struct Service {
     codec: Arc<ChatCodec>,
     model: Arc<str>,
     context: usize,
+    vision: Option<orin_engine::vision::VisionSpec>,
     api_key: Option<Arc<str>>,
     ids: Arc<AtomicU64>,
 }
@@ -131,11 +133,12 @@ async fn serve(settings: Settings) -> Result<()> {
                     return Err("Tokenizer exceeds model vocabulary".into());
                 }
                 let context = model.max_context();
-                Ok((lock, model, context))
+                let vision = model.vision().cloned();
+                Ok((lock, model, context, vision))
             };
             match initialize() {
-                Ok((_lock, mut model, context)) => {
-                    if ready_sender.send(Ok(context)).is_ok() {
+                Ok((_lock, mut model, context, vision)) => {
+                    if ready_sender.send(Ok((context, vision))).is_ok() {
                         worker_loop(
                             &mut model,
                             receiver,
@@ -151,12 +154,13 @@ async fn serve(settings: Settings) -> Result<()> {
             }
         })
         .map_err(|e| e.to_string())?;
-    let context = ready_receiver.await.map_err(|e| e.to_string())??;
+    let (context, vision) = ready_receiver.await.map_err(|e| e.to_string())??;
     let state = Service {
         jobs: sender,
         codec,
         model: model_id,
         context,
+        vision,
         api_key: std::env::var("ORIN_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())
@@ -167,7 +171,7 @@ async fn serve(settings: Settings) -> Result<()> {
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(completions))
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&settings.listen)
         .await
@@ -232,12 +236,16 @@ async fn completions(
     let codec = Arc::clone(&state.codec);
     let model = Arc::clone(&state.model);
     let context = state.context;
-    let prepared =
-        match tokio::task::spawn_blocking(move || codec.prepare(request, &model, context)).await {
-            Ok(Ok(prepared)) => prepared,
-            Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, e),
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
+    let vision = state.vision.clone();
+    let prepared = match tokio::task::spawn_blocking(move || {
+        codec.prepare(request, &model, context, vision.as_ref())
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, e),
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
     let stream = prepared.stream;
     let (events, mut responses) = mpsc::channel(64);
     let created = SystemTime::now()
@@ -340,8 +348,9 @@ fn generate_job(
     if !send_delta(job, model_id, json!({"role":"assistant","content":""})) {
         return Ok(());
     }
-    let count = model.generate(
+    let count = model.generate_visual(
         &job.prepared.input,
+        &job.prepared.images,
         job.prepared.max_tokens,
         &job.prepared.sampling,
         || job.events.is_closed() || shutdown.load(Ordering::Relaxed),

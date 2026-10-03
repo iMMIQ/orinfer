@@ -6,13 +6,14 @@ pub mod artifact;
 mod cuda;
 pub mod model;
 pub mod sampling;
+pub mod vision;
 
 /// Build target; runtime device discovery must validate it before inference.
 pub const TARGET_DEVICE: &str = "Jetson AGX Orin 64GB";
 pub const TARGET_ARCH: &str = "aarch64";
 pub const CUDA_ARCH: &str = "sm_87";
 pub const FIRST_MODEL: &str = "Qwen3.8-27B";
-pub const STATUS: &str = "Rust/TileLang resident text inference with OpenAI Chat API";
+pub const STATUS: &str = "Rust/TileLang resident image/text inference with OpenAI Chat API";
 
 /// Authoritative benchmark plan, embedded without duplicating its thresholds.
 pub const BENCHMARK_PLAN: &str = include_str!("../../../configs/benchmark.json");

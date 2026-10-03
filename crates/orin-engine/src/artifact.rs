@@ -29,7 +29,7 @@ pub struct FileIdentity {
     pub sha256: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dtype {
     U8,
@@ -280,10 +280,10 @@ fn load(path: &Path) -> Result<Loaded> {
     }
     add(&manifest.validation.reference)?;
     for b in &manifest.buffers {
-        if let Some(id) = &b.data {
-            if files[&id.file].len() != b.bytes()? {
-                return Err(format!("{}: data byte count mismatch", b.name));
-            }
+        if let Some(id) = &b.data
+            && files[&id.file].len() != b.bytes()?
+        {
+            return Err(format!("{}: data byte count mismatch", b.name));
         }
     }
     let out = manifest

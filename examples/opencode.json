@@ -10,6 +10,8 @@
       "models": {
         "qwen3.8-27b": {
           "name": "Qwen3.8 27B Orin",
+          "attachment": true,
+          "modalities": {"input": ["text", "image"], "output": ["text"]},
           "limit": {"context": 8704, "output": 256},
           "options": {"temperature": 0}
         }

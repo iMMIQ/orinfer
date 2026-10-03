@@ -38,6 +38,7 @@ pub struct ChatRequest {
 
 pub struct Prepared {
     pub input: Vec<u32>,
+    pub images: Vec<orin_engine::vision::ImageInput>,
     pub max_tokens: usize,
     pub sampling: Options,
     pub tools: Vec<Value>,
@@ -86,13 +87,13 @@ impl ChatCodec {
         let mut environment = Environment::new();
         // The checkpoint uses Python's startswith/endswith methods on strings.
         environment.set_unknown_method_callback(|_, value, method, args| {
-            if let (Some(text), [arg]) = (value.as_str(), args) {
-                if let Some(arg) = arg.as_str() {
-                    match method {
-                        "startswith" => return Ok(minijinja::Value::from(text.starts_with(arg))),
-                        "endswith" => return Ok(minijinja::Value::from(text.ends_with(arg))),
-                        _ => {}
-                    }
+            if let (Some(text), [arg]) = (value.as_str(), args)
+                && let Some(arg) = arg.as_str()
+            {
+                match method {
+                    "startswith" => return Ok(minijinja::Value::from(text.starts_with(arg))),
+                    "endswith" => return Ok(minijinja::Value::from(text.ends_with(arg))),
+                    _ => {}
                 }
             }
             Err(minijinja::Error::new(
@@ -149,6 +150,7 @@ impl ChatCodec {
         request: ChatRequest,
         model: &str,
         context_limit: usize,
+        vision: Option<&orin_engine::vision::VisionSpec>,
     ) -> Result<Prepared> {
         if request.model != model {
             return Err(format!("Unknown model {}; expected {model}", request.model));
@@ -237,7 +239,8 @@ impl ChatCodec {
             }
             _ => return Err("Invalid tool_choice".into()),
         };
-        let mut messages = normalize_messages(request.messages)?;
+        let (raw_messages, images) = super::image::messages(request.messages, vision)?;
+        let mut messages = normalize_messages(raw_messages)?;
         if choice == "required" || choice.is_object() {
             let instruction = if let Some(name) = choice["function"]["name"].as_str() {
                 format!("For this response you must call the function {name}.")
@@ -262,6 +265,11 @@ impl ChatCodec {
             .map_err(|e| e.to_string())?
             .get_ids()
             .to_vec();
+        let input = if let Some(v) = vision {
+            v.expand(&input, &images, context_limit)?
+        } else {
+            input
+        };
         if input.is_empty()
             || input
                 .len()
@@ -280,6 +288,7 @@ impl ChatCodec {
         let _ = request.user; // Attribution only; it does not alter sampling identity.
         Ok(Prepared {
             input,
+            images,
             max_tokens,
             sampling,
             tools,
@@ -455,9 +464,30 @@ mod tests {
         let cases: Value = serde_json::from_slice(&std::fs::read(cases).unwrap()).unwrap();
         for case in cases.as_array().unwrap() {
             let request: ChatRequest = serde_json::from_value(case["request"].clone()).unwrap();
-            let prepared = codec.prepare(request, "qwen3.8-27b", 8704).unwrap();
+            let vision: Option<orin_engine::vision::VisionSpec> = case
+                .get("vision")
+                .map(|v| serde_json::from_value(v.clone()).unwrap());
+            let prepared = codec
+                .prepare(request, "qwen3.8-27b", 8704, vision.as_ref())
+                .unwrap();
             let expected: Vec<u32> = serde_json::from_value(case["ids"].clone()).unwrap();
-            assert_eq!(prepared.input, expected);
+            assert_eq!(
+                prepared.input, expected,
+                "Checkpoint template mismatch: {}",
+                case["request"]["messages"]
+            );
+            if let Some(expected) = case.get("mrope_positions") {
+                let expected: Vec<u32> = serde_json::from_value(expected.clone()).unwrap();
+                let (_, positions) = vision
+                    .as_ref()
+                    .unwrap()
+                    .layout(&prepared.input, &prepared.images, prepared.input.len() + 16)
+                    .unwrap();
+                assert_eq!(
+                    positions, expected,
+                    "Official multimodal positions mismatch"
+                );
+            }
         }
     }
 }

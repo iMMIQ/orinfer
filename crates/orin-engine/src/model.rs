@@ -31,6 +31,8 @@ pub struct Manifest {
     pub weight_bytes: usize,
     pub weight_parameters: usize,
     pub weight_scope: String,
+    #[serde(default)]
+    pub vision: Option<crate::vision::VisionSpec>,
 }
 
 /// Fixed-shape graphs sharing one model's weights, workspace and private state.
@@ -143,6 +145,9 @@ impl Manifest {
                 .copied()
                 .ok_or_else(|| format!("Unknown buffer {name}"))
         };
+        if let Some(vision) = &self.vision {
+            vision.validate(self)?;
+        }
         for (name, minimum) in [
             (
                 &self.input,
@@ -313,7 +318,7 @@ impl Manifest {
             return Err("Empty prefill".into());
         }
         if self.prefill_plans.is_empty() {
-            if self.chunk_tokens == 0 || tokens % self.chunk_tokens != 0 {
+            if self.chunk_tokens == 0 || !tokens.is_multiple_of(self.chunk_tokens) {
                 return Err("Input is not a multiple of the legacy chunk size".into());
             }
             return Ok((self.chunk_tokens, "prefill", "head"));
@@ -321,7 +326,7 @@ impl Manifest {
         let plan = self
             .prefill_plans
             .iter()
-            .filter(|plan| plan.chunk_tokens > 0 && tokens % plan.chunk_tokens == 0)
+            .filter(|plan| plan.chunk_tokens > 0 && tokens.is_multiple_of(plan.chunk_tokens))
             .max_by_key(|plan| plan.chunk_tokens)
             .ok_or("No compatible prefill plan")?;
         Ok((plan.chunk_tokens, &plan.prefill_program, &plan.head_program))
@@ -385,6 +390,9 @@ impl Model {
     pub fn vocab(&self) -> usize {
         self.0.manifest.vocab
     }
+    pub fn vision(&self) -> Option<&crate::vision::VisionSpec> {
+        self.0.manifest.vision.as_ref()
+    }
     pub fn generate(
         &mut self,
         input: &[u32],
@@ -393,7 +401,20 @@ impl Model {
         cancelled: impl Fn() -> bool,
         emit: impl FnMut(u32) -> bool,
     ) -> Result<usize> {
-        self.0.generate(input, limit, options, cancelled, emit)
+        self.0
+            .generate(input, None, limit, options, cancelled, emit)
+    }
+    pub fn generate_visual(
+        &mut self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+        limit: usize,
+        options: &crate::sampling::Options,
+        cancelled: impl Fn() -> bool,
+        emit: impl FnMut(u32) -> bool,
+    ) -> Result<usize> {
+        self.0
+            .generate(input, Some(images), limit, options, cancelled, emit)
     }
 }
 

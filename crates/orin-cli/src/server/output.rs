@@ -287,11 +287,11 @@ fn validate_schema(value: &Value, schema: &Value) -> Result<()> {
             }
         }
     }
-    if let Some(items) = value.as_array() {
-        if let Some(schema) = schema.get("items") {
-            for v in items {
-                validate_schema(v, schema)?;
-            }
+    if let Some(items) = value.as_array()
+        && let Some(schema) = schema.get("items")
+    {
+        for v in items {
+            validate_schema(v, schema)?;
         }
     }
     Ok(())

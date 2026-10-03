@@ -332,16 +332,22 @@ impl Launch<'_> {
 fn floats(raw: &[u8], dtype: Dtype) -> Vec<f32> {
     match dtype {
         Dtype::F32 => raw
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect(),
         Dtype::F16 => raw
-            .chunks_exact(2)
-            .map(|b| half_to_float(u16::from_le_bytes(b.try_into().unwrap())))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half_to_float(u16::from_le_bytes(*b)))
             .collect(),
         Dtype::Bf16 => raw
-            .chunks_exact(2)
-            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(b.try_into().unwrap())) << 16))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
             .collect(),
         _ => unreachable!("validated floating point output"),
     }
@@ -1105,11 +1111,104 @@ impl ModelRuntime {
         }
         Ok(value)
     }
+    fn upload_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let size = self.sizes.get(name).ok_or("Missing image buffer")?;
+        if bytes.len() > *size {
+            return Err("Image upload exceeds buffer".into());
+        }
+        self.sync()?;
+        // SAFETY: The synchronized destination is live and covers the borrowed bytes.
+        unsafe {
+            check(
+                (self.session.driver.upload)(
+                    self.pointers[name],
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                ),
+                "image upload",
+            )?;
+            check(
+                (self.session.driver.context_sync)(),
+                "image upload dependency",
+            )
+        }
+    }
+    fn prepare_visual(
+        &self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<()> {
+        let Some(v) = &self.manifest.vision else {
+            return if images.is_empty() {
+                Ok(())
+            } else {
+                Err("Model has no vision adapter".into())
+            };
+        };
+        let (index, positions) = v.layout(input, images, self.manifest.max_context)?;
+        self.upload_bytes(
+            &v.feature_index,
+            &index
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )?;
+        self.upload_ids(&v.mrope_positions, &positions)?;
+        let mut offset = 0;
+        for image in images {
+            if cancelled() {
+                return Err("Request cancelled during image encoding".into());
+            }
+            let features = v.feature_count(image)?;
+            let patches = image.grid_height * image.grid_width;
+            let plan = v
+                .plans
+                .iter()
+                .filter(|p| p.patches >= patches)
+                .min_by_key(|p| p.patches)
+                .ok_or("No image graph")?;
+            let raw: Vec<u8> = image
+                .pixels
+                .iter()
+                .flat_map(|&x| match v.dtype {
+                    crate::vision::Precision::F16 => half::f16::from_f32(x).to_bits().to_le_bytes(),
+                    crate::vision::Precision::Bf16 => {
+                        half::bf16::from_f32(x).to_bits().to_le_bytes()
+                    }
+                })
+                .collect();
+            self.upload_bytes(&v.pixels, &raw)?;
+            self.upload_ids(
+                &v.grid,
+                &[image.grid_height as u32, image.grid_width as u32],
+            )?;
+            self.upload_ids(&v.length, &[patches as u32])?;
+            self.launch_program(&plan.program)?;
+            // SAFETY: Validated feature counts cover both nonoverlapping allocations;
+            // the producing image graph completed and the stream owns this copy.
+            unsafe {
+                check(
+                    (self.session.driver.copy)(
+                        self.pointers[&v.features] + (offset * v.hidden * 2) as u64,
+                        self.pointers[&v.output],
+                        features * v.hidden * 2,
+                        self.session.stream,
+                    ),
+                    "image features",
+                )?;
+            }
+            self.sync()?;
+            offset += features;
+        }
+        Ok(())
+    }
     /// Full chunks use prefill graphs. A remaining tail is teacher-forced through
     /// the M=1 graph: no dummy IDs enter attention, convolution or GDN state.
     pub(crate) fn generate(
         &mut self,
         input: &[u32],
+        images: Option<&[crate::vision::ImageInput]>,
         limit: usize,
         options: &crate::sampling::Options,
         cancelled: impl Fn() -> bool,
@@ -1143,6 +1242,7 @@ impl ModelRuntime {
             }
         }
         self.sync()?;
+        self.prepare_visual(input, images.unwrap_or(&[]), &cancelled)?;
         let mut offset = 0;
         let mut last_head = None;
         while offset < input.len() {
@@ -1245,6 +1345,7 @@ impl ModelRuntime {
         use crate::model::{Report, RequestReport};
         use std::fs;
         self.manifest.validate_requests(&requests)?;
+        self.prepare_visual(&[], &[], &|| false)?;
         let manifest = &self.manifest;
         let s = &mut self.session;
         let pointers = &self.pointers;
@@ -1520,5 +1621,111 @@ mod tests {
     fn rejects_nonfinite_numerical_validation() {
         assert!(errors(&[f32::NAN], &[1.0]).is_err());
         assert_eq!(errors(&[1.0, 2.0], &[1.0, 2.0]).unwrap(), (0.0, 0.0));
+    }
+
+    #[test]
+    #[ignore = "Requires a real model, fixture and exclusive GPU experiment lock"]
+    fn multimodal_token_probe() {
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            model: std::path::PathBuf,
+            input_tokens: Vec<u32>,
+            images: Vec<crate::vision::ImageInput>,
+            prefixes: Vec<Vec<u32>>,
+            target_tokens: Vec<u32>,
+            output: std::path::PathBuf,
+        }
+        let path = std::env::var("ORIN_VISION_PROBE").expect("ORIN_VISION_PROBE");
+        let probe: Probe = crate::model::read(std::path::Path::new(&path)).unwrap();
+        let mut model = ModelRuntime::load(&probe.model).unwrap();
+        let options = crate::sampling::Options {
+            temperature: 0.,
+            ..Default::default()
+        };
+        let mut generated = vec![];
+        model
+            .generate(
+                &probe.input_tokens,
+                Some(&probe.images),
+                128,
+                &options,
+                || false,
+                |id| {
+                    generated.push(id);
+                    ![248046, 248044].contains(&id)
+                },
+            )
+            .unwrap();
+        let mut checks = vec![];
+        for prefix in &probe.prefixes {
+            let mut input = probe.input_tokens.clone();
+            input.extend(prefix);
+            let mut selected = 0;
+            model
+                .generate(
+                    &input,
+                    Some(&probe.images),
+                    1,
+                    &options,
+                    || false,
+                    |id| {
+                        selected = id;
+                        true
+                    },
+                )
+                .unwrap();
+            let spec = model
+                .manifest
+                .buffers
+                .iter()
+                .find(|b| b.name == model.manifest.logits)
+                .unwrap();
+            let mut raw = vec![0u8; spec.bytes().unwrap()];
+            // SAFETY: generate synchronized the producing stream; the host
+            // allocation covers the complete validated logits buffer.
+            unsafe {
+                check(
+                    (model.session.driver.download)(
+                        raw.as_mut_ptr().cast(),
+                        model.pointers[&model.manifest.logits],
+                        raw.len(),
+                    ),
+                    "probe logits",
+                )
+                .unwrap();
+            }
+            let logits = floats(&raw, spec.dtype);
+            assert!(logits.iter().all(|v| v.is_finite()));
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let log_z = f64::from(max)
+                + logits
+                    .iter()
+                    .map(|&v| f64::from(v - max).exp())
+                    .sum::<f64>()
+                    .ln();
+            let entry = |id: usize| {
+                serde_json::json!({
+                    "token_id":id,"logit":logits[id],"logprob":f64::from(logits[id])-log_z
+                })
+            };
+            let mut ids: Vec<usize> = (0..logits.len()).collect();
+            ids.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+            checks.push(serde_json::json!({"prefix":prefix,"selected":selected,
+                "top3":ids[..3].iter().map(|&id|entry(id)).collect::<Vec<_>>(),
+                "targets":probe.target_tokens.iter().map(|&id|entry(id as usize)).collect::<Vec<_>>()
+            }));
+        }
+        let result = serde_json::json!({"generated":generated,"checks":checks,
+            "seed":crate::sampling::EVALUATION_SEED});
+        use std::io::Write;
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&probe.output)
+            .unwrap();
+        output
+            .write_all(serde_json::to_string_pretty(&result).unwrap().as_bytes())
+            .unwrap();
+        println!("{result}");
     }
 }

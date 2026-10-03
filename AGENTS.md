@@ -5,7 +5,7 @@
 ## 范围
 
 - 硬件固定本机Jetson AGX Orin 64GB，aarch64/CUDA SM87。
-- 当前支持Qwen3.8-27B文本主干，实际checkpoint为Qwen3_5架构；不加载视觉权重。
+- 支持Qwen3.8-27B文本、图片和多图输入，实际checkpoint为Qwen3_5架构；不包含视频。
 - 在线运行时用Rust，生产GPU kernel以TileLang为源；Python只用于离线转换、编译、参考和验证。
 - 公共运行时按manifest执行，不硬编码模型层数、维度或层序；后续架构由adapter和执行计划扩展。
 - 当前性能优化已结束。新增优化、prefix、并发、MTP或其他模型须以新的用户任务为依据。
