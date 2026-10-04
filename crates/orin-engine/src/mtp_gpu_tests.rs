@@ -50,19 +50,51 @@ fn download(model: &ModelRuntime, name: &str, bytes: usize) -> Vec<u8> {
     raw
 }
 
-fn snapshot(model: &ModelRuntime, position: usize) -> BTreeMap<String, Vec<u8>> {
+fn snapshot(model: &ModelRuntime, position: usize) -> BTreeMap<String, String> {
+    use sha2::{Digest, Sha256};
     model
         .manifest
         .reset_buffers
         .iter()
         .filter(|name| name.starts_with('L'))
         .map(|name| {
-            let bytes = if name.ends_with("_KPages") || name.ends_with("_VPages") {
+            let stride = model
+                .manifest
+                .kv_cache
+                .as_ref()
+                .and_then(|kv| kv.buffers.get(name));
+            let bytes = if let Some(stride) = stride {
+                position.checked_mul(*stride).unwrap()
+            } else if name.ends_with("_KPages") || name.ends_with("_VPages") {
                 position * 4 * 256 * 2
             } else {
                 model.execution.sizes[name]
             };
-            (name.clone(), download(model, name, bytes))
+            assert!(bytes <= model.execution.sizes[name]);
+            // Hash in bounded chunks: a 256k context has GiB of live KV.
+            // Keeping several complete host copies would exhaust Orin RAM.
+            let mut digest = Sha256::new();
+            let mut scratch = vec![0u8; bytes.min(8 * 1024 * 1024)];
+            for offset in (0..bytes).step_by(scratch.len()) {
+                let count = scratch.len().min(bytes - offset);
+                let pointer = model.execution.pointers[name]
+                    .checked_add(offset as u64)
+                    .unwrap();
+                // SAFETY: Both ranges are checked and the graph has completed.
+                unsafe {
+                    check(
+                        (model.execution.session.driver.download)(
+                            scratch.as_mut_ptr().cast(),
+                            pointer,
+                            count,
+                        ),
+                        "MTP state hash download",
+                    )
+                    .unwrap();
+                }
+                digest.update(&scratch[..count]);
+            }
+            (name.clone(), format!("{:x}", digest.finalize()))
         })
         .collect()
 }
@@ -169,8 +201,7 @@ fn validate_mtp_generation() {
                 {
                     assert!(expected == &output, "Target outputs differ for {}", case.id);
                     for (name, value) in &state {
-                        let expected: &BTreeMap<String, Vec<u8>> =
-                            reference_state.as_ref().unwrap();
+                        let expected: &BTreeMap<String, String> = reference_state.as_ref().unwrap();
                         assert!(
                             value == &expected[name],
                             "Target state differs: {} {name}",

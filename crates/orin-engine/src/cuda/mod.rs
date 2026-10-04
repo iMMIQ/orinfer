@@ -10,6 +10,7 @@ use std::{
     ptr,
     time::Instant,
 };
+mod virtual_memory;
 pub(crate) type Handle = *mut c_void;
 
 pub(crate) struct Driver {
@@ -30,6 +31,17 @@ pub(crate) struct Driver {
     pub(crate) stream_destroy: unsafe extern "C" fn(Handle) -> i32,
     pub(crate) memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> i32,
     pub(crate) alloc: unsafe extern "C" fn(*mut u64, usize) -> i32,
+    pub(crate) vmm_reserve: unsafe extern "C" fn(*mut u64, usize, usize, u64, u64) -> i32,
+    pub(crate) vmm_address_free: unsafe extern "C" fn(u64, usize) -> i32,
+    pub(crate) vmm_granularity:
+        unsafe extern "C" fn(*mut usize, *const virtual_memory::AllocationProp, i32) -> i32,
+    pub(crate) vmm_create:
+        unsafe extern "C" fn(*mut u64, usize, *const virtual_memory::AllocationProp, u64) -> i32,
+    pub(crate) vmm_map: unsafe extern "C" fn(u64, usize, usize, u64, u64) -> i32,
+    pub(crate) vmm_access:
+        unsafe extern "C" fn(u64, usize, *const virtual_memory::AccessDesc, usize) -> i32,
+    pub(crate) vmm_unmap: unsafe extern "C" fn(u64, usize) -> i32,
+    pub(crate) vmm_release: unsafe extern "C" fn(u64) -> i32,
     pub(crate) free: unsafe extern "C" fn(u64) -> i32,
     pub(crate) upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
     pub(crate) copy: unsafe extern "C" fn(u64, u64, usize, Handle) -> i32,
@@ -100,6 +112,14 @@ impl Driver {
             stream_destroy: symbol!("cuStreamDestroy_v2"),
             memory_info: symbol!("cuMemGetInfo_v2"),
             alloc: symbol!("cuMemAlloc_v2"),
+            vmm_reserve: symbol!("cuMemAddressReserve"),
+            vmm_address_free: symbol!("cuMemAddressFree"),
+            vmm_granularity: symbol!("cuMemGetAllocationGranularity"),
+            vmm_create: symbol!("cuMemCreate"),
+            vmm_map: symbol!("cuMemMap"),
+            vmm_access: symbol!("cuMemSetAccess"),
+            vmm_unmap: symbol!("cuMemUnmap"),
+            vmm_release: symbol!("cuMemRelease"),
             free: symbol!("cuMemFree_v2"),
             upload: symbol!("cuMemcpyHtoD_v2"),
             copy: symbol!("cuMemcpyDtoDAsync_v2"),
@@ -169,6 +189,7 @@ pub(crate) struct Session {
     pub(crate) retained: bool,
     pub(crate) stream: Handle,
     pub(crate) buffers: Vec<u64>,
+    pub(crate) virtual_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) modules: Vec<Handle>,
     pub(crate) events: Vec<Handle>,
     pub(crate) graph: Handle,
@@ -185,6 +206,7 @@ impl Session {
             retained: false,
             stream: ptr::null_mut(),
             buffers: vec![],
+            virtual_buffers: Default::default(),
             modules: vec![],
             events: vec![],
             graph: ptr::null_mut(),
@@ -238,6 +260,15 @@ impl Session {
             }
             for event in self.events.drain(..) {
                 record((self.driver.event_destroy)(event), "destroy event");
+            }
+            for (_, mut buffer) in std::mem::take(self.virtual_buffers.get_mut()) {
+                if let Err(e) = buffer.release_slabs(&self.driver) {
+                    eprintln!("CUDA KV cleanup: {e}");
+                }
+                record(
+                    (self.driver.vmm_address_free)(buffer.address, buffer.bytes),
+                    "free KV address reservation",
+                );
             }
             for buffer in self.buffers.drain(..) {
                 record((self.driver.free)(buffer), "free buffer");

@@ -38,7 +38,7 @@ CLI接收token-ID请求，输出包含生成token、加载时间和请求时延�
 }
 ```
 
-上面只展示字段格式。`run-model`是固定块、普通decode的诊断基准，输入长度须为某个声明prefill计划的整数倍，选择能整除请求长度的最大计划；基础计划为512/2048/8192。任意长度请求及MTP通过下述Chat API或Rust `Model::generate`执行。具体上下文容量由manifest声明；本机模型为8704 tokens。请求状态不复用。
+上面只展示字段格式。`run-model`是固定块、普通decode的诊断基准，输入长度须为某个声明prefill计划的整数倍，选择能整除请求长度的最大计划；基础计划为512/2048/8192。任意长度请求及MTP通过下述Chat API或Rust `Model::generate`执行。具体上下文容量由模型缓存声明；本机部署容量为262144 tokens（256k），提示、历史、图片、thinking与输出合计计入。当前部署的最大prefill块为2048 tokens，长提示分块处理。请求状态不复用。
 
 ## Chat API
 
@@ -97,7 +97,7 @@ opencode run --pure --agent orin --model orin/qwen3.8-27b '比较两张图片' -
 python3 tools/api/smoke.py --output artifacts/api-smoke-results.json
 ```
 
-Smoke工具验证真实模型的文本/SSE、采样、停止词、状态隔离、错误格式和工具结果回传；结果文件不进入源码库。完整OpenCode默认工具集和长系统提示可能超出当前8704-token容量，示例仅开放read/write。
+Smoke工具验证真实模型的文本/SSE、采样、停止词、状态隔离、错误格式和工具结果回传；结果文件不进入源码库。示例仅开放read/write，客户端声明的上下文容量应与`/health`中的`max_context`一致。
 
 示例配置声明text/image输入；附图请求需要服务加载视觉manifest。
 
@@ -112,6 +112,8 @@ Smoke工具验证真实模型的文本/SSE、采样、停止词、状态隔离�
 - `tools/operators/`、`tools/eval/`、`tools/bench/`：kernel、质量及计时检查。
 
 Prefill使用单份W4权重、临时W8/A8和INT8 Tensor Core；512的FFN使用LUT4融合。Decode直接读取同一份W4，GDN持续状态和累积为FP32。权重含量化元数据约14.794GB，平均4.4003bits；显式CUDA allocations约19.713GB，另有driver/module/graph开销。图文manifest另加约0.921GB视觉权重，来自原始BF16 checkpoint，默认转为FP16存储，合计约4.596bits；默认视觉workspace下显式CUDA allocations约22.021GB。
+
+8704-token容量的分配数字见上。262144-token配置可通过 `tools/model/optimize_kv.py` 使用直接 KV prefill 和 CUDA VMM：加载时固定缓冲区约 18.60 GiB，KV 物理内存按执行位置增长，graph 地址保持稳定；最大 prefill 块为 2048 tokens。FP16 KV 满容量包含主模型和 MTP 共 17 GiB，INT8 group-64 KV 含 FP16 scale 共约 8.77 GiB，另有 driver/module/graph 开销。新请求会回收上一请求的 KV 物理映射。构建与验证方法见[模型构建](tools/model/README.md)。
 
 ## 性能与限制
 

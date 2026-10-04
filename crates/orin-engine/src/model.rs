@@ -20,6 +20,8 @@ pub struct Manifest {
     #[serde(default)]
     pub prefill_plans: Vec<PrefillPlan>,
     pub max_context: usize,
+    #[serde(default)]
+    pub kv_cache: Option<KvCache>,
     pub vocab: usize,
     pub toolchain: BTreeMap<String, String>,
     pub buffers: Vec<Buffer<TensorIdentity>>,
@@ -40,6 +42,25 @@ pub struct Manifest {
     pub vision: Option<crate::vision::VisionSpec>,
     #[serde(default)]
     pub mtp: Option<crate::mtp::Spec>,
+}
+
+/// Storage contract for stable, demand-mapped token-major KV state.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvCache {
+    pub direct_prefill: bool,
+    pub demand_mapping: bool,
+    /// Bytes per token for each payload or scale buffer (including metadata).
+    pub buffers: BTreeMap<String, usize>,
+    /// Derived by the architecture; never supplied by an operator package.
+    #[serde(skip)]
+    pub(crate) growth: BTreeMap<String, KvGrowth>,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct KvGrowth {
+    pub position: String,
+    pub tokens: usize,
+    pub buffers: Vec<String>,
 }
 
 /// Fixed-shape graphs sharing one model's weights, workspace and private state.
@@ -170,6 +191,23 @@ impl Manifest {
                 .copied()
                 .ok_or_else(|| format!("Unknown buffer {name}"))
         };
+        if let Some(kv) = &self.kv_cache {
+            if kv.buffers.is_empty() {
+                return Err("Empty KV allocation contract".into());
+            }
+            for (name, stride) in &kv.buffers {
+                let b = lookup(name)?;
+                if *stride == 0
+                    || stride.checked_mul(self.max_context) != Some(b.bytes()?)
+                    || b.data.is_some()
+                    || b.access == Access::Read
+                {
+                    return Err(format!(
+                        "{name}: invalid token-major KV allocation contract"
+                    ));
+                }
+            }
+        }
         if let Some(vision) = &self.vision {
             vision.validate(self)?;
         }
@@ -391,7 +429,10 @@ pub struct Report {
     pub graph_capture_s: f64,
     pub cuda_graph: CudaGraphMode,
     pub captured_programs: Vec<String>,
+    /// Resident fixed buffers at load, excluding demand-mapped KV.
     pub buffer_bytes: usize,
+    pub buffer_capacity_bytes: usize,
+    pub peak_kv_bytes: usize,
     pub weight_bytes: usize,
     pub effective_weight_bits: f64,
     pub weight_scope: String,

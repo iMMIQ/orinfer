@@ -113,6 +113,17 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
             return Err(format!("{}: invalid weight allocation scope", buffer.name));
         }
     }
+    if let Some(kv) = &model.kv_cache {
+        for name in kv.buffers.keys() {
+            if scopes.get(name) != Some(&BufferScope::Sequence)
+                || !model.reset_buffers.contains(name)
+            {
+                return Err(format!(
+                    "{name}: KV must be private resettable sequence state"
+                ));
+            }
+        }
+    }
     for name in model.reset_buffers.iter().chain([
         &model.input,
         &model.token,

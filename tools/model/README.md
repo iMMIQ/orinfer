@@ -141,3 +141,44 @@ python3 tools/model/package.py install operators.tar.gz ~/.cache/orin-llm/operat
 ```
 
 可用`ORIN_OPERATOR_CACHE`指定共享缓存位置。只有一种`int8_quality`策略，暂不提供compute-dtype切换。配置或构建变体不受当前包/架构recipe支持时，在准备或加载阶段报错；不在首次请求中编译或重新量化。
+
+## 扩展已准备模型的上下文
+
+已经包含视觉和MTP的本机Qwen3_5缓存可用以下命令扩容，无需重新量化权重：
+
+```bash
+bash tools/operators/run.sh tools/model/resize_context.py artifacts/context-build \
+  --model artifacts/models/qwen3.8-27b-uncensored \
+  --destination artifacts/models/qwen3.8-27b-uncensored-256k \
+  --max-context 262144 --max-prefill-tokens 2048
+target/release/orin-llm validate-model artifacts/models/qwen3.8-27b-uncensored-256k
+bash tools/operators/run.sh tools/model/context_probe.py artifacts/context-probe --hidden-ring 2048
+target/release/orin-llm serve artifacts/models/qwen3.8-27b-uncensored-256k
+```
+
+上下文必须按128 tokens对齐，且不超过checkpoint声明的原生容量。工具重新编译容量相关TileLang算子、按实际host ABI重新绑定参数并扩展位置表与KV；学习得到的权重分片使用硬链接。MTP随target prefill分块预热，以最大prefill块大小的hidden环形缓存代替整段hidden存储；主模型与MTP仍保留完整上下文的KV。视觉特征容量单独限制，不随文本扩容。`--max-prefill-tokens`可选择已有的较小profile，缩小文本临时workspace；提示总容量不变。
+
+256k、2048-token最大prefill块配置显式CUDA分配约36.60 GiB，另需driver、graph及CPU内存。扩容影响常驻内存；长提示的attention计算量也随长度增加。`context_probe.py`检查最后一个位置的KV写入、因果边界、KV gather及hidden环形缓存的输入变化后graph replay；完整请求和长上下文质量仍需用实际模型另行验证。
+
+
+## KV 存储优化
+
+先用 `resize_context.py` 确定容量，再做 KV 优化；已优化目录不能直接用于上下文重编译，需要从原始 prepared 模型重建。已准备的 Qwen3_5 模型可以离线发布为直接读取 KV、按需映射物理内存的模型目录；权重 payload 不变，算子包由新目录独立固定：
+
+```bash
+python3 tools/model/optimize_kv.py \
+  --model /path/to/prepared-model --destination /path/to/fp16-kv-model
+
+bash tools/operators/run.sh tools/model/optimize_kv.py artifacts/kv-build \
+  --model /path/to/prepared-model --destination /path/to/int8-kv-model \
+  --storage int8
+```
+
+`fp16` 保留无损 KV。`int8` 使用每 token、每 KV head、每 64 个通道一组的对称 INT8，FP16 scale 计入存储；attention 以 packed half2 在共享内存 tile 中反量化后，继续使用 FP16 tensor-core 计算和 FP32 累加；反量化覆盖 INT8 全取值、FP16 次正规 scale 和最大有限值。当前单请求页表必须为 identity 顺序；转换工具校验 safetensors 中的页表及其 hash，省去 prefill 的 KV gather 和整份 FP16 workspace。文本与 MTP KV 都采用所选存储方式，GDN 状态保持 FP32。
+
+CUDA VMM 只保留最大上下文的虚拟地址，按实际执行位置、写入块大小和驱动粒度映射物理内存；增长发生在图外，指针保持稳定。新请求开始时释放上一请求的 KV 映射，重新清零状态；已有 graph 可以继续重放。容量错误和物理内存不足返回错误，不缩短模型上下文。`run-model` 报告中的 `buffer_bytes` 为加载时固定常驻字节，`buffer_capacity_bytes` 为全部逻辑容量，`peak_kv_bytes` 为执行时 KV 映射峰值。
+
+`tools/model/kv_probe.py` 验证 INT8 writer 的 RNE codes、Q/Gate 不变、非连续物理页、尾部和变化输入后的 graph replay。Rust ignored test `vmm_graph_growth_reset_and_last_token` 验证分配粒度、256k 最后一个 token、扩容和回收后的 graph replay；完整模型状态与图片/MTP回归继续使用 `validate_mtp_generation`。量化质量需要额外固定历史对照，不能由微测误差替代。
+
+
+KV 质量对照可以用 `run-model` 的 `logits_steps` 导出完整分布。先运行 FP16 KV，再将它的 `output_tokens` 的前 `max_new_tokens - 1` 个作为 INT8 请求的 `forced_tokens`，保持输入、历史和采样 seed 一致。`compare_kv_quality.py --reference REF_REPORT --candidate INT8_REPORT --reference-requests REF_REQUESTS --candidate-requests INT8_REQUESTS --output NEW_RESULT` 校验历史，报告完整分布 KL、参考 token NLL 差、top-3 概率误差和重叠率；逐 token 不一致本身不判失败。这项对照隔离 KV 存储误差，权重质量仍应对照 BF16/FP8 并结合任务结果。

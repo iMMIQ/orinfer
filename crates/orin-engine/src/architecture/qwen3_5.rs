@@ -359,6 +359,72 @@ pub(super) fn build(
         );
         b.programs.insert("mtp_draft".into(), ops);
     }
+    if let Some(kv) = &mut manifest.kv_cache {
+        if kv.direct_prefill {
+            // Chunk recipes retain their stable slot numbering but omit gather.
+            for (program, ops) in &mut b.programs {
+                let chunk = profiles.iter().any(|p| {
+                    p.kind != PrefillKind::Sequence && program == &format!("prefill_m{}", p.tokens)
+                });
+                if chunk || program == "prefill" {
+                    for (layer, kind) in config.text.layer_types.iter().enumerate() {
+                        if kind == "full_attention" {
+                            let gather = format!("{program}/layer{layer}/k4");
+                            // The alias prefill uses bindings of its largest profile.
+                            let gather_alias =
+                                format!("prefill_m{}/layer{layer}/k4", manifest.chunk_tokens);
+                            ops.retain(|op| !matches!(op, Operation::Kernel { name }
+                                if name == &gather || (program == "prefill" && name == &gather_alias)));
+                        }
+                    }
+                }
+            }
+        }
+        for program in b.programs.keys() {
+            let (position, tokens, mtp) = if program == "decode" {
+                (manifest.position.clone(), 1, false)
+            } else if program == "prefill" {
+                (manifest.position.clone(), manifest.chunk_tokens, false)
+            } else if let Some(n) = program
+                .strip_prefix("prefill_m")
+                .or_else(|| program.strip_prefix("verify_m"))
+            {
+                (
+                    manifest.position.clone(),
+                    n.parse().map_err(|_| "Invalid prefill size")?,
+                    false,
+                )
+            } else if program == "mtp_draft" {
+                (
+                    manifest.mtp.as_ref().ok_or("Missing MTP")?.position.clone(),
+                    1,
+                    true,
+                )
+            } else if let Some(n) = program.strip_prefix("mtp_warm_m") {
+                (
+                    manifest.mtp.as_ref().ok_or("Missing MTP")?.position.clone(),
+                    n.parse().map_err(|_| "Invalid MTP size")?,
+                    true,
+                )
+            } else {
+                continue;
+            };
+            let buffers = kv
+                .buffers
+                .keys()
+                .filter(|name| name.starts_with("Mtp") == mtp)
+                .cloned()
+                .collect();
+            kv.growth.insert(
+                program.clone(),
+                crate::model::KvGrowth {
+                    position,
+                    tokens,
+                    buffers,
+                },
+            );
+        }
+    }
     manifest.programs = b.programs;
     // Declare decode candidates here, independent of kernel names. Some of
     // these plans also run during prefill; the runtime supplies the call phase.

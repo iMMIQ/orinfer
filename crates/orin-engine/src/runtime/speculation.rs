@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Default)]
+pub(super) struct PrefillWarm {
+    pub tokens: usize,
+    pub seconds: f64,
+}
+
 impl ModelRuntime {
     pub(super) fn mtp_capture(
         &self,
@@ -45,24 +51,29 @@ impl ModelRuntime {
     pub(super) fn mtp_generate(
         &mut self,
         spec: &crate::mtp::Spec,
-        input: &[u32],
+        prefill: (&[u32], PrefillWarm),
         limit: usize,
         options: &crate::sampling::Options,
         cancelled: &impl Fn() -> bool,
         emit: &mut impl FnMut(u32) -> bool,
     ) -> Result<usize> {
         use std::time::Instant;
+        let (input, warm) = prefill;
+        if warm.tokens >= input.len() || self.read_control(&spec.position)? as usize != warm.tokens
+        {
+            return Err("MTP prefill warm position mismatch".into());
+        }
         let vocab = self.manifest.vocab;
         let mut stats = crate::mtp::Statistics::default();
         let mut pending = self.select_target(input, options, 0)?;
         self.upload_ids(&self.manifest.token, &[pending])?;
         let mut history = input.to_vec();
         history.push(pending);
-        let mut shifted = input[1..].to_vec();
+        let mut shifted = input[warm.tokens + 1..].to_vec();
         shifted.push(pending);
         let at = Instant::now();
         self.mtp_warm(spec, &shifted, cancelled, ExecutionPhase::Prefill)?;
-        stats.initial_warm_s = at.elapsed().as_secs_f64();
+        stats.initial_warm_s = warm.seconds + at.elapsed().as_secs_f64();
         let mut generated = 1;
         if !emit(pending) || limit == 1 {
             stats.committed_tokens = generated;

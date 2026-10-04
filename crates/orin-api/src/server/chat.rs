@@ -27,7 +27,12 @@ mod mtp_fixture_export {
         for case in raw["cases"].as_array().unwrap() {
             let request: ChatRequest = serde_json::from_value(case["request"].clone()).unwrap();
             let prepared = codec
-                .prepare(request, "qwen3.8-27b", 8704, vision.as_ref())
+                .prepare(
+                    request,
+                    "qwen3.8-27b",
+                    descriptor["metadata"]["max_context"].as_u64().unwrap() as usize,
+                    vision.as_ref(),
+                )
                 .unwrap();
             cases.push(json!({"id":case["id"],"input_tokens":prepared.input,
                 "max_new_tokens":prepared.max_tokens,"sampling":prepared.sampling,

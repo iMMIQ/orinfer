@@ -29,6 +29,7 @@ impl ModelRuntime {
         self.execution.reset_sequence(&m.reset_buffers)?;
         self.prepare_visual(input, images.unwrap_or(&[]), &cancelled)?;
         let mut offset = 0;
+        let mut warm = super::speculation::PrefillWarm::default();
         let mut last_head = None;
         while offset < input.len() {
             if cancelled() {
@@ -60,11 +61,22 @@ impl ModelRuntime {
                 self.launch_program(program, ExecutionPhase::Prefill)?;
                 if let Some(spec) = &mtp {
                     self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
+                    if spec.hidden_ring.is_some() && offset + chunk < input.len() {
+                        let at = Instant::now();
+                        self.mtp_warm(
+                            spec,
+                            &input[offset + 1..offset + chunk + 1],
+                            &cancelled,
+                            ExecutionPhase::Prefill,
+                        )?;
+                        warm.tokens = offset + chunk;
+                        warm.seconds += at.elapsed().as_secs_f64();
+                    }
                 }
                 offset += chunk;
                 last_head = Some(head);
             } else {
-                for id in &input[offset..] {
+                for (index, id) in input.iter().enumerate().skip(offset) {
                     if cancelled() {
                         return Err("Request cancelled during prefill".into());
                     }
@@ -72,6 +84,17 @@ impl ModelRuntime {
                     self.launch_program("decode", ExecutionPhase::Prefill)?;
                     if let Some(spec) = &mtp {
                         self.mtp_capture(spec, 1, ExecutionPhase::Prefill)?;
+                        if spec.hidden_ring.is_some() && index + 1 < input.len() {
+                            let at = Instant::now();
+                            self.mtp_warm(
+                                spec,
+                                &input[index + 1..index + 2],
+                                &cancelled,
+                                ExecutionPhase::Prefill,
+                            )?;
+                            warm.tokens = index + 1;
+                            warm.seconds += at.elapsed().as_secs_f64();
+                        }
                     }
                 }
                 offset = input.len();
@@ -85,7 +108,7 @@ impl ModelRuntime {
             return Err("Prefill position mismatch".into());
         }
         if let Some(spec) = &mtp {
-            return self.mtp_generate(spec, input, limit, options, &cancelled, &mut emit);
+            return self.mtp_generate(spec, (input, warm), limit, options, &cancelled, &mut emit);
         }
         let mut generated = 0;
         let mut history = input.to_vec();

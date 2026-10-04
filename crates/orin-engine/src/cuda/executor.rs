@@ -23,6 +23,8 @@ pub(crate) struct Executor {
     pub(crate) graphs: BTreeMap<String, Handle>,
     direct: Option<DirectPrograms>,
     cuda_graph: CudaGraphMode,
+    growth: BTreeMap<String, crate::model::KvGrowth>,
+    pub(crate) peak_kv_bytes: std::cell::Cell<usize>,
     pub(crate) allocations: Allocations,
 }
 
@@ -50,6 +52,7 @@ pub(crate) struct LoadStats {
     pub(crate) cuda_graph: CudaGraphMode,
     pub(crate) captured_programs: Vec<String>,
     pub(crate) buffer_bytes: usize,
+    pub(crate) buffer_capacity_bytes: usize,
 }
 impl Executor {
     pub(crate) fn load(
@@ -70,7 +73,17 @@ impl Executor {
             return Err("Architecture declares a missing decode program".into());
         }
         let started = Instant::now();
-        let buffer_bytes = manifest.validate()?;
+        let capacity_bytes = manifest.validate()?;
+        let lazy = manifest.kv_cache.as_ref().filter(|kv| kv.demand_mapping);
+        let lazy_bytes = manifest
+            .buffers
+            .iter()
+            .filter(|b| lazy.is_some_and(|kv| kv.buffers.contains_key(&b.name)))
+            .try_fold(0usize, |sum, b| {
+                b.bytes()
+                    .and_then(|n| sum.checked_add(n).ok_or("KV sum overflow".into()))
+            })?;
+        let buffer_bytes = capacity_bytes - lazy_bytes;
         let mut s = Session::new(Driver::load()?);
         let mut pointers = BTreeMap::new();
         let mut sizes = BTreeMap::new();
@@ -117,13 +130,23 @@ impl Executor {
             let mut address = 0;
             // SAFETY: Allocation length is checked by manifest validation and owned
             // by Session before any fallible operation can return.
-            unsafe {
-                check(
-                    (s.driver.alloc)(&mut address, bytes),
-                    &format!("allocate {}", b.name),
-                )?;
+            let stride = lazy.and_then(|kv| kv.buffers.get(&b.name)).copied();
+            if let Some(stride) = stride {
+                let reservation = super::virtual_memory::Reservation::reserve(&s, bytes, stride)?;
+                address = reservation.address;
+                s.virtual_buffers
+                    .borrow_mut()
+                    .insert(b.name.clone(), reservation);
+            } else {
+                // SAFETY: Validated extent, immediately transferred to Session.
+                unsafe {
+                    check(
+                        (s.driver.alloc)(&mut address, bytes),
+                        &format!("allocate {}", b.name),
+                    )?;
+                }
+                s.buffers.push(address);
             }
-            s.buffers.push(address);
             if address % b.alignment != 0 {
                 return Err("Model allocation alignment".into());
             }
@@ -153,7 +176,7 @@ impl Executor {
                     )?;
                 }
                 weight_upload_s += t.elapsed().as_secs_f64();
-            } else {
+            } else if stride.is_none() {
                 // SAFETY: Whole allocation is owned and not in use yet.
                 unsafe {
                     check(
@@ -374,7 +397,7 @@ impl Executor {
         let load_to_ready_s = started.elapsed().as_secs_f64();
         let captured_programs: Vec<String> = graphs.keys().cloned().collect();
         eprintln!(
-            "MODEL READY after {load_to_ready_s:.3}s; {buffer_bytes} buffer bytes; cuda_graph={cuda_graph}, {} captured programs",
+            "MODEL READY after {load_to_ready_s:.3}s; {buffer_bytes} resident buffer bytes, {capacity_bytes} capacity bytes; cuda_graph={cuda_graph}, {} captured programs",
             captured_programs.len()
         );
         let device = DeviceInfo {
@@ -392,7 +415,13 @@ impl Executor {
             graphs,
             direct,
             cuda_graph,
+            growth: manifest
+                .kv_cache
+                .as_ref()
+                .map(|kv| kv.growth.clone())
+                .unwrap_or_default(),
             allocations,
+            peak_kv_bytes: std::cell::Cell::new(0),
         };
         let stats = LoadStats {
             manifest_sha256: fingerprint,
@@ -405,6 +434,7 @@ impl Executor {
             cuda_graph,
             captured_programs,
             buffer_bytes,
+            buffer_capacity_bytes: capacity_bytes,
         };
         Ok((executor, stats))
     }
@@ -419,7 +449,14 @@ impl Executor {
     }
     pub(crate) fn reset_sequence(&self, names: &[String]) -> Result<()> {
         self.sync()?;
+        // Return physical KV pages after each request; virtual addresses survive.
+        for buffer in self.session.virtual_buffers.borrow_mut().values_mut() {
+            buffer.release_slabs(&self.session.driver)?;
+        }
         for name in names {
+            if self.session.virtual_buffers.borrow().contains_key(name) {
+                continue;
+            }
             let address = *self
                 .allocations
                 .sequence
@@ -440,6 +477,15 @@ impl Executor {
     pub(crate) fn download_bytes(&self, name: &str, bytes: usize) -> Result<Vec<u8>> {
         if bytes > *self.sizes.get(name).ok_or("Unknown download buffer")? {
             return Err("Download exceeds buffer".into());
+        }
+        if self
+            .session
+            .virtual_buffers
+            .borrow()
+            .get(name)
+            .is_some_and(|b| bytes > b.mapped)
+        {
+            return Err("Download exceeds resident KV extent".into());
         }
         self.sync()?;
         let mut raw = vec![0; bytes];
@@ -488,6 +534,7 @@ impl Executor {
 
     /// Submit the same registered program without adding synchronization points.
     pub(crate) fn submit_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
+        self.ensure_kv(name)?;
         if self.cuda_graph.uses_graph(phase) {
             let graph = *self
                 .graphs
@@ -560,6 +607,52 @@ impl Executor {
             return Ok(());
         }
         Err(format!("Missing direct execution bindings for {name}"))
+    }
+    fn ensure_kv(&self, program: &str) -> Result<()> {
+        let Some(growth) = self.growth.get(program) else {
+            return Ok(());
+        };
+        if self.session.virtual_buffers.borrow().is_empty() {
+            return Ok(());
+        }
+        self.sync()?;
+        let position = usize::try_from(self.read_control(&growth.position)?)
+            .map_err(|_| "Negative KV write position")?;
+        let tokens = position
+            .checked_add(growth.tokens)
+            .ok_or("KV position overflow")?;
+        let mut buffers = self.session.virtual_buffers.borrow_mut();
+        let mut additional = 0usize;
+        for name in &growth.buffers {
+            let b = buffers.get(name).ok_or("Missing demand KV buffer")?;
+            additional = additional
+                .checked_add(b.extent(tokens)?.saturating_sub(b.mapped))
+                .ok_or("KV growth sum overflow")?;
+        }
+        if additional == 0 {
+            return Ok(());
+        }
+        let (mut free, mut total) = (0, 0);
+        // SAFETY: Live context; driver writes two scalar extents.
+        unsafe {
+            check(
+                (self.session.driver.memory_info)(&mut free, &mut total),
+                "KV available memory",
+            )?;
+        }
+        if additional > free {
+            return Err(format!("KV growth needs {additional} bytes, free {free}"));
+        }
+        for name in &growth.buffers {
+            buffers
+                .get_mut(name)
+                .ok_or("Missing KV reservation")?
+                .grow(&self.session, tokens)?;
+        }
+        let resident = buffers.values().map(|b| b.mapped).sum::<usize>();
+        self.peak_kv_bytes
+            .set(self.peak_kv_bytes.get().max(resident));
+        self.sync()
     }
     pub(crate) fn upload_ids(&self, name: &str, ids: &[u32]) -> Result<()> {
         if ids.len() * 4 > self.sizes[name] {

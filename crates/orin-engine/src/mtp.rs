@@ -21,6 +21,9 @@ pub struct Spec {
     pub accepted_inputs: String,
     pub target_length: String,
     pub draft_program: String,
+    /// When present, consume each target prefill chunk before reusing this ring.
+    #[serde(default)]
+    pub hidden_ring: Option<String>,
     pub default_verification_tokens: usize,
     pub warm_plans: Vec<WarmPlan>,
     pub capture_plans: Vec<CapturePlan>,
@@ -101,6 +104,24 @@ impl Spec {
         }
         let max_warm = *warm_sizes.last().ok_or("No MTP warm plans")?;
         let max_verify = *verify_sizes.last().ok_or("No MTP verification plans")?;
+        if let Some(name) = &self.hidden_ring {
+            let buffer = model
+                .buffers
+                .iter()
+                .find(|b| &b.name == name)
+                .ok_or("Missing MTP hidden ring")?;
+            if buffer.dtype != Dtype::F16
+                || buffer.access == Access::Read
+                || buffer.shape.len() != 2
+                || buffer.shape[1] == 0
+                || buffer.shape[0] < model.chunk_tokens.max(max_warm).max(max_verify)
+                || buffer.data.is_some()
+            {
+                return Err(
+                    "MTP hidden ring must hold every capture/warm/verification chunk".into(),
+                );
+            }
+        }
         for (name, rows) in [
             (&self.draft_logits, 1),
             (&self.verification_logits, max_verify),
@@ -383,6 +404,23 @@ mod tests {
             "verification_plans":[{"tokens":4,"program":"execute","restore_program":"execute","capture_program":"execute"}]
         })).unwrap()
     }
+    #[test]
+    fn rejects_hidden_ring_too_small_for_prefill() {
+        let mut model = manifest();
+        let mut spec = spec();
+        spec.hidden_ring = Some("Ring".into());
+        model.buffers.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"Ring","dtype":"f16","shape":[8,16],"layout":"contiguous",
+                "alignment":256,"access":"read_write","data":null
+            }))
+            .unwrap(),
+        );
+        assert!(spec.validate(&model).is_ok());
+        model.buffers.last_mut().unwrap().shape[0] = 4;
+        assert!(spec.validate(&model).is_err());
+    }
+
     #[test]
     fn rejects_control_aliases_missing_capture_and_request_reset() {
         let model = manifest();

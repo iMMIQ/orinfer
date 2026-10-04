@@ -12,7 +12,6 @@ impl ModelRuntime {
         let manifest = &self.manifest;
         let s = &self.execution.session;
         let pointers = &self.execution.pointers;
-        let sizes = &self.execution.sizes;
         let stats = self.stats;
         let output_directory = requests
             .logits_output
@@ -89,19 +88,7 @@ impl ModelRuntime {
                 q.max_new_tokens
             );
             let reset_start = Instant::now();
-            for b in &manifest.reset_buffers {
-                // SAFETY: Validated writable buffers; previous request is complete.
-                unsafe {
-                    check(
-                        (s.driver.memset)(pointers[b], 0, sizes[b], s.stream),
-                        "reset model state",
-                    )?;
-                }
-            }
-            // SAFETY: Complete reset before timing the actual request.
-            unsafe {
-                check((s.driver.stream_sync)(s.stream), "state reset complete")?;
-            }
+            self.execution.reset_sequence(&manifest.reset_buffers)?;
             let reset_s = reset_start.elapsed().as_secs_f64();
             let request_start = Instant::now();
             let mut tokens = vec![];
@@ -234,6 +221,8 @@ impl ModelRuntime {
             cuda_graph: stats.cuda_graph,
             captured_programs: stats.captured_programs,
             buffer_bytes: stats.buffer_bytes,
+            buffer_capacity_bytes: stats.buffer_capacity_bytes,
+            peak_kv_bytes: self.execution.peak_kv_bytes.get(),
             weight_bytes: manifest.weight_bytes,
             effective_weight_bits: 8.0 * manifest.weight_bytes as f64
                 / manifest.weight_parameters as f64,
