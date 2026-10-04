@@ -221,6 +221,9 @@ pub fn sample(
     options: &Options,
     step: usize,
 ) -> Result<u32, String> {
+    if options.temperature == 0.0 {
+        return greedy(logits, history, options);
+    }
     Distribution::from_logits(logits, history, options)?.draw(counter_uniform(
         options.seed,
         0,
@@ -228,9 +231,70 @@ pub fn sample(
     ))
 }
 
+/// Greedy needs neither sorting nor a dense probability distribution. Retain
+/// f64 processors, full-vocabulary validation and total-order tie semantics.
+fn greedy(logits: &[f32], history: &[u32], options: &Options) -> Result<u32, String> {
+    options.validate()?;
+    if logits.is_empty() || logits.len() > u32::MAX as usize {
+        return Err("Invalid sampling logits".into());
+    }
+    let mut counts = vec![0usize; logits.len()];
+    for &id in history {
+        if let Some(count) = counts.get_mut(id as usize) {
+            *count += 1;
+        }
+    }
+    let mut best = (0, f64::NEG_INFINITY);
+    for (id, (&value, &count)) in logits.iter().zip(&counts).enumerate() {
+        if !value.is_finite() {
+            return Err("Invalid sampling logits".into());
+        }
+        let mut score = f64::from(value);
+        if count > 0 {
+            score = if score < 0.0 {
+                score * options.repetition_penalty
+            } else {
+                score / options.repetition_penalty
+            };
+            score -= options.presence_penalty;
+        }
+        score -= options.frequency_penalty * count as f64;
+        if !score.is_finite() {
+            return Err("Nonfinite processed sampling logits".into());
+        }
+        if score.total_cmp(&best.1).is_gt() {
+            best = (id as u32, score);
+        }
+    }
+    Ok(best.0)
+}
+
 #[cfg(test)]
 mod sampling_tests {
     use super::*;
+    #[test]
+    fn greedy_matches_distribution_processors_and_total_order() {
+        for repeat in [0.5, 1.0, 1.05, 2.0, f64::MAX] {
+            for presence in [-2.0, 0.0, 2.0] {
+                for frequency in [-2.0, 0.0, 2.0] {
+                    let options = Options {
+                        temperature: 0.0,
+                        repetition_penalty: repeat,
+                        presence_penalty: presence,
+                        frequency_penalty: frequency,
+                        ..Options::default()
+                    };
+                    for logits in [vec![0.0, -0.0, 1.0, -2.0], vec![-0.0, 0.0], vec![1.0; 7]] {
+                        let history = [0, 0, 2, 6, 100];
+                        let reference = Distribution::from_logits(&logits, &history, &options)
+                            .and_then(|d| d.draw(0.5));
+                        assert_eq!(greedy(&logits, &history, &options), reference);
+                    }
+                }
+            }
+        }
+        assert!(greedy(&[1., f32::NAN], &[], &Options::default()).is_err());
+    }
     #[test]
     fn rounded_mass_does_not_select_an_underflowed_token() {
         let law = Distribution {

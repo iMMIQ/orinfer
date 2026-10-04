@@ -48,6 +48,8 @@ pub struct OperatorPackage {
     pub prefill_profiles: Vec<PrefillProfile>,
     #[serde(default)]
     pub batch_profiles: Vec<usize>,
+    #[serde(default)]
+    pub greedy_sampling: bool,
     pub buffer_contracts: Vec<BufferContract>,
     pub kernels: Vec<Kernel>,
     pub toolchain: BTreeMap<String, String>,

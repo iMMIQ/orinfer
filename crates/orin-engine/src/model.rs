@@ -45,6 +45,8 @@ pub struct Manifest {
     #[serde(skip)]
     pub(crate) batch_profiles: Vec<usize>,
     #[serde(skip)]
+    pub(crate) greedy_sampling: bool,
+    #[serde(skip)]
     pub(crate) batch_layout: Option<crate::architecture::BatchLayout>,
 }
 

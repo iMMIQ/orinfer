@@ -86,6 +86,7 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
         .metadata
         .batch_profiles
         .clone_from(&package.batch_profiles);
+    model.metadata.greedy_sampling = package.greedy_sampling;
     let decode_programs =
         architecture::build(&config, &mut model.metadata, &package.prefill_profiles)?;
     model.metadata.kernels = package.kernels;

@@ -51,7 +51,9 @@ CLI接收token-ID请求，输出包含生成token、加载时间和请求时延�
 
 包含批处理算子的模型自动启用continuous batching。默认最多32个活跃请求，混合prefill/decode每轮最多128个target计算tokens；`--max-active-requests 1..128`和`--max-batch-tokens 1..128`调整上限，活跃数还受请求的完整上下文/输出预算、共享prefill workspace及可用显存约束。`--memory-reserve-mib 1024`保留显存余量；不足时先收缩prefix cache，再让新请求排队。权重只常驻一份，私有KV虚拟地址按请求上下文预算预留，空闲槽位扩容时重建相关Graph。新请求加入与结束按迭代处理，断连后释放其槽位，慢客户端输出通过有界非阻塞缓冲传送。
 
-单独prefill使用原有512/2048大块计划；与decode混合时按预测耗时选择1/2/4/8/32/64/128-token块，`--prefill-budget-ms 200`是混合块的预测时间目标，首轮估计和不可切分的视觉编码/缓存复制可能超过它。投影与FFN按总行数合批，attention/GDN保持每请求独立。2/4/8/16/32/64/128行共用离线编译的动态行数kernel，其他大小补齐到下一档，填充行不进入请求状态。旧算子包继续串行执行，`/health.continuous_batching`报告实际模式；离线升级见[模型构建](tools/model/README.md)。
+单独prefill使用原有512/2048大块计划；与decode混合时按预测耗时选择1/2/4/8/32/64/128-token块，`--prefill-budget-ms 200`是混合块的预测时间目标，首轮估计和不可切分的视觉编码/缓存复制可能超过它。投影与FFN按总行数合批，attention/GDN保持每请求独立。算子包覆盖2/4/8/16/32/64/128行，可为常见小batch加入固定行数投影，其他大小补齐到下一档，填充行不进入请求状态。Graph命中时直接重放，不重建执行计划。不含批处理算子的包继续串行执行，`/health.continuous_batching`报告实际模式；离线升级见[模型构建](tools/model/README.md)。
+
+包含`greedy_sampling`能力的算子包在GPU执行带历史惩罚的零温度token选择，使用FP64运算、完整历史词频和确定性的并列排序，不逐步下载完整logits；每请求约2 MiB临时缓冲。正温度及MTP接受/拒绝的分布计算保留CPU路径。
 
 `serve`和`run-model`支持`--cuda-graph decode_only|full|off`，默认`decode_only`。`decode_only`只在生成阶段使用Graph，包含普通decode及MTP草稿、验证、恢复和短步刷新；文本prefill、视觉编码及MTP首次预热直接提交。prefill尾部即使复用decode计划也不使用Graph。`full`捕获并使用全部执行计划；`off`按相同计划逐个提交kernel、copy和memset。Graph模式通过显式加载配置传入引擎。
 

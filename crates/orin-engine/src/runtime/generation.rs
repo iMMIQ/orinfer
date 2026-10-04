@@ -249,6 +249,32 @@ impl ModelRuntime {
         if self.read_control(&m.status)? != 0 {
             return Err("Model token status failure".into());
         }
+        if m.greedy_sampling && options.temperature == 0.0 && !options.is_greedy() {
+            options.validate()?;
+            // Counts are rebuilt from the authoritative history, including the
+            // entire prompt on prefix hits and each speculative commit. They
+            // never enter the prefix cache or depend on a resident batch lane.
+            self.upload_ids("SamplingHistory", history)?;
+            self.upload_ids("SamplingLength", &[history.len() as u32])?;
+            let parameters: Vec<u8> = [
+                options.repetition_penalty,
+                options.presence_penalty,
+                options.frequency_penalty,
+            ]
+            .into_iter()
+            .flat_map(f64::to_le_bytes)
+            .collect();
+            self.upload_bytes("SamplingParameters", &parameters)?;
+            self.launch_program("greedy_sampling", ExecutionPhase::Decode)?;
+            if self.read_control(&m.status)? != 0 {
+                return Err("Nonfinite processed sampling logits".into());
+            }
+            let token = self.read_control(&m.token)?;
+            if token < 0 || token as usize >= m.vocab {
+                return Err("Selected token outside vocabulary".into());
+            }
+            return Ok(token as u32);
+        }
         if options.is_greedy() {
             let value = self.read_control(&m.token)?;
             if value < 0 || value as usize >= m.vocab {

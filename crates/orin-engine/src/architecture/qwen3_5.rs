@@ -267,6 +267,26 @@ pub(super) fn build(
         return Err("Operator package lacks the model's maximum prefill chunk".into());
     }
     b.text("decode", &DECODE, 1)?;
+    if manifest.greedy_sampling {
+        b.programs.insert(
+            "greedy_sampling".into(),
+            vec![
+                Operation::Zero {
+                    destination: "SamplingCounts".into(),
+                    bytes: manifest.vocab * 4,
+                },
+                Operation::Kernel {
+                    name: "greedy_sampling/count".into(),
+                },
+                Operation::Kernel {
+                    name: "greedy_sampling/partials".into(),
+                },
+                Operation::Kernel {
+                    name: "greedy_sampling/merge".into(),
+                },
+            ],
+        );
+    }
     batching::register(config, manifest, profiles, &mut b)?;
     b.programs.insert(
         "prefill".into(),

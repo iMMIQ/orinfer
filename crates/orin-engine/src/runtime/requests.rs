@@ -3,6 +3,8 @@
 use super::*;
 use crate::{architecture::BatchSegment, prefix::Media, scheduler};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+mod profile;
 mod speculation;
 #[cfg(test)]
 mod tests;
@@ -478,6 +480,8 @@ impl ModelRuntime {
         requests: &mut [&mut RequestState],
         options: &scheduler::Options,
     ) -> Result<Vec<StepOutput>> {
+        #[cfg(test)]
+        profile::mark("entry");
         options.validate()?;
         for r in requests.iter() {
             if r.owner != self.owner_id || r.released {
@@ -657,6 +661,8 @@ impl ModelRuntime {
                 tokens,
             })
             .collect();
+        #[cfg(test)]
+        profile::mark("policy");
         for &(i, chunk) in &selected {
             let req = &mut requests[i];
             self.execution.activate_sequence(req.slot)?;
@@ -679,15 +685,23 @@ impl ModelRuntime {
             };
             self.execution.ensure_sequence_program(req.slot, &program)?;
         }
-        let plan = crate::architecture::batch_plan(&self.manifest, &segments)?;
+        #[cfg(test)]
+        profile::mark("inputs");
         let decode_only = selected.iter().all(|(i, _)| !requests[*i].prefilling);
+        let graph_key: Vec<_> = segments.iter().map(|s| (s.slot, s.tokens)).collect();
+        let plan = if self.execution.has_batch_graph(&graph_key, decode_only) {
+            Vec::new()
+        } else {
+            crate::architecture::batch_plan(&self.manifest, &segments)?
+        };
+        #[cfg(test)]
+        profile::mark("plan");
         let key = Self::iteration_key(requests, &selected);
         let compute_at = Instant::now();
-        self.execution.execute_batch(
-            segments.iter().map(|s| (s.slot, s.tokens)).collect(),
-            &plan,
-            decode_only,
-        )?;
+        self.execution
+            .execute_batch(graph_key, &plan, decode_only)?;
+        #[cfg(test)]
+        profile::mark("execute");
         let seconds = compute_at.elapsed().as_secs_f64();
         self.iteration_costs
             .entry(key)
@@ -716,6 +730,8 @@ impl ModelRuntime {
             }
         }
         self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
+        #[cfg(test)]
+        profile::mark("commit");
         Ok(output)
     }
     fn commit_ordinary_token(&mut self, req: &mut RequestState) -> Result<Vec<u32>> {

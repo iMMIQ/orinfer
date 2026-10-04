@@ -16,6 +16,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--static-rows', action='store_true')
+    parser.add_argument('--tile-n', type=int, choices=(64,128,256))
     args = parser.parse_args()
     configure()
     weights = args.model / 'cache/weights'
@@ -39,9 +41,13 @@ def main():
         k, split = groups*128, 8 if family == 'Down' else 1
         dtype = 'float32' if split > 1 else 'float16'
         tile_n = 64 if split > 1 else 128
-        base = w4_small_m(None,n,k,split,dtype,TILE_N=tile_n,weight_layout='i8')
-        fast = w4_small_m(None,n,k,split,dtype,TILE_N=tile_n,weight_layout='i8',byte_permute=True,vector_words=4)
-        for rows in [1,2,3,4,8,17,32,65,128]:
+        base = w4_small_m(None,n,k,split,dtype,TILE_N=tile_n,weight_layout='i8',byte_permute=True,vector_words=4)
+        fast = w4_small_m(None,n,k,split,dtype,TILE_N=args.tile_n or tile_n,
+                          weight_layout='i8',byte_permute=True,vector_words=4)
+        for rows in [1,2,3,4,8,16,17,31,32,33,65,128]:
+            if args.static_rows:
+                fast = w4_small_m(rows,n,k,split,dtype,TILE_N=args.tile_n or tile_n,
+                                  weight_layout='i8',byte_permute=True,vector_words=4)
             a = torch.randn((rows,k),device='cuda',dtype=torch.float16)*0.1
             golden = torch.empty((split,rows,n),device='cuda',dtype=getattr(torch,dtype))
             guarded = torch.full((split*rows*n+256,),123.,device='cuda',dtype=getattr(torch,dtype))
@@ -58,7 +64,7 @@ def main():
             a.copy_(saved); graph.replay(); torch.cuda.synchronize()
             assert torch.equal(initial,result), 'Graph restoration differs'
             assert bool((guarded[-256:]==123.).all()), 'Graph overwrote tail'
-            report['cases'].append(dict(family=family,rows=rows,exact_equal=True,tail_safe=True,
+            report['cases'].append(dict(family=family,rows=rows,static_rows=args.static_rows,tile_n=args.tile_n or tile_n,exact_equal=True,tail_safe=True,
                 graph_zero_restore=True,baseline=before,optimized=after))
             write_json(args.output/'result.json',report)
             print(family,rows,'passed',flush=True)

@@ -124,6 +124,17 @@ python3 tools/model/prepare.py \
 
 ### 连续批处理
 
+已有批处理算子包可加入GPU历史惩罚greedy；`--specialize-projections`同时加入27B的B4/B8 GateUp及B2/B4/B8 Down固定行数kernel。其他行数仍由动态kernel处理，权重payload保持不变，输出是独立的新模型目录：
+
+```bash
+make build
+bash tools/operators/run.sh tools/model/optimize_decode.py artifacts/operators/decode-optimized \
+  --model /path/to/prepared-batch-model --model-output /path/to/new-model \
+  --specialize-projections
+```
+
+`validate_greedy_sampling.py`验证FP64历史惩罚、并列排序、非有限值和改输入的Graph replay；`validate_batch_projection.py --static-rows`用真实权重对照动态行数投影，检查逐元素输出、非对齐尾部和Graph。完整模型仍需执行`validate_continuous_requests`并测试实际API并发，不能以kernel微测代替吞吐验收。
+
 含原生MTP、直接INT8 KV以及当前27B投影布局的prepared模型，可离线加入批处理算子与32/64/128-token混合prefill计划：
 
 ```bash

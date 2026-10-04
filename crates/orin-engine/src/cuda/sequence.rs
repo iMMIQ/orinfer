@@ -524,6 +524,13 @@ impl Executor {
         self.graphs.borrow_mut().insert(name.into(), graph);
         Ok(graph)
     }
+    /// Query after ensuring every segment's KV mapping: arena growth invalidates
+    /// captures. The sole worker cannot change the cache between this and replay.
+    pub(crate) fn has_batch_graph(&self, key: &[(usize, usize)], decode: bool) -> bool {
+        (self.cuda_graph == crate::execution::CudaGraphMode::Full
+            || (decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly))
+            && self.batch_graphs.borrow().contains_key(key)
+    }
     pub(crate) fn execute_batch(
         &self,
         key: Vec<(usize, usize)>,
@@ -591,6 +598,172 @@ impl Executor {
             }
         }
         self.sync()
+    }
+}
+
+#[cfg(test)]
+impl Executor {
+    fn profile_events(&mut self, count: usize) -> Result<Vec<Handle>> {
+        let mut events = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut event = ptr::null_mut();
+            // SAFETY: Live context; transfer ownership before any further error.
+            unsafe {
+                check(
+                    (self.session.driver.event_create)(&mut event, 0),
+                    "profile event",
+                )?;
+            }
+            self.session.events.push(event);
+            events.push(event);
+        }
+        Ok(events)
+    }
+    pub(crate) fn profile_hot_graph(
+        &mut self,
+        key: &[(usize, usize)],
+        repetitions: usize,
+    ) -> Result<Vec<f32>> {
+        let graph = if key.len() == 1 {
+            self.program_graph("decode")?
+        } else {
+            self.batch_graphs
+                .borrow()
+                .get(key)
+                .ok_or("Missing hot batch graph")?
+                .0
+        };
+        let events = self.profile_events(2)?;
+        let mut times = vec![];
+        for _ in 0..repetitions {
+            let mut ms = 0.;
+            // SAFETY: Stable graph bindings, owned events and worker stream.
+            unsafe {
+                check(
+                    (self.session.driver.event_record)(events[0], self.session.stream),
+                    "profile start",
+                )?;
+                check(
+                    (self.session.driver.graph_launch)(graph, self.session.stream),
+                    "profile replay",
+                )?;
+                check(
+                    (self.session.driver.event_record)(events[1], self.session.stream),
+                    "profile end",
+                )?;
+                check(
+                    (self.session.driver.event_sync)(events[1]),
+                    "profile completion",
+                )?;
+                check(
+                    (self.session.driver.event_elapsed)(&mut ms, events[0], events[1]),
+                    "profile elapsed",
+                )?;
+            }
+            times.push(ms);
+        }
+        Ok(times)
+    }
+    pub(crate) fn profile_graph_operations(
+        &mut self,
+        operations: &[Invocation],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.sync()?;
+        let events = self.profile_events(operations.len() + 1)?;
+        type Record = unsafe extern "C" fn(Handle, Handle, u32) -> i32;
+        // SAFETY: Driver library outlives the symbol; signature is CUDA 12.6 ABI.
+        let record = unsafe {
+            *self
+                .session
+                .driver
+                ._library
+                .get::<Record>(b"cuEventRecordWithFlags\0")
+                .map_err(|e| e.to_string())?
+        };
+        // SAFETY: Sole stream owner; external event nodes retain timestamps in replay.
+        unsafe {
+            check(
+                (self.session.driver.capture_begin)(self.session.stream, 0),
+                "profile capture",
+            )?;
+        }
+        let result = (|| -> Result<()> {
+            for (i, operation) in operations.iter().enumerate() {
+                // SAFETY: Owned event, during capture; CU_EVENT_RECORD_EXTERNAL=1.
+                unsafe {
+                    check(
+                        record(events[i], self.session.stream, 1),
+                        "profile boundary",
+                    )?;
+                }
+                self.invoke(operation)?;
+            }
+            // SAFETY: Last event records completion of all captured operations.
+            unsafe {
+                check(
+                    record(*events.last().unwrap(), self.session.stream, 1),
+                    "profile last boundary",
+                )?;
+            }
+            Ok(())
+        })();
+        let mut graph = ptr::null_mut();
+        // SAFETY: Always terminate capture after either success or failure.
+        let end = unsafe {
+            check(
+                (self.session.driver.capture_end)(self.session.stream, &mut graph),
+                "profile capture end",
+            )
+        };
+        if let Err(error) = result.and(end) {
+            if !graph.is_null() {
+                // SAFETY: Failed graph has no other owner.
+                unsafe {
+                    (self.session.driver.graph_destroy)(graph);
+                }
+            }
+            return Err(error);
+        }
+        let mut exec = ptr::null_mut();
+        // SAFETY: Locally owned graph transferred to session on success.
+        unsafe {
+            if let Err(error) = check(
+                (self.session.driver.graph_instantiate)(&mut exec, graph, 0),
+                "profile instantiate",
+            ) {
+                (self.session.driver.graph_destroy)(graph);
+                return Err(error);
+            }
+        }
+        self.session.graphs.borrow_mut().push((graph, exec));
+        let mut trials = vec![];
+        for trial in 0..4 {
+            // SAFETY: All request buffers are retained; bounded extra steps fit reservations.
+            unsafe {
+                check(
+                    (self.session.driver.graph_launch)(exec, self.session.stream),
+                    "profile operation replay",
+                )?;
+            }
+            self.sync()?;
+            if trial == 0 {
+                continue;
+            }
+            let mut times = vec![];
+            for pair in events.windows(2) {
+                let mut ms = 0.;
+                // SAFETY: Events completed on the same stream in replay order.
+                unsafe {
+                    check(
+                        (self.session.driver.event_elapsed)(&mut ms, pair[0], pair[1]),
+                        "profile operation elapsed",
+                    )?;
+                }
+                times.push(ms);
+            }
+            trials.push(times);
+        }
+        Ok(trials)
     }
 }
 
