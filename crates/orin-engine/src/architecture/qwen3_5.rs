@@ -3,6 +3,7 @@
 use super::*;
 use Extent::{Hidden, History, Residual, State, Token};
 use Step::{Copy as C, Kernel as K, Zero as Z};
+pub(super) mod batching;
 
 const CHUNK_LUT4: Recipe = Recipe {
     begin: &[K(0), K(1), Z("R0", Residual)],
@@ -230,6 +231,24 @@ pub(super) fn build(
             PrefillKind::ChunkLut4 => &CHUNK_LUT4,
             PrefillKind::ChunkExpanded => &CHUNK_EXPANDED,
             PrefillKind::Sequence => &SEQUENCE,
+            PrefillKind::Recurrent => &Recipe {
+                begin: SEQUENCE.begin,
+                gdn: DECODE.gdn,
+                attention: &[
+                    K(0),
+                    K(1),
+                    K(2),
+                    K(3),
+                    K(5),
+                    K(6),
+                    K(7),
+                    K(8),
+                    K(9),
+                    K(10),
+                    K(11),
+                ],
+                end: SEQUENCE.end,
+            },
         };
         let prefill = format!("prefill_m{}", profile.tokens);
         let head = format!("head_m{}", profile.tokens);
@@ -248,6 +267,7 @@ pub(super) fn build(
         return Err("Operator package lacks the model's maximum prefill chunk".into());
     }
     b.text("decode", &DECODE, 1)?;
+    batching::register(config, manifest, profiles, &mut b)?;
     b.programs.insert(
         "prefill".into(),
         b.programs[&format!("prefill_m{}", manifest.chunk_tokens)].clone(),
@@ -364,7 +384,8 @@ pub(super) fn build(
             // Chunk recipes retain their stable slot numbering but omit gather.
             for (program, ops) in &mut b.programs {
                 let chunk = profiles.iter().any(|p| {
-                    p.kind != PrefillKind::Sequence && program == &format!("prefill_m{}", p.tokens)
+                    matches!(p.kind, PrefillKind::ChunkExpanded | PrefillKind::ChunkLut4)
+                        && program == &format!("prefill_m{}", p.tokens)
                 });
                 if chunk || program == "prefill" {
                     for (layer, kind) in config.text.layer_types.iter().enumerate() {
@@ -419,7 +440,7 @@ pub(super) fn build(
                 || (!mtp
                     && (program == "prefill"
                         || profiles.iter().any(|p| {
-                            p.kind != PrefillKind::Sequence
+                            matches!(p.kind, PrefillKind::ChunkExpanded | PrefillKind::ChunkLut4)
                                 && program == &format!("prefill_m{}", p.tokens)
                         })))
             {

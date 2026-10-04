@@ -1,4 +1,5 @@
 mod chat;
+mod continuous;
 mod image;
 mod output;
 
@@ -36,6 +37,7 @@ struct Settings {
     gpu_lock: PathBuf,
     cuda_graph: CudaGraphMode,
     prefix_cache_bytes: usize,
+    scheduler: orin_engine::scheduler::Options,
 }
 impl Settings {
     fn parse(args: &[String]) -> Result<Self> {
@@ -50,6 +52,7 @@ impl Settings {
             gpu_lock: "artifacts/gpu-experiment.lock".into(),
             cuda_graph: CudaGraphMode::default(),
             prefix_cache_bytes: 12 * 1024 * 1024 * 1024,
+            scheduler: Default::default(),
         };
         for pair in args[1..].chunks(2) {
             if pair.len() != 2 {
@@ -63,12 +66,30 @@ impl Settings {
                 "--prefix-cache-mib" => {
                     settings.prefix_cache_bytes = orin_engine::execution::parse_cache_mib(&pair[1])?
                 }
+                "--max-active-requests" => {
+                    settings.scheduler.max_active = pair[1]
+                        .parse()
+                        .map_err(|_| "Invalid active request limit")?
+                }
+                "--max-batch-tokens" => {
+                    settings.scheduler.max_batch_tokens =
+                        pair[1].parse().map_err(|_| "Invalid batch token limit")?
+                }
+                "--prefill-budget-ms" => {
+                    settings.scheduler.prefill_budget_ms =
+                        pair[1].parse().map_err(|_| "Invalid prefill time budget")?
+                }
+                "--memory-reserve-mib" => {
+                    settings.scheduler.memory_reserve_bytes =
+                        orin_engine::execution::parse_cache_mib(&pair[1])?
+                }
                 _ => return Err(format!("Unknown server option {}", pair[0])),
             }
         }
         if settings.model.is_empty() {
             return Err("Model ID cannot be empty".into());
         }
+        settings.scheduler.validate()?;
         Ok(settings)
     }
 }
@@ -126,6 +147,36 @@ mod settings_tests {
             );
         }
     }
+
+    #[test]
+    fn scheduler_limits_and_time_budget_are_validated() {
+        let directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let settings = Settings::parse(&[
+            directory.clone(),
+            "--max-active-requests".into(),
+            "8".into(),
+            "--max-batch-tokens".into(),
+            "64".into(),
+            "--prefill-budget-ms".into(),
+            "150".into(),
+            "--memory-reserve-mib".into(),
+            "2048".into(),
+        ])
+        .unwrap();
+        assert_eq!(settings.scheduler.max_active, 8);
+        assert_eq!(settings.scheduler.max_batch_tokens, 64);
+        assert_eq!(settings.scheduler.prefill_budget_ms, 150.);
+        assert_eq!(settings.scheduler.memory_reserve_bytes, 2 << 30);
+        for (name, value) in [
+            ("--max-active-requests", "0"),
+            ("--max-active-requests", "129"),
+            ("--max-batch-tokens", "0"),
+            ("--prefill-budget-ms", "NaN"),
+            ("--prefill-budget-ms", "-1"),
+        ] {
+            assert!(Settings::parse(&[directory.clone(), name.into(), value.into()]).is_err());
+        }
+    }
 }
 #[derive(Clone)]
 struct Service {
@@ -137,6 +188,9 @@ struct Service {
     vision: Option<orin_engine::vision::VisionSpec>,
     api_key: Option<Arc<str>>,
     ids: Arc<AtomicU64>,
+    scheduler: orin_engine::scheduler::Options,
+    batching: bool,
+    activity: Arc<continuous::Activity>,
 }
 struct Job {
     _slot: tokio::sync::OwnedSemaphorePermit,
@@ -170,6 +224,9 @@ async fn serve(settings: Settings) -> Result<()> {
     let worker_codec = Arc::clone(&codec);
     let worker_model = Arc::clone(&model_id);
     let worker_shutdown = Arc::clone(&shutdown);
+    let scheduler = settings.scheduler;
+    let activity = Arc::new(continuous::Activity::default());
+    let worker_activity = Arc::clone(&activity);
     let worker = std::thread::Builder::new()
         .name("orin-gpu".into())
         .spawn(move || {
@@ -206,18 +263,31 @@ async fn serve(settings: Settings) -> Result<()> {
                 }
                 let context = model.max_context();
                 let vision = model.vision().cloned();
-                Ok((lock, model, context, vision))
+                let batching = model.batching_supported();
+                Ok((lock, model, context, vision, batching))
             };
             match initialize() {
-                Ok((_lock, mut model, context, vision)) => {
-                    if ready_sender.send(Ok((context, vision))).is_ok() {
-                        worker_loop(
-                            &mut model,
-                            receiver,
-                            &worker_codec,
-                            &worker_model,
-                            &worker_shutdown,
-                        );
+                Ok((_lock, mut model, context, vision, batching)) => {
+                    if ready_sender.send(Ok((context, vision, batching))).is_ok() {
+                        if batching {
+                            continuous::worker(
+                                &mut model,
+                                receiver,
+                                &worker_codec,
+                                &worker_model,
+                                &worker_shutdown,
+                                scheduler,
+                                &worker_activity,
+                            );
+                        } else {
+                            worker_loop(
+                                &mut model,
+                                receiver,
+                                &worker_codec,
+                                &worker_model,
+                                &worker_shutdown,
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -226,10 +296,10 @@ async fn serve(settings: Settings) -> Result<()> {
             }
         })
         .map_err(|e| e.to_string())?;
-    let (context, vision) = ready_receiver.await.map_err(|e| e.to_string())??;
+    let (context, vision, batching) = ready_receiver.await.map_err(|e| e.to_string())??;
     let state = Service {
         jobs: sender,
-        slots: Arc::new(tokio::sync::Semaphore::new(129)),
+        slots: Arc::new(tokio::sync::Semaphore::new(128 + scheduler.max_active)),
         codec,
         model: model_id,
         context,
@@ -239,6 +309,9 @@ async fn serve(settings: Settings) -> Result<()> {
             .filter(|s| !s.is_empty())
             .map(Arc::from),
         ids: Arc::new(AtomicU64::new(0)),
+        scheduler,
+        batching,
+        activity,
     };
     let router = Router::new()
         .route("/health", get(health))
@@ -250,8 +323,8 @@ async fn serve(settings: Settings) -> Result<()> {
         .await
         .map_err(|e| e.to_string())?;
     eprintln!(
-        "API READY http://{}/v1; context {context}; one GPU worker, queue 128",
-        settings.listen
+        "API READY http://{}/v1; context {context}; continuous_batching={batching}, max_active={}, queue 128",
+        settings.listen, scheduler.max_active
     );
     let signal_shutdown = Arc::clone(&shutdown);
     let result = axum::serve(listener, router)
@@ -286,7 +359,13 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({"error":{"message":message.into(),"type":kind,"param":null,"code":status.as_u16().to_string()}}))).into_response()
 }
 async fn health(State(state): State<Service>) -> Json<Value> {
-    Json(json!({"status":"ready","model":state.model.as_ref(),"max_context":state.context}))
+    Json(
+        json!({"status":"ready","model":state.model.as_ref(),"max_context":state.context,
+        "continuous_batching":state.batching,"scheduler":state.scheduler,
+        "scheduler_statistics":state.activity.statistics.lock().ok().map(|s| s.clone()),
+        "active_requests":state.activity.active.load(Ordering::Relaxed),
+        "queued_requests":state.activity.queued.load(Ordering::Relaxed)}),
+    )
 }
 async fn models(State(state): State<Service>, headers: HeaderMap) -> Response {
     if !authorized(&state, &headers) {

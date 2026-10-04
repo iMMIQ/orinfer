@@ -10,6 +10,7 @@ use std::{
     ptr,
     time::Instant,
 };
+mod sequence;
 pub(crate) mod snapshot;
 mod virtual_memory;
 pub(crate) type Handle = *mut c_void;
@@ -195,7 +196,7 @@ pub(crate) struct Session {
     pub(crate) events: Vec<Handle>,
     pub(crate) graph: Handle,
     pub(crate) exec: Handle,
-    pub(crate) graphs: Vec<(Handle, Handle)>,
+    pub(crate) graphs: std::cell::RefCell<Vec<(Handle, Handle)>>,
     pub(crate) capturing: bool,
 }
 impl Session {
@@ -212,7 +213,7 @@ impl Session {
             events: vec![],
             graph: ptr::null_mut(),
             exec: ptr::null_mut(),
-            graphs: vec![],
+            graphs: Default::default(),
             capturing: false,
         }
     }
@@ -252,7 +253,7 @@ impl Session {
                 record((self.driver.graph_destroy)(self.graph), "destroy graph");
                 self.graph = ptr::null_mut();
             }
-            for (graph, exec) in self.graphs.drain(..) {
+            for (graph, exec) in self.graphs.get_mut().drain(..) {
                 record(
                     (self.driver.graph_exec_destroy)(exec),
                     "destroy model graph exec",
@@ -308,6 +309,7 @@ impl Drop for Session {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum Value {
     Pointer(u64),
     I32(i32),

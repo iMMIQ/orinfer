@@ -29,6 +29,7 @@ pub enum PrefillKind {
     ChunkLut4,
     ChunkExpanded,
     Sequence,
+    Recurrent,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -41,6 +42,8 @@ pub struct PrefillProfile {
 #[derive(Debug, Deserialize)]
 pub(crate) struct TextConfig {
     pub hidden_size: usize,
+    #[serde(default)]
+    pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub vocab_size: usize,
     pub layer_types: Vec<String>,
@@ -49,6 +52,27 @@ pub(crate) struct TextConfig {
     pub linear_key_head_dim: usize,
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct BatchLayout {
+    pub layers: Vec<String>,
+    pub row_strides: BTreeMap<String, usize>,
+    pub profiles: BTreeMap<usize, PrefillKind>,
+    pub hidden: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BatchSegment {
+    pub slot: usize,
+    pub tokens: usize,
+}
+
+pub(crate) fn batch_plan(
+    manifest: &Manifest,
+    segments: &[BatchSegment],
+) -> Result<Vec<crate::execution::Invocation>> {
+    qwen3_5::batching::plan(manifest, segments)
 }
 
 pub(crate) struct Configuration {

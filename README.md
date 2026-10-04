@@ -18,7 +18,7 @@ make build
 
 Rust从配置识别注册架构，在代码中生成执行计划；算子包独立保存cubin、ABI、布局和形状契约。加载器先查`ORIN_OPERATOR_CACHE`或`$XDG_CACHE_HOME/orin-llm/operators`（默认`~/.cache/orin-llm/operators`），再查模型内的`cache/operators/`。第一阶段计算策略是INT8为主、质量优先的混合精度，关键路径保留FP16/FP32。`validate-model`校验完整模型；`plan-model`在CPU上输出实际生成的计划。
 
-服务协议位于`orin-api`，CLI只处理命令；`orin-engine`分为加载器、架构注册、算子包、CUDA执行器和生成/视觉/MTP控制模块。权重、请求状态和workspace按作用域分开管理，当前GPU仍逐个处理请求。
+服务协议位于`orin-api`，CLI只处理命令；`orin-engine`分为加载器、架构注册、算子包、CUDA执行器和生成/视觉/MTP控制模块。连续批处理共享权重与workspace，为每个请求保留独立KV、FP32 GDN、卷积、位置、视觉和采样状态。
 模型权重、cubin和编译缓存不包含在源码库中。[离线构建说明](tools/model/README.md)介绍checkpoint转换、kernel导出和模型组装。
 
 ## 运行
@@ -47,7 +47,11 @@ CLI接收token-ID请求，输出包含生成token、加载时间和请求时延�
   --model qwen3.8-27b
 ```
 
-默认监听`0.0.0.0:8088`，可用`--listen HOST:PORT`覆盖。模型目录内保留与权重匹配的`tokenizer.json`、`chat_template.jinja`和`generation_config.json`。Rust直接渲染checkpoint模板并分词。服务只加载一次模型，通过一个GPU worker执行请求；最多128个等待请求，队列满返回429。GPU worker持有`artifacts/gpu-experiment.lock`；可用`--gpu-lock`指定共享锁路径。
+默认监听`0.0.0.0:8088`，可用`--listen HOST:PORT`覆盖。模型目录内保留与权重匹配的`tokenizer.json`、`chat_template.jinja`和`generation_config.json`。Rust直接渲染checkpoint模板并分词。服务只加载一次模型，通过一个GPU worker执行请求；活跃与待处理请求合计有界，默认容量为160（32+128），满时返回429。GPU worker持有`artifacts/gpu-experiment.lock`；可用`--gpu-lock`指定共享锁路径。
+
+包含批处理算子的模型自动启用continuous batching。默认最多32个活跃请求，混合prefill/decode每轮最多128个target计算tokens；`--max-active-requests 1..128`和`--max-batch-tokens 1..128`调整上限，活跃数还受请求的完整上下文/输出预算、共享prefill workspace及可用显存约束。`--memory-reserve-mib 1024`保留显存余量；不足时先收缩prefix cache，再让新请求排队。权重只常驻一份，私有KV虚拟地址按请求上下文预算预留，空闲槽位扩容时重建相关Graph。新请求加入与结束按迭代处理，断连后释放其槽位，慢客户端输出通过有界非阻塞缓冲传送。
+
+单独prefill使用原有512/2048大块计划；与decode混合时按预测耗时选择1/2/4/8/32/64/128-token块，`--prefill-budget-ms 200`是混合块的预测时间目标，首轮估计和不可切分的视觉编码/缓存复制可能超过它。投影与FFN按总行数合批，attention/GDN保持每请求独立。2/4/8/16/32/64/128行共用离线编译的动态行数kernel，其他大小补齐到下一档，填充行不进入请求状态。旧算子包继续串行执行，`/health.continuous_batching`报告实际模式；离线升级见[模型构建](tools/model/README.md)。
 
 `serve`和`run-model`支持`--cuda-graph decode_only|full|off`，默认`decode_only`。`decode_only`只在生成阶段使用Graph，包含普通decode及MTP草稿、验证、恢复和短步刷新；文本prefill、视觉编码及MTP首次预热直接提交。prefill尾部即使复用decode计划也不使用Graph。`full`捕获并使用全部执行计划；`off`按相同计划逐个提交kernel、copy和memset。Graph模式通过显式加载配置传入引擎。
 
@@ -64,17 +68,17 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 提供`GET /health`、`GET /v1/models`和`POST /v1/chat/completions`。设置`ORIN_API_KEY`后，`/v1`请求需要对应的Bearer token。支持文本和图片messages、`tools`、`tool_choice`、`parallel_tool_calls`、SSE deltas/`[DONE]`、usage、EOS、stop、temperature、top_p、top_k、presence/frequency/repetition penalties和seed。temperature、top_p、top_k和repetition_penalty默认采用模型`generation_config.json`，请求可覆盖；presence/frequency penalties默认0。默认关闭thinking；`enable_thinking=true`启用`reasoning_content`输出。默认输出上限512 tokens，可通过`max_tokens`或`max_completion_tokens`调整。
 
-使用包含`mtp`执行计划的模型时，所有支持的采样参数组合及文本、图片、多图请求自动启用MTP，thinking与工具调用沿用相同路径。无惩罚的greedy使用GPU top-1；其他组合对主模型与草稿分别应用相同的历史惩罚、temperature、top-k和top-p，再按`min(1,p/q)`接受草稿，拒绝后从归一化的`(p-q)+`采样修正token，保留主模型的采样分布（[算法来源](https://arxiv.org/abs/2211.17192)）。拒绝时恢复GDN、卷积、位置和有效KV状态。固定seed可复现同模式输出；随机MTP与普通decode不要求同seed输出逐token相同。图片草稿使用对应视觉embedding与MRoPE。输出尾部不足一个验证块时执行普通decode。MTP复用主模型embedding/head，额外草稿权重采用W4；构建方式见[离线构建说明](tools/model/README.md)。API日志记录每个请求的MTP接受数、轮数和分段耗时；是否加速取决于接受率及采样开销。
+使用包含`mtp`执行计划的模型时，所有支持的采样参数组合及文本、图片、多图请求自动启用MTP，thinking与工具调用沿用相同路径。无惩罚的greedy使用GPU top-1；其他组合对主模型与草稿分别应用相同的历史惩罚、temperature、top-k和top-p，再按`min(1,p/q)`接受草稿，拒绝后从归一化的`(p-q)+`采样修正token，保留主模型的采样分布（[算法来源](https://arxiv.org/abs/2211.17192)）。拒绝时恢复GDN、卷积、位置和有效KV状态。固定seed可复现同模式输出；随机MTP与普通decode不要求同seed输出逐token相同。图片草稿使用对应视觉embedding与MRoPE。输出尾部不足一个验证块时执行普通decode。MTP复用主模型embedding/head，额外草稿权重采用W4；构建方式见[离线构建说明](tools/model/README.md)。连续批处理在独立decode请求时使用MTP；2–4个decoder根据实测的每提交token代价选择交替MTP或target batch，更大并发及混合prefill使用target batch。恢复MTP时从私有hidden环追赶草稿状态，若超出环容量则保持普通decode。API日志记录每个请求的MTP接受数、轮数和分段耗时；是否加速取决于接受率及采样开销。
 
 `serve`默认启用prefix cache，`--prefix-cache-mib 12288`设置实际GPU缓存字节预算，`0`关闭；按需分配，不在加载时预占。Rust压缩radix tree寻找兼容的完整状态检查点，结合在线测量的prefill块耗时、剩余输入分块和恢复复制成本选择命中；短前缀会破坏高效大块执行时跳过。KV区间不可变、按引用共享，GDN/卷积/位置/MTP状态独立保存，恢复复制到原有Graph绑定地址。保存最终提示、每8192 tokens的回退检查点，并按执行成本准入实际分叉点及Chat模板提示的系统/历史边界；生成结束时还保存已经计算的输出前缀，最后一个尚未计算的token由下一轮续接。输出检查点没有有效head时只用于继续输入，不能作为完整提示直接采样。检查点数量由字节预算决定，淘汰结合最近使用、复用次数与到最近有效祖先的重算距离。
 
-图片身份包含预处理后的像素和网格，绑定到该图片的第一个特征token；后面的图片变化不影响前面的有效检查点。模型重载后缓存清空。命中免除该段文本主干计算，视觉编码、剩余提示和生成仍执行。服务保持单GPU执行线程，在现有排队请求中优先选择完整前缀命中较长的请求；等待超过两秒后优先处理较早到达的请求，不为凑batch额外等待，最多一个执行请求和128个待处理请求。
+图片身份包含预处理后的像素和网格，绑定到该图片的第一个特征token；后面的图片变化不影响前面的有效检查点。模型重载后缓存清空。命中免除该段文本主干计算，视觉编码、剩余提示和生成仍执行。服务保持单GPU执行线程，按剩余prefill与缓存恢复成本选择待准入请求；等待超过两秒后优先处理较早到达的请求，不为凑batch额外等待。
 
 响应的`usage.prompt_tokens_details.cached_tokens`报告实际恢复的tokens；SSE需请求`stream_options.include_usage=true`。日志分别记录token匹配长度、状态恢复长度、查询/恢复/保存耗时、物理/逻辑字节、共享节省与淘汰数量。公共KV共享可以降低持久缓存占用，恢复仍执行GPU复制；缓存不是paged attention或零复制映射。预算不足或无法分配时跳过缓存保存。GDN继续保留FP32，没有使用近似后缀重建或状态量化；长提示首次计算仍包含完整dense attention，复杂度不变。
 
 模型的XML工具调用会转换成标准`tool_calls`，arguments为JSON字符串。客户端执行工具，并将带`tool_call_id`的`role=tool`消息连同历史再次发送。函数调用完成后才发送该调用的流式delta；工具参数支持结构校验，暂不提供完整JSON Schema约束解码。`tool_choice=required`或指定函数会加入模板指令并校验结果，模型未遵守时返回生成错误。
 
-API支持任意提示长度：优先选择能容纳剩余输入的最大prefill块，不足最小块的真实tokens走M=1图，不会用额外token填充提示。基础512-token计划的尾部最多511 tokens，可能显著增加首token等待时间；MTP manifest额外包含2/4/8-token计划，将M=1尾部缩小到最多1 token。上下文和输出预算超过manifest容量时返回400。`run-model`仍保留固定块性能测试行为。暂不支持视频、音频、n>1、logprobs、JSON约束输出或同时驻留多个请求；等待请求串行执行，客户端断开后停止生成。
+API支持任意提示长度：优先选择能容纳剩余输入的最大prefill块，不足最小块的真实tokens走M=1图，不会用额外token填充提示。基础512-token计划的尾部最多511 tokens，可能显著增加首token等待时间；MTP manifest额外包含2/4/8-token计划，将M=1尾部缩小到最多1 token。上下文和输出预算超过manifest容量时返回400。`run-model`仍保留固定块性能测试行为。暂不支持视频、音频、n>1、logprobs或JSON约束输出；客户端断开后停止其生成。
 
 带视觉编码器的manifest接受用户消息中的`image_url`，支持PNG/JPEG/WebP、HTTP(S) URL和base64 data URI。可按内容顺序交错多张图片与文本，历史消息中的图片也会重新编码。每张图片独立做双向视觉attention，merger输出注入对应image tokens；文本full attention使用交错MRoPE，物理KV位置保持连续。
 
@@ -110,7 +114,8 @@ Smoke工具验证真实模型的文本/SSE、采样、停止词、状态隔离�
 ## 实现
 
 - `crates/orin-engine/`：CUDA Driver封装、manifest校验、权重加载、graph执行、KV/GDN/卷积状态和采样。
-- `crates/orin-cli/`：命令行、Rust tokenizer/chat template、HTTP/SSE和工具协议。
+- `crates/orin-api/`：Rust tokenizer/chat template、HTTP/SSE、调度队列与工具协议。
+- `crates/orin-cli/`：命令行入口。
 - `kernels/operators/`：基础TileLang算子。
 - `kernels/vision/`：视觉encoder、特征注入和MRoPE。
 - `kernels/model/`：模型投影、融合、GDN与attention实现。
@@ -119,7 +124,7 @@ Smoke工具验证真实模型的文本/SSE、采样、停止词、状态隔离�
 
 Prefill使用单份W4权重、临时W8/A8和INT8 Tensor Core；512的FFN使用LUT4融合。Decode直接读取同一份W4，GDN持续状态和累积为FP32。权重含量化元数据约14.794GB，平均4.4003bits；显式CUDA allocations约19.713GB，另有driver/module/graph开销。图文manifest另加约0.921GB视觉权重，来自原始BF16 checkpoint，默认转为FP16存储，合计约4.596bits；默认视觉workspace下显式CUDA allocations约22.021GB。
 
-8704-token容量的分配数字见上。262144-token配置可通过 `tools/model/optimize_kv.py` 使用直接 KV prefill 和 CUDA VMM：加载时固定缓冲区约 18.60 GiB，KV 物理内存按执行位置增长，graph 地址保持稳定；最大 prefill 块为 2048 tokens。FP16 KV 满容量包含主模型和 MTP 共 17 GiB，INT8 group-64 KV 含 FP16 scale 共约 8.77 GiB，长文本 prefill 可共享按需映射的单层 FP16 临时 KV workspace，每 token 4096 字节、256k 上限 1 GiB；decode 直接读取 INT8 KV。另有 driver/module/graph 开销。新请求会回收上一请求的 KV 和临时 workspace 物理映射。构建与验证方法见[模型构建](tools/model/README.md)。
+8704-token容量的分配数字见上。262144-token配置可通过 `tools/model/optimize_kv.py` 使用直接 KV prefill 和 CUDA VMM：加载时固定缓冲区约 18.60 GiB，KV 物理内存按执行位置增长，graph 地址保持稳定；最大 prefill 块为 2048 tokens。FP16 KV 满容量包含主模型和 MTP 共 17 GiB，INT8 group-64 KV 含 FP16 scale 共约 8.77 GiB，长文本 prefill 可共享按需映射的单层 FP16 临时 KV workspace，每 token 4096 字节、256k 上限 1 GiB；decode 直接读取 INT8 KV。另有 driver/module/graph 开销。请求结束时回收其 KV 物理映射；prefill临时workspace由执行线程共享。构建与验证方法见[模型构建](tools/model/README.md)。
 
 ## 性能与限制
 
@@ -131,7 +136,7 @@ Prefill使用单份W4权重、临时W8/A8和INT8 Tensor Core；512的FFN使用LU
 | 2048 | 773.25 | 10.481 |
 | 8192 | 765.88 | 10.223 |
 
-Prefill计时包含输入复制和同步，排除末位置head；decode排除首token，包含逐token复制和同步。上表是关闭MTP时固定块token-ID请求的引擎计时，不包含API分词、排队或M=1输入尾部。当前未提供并行batch。BF16/FP8量化质量评测尚待补充。
+Prefill计时包含输入复制和同步，排除末位置head；decode排除首token，包含逐token复制和同步。上表是关闭MTP时固定块token-ID请求的引擎计时，不包含API分词、排队或M=1输入尾部。上表不代表连续批处理吞吐；并发需通过真实API另测。BF16/FP8量化质量评测尚待补充。
 
 开启MTP后，固定seed20261002、greedy、关闭thinking、单请求128-token代码输出，预热后3次HTTP SSE decode中位数：Python合并排序26.04 TPS、Rust LRU缓存25.11 TPS、TypeScript异步并发映射25.82 TPS。计数通过关闭MTP时的主模型token IDs核对，排除首个输出片段和被拒绝的草稿；完整输出与主模型参考相同。额外MTP草稿权重222,342,144 bytes，含视觉与MTP的常驻权重合计约4.59 bits/parameter。
 

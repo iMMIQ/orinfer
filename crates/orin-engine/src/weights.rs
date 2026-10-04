@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TensorIdentity {
     pub tensor: String,

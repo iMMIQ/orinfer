@@ -12,6 +12,7 @@ impl ModelRuntime {
         cancelled: impl Fn() -> bool,
         emit: impl FnMut(u32) -> bool,
     ) -> Result<usize> {
+        self.execution.prepare_legacy_sequence()?;
         let outcome = self.generate_inner(input, images, limit, options, cancelled, emit);
         self.prefix_hints.clear();
         self.prefix_kv.clear();
@@ -119,6 +120,10 @@ impl ModelRuntime {
             let compute_at = Instant::now();
             let (chunk, head) = if let Some((chunk, program, head)) = selected {
                 self.upload_ids(&m.input, &input[offset..offset + chunk])?;
+                if !m.batch_profiles.is_empty() {
+                    self.upload_ids("BatchSegmentLength", &[chunk as u32])?;
+                    self.upload_ids("BatchLastIndex", &[(chunk - 1) as u32])?;
+                }
                 self.launch_program(&program, ExecutionPhase::Prefill)?;
                 (chunk, Some(head))
             } else {

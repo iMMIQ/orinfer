@@ -14,8 +14,8 @@ HK, HV, DK, DV = 16, 48, 128, 128
 
 @orin_jit
 def gdn_sequence(tokens: int, q_scale: float = 128 ** -.5,
-                 value_tile: int = 32, threads: int = 128):
-    assert 1 <= tokens <= 16 and q_scale > 0
+                 value_tile: int = 32, threads: int = 128, in_place: bool = False):
+    assert 1 <= tokens <= (128 if in_place else 16) and q_scale > 0
     assert value_tile in (16, 32, 64, 128) and threads in (64, 128, 256)
 
     @T.prim_func
@@ -46,7 +46,11 @@ def gdn_sequence(tokens: int, q_scale: float = 128 ** -.5,
                     product[i, j] = state[i, j] * (T.cast(Q[kh, t, i], T.float32) * q_scale)
                 T.reduce_sum(product, result, dim=0)
                 for i, j in T.Parallel(DK, value_tile):
-                    Prefix[t, h, i, bv * value_tile + j] = state[i, j]
+                    if in_place:
+                        if t == tokens - 1:
+                            State[h, i, bv * value_tile + j] = state[i, j]
+                    else:
+                        Prefix[t, h, i, bv * value_tile + j] = state[i, j]
                 for j in T.Parallel(value_tile):
                     Out[t, h * DV + bv * value_tile + j] = result[j]
     return main

@@ -11,13 +11,16 @@ from kernels.operators.op03_ffn_gate_up import _orin_jit, _PAIR_SOURCE
 
 @_orin_jit
 def w4_small_m(M: int, N: int, K: int, SPLIT=1,
-               output_dtype='float16', TILE_N=64, output_layout='flat', weight_layout='f16'):
-    assert 1 <= M <= 2048
+               output_dtype='float16', TILE_N=64, output_layout='flat', weight_layout='f16',
+               byte_permute=False, vector_words=2):
+    assert M is None or 1 <= M <= 2048
+    M = T.dynamic('M') if M is None else M
     assert TILE_N in (64, 128, 256)
     assert N % TILE_N == 0 and K % (128 * SPLIT) == 0
     assert output_dtype in ('float16', 'float32')
     assert output_layout in ('flat', 'qkvz')
     assert weight_layout in ('f16', 'i8')
+    assert vector_words in (2,4)
     if output_layout == 'qkvz':
         assert N == 16384 and SPLIT == 1 and output_dtype == 'float16'
     blocks = TILE_N // 64
@@ -29,7 +32,8 @@ def w4_small_m(M: int, N: int, K: int, SPLIT=1,
         lane, warp = tx % 32, tx // 32
         row, tid = lane // 4, lane % 4
         packed = T.alloc_local((blocks, 8), T.uint32)
-        native = T.alloc_local((2, 2), T.uint32)
+        native = T.alloc_local((2, 8 if vector_words == 4 else 2), T.uint32)
+        pair = T.alloc_local((2,), T.uint32)
         scales = T.alloc_local((blocks * 2,), T.float16)
         zeros = T.alloc_local((blocks * 2,), T.int8)
         ar = T.alloc_local((4,), T.uint32)
@@ -48,17 +52,31 @@ def w4_small_m(M: int, N: int, K: int, SPLIT=1,
                 else:
                     # Reconstruct F16 fragments directly from the resident I8
                     # layout. No second packed copy or full dequantized B.
+                    if vector_words == 4:
+                        for vector in T.unroll(2):
+                            for ni in T.vectorized(4):
+                                native[0,vector*4+ni] = PP[bx*blocks+block,gk,(tx//4)*4+tid//2,vector*4+ni]
+                                native[1,vector*4+ni] = PP[bx*blocks+block,gk,(tx//4)*4+tid//2+2,vector*4+ni]
                     for ki32 in T.unroll(4):
-                        for ni in T.vectorized(2):
-                            native[0, ni] = PP[bx * blocks + block, gk, (tx // 4) * 4 + tid // 2, ki32 * 2 + ni]
-                            native[1, ni] = PP[bx * blocks + block, gk, (tx // 4) * 4 + tid // 2 + 2, ki32 * 2 + ni]
-                        for half in T.unroll(2):
-                            shift = half * 16 + (tid % 2) * 8
-                            packed[block, ki32 * 2 + half] = 0
+                        if vector_words == 2:
+                            for ni in T.vectorized(2):
+                                native[0, ni] = PP[bx * blocks + block, gk, (tx // 4) * 4 + tid // 2, ki32 * 2 + ni]
+                                native[1, ni] = PP[bx * blocks + block, gk, (tx // 4) * 4 + tid // 2 + 2, ki32 * 2 + ni]
+                        if byte_permute:
                             for ni in T.unroll(2):
-                                pair0 = (native[0, ni] >> shift) & 255
-                                pair1 = (native[1, ni] >> shift) & 255
-                                packed[block, ki32 * 2 + half] = packed[block, ki32 * 2 + half] | ((pair0 | (pair1 << 8)) << (ni * 16))
+                                pair[ni] = T.call_pure_extern('uint32','__byte_perm',
+                                    native[0,ki32*2+ni if vector_words==4 else ni],
+                                    native[1,ki32*2+ni if vector_words==4 else ni],T.cast(0x6240+(tid%2)*0x1111,T.uint32))
+                            packed[block,ki32*2] = T.call_pure_extern('uint32','__byte_perm',pair[0],pair[1],T.cast(0x5410,T.uint32))
+                            packed[block,ki32*2+1] = T.call_pure_extern('uint32','__byte_perm',pair[0],pair[1],T.cast(0x7632,T.uint32))
+                        else:
+                            for half in T.unroll(2):
+                                shift = half * 16 + (tid % 2) * 8
+                                packed[block, ki32 * 2 + half] = 0
+                                for ni in T.unroll(2):
+                                    pair0 = (native[0,ki32*2+ni if vector_words==4 else ni] >> shift) & 255
+                                    pair1 = (native[1,ki32*2+ni if vector_words==4 else ni] >> shift) & 255
+                                    packed[block, ki32 * 2 + half] = packed[block, ki32 * 2 + half] | ((pair0 | (pair1 << 8)) << (ni * 16))
             for part in T.unroll(blocks * 2):
                 col = bx * TILE_N + warp * 16 + (part // 2) * 64 + (part % 2) * 8 + row
                 scales[part] = S[col, gk]

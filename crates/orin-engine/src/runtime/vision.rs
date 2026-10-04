@@ -7,6 +7,15 @@ impl ModelRuntime {
         images: &[crate::vision::ImageInput],
         cancelled: &impl Fn() -> bool,
     ) -> Result<()> {
+        self.prepare_visual_capacity(input, images, self.manifest.max_context, cancelled)
+    }
+    pub(super) fn prepare_visual_capacity(
+        &self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+        capacity: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<()> {
         let Some(v) = &self.manifest.vision else {
             return if images.is_empty() {
                 Ok(())
@@ -14,7 +23,7 @@ impl ModelRuntime {
                 Err("Model has no vision adapter".into())
             };
         };
-        let (index, positions) = v.layout(input, images, self.manifest.max_context)?;
+        let (index, positions) = v.layout(input, images, capacity)?;
         if let Some(name) = self
             .manifest
             .mtp

@@ -89,6 +89,12 @@ impl ModelRuntime {
             );
             let reset_start = Instant::now();
             self.execution.reset_sequence(&manifest.reset_buffers)?;
+            if !manifest.batch_profiles.is_empty() {
+                self.execution
+                    .upload_ids("BatchSegmentLength", &[chunk_tokens as u32])?;
+                self.execution
+                    .upload_ids("BatchLastIndex", &[(chunk_tokens - 1) as u32])?;
+            }
             let reset_s = reset_start.elapsed().as_secs_f64();
             let request_start = Instant::now();
             let mut tokens = vec![];

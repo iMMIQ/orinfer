@@ -57,14 +57,17 @@ impl Reservation {
         }
     }
     pub(crate) fn extent(&self, tokens: usize) -> Result<usize> {
-        let raw = tokens
-            .checked_mul(self.stride)
-            .ok_or("KV extent overflow")?;
-        let extent = round_up(raw, self.granularity)?;
+        let extent = self.required_extent(tokens)?;
         if extent > self.bytes {
             return Err("KV growth exceeds reserved context".into());
         }
         Ok(extent)
+    }
+    pub(crate) fn required_extent(&self, tokens: usize) -> Result<usize> {
+        let raw = tokens
+            .checked_mul(self.stride)
+            .ok_or("KV extent overflow")?;
+        round_up(raw, self.granularity)
     }
     pub(crate) fn grow(&mut self, s: &Session, tokens: usize) -> Result<()> {
         let extent = self.extent(tokens)?;
@@ -268,6 +271,7 @@ mod tests {
         assert_eq!(r.extent(1024).unwrap(), 2 << 20);
         assert_eq!(r.extent(1025).unwrap(), 4 << 20);
         assert!(r.extent(2049).is_err());
+        assert_eq!(r.required_extent(2049).unwrap(), 6 << 20);
         let scale = Reservation {
             address: 0,
             bytes: 8 << 20,

@@ -46,6 +46,8 @@ pub struct OperatorPackage {
     pub compute_policy: ComputePolicy,
     pub config_signature: Value,
     pub prefill_profiles: Vec<PrefillProfile>,
+    #[serde(default)]
+    pub batch_profiles: Vec<usize>,
     pub buffer_contracts: Vec<BufferContract>,
     pub kernels: Vec<Kernel>,
     pub toolchain: BTreeMap<String, String>,
@@ -68,6 +70,14 @@ impl OperatorPackage {
         }
         if &self.config_signature != signature {
             return Err("Operator package does not support this model configuration".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if self
+            .batch_profiles
+            .iter()
+            .any(|&b| !(2..=128).contains(&b) || !b.is_power_of_two() || !seen.insert(b))
+        {
+            return Err("Invalid or duplicate batch profile".into());
         }
         let actual: Vec<_> = buffers.iter().map(BufferContract::from).collect();
         if actual != self.buffer_contracts {

@@ -13,6 +13,7 @@ pub mod operators;
 pub mod prefix;
 mod runtime;
 pub mod sampling;
+pub mod scheduler;
 pub mod vision;
 mod weights;
 

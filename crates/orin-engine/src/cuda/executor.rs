@@ -1,16 +1,17 @@
 use super::*;
 use crate::execution::{CudaGraphMode, ExecutionPhase, LoadOptions};
 use std::cell::RefCell;
+type BatchGraphCache = BTreeMap<Vec<(usize, usize)>, (Handle, u64)>;
 
-struct DirectKernel {
-    spec: Kernel,
-    function: Handle,
-    values: Vec<Value>,
+pub(super) struct DirectKernel {
+    pub(super) spec: Kernel,
+    pub(super) function: Handle,
+    pub(super) values: Vec<Value>,
 }
 
-struct DirectPrograms {
-    kernels: RefCell<BTreeMap<String, DirectKernel>>,
-    programs: BTreeMap<String, Vec<crate::model::Operation>>,
+pub(super) struct DirectPrograms {
+    pub(super) kernels: RefCell<BTreeMap<String, DirectKernel>>,
+    pub(super) programs: BTreeMap<String, Vec<crate::model::Operation>>,
 }
 
 /// Execute an architecture adapter's explicit programs with stable allocations.
@@ -20,15 +21,21 @@ pub(crate) struct Executor {
     pub(crate) session: Session,
     pub(crate) pointers: BTreeMap<String, u64>,
     pub(crate) sizes: BTreeMap<String, usize>,
-    pub(crate) graphs: BTreeMap<String, Handle>,
-    direct: Option<DirectPrograms>,
-    cuda_graph: CudaGraphMode,
+    pub(crate) graphs: RefCell<BTreeMap<String, Handle>>,
+    pub(super) direct: Option<DirectPrograms>,
+    pub(super) cuda_graph: CudaGraphMode,
     growth: BTreeMap<String, crate::model::KvGrowth>,
     pub(crate) peak_kv_bytes: std::cell::Cell<usize>,
     pub(crate) peak_prefill_workspace_bytes: std::cell::Cell<usize>,
-    prefill_workspace: std::collections::BTreeSet<String>,
+    pub(super) prefill_workspace: std::collections::BTreeSet<String>,
     pub(crate) allocations: Allocations,
     pub(crate) snapshot_allocations: Vec<std::rc::Rc<super::snapshot::Allocation>>,
+    pub(super) sequences: Vec<super::sequence::Sequence>,
+    pub(super) active_sequence: usize,
+    pub(super) sequence_specs: Vec<crate::artifact::Buffer<crate::weights::TensorIdentity>>,
+    pub(super) sequence_strides: BTreeMap<String, usize>,
+    pub(super) batch_graphs: RefCell<BatchGraphCache>,
+    pub(super) batch_graph_clock: std::cell::Cell<u64>,
 }
 
 /// Logical arenas share one CUDA owner today. Their addresses are separate so
@@ -380,7 +387,7 @@ impl Executor {
                 )?;
             }
             graphs.insert(phase.clone(), s.exec);
-            s.graphs.push((s.graph, s.exec));
+            s.graphs.borrow_mut().push((s.graph, s.exec));
             s.graph = ptr::null_mut();
             s.exec = ptr::null_mut();
         }
@@ -389,7 +396,7 @@ impl Executor {
         } else {
             0.0
         };
-        let direct = (cuda_graph != CudaGraphMode::Full).then(|| DirectPrograms {
+        let direct = Some(DirectPrograms {
             kernels: RefCell::new(
                 launches
                     .into_iter()
@@ -426,7 +433,7 @@ impl Executor {
             session: s,
             pointers,
             sizes,
-            graphs,
+            graphs: RefCell::new(graphs),
             direct,
             cuda_graph,
             growth: manifest
@@ -442,6 +449,17 @@ impl Executor {
                 .as_ref()
                 .map(|kv| kv.prefill_workspace.keys().cloned().collect())
                 .unwrap_or_default(),
+            sequences: vec![super::sequence::Sequence::default()],
+            active_sequence: 0,
+            sequence_specs: manifest
+                .buffers
+                .iter()
+                .filter(|b| scopes[&b.name] == crate::loader::BufferScope::Sequence)
+                .cloned()
+                .collect(),
+            sequence_strides: lazy.map(|kv| kv.buffers.clone()).unwrap_or_default(),
+            batch_graphs: Default::default(),
+            batch_graph_clock: std::cell::Cell::new(0),
         };
         let stats = LoadStats {
             manifest_sha256: fingerprint,
@@ -456,6 +474,15 @@ impl Executor {
             buffer_bytes,
             buffer_capacity_bytes: capacity_bytes,
         };
+        let mut executor = executor;
+        executor.sequences[0].addresses = executor.allocations.sequence.addresses.clone();
+        executor.sequences[0].sizes = executor
+            .allocations
+            .sequence
+            .addresses
+            .keys()
+            .map(|n| (n.clone(), executor.sizes[n]))
+            .collect();
         Ok((executor, stats))
     }
     pub(crate) fn sync(&self) -> Result<()> {
@@ -470,16 +497,16 @@ impl Executor {
     pub(crate) fn reset_sequence(&self, names: &[String]) -> Result<()> {
         self.sync()?;
         // Return physical KV pages after each request; virtual addresses survive.
-        for buffer in self.session.virtual_buffers.borrow_mut().values_mut() {
-            buffer.release_slabs(&self.session.driver)?;
+        for (name, buffer) in self.session.virtual_buffers.borrow_mut().iter_mut() {
+            if self.sequence_strides.contains_key(name) {
+                buffer.release_slabs(&self.session.driver)?;
+            }
         }
         for name in names {
             if self.session.virtual_buffers.borrow().contains_key(name) {
                 continue;
             }
-            let address = *self
-                .allocations
-                .sequence
+            let address = *self.sequences[self.active_sequence]
                 .addresses
                 .get(name)
                 .ok_or_else(|| format!("{name}: reset outside sequence arena"))?;
@@ -556,10 +583,7 @@ impl Executor {
     pub(crate) fn submit_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
         self.ensure_kv(name)?;
         if self.cuda_graph.uses_graph(phase) {
-            let graph = *self
-                .graphs
-                .get(name)
-                .ok_or_else(|| format!("Missing captured program {name} for {phase:?}"))?;
+            let graph = self.program_graph(name)?;
             // SAFETY: Graphs and their stable addresses live in this thread's session.
             unsafe {
                 check(
@@ -580,6 +604,17 @@ impl Executor {
                 match op {
                     Operation::Kernel { name } => {
                         let kernel = kernels.get_mut(name).ok_or("Unbound kernel")?;
+                        // Bind only this submitted kernel's private arguments.
+                        // Switching requests must not walk every kernel in every
+                        // compiled profile; weights and workspace stay fixed.
+                        for (argument, value) in kernel.spec.args.iter().zip(&mut kernel.values) {
+                            if let Argument::Buffer { name } = argument
+                                && let Some(&address) =
+                                    self.sequences[self.active_sequence].addresses.get(name)
+                            {
+                                *value = Value::Pointer(address);
+                            }
+                        }
                         launch_kernel(
                             &kernel.spec,
                             kernel.function,
@@ -628,7 +663,7 @@ impl Executor {
         }
         Err(format!("Missing direct execution bindings for {name}"))
     }
-    fn ensure_kv(&self, program: &str) -> Result<()> {
+    pub(super) fn ensure_kv(&self, program: &str) -> Result<()> {
         let Some(growth) = self.growth.get(program) else {
             return Ok(());
         };

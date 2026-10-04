@@ -32,6 +32,9 @@ impl Costs {
             self.restore_s_per_byte = self.restore_s_per_byte * 0.8 + seconds / bytes as f64 * 0.2;
         }
     }
+    pub fn restore_cost(&self, bytes: usize) -> f64 {
+        bytes as f64 * self.restore_s_per_byte
+    }
     fn span(&self, mut tokens: usize) -> f64 {
         let mut total = 0.;
         for (&chunk, &seconds) in self.shapes.iter().rev() {

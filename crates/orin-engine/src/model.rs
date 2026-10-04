@@ -42,6 +42,10 @@ pub struct Manifest {
     pub vision: Option<crate::vision::VisionSpec>,
     #[serde(default)]
     pub mtp: Option<crate::mtp::Spec>,
+    #[serde(skip)]
+    pub(crate) batch_profiles: Vec<usize>,
+    #[serde(skip)]
+    pub(crate) batch_layout: Option<crate::architecture::BatchLayout>,
 }
 
 /// Storage contract for stable, demand-mapped token-major KV state.
@@ -555,7 +559,45 @@ pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
 
 /// Thread-affine resident model. All CUDA resources remain on the creating thread.
 pub struct Model(crate::runtime::ModelRuntime);
+pub use crate::runtime::requests::{GenerationInput, RequestState, StepOutput};
 impl Model {
+    pub fn batching_supported(&self) -> bool {
+        !self.0.manifest.batch_profiles.is_empty()
+    }
+    pub fn scheduler_statistics(&self) -> &crate::scheduler::Statistics {
+        &self.0.scheduler_statistics
+    }
+    pub fn estimated_request_cost(
+        &self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+    ) -> Result<crate::scheduler::Waiting> {
+        self.0.waiting_cost(input, images)
+    }
+    pub fn can_admit(
+        &mut self,
+        input: &GenerationInput,
+        options: &crate::scheduler::Options,
+    ) -> Result<bool> {
+        self.0.can_admit_request(input, options)
+    }
+    pub fn start_request(
+        &mut self,
+        input: GenerationInput,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<RequestState> {
+        self.0.start_request(input, &cancelled)
+    }
+    pub fn advance_requests(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        options: &crate::scheduler::Options,
+    ) -> Result<Vec<StepOutput>> {
+        self.0.advance_requests(requests, options)
+    }
+    pub fn finish_request(&mut self, request: &mut RequestState, cache: bool) -> Result<()> {
+        self.0.finish_request(request, cache)
+    }
     pub fn load(path: &Path) -> Result<Self> {
         Self::load_with_options(path, LoadOptions::default())
     }

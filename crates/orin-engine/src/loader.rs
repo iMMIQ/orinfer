@@ -82,6 +82,10 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
         &model.metadata.buffers,
     )?;
     validate_scopes(&model.metadata, &model.buffer_scopes)?;
+    model
+        .metadata
+        .batch_profiles
+        .clone_from(&package.batch_profiles);
     let decode_programs =
         architecture::build(&config, &mut model.metadata, &package.prefill_profiles)?;
     model.metadata.kernels = package.kernels;

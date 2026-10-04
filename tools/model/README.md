@@ -122,6 +122,24 @@ python3 tools/model/prepare.py \
 
 ## 独立算子包
 
+### 连续批处理
+
+含原生MTP、直接INT8 KV以及当前27B投影布局的prepared模型，可离线加入批处理算子与32/64/128-token混合prefill计划：
+
+```bash
+make build
+bash tools/operators/run.sh tools/model/upgrade_batching.py artifacts/batch-build \
+  --model /path/to/prepared-model --model-output /path/to/batch-model
+target/release/orin-llm serve /path/to/batch-model \
+  --max-active-requests 32 --max-batch-tokens 128 --prefill-budget-ms 200
+```
+
+工具编译动态行数TileLang投影，按实际host ABI生成2/4/8/16/32/64/128绑定；相同不可变权重与原kernel资产使用hardlink，模型描述和新包独立发布。源码目录中不包含这些二进制资产。Rust先验证注册计划，完成后原子发布新的模型目录；已有目录不覆盖，失败时清理本次临时目录。在线请求不触发编译或量化。
+
+每请求状态驻留独立GPU地址，GDN验证前缀和统计临时量由执行线程共享；混合计划只合并无状态投影，因果attention和FP32 GDN逐段执行，padding不写入请求状态。Graph按有序槽位/段长缓存，地址保持稳定，最多16个batch捕获；新成员组合首次出现需捕获。执行计划由架构模块生成，算子包不提供用户程序。
+
+`orin_engine::model::Model`提供`start_request`、`advance_requests`、`finish_request`，API worker负责队列与输出解析；退出或取消必须调用`finish_request`释放槽位。GPU ignored test `validate_continuous_requests`使用`ORIN_BATCH_FIXTURE`（model/output/cases/cuda_graph，cases包含原生token IDs及sampling），验证批处理输出、全部私有状态的请求隔离、取消/复用、相同历史下的概率/top-3及固定seed重排。这里的概率参考是同权重串行执行，用于检验重构；不会替代BF16/FP8量化质量评测。
+
 已有schema-2 safetensors缓存可离线拆分为新的目录；这是一次性构建工具，在线加载器不读取旧manifest。相同文件系统上的不可变权重与kernel资产通过hardlink复用，避免额外复制整套权重；配置和描述文件独立复制。相关目录在使用期间必须保持不变。
 
 ```bash
