@@ -12,7 +12,7 @@ from kernels.operators.op03_ffn_gate_up import _orin_jit, _PAIR_SOURCE
 @_orin_jit
 def w4_small_m(M: int, N: int, K: int, SPLIT=1,
                output_dtype='float16', TILE_N=64, output_layout='flat', weight_layout='f16'):
-    assert 1 <= M <= 16
+    assert 1 <= M <= 2048
     assert TILE_N in (64, 128, 256)
     assert N % TILE_N == 0 and K % (128 * SPLIT) == 0
     assert output_dtype in ('float16', 'float32')
@@ -23,7 +23,7 @@ def w4_small_m(M: int, N: int, K: int, SPLIT=1,
     blocks = TILE_N // 64
 
     @T.macro
-    def multiply(A, PP, S, Z, bx, sk, acc):
+    def multiply(A, PP, S, Z, bx, sk, my, acc):
         T.import_source(_PAIR_SOURCE)
         tx = T.get_thread_binding()
         lane, warp = tx % 32, tx // 32
@@ -65,12 +65,12 @@ def w4_small_m(M: int, N: int, K: int, SPLIT=1,
                 zeros[part] = Z[col, gk]
             for ki in T.unroll(8):
                 for half in T.unroll(2):
-                    if row + half * 8 < M:
+                    if my * 16 + row + half * 8 < M:
                         col = gk * 128 + ki * 16 + tid * 2
-                        ar[half] = (T.cast(T.reinterpret(T.uint16, A[row + half * 8, col]), T.uint32)
-                                    | (T.cast(T.reinterpret(T.uint16, A[row + half * 8, col + 1]), T.uint32) << 16))
-                        ar[half + 2] = (T.cast(T.reinterpret(T.uint16, A[row + half * 8, col + 8]), T.uint32)
-                                        | (T.cast(T.reinterpret(T.uint16, A[row + half * 8, col + 9]), T.uint32) << 16))
+                        ar[half] = (T.cast(T.reinterpret(T.uint16, A[my * 16 + row + half * 8, col]), T.uint32)
+                                    | (T.cast(T.reinterpret(T.uint16, A[my * 16 + row + half * 8, col + 1]), T.uint32) << 16))
+                        ar[half + 2] = (T.cast(T.reinterpret(T.uint16, A[my * 16 + row + half * 8, col + 8]), T.uint32)
+                                        | (T.cast(T.reinterpret(T.uint16, A[my * 16 + row + half * 8, col + 9]), T.uint32) << 16))
                 for part in T.unroll(blocks * 2):
                     br[0] = T.call_pure_extern('uint32', 'op03_deq_pair',
                         T.cast((packed[part // 2, ki] >> ((part % 2) * 16)) & 255, T.uint8), scales[part], zeros[part])
@@ -87,20 +87,20 @@ def w4_small_m(M: int, N: int, K: int, SPLIT=1,
                  Z: T.Tensor((N, K // 128), T.int8),
                  QKV: T.Tensor((M, 10240), T.float16),
                  ZOUT: T.Tensor((M, 6144), T.float16)):
-            with T.Kernel(N // TILE_N, threads=128) as bx:
+            with T.Kernel(N // TILE_N, T.ceildiv(M,16), threads=128) as (bx, my):
                 acc = T.alloc_local((blocks * 8,), T.float32)
-                multiply(A, PP, S, Z, bx, 0, acc)
+                multiply(A, PP, S, Z, bx, 0, my, acc)
                 tx = T.get_thread_binding()
                 row = (tx % 32) // 4
                 for half in T.unroll(2):
-                    if row + half * 8 < M:
+                    if my * 16 + row + half * 8 < M:
                         for part in T.unroll(blocks * 2):
                             for j in T.unroll(2):
                                 col = bx * TILE_N + (tx // 32) * 16 + (part // 2) * 64 + (part % 2) * 8 + (tx % 4) * 2 + j
                                 if col < 10240:
-                                    QKV[row + half * 8, col] = acc[part * 4 + half * 2 + j]
+                                    QKV[my * 16 + row + half * 8, col] = acc[part * 4 + half * 2 + j]
                                 else:
-                                    ZOUT[row + half * 8, col - 10240] = acc[part * 4 + half * 2 + j]
+                                    ZOUT[my * 16 + row + half * 8, col - 10240] = acc[part * 4 + half * 2 + j]
     else:
         @T.prim_func
         def main(A: T.Tensor((M, K), T.float16),
@@ -108,15 +108,15 @@ def w4_small_m(M: int, N: int, K: int, SPLIT=1,
                  S: T.Tensor((N, K // 128), T.float16),
                  Z: T.Tensor((N, K // 128), T.int8),
                  O: T.Tensor((SPLIT, M, N), output_dtype)):
-            with T.Kernel(N // TILE_N, SPLIT, threads=128) as (bx, sk):
+            with T.Kernel(N // TILE_N, SPLIT, T.ceildiv(M,16), threads=128) as (bx, sk, my):
                 acc = T.alloc_local((blocks * 8,), T.float32)
-                multiply(A, PP, S, Z, bx, sk, acc)
+                multiply(A, PP, S, Z, bx, sk, my, acc)
                 tx = T.get_thread_binding()
                 row = (tx % 32) // 4
                 for half in T.unroll(2):
-                    if row + half * 8 < M:
+                    if my * 16 + row + half * 8 < M:
                         for part in T.unroll(blocks * 2):
                             for j in T.unroll(2):
                                 col = bx * TILE_N + (tx // 32) * 16 + (part // 2) * 64 + (part % 2) * 8 + (tx % 4) * 2 + j
-                                O[sk, row + half * 8, col] = acc[part * 4 + half * 2 + j]
+                                O[sk, my * 16 + row + half * 8, col] = acc[part * 4 + half * 2 + j]
     return main

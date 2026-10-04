@@ -35,11 +35,12 @@ struct Settings {
     listen: String,
     gpu_lock: PathBuf,
     cuda_graph: CudaGraphMode,
+    prefix_cache_bytes: usize,
 }
 impl Settings {
     fn parse(args: &[String]) -> Result<Self> {
         if args.is_empty() || !std::path::Path::new(&args[0]).is_dir() {
-            return Err("Usage: orin-llm serve MODEL_DIR [--listen 0.0.0.0:8088] [--model qwen3.8-27b] [--cuda-graph decode_only|full|off] [--gpu-lock artifacts/gpu-experiment.lock]; MODEL_DIR must contain the prepared cache and checkpoint tokenizer".into());
+            return Err("Usage: orin-llm serve MODEL_DIR [--listen 0.0.0.0:8088] [--model qwen3.8-27b] [--cuda-graph decode_only|full|off] [--prefix-cache-mib 12288] [--gpu-lock artifacts/gpu-experiment.lock]; MODEL_DIR must contain the prepared cache and checkpoint tokenizer".into());
         }
         let mut settings = Self {
             manifest: (&args[0]).into(),
@@ -48,6 +49,7 @@ impl Settings {
             listen: "0.0.0.0:8088".into(),
             gpu_lock: "artifacts/gpu-experiment.lock".into(),
             cuda_graph: CudaGraphMode::default(),
+            prefix_cache_bytes: 12 * 1024 * 1024 * 1024,
         };
         for pair in args[1..].chunks(2) {
             if pair.len() != 2 {
@@ -58,6 +60,9 @@ impl Settings {
                 "--model" => settings.model = pair[1].clone(),
                 "--gpu-lock" => settings.gpu_lock = (&pair[1]).into(),
                 "--cuda-graph" => settings.cuda_graph = pair[1].parse()?,
+                "--prefix-cache-mib" => {
+                    settings.prefix_cache_bytes = orin_engine::execution::parse_cache_mib(&pair[1])?
+                }
                 _ => return Err(format!("Unknown server option {}", pair[0])),
             }
         }
@@ -95,6 +100,7 @@ mod settings_tests {
         let settings = Settings::parse(std::slice::from_ref(&directory)).unwrap();
         assert_eq!(settings.listen, "0.0.0.0:8088");
         assert_eq!(settings.cuda_graph, CudaGraphMode::DecodeOnly);
+        assert_eq!(settings.prefix_cache_bytes, 12usize << 30);
         for mode in ["decode_only", "full", "off"] {
             let settings =
                 Settings::parse(&[directory.clone(), "--cuda-graph".into(), mode.into()]).unwrap();
@@ -102,6 +108,23 @@ mod settings_tests {
         }
         assert!(Settings::parse(&[directory.clone(), "--cuda-graph".into()]).is_err());
         assert!(Settings::parse(&[directory, "--cuda-graph".into(), "on".into()]).is_err());
+    }
+
+    #[test]
+    fn prefix_budget_can_be_disabled_and_requires_integer_mib() {
+        let directory = std::env::temp_dir().to_string_lossy().into_owned();
+        for (value, expected) in [("0", 0), ("512", 512usize << 20)] {
+            let settings =
+                Settings::parse(&[directory.clone(), "--prefix-cache-mib".into(), value.into()])
+                    .unwrap();
+            assert_eq!(settings.prefix_cache_bytes, expected);
+        }
+        for value in ["-1", "1.5"] {
+            assert!(
+                Settings::parse(&[directory.clone(), "--prefix-cache-mib".into(), value.into(),])
+                    .is_err()
+            );
+        }
     }
 }
 #[derive(Clone)]
@@ -173,6 +196,7 @@ async fn serve(settings: Settings) -> Result<()> {
                     &settings.manifest,
                     LoadOptions {
                         cuda_graph: settings.cuda_graph,
+                        prefix_cache_bytes: settings.prefix_cache_bytes,
                     },
                 )?;
                 if worker_codec.tokenizer.get_vocab_size(true) > model.vocab() {
@@ -449,7 +473,7 @@ fn generate_job(
     } else {
         "stop"
     };
-    let usage = json!({"prompt_tokens":job.prepared.input.len(),"completion_tokens":count,"total_tokens":job.prepared.input.len()+count});
+    let usage = json!({"prompt_tokens":job.prepared.input.len(),"completion_tokens":count,"total_tokens":job.prepared.input.len()+count,"prompt_tokens_details":{"cached_tokens":model.prefix_statistics().cached_tokens}});
     let response = json!({"id":job.id,"object":"chat.completion","created":job.created,"model":model_id,
         "choices":[{"index":0,"message":parser.message(),"finish_reason":finish,"logprobs":null}],"usage":usage});
     let _ = job.events.blocking_send(ModelEvent::Chunk(chunk(
@@ -475,5 +499,10 @@ fn generate_job(
             serde_json::to_string(stats).map_err(|e| e.to_string())?
         );
     }
+    eprintln!(
+        "{}: prefix {}",
+        job.id,
+        serde_json::to_string(model.prefix_statistics()).map_err(|e| e.to_string())?
+    );
     Ok(())
 }

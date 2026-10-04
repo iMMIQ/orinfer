@@ -574,6 +574,9 @@ impl Model {
     pub fn speculation_statistics(&self) -> Option<&crate::mtp::Statistics> {
         self.0.speculation_statistics.as_ref()
     }
+    pub fn prefix_statistics(&self) -> &crate::prefix::Statistics {
+        &self.0.prefix_statistics
+    }
     pub fn generate(
         &mut self,
         input: &[u32],

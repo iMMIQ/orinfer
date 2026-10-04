@@ -415,12 +415,13 @@ pub(super) fn build(
                 .filter(|name| name.starts_with("Mtp") == mtp)
                 .cloned()
                 .collect();
-            if !mtp
-                && (program == "prefill"
-                    || profiles.iter().any(|p| {
-                        p.kind != PrefillKind::Sequence
-                            && program == &format!("prefill_m{}", p.tokens)
-                    }))
+            if (mtp && tokens >= 32)
+                || (!mtp
+                    && (program == "prefill"
+                        || profiles.iter().any(|p| {
+                            p.kind != PrefillKind::Sequence
+                                && program == &format!("prefill_m{}", p.tokens)
+                        })))
             {
                 buffers.extend(kv.prefill_workspace.keys().cloned());
             }

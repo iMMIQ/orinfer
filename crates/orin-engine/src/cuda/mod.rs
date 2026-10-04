@@ -10,6 +10,7 @@ use std::{
     ptr,
     time::Instant,
 };
+pub(crate) mod snapshot;
 mod virtual_memory;
 pub(crate) type Handle = *mut c_void;
 

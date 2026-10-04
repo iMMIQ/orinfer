@@ -28,13 +28,30 @@ impl ModelRuntime {
         let mtp = self.manifest.mtp.clone();
         self.execution.reset_sequence(&m.reset_buffers)?;
         self.prepare_visual(input, images.unwrap_or(&[]), &cancelled)?;
-        let mut offset = 0;
-        let mut warm = super::speculation::PrefillWarm::default();
+        let media = super::prefix::media_identity(images.unwrap_or(&[]));
+        let (mut offset, mut warm) = self.restore_prefix(input, &media)?;
+        if offset != 0
+            && offset < input.len()
+            && let Some(spec) = &mtp
+        {
+            // Pair the cached endpoint h[P-1] with x[P] before reusing its ring.
+            let at = Instant::now();
+            self.mtp_warm_state(
+                spec,
+                &input[offset..offset + 1],
+                &cancelled,
+                ExecutionPhase::Prefill,
+                false,
+            )?;
+            warm.tokens = offset;
+            warm.seconds += at.elapsed().as_secs_f64();
+        }
         let mut last_head = None;
         while offset < input.len() {
             if cancelled() {
                 return Err("Request cancelled during prefill".into());
             }
+            let m = &self.manifest;
             let remaining = input.len() - offset;
             let plan = m
                 .prefill_plans
@@ -45,33 +62,57 @@ impl ModelRuntime {
                 .map(|p| {
                     (
                         p.chunk_tokens,
-                        p.prefill_program.as_str(),
-                        p.head_program.as_str(),
+                        p.prefill_program.clone(),
+                        p.head_program.clone(),
                     )
                 })
                 .or_else(|| {
                     (m.prefill_plans.is_empty() && m.chunk_tokens <= remaining).then_some((
                         m.chunk_tokens,
-                        "prefill",
-                        "head",
+                        "prefill".to_string(),
+                        "head".to_string(),
                     ))
                 });
             if let Some((chunk, program, head)) = selected {
                 self.upload_ids(&m.input, &input[offset..offset + chunk])?;
-                self.launch_program(program, ExecutionPhase::Prefill)?;
+                self.launch_program(&program, ExecutionPhase::Prefill)?;
+                let endpoint = offset + chunk;
+                let checkpoint = self.prefix_cache.budget != 0
+                    && endpoint < input.len()
+                    && endpoint.is_multiple_of(8192);
                 if let Some(spec) = &mtp {
                     self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
-                    if spec.hidden_ring.is_some() && offset + chunk < input.len() {
+                    if checkpoint && spec.hidden_ring.is_some() {
                         let at = Instant::now();
-                        self.mtp_warm(
+                        self.mtp_warm_state(
                             spec,
-                            &input[offset + 1..offset + chunk + 1],
+                            &input[warm.tokens + 1..endpoint],
                             &cancelled,
                             ExecutionPhase::Prefill,
+                            false,
                         )?;
-                        warm.tokens = offset + chunk;
+                        warm.tokens = endpoint - 1;
                         warm.seconds += at.elapsed().as_secs_f64();
                     }
+                }
+                if checkpoint {
+                    self.launch_program(&head, ExecutionPhase::Prefill)?;
+                    self.store_prefix(&input[..endpoint], media, warm.tokens)?;
+                }
+                if let Some(spec) = &mtp
+                    && spec.hidden_ring.is_some()
+                    && endpoint < input.len()
+                {
+                    let at = Instant::now();
+                    self.mtp_warm_state(
+                        spec,
+                        &input[warm.tokens + 1..endpoint + 1],
+                        &cancelled,
+                        ExecutionPhase::Prefill,
+                        false,
+                    )?;
+                    warm.tokens = endpoint;
+                    warm.seconds += at.elapsed().as_secs_f64();
                 }
                 offset += chunk;
                 last_head = Some(head);
@@ -86,11 +127,12 @@ impl ModelRuntime {
                         self.mtp_capture(spec, 1, ExecutionPhase::Prefill)?;
                         if spec.hidden_ring.is_some() && index + 1 < input.len() {
                             let at = Instant::now();
-                            self.mtp_warm(
+                            self.mtp_warm_state(
                                 spec,
                                 &input[index + 1..index + 2],
                                 &cancelled,
                                 ExecutionPhase::Prefill,
+                                false,
                             )?;
                             warm.tokens = index + 1;
                             warm.seconds += at.elapsed().as_secs_f64();
@@ -102,11 +144,29 @@ impl ModelRuntime {
             }
         }
         if let Some(head) = last_head {
-            self.launch_program(head, ExecutionPhase::Prefill)?;
+            self.launch_program(&head, ExecutionPhase::Prefill)?;
         }
-        if self.read_control(&m.position)? as usize != input.len() {
+        if self.read_control(&self.manifest.position)? as usize != input.len() {
             return Err("Prefill position mismatch".into());
         }
+        if self.prefix_cache.budget != 0
+            && let Some(spec) = &mtp
+            && spec.hidden_ring.is_some()
+            && warm.tokens < input.len() - 1
+        {
+            let at = Instant::now();
+            self.mtp_warm_state(
+                spec,
+                &input[warm.tokens + 1..],
+                &cancelled,
+                ExecutionPhase::Prefill,
+                false,
+            )?;
+            warm.tokens = input.len() - 1;
+            warm.seconds += at.elapsed().as_secs_f64();
+        }
+        self.store_prefix(input, media, warm.tokens)?;
+        let m = &self.manifest;
         if let Some(spec) = &mtp {
             return self.mtp_generate(spec, (input, warm), limit, options, &cancelled, &mut emit);
         }

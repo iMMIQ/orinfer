@@ -32,6 +32,292 @@ fn default_graph() -> String {
     "decode_only".into()
 }
 
+#[test]
+#[ignore = "Requires real model, prefix fixtures and exclusive GPU lock"]
+fn validate_prefix_reuse() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORIN_PREFIX_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    let defaults = crate::sampling::Options {
+        temperature: 0.,
+        ..Default::default()
+    };
+    let mut rows = vec![];
+    for case in &fixture.cases {
+        while let Some(entry) = model.prefix_cache.entries.pop_front() {
+            model.execution.release_snapshot(entry.snapshot).unwrap();
+        }
+        model.prefix_cache.bytes = 0;
+        let options = case.sampling.as_ref().unwrap_or(&defaults);
+        let mut reference = None;
+        let mut reference_state = None;
+        let mut reference_logits = None;
+        for (name, budget) in [
+            ("cold", 0),
+            ("populate", 12usize << 30),
+            ("hit", 12usize << 30),
+        ] {
+            model.prefix_cache.budget = budget;
+            let at = Instant::now();
+            let mut tokens = vec![];
+            let mut ttft = 0.0;
+            model
+                .generate(
+                    &case.input_tokens,
+                    Some(&case.images),
+                    case.max_new_tokens,
+                    options,
+                    || false,
+                    |token| {
+                        if tokens.is_empty() {
+                            ttft = at.elapsed().as_secs_f64();
+                        }
+                        tokens.push(token);
+                        true
+                    },
+                )
+                .unwrap();
+            let elapsed = at.elapsed().as_secs_f64();
+            let position = case.input_tokens.len() + tokens.len() - 1;
+            let state = snapshot(&model, position);
+            let logits = model
+                .execution
+                .download_bytes(
+                    &model.manifest.logits,
+                    model.execution.sizes[&model.manifest.logits],
+                )
+                .unwrap();
+            if name == "hit" {
+                assert_eq!(
+                    model.prefix_statistics.cached_tokens,
+                    case.input_tokens.len()
+                );
+                assert_eq!(
+                    reference.as_ref().unwrap(),
+                    &tokens,
+                    "Cached seeded outputs changed: {}",
+                    case.id
+                );
+                assert_eq!(
+                    reference_state.as_ref().unwrap(),
+                    &state,
+                    "Cached sequence state changed: {}",
+                    case.id
+                );
+                assert_eq!(
+                    reference_logits.as_ref().unwrap(),
+                    &logits,
+                    "Cached target logits changed: {}",
+                    case.id
+                );
+            } else {
+                if name == "populate" && options.is_greedy() {
+                    assert_eq!(
+                        reference.as_ref().unwrap(),
+                        &tokens,
+                        "Cold/populate target changed: {}",
+                        case.id
+                    );
+                    assert_eq!(
+                        reference_state.as_ref().unwrap(),
+                        &state,
+                        "Cold/populate state changed: {}",
+                        case.id
+                    );
+                }
+                reference = Some(tokens.clone());
+                reference_state = Some(state);
+                reference_logits = Some(logits);
+            }
+            rows.push(json!({"case":case.id,"mode":name,"ttft_s":ttft,"total_s":elapsed,"tokens":tokens,"prefix":model.prefix_statistics}));
+            eprintln!("{} {name}: first token {ttft:.4}s", case.id);
+        }
+        // Cancellation mutates live state, but must leave its immutable
+        // cached prompt usable by a subsequent seeded request.
+        let emitted = std::cell::Cell::new(0usize);
+        let cancelled = model.generate(
+            &case.input_tokens,
+            Some(&case.images),
+            8,
+            options,
+            || emitted.get() >= 2,
+            |_| {
+                emitted.set(emitted.get() + 1);
+                true
+            },
+        );
+        assert!(cancelled.is_err_and(|e| e.contains("cancelled")));
+        let mut replay = vec![];
+        model
+            .generate(
+                &case.input_tokens,
+                Some(&case.images),
+                case.max_new_tokens,
+                options,
+                || false,
+                |token| {
+                    replay.push(token);
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(reference.as_ref().unwrap(), &replay);
+        assert_eq!(
+            model.prefix_statistics.cached_tokens,
+            case.input_tokens.len()
+        );
+        if !case.images.is_empty() {
+            let mut changed = case.images.clone();
+            changed[0].pixels[0] += 0.01;
+            model
+                .generate(
+                    &case.input_tokens,
+                    Some(&changed),
+                    1,
+                    options,
+                    || false,
+                    |_| true,
+                )
+                .unwrap();
+            assert_eq!(
+                model.prefix_statistics.cached_tokens, 0,
+                "Changed image reused state"
+            );
+        }
+        if case.input_tokens.len() == 8192 && case.images.is_empty() {
+            while let Some(entry) = model.prefix_cache.entries.pop_front() {
+                model.execution.release_snapshot(entry.snapshot).unwrap();
+            }
+            model.prefix_cache.bytes = 0;
+            let mut extended = case.input_tokens.clone();
+            extended.extend_from_slice(&case.input_tokens[..512]);
+            model
+                .generate(&extended, None, 1, &defaults, || false, |_| true)
+                .unwrap();
+            assert!(
+                model
+                    .prefix_cache
+                    .entries
+                    .iter()
+                    .any(|e| e.tokens.len() == 8192)
+            );
+            let mut branch = case.input_tokens.clone();
+            branch.extend_from_slice(&[198; 8]);
+            let mut expected = vec![];
+            model.prefix_cache.budget = 0;
+            model
+                .generate(
+                    &branch,
+                    None,
+                    8,
+                    &defaults,
+                    || false,
+                    |t| {
+                        expected.push(t);
+                        true
+                    },
+                )
+                .unwrap();
+            let state = snapshot(&model, branch.len() + 7);
+            model.prefix_cache.budget = 12usize << 30;
+            let mut actual = vec![];
+            model
+                .generate(
+                    &branch,
+                    None,
+                    8,
+                    &defaults,
+                    || false,
+                    |t| {
+                        actual.push(t);
+                        true
+                    },
+                )
+                .unwrap();
+            assert_eq!(model.prefix_statistics.cached_tokens, 8192);
+            assert_eq!(expected, actual, "Intermediate checkpoint outputs changed");
+            assert_eq!(state, snapshot(&model, branch.len() + 7));
+            rows.push(
+                json!({"case":case.id,"mode":"checkpoint_branch","prefix":model.prefix_statistics}),
+            );
+            // Remove the just-cached branch so the next test exercises a
+            // shorter prefix again, rather than a complete prompt hit.
+            let index = model
+                .prefix_cache
+                .entries
+                .iter()
+                .position(|e| e.tokens == branch)
+                .unwrap();
+            let entry = model.prefix_cache.entries.remove(index).unwrap();
+            model.prefix_cache.bytes -= entry.bytes;
+            model.execution.release_snapshot(entry.snapshot).unwrap();
+        }
+        if case.images.is_empty() && case.input_tokens.len().is_multiple_of(512) {
+            // These aligned suffixes preserve the cold execution partition,
+            // isolating state reuse from the engine's mixed-precision dispatch.
+            for suffix in [&[198u32; 8][..], &[1103u32; 8][..]] {
+                let mut input = case.input_tokens.clone();
+                input.extend_from_slice(suffix);
+                let mut expected = None;
+                let mut expected_state = None;
+                for budget in [0, 12usize << 30] {
+                    model.prefix_cache.budget = budget;
+                    let mut tokens = vec![];
+                    model
+                        .generate(
+                            &input,
+                            None,
+                            8,
+                            &defaults,
+                            || false,
+                            |token| {
+                                tokens.push(token);
+                                true
+                            },
+                        )
+                        .unwrap();
+                    let state = snapshot(&model, input.len() + tokens.len() - 1);
+                    if budget == 0 {
+                        expected = Some(tokens);
+                        expected_state = Some(state);
+                    } else {
+                        assert_eq!(
+                            model.prefix_statistics.cached_tokens,
+                            case.input_tokens.len()
+                        );
+                        assert_eq!(
+                            expected.as_ref().unwrap(),
+                            &tokens,
+                            "Prefix branch outputs changed"
+                        );
+                        assert_eq!(
+                            expected_state.as_ref().unwrap(),
+                            &state,
+                            "Prefix branch state changed"
+                        );
+                        rows.push(json!({"case":case.id,"mode":"append","prefix":model.prefix_statistics}));
+                    }
+                }
+            }
+        }
+    }
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(&json!({"status":"passed","requests":rows})).unwrap(),
+    )
+    .unwrap();
+}
+
 fn download(model: &ModelRuntime, name: &str, bytes: usize) -> Vec<u8> {
     assert!(bytes <= model.execution.sizes[name]);
     let mut raw = vec![0u8; bytes];
@@ -110,6 +396,7 @@ fn validate_mtp_generation() {
         &fixture.model,
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            ..LoadOptions::default()
         },
     )
     .unwrap();

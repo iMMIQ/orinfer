@@ -39,6 +39,16 @@ impl FromStr for CudaGraphMode {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadOptions {
     pub cuda_graph: CudaGraphMode,
+    /// Maximum extra resident prefix snapshots. Zero disables reuse.
+    pub prefix_cache_bytes: usize,
+}
+
+pub fn parse_cache_mib(value: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_mul(1024 * 1024))
+        .ok_or_else(|| "Prefix cache MiB must be a nonnegative integer within usize".into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +86,11 @@ mod tests {
             assert!(invalid.parse::<CudaGraphMode>().is_err());
         }
         assert_eq!(LoadOptions::default().cuda_graph, CudaGraphMode::DecodeOnly);
+        assert_eq!(parse_cache_mib("0").unwrap(), 0);
+        assert_eq!(parse_cache_mib("12288").unwrap(), 12usize << 30);
+        for invalid in ["-1", "1.5", "", "18446744073709551615"] {
+            assert!(parse_cache_mib(invalid).is_err());
+        }
     }
 
     #[test]

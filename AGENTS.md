@@ -8,7 +8,7 @@
 - 支持Qwen3.8-27B文本、图片和多图输入，实际checkpoint为Qwen3_5架构；不包含视频。
 - 在线运行时用Rust，生产GPU kernel以TileLang为源；Python只用于离线转换、编译、参考和验证。
 - 架构通过Rust模块注册，按checkpoint配置实例化执行顺序；算子包提供实现/ABI/布局契约，不携带执行程序。公共CUDA执行器不硬编码模型层数、维度或层序。
-- 第一阶段仍需prefix cache与多请求batching；当前任务先完成架构重构，保持现有行为与性能。
+- 第一阶段包含prefix cache与多请求batching；缓存恢复和batch调度必须保持完整KV/GDN/卷积/MTP状态及请求隔离。
 - 项目许可证为LGPL-3.0-or-later，保留第三方版权和许可证声明。
 
 ## 实现

@@ -52,12 +52,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8088/v1")
     parser.add_argument("--model", default="qwen3.8-27b")
+    parser.add_argument("--expect-prefix-cache", action="store_true",
+                        help="Require complete prompt reuse on repeated requests")
     parser.add_argument("--output", type=Path, required=True,
                         help="New JSON result path outside tracked source")
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
     base = args.base_url.rstrip("/")
+    with request(base.removesuffix("/v1"), "/health") as response:
+        context = json.load(response)["max_context"]
     with request(base, "/models") as response:
         assert any(model["id"] == args.model for model in json.load(response)["data"])
     common = {"model": args.model, "temperature": 0, "seed": 20261002, "max_tokens": 16}
@@ -72,6 +76,8 @@ def main():
     chunks = stream(base, text)
     content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c["choices"])
     assert content == first["choices"][0]["message"]["content"]
+    if args.expect_prefix_cache:
+        assert chunks[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == first["usage"]["prompt_tokens"]
     evidence["stream"] = chunks
     print("PASS SSE text matches non-streaming", flush=True)
     stopped = complete(base, dict(text, stop="5"))
@@ -81,6 +87,8 @@ def main():
     a = complete(base, stochastic)
     b = complete(base, stochastic)
     assert a["choices"] == b["choices"], (a, b)
+    if args.expect_prefix_cache:
+        assert b["usage"]["prompt_tokens_details"]["cached_tokens"] == b["usage"]["prompt_tokens"]
     evidence["seeded"] = [a, b]
     print("PASS stop across tokens and seeded sampling", flush=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -99,7 +107,7 @@ def main():
     assert after_cancel["choices"] == first["choices"]
     evidence["after_cancel"] = after_cancel
     print("PASS disconnected request cancels and next request resets", flush=True)
-    for invalid in [dict(text, model="unknown"), dict(text, n=2), dict(text, max_tokens=99999),
+    for invalid in [dict(text, model="unknown"), dict(text, n=2), dict(text, max_tokens=context + 1),
                     dict(text, messages=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}])]:
         try:
             complete(base, invalid)

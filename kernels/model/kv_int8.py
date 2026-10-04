@@ -375,12 +375,14 @@ def paged_attention_partials_int8(max_pages,num_pages,nsplits=8,block_size=128,b
 
 
 @orin_jit
-def dequant_prefill_kv(context: int):
+def dequant_prefill_kv(context: int, pad_to: int = 1):
     """Expand one layer once into shared prefill scratch, preserving FP16 bits.
 
+    Optional zero padding makes the last asynchronous attention tile safe.
     The persistent grid covers only the valid prefix. Scratch is reused across
     layers and never participates in decode or speculative state restoration.
     """
+    assert pad_to in (1, 32, 64) and context % pad_to == 0
     @T.prim_func
     def kernel(K: T.Tensor((context,256),T.uint32),
                V: T.Tensor((context,256),T.uint32),
@@ -410,4 +412,8 @@ def dequant_prefill_kv(context: int):
                         VO[token,d*4+1]=T.reinterpret(T.float16,T.cast(v0>>16,T.uint16))
                         VO[token,d*4+2]=T.reinterpret(T.float16,T.cast(v1&65535,T.uint16))
                         VO[token,d*4+3]=T.reinterpret(T.float16,T.cast(v1>>16,T.uint16))
+                    elif token < T.min(context,T.ceildiv(Lengths[0],pad_to)*pad_to):
+                        for c in T.unroll(4):
+                            KO[token,d*4+c]=0.0
+                            VO[token,d*4+c]=0.0
     return kernel

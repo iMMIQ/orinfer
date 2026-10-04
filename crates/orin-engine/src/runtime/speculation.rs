@@ -27,6 +27,16 @@ impl ModelRuntime {
         cancelled: &impl Fn() -> bool,
         phase: ExecutionPhase,
     ) -> Result<()> {
+        self.mtp_warm_state(spec, shifted_ids, cancelled, phase, true)
+    }
+    pub(super) fn mtp_warm_state(
+        &self,
+        spec: &crate::mtp::Spec,
+        shifted_ids: &[u32],
+        cancelled: &impl Fn() -> bool,
+        phase: ExecutionPhase,
+        produce_head: bool,
+    ) -> Result<()> {
         let mut offset = 0;
         while offset < shifted_ids.len() {
             if cancelled() {
@@ -42,7 +52,7 @@ impl ModelRuntime {
             self.upload_ids(&spec.input, &shifted_ids[offset..offset + plan.tokens])?;
             self.launch_program(&plan.program, phase)?;
             offset += plan.tokens;
-            if offset == shifted_ids.len() {
+            if produce_head && offset == shifted_ids.len() {
                 self.launch_program(&plan.head_program, phase)?;
             }
         }

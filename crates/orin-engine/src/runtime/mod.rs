@@ -13,6 +13,7 @@ mod generation;
 #[cfg(test)]
 #[path = "../mtp_gpu_tests.rs"]
 mod mtp_gpu_tests;
+mod prefix;
 mod speculation;
 mod vision;
 
@@ -21,6 +22,8 @@ pub(crate) struct ModelRuntime {
     execution: Executor,
     stats: LoadStats,
     pub(crate) speculation_statistics: Option<crate::mtp::Statistics>,
+    prefix_cache: crate::prefix::Cache<crate::cuda::snapshot::Snapshot>,
+    pub(crate) prefix_statistics: crate::prefix::Statistics,
 }
 impl ModelRuntime {
     #[cfg(test)]
@@ -45,6 +48,8 @@ impl ModelRuntime {
             execution,
             stats,
             speculation_statistics: None,
+            prefix_cache: crate::prefix::Cache::new(options.prefix_cache_bytes),
+            prefix_statistics: crate::prefix::Statistics::default(),
         })
     }
     fn launch_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {

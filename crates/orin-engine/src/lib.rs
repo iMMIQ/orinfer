@@ -10,6 +10,7 @@ mod loader;
 pub mod model;
 pub mod mtp;
 pub mod operators;
+pub mod prefix;
 mod runtime;
 pub mod sampling;
 pub mod vision;

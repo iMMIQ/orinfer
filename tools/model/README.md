@@ -192,3 +192,20 @@ bash tools/operators/run.sh tools/model/kv_prefill_probe.py artifacts/kv-prefill
 ```
 
 该工具保留 INT8 权重与 KV、decode 和 MTP 算子，只替换 512/2048-token 文本 prefill 的 KV 读取。所有主模型 attention 层顺序复用同一份 K/V workspace，按实际 prefill 位置映射物理内存，并随请求 reset 释放；不保存到模型权重或恢复状态中。每 token 临时容量为 4096 字节，8k 为 32 MiB，256k 上限为 1 GiB；加载时只预留虚拟地址。报告的 `peak_prefill_workspace_bytes` 单独记录临时映射峰值，`peak_kv_bytes` 仍只包含长期 KV。`kv_prefill_probe.py --context 262144 --query-tokens 64` 可验证最大容量、非对齐尾部和真实 graph replay；`ORIN_OPERATOR_SANITIZER=memcheck` 可检查越界。
+
+## Dense prefill 流水线与 MTP warm
+
+已有按需映射INT8 KV及FP16 prefill workspace的Qwen3_5模型，可发布新的SM87算子包：
+
+```bash
+bash tools/operators/run.sh tools/model/optimize_prefill.py artifacts/prefill-kernels \
+  --model /path/to/prepared-model --destination /path/to/new-model
+```
+
+工具保持权重字节和完整dense attention，替换512/2048-token主模型attention为64×32查询/KV tile，使用单阶段CUDA异步复制，并跳过完全位于因果区域内的逐元素mask。KV反量化同时清零最后32-token块中的无效位置，避免异步读取旧值。主模型和MTP顺序复用同一份FP16 scratch。
+
+默认添加64/128/512-token MTP warm计划，`--warm-sizes`可指定不超过主prefill块容量的32倍数；空列表只替换主模型attention。新增warm计划使用按16行分块的W4投影，增加有界临时buffer，不增加权重副本。运行时在主prefill分块间预热草稿状态，只在实际生成需要时计算草稿词表head。
+
+源模型目录不修改；新目录通过完整加载器校验后发布。缓存预算是运行时配置，模型不包含prefix快照。`screen_prefill_attention.py`提供TileLang候选筛选、非对齐尾部及改变输入后的Graph replay验证；所有产物写入指定的新输出目录。
+
+`validate_mtp_warm.py --model /path/to/new-model`通过相同GPU入口运行，使用实际W4权重逐位比较17/64/128/512行投影与16行执行，覆盖FP32 split-K、尾部及改变输入后的Graph replay。`kv_prefill_probe.py --context 262144 --query-tokens 64 --async-stages 1`验证反量化padding与异步attention完整链，可配合`ORIN_OPERATOR_SANITIZER=memcheck`检查越界。
