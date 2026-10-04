@@ -113,7 +113,7 @@ Smoke工具验证真实模型的文本/SSE、采样、停止词、状态隔离�
 
 Prefill使用单份W4权重、临时W8/A8和INT8 Tensor Core；512的FFN使用LUT4融合。Decode直接读取同一份W4，GDN持续状态和累积为FP32。权重含量化元数据约14.794GB，平均4.4003bits；显式CUDA allocations约19.713GB，另有driver/module/graph开销。图文manifest另加约0.921GB视觉权重，来自原始BF16 checkpoint，默认转为FP16存储，合计约4.596bits；默认视觉workspace下显式CUDA allocations约22.021GB。
 
-8704-token容量的分配数字见上。262144-token配置可通过 `tools/model/optimize_kv.py` 使用直接 KV prefill 和 CUDA VMM：加载时固定缓冲区约 18.60 GiB，KV 物理内存按执行位置增长，graph 地址保持稳定；最大 prefill 块为 2048 tokens。FP16 KV 满容量包含主模型和 MTP 共 17 GiB，INT8 group-64 KV 含 FP16 scale 共约 8.77 GiB，另有 driver/module/graph 开销。新请求会回收上一请求的 KV 物理映射。构建与验证方法见[模型构建](tools/model/README.md)。
+8704-token容量的分配数字见上。262144-token配置可通过 `tools/model/optimize_kv.py` 使用直接 KV prefill 和 CUDA VMM：加载时固定缓冲区约 18.60 GiB，KV 物理内存按执行位置增长，graph 地址保持稳定；最大 prefill 块为 2048 tokens。FP16 KV 满容量包含主模型和 MTP 共 17 GiB，INT8 group-64 KV 含 FP16 scale 共约 8.77 GiB，长文本 prefill 可共享按需映射的单层 FP16 临时 KV workspace，每 token 4096 字节、256k 上限 1 GiB；decode 直接读取 INT8 KV。另有 driver/module/graph 开销。新请求会回收上一请求的 KV 和临时 workspace 物理映射。构建与验证方法见[模型构建](tools/model/README.md)。
 
 ## 性能与限制
 

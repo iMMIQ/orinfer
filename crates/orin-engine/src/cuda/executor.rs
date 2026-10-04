@@ -25,6 +25,8 @@ pub(crate) struct Executor {
     cuda_graph: CudaGraphMode,
     growth: BTreeMap<String, crate::model::KvGrowth>,
     pub(crate) peak_kv_bytes: std::cell::Cell<usize>,
+    pub(crate) peak_prefill_workspace_bytes: std::cell::Cell<usize>,
+    prefill_workspace: std::collections::BTreeSet<String>,
     pub(crate) allocations: Allocations,
 }
 
@@ -78,7 +80,11 @@ impl Executor {
         let lazy_bytes = manifest
             .buffers
             .iter()
-            .filter(|b| lazy.is_some_and(|kv| kv.buffers.contains_key(&b.name)))
+            .filter(|b| {
+                lazy.is_some_and(|kv| {
+                    kv.buffers.contains_key(&b.name) || kv.prefill_workspace.contains_key(&b.name)
+                })
+            })
             .try_fold(0usize, |sum, b| {
                 b.bytes()
                     .and_then(|n| sum.checked_add(n).ok_or("KV sum overflow".into()))
@@ -130,7 +136,13 @@ impl Executor {
             let mut address = 0;
             // SAFETY: Allocation length is checked by manifest validation and owned
             // by Session before any fallible operation can return.
-            let stride = lazy.and_then(|kv| kv.buffers.get(&b.name)).copied();
+            let stride = lazy
+                .and_then(|kv| {
+                    kv.buffers
+                        .get(&b.name)
+                        .or_else(|| kv.prefill_workspace.get(&b.name))
+                })
+                .copied();
             if let Some(stride) = stride {
                 let reservation = super::virtual_memory::Reservation::reserve(&s, bytes, stride)?;
                 address = reservation.address;
@@ -422,6 +434,12 @@ impl Executor {
                 .unwrap_or_default(),
             allocations,
             peak_kv_bytes: std::cell::Cell::new(0),
+            peak_prefill_workspace_bytes: std::cell::Cell::new(0),
+            prefill_workspace: manifest
+                .kv_cache
+                .as_ref()
+                .map(|kv| kv.prefill_workspace.keys().cloned().collect())
+                .unwrap_or_default(),
         };
         let stats = LoadStats {
             manifest_sha256: fingerprint,
@@ -649,7 +667,14 @@ impl Executor {
                 .ok_or("Missing KV reservation")?
                 .grow(&self.session, tokens)?;
         }
-        let resident = buffers.values().map(|b| b.mapped).sum::<usize>();
+        let scratch = buffers
+            .iter()
+            .filter(|(n, _)| self.prefill_workspace.contains(*n))
+            .map(|(_, b)| b.mapped)
+            .sum::<usize>();
+        self.peak_prefill_workspace_bytes
+            .set(self.peak_prefill_workspace_bytes.get().max(scratch));
+        let resident = buffers.values().map(|b| b.mapped).sum::<usize>() - scratch;
         self.peak_kv_bytes
             .set(self.peak_kv_bytes.get().max(resident));
         self.sync()

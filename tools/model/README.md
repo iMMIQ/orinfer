@@ -182,3 +182,13 @@ CUDA VMM 只保留最大上下文的虚拟地址，按实际执行位置、写�
 
 
 KV 质量对照可以用 `run-model` 的 `logits_steps` 导出完整分布。先运行 FP16 KV，再将它的 `output_tokens` 的前 `max_new_tokens - 1` 个作为 INT8 请求的 `forced_tokens`，保持输入、历史和采样 seed 一致。`compare_kv_quality.py --reference REF_REPORT --candidate INT8_REPORT --reference-requests REF_REQUESTS --candidate-requests INT8_REQUESTS --output NEW_RESULT` 校验历史，报告完整分布 KL、参考 token NLL 差、top-3 概率误差和重叠率；逐 token 不一致本身不判失败。这项对照隔离 KV 存储误差，权重质量仍应对照 BF16/FP8 并结合任务结果。
+
+INT8 KV 的长文本 prefill 可以使用每层共享的 FP16 临时 workspace，避免每个 query tile 重复反量化历史 KV：
+
+```bash
+bash tools/operators/run.sh tools/model/stage_kv_prefill.py artifacts/kv-prefill-build \
+  --model /path/to/int8-kv-model --destination /path/to/staged-int8-kv-model
+bash tools/operators/run.sh tools/model/kv_prefill_probe.py artifacts/kv-prefill-probe
+```
+
+该工具保留 INT8 权重与 KV、decode 和 MTP 算子，只替换 512/2048-token 文本 prefill 的 KV 读取。所有主模型 attention 层顺序复用同一份 K/V workspace，按实际 prefill 位置映射物理内存，并随请求 reset 释放；不保存到模型权重或恢复状态中。每 token 临时容量为 4096 字节，8k 为 32 MiB，256k 上限为 1 GiB；加载时只预留虚拟地址。报告的 `peak_prefill_workspace_bytes` 单独记录临时映射峰值，`peak_kv_bytes` 仍只包含长期 KV。`kv_prefill_probe.py --context 262144 --query-tokens 64` 可验证最大容量、非对齐尾部和真实 graph replay；`ORIN_OPERATOR_SANITIZER=memcheck` 可检查越界。

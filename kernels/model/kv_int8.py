@@ -372,3 +372,42 @@ def paged_attention_partials_int8(max_pages,num_pages,nsplits=8,block_size=128,b
     assert block_n in (32,64) and block_size==128
     assert queries is None or 1 <= queries <= 16
     return _compile_int8(max_pages,num_pages,block_size,block_n,nsplits,True,queries)
+
+
+@orin_jit
+def dequant_prefill_kv(context: int):
+    """Expand one layer once into shared prefill scratch, preserving FP16 bits.
+
+    The persistent grid covers only the valid prefix. Scratch is reused across
+    layers and never participates in decode or speculative state restoration.
+    """
+    @T.prim_func
+    def kernel(K: T.Tensor((context,256),T.uint32),
+               V: T.Tensor((context,256),T.uint32),
+               KS: T.Tensor((context,16),T.float16),
+               VS: T.Tensor((context,16),T.float16),
+               Lengths: T.Tensor((1,),T.int32),
+               KO: T.Tensor((context,1024),T.float16),
+               VO: T.Tensor((context,1024),T.float16)):
+        with T.Kernel(128,threads=256) as b:
+            T.import_source(HALF2_SOURCE)
+            for tile in T.serial(T.ceildiv(Lengths[0],1024)):
+                for j,d in T.Parallel(8,256):
+                    token=(tile*128+b)*8+j
+                    if token<Lengths[0]:
+                        kw=K[token,d];vw=V[token,d]
+                        sk=T.reinterpret(T.uint16,KS[token,d//16])
+                        sv=T.reinterpret(T.uint16,VS[token,d//16])
+                        k0=T.call_extern('uint32','kv_dequant_pair',kw,sk)
+                        k1=T.call_extern('uint32','kv_dequant_pair',kw>>16,sk)
+                        v0=T.call_extern('uint32','kv_dequant_pair',vw,sv)
+                        v1=T.call_extern('uint32','kv_dequant_pair',vw>>16,sv)
+                        KO[token,d*4]=T.reinterpret(T.float16,T.cast(k0&65535,T.uint16))
+                        KO[token,d*4+1]=T.reinterpret(T.float16,T.cast(k0>>16,T.uint16))
+                        KO[token,d*4+2]=T.reinterpret(T.float16,T.cast(k1&65535,T.uint16))
+                        KO[token,d*4+3]=T.reinterpret(T.float16,T.cast(k1>>16,T.uint16))
+                        VO[token,d*4]=T.reinterpret(T.float16,T.cast(v0&65535,T.uint16))
+                        VO[token,d*4+1]=T.reinterpret(T.float16,T.cast(v0>>16,T.uint16))
+                        VO[token,d*4+2]=T.reinterpret(T.float16,T.cast(v1&65535,T.uint16))
+                        VO[token,d*4+3]=T.reinterpret(T.float16,T.cast(v1>>16,T.uint16))
+    return kernel

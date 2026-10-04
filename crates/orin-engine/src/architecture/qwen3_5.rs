@@ -360,7 +360,7 @@ pub(super) fn build(
         b.programs.insert("mtp_draft".into(), ops);
     }
     if let Some(kv) = &mut manifest.kv_cache {
-        if kv.direct_prefill {
+        if kv.direct_prefill && kv.prefill_workspace.is_empty() {
             // Chunk recipes retain their stable slot numbering but omit gather.
             for (program, ops) in &mut b.programs {
                 let chunk = profiles.iter().any(|p| {
@@ -409,12 +409,21 @@ pub(super) fn build(
             } else {
                 continue;
             };
-            let buffers = kv
+            let mut buffers: Vec<String> = kv
                 .buffers
                 .keys()
                 .filter(|name| name.starts_with("Mtp") == mtp)
                 .cloned()
                 .collect();
+            if !mtp
+                && (program == "prefill"
+                    || profiles.iter().any(|p| {
+                        p.kind != PrefillKind::Sequence
+                            && program == &format!("prefill_m{}", p.tokens)
+                    }))
+            {
+                buffers.extend(kv.prefill_workspace.keys().cloned());
+            }
             kv.growth.insert(
                 program.clone(),
                 crate::model::KvGrowth {

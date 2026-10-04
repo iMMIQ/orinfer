@@ -12,7 +12,7 @@ check:
 	python3 -m unittest discover -s tools/bench -p 'test_*.py' -v
 	python3 -m unittest discover -s tools/operators -p 'test_abi.py' -v
 	python3 -m unittest discover -s tools/vision -p 'test_*.py' -v
-	python3 -m unittest tools.model.test_prepare tools.model.test_package tools.model.test_resize_context tools.model.test_optimize_kv -v
+	python3 -m unittest tools.model.test_prepare tools.model.test_package tools.model.test_resize_context tools.model.test_optimize_kv tools.model.test_stage_kv_prefill -v
 	python3 tools/bench/validate_plan.py
 
 info:

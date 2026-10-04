@@ -52,6 +52,9 @@ pub struct KvCache {
     pub demand_mapping: bool,
     /// Bytes per token for each payload or scale buffer (including metadata).
     pub buffers: BTreeMap<String, usize>,
+    /// Shared per-layer prefill scratch, demand-mapped independently of KV state.
+    #[serde(default)]
+    pub prefill_workspace: BTreeMap<String, usize>,
     /// Derived by the architecture; never supplied by an operator package.
     #[serde(skip)]
     pub(crate) growth: BTreeMap<String, KvGrowth>,
@@ -195,7 +198,14 @@ impl Manifest {
             if kv.buffers.is_empty() {
                 return Err("Empty KV allocation contract".into());
             }
-            for (name, stride) in &kv.buffers {
+            if kv
+                .prefill_workspace
+                .keys()
+                .any(|n| kv.buffers.contains_key(n))
+            {
+                return Err("KV state and scratch allocations overlap".into());
+            }
+            for (name, stride) in kv.buffers.iter().chain(&kv.prefill_workspace) {
                 let b = lookup(name)?;
                 if *stride == 0
                     || stride.checked_mul(self.max_context) != Some(b.bytes()?)
@@ -433,6 +443,7 @@ pub struct Report {
     pub buffer_bytes: usize,
     pub buffer_capacity_bytes: usize,
     pub peak_kv_bytes: usize,
+    pub peak_prefill_workspace_bytes: usize,
     pub weight_bytes: usize,
     pub effective_weight_bits: f64,
     pub weight_scope: String,

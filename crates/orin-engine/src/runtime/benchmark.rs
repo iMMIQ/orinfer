@@ -223,6 +223,7 @@ impl ModelRuntime {
             buffer_bytes: stats.buffer_bytes,
             buffer_capacity_bytes: stats.buffer_capacity_bytes,
             peak_kv_bytes: self.execution.peak_kv_bytes.get(),
+            peak_prefill_workspace_bytes: self.execution.peak_prefill_workspace_bytes.get(),
             weight_bytes: manifest.weight_bytes,
             effective_weight_bits: 8.0 * manifest.weight_bytes as f64
                 / manifest.weight_parameters as f64,
