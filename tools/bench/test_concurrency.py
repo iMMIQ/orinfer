@@ -1,10 +1,18 @@
 import io
 import unittest
 from unittest.mock import patch
-from tools.bench.concurrency import events, request, percentile
+from tools.bench.concurrency import counter_delta, events, request, percentile
 
 
 class StreamingTests(unittest.TestCase):
+    def test_counter_delta_handles_new_histogram_keys_and_omits_maxima(self):
+        self.assertEqual(counter_delta(
+            {'iterations': 5, 'peak_active': 2, 'batch_histogram': {'1': 5}},
+            {'iterations': 8, 'peak_active': 4, 'batch_histogram': {'1': 5, '4': 3}}),
+            {'iterations': 3, 'batch_histogram': {'1': 0, '4': 3}})
+        self.assertIsNone(counter_delta(None, {}))
+        with self.assertRaises(ValueError):
+            counter_delta({'iterations': 5}, {'iterations': 0})
     def test_small_sample_tail_percentile_uses_nearest_rank(self):
         self.assertEqual(percentile([2.,1.],.95),2.)
         self.assertEqual(percentile([2.,1.],.5),1.)

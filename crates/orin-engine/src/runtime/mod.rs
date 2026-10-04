@@ -39,6 +39,11 @@ pub(crate) struct ModelRuntime {
     mtp_seconds_per_token: f64,
 }
 impl ModelRuntime {
+    pub(crate) fn scheduling_statistics(&self) -> crate::scheduler::Statistics {
+        let mut statistics = self.scheduler_statistics.clone();
+        statistics.batch_execution = self.execution.batch_statistics.get();
+        statistics
+    }
     #[cfg(test)]
     pub(crate) fn load(path: &std::path::Path) -> Result<Self> {
         Self::load_with_options(path, LoadOptions::default())

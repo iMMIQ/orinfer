@@ -48,8 +48,16 @@ impl ModelRuntime {
         input: &[u32],
         images: &[crate::vision::ImageInput],
     ) -> Result<usize> {
+        self.prefix_match_cost(input, images)
+            .map(|(tokens, _)| tokens)
+    }
+    pub(crate) fn prefix_match_cost(
+        &self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+    ) -> Result<(usize, usize)> {
         if self.prefix_cache.budget == 0 {
-            return Ok(0);
+            return Ok((0, 0));
         }
         let media = self.prefix_media(input, images)?;
         Ok(self
@@ -59,8 +67,11 @@ impl ModelRuntime {
                     .score(e.tokens.len(), input.len(), e.bytes)
             })
             .checkpoint
-            .map(|id| self.prefix_cache.entries[&id].tokens.len())
-            .unwrap_or(0))
+            .map(|id| {
+                let entry = &self.prefix_cache.entries[&id];
+                (entry.tokens.len(), entry.bytes)
+            })
+            .unwrap_or((0, 0)))
     }
     pub(super) fn restore_prefix(
         &mut self,

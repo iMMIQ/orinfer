@@ -3,6 +3,7 @@
 use super::{Argument, Handle, Result, Value, check, executor::Executor, ptr};
 use crate::{execution::Invocation, model::Operation};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[derive(Default)]
 pub(super) struct Sequence {
@@ -244,6 +245,9 @@ impl Executor {
         Ok(())
     }
     fn invalidate_current_graphs(&mut self) -> Result<()> {
+        let mut statistics = self.batch_statistics.get();
+        statistics.graph_invalidations += self.batch_graphs.get_mut().len();
+        self.batch_statistics.set(statistics);
         let mut execs: Vec<_> = std::mem::take(self.graphs.get_mut())
             .into_values()
             .collect();
@@ -520,7 +524,12 @@ impl Executor {
                 views: BTreeMap::new(),
             })
             .collect();
+        let at = Instant::now();
         let graph = self.capture(&invocations)?;
+        let mut statistics = self.batch_statistics.get();
+        statistics.sequence_captures += 1;
+        statistics.sequence_capture_s += at.elapsed().as_secs_f64();
+        self.batch_statistics.set(statistics);
         self.graphs.borrow_mut().insert(name.into(), graph);
         Ok(graph)
     }
@@ -551,11 +560,18 @@ impl Executor {
                     *g
                 });
             let graph = if let Some(graph) = cached {
+                let mut statistics = self.batch_statistics.get();
+                statistics.graph_hits += 1;
+                self.batch_statistics.set(statistics);
                 graph
             } else {
+                let mut statistics = self.batch_statistics.get();
+                statistics.graph_misses += 1;
+                self.batch_statistics.set(statistics);
                 // Bound graph cache size; varying slot memberships cannot retain
                 // unbounded captures. Stream is synchronized before destruction.
                 if self.batch_graphs.borrow().len() >= 16 {
+                    let at = Instant::now();
                     self.sync()?;
                     let victim = self
                         .batch_graphs
@@ -580,11 +596,21 @@ impl Executor {
                             )?;
                         }
                     }
+                    let mut statistics = self.batch_statistics.get();
+                    statistics.graph_evictions += 1;
+                    statistics.eviction_s += at.elapsed().as_secs_f64();
+                    self.batch_statistics.set(statistics);
                 }
+                let at = Instant::now();
                 let graph = self.capture(operations)?;
+                let mut statistics = self.batch_statistics.get();
+                statistics.capture_s += at.elapsed().as_secs_f64();
+                statistics.captured_operations += operations.len();
+                self.batch_statistics.set(statistics);
                 self.batch_graphs.borrow_mut().insert(key, (graph, tick));
                 graph
             };
+            let at = Instant::now();
             // SAFETY: Captured pointers refer to stable, retained request arenas.
             unsafe {
                 check(
@@ -592,12 +618,21 @@ impl Executor {
                     "batch graph",
                 )?;
             }
+            self.sync()?;
+            let mut statistics = self.batch_statistics.get();
+            statistics.replay_s += at.elapsed().as_secs_f64();
+            self.batch_statistics.set(statistics);
         } else {
+            let at = Instant::now();
             for op in operations {
                 self.invoke(op)?;
             }
+            self.sync()?;
+            let mut statistics = self.batch_statistics.get();
+            statistics.direct_s += at.elapsed().as_secs_f64();
+            self.batch_statistics.set(statistics);
         }
-        self.sync()
+        Ok(())
     }
 }
 

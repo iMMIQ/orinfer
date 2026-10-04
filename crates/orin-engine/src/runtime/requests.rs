@@ -129,12 +129,9 @@ impl ModelRuntime {
         input: &[u32],
         images: &[crate::vision::ImageInput],
     ) -> Result<scheduler::Waiting> {
-        let cached = self.prefix_match_tokens(input, images)?;
-        let bytes = if cached == 0 {
-            0
-        } else {
-            self.prefix_ranges(cached)?.values().map(|r| r.bytes).sum()
-        };
+        // The checkpoint already records the actual restored payload bytes.
+        // Rebuilding every tensor range for each queued request is unnecessary.
+        let (cached, bytes) = self.prefix_match_cost(input, images)?;
         Ok(scheduler::Waiting {
             age_s: 0.,
             remaining_s: self.prefill_costs.remaining(cached, input.len()),
@@ -233,6 +230,7 @@ impl ModelRuntime {
         input: GenerationInput,
         cancelled: &impl Fn() -> bool,
     ) -> Result<RequestState> {
+        let started = Instant::now();
         if self.manifest.batch_profiles.is_empty() {
             return Err(
                 "Model operator package lacks continuous batching; upgrade_batching.py is required"
@@ -318,6 +316,11 @@ impl ModelRuntime {
             self.execution
                 .release_sequence(slot, &self.manifest.reset_buffers)?;
             self.prefix_kv.clear();
+        }
+        self.scheduler_statistics.request_start_s += started.elapsed().as_secs_f64();
+        if let Ok(request) = &result {
+            self.scheduler_statistics.admissions += 1;
+            self.scheduler_statistics.prefix_restore_s += request.prefix.restore_s;
         }
         result
     }
@@ -496,6 +499,7 @@ impl ModelRuntime {
         let at = Instant::now();
         let mut output = vec![];
         let mut initialized = BTreeSet::new();
+        let completion_at = Instant::now();
         for (i, req) in requests.iter_mut().enumerate() {
             if req.prefilling && req.offset == req.input.len() {
                 let tokens = self.with_request(req, |model, req| model.complete_prefill(req))?;
@@ -503,6 +507,7 @@ impl ModelRuntime {
                 output.push(StepOutput { request: i, tokens });
             }
         }
+        self.scheduler_statistics.prefill_completion_s += completion_at.elapsed().as_secs_f64();
         let prefill = requests
             .iter()
             .enumerate()
@@ -663,6 +668,7 @@ impl ModelRuntime {
             .collect();
         #[cfg(test)]
         profile::mark("policy");
+        let inputs_at = Instant::now();
         for &(i, chunk) in &selected {
             let req = &mut requests[i];
             self.execution.activate_sequence(req.slot)?;
@@ -687,6 +693,8 @@ impl ModelRuntime {
         }
         #[cfg(test)]
         profile::mark("inputs");
+        self.scheduler_statistics.batch_inputs_s += inputs_at.elapsed().as_secs_f64();
+        let plan_at = Instant::now();
         let decode_only = selected.iter().all(|(i, _)| !requests[*i].prefilling);
         let graph_key: Vec<_> = segments.iter().map(|s| (s.slot, s.tokens)).collect();
         let plan = if self.execution.has_batch_graph(&graph_key, decode_only) {
@@ -696,12 +704,14 @@ impl ModelRuntime {
         };
         #[cfg(test)]
         profile::mark("plan");
+        self.scheduler_statistics.batch_plan_s += plan_at.elapsed().as_secs_f64();
         let key = Self::iteration_key(requests, &selected);
         let compute_at = Instant::now();
         self.execution
             .execute_batch(graph_key, &plan, decode_only)?;
         #[cfg(test)]
         profile::mark("execute");
+        let commit_at = Instant::now();
         let seconds = compute_at.elapsed().as_secs_f64();
         self.iteration_costs
             .entry(key)
@@ -730,6 +740,7 @@ impl ModelRuntime {
             }
         }
         self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
+        self.scheduler_statistics.batch_commit_s += commit_at.elapsed().as_secs_f64();
         #[cfg(test)]
         profile::mark("commit");
         Ok(output)

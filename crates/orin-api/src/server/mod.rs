@@ -363,6 +363,7 @@ async fn health(State(state): State<Service>) -> Json<Value> {
         json!({"status":"ready","model":state.model.as_ref(),"max_context":state.context,
         "continuous_batching":state.batching,"scheduler":state.scheduler,
         "scheduler_statistics":state.activity.statistics.lock().ok().map(|s| s.clone()),
+        "admission_statistics":state.activity.admission.lock().ok().map(|s| s.clone()),
         "active_requests":state.activity.active.load(Ordering::Relaxed),
         "queued_requests":state.activity.queued.load(Ordering::Relaxed)}),
     )

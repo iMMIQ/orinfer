@@ -73,16 +73,37 @@ def percentile(values, fraction):
     return values[min(len(values)-1, max(0, math.ceil(len(values)*fraction)-1))]
 
 
+def counter_delta(before, after):
+    """Differences of cumulative counters, including nested graph/histogram data."""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    out = {}
+    for key in before.keys() | after.keys():
+        a, b = before.get(key, 0), after.get(key, 0)
+        if isinstance(b, dict):
+            out[key] = counter_delta(a if isinstance(a, dict) else {}, b)
+        elif isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            if key.startswith('peak_') or key.startswith('max_'):
+                continue  # Cumulative maxima cannot be subtracted per round.
+            if b < a:
+                raise ValueError('Service counters reset during the benchmark')
+            out[key] = b-a
+    return out
+
+
 def run_round(base_url, cases, count):
     barrier = threading.Barrier(count)
     stop = threading.Event()
     samples = []
+    url = base_url.rstrip('/').removesuffix('/v1') + '/health'
+    def health():
+        with urllib.request.urlopen(url, timeout=2) as response:
+            return json.load(response)
+    before = health()
     def monitor():
-        url = base_url.rstrip('/').removesuffix('/v1') + '/health'
         while not stop.is_set():
             try:
-                with urllib.request.urlopen(url, timeout=1) as response:
-                    samples.append(json.load(response))
+                samples.append(health())
             except (OSError, ValueError):
                 pass
             stop.wait(.1)
@@ -98,6 +119,7 @@ def run_round(base_url, cases, count):
     finally:
         stop.set()
         thread.join(timeout=2)
+    after = health()
     output = sum(row['usage']['completion_tokens'] for row in rows)
     prompt = sum(row['usage']['prompt_tokens'] for row in rows)
     cached = sum(row['usage'].get('prompt_tokens_details', {}).get('cached_tokens', 0)
@@ -107,8 +129,12 @@ def run_round(base_url, cases, count):
         committed_output_tps=output/wall, prompt_tokens=prompt, cached_tokens=cached,
         observed_peak_active=max((s.get('active_requests',0) for s in samples),default=None),
         observed_peak_queued=max((s.get('queued_requests',0) for s in samples),default=None),
-        scheduler_first=samples[0].get('scheduler_statistics') if samples else None,
-        scheduler_last=samples[-1].get('scheduler_statistics') if samples else None,
+        scheduler_first=before.get('scheduler_statistics'),
+        scheduler_last=after.get('scheduler_statistics'),
+        scheduler_delta=counter_delta(before.get('scheduler_statistics'), after.get('scheduler_statistics')),
+        admission_first=before.get('admission_statistics'),
+        admission_last=after.get('admission_statistics'),
+        admission_delta=counter_delta(before.get('admission_statistics'), after.get('admission_statistics')),
         ttft_p50_s=percentile(ttft, .5) if ttft else None,
         ttft_p95_s=percentile(ttft, .95) if ttft else None, rows=rows)
 

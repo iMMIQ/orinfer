@@ -64,6 +64,39 @@ pub fn select_waiting(requests: &[Waiting]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
+/// Cached text admissions can form a cohort before the first decode. During
+/// ongoing generation, bound restoration work to protect inter-token latency.
+pub fn admission_should_yield(
+    has_decoders: bool,
+    admitted: usize,
+    elapsed_s: f64,
+    cached_text: bool,
+) -> bool {
+    if !cached_text {
+        return elapsed_s >= 0.010;
+    }
+    // Initial CUDA arena allocation is slower than reusing warm arenas. Allow
+    // a bounded cold cohort while no decoder is waiting for its next token.
+    let (count, seconds) = if has_decoders { (8, 0.100) } else { (32, 3.0) };
+    admitted >= count || elapsed_s >= seconds
+}
+
+/// Host timings; replay includes stream synchronization, not GPU event timing.
+#[derive(Default, Clone, Copy, Debug, Serialize)]
+pub struct BatchExecutionStatistics {
+    pub graph_hits: usize,
+    pub graph_misses: usize,
+    pub graph_evictions: usize,
+    pub graph_invalidations: usize,
+    pub captured_operations: usize,
+    pub capture_s: f64,
+    pub eviction_s: f64,
+    pub replay_s: f64,
+    pub direct_s: f64,
+    pub sequence_captures: usize,
+    pub sequence_capture_s: f64,
+}
+
 #[derive(Default, Clone, Debug, Serialize)]
 pub struct Statistics {
     pub iterations: usize,
@@ -75,11 +108,34 @@ pub struct Statistics {
     pub peak_active: usize,
     pub compute_s: f64,
     pub admission_deferrals: usize,
+    pub admissions: usize,
+    pub request_start_s: f64,
+    pub prefix_restore_s: f64,
+    pub prefill_completion_s: f64,
+    pub batch_inputs_s: f64,
+    pub batch_plan_s: f64,
+    pub batch_commit_s: f64,
+    pub batch_execution: BatchExecutionStatistics,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_cohorts_are_bounded_without_delaying_decoders_for_cold_work() {
+        assert!(!admission_should_yield(false, 1, 0.020, true));
+        assert!(!admission_should_yield(false, 31, 0.900, true));
+        assert!(admission_should_yield(false, 32, 0.900, true));
+        assert!(!admission_should_yield(false, 20, 1.500, true));
+        assert!(admission_should_yield(false, 2, 3.001, true));
+        assert!(!admission_should_yield(true, 4, 0.080, true));
+        assert!(admission_should_yield(true, 8, 0.080, true));
+        assert!(admission_should_yield(true, 4, 0.101, true));
+        for active in [false, true] {
+            assert!(admission_should_yield(active, 1, 0.020, false));
+            assert!(!admission_should_yield(active, 1, 0.005, false));
+        }
+    }
     #[test]
     fn aging_overrides_locality_and_restore_cost_is_charged() {
         let req = |age_s, remaining_s, restore_s| Waiting {

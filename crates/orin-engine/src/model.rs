@@ -566,8 +566,8 @@ impl Model {
     pub fn batching_supported(&self) -> bool {
         !self.0.manifest.batch_profiles.is_empty()
     }
-    pub fn scheduler_statistics(&self) -> &crate::scheduler::Statistics {
-        &self.0.scheduler_statistics
+    pub fn scheduler_statistics(&self) -> crate::scheduler::Statistics {
+        self.0.scheduling_statistics()
     }
     pub fn estimated_request_cost(
         &self,

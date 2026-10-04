@@ -11,6 +11,18 @@ pub(super) struct Activity {
     pub active: AtomicUsize,
     pub queued: AtomicUsize,
     pub statistics: std::sync::Mutex<scheduler::Statistics>,
+    pub admission: std::sync::Mutex<AdmissionStatistics>,
+}
+
+/// Wall time in admission includes policy, memory checks and request startup.
+#[derive(Default, Clone, serde::Serialize)]
+pub(super) struct AdmissionStatistics {
+    rounds: usize,
+    requests: usize,
+    cached_text_requests: usize,
+    wall_s: f64,
+    max_round_s: f64,
+    histogram: std::collections::BTreeMap<usize, usize>,
 }
 
 type Decoder<'a> = tokenizers::tokenizer::DecodeStream<
@@ -225,13 +237,7 @@ pub(super) fn worker(
     let mut completed: Vec<Mailbox> = vec![];
     loop {
         completed.retain_mut(|box_| box_.flush() && !box_.pending.is_empty());
-        while waiting.len() < 128 {
-            match jobs.try_recv() {
-                Ok(job) => waiting.push(job),
-                Err(_) => break,
-            }
-        }
-        waiting.retain(|job| !job.events.is_closed());
+        receive_waiting(&mut waiting, &mut jobs);
         for a in &mut active {
             if !a.mailbox.flush() || a.mailbox.failed || shutdown.load(Ordering::Relaxed) {
                 a.cancelled = true;
@@ -258,6 +264,9 @@ pub(super) fn worker(
             break;
         }
         let admission = Instant::now();
+        let has_decoders = active.iter().any(|a| !a.request.is_prefilling());
+        let mut admitted_count = 0;
+        let mut cached_count = 0;
         while active.len() < options.max_active && !waiting.is_empty() {
             let costs: Vec<_> = waiting
                 .iter()
@@ -274,6 +283,7 @@ pub(super) fn worker(
                 })
                 .collect();
             let mut admitted = false;
+            let mut cached_text = false;
             let mut untried: Vec<_> = (0..waiting.len()).collect();
             while !untried.is_empty() {
                 let relative = scheduler::select_waiting(
@@ -292,10 +302,14 @@ pub(super) fn worker(
                 match model.can_admit(&input, &options) {
                     Ok(true) => {
                         let job = waiting.remove(i);
+                        let text_only = input.images.is_empty();
+                        let prompt_tokens = input.input_tokens.len();
                         match model.start_request(input, || {
                             job.events.is_closed() || shutdown.load(Ordering::Relaxed)
                         }) {
                             Ok(request) => {
+                                cached_text = text_only
+                                    && request.prefix_statistics().cached_tokens == prompt_tokens;
                                 let mut a = Active::new(request, job, codec);
                                 a.mailbox
                                     .delta(model_id, json!({"role":"assistant","content":""}));
@@ -321,8 +335,35 @@ pub(super) fn worker(
                     Ok(false) => {}
                 }
             }
-            if !admitted || admission.elapsed().as_millis() >= 10 {
+            if admitted {
+                admitted_count += 1;
+                cached_count += usize::from(cached_text);
+                // HTTP arrivals continue while CUDA restores a prefix. Include
+                // already-arrived work in the cohort without a batching timer.
+                if cached_text {
+                    receive_waiting(&mut waiting, &mut jobs);
+                }
+            }
+            if !admitted
+                || scheduler::admission_should_yield(
+                    has_decoders,
+                    admitted_count,
+                    admission.elapsed().as_secs_f64(),
+                    cached_text,
+                )
+            {
                 break;
+            }
+        }
+        if admitted_count > 0 {
+            let seconds = admission.elapsed().as_secs_f64();
+            if let Ok(mut statistics) = activity.admission.lock() {
+                statistics.rounds += 1;
+                statistics.requests += admitted_count;
+                statistics.cached_text_requests += cached_count;
+                statistics.wall_s += seconds;
+                statistics.max_round_s = statistics.max_round_s.max(seconds);
+                *statistics.histogram.entry(admitted_count).or_default() += 1;
             }
         }
         activity.active.store(active.len(), Ordering::Relaxed);
@@ -344,7 +385,7 @@ pub(super) fn worker(
                 }
             }
             if let Ok(mut statistics) = activity.statistics.lock() {
-                *statistics = model.scheduler_statistics().clone();
+                *statistics = model.scheduler_statistics();
             }
         } else if waiting.is_empty() && completed.is_empty() {
             let Some(job) = jobs.blocking_recv() else {
@@ -357,9 +398,19 @@ pub(super) fn worker(
     }
     activity.active.store(0, Ordering::Relaxed);
     activity.queued.store(0, Ordering::Relaxed);
-    if let Ok(stats) = serde_json::to_string(model.scheduler_statistics()) {
+    if let Ok(stats) = serde_json::to_string(&model.scheduler_statistics()) {
         eprintln!("SCHEDULER {stats}");
     }
+}
+
+fn receive_waiting(waiting: &mut Vec<Job>, jobs: &mut mpsc::Receiver<Job>) {
+    while waiting.len() < 128 {
+        match jobs.try_recv() {
+            Ok(job) => waiting.push(job),
+            Err(_) => break,
+        }
+    }
+    waiting.retain(|job| !job.events.is_closed());
 }
 
 #[cfg(test)]
@@ -391,6 +442,26 @@ mod tests {
             queued: Instant::now(),
         };
         (Mailbox::new(job), receiver)
+    }
+
+    #[test]
+    fn admission_collects_arrivals_and_discards_disconnected_waiters() {
+        let (sender, mut jobs) = mpsc::channel(4);
+        let (first, first_receiver) = mailbox();
+        let (cancelled, cancelled_receiver) = mailbox();
+        sender.try_send(first.job).unwrap();
+        sender.try_send(cancelled.job).unwrap();
+        drop(cancelled_receiver);
+        let mut waiting = Vec::new();
+        receive_waiting(&mut waiting, &mut jobs);
+        assert_eq!(waiting.len(), 1);
+        let (arrival, arrival_receiver) = mailbox();
+        sender.try_send(arrival.job).unwrap();
+        receive_waiting(&mut waiting, &mut jobs);
+        assert_eq!(waiting.len(), 2);
+        drop((first_receiver, arrival_receiver));
+        receive_waiting(&mut waiting, &mut jobs);
+        assert!(waiting.is_empty());
     }
 
     #[test]

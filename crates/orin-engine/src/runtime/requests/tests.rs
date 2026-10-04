@@ -68,6 +68,19 @@ fn validate_continuous_requests() {
                 )
                 .unwrap();
             reference.push(tokens);
+            if source.images.is_empty() {
+                let (cached, bytes) = model
+                    .prefix_match_cost(&source.input_tokens, &source.images)
+                    .unwrap();
+                assert_eq!(cached, source.input_tokens.len());
+                let expected: usize = model
+                    .prefix_ranges(cached)
+                    .unwrap()
+                    .values()
+                    .map(|range| range.bytes)
+                    .sum();
+                assert_eq!(bytes, expected, "Cached restore-byte estimate changed");
+            }
         }
         let mut requests: Vec<_> = (0..count)
             .map(|i| {
