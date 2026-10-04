@@ -58,6 +58,83 @@ fn category(model: &ModelRuntime, op: &Invocation) -> String {
 }
 
 #[test]
+#[ignore = "Captures real FFN inputs; requires model and exclusive GPU experiment lock"]
+fn capture_decode_projections() {
+    use std::io::Write;
+    let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
+        std::env::var("ORIN_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
+    std::fs::create_dir(&output).unwrap();
+    let sources: Vec<GenerationInput> = serde_json::from_value(fixture["cases"].clone()).unwrap();
+    let mut model = ModelRuntime::load_with_options(
+        std::path::Path::new(fixture["model"].as_str().unwrap()),
+        LoadOptions {
+            cuda_graph: crate::execution::CudaGraphMode::Off,
+            prefix_cache_bytes: 0,
+        },
+    )
+    .unwrap();
+    model.manifest.mtp = None;
+    let options = scheduler::Options::default();
+    let mut samples = 0;
+    for source in sources {
+        let mut request = model.start_request(source, &|| false).unwrap();
+        while request.prefilling {
+            model
+                .advance_requests(&mut [&mut request], &options)
+                .unwrap();
+        }
+        model.with_request(&mut request, |model, req| {
+            model.execution.ensure_sequence_program(req.slot, "decode")?;
+            let operations = model.manifest.programs["decode"].clone();
+            for _ in 0..8 {
+                for operation in &operations {
+                    if let crate::model::Operation::Kernel { name } = operation {
+                        let pieces: Vec<_> = name.split('/').collect();
+                        if let Some(layer) = pieces.get(1).and_then(|s| s.strip_prefix("layer")) {
+                            let spec = model.manifest.kernels.iter().find(|k| k.name == *name).unwrap();
+                            for (family, input) in [("GateUp", "Norm"), ("Down", "Activated")] {
+                                if spec.args.iter().any(|a| matches!(a,
+                                    crate::artifact::Argument::Buffer { name } if name == &format!("L{layer}_{family}_P"))) {
+                                    if !spec.args.iter().any(|a| matches!(a,
+                                        crate::artifact::Argument::Buffer { name } if name == input)) {
+                                        return Err("Capture requires a source package with FP16 Norm/Activated inputs".into());
+                                    }
+                                    let stride = model.manifest.batch_layout.as_ref().unwrap().row_strides[input];
+                                    let bytes = model.execution.download_bytes(input, stride)?;
+                                    let mut file = std::fs::OpenOptions::new().create(true).append(true)
+                                        .open(output.join(format!("L{layer}_{family}.f16"))).map_err(|e| e.to_string())?;
+                                    file.write_all(&bytes).map_err(|e| e.to_string())?;
+                                }
+                            }
+                        }
+                    }
+                    model.execution.execute_batch(vec![], &[Invocation {
+                        operation: operation.clone(), sequence: None, views: BTreeMap::new(),
+                    }], false)?;
+                }
+                model.execution.sync()?;
+                samples += 1;
+            }
+            Ok(())
+        }).unwrap();
+        model.finish_request(&mut request, false).unwrap();
+    }
+    std::fs::write(
+        output.join("capture.json"),
+        serde_json::to_vec_pretty(&json!({
+            "model":fixture["model"],"fingerprint":model.stats.manifest_sha256,
+            "samples_per_projection":samples,"seed":20261002,
+            "scope":"Real sequential target-model decode inputs; no MTP."
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
 #[ignore = "Requires real model and exclusive GPU experiment lock"]
 fn profile_continuous_decode() {
     let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(

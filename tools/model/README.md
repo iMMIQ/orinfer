@@ -122,6 +122,21 @@ python3 tools/model/prepare.py \
 
 ## 独立算子包
 
+### Decode INT8 FFN
+
+已采用`u4_warp_n64_k128_mma_i8`布局的批处理模型，可离线添加质量优先的INT8 FFN包：
+
+```bash
+bash tools/operators/run.sh tools/model/optimize_int8_decode.py artifacts/operators/int8-decode \
+  --model /path/to/prepared-batch-model --model-output /path/to/int8-model
+```
+
+GateUp与Down直接从原W4解包到寄存器，通过INT8 Tensor Core逐128通道group累积，再使用原scale进行FP32缩放；不增加常驻W8副本，也不重新量化权重。Post RMSNorm融合每token A8量化，SwiGLU保留FP16激活边界并融合每128通道A8量化，Down使用FP32 split-K及原归并。其它投影、norm、head和持续状态沿用原精度；这不是所有算子强制INT8。27B新增Down scale workspace为34 KiB。
+
+1/2/4/8行使用固定行数kernel，较大batch使用动态行数kernel；32行及以上复用W4 tile计算两个MMA行块。短prefill、混合prefill和MTP主模型验证使用同一FFN策略，大块prefill沿用原包。执行计划仍由Rust注册，CLI和在线加载流程不变。工具验证布局、源包digest和生成后的计划，向新的目录原子发布；输出目录不可覆盖。
+
+`validate_int8_decode.py`使用真实权重、独立FP32参考、尾部保护及改变输入后的Graph replay验证kernel。可用ignored test `capture_decode_projections`（`ORIN_BATCH_FIXTURE`含model/output/cases）导出原路径的真实输入，再传入`--activations`；随机输入只检查实现。Down验证需使用`--families Down --modes group --group-activation`。`--dynamic-rows --tile-m 32 --tile-n 128`覆盖动态分支。验证报告与当前W4路径比较，用于判断新增计算误差；BF16/FP8量化质量需单独验收。完整模型必须另测连续请求、MTP已提交历史状态与实际吞吐。
+
 ### 连续批处理
 
 已有批处理算子包可加入GPU历史惩罚greedy；`--specialize-projections`同时加入27B的B4/B8 GateUp及B2/B4/B8 Down固定行数kernel。其他行数仍由动态kernel处理，权重payload保持不变，输出是独立的新模型目录：
