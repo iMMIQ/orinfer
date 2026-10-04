@@ -66,9 +66,11 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 使用包含`mtp`执行计划的模型时，所有支持的采样参数组合及文本、图片、多图请求自动启用MTP，thinking与工具调用沿用相同路径。无惩罚的greedy使用GPU top-1；其他组合对主模型与草稿分别应用相同的历史惩罚、temperature、top-k和top-p，再按`min(1,p/q)`接受草稿，拒绝后从归一化的`(p-q)+`采样修正token，保留主模型的采样分布（[算法来源](https://arxiv.org/abs/2211.17192)）。拒绝时恢复GDN、卷积、位置和有效KV状态。固定seed可复现同模式输出；随机MTP与普通decode不要求同seed输出逐token相同。图片草稿使用对应视觉embedding与MRoPE。输出尾部不足一个验证块时执行普通decode。MTP复用主模型embedding/head，额外草稿权重采用W4；构建方式见[离线构建说明](tools/model/README.md)。API日志记录每个请求的MTP接受数、轮数和分段耗时；是否加速取决于接受率及采样开销。
 
-`serve`默认启用prefix cache，`--prefix-cache-mib 12288`设置GPU快照预算，`0`关闭；预算按需分配，不在加载时预占。每个快照保存主模型KV、GDN、卷积、位置、最后logits，以及MTP KV和hidden环形缓存，恢复不改变Graph绑定地址。缓存最终提示和每8192 tokens的可用检查点，最多8项，按LRU和字节预算淘汰；选择与新请求匹配的最长完整检查点。图片身份包含预处理后的像素和网格，图片改变会导致miss。模型重载后缓存清空。命中只免除该段文本主干计算，视觉编码、剩余提示和生成仍执行。
+`serve`默认启用prefix cache，`--prefix-cache-mib 12288`设置实际GPU缓存字节预算，`0`关闭；按需分配，不在加载时预占。Rust压缩radix tree寻找兼容的完整状态检查点，结合在线测量的prefill块耗时、剩余输入分块和恢复复制成本选择命中；短前缀会破坏高效大块执行时跳过。KV区间不可变、按引用共享，GDN/卷积/位置/MTP状态独立保存，恢复复制到原有Graph绑定地址。保存最终提示、每8192 tokens的回退检查点，并按执行成本准入实际分叉点及Chat模板提示的系统/历史边界；生成结束时还保存已经计算的输出前缀，最后一个尚未计算的token由下一轮续接。输出检查点没有有效head时只用于继续输入，不能作为完整提示直接采样。检查点数量由字节预算决定，淘汰结合最近使用、复用次数与到最近有效祖先的重算距离。
 
-响应的`usage.prompt_tokens_details.cached_tokens`报告命中的tokens；SSE需请求`stream_options.include_usage=true`。日志记录查询、恢复、保存耗时和缓存实际字节。快照会复制状态并额外占用GPU内存；预算不足或无法分配时跳过缓存保存。长提示首次计算仍包含完整dense attention，复杂度不变。
+图片身份包含预处理后的像素和网格，绑定到该图片的第一个特征token；后面的图片变化不影响前面的有效检查点。模型重载后缓存清空。命中免除该段文本主干计算，视觉编码、剩余提示和生成仍执行。服务保持单GPU执行线程，在现有排队请求中优先选择完整前缀命中较长的请求；等待超过两秒后优先处理较早到达的请求，不为凑batch额外等待，最多一个执行请求和128个待处理请求。
+
+响应的`usage.prompt_tokens_details.cached_tokens`报告实际恢复的tokens；SSE需请求`stream_options.include_usage=true`。日志分别记录token匹配长度、状态恢复长度、查询/恢复/保存耗时、物理/逻辑字节、共享节省与淘汰数量。公共KV共享可以降低持久缓存占用，恢复仍执行GPU复制；缓存不是paged attention或零复制映射。预算不足或无法分配时跳过缓存保存。GDN继续保留FP32，没有使用近似后缀重建或状态量化；长提示首次计算仍包含完整dense attention，复杂度不变。
 
 模型的XML工具调用会转换成标准`tool_calls`，arguments为JSON字符串。客户端执行工具，并将带`tool_call_id`的`role=tool`消息连同历史再次发送。函数调用完成后才发送该调用的流式delta；工具参数支持结构校验，暂不提供完整JSON Schema约束解码。`tool_choice=required`或指定函数会加入模板指令并校验结果，模型未遵守时返回生成错误。
 

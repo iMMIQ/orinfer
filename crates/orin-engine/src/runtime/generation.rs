@@ -10,6 +10,24 @@ impl ModelRuntime {
         limit: usize,
         options: &crate::sampling::Options,
         cancelled: impl Fn() -> bool,
+        emit: impl FnMut(u32) -> bool,
+    ) -> Result<usize> {
+        let outcome = self.generate_inner(input, images, limit, options, cancelled, emit);
+        self.prefix_hints.clear();
+        self.prefix_kv.clear();
+        let cleanup = self.execution.collect_snapshots();
+        match outcome {
+            Ok(count) => cleanup.map(|()| count),
+            Err(error) => Err(error),
+        }
+    }
+    fn generate_inner(
+        &mut self,
+        input: &[u32],
+        images: Option<&[crate::vision::ImageInput]>,
+        limit: usize,
+        options: &crate::sampling::Options,
+        cancelled: impl Fn() -> bool,
         mut emit: impl FnMut(u32) -> bool,
     ) -> Result<usize> {
         let m = &self.manifest;
@@ -28,7 +46,7 @@ impl ModelRuntime {
         let mtp = self.manifest.mtp.clone();
         self.execution.reset_sequence(&m.reset_buffers)?;
         self.prepare_visual(input, images.unwrap_or(&[]), &cancelled)?;
-        let media = super::prefix::media_identity(images.unwrap_or(&[]));
+        let media = self.prefix_media(input, images.unwrap_or(&[]))?;
         let (mut offset, mut warm) = self.restore_prefix(input, &media)?;
         if offset != 0
             && offset < input.len()
@@ -46,13 +64,38 @@ impl ModelRuntime {
             warm.tokens = offset;
             warm.seconds += at.elapsed().as_secs_f64();
         }
+        let mut checkpoints = std::collections::BTreeSet::new();
+        let hints = std::mem::take(&mut self.prefix_hints);
+        if self.prefix_cache.budget != 0 {
+            checkpoints.extend((8192..input.len()).step_by(8192));
+            for hint in hints.into_iter().filter(|&p| p > offset && p < input.len()) {
+                if self.admit_prefix_checkpoint(hint, input.len(), offset, &checkpoints)? {
+                    checkpoints.insert(hint);
+                }
+            }
+            let branch = self.prefix_statistics.matched_tokens;
+            if branch > offset
+                && branch < input.len()
+                && self.admit_prefix_checkpoint(branch, input.len(), offset, &checkpoints)?
+            {
+                checkpoints.insert(branch);
+            }
+        }
         let mut last_head = None;
         while offset < input.len() {
             if cancelled() {
                 return Err("Request cancelled during prefill".into());
             }
+            let boundary = checkpoints
+                .range((
+                    std::ops::Bound::Excluded(offset),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .copied()
+                .unwrap_or(input.len());
+            let remaining = boundary - offset;
             let m = &self.manifest;
-            let remaining = input.len() - offset;
             let plan = m
                 .prefill_plans
                 .iter()
@@ -73,75 +116,65 @@ impl ModelRuntime {
                         "head".to_string(),
                     ))
                 });
-            if let Some((chunk, program, head)) = selected {
+            let compute_at = Instant::now();
+            let (chunk, head) = if let Some((chunk, program, head)) = selected {
                 self.upload_ids(&m.input, &input[offset..offset + chunk])?;
                 self.launch_program(&program, ExecutionPhase::Prefill)?;
-                let endpoint = offset + chunk;
-                let checkpoint = self.prefix_cache.budget != 0
-                    && endpoint < input.len()
-                    && endpoint.is_multiple_of(8192);
-                if let Some(spec) = &mtp {
-                    self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
-                    if checkpoint && spec.hidden_ring.is_some() {
-                        let at = Instant::now();
-                        self.mtp_warm_state(
-                            spec,
-                            &input[warm.tokens + 1..endpoint],
-                            &cancelled,
-                            ExecutionPhase::Prefill,
-                            false,
-                        )?;
-                        warm.tokens = endpoint - 1;
-                        warm.seconds += at.elapsed().as_secs_f64();
-                    }
-                }
-                if checkpoint {
-                    self.launch_program(&head, ExecutionPhase::Prefill)?;
-                    self.store_prefix(&input[..endpoint], media, warm.tokens)?;
-                }
-                if let Some(spec) = &mtp
-                    && spec.hidden_ring.is_some()
-                    && endpoint < input.len()
-                {
+                (chunk, Some(head))
+            } else {
+                self.upload_ids(&m.token, &input[offset..offset + 1])?;
+                self.launch_program("decode", ExecutionPhase::Prefill)?;
+                (1, None)
+            };
+            let endpoint = offset + chunk;
+            let checkpoint = checkpoints.contains(&endpoint);
+            let mut compute_s;
+            if let Some(spec) = &mtp {
+                self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
+                compute_s = compute_at.elapsed().as_secs_f64();
+                if checkpoint && spec.hidden_ring.is_some() {
                     let at = Instant::now();
                     self.mtp_warm_state(
                         spec,
-                        &input[warm.tokens + 1..endpoint + 1],
+                        &input[warm.tokens + 1..endpoint],
                         &cancelled,
                         ExecutionPhase::Prefill,
                         false,
                     )?;
-                    warm.tokens = endpoint;
-                    warm.seconds += at.elapsed().as_secs_f64();
+                    warm.tokens = endpoint - 1;
+                    let seconds = at.elapsed().as_secs_f64();
+                    warm.seconds += seconds;
+                    compute_s += seconds;
                 }
-                offset += chunk;
-                last_head = Some(head);
             } else {
-                for (index, id) in input.iter().enumerate().skip(offset) {
-                    if cancelled() {
-                        return Err("Request cancelled during prefill".into());
-                    }
-                    self.upload_ids(&m.token, std::slice::from_ref(id))?;
-                    self.launch_program("decode", ExecutionPhase::Prefill)?;
-                    if let Some(spec) = &mtp {
-                        self.mtp_capture(spec, 1, ExecutionPhase::Prefill)?;
-                        if spec.hidden_ring.is_some() && index + 1 < input.len() {
-                            let at = Instant::now();
-                            self.mtp_warm_state(
-                                spec,
-                                &input[index + 1..index + 2],
-                                &cancelled,
-                                ExecutionPhase::Prefill,
-                                false,
-                            )?;
-                            warm.tokens = index + 1;
-                            warm.seconds += at.elapsed().as_secs_f64();
-                        }
-                    }
-                }
-                offset = input.len();
-                last_head = None;
+                compute_s = compute_at.elapsed().as_secs_f64();
             }
+            if checkpoint {
+                if let Some(head) = &head {
+                    self.launch_program(head, ExecutionPhase::Prefill)?;
+                }
+                self.store_prefix(&input[..endpoint], &media, warm.tokens, true)?;
+            }
+            if let Some(spec) = &mtp
+                && spec.hidden_ring.is_some()
+                && endpoint < input.len()
+            {
+                let at = Instant::now();
+                self.mtp_warm_state(
+                    spec,
+                    &input[warm.tokens + 1..endpoint + 1],
+                    &cancelled,
+                    ExecutionPhase::Prefill,
+                    false,
+                )?;
+                warm.tokens = endpoint;
+                let seconds = at.elapsed().as_secs_f64();
+                warm.seconds += seconds;
+                compute_s += seconds;
+            }
+            self.prefill_costs.observe(chunk, compute_s);
+            offset = endpoint;
+            last_head = head;
         }
         if let Some(head) = last_head {
             self.launch_program(&head, ExecutionPhase::Prefill)?;
@@ -165,10 +198,17 @@ impl ModelRuntime {
             warm.tokens = input.len() - 1;
             warm.seconds += at.elapsed().as_secs_f64();
         }
-        self.store_prefix(input, media, warm.tokens)?;
+        self.store_prefix(input, &media, warm.tokens, true)?;
         let m = &self.manifest;
         if let Some(spec) = &mtp {
-            return self.mtp_generate(spec, (input, warm), limit, options, &cancelled, &mut emit);
+            return self.mtp_generate(
+                spec,
+                (input, warm, &media),
+                limit,
+                options,
+                &cancelled,
+                &mut emit,
+            );
         }
         let mut generated = 0;
         let mut history = input.to_vec();
@@ -190,6 +230,7 @@ impl ModelRuntime {
         if self.read_control(&m.position)? as usize != input.len() + generated - 1 {
             return Err("Decode position mismatch".into());
         }
+        self.store_decoded_prefix(&history, &media, &cancelled)?;
         Ok(generated)
     }
 

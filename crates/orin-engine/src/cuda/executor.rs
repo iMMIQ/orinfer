@@ -28,6 +28,7 @@ pub(crate) struct Executor {
     pub(crate) peak_prefill_workspace_bytes: std::cell::Cell<usize>,
     prefill_workspace: std::collections::BTreeSet<String>,
     pub(crate) allocations: Allocations,
+    pub(crate) snapshot_allocations: Vec<std::rc::Rc<super::snapshot::Allocation>>,
 }
 
 /// Logical arenas share one CUDA owner today. Their addresses are separate so
@@ -421,6 +422,7 @@ impl Executor {
             total_bytes: total,
         };
         let executor = Self {
+            snapshot_allocations: vec![],
             session: s,
             pointers,
             sizes,

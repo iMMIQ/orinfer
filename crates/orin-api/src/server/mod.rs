@@ -130,6 +130,7 @@ mod settings_tests {
 #[derive(Clone)]
 struct Service {
     jobs: mpsc::Sender<Job>,
+    slots: Arc<tokio::sync::Semaphore>,
     codec: Arc<ChatCodec>,
     model: Arc<str>,
     context: usize,
@@ -138,6 +139,7 @@ struct Service {
     ids: Arc<AtomicU64>,
 }
 struct Job {
+    _slot: tokio::sync::OwnedSemaphorePermit,
     prepared: Prepared,
     events: mpsc::Sender<ModelEvent>,
     id: String,
@@ -227,6 +229,7 @@ async fn serve(settings: Settings) -> Result<()> {
     let (context, vision) = ready_receiver.await.map_err(|e| e.to_string())??;
     let state = Service {
         jobs: sender,
+        slots: Arc::new(tokio::sync::Semaphore::new(129)),
         codec,
         model: model_id,
         context,
@@ -303,6 +306,10 @@ async fn completions(
         Ok(Json(v)) => v,
         Err(e) => return error(e.status(), e.body_text()),
     };
+    let slot = match Arc::clone(&state.slots).try_acquire_owned() {
+        Ok(slot) => slot,
+        Err(_) => return error(StatusCode::TOO_MANY_REQUESTS, "Request queue is full"),
+    };
     let codec = Arc::clone(&state.codec);
     let model = Arc::clone(&state.model);
     let context = state.context;
@@ -324,6 +331,7 @@ async fn completions(
         .as_secs();
     let serial = state.ids.fetch_add(1, Ordering::Relaxed);
     let job = Job {
+        _slot: slot,
         prepared,
         events,
         id: format!("chatcmpl-{created}-{}-{serial}", std::process::id()),
@@ -382,7 +390,38 @@ fn worker_loop(
     model_id: &str,
     shutdown: &AtomicBool,
 ) {
-    while let Some(job) = jobs.blocking_recv() {
+    let mut waiting = Vec::new();
+    loop {
+        if waiting.is_empty() {
+            let Some(job) = jobs.blocking_recv() else {
+                break;
+            };
+            waiting.push(job);
+        }
+        while waiting.len() < 128 {
+            match jobs.try_recv() {
+                Ok(job) => waiting.push(job),
+                Err(_) => break,
+            }
+        }
+        waiting.retain(|job| !job.events.is_closed());
+        if waiting.is_empty() {
+            continue;
+        }
+        // Reorder queued work only; never delay a runnable request to form a batch.
+        // Age wins after two seconds, so cache locality cannot starve cold prompts.
+        let now = Instant::now();
+        let scores: Vec<_> = waiting
+            .iter()
+            .map(|job| {
+                let cached = model
+                    .cached_prefix_tokens(&job.prepared.input, &job.prepared.images)
+                    .unwrap_or(0);
+                (now.duration_since(job.queued), cached)
+            })
+            .collect();
+        let index = select_queued(&scores);
+        let job = waiting.remove(index);
         if job.events.is_closed() {
             continue;
         }
@@ -391,6 +430,46 @@ fn worker_loop(
             eprintln!("{}: {error}", job.id);
             let _ = job.events.blocking_send(ModelEvent::Failed(error));
         }
+    }
+}
+
+fn select_queued(scores: &[(std::time::Duration, usize)]) -> usize {
+    scores
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            let aged_a = a.0 >= std::time::Duration::from_secs(2);
+            let aged_b = b.0 >= std::time::Duration::from_secs(2);
+            aged_a.cmp(&aged_b).then_with(|| {
+                if aged_a {
+                    a.0.cmp(&b.0)
+                } else {
+                    a.1.cmp(&b.1).then(a.0.cmp(&b.0))
+                }
+            })
+        })
+        .map(|(i, _)| i)
+        .expect("nonempty queue")
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    #[test]
+    fn locality_reorders_fresh_jobs_but_waiting_age_prevents_starvation() {
+        use std::time::Duration as D;
+        assert_eq!(
+            select_queued(&[(D::from_millis(100), 0), (D::from_millis(50), 8000)]),
+            1
+        );
+        assert_eq!(
+            select_queued(&[(D::from_secs(3), 0), (D::from_secs(1), 8000)]),
+            0
+        );
+        assert_eq!(
+            select_queued(&[(D::from_secs(4), 0), (D::from_secs(3), 8000)]),
+            0
+        );
     }
 }
 fn generate_job(
@@ -415,6 +494,7 @@ fn generate_job(
     let mut parse_error = None;
     let mut eos = false;
     let mut cancelled = false;
+    model.set_prefix_cache_hints(job.prepared.prefix_hints.clone());
     if !send_delta(job, model_id, json!({"role":"assistant","content":""})) {
         return Ok(());
     }

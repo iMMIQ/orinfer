@@ -1,128 +1,304 @@
-//! Immutable GPU snapshots; graph-bound sequence addresses never change.
+//! Shared immutable KV extents plus private endpoint state. Restore keeps graph VAs.
 use super::executor::Executor;
 use super::{Result, check};
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
+#[derive(Clone, Debug)]
+pub(crate) struct Range {
+    pub offset: usize,
+    pub bytes: usize,
+}
+pub(crate) struct Allocation {
+    address: u64,
+    bytes: usize,
+}
+#[derive(Clone)]
+pub(crate) struct Piece {
+    allocation: Rc<Allocation>,
+    name: String,
+    range: Range,
+    source: usize,
+}
+#[derive(Clone)]
 pub(crate) struct Snapshot {
     pub bytes: usize,
-    address: u64,
-    ranges: Vec<(String, usize, usize)>,
+    state: Vec<Piece>,
+    pub kv: Vec<Piece>,
 }
-
-impl Executor {
-    pub(crate) fn snapshot_size(ranges: &BTreeMap<String, usize>) -> Result<usize> {
-        ranges.values().try_fold(0usize, |offset, bytes| {
-            offset
-                .checked_add(*bytes)
-                .and_then(|n| n.checked_add(255))
-                .map(|n| n & !255)
-                .ok_or("Snapshot size overflow".into())
-        })
+pub(crate) struct Plan {
+    state: BTreeMap<String, Range>,
+    tail: BTreeMap<String, Range>,
+    kv: Vec<Piece>,
+    pub new_bytes: usize,
+}
+impl crate::prefix::Resident for Plan {
+    fn allocations(&self, out: &mut BTreeMap<u64, usize>) {
+        for p in &self.kv {
+            out.insert(p.allocation.address, p.allocation.bytes);
+        }
     }
-
-    pub(crate) fn snapshot(&mut self, ranges: BTreeMap<String, usize>) -> Result<Option<Snapshot>> {
-        self.sync()?;
-        let bytes = Self::snapshot_size(&ranges)?;
-        for (name, count) in &ranges {
-            if *count > self.sizes.get(name).copied().unwrap_or(0)
+}
+impl crate::prefix::Resident for Snapshot {
+    fn allocations(&self, out: &mut BTreeMap<u64, usize>) {
+        for p in self.state.iter().chain(&self.kv) {
+            out.insert(p.allocation.address, p.allocation.bytes);
+        }
+    }
+}
+fn size(ranges: &BTreeMap<String, Range>) -> Result<usize> {
+    ranges.values().try_fold(0usize, |offset, r| {
+        offset
+            .checked_add(r.bytes)
+            .and_then(|n| n.checked_add(255))
+            .map(|n| n & !255)
+            .ok_or("Snapshot size overflow".into())
+    })
+}
+impl Executor {
+    #[cfg(test)]
+    pub(crate) fn snapshot_resident_bytes(&self) -> usize {
+        self.snapshot_allocations.iter().map(|a| a.bytes).sum()
+    }
+    pub(crate) fn plan_snapshot(
+        &self,
+        ranges: BTreeMap<String, Range>,
+        kv_names: &BTreeSet<String>,
+        base: &[Piece],
+    ) -> Result<Plan> {
+        let (mut state_ranges, mut new_kv, mut kv) = (BTreeMap::new(), BTreeMap::new(), vec![]);
+        for (name, range) in ranges {
+            let end = range
+                .offset
+                .checked_add(range.bytes)
+                .ok_or("Snapshot extent overflow")?;
+            if self.sizes.get(&name).is_none_or(|&bytes| end > bytes)
                 || self
                     .session
                     .virtual_buffers
                     .borrow()
-                    .get(name)
-                    .is_some_and(|v| *count > v.mapped)
+                    .get(&name)
+                    .is_some_and(|v| end > v.mapped)
             {
                 return Err(format!("{name}: snapshot outside resident allocation"));
             }
+            if !kv_names.contains(&name) {
+                state_ranges.insert(name, range);
+                continue;
+            }
+            if range.offset != 0 {
+                return Err("KV snapshot must start at zero".into());
+            }
+            let mut covered = 0;
+            for p in base.iter().filter(|p| p.name == name) {
+                if covered == range.bytes {
+                    break;
+                }
+                if p.range.offset != covered {
+                    return Err("Non-contiguous shared KV extent".into());
+                }
+                let mut p = p.clone();
+                p.range.bytes = p.range.bytes.min(range.bytes - covered);
+                covered += p.range.bytes;
+                kv.push(p);
+            }
+            if covered < range.bytes {
+                new_kv.insert(
+                    name,
+                    Range {
+                        offset: covered,
+                        bytes: range.bytes - covered,
+                    },
+                );
+            }
+        }
+        let new_bytes = size(&state_ranges)?
+            .checked_add(size(&new_kv)?)
+            .ok_or("Snapshot size overflow")?;
+        Ok(Plan {
+            state: state_ranges,
+            tail: new_kv,
+            kv,
+            new_bytes,
+        })
+    }
+    pub(crate) fn snapshot(&mut self, plan: &Plan) -> Result<Option<Snapshot>> {
+        self.sync()?;
+        self.collect_snapshots()?;
+        let Some(state) = self.save_ranges(plan.state.clone())? else {
+            return Ok(None);
+        };
+        let Some(tail) = self.save_ranges(plan.tail.clone())? else {
+            drop(state);
+            self.collect_snapshots()?;
+            return Ok(None);
+        };
+        let mut kv = plan.kv.clone();
+        kv.extend(tail);
+        let bytes = state.iter().chain(&kv).map(|p| p.range.bytes).sum();
+        self.sync()?;
+        Ok(Some(Snapshot { bytes, state, kv }))
+    }
+    fn save_ranges(&mut self, ranges: BTreeMap<String, Range>) -> Result<Option<Vec<Piece>>> {
+        let bytes = size(&ranges)?;
+        if bytes == 0 {
+            return Ok(Some(vec![]));
         }
         let (mut free, mut total, mut address) = (0, 0, 0);
-        // SAFETY: Live context; this thread owns all source buffers. The new
-        // allocation immediately joins Session ownership, including error paths.
+        // SAFETY: Live context, checked extents. Ownership transfers to Session
+        // before any fallible copy; its destructor also handles error paths.
         unsafe {
             check(
                 (self.session.driver.memory_info)(&mut free, &mut total),
                 "snapshot memory",
             )?;
-            if bytes == 0 || bytes > free.saturating_sub(64 * 1024 * 1024) {
+            if bytes > free.saturating_sub(64 * 1024 * 1024) {
                 return Ok(None);
             }
             let status = (self.session.driver.alloc)(&mut address, bytes);
             if status == 2 {
                 return Ok(None);
-            } // Cache admission must not cause OOM.
+            }
             check(status, "allocate prefix snapshot")?;
         }
         self.session.buffers.push(address);
-        let mut snapshot = Snapshot {
-            address,
-            bytes,
-            ranges: vec![],
-        };
-        let mut offset = 0;
-        for (name, count) in ranges {
-            if count != 0 {
-                // SAFETY: Both validated allocations cover count bytes. Copies
-                // share the executor stream and complete before publication.
+        let allocation = Rc::new(Allocation { address, bytes });
+        self.snapshot_allocations.push(Rc::clone(&allocation));
+        let (mut pieces, mut source) = (vec![], 0);
+        for (name, range) in ranges {
+            if range.bytes != 0 {
+                // SAFETY: Source/destination extents are validated; one stream
+                // orders all writes before the immutable snapshot is published.
                 unsafe {
                     check(
                         (self.session.driver.copy)(
-                            address + offset as u64,
-                            self.pointers[&name],
-                            count,
+                            address + source as u64,
+                            self.pointers[&name] + range.offset as u64,
+                            range.bytes,
                             self.session.stream,
                         ),
-                        "save prefix state",
+                        "save prefix extent",
                     )?;
                 }
-                snapshot.ranges.push((name, offset, count));
+                let count = range.bytes;
+                pieces.push(Piece {
+                    allocation: Rc::clone(&allocation),
+                    name,
+                    range,
+                    source,
+                });
+                source = (source + count + 255) & !255;
             }
-            offset = (offset + count + 255) & !255;
         }
-        self.sync()?;
-        Ok(Some(snapshot))
+        Ok(Some(pieces))
     }
-
     pub(crate) fn restore_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
         self.sync()?;
-        for (name, _, count) in &snapshot.ranges {
+        // Grow once to each final extent, then restore shared KV and endpoint state.
+        let mut extents: BTreeMap<&str, usize> = BTreeMap::new();
+        for p in snapshot.kv.iter().chain(&snapshot.state) {
+            let end = p
+                .range
+                .offset
+                .checked_add(p.range.bytes)
+                .ok_or("Restore extent overflow")?;
+            extents
+                .entry(&p.name)
+                .and_modify(|e| *e = (*e).max(end))
+                .or_insert(end);
+        }
+        for (name, count) in extents {
             if let Some(v) = self.session.virtual_buffers.borrow_mut().get_mut(name) {
                 v.grow(&self.session, count.div_ceil(v.stride))?;
             }
         }
-        for (name, offset, count) in &snapshot.ranges {
-            // SAFETY: Snapshot ranges were checked on creation. Mutable state
-            // uses its original graph-bound addresses; mappings grew above.
+        for p in snapshot.kv.iter().chain(&snapshot.state) {
+            // SAFETY: Immutable allocations remain referenced; ranges were checked
+            // at capture, and graph-bound destinations retain their original VAs.
             unsafe {
                 check(
                     (self.session.driver.copy)(
-                        self.pointers[name],
-                        snapshot.address + *offset as u64,
-                        *count,
+                        self.pointers[&p.name] + p.range.offset as u64,
+                        p.allocation.address + p.source as u64,
+                        p.range.bytes,
                         self.session.stream,
                     ),
-                    "restore prefix state",
+                    "restore prefix extent",
                 )?;
             }
         }
         self.sync()
     }
-
     pub(crate) fn release_snapshot(&mut self, snapshot: Snapshot) -> Result<()> {
-        self.sync()?;
-        let index = self
-            .session
-            .buffers
+        drop(snapshot);
+        self.collect_snapshots()
+    }
+    pub(crate) fn collect_snapshots(&mut self) -> Result<()> {
+        if self
+            .snapshot_allocations
             .iter()
-            .position(|&p| p == snapshot.address)
-            .ok_or("Unowned prefix snapshot")?;
-        // SAFETY: Completed stream; allocation remains Session-owned until free succeeds.
-        unsafe {
-            check(
-                (self.session.driver.free)(snapshot.address),
-                "release prefix snapshot",
-            )?;
+            .all(|a| Rc::strong_count(a) > 1)
+        {
+            return Ok(());
         }
-        self.session.buffers.swap_remove(index);
+        self.sync()?;
+        let mut i = 0;
+        while i < self.snapshot_allocations.len() {
+            let a = &self.snapshot_allocations[i];
+            if Rc::strong_count(a) != 1 {
+                i += 1;
+                continue;
+            }
+            let index = self
+                .session
+                .buffers
+                .iter()
+                .position(|&p| p == a.address)
+                .ok_or("Unowned snapshot allocation")?;
+            // SAFETY: Stream completed and registry is the only remaining owner.
+            unsafe {
+                check(
+                    (self.session.driver.free)(a.address),
+                    "release prefix allocation",
+                )?;
+            }
+            self.session.buffers.swap_remove(index);
+            self.snapshot_allocations.swap_remove(i);
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn range_accounting_checks_overflow_and_alignment() {
+        let mut r = BTreeMap::new();
+        r.insert(
+            "a".into(),
+            Range {
+                offset: 100,
+                bytes: 1,
+            },
+        );
+        r.insert(
+            "b".into(),
+            Range {
+                offset: 0,
+                bytes: 257,
+            },
+        );
+        assert_eq!(size(&r).unwrap(), 768);
+        r.insert(
+            "c".into(),
+            Range {
+                offset: 0,
+                bytes: usize::MAX,
+            },
+        );
+        assert!(size(&r).is_err());
     }
 }

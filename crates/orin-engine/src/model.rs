@@ -577,6 +577,18 @@ impl Model {
     pub fn prefix_statistics(&self) -> &crate::prefix::Statistics {
         &self.0.prefix_statistics
     }
+    /// CPU-only scheduling estimate; does not touch LRU or CUDA state.
+    pub fn cached_prefix_tokens(
+        &self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+    ) -> Result<usize> {
+        self.0.prefix_match_tokens(input, images)
+    }
+    /// Exact token boundaries supplied by an API template. Consumed by the next request.
+    pub fn set_prefix_cache_hints(&mut self, positions: Vec<usize>) {
+        self.0.prefix_hints = positions;
+    }
     pub fn generate(
         &mut self,
         input: &[u32],

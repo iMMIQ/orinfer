@@ -79,6 +79,7 @@ pub struct ChatRequest {
 
 pub struct Prepared {
     pub input: Vec<u32>,
+    pub prefix_hints: Vec<usize>,
     pub images: Vec<orin_engine::vision::ImageInput>,
     pub max_tokens: usize,
     pub sampling: Options,
@@ -348,9 +349,28 @@ impl ChatCodec {
             .stream_options
             .as_ref()
             .is_some_and(|v| v["include_usage"] == true);
+        // Hint at actual template token boundaries; never alter or pad the prompt.
+        let ends: Vec<_> = input
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| self.eos.contains(id))
+            .map(|(i, _)| i + 1)
+            .collect();
+        let mut prefix_hints = vec![];
+        if messages.first().is_some_and(|m| m["role"] == "system")
+            && let Some(&p) = ends.first()
+        {
+            prefix_hints.push(p);
+        }
+        if ends.len() >= 2 {
+            prefix_hints.push(ends[ends.len() - 2]);
+        }
+        prefix_hints.sort_unstable();
+        prefix_hints.dedup();
         let _ = request.user; // Attribution only; it does not alter sampling identity.
         Ok(Prepared {
             input,
+            prefix_hints,
             images,
             max_tokens,
             sampling,

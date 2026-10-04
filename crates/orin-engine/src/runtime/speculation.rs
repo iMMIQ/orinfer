@@ -61,14 +61,14 @@ impl ModelRuntime {
     pub(super) fn mtp_generate(
         &mut self,
         spec: &crate::mtp::Spec,
-        prefill: (&[u32], PrefillWarm),
+        prefill: (&[u32], PrefillWarm, &crate::prefix::Media),
         limit: usize,
         options: &crate::sampling::Options,
         cancelled: &impl Fn() -> bool,
         emit: &mut impl FnMut(u32) -> bool,
     ) -> Result<usize> {
         use std::time::Instant;
-        let (input, warm) = prefill;
+        let (input, warm, media) = prefill;
         if warm.tokens >= input.len() || self.read_control(&spec.position)? as usize != warm.tokens
         {
             return Err("MTP prefill warm position mismatch".into());
@@ -88,6 +88,7 @@ impl ModelRuntime {
         if !emit(pending) || limit == 1 {
             stats.committed_tokens = generated;
             self.speculation_statistics = Some(stats);
+            self.store_decoded_prefix(&history, media, cancelled)?;
             return Ok(generated);
         }
         while generated < limit {
@@ -244,6 +245,7 @@ impl ModelRuntime {
         self.upload_ids(&self.manifest.token, &[pending])?;
         stats.committed_tokens = generated;
         self.speculation_statistics = Some(stats);
+        self.store_decoded_prefix(&history, media, cancelled)?;
         Ok(generated)
     }
 }

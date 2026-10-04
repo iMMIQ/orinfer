@@ -34,6 +34,212 @@ fn default_graph() -> String {
 
 #[test]
 #[ignore = "Requires real model, prefix fixtures and exclusive GPU lock"]
+fn validate_adaptive_prefix_cache() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORIN_PREFIX_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 12usize << 30,
+        },
+    )
+    .unwrap();
+    let options = crate::sampling::Options {
+        temperature: 0.,
+        ..Default::default()
+    };
+    let source = &fixture
+        .cases
+        .iter()
+        .find(|c| c.images.is_empty() && c.input_tokens.len() >= 8192)
+        .unwrap()
+        .input_tokens;
+    let mut rows = vec![];
+    let run = |model: &mut ModelRuntime, input: &[u32], limit: usize| {
+        let at = Instant::now();
+        let mut tokens = vec![];
+        let mut ttft = 0.;
+        model
+            .generate(
+                input,
+                None,
+                limit,
+                &options,
+                || false,
+                |id| {
+                    if tokens.is_empty() {
+                        ttft = at.elapsed().as_secs_f64();
+                    }
+                    tokens.push(id);
+                    true
+                },
+            )
+            .unwrap();
+        (tokens, ttft)
+    };
+    // A short cached root or template hint must not break a fast 512-token
+    // plan into dozens of small, bandwidth-bound launches.
+    // Both runs keep identical MTP warm/head partitions; only cache contents
+    // and the candidate boundaries differ.
+    let (cold, _) = run(&mut model, &source[..512], 1);
+    let cold_state = complete_prefix_state(&model, 512);
+    for snapshot in model.prefix_cache.clear() {
+        model.execution.release_snapshot(snapshot).unwrap();
+    }
+    run(&mut model, &source[..1], 1);
+    run(&mut model, &source[..26], 1);
+    model.prefix_hints = vec![1, 26];
+    let (actual, ttft) = run(&mut model, &source[..512], 1);
+    assert_eq!(model.prefix_statistics.cached_tokens, 0);
+    assert_eq!(model.prefix_statistics.matched_tokens, 26);
+    assert_eq!(actual, cold);
+    assert_eq!(complete_prefix_state(&model, 512), cold_state);
+    assert_eq!(model.prefix_cache.entries.len(), 3);
+    rows.push(
+        json!({"case":"unprofitable_short_prefix","ttft_s":ttft,"prefix":model.prefix_statistics}),
+    );
+    for snapshot in model.prefix_cache.clear() {
+        model.execution.release_snapshot(snapshot).unwrap();
+    }
+    // The second request discovers a branch; the third can resume at it.
+    run(&mut model, &source[..1024], 1);
+    let mut branch_a = source[..512].to_vec();
+    branch_a.extend([991; 8]);
+    run(&mut model, &branch_a, 1);
+    assert_eq!(model.prefix_statistics.matched_tokens, 512);
+    let mut branch_b = source[..512].to_vec();
+    branch_b.extend([992; 8]);
+    model.prefix_cache.budget = 0;
+    let (expected, _) = run(&mut model, &branch_b, 8);
+    let expected_state = complete_prefix_state(&model, branch_b.len() + 7);
+    model.prefix_cache.budget = 12usize << 30;
+    let (actual, ttft) = run(&mut model, &branch_b, 8);
+    assert_eq!(model.prefix_statistics.cached_tokens, 512);
+    assert_eq!(expected, actual);
+    assert_eq!(
+        expected_state,
+        complete_prefix_state(&model, branch_b.len() + 7)
+    );
+    rows.push(json!({"case":"adaptive_branch","ttft_s":ttft,"prefix":model.prefix_statistics}));
+    // Generated tokens are retained, excluding the final pending token.
+    let mut continuation = branch_b.clone();
+    continuation.extend(&actual);
+    continuation.extend([198; 8]);
+    let (cached, ttft) = run(&mut model, &continuation, 8);
+    assert!(model.prefix_statistics.cached_tokens >= branch_b.len() + actual.len() - 1);
+    let state = complete_prefix_state(&model, continuation.len() + 7);
+    rows.push(
+        json!({"case":"generated_continuation","ttft_s":ttft,"prefix":model.prefix_statistics}),
+    );
+    model.prefix_cache.budget = 0;
+    let (cold, _) = run(&mut model, &continuation, 8);
+    assert_eq!(cold, cached);
+    assert_eq!(state, complete_prefix_state(&model, continuation.len() + 7));
+    // Nested checkpoints share GPU KV, not just CPU metadata.
+    for snapshot in model.prefix_cache.clear() {
+        model.execution.release_snapshot(snapshot).unwrap();
+    }
+    model.prefix_cache.budget = 12usize << 30;
+    let long: Vec<_> = source.iter().copied().cycle().take(32768).collect();
+    let (_, ttft) = run(&mut model, &long, 1);
+    assert_eq!(model.prefix_statistics.entries, 4);
+    assert!(model.prefix_statistics.shared_bytes > 1_500_000_000);
+    assert!(model.prefix_statistics.resident_bytes < 2_000_000_000);
+    rows.push(json!({"case":"nested_32k","ttft_s":ttft,"prefix":model.prefix_statistics}));
+    let (_, ttft) = run(&mut model, &long, 1);
+    assert_eq!(model.prefix_statistics.cached_tokens, 32768);
+    rows.push(json!({"case":"nested_32k_hit","ttft_s":ttft,"prefix":model.prefix_statistics}));
+    for snapshot in model.prefix_cache.clear() {
+        model.execution.release_snapshot(snapshot).unwrap();
+    }
+    model.prefix_cache.budget = 350usize << 20;
+    for token in 1000..1006 {
+        let mut input = source[..512].to_vec();
+        input[0] = token;
+        run(&mut model, &input, 1);
+        assert!(model.prefix_cache.bytes <= model.prefix_cache.budget);
+        assert_eq!(
+            model.prefix_cache.bytes,
+            model.prefix_cache.resident_with(None)
+        );
+        assert_eq!(
+            model.execution.snapshot_resident_bytes(),
+            model.prefix_cache.bytes
+        );
+        rows.push(json!({"case":"budget_eviction","prefix":model.prefix_statistics}));
+    }
+    assert!(
+        rows.iter()
+            .any(|r| r["case"] == "budget_eviction"
+                && r["prefix"]["evictions"].as_u64().unwrap() > 0)
+    );
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(&json!({"status":"passed","requests":rows})).unwrap(),
+    )
+    .unwrap();
+}
+
+fn complete_prefix_state(model: &ModelRuntime, position: usize) -> BTreeMap<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut ranges = model.prefix_ranges(position).unwrap();
+    if let Some(kv) = &model.manifest.kv_cache {
+        for growth in kv
+            .growth
+            .values()
+            .filter(|g| g.position != model.manifest.position)
+        {
+            let count = model.read_control(&growth.position).unwrap() as usize;
+            for name in &growth.buffers {
+                if let Some(range) = ranges.get_mut(name) {
+                    range.bytes = count * kv.buffers[name];
+                }
+            }
+        }
+    }
+    if let Some(spec) = &model.manifest.mtp {
+        ranges.insert(
+            spec.draft_logits.clone(),
+            crate::cuda::snapshot::Range {
+                offset: 0,
+                bytes: model.execution.sizes[&spec.draft_logits],
+            },
+        );
+    }
+    ranges
+        .into_iter()
+        .filter(|(name, _)| name != &model.manifest.logits)
+        .map(|(name, range)| {
+            let mut hash = Sha256::new();
+            let mut raw = vec![0u8; range.bytes.clamp(1, 8 * 1024 * 1024)];
+            for offset in (0..range.bytes).step_by(raw.len()) {
+                let count = raw.len().min(range.bytes - offset);
+                // SAFETY: prefix_ranges validates model extents; all graph launches
+                // have completed, and the bounded host allocation covers count bytes.
+                unsafe {
+                    check(
+                        (model.execution.session.driver.download)(
+                            raw.as_mut_ptr().cast(),
+                            model.execution.pointers[&name] + (range.offset + offset) as u64,
+                            count,
+                        ),
+                        "complete cached state",
+                    )
+                    .unwrap();
+                }
+                hash.update(&raw[..count]);
+            }
+            (name, format!("{:x}", hash.finalize()))
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "Requires real model, prefix fixtures and exclusive GPU lock"]
 fn validate_prefix_reuse() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(
         std::env::var("ORIN_PREFIX_FIXTURE").unwrap(),
@@ -54,10 +260,9 @@ fn validate_prefix_reuse() {
     };
     let mut rows = vec![];
     for case in &fixture.cases {
-        while let Some(entry) = model.prefix_cache.entries.pop_front() {
-            model.execution.release_snapshot(entry.snapshot).unwrap();
+        for snapshot in model.prefix_cache.clear() {
+            model.execution.release_snapshot(snapshot).unwrap();
         }
-        model.prefix_cache.bytes = 0;
         let options = case.sampling.as_ref().unwrap_or(&defaults);
         let mut reference = None;
         let mut reference_state = None;
@@ -195,10 +400,9 @@ fn validate_prefix_reuse() {
             );
         }
         if case.input_tokens.len() == 8192 && case.images.is_empty() {
-            while let Some(entry) = model.prefix_cache.entries.pop_front() {
-                model.execution.release_snapshot(entry.snapshot).unwrap();
+            for snapshot in model.prefix_cache.clear() {
+                model.execution.release_snapshot(snapshot).unwrap();
             }
-            model.prefix_cache.bytes = 0;
             let mut extended = case.input_tokens.clone();
             extended.extend_from_slice(&case.input_tokens[..512]);
             model
@@ -208,7 +412,7 @@ fn validate_prefix_reuse() {
                 model
                     .prefix_cache
                     .entries
-                    .iter()
+                    .values()
                     .any(|e| e.tokens.len() == 8192)
             );
             let mut branch = case.input_tokens.clone();
@@ -256,10 +460,10 @@ fn validate_prefix_reuse() {
                 .prefix_cache
                 .entries
                 .iter()
-                .position(|e| e.tokens == branch)
+                .find(|(_, e)| e.tokens == branch)
+                .map(|(&id, _)| id)
                 .unwrap();
-            let entry = model.prefix_cache.entries.remove(index).unwrap();
-            model.prefix_cache.bytes -= entry.bytes;
+            let entry = model.prefix_cache.remove(index).unwrap();
             model.execution.release_snapshot(entry.snapshot).unwrap();
         }
         if case.images.is_empty() && case.input_tokens.len().is_multiple_of(512) {

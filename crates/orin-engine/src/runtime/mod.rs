@@ -13,6 +13,7 @@ mod generation;
 #[cfg(test)]
 #[path = "../mtp_gpu_tests.rs"]
 mod mtp_gpu_tests;
+mod prefill_cost;
 mod prefix;
 mod speculation;
 mod vision;
@@ -24,6 +25,9 @@ pub(crate) struct ModelRuntime {
     pub(crate) speculation_statistics: Option<crate::mtp::Statistics>,
     prefix_cache: crate::prefix::Cache<crate::cuda::snapshot::Snapshot>,
     pub(crate) prefix_statistics: crate::prefix::Statistics,
+    prefix_kv: Vec<crate::cuda::snapshot::Piece>,
+    pub(crate) prefix_hints: Vec<usize>,
+    prefill_costs: prefill_cost::Costs,
 }
 impl ModelRuntime {
     #[cfg(test)]
@@ -43,6 +47,16 @@ impl ModelRuntime {
             options,
         )?;
         stats.load_to_ready_s = started.elapsed().as_secs_f64();
+        let shapes = if prepared.plan.prefill_plans.is_empty() {
+            vec![prepared.plan.chunk_tokens]
+        } else {
+            prepared
+                .plan
+                .prefill_plans
+                .iter()
+                .map(|p| p.chunk_tokens)
+                .collect()
+        };
         Ok(Self {
             manifest: prepared.plan,
             execution,
@@ -50,6 +64,9 @@ impl ModelRuntime {
             speculation_statistics: None,
             prefix_cache: crate::prefix::Cache::new(options.prefix_cache_bytes),
             prefix_statistics: crate::prefix::Statistics::default(),
+            prefix_kv: vec![],
+            prefix_hints: vec![],
+            prefill_costs: prefill_cost::Costs::new(shapes),
         })
     }
     fn launch_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
