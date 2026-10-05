@@ -6,7 +6,8 @@ import tempfile
 import unittest
 
 from safetensors import safe_open
-from tools.model.prepare import _prepare_containers as prepare
+from tools.model.prepare import _write_containers
+from tools.model.publication import staged_directory
 
 
 class PrepareTests(unittest.TestCase):
@@ -43,7 +44,9 @@ class PrepareTests(unittest.TestCase):
         (self.source / 'model.json').write_text(json.dumps(self.manifest))
 
     def run_prepare(self, size=8):
-        return prepare(self.source / 'model.json', self.checkpoint, self.output, size)
+        with staged_directory(self.output) as staging:
+            result = _write_containers(self.source / 'model.json', self.checkpoint, staging, size)
+        return result
 
     def test_roundtrip_all_bits_shards_and_checkpoint_files(self):
         report = self.run_prepare()

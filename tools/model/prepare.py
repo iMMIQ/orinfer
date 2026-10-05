@@ -8,13 +8,14 @@ import argparse
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import shutil
-import tempfile
 import time
 
 from safetensors import safe_open, serialize_file
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.model.publication import file_hash, source_path, write_json, staged_directory
 
 
 DTYPES = {
@@ -36,36 +37,17 @@ REQUIRED_FILES = ('config.json', 'generation_config.json', 'tokenizer.json',
                   'chat_template.jinja')
 
 
-def source_path(base, file):
-    path = Path(file)
-    if not file or path.is_absolute() or any(p in ('.', '..') for p in path.parts):
-        raise ValueError(f'Unsafe artifact path: {file}')
-    # Check lexical components too: pathlib normalizes away "." components.
-    if any(p in ('', '.', '..') for p in file.split('/')):
-        raise ValueError(f'Unsafe artifact path: {file}')
-    resolved = (base / path).resolve(strict=True)
-    if not resolved.is_relative_to(base):
-        raise ValueError(f'Artifact leaves its directory: {file}')
-    return resolved
 
 
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def file_hash(path):
-    digest = hashlib.sha256()
-    with path.open('rb') as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
-def write_json(path, data):
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + '\n')
 
 
-def _prepare_containers(model, checkpoint, output, shard_bytes=1024**3):
+def _write_containers(model, checkpoint, output, shard_bytes=1024**3):
     started = time.monotonic()
     model = model.resolve(strict=True)
     checkpoint = checkpoint.resolve(strict=True)
@@ -118,72 +100,64 @@ def _prepare_containers(model, checkpoint, output, shard_bytes=1024**3):
     free = shutil.disk_usage(output.parent).free
     if free < total_size + 128 * 1024**2:
         raise ValueError(f'Insufficient space: need {total_size} payload bytes, free {free}')
-    staging = Path(tempfile.mkdtemp(prefix=f'.{output.name}-', dir=output.parent))
-    try:
-        cache = staging / 'cache'
-        weights = cache / 'weights'
-        kernels = cache / 'kernels'
-        weights.mkdir(parents=True)
-        kernels.mkdir()
-        for name in CONFIG_FILES:
-            source = checkpoint / name
-            if source.is_file():
-                shutil.copyfile(source, staging / name)
-        weight_map = {}
-        for number, group in enumerate(groups, 1):
-            filename = f'model-{number:05d}-of-{len(groups):05d}.safetensors'
-            tensors = {}
-            metadata = {'orin.cache_format': '1'}
-            for buffer, path, dtype, _ in group:
-                data = path.read_bytes()
-                digest = sha256(data)
-                if digest != buffer['data']['sha256']:
-                    raise ValueError(f'{buffer["name"]}: source sha256 mismatch')
-                name = buffer['name']
-                tensors[name] = {'dtype': RAW_DTYPES[dtype], 'shape': buffer['shape'], 'data': data}
-                metadata[f'orin.layout.{name}'] = buffer['layout']
-                weight_map[name] = filename
-                buffer['data'] = {'tensor': name, 'sha256': digest}
-            serialize_file(tensors, weights / filename, metadata=metadata)
-            # The standard reader validates the written header, shapes and extents.
-            with safe_open(weights / filename, framework='np') as reader:
-                for buffer, _, dtype, _ in group:
-                    view = reader.get_slice(buffer['name'])
-                    if view.get_shape() != buffer['shape'] or view.get_dtype() != dtype:
-                        raise ValueError('Written safetensors metadata differs')
-            del tensors, data
-            print(f'prepared shard {number}/{len(groups)}', flush=True)
-        write_json(weights / 'model.safetensors.index.json', {
-            'metadata': {'total_size': total_size}, 'weight_map': weight_map,
-        })
-        assets = {}
-        for kernel in manifest['kernels']:
-            for field in ('module', 'source', 'host_abi'):
-                identity = kernel[field]
-                key = (identity['file'], identity['sha256'])
-                if key not in assets:
-                    path = source_path(model.parent, identity['file'])
-                    if file_hash(path) != identity['sha256']:
-                        raise ValueError(f'{path}: kernel asset sha256 mismatch')
-                    filename = identity['sha256'] + path.suffix
-                    destination = kernels / filename
-                    if not destination.exists():
-                        # Copy rather than hardlink: the published cache must stay
-                        # immutable even if an intermediate AOT asset is rebuilt.
-                        shutil.copyfile(path, destination)
-                    assets[key] = {'file': f'kernels/{filename}', 'sha256': identity['sha256']}
-                kernel[field] = assets[key].copy()
-        manifest['schema_version'] = 2
-        manifest['toolchain']['weight_container'] = 'safetensors'
-        manifest['toolchain']['source_manifest_sha256'] = sha256(raw)
-        write_json(cache / 'manifest.json', manifest)
-        # Publish only a complete directory. Existing outputs are never overwritten.
-        if output.exists() or output.is_symlink():
-            raise ValueError(f'Output appeared during preparation: {output}')
-        staging.rename(output)
-    except BaseException:
-        shutil.rmtree(staging)
-        raise
+    cache = output / 'cache'
+    weights = cache / 'weights'
+    kernels = cache / 'kernels'
+    weights.mkdir(parents=True)
+    kernels.mkdir()
+    for name in CONFIG_FILES:
+        source = checkpoint / name
+        if source.is_file():
+            shutil.copyfile(source, output / name)
+    weight_map = {}
+    for number, group in enumerate(groups, 1):
+        filename = f'model-{number:05d}-of-{len(groups):05d}.safetensors'
+        tensors = {}
+        metadata = {'orin.cache_format': '1'}
+        for buffer, path, dtype, _ in group:
+            data = path.read_bytes()
+            digest = sha256(data)
+            if digest != buffer['data']['sha256']:
+                raise ValueError(f'{buffer["name"]}: source sha256 mismatch')
+            name = buffer['name']
+            tensors[name] = {'dtype': RAW_DTYPES[dtype], 'shape': buffer['shape'], 'data': data}
+            metadata[f'orin.layout.{name}'] = buffer['layout']
+            weight_map[name] = filename
+            buffer['data'] = {'tensor': name, 'sha256': digest}
+        serialize_file(tensors, weights / filename, metadata=metadata)
+        # The standard reader validates the written header, shapes and extents.
+        with safe_open(weights / filename, framework='np') as reader:
+            for buffer, _, dtype, _ in group:
+                view = reader.get_slice(buffer['name'])
+                if view.get_shape() != buffer['shape'] or view.get_dtype() != dtype:
+                    raise ValueError('Written safetensors metadata differs')
+        del tensors, data
+        print(f'prepared shard {number}/{len(groups)}', flush=True)
+    write_json(weights / 'model.safetensors.index.json', {
+        'metadata': {'total_size': total_size}, 'weight_map': weight_map,
+    })
+    assets = {}
+    for kernel in manifest['kernels']:
+        for field in ('module', 'source', 'host_abi'):
+            identity = kernel[field]
+            key = (identity['file'], identity['sha256'])
+            if key not in assets:
+                path = source_path(model.parent, identity['file'])
+                if file_hash(path) != identity['sha256']:
+                    raise ValueError(f'{path}: kernel asset sha256 mismatch')
+                filename = identity['sha256'] + path.suffix
+                destination = kernels / filename
+                if not destination.exists():
+                    # Copy rather than hardlink: the published cache must stay
+                    # immutable even if an intermediate AOT asset is rebuilt.
+                    shutil.copyfile(path, destination)
+                assets[key] = {'file': f'kernels/{filename}', 'sha256': identity['sha256']}
+            kernel[field] = assets[key].copy()
+    manifest['schema_version'] = 2
+    manifest['toolchain']['weight_container'] = 'safetensors'
+    manifest['toolchain']['source_manifest_sha256'] = sha256(raw)
+    write_json(cache / 'manifest.json', manifest)
+    # Publish only a complete directory. Existing outputs are never overwritten.
     return {'output': str(output), 'tensor_count': len(records), 'shard_count': len(groups),
             'tensor_bytes': total_size, 'weight_bytes': manifest['weight_bytes'],
             'weight_parameters': manifest['weight_parameters'],
@@ -191,7 +165,7 @@ def _prepare_containers(model, checkpoint, output, shard_bytes=1024**3):
             'source_manifest_sha256': sha256(raw), 'prepare_s': time.monotonic() - started}
 
 
-def prepare(model, checkpoint, output, shard_bytes=1024**3):
+def prepare(model, checkpoint, output, shard_bytes=1024**3, engine=None):
     # The inner container producer is a build intermediate. Publish only after
     # the architecture plan and independent operator package have been checked.
     import sys
@@ -201,19 +175,12 @@ def prepare(model, checkpoint, output, shard_bytes=1024**3):
     if output.exists() or output.is_symlink():
         raise ValueError(f'Output already exists: {output}')
     output.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f'.{output.name}-', dir=output.parent))
-    try:
-        directory = staging / 'model'
-        result = _prepare_containers(model, checkpoint, directory, shard_bytes)
-        package = publish(directory)
+    with staged_directory(output) as directory:
+        result = _write_containers(model, checkpoint, directory, shard_bytes)
+        package = publish(directory, engine)
         package.pop('binding_map')
         result.update(package, output=str(output))
-        if output.exists() or output.is_symlink():
-            raise ValueError('Output appeared during preparation')
-        directory.rename(output)
-        return result
-    finally:
-        shutil.rmtree(staging)
+    return result
 
 
 def main():
@@ -221,10 +188,11 @@ def main():
     parser.add_argument('--model', type=Path, required=True, help='Assembled intermediate AOT model.json')
     parser.add_argument('--checkpoint', type=Path, required=True, help='Matching HF config/tokenizer directory')
     parser.add_argument('--output', type=Path, required=True, help='New prepared model directory')
+    parser.add_argument('--engine', type=Path, help='Rust CLI used to validate the registered plan')
     parser.add_argument('--shard-mib', type=int, default=1024,
                         help='Target payload size; an individual tensor is never split')
     args = parser.parse_args()
-    result = prepare(args.model, args.checkpoint, args.output, args.shard_mib * 1024**2)
+    result = prepare(args.model, args.checkpoint, args.output, args.shard_mib * 1024**2, args.engine)
     print(json.dumps(result, indent=2))
 
 

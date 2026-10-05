@@ -22,7 +22,14 @@ python3 tools/bench/sample_machine.py --output "$output_dir/machine-before.json"
 printf '%s\n' "compile-and-test" > "$output_dir/phase.txt"
 sampler_pid=""
 container_name="orin-operator-$$"
-entrypoint="python3"
+extra_mounts=()
+group_args=()
+for group_id in $(id -G); do group_args+=(--group-add "$group_id"); done
+if [[ -n "${ORIN_CHECKPOINT_DIR:-}" ]]; then
+    checkpoint_dir="$(realpath -- "$ORIN_CHECKPOINT_DIR")"
+    extra_mounts+=(-v "$checkpoint_dir:$checkpoint_dir:ro")
+fi
+entrypoint="${ORIN_COMPILER_PYTHON:-/usr/bin/python3}"
 command_args=("$runner")
 if [[ -n "${ORIN_OPERATOR_SANITIZER:-}" ]]; then
     entrypoint="/usr/local/cuda/bin/compute-sanitizer"
@@ -61,11 +68,13 @@ python3 tools/bench/sample_continuous.py --output "$output_dir/machine.jsonl" \
     --phase "$output_dir/phase.txt" --stop "$output_dir/sampler.stop" &
 sampler_pid=$!
 docker run --rm --name "$container_name" --runtime nvidia --network none \
-    --entrypoint "$entrypoint" --shm-size 2g -v /home/nvidia/model:/home/nvidia/model \
-    -w "$repo_dir" -e OMP_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
-    -e PYTHONPATH="$repo_dir:$repo_dir/tools/operators" \
+    --user "$(id -u):$(id -g)" "${group_args[@]}" \
+    --entrypoint "$entrypoint" --shm-size 2g -v "$repo_dir:$repo_dir" -v "$output_dir:$output_dir" \
+    "${extra_mounts[@]}" -w "$repo_dir" -e OMP_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+    -e PYTHONPATH="$repo_dir:$repo_dir/tools/operators:${ORIN_COMPILER_SITE_PACKAGES:-/opt/venv/lib/python3.10/site-packages}" \
+    -e TORCH_EXTENSIONS_DIR="$output_dir/cache/torch" -e XDG_CACHE_HOME="$output_dir/cache" \
     -e PYTHONDONTWRITEBYTECODE=1 \
     -e ORIN_OPERATOR_OUTPUT="$output_dir" -e TILELANG_CACHE_DIR="$output_dir/cache" \
     -e LD_PRELOAD=/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1 \
-    "${ORIN_OPERATOR_IMAGE:-lada-orin-tilelang:0.11.0-exp7}" "${command_args[@]}" \
+    "${ORIN_OPERATOR_IMAGE:-orin-llm-compiler:0.1.0}" "${command_args[@]}" \
     --output "$output_dir" "$@" 2>&1 | tee "$output_dir/run.log"

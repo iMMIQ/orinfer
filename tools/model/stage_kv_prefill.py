@@ -4,12 +4,9 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import shutil
-import subprocess
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
-from tools.model.optimize_kv import link_or_copy
-from tools.model.prepare import write_json
+from tools.model.publication import atomic_model, clone_model, commit_package, load_model
 
 SCRATCH=('PrefillK','PrefillV')
 
@@ -40,20 +37,11 @@ def publish(source,destination,engine,output):
     source=source.resolve(strict=True);destination=destination.absolute()
     if destination.exists() or destination.is_symlink() or destination.resolve().is_relative_to(source):
         raise ValueError('Destination must be new and outside immutable source')
-    w=json.loads((source/'cache/model.json').read_text())
-    old=source/'cache/operators'/w['operator_package']
-    raw=(old/'package.json').read_bytes()
-    if hashlib.sha256(raw).hexdigest()!=w['operator_package']:raise ValueError('Package hash mismatch')
-    package=json.loads(raw);w=add_workspace(w);context=w['metadata']['max_context']
-    staging=destination.with_name(destination.name+'.staging')
-    if staging.exists():raise ValueError('Staging exists')
-    staging.mkdir(parents=True)
-    try:
-        for item in source.iterdir():
-            if item.is_file():shutil.copy2(item,staging/item.name)
-        shutil.copytree(source/'cache/weights',staging/'cache/weights',copy_function=link_or_copy)
-        pkg=staging/'cache/operators/staging'
-        shutil.copytree(old,pkg,copy_function=link_or_copy);(pkg/'package.json').unlink()
+    w, old, package = load_model(source)
+    w = add_workspace(w)
+    context = w['metadata']['max_context']
+    with atomic_model(destination, engine, command='validate-model') as staging:
+        pkg = clone_model(source, staging, old)
         exports={}
         def exported(key,factory):
             if key not in exports:
@@ -97,14 +85,8 @@ def publish(source,destination,engine,output):
         if count!=32:raise ValueError('Expected two chunk profiles across 16 attention layers')
         package['kernels']=kernels
         package['buffer_contracts']=[{k:v for k,v in b.items() if k!='data'} for b in w['metadata']['buffers']]
-        write_json(pkg/'package.json',package);digest=hashlib.sha256((pkg/'package.json').read_bytes()).hexdigest()
-        pkg.rename(pkg.with_name(digest));w['operator_package']=digest
-        write_json(staging/'cache/model.json',w)
-        subprocess.run([str(engine.resolve()),'validate-model',str(staging)],check=True)
-        staging.rename(destination)
-        return dict(model=str(destination),operator_package=digest,prefill_workspace_capacity_bytes=4096*context)
-    except BaseException:
-        shutil.rmtree(staging);raise
+        digest = commit_package(staging, pkg, w, package)
+    return dict(model=str(destination),operator_package=digest,prefill_workspace_capacity_bytes=4096*context)
 
 
 if __name__=='__main__':

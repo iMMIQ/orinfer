@@ -15,24 +15,26 @@ mod generation;
 mod mtp_gpu_tests;
 mod prefill_cost;
 mod prefix;
+#[cfg(test)]
+mod reference_generation;
 pub(crate) mod requests;
 pub(crate) mod scoring;
 mod speculation;
 mod vision;
 
 pub(crate) struct ModelRuntime {
+    pub(crate) frontend_assets: std::collections::BTreeMap<String, String>,
     pub(crate) manifest: crate::model::Manifest,
     execution: Executor,
     stats: LoadStats,
     pub(crate) speculation_statistics: Option<crate::mtp::Statistics>,
     prefix_cache: crate::prefix::Cache<crate::cuda::snapshot::Snapshot>,
     pub(crate) prefix_statistics: crate::prefix::Statistics,
-    prefix_kv: Vec<crate::cuda::snapshot::Piece>,
     pub(crate) prefix_hints: Vec<usize>,
     prefill_costs: prefill_cost::Costs,
     owner_id: u64,
-    reserved_requests: std::collections::BTreeMap<usize, usize>,
-    reserved_contexts: std::collections::BTreeMap<usize, usize>,
+    abandoned: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    reserved_requests: std::collections::BTreeMap<usize, requests::Reservation>,
     prefix_cache_limit: usize,
     pub(crate) scheduler_statistics: crate::scheduler::Statistics,
     scheduler_cursor: usize,
@@ -73,21 +75,21 @@ impl ModelRuntime {
                 .collect()
         };
         Ok(Self {
+            frontend_assets: prepared.frontend_assets,
             manifest: prepared.plan,
             execution,
             stats,
             speculation_statistics: None,
             prefix_cache: crate::prefix::Cache::new(options.prefix_cache_bytes),
             prefix_statistics: crate::prefix::Statistics::default(),
-            prefix_kv: vec![],
             prefix_hints: vec![],
             prefill_costs: prefill_cost::Costs::new(shapes),
             owner_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
+            abandoned: Default::default(),
             reserved_requests: Default::default(),
-            reserved_contexts: Default::default(),
             prefix_cache_limit: options.prefix_cache_bytes,
             scheduler_statistics: Default::default(),
             scheduler_cursor: 0,

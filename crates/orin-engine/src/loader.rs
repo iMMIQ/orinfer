@@ -29,6 +29,7 @@ struct Descriptor {
     compute_policy: ComputePolicy,
     operator_package: String,
     buffer_scopes: BTreeMap<String, BufferScope>,
+    frontend_assets: BTreeMap<String, String>,
     metadata: Manifest,
 }
 
@@ -41,6 +42,7 @@ pub(crate) struct PreparedModel {
     pub operator_package: String,
     pub architecture: Architecture,
     pub policy: ComputePolicy,
+    pub frontend_assets: BTreeMap<String, String>,
     pub decode_programs: std::collections::BTreeSet<String>,
 }
 
@@ -60,6 +62,7 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
     {
         return Err("Expected custom model descriptor without embedded kernels or programs".into());
     }
+    validate_frontend_assets(root, &model.frontend_assets)?;
     let config_path = resolve_file(root, "config.json")?;
     let config_raw = fs::read(config_path).map_err(|e| e.to_string())?;
     let config =
@@ -117,6 +120,7 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
         operator_package: model.operator_package,
         architecture: model.architecture,
         policy: model.compute_policy,
+        frontend_assets: model.frontend_assets,
         decode_programs,
     })
 }
@@ -180,7 +184,7 @@ mod tests {
         ));
         fs::create_dir_all(root.join("cache")).unwrap();
         let descriptor = serde_json::json!({"schema_version":1,"architecture":"qwen3_5",
-            "compute_policy":"int8_quality","operator_package":"0".repeat(64),"buffer_scopes":{},
+            "compute_policy":"int8_quality","operator_package":"0".repeat(64),"buffer_scopes":{},"frontend_assets":{},
             "metadata":{"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":2,
                 "max_context":8,"vocab":4,"toolchain":{},"buffers":[],"programs":{"decode":[]},
                 "reset_buffers":[],"input":"Input","token":"Token","status":"Status",
@@ -193,5 +197,53 @@ mod tests {
         let error = load(&root).err().unwrap();
         fs::remove_dir_all(root).unwrap();
         assert!(error.contains("without embedded kernels or programs"));
+    }
+}
+
+fn validate_frontend_assets(root: &Path, expected: &BTreeMap<String, String>) -> Result<()> {
+    let names = [
+        "tokenizer.json",
+        "chat_template.jinja",
+        "generation_config.json",
+    ];
+    if expected.len() != names.len() {
+        return Err(
+            "Prepared model requires all frontend asset identities; run package.py pin-assets"
+                .into(),
+        );
+    }
+    for name in names {
+        let bytes = fs::read(resolve_file(root, name)?).map_err(|e| e.to_string())?;
+        if expected.get(name) != Some(&sha256(&bytes)) {
+            return Err(format!("Frontend asset identity mismatch: {name}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::*;
+    #[test]
+    fn equal_size_semantic_edits_are_rejected() {
+        let root = std::env::temp_dir().join(format!("orin-assets-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut hashes = BTreeMap::new();
+        for name in [
+            "tokenizer.json",
+            "chat_template.jinja",
+            "generation_config.json",
+        ] {
+            fs::write(root.join(name), b"original").unwrap();
+            hashes.insert(name.to_owned(), sha256(b"original"));
+        }
+        validate_frontend_assets(&root, &hashes).unwrap();
+        fs::write(root.join("tokenizer.json"), b"modified").unwrap();
+        assert!(
+            validate_frontend_assets(&root, &hashes)
+                .unwrap_err()
+                .contains("tokenizer.json")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

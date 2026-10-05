@@ -2,14 +2,9 @@
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
-import subprocess
-import uuid
 
-from tools.model.prepare import file_hash, write_json
-from tools.model.optimize_kv import link_or_copy
+from tools.model.publication import atomic_model, clone_model, commit_package, file_hash, load_model, write_json
 from tools.model.screen_prefill_ffn import model_identity
 from tools.model.upgrade_batching import bind
 from tools.operators.abi import parse_host
@@ -18,7 +13,6 @@ from tools.operators.abi import parse_host
 def publish(model, screens, destination, engine):
     model = model.resolve(strict=True)
     destination = destination.absolute()
-    source_raw = (model / 'cache/model.json').read_bytes()
     fingerprint = model_identity(model)
     if isinstance(screens, Path):
         screens = [screens]
@@ -57,28 +51,13 @@ def publish(model, screens, destination, engine):
         selected[rows] = families
     if not selected:
         raise ValueError('No prefill screens supplied')
-    data = json.loads(source_raw)
+    data, origin, package = load_model(model)
     meta = data['metadata']
-    cache_root = Path(os.environ.get('ORIN_OPERATOR_CACHE', str(Path(os.environ.get(
-        'XDG_CACHE_HOME', str(Path.home() / '.cache'))) / 'orin-llm/operators')))
-    origin = cache_root / data['operator_package']
-    if not origin.exists():
-        origin = model / 'cache/operators' / data['operator_package']
-    if file_hash(origin / 'package.json') != data['operator_package']:
-        raise ValueError('Package digest mismatch')
-    package = json.loads((origin / 'package.json').read_text())
     buffers = {b['name']: b for b in meta['buffers']}
     if destination.exists():
         raise FileExistsError(destination)
-    staging = destination.with_name('.' + destination.name + '.building-' + uuid.uuid4().hex)
-    try:
-        staging.mkdir(parents=True)
-        for file in model.iterdir():
-            if file.is_file():
-                shutil.copyfile(file, staging / file.name)
-        shutil.copytree(model / 'cache/weights', staging / 'cache/weights', copy_function=link_or_copy)
-        target = staging / 'cache/operators/building'
-        shutil.copytree(origin, target, copy_function=link_or_copy)
+    with atomic_model(destination, engine, command='validate-model') as staging:
+        target = clone_model(model, staging, origin)
         (target / 'kernels').mkdir(exist_ok=True)
         exports = {}
         for rows, families in selected.items():
@@ -127,24 +106,11 @@ def publish(model, screens, destination, engine):
         layers = len(config.get('text_config', config)['layer_types'])
         if any(count != layers for count in replaced.values()):
             raise ValueError('Incomplete FFN projection replacement')
-        raw = (json.dumps(package, ensure_ascii=False, indent=2) + '\n').encode()
-        digest = hashlib.sha256(raw).hexdigest()
-        # Never truncate a hardlink shared with the source package.
-        (target / 'package.new.json').write_bytes(raw)
-        (target / 'package.new.json').replace(target / 'package.json')
-        target.rename(target.with_name(digest))
-        data['operator_package'] = digest
-        write_json(staging / 'cache/model.json', data)
-        subprocess.run([str(engine.resolve()), 'validate-model', str(staging)],
-                       check=True, stdout=subprocess.DEVNULL)
-        staging.rename(destination)
-        return dict(operator_package=digest,
-                    selected={str(rows): {family: v['choice'] for family, v in families.items()}
-                              for rows, families in selected.items()}, replaced=replaced,
-                    weight_bytes=meta['weight_bytes'], persistent_weight_bytes_added=0)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+        digest = commit_package(staging, target, data, package)
+    return dict(operator_package=digest,
+                selected={str(rows): {family: v['choice'] for family, v in families.items()}
+                          for rows, families in selected.items()}, replaced=replaced,
+                weight_bytes=meta['weight_bytes'], persistent_weight_bytes_added=0)
 
 
 def main():

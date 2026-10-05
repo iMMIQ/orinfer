@@ -7,14 +7,12 @@ import argparse
 import copy
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.model.prepare import write_json
+from tools.model.publication import atomic_model, clone_model, commit_package, load_model
 
 
 def transform(wrapper, package):
@@ -55,11 +53,6 @@ def transform(wrapper, package):
     return wrapper, package
 
 
-def link_or_copy(source, destination):
-    try:
-        os.link(source, destination)
-    except OSError:
-        shutil.copy2(source, destination)
 
 
 def optimize(source, destination, engine, storage='fp16', output=None):
@@ -69,13 +62,7 @@ def optimize(source, destination, engine, storage='fp16', output=None):
         raise ValueError('Destination already exists')
     if destination.resolve().is_relative_to(source):
         raise ValueError('Destination must be outside the immutable source model')
-    raw = (source/'cache/model.json').read_bytes()
-    wrapper = json.loads(raw)
-    old_package = source/'cache/operators'/wrapper['operator_package']
-    package_raw = (old_package/'package.json').read_bytes()
-    if hashlib.sha256(package_raw).hexdigest() != wrapper['operator_package']:
-        raise ValueError('Source package digest mismatch')
-    package = json.loads(package_raw)
+    wrapper, old_package, package = load_model(source)
     # Demand mapping and direct prefill require token-major identity page order.
     completed = subprocess.run([str(engine.resolve()), 'plan-model', str(source)],
                                check=True, capture_output=True, text=True)
@@ -96,36 +83,20 @@ def optimize(source, destination, engine, storage='fp16', output=None):
     if pages != expected or hashlib.sha256(pages).hexdigest()!=page_buffer['data']['sha256']:
         raise ValueError('Direct KV requires a verified identity page table')
     wrapper, package = transform(wrapper, package)
-    staging = destination.with_name(destination.name+'.staging')
-    if staging.exists(): raise ValueError('Staging already exists')
-    staging.mkdir(parents=True)
-    try:
-        for item in source.iterdir():
-            if item.is_file(): shutil.copy2(item, staging/item.name)
-        shutil.copytree(source/'cache/weights', staging/'cache/weights', copy_function=link_or_copy)
-        pkg = staging/'cache/operators/staging'
-        shutil.copytree(old_package, pkg, copy_function=link_or_copy)
+    with atomic_model(destination, engine, command='validate-model') as staging:
+        pkg = clone_model(source, staging, old_package)
         # Break the package.json hardlink before writing new contracts.
         (pkg/'package.json').unlink()
         if storage == 'int8':
             if output is None: raise ValueError('INT8 export needs --output')
-            quantize_package(wrapper, package, old_package, pkg, output)
+            quantize_package(wrapper, package, old_package, pkg, output, json.loads((source / 'config.json').read_text()))
         package['buffer_contracts'] = [{k:v for k,v in b.items() if k!='data'} for b in wrapper['metadata']['buffers']]
-        write_json(pkg/'package.json', package)
-        digest = hashlib.sha256((pkg/'package.json').read_bytes()).hexdigest()
-        pkg.rename(pkg.with_name(digest))
-        wrapper['operator_package'] = digest
-        write_json(staging/'cache/model.json', wrapper)
-        subprocess.run([str(engine.resolve()), 'validate-model', str(staging)], check=True)
-        staging.rename(destination)
-        return dict(model=str(destination),operator_package=digest,storage=storage,
-                    kv_capacity_bytes=sum(wrapper['metadata']['kv_cache']['buffers'].values())*original['max_context'])
-    except BaseException:
-        shutil.rmtree(staging)
-        raise
+        digest = commit_package(staging, pkg, wrapper, package)
+    return dict(model=str(destination),operator_package=digest,storage=storage,
+                kv_capacity_bytes=sum(wrapper['metadata']['kv_cache']['buffers'].values())*original['max_context'])
 
 
-def quantize_package(wrapper, package, old_package, destination, output):
+def quantize_package(wrapper, package, old_package, destination, output, config):
     from tools.operators.common import configure, export_kernel
     from tools.operators.abi import parse_host, evaluate
     from kernels.model.kv_int8 import (full_prepare_mrope_int8,
@@ -134,7 +105,6 @@ def quantize_package(wrapper, package, old_package, destination, output):
     meta = wrapper['metadata']
     context = meta['max_context']
     pages = context // 128
-    config = json.loads((old_package.parents[2]/'config.json').read_text())
     text = config['text_config']
     if (text['num_attention_heads'],text['num_key_value_heads'],text['head_dim'],text['rms_norm_eps']) != (24,4,256,1e-6) or text['rope_parameters']['partial_rotary_factor'] != .25:
         raise ValueError('INT8 KV kernels require the 27B attention/norm/RoPE geometry')

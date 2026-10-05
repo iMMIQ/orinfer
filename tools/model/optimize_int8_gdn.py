@@ -8,16 +8,11 @@ strict temporary-W8 quantization law.
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
-import subprocess
 import sys
-import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.model.prepare import file_hash, write_json
-from tools.model.optimize_kv import link_or_copy
+from tools.model.publication import atomic_model, clone_model, commit_package, file_hash, load_model, write_json
 from tools.model.upgrade_batching import bind
 from tools.operators.abi import parse_host
 
@@ -67,16 +62,8 @@ def upgrade(model, destination, report, weight_layout):
 
     configure()
     torch.empty(1, device='cuda')
-    data = json.loads((model / 'cache/model.json').read_text())
+    data, origin, package = load_model(model)
     metadata = data['metadata']
-    cache_root = Path(os.environ.get('ORIN_OPERATOR_CACHE', str(Path(os.environ.get(
-        'XDG_CACHE_HOME', str(Path.home() / '.cache'))) / 'orin-llm/operators')))
-    origin = cache_root / data['operator_package']
-    if not origin.exists():
-        origin = model / 'cache/operators' / data['operator_package']
-    if file_hash(origin / 'package.json') != data['operator_package']:
-        raise ValueError('Source operator package digest mismatch')
-    package = json.loads((origin / 'package.json').read_text())
     config = json.loads((model / 'config.json').read_text())
     text = config.get('text_config', config)
     hidden = text['hidden_size']
@@ -97,14 +84,9 @@ def upgrade(model, destination, report, weight_layout):
                      layout='contiguous', alignment=256, access='read_write', data=None)
     metadata['buffers'].append(workspace)
     data['buffer_scopes'][workspace['name']] = 'workspace'
-    destination.mkdir(parents=True)
-    for path in model.iterdir():
-        if path.is_file():
-            shutil.copyfile(path, destination / path.name)
-    shutil.copytree(model / 'cache/weights', destination / 'cache/weights', copy_function=link_or_copy)
+    cache = destination / 'cache'
+    operator = clone_model(model, destination, origin)
     repacked = repack_weights(model / 'cache/weights', destination / 'cache/weights', buffers, layers) if weight_layout == 'i8' else []
-    operator = destination / 'cache/operators/building'
-    shutil.copytree(origin, operator, copy_function=link_or_copy)
     kernels = {k['name']: k for k in package['kernels']}
     exports = {}
 
@@ -180,15 +162,7 @@ def upgrade(model, destination, report, weight_layout):
     package['kernels'] = list(kernels.values())
     package['buffer_contracts'] = [{k: v for k, v in b.items() if k != 'data'}
                                    for b in metadata['buffers']]
-    raw = (json.dumps(package, ensure_ascii=False, indent=2) + '\n').encode()
-    digest = hashlib.sha256(raw).hexdigest()
-    (operator / 'package.new.json').write_bytes(raw)
-    (operator / 'package.new.json').replace(operator / 'package.json')
-    operator.rename(operator.with_name(digest))
-    data['operator_package'] = digest
-    write_json(destination / 'cache/model.json', data)
-    subprocess.run([str(Path('target/release/orin-llm').resolve()), 'validate-model', str(destination)],
-                   check=True, stdout=subprocess.DEVNULL)
+    digest = commit_package(destination, operator, data, package)
     write_json(report / 'upgrade.json', dict(operator_package=digest, replaced=replaced,
                weight_bytes=metadata['weight_bytes'], persistent_weight_bytes_added=0,
                workspace_bytes_added=128 * (width // 128) * 2,
@@ -207,14 +181,9 @@ def main():
     destination = args.model_output.absolute()
     if destination.exists():
         raise FileExistsError(destination)
-    staging = destination.with_name('.' + destination.name + '.building-' + uuid.uuid4().hex)
     args.output.mkdir(parents=True, exist_ok=True)
-    try:
+    with atomic_model(destination, command='validate-model') as staging:
         upgrade(args.model.resolve(strict=True), staging, args.output, args.weight_layout)
-        staging.rename(destination)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
     print('INT8 GDN OUTPUT PACKAGE READY', destination, flush=True)
 
 

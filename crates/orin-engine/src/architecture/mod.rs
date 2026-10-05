@@ -39,23 +39,14 @@ pub struct PrefillProfile {
     pub kind: PrefillKind,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct TextConfig {
-    pub hidden_size: usize,
-    #[serde(default)]
-    pub intermediate_size: usize,
-    pub num_hidden_layers: usize,
-    pub vocab_size: usize,
-    pub layer_types: Vec<String>,
-    pub linear_num_key_heads: usize,
-    pub linear_num_value_heads: usize,
-    pub linear_key_head_dim: usize,
-    pub linear_value_head_dim: usize,
-    pub linear_conv_kernel_dim: usize,
+#[derive(Debug)]
+pub(crate) enum FamilyConfig {
+    Qwen3_5(qwen3_5::TextConfig),
 }
 
 #[derive(Debug)]
 pub(crate) struct BatchLayout {
+    pub architecture: Architecture,
     pub layers: Vec<String>,
     pub row_strides: BTreeMap<String, usize>,
     pub profiles: BTreeMap<usize, PrefillKind>,
@@ -72,78 +63,66 @@ pub(crate) fn batch_plan(
     manifest: &Manifest,
     segments: &[BatchSegment],
 ) -> Result<Vec<crate::execution::Invocation>> {
-    qwen3_5::batching::plan(manifest, segments)
+    match manifest
+        .batch_layout
+        .as_ref()
+        .ok_or("Missing registered batch layout")?
+        .architecture
+    {
+        Architecture::Qwen3_5 => qwen3_5::batching::plan(manifest, segments),
+    }
 }
 
 pub(crate) fn batch_state_bindings(
     manifest: &Manifest,
     segments: &[BatchSegment],
-) -> Vec<Option<(usize, String)>> {
-    qwen3_5::batching::state_bindings(manifest, segments)
+) -> Result<Vec<Option<(usize, String)>>> {
+    match manifest
+        .batch_layout
+        .as_ref()
+        .ok_or("Missing registered batch layout")?
+        .architecture
+    {
+        Architecture::Qwen3_5 => Ok(qwen3_5::batching::state_bindings(manifest, segments)),
+    }
 }
 
 pub(crate) struct Configuration {
     pub architecture: Architecture,
-    pub text: TextConfig,
+    family: FamilyConfig,
     pub vision_depth: usize,
     pub signature: Value,
 }
 
 impl Configuration {
+    fn qwen3_5(&self) -> &qwen3_5::TextConfig {
+        match &self.family {
+            FamilyConfig::Qwen3_5(text) => text,
+        }
+    }
+
     pub fn parse(config: Value) -> Result<Self> {
         let architecture = match config["model_type"].as_str() {
             Some("qwen3_5" | "qwen3_5_text") => Architecture::Qwen3_5,
             _ => return Err("Unregistered model architecture".into()),
         };
         let text_value = config.get("text_config").unwrap_or(&config);
-        let text: TextConfig =
-            serde_json::from_value(text_value.clone()).map_err(|e| format!("Text config: {e}"))?;
-        if text.hidden_size == 0
-            || text.vocab_size == 0
-            || text.num_hidden_layers == 0
-            || text.layer_types.len() != text.num_hidden_layers
-            || text
-                .layer_types
-                .iter()
-                .any(|s| !matches!(s.as_str(), "linear_attention" | "full_attention"))
-            || text.linear_num_key_heads == 0
-            || text.linear_num_value_heads == 0
-            || text.linear_key_head_dim == 0
-            || text.linear_value_head_dim == 0
-            || text.linear_conv_kernel_dim < 2
-        {
-            return Err("Invalid Qwen3_5 layer/state configuration".into());
-        }
+        let family = match architecture {
+            Architecture::Qwen3_5 => FamilyConfig::Qwen3_5(qwen3_5::parse_text(text_value)?),
+        };
         // These values affect compiled arithmetic, weight contracts or state.
         // Checkpoint identity, naming, dtype labels and quantization provenance
         // deliberately do not determine architecture/operator compatibility.
-        let text_keys = [
-            "hidden_size",
-            "intermediate_size",
-            "num_hidden_layers",
-            "vocab_size",
-            "layer_types",
-            "num_attention_heads",
-            "num_key_value_heads",
-            "head_dim",
-            "linear_num_key_heads",
-            "linear_num_value_heads",
-            "linear_key_head_dim",
-            "linear_value_head_dim",
-            "linear_conv_kernel_dim",
-            "hidden_act",
-            "rms_norm_eps",
-            "rope_parameters",
-            "partial_rotary_factor",
-            "attn_output_gate",
-            "output_gate_type",
-            "attention_bias",
-            "tie_word_embeddings",
-            "mtp_num_hidden_layers",
-            "mtp_use_dedicated_embeddings",
-        ];
+        let contract: Value = serde_json::from_str(include_str!(
+            "../../../../configs/architecture-contract.json"
+        ))
+        .map_err(|e| e.to_string())?;
+        let text_keys = contract["families"]["qwen3_5"]["text_keys"]
+            .as_array()
+            .ok_or("Missing architecture signature contract")?;
         let text_signature: serde_json::Map<String, Value> = text_keys
-            .into_iter()
+            .iter()
+            .filter_map(|k| k.as_str())
             .filter_map(|k| text_value.get(k).map(|v| (k.into(), v.clone())))
             .collect();
         let vision_depth = config["vision_config"]["depth"]
@@ -154,112 +133,10 @@ impl Configuration {
             "vision": config.get("vision_config").cloned().unwrap_or(Value::Null)});
         Ok(Self {
             architecture,
-            text,
+            family,
             vision_depth,
             signature,
         })
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Extent {
-    Residual,
-    History,
-    State,
-    Hidden,
-    Token,
-}
-#[derive(Clone, Copy)]
-enum Step {
-    Kernel(usize),
-    Copy(&'static str, &'static str, Extent),
-    Zero(&'static str, Extent),
-}
-struct Recipe {
-    begin: &'static [Step],
-    gdn: &'static [Step],
-    attention: &'static [Step],
-    end: &'static [Step],
-}
-
-struct Builder<'a> {
-    config: &'a Configuration,
-    programs: BTreeMap<String, Vec<Operation>>,
-}
-impl Builder<'_> {
-    fn emit(
-        &self,
-        steps: &[Step],
-        program: &str,
-        section: &str,
-        tokens: usize,
-        layer: usize,
-    ) -> Result<Vec<Operation>> {
-        let t = &self.config.text;
-        let bytes = |extent: Extent| -> Result<usize> {
-            let factors: &[usize] = match extent {
-                Extent::Residual => &[tokens, t.hidden_size, 4],
-                Extent::Hidden => &[t.hidden_size, 2],
-                Extent::Token => &[4],
-                Extent::History => &[
-                    t.linear_conv_kernel_dim - 1,
-                    t.linear_num_key_heads
-                        .checked_mul(t.linear_key_head_dim)
-                        .and_then(|n| n.checked_mul(2))
-                        .and_then(|n| {
-                            t.linear_num_value_heads
-                                .checked_mul(t.linear_value_head_dim)
-                                .and_then(|v| n.checked_add(v))
-                        })
-                        .ok_or("History dimensions overflow")?,
-                    2,
-                ],
-                Extent::State => &[
-                    t.linear_num_value_heads,
-                    t.linear_key_head_dim,
-                    t.linear_value_head_dim,
-                    4,
-                ],
-            };
-            factors.iter().try_fold(1usize, |n, v| {
-                n.checked_mul(*v)
-                    .ok_or_else(|| "Plan extent overflow".into())
-            })
-        };
-        let name = |s: &str| s.replace("{layer}", &layer.to_string());
-        steps
-            .iter()
-            .map(|step| {
-                Ok(match *step {
-                    Step::Kernel(slot) => Operation::Kernel {
-                        name: format!("{program}/{section}/k{slot}"),
-                    },
-                    Step::Copy(source, destination, extent) => Operation::Copy {
-                        source: name(source),
-                        destination: name(destination),
-                        bytes: bytes(extent)?,
-                    },
-                    Step::Zero(destination, extent) => Operation::Zero {
-                        destination: name(destination),
-                        bytes: bytes(extent)?,
-                    },
-                })
-            })
-            .collect()
-    }
-    fn text(&mut self, program: &str, recipe: &Recipe, tokens: usize) -> Result<()> {
-        let mut ops = self.emit(recipe.begin, program, "begin", tokens, 0)?;
-        for (layer, kind) in self.config.text.layer_types.iter().enumerate() {
-            let steps = if kind == "linear_attention" {
-                recipe.gdn
-            } else {
-                recipe.attention
-            };
-            ops.extend(self.emit(steps, program, &format!("layer{layer}"), tokens, layer)?);
-        }
-        ops.extend(self.emit(recipe.end, program, "end", tokens, 0)?);
-        self.programs.insert(program.into(), ops);
-        Ok(())
     }
 }
 
@@ -309,34 +186,6 @@ mod tests {
         assert_ne!(
             original.signature,
             Configuration::parse(raw).unwrap().signature
-        );
-    }
-    #[test]
-    fn state_copy_extents_follow_configuration_and_reject_overflow() {
-        let config = Configuration::parse(config()).unwrap();
-        let builder = Builder {
-            config: &config,
-            programs: BTreeMap::new(),
-        };
-        let steps = &[
-            Step::Copy("Ho", "L{layer}_History", Extent::History),
-            Step::Copy("Sout", "L{layer}_State", Extent::State),
-        ];
-        let ops = builder.emit(steps, "prefill_m2", "layer1", 2, 1).unwrap();
-        assert!(
-            matches!(&ops[0], Operation::Copy { destination, bytes:60, .. } if destination=="L1_History")
-        );
-        assert!(matches!(&ops[1], Operation::Copy { bytes: 48, .. }));
-        assert!(
-            builder
-                .emit(
-                    &[Step::Zero("R0", Extent::Residual)],
-                    "overflow",
-                    "begin",
-                    usize::MAX,
-                    0
-                )
-                .is_err()
         );
     }
 }

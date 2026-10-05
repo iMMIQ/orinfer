@@ -1,0 +1,5 @@
+**
+!tools/
+!tools/build/
+!tools/build/compiler.Dockerfile
+!tools/build/compiler-requirements.txt

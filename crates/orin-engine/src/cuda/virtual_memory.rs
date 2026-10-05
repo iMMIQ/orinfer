@@ -28,7 +28,8 @@ pub(crate) struct Reservation {
     pub stride: usize,
     pub granularity: usize,
     pub mapped: usize,
-    pub slabs: Vec<(usize, usize, u64)>,
+    slabs: Vec<Slab>,
+    poisoned: bool,
 }
 impl Reservation {
     pub(crate) fn reserve(s: &Session, bytes: usize, stride: usize) -> Result<Self> {
@@ -53,6 +54,7 @@ impl Reservation {
                 granularity,
                 mapped: 0,
                 slabs: vec![],
+                poisoned: false,
             })
         }
     }
@@ -69,13 +71,16 @@ impl Reservation {
             .ok_or("KV extent overflow")?;
         round_up(raw, self.granularity)
     }
-    pub(crate) fn grow(&mut self, s: &Session, tokens: usize) -> Result<()> {
+    pub(crate) fn grow(&mut self, s: &super::Session, tokens: usize) -> Result<()> {
+        if self.poisoned {
+            return Err("KV reservation is quarantined after a failed transition".into());
+        }
         let extent = self.extent(tokens)?;
         if extent <= self.mapped {
             return Ok(());
         }
-        let bytes = extent - self.mapped;
         let offset = self.mapped;
+        let bytes = extent - offset;
         let address = self
             .address
             .checked_add(offset as u64)
@@ -84,58 +89,119 @@ impl Reservation {
         let access = AccessDesc {
             location: prop.location,
             flags: 3,
-        }; // READWRITE
+        };
         let mut handle = 0;
-        // SAFETY: Caller synchronizes the stream before changing mappings.
-        // On partial failure, release any resource not yet owned by this object.
+        // SAFETY: Session owns the context/stream; each successful create is
+        // immediately recorded before any fallible map/access/initialization.
         unsafe {
             check(
                 (s.driver.vmm_create)(&mut handle, bytes, &prop, 0),
                 "create KV physical slab",
             )?;
-            if let Err(e) = check(
-                (s.driver.vmm_map)(address, bytes, 0, handle, 0),
-                "map KV slab",
-            ) {
-                (s.driver.vmm_release)(handle);
-                return Err(e);
-            }
-            self.slabs.push((offset, bytes, handle));
-            self.mapped = extent;
-            check(
-                (s.driver.vmm_access)(address, bytes, &access, 1),
-                "enable KV slab access",
-            )?;
-            // Zero once so masked tile accesses within the rounded slab are defined.
-            check(
-                (s.driver.memset)(address, 0, bytes, s.stream),
-                "initialize KV slab",
-            )?;
         }
+        let mut slab = Slab {
+            offset,
+            bytes,
+            handle,
+            mapped: false,
+        };
+        let result = (|| {
+            // SAFETY: Reserved VA extent and live physical allocation do not overlap prior slabs.
+            unsafe {
+                check(
+                    (s.driver.vmm_map)(address, bytes, 0, handle, 0),
+                    "map KV slab",
+                )?;
+                slab.mapped = true;
+                check(
+                    (s.driver.vmm_access)(address, bytes, &access, 1),
+                    "enable KV slab access",
+                )?;
+                check(
+                    (s.driver.memset)(address, 0, bytes, s.stream),
+                    "initialize KV slab",
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            // Keep failed cleanup ownership for Session::cleanup; never expose this extent.
+            let mut pending = vec![slab];
+            let _ = release_owned(
+                &mut pending,
+                |slab| unsafe_unmap(&s.driver, self.address, slab),
+                |handle| unsafe_release(&s.driver, handle),
+            );
+            self.slabs.extend(pending);
+            return Err(error);
+        }
+        self.slabs.push(slab);
+        self.mapped = extent;
         Ok(())
     }
     pub(crate) fn release_slabs(&mut self, driver: &Driver) -> Result<()> {
-        let mut errors = vec![];
-        for (offset, bytes, handle) in self.slabs.drain(..) {
-            // SAFETY: Work was synchronized; each mapping/handle is owned once.
-            unsafe {
-                if let Err(e) = check(
-                    (driver.vmm_unmap)(self.address + offset as u64, bytes),
-                    "unmap KV slab",
-                ) {
-                    errors.push(e)
-                }
-                if let Err(e) = check((driver.vmm_release)(handle), "release KV slab") {
-                    errors.push(e)
-                }
-            }
-        }
-        self.mapped = 0;
-        if errors.is_empty() {
-            Ok(())
+        let result = release_owned(
+            &mut self.slabs,
+            |slab| unsafe_unmap(driver, self.address, slab),
+            |handle| unsafe_release(driver, handle),
+        );
+        if result.is_ok() {
+            self.mapped = 0;
+            self.poisoned = false;
         } else {
-            Err(errors.join("; "))
+            self.poisoned = true;
         }
+        result
+    }
+    pub(crate) fn has_slabs(&self) -> bool {
+        !self.slabs.is_empty()
+    }
+}
+#[derive(Debug)]
+struct Slab {
+    offset: usize,
+    bytes: usize,
+    handle: u64,
+    mapped: bool,
+}
+fn unsafe_unmap(driver: &Driver, address: u64, slab: &Slab) -> Result<()> {
+    // SAFETY: The caller owns this mapped extent and synchronized its stream.
+    unsafe {
+        check(
+            (driver.vmm_unmap)(address + slab.offset as u64, slab.bytes),
+            "unmap KV slab",
+        )
+    }
+}
+fn unsafe_release(driver: &Driver, handle: u64) -> Result<()> {
+    // SAFETY: The caller owns the live allocation handle, now unmapped.
+    unsafe { check((driver.vmm_release)(handle), "release KV slab") }
+}
+fn release_owned(
+    slabs: &mut Vec<Slab>,
+    mut unmap: impl FnMut(&Slab) -> Result<()>,
+    mut release: impl FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    let mut errors = vec![];
+    slabs.retain_mut(|slab| {
+        if slab.mapped {
+            if let Err(e) = unmap(slab) {
+                errors.push(e);
+                return true;
+            }
+            slab.mapped = false;
+        }
+        if let Err(e) = release(slab.handle) {
+            errors.push(e);
+            return true;
+        }
+        false
+    });
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 fn properties(device: i32) -> AllocationProp {
@@ -164,6 +230,42 @@ pub(crate) type Reservations = BTreeMap<String, Reservation>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cleanup_retries_preserve_mapping_and_handle_ownership() {
+        let mut slabs = vec![Slab {
+            offset: 0,
+            bytes: 4096,
+            handle: 7,
+            mapped: true,
+        }];
+        let mut releases = 0;
+        assert!(
+            release_owned(
+                &mut slabs,
+                |_| Err("unmap fault".into()),
+                |_| {
+                    releases += 1;
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(releases, 0);
+        assert!(slabs[0].mapped);
+        assert!(release_owned(&mut slabs, |_| Ok(()), |_| Err("release fault".into())).is_err());
+        assert!(!slabs[0].mapped);
+        assert_eq!(slabs[0].handle, 7);
+        release_owned(
+            &mut slabs,
+            |_| panic!("must not unmap twice"),
+            |h| {
+                assert_eq!(h, 7);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(slabs.is_empty());
+    }
     #[test]
     #[ignore = "Requires exclusive GPU experiment lock"]
     fn vmm_graph_growth_reset_and_last_token() {
@@ -267,6 +369,7 @@ mod tests {
             granularity: 2 << 20,
             mapped: 0,
             slabs: vec![],
+            poisoned: false,
         };
         assert_eq!(r.extent(1024).unwrap(), 2 << 20);
         assert_eq!(r.extent(1025).unwrap(), 4 << 20);
@@ -279,6 +382,7 @@ mod tests {
             granularity: 2 << 20,
             mapped: 0,
             slabs: vec![],
+            poisoned: false,
         };
         assert_eq!(scale.extent(65536).unwrap(), 2 << 20);
         assert_eq!(scale.extent(65537).unwrap(), 4 << 20);

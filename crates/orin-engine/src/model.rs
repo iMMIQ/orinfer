@@ -580,6 +580,10 @@ pub fn score_with_options(
     crate::runtime::ModelRuntime::load_with_options(path, options)?.score(input)
 }
 impl Model {
+    pub fn frontend_assets(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.0.frontend_assets
+    }
+
     pub fn batching_supported(&self) -> bool {
         !self.0.manifest.batch_profiles.is_empty()
     }

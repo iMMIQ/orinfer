@@ -152,6 +152,7 @@ pub(crate) fn check(code: i32, operation: &str) -> Result<()> {
     if code == 0 {
         Ok(())
     } else {
+        crate::error::record_cuda(code);
         Err(format!("{operation}: CUDA error {code}"))
     }
 }
@@ -254,10 +255,12 @@ impl Session {
                 self.graph = ptr::null_mut();
             }
             for (graph, exec) in self.graphs.get_mut().drain(..) {
-                record(
-                    (self.driver.graph_exec_destroy)(exec),
-                    "destroy model graph exec",
-                );
+                if !exec.is_null() {
+                    record(
+                        (self.driver.graph_exec_destroy)(exec),
+                        "destroy model graph exec",
+                    );
+                }
                 record((self.driver.graph_destroy)(graph), "destroy model graph");
             }
             for event in self.events.drain(..) {
@@ -266,6 +269,9 @@ impl Session {
             for (_, mut buffer) in std::mem::take(self.virtual_buffers.get_mut()) {
                 if let Err(e) = buffer.release_slabs(&self.driver) {
                     eprintln!("CUDA KV cleanup: {e}");
+                }
+                if buffer.has_slabs() {
+                    continue;
                 }
                 record(
                     (self.driver.vmm_address_free)(buffer.address, buffer.bytes),

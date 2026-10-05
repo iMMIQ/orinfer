@@ -12,6 +12,7 @@ pub(super) struct Sequence {
     pub reservations: super::virtual_memory::Reservations,
     pub graphs: BTreeMap<String, Handle>,
     pub leased: bool,
+    pub quarantined: bool,
 }
 
 impl Executor {
@@ -72,6 +73,19 @@ impl Executor {
             })
     }
     pub(crate) fn lease_sequence(&mut self, limits: &BTreeMap<String, usize>) -> Result<usize> {
+        let reused = self
+            .sequences
+            .iter()
+            .position(|s| !s.leased && !s.quarantined);
+        let result = self.lease_sequence_inner(limits);
+        if result.is_err()
+            && let Some(slot) = reused
+        {
+            self.sequences[slot].quarantined = true;
+        }
+        result
+    }
+    fn lease_sequence_inner(&mut self, limits: &BTreeMap<String, usize>) -> Result<usize> {
         for (name, &bytes) in limits {
             let capacity = self
                 .sequence_specs
@@ -83,7 +97,11 @@ impl Executor {
                 return Err("Invalid private buffer limit".into());
             }
         }
-        if let Some(slot) = self.sequences.iter().position(|s| !s.leased) {
+        if let Some(slot) = self
+            .sequences
+            .iter()
+            .position(|s| !s.leased && !s.quarantined)
+        {
             self.activate_sequence(slot)?;
             let needed: Vec<_> = self
                 .sequence_specs
@@ -241,7 +259,10 @@ impl Executor {
         sequence.leased = true;
         let slot = self.sequences.len();
         self.sequences.push(sequence);
-        self.activate_sequence(slot)?;
+        if let Err(error) = self.activate_sequence(slot) {
+            self.sequences[slot].quarantined = true;
+            return Err(error);
+        }
         Ok(slot)
     }
     pub(crate) fn activate_sequence(&mut self, slot: usize) -> Result<()> {
@@ -287,18 +308,20 @@ impl Executor {
         let mut index = 0;
         while index < owned.len() {
             if execs.contains(&owned[index].1) {
-                let (graph, exec) = owned.remove(index);
+                let (graph, exec) = owned[index];
                 // SAFETY: Idle stream, graphs removed from every execution map.
                 unsafe {
                     check(
                         (self.session.driver.graph_exec_destroy)(exec),
                         "invalidate metadata graph",
                     )?;
+                    owned[index].1 = std::ptr::null_mut();
                     check(
                         (self.session.driver.graph_destroy)(graph),
                         "invalidate metadata capture",
                     )?;
                 }
+                owned.remove(index);
             } else {
                 index += 1;
             }
@@ -342,7 +365,7 @@ impl Executor {
             })
     }
     pub(crate) fn additional_state_bytes(&self, limits: &BTreeMap<String, usize>) -> Result<usize> {
-        if let Some(s) = self.sequences.iter().find(|s| !s.leased) {
+        if let Some(s) = self.sequences.iter().find(|s| !s.leased && !s.quarantined) {
             Ok(limits
                 .iter()
                 .filter(|(name, _)| !self.sequence_strides.contains_key(*name))
@@ -353,11 +376,18 @@ impl Executor {
         }
     }
     pub(crate) fn release_sequence(&mut self, slot: usize, resets: &[String]) -> Result<()> {
-        self.activate_sequence(slot)?;
-        self.reset_sequence(resets)?;
+        let result = self
+            .activate_sequence(slot)
+            .and_then(|()| self.reset_sequence(resets));
+        if let Err(error) = result {
+            self.sequences[slot].quarantined = true;
+            return Err(error);
+        }
+        self.sequences[slot].quarantined = false;
         self.sequences[slot].leased = false;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn prepare_legacy_sequence(&mut self) -> Result<()> {
         if self.sequences.iter().any(|s| s.leased) {
             return Err("Complete active requests before using whole-request generation".into());
@@ -628,18 +658,20 @@ impl Executor {
                     self.batch_graphs.borrow_mut().remove(&victim.0);
                     let mut owned = self.session.graphs.borrow_mut();
                     if let Some(index) = owned.iter().position(|(_, e)| *e == victim.1) {
-                        let (g, e) = owned.remove(index);
+                        let (g, e) = owned[index];
                         // SAFETY: Completed graph is removed from all owners.
                         unsafe {
                             check(
                                 (self.session.driver.graph_exec_destroy)(e),
                                 "evict batch graph",
                             )?;
+                            owned[index].1 = std::ptr::null_mut();
                             check(
                                 (self.session.driver.graph_destroy)(g),
                                 "evict batch capture",
                             )?;
                         }
+                        owned.remove(index);
                     }
                     let mut statistics = self.batch_statistics.get();
                     statistics.graph_evictions += 1;

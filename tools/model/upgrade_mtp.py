@@ -6,17 +6,12 @@ content-addressed operator package and model directory atomically.
 """
 import argparse
 import copy
-import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
-import subprocess
 import sys
-import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.model.prepare import file_hash, source_path, write_json
+from tools.model.publication import atomic_model, clone_model, commit_package, load_model, source_path
 from tools.operators.abi import evaluate, parse_host
 
 
@@ -50,18 +45,11 @@ def upgrade(model, output, engine):
     output = output.absolute()
     if output.exists() or output.is_symlink():
         raise ValueError('Output already exists')
-    data = json.loads((model / 'cache/model.json').read_text())
+    data, package_dir, package = load_model(model)
     metadata = data['metadata']
     spec = metadata['mtp']
     if not spec or not metadata['vision']:
         raise ValueError('Expected a prepared multimodal MTP model')
-    digest = data['operator_package']
-    package_dir = model / 'cache/operators' / digest
-    if not package_dir.exists():
-        package_dir = Path.home() / '.cache/orin-llm/operators' / digest
-    if file_hash(package_dir / 'package.json') != digest:
-        raise ValueError('Operator package hash differs')
-    package = json.loads((package_dir / 'package.json').read_text())
     kernels = {k['name']: k for k in package['kernels']}
     embedding = kernels['decode/begin/k1']
     prepare = next(k for k in package['kernels'] if k['name'].startswith('prefill_m2/layer')
@@ -89,32 +77,9 @@ def upgrade(model, output, engine):
     package['buffer_contracts'].append({k: v for k, v in index.items() if k != 'data'})
     data['buffer_scopes'][index['name']] = 'sequence'
     spec.update(draft_logits='MtpLogits', verification_logits='SequenceLogits', feature_index=index['name'])
-    raw = (json.dumps(package, indent=2, ensure_ascii=False) + '\n').encode()
-    new_digest = hashlib.sha256(raw).hexdigest()
-    data['operator_package'] = new_digest
-    output.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f'.{output.name}-', dir=output.parent))
-    try:
-        for file in model.iterdir():
-            if file.is_file():
-                shutil.copyfile(file, staging / file.name)
-        (staging / 'cache').mkdir()
-        # Only immutable weight shards share storage; descriptors are new files.
-        def immutable_copy(source, destination):
-            try:
-                os.link(source, destination)
-            except OSError:
-                shutil.copyfile(source, destination)
-        shutil.copytree(model / 'cache/weights', staging / 'cache/weights', copy_function=immutable_copy)
-        destination = staging / 'cache/operators' / new_digest
-        shutil.copytree(package_dir, destination)
-        (destination / 'package.json').write_bytes(raw)
-        write_json(staging / 'cache/model.json', data)
-        subprocess.run([str(engine.resolve(strict=True)), 'validate-model', str(staging)], check=True)
-        staging.rename(output)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+    with atomic_model(output, engine, command='validate-model') as staging:
+        operator = clone_model(model, staging, package_dir)
+        new_digest = commit_package(staging, operator, data, package)
     return dict(model=str(output), operator_package=new_digest, weights_unchanged=True)
 
 

@@ -4,6 +4,12 @@ use crate::prefix::{Entry, Media, Resident};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Default)]
+pub(super) struct Context {
+    pub kv: Vec<crate::cuda::snapshot::Piece>,
+    pub statistics: crate::prefix::Statistics,
+}
+
 impl ModelRuntime {
     pub(crate) fn prefix_media(
         &self,
@@ -77,9 +83,10 @@ impl ModelRuntime {
         &mut self,
         input: &[u32],
         media: &Media,
+        context: &mut Context,
     ) -> Result<(usize, super::speculation::PrefillWarm)> {
-        self.prefix_statistics = crate::prefix::Statistics::default();
-        self.prefix_kv.clear();
+        context.statistics = crate::prefix::Statistics::default();
+        context.kv.clear();
         self.execution.collect_snapshots()?;
         if self.prefix_cache.budget == 0 {
             return Ok((0, super::speculation::PrefillWarm::default()));
@@ -89,19 +96,19 @@ impl ModelRuntime {
             self.prefill_costs
                 .score(e.tokens.len(), input.len(), e.bytes)
         });
-        self.prefix_statistics.lookup_s = at.elapsed().as_secs_f64();
-        self.prefix_statistics.matched_tokens = matched.matched_tokens;
+        context.statistics.lookup_s = at.elapsed().as_secs_f64();
+        context.statistics.matched_tokens = matched.matched_tokens;
         let Some(id) = matched.checkpoint else {
             return Ok((0, super::speculation::PrefillWarm::default()));
         };
         let entry = self.prefix_cache.touch(id);
         let at = Instant::now();
         self.execution.restore_snapshot(&entry.snapshot)?;
-        self.prefix_kv.clone_from(&entry.snapshot.kv);
-        self.prefix_statistics.cached_tokens = entry.tokens.len();
-        self.prefix_statistics.restore_s = at.elapsed().as_secs_f64();
+        context.kv.clone_from(&entry.snapshot.kv);
+        context.statistics.cached_tokens = entry.tokens.len();
+        context.statistics.restore_s = at.elapsed().as_secs_f64();
         self.prefill_costs
-            .observe_restore(entry.bytes, self.prefix_statistics.restore_s);
+            .observe_restore(entry.bytes, context.statistics.restore_s);
         Ok((
             entry.tokens.len(),
             super::speculation::PrefillWarm {
@@ -195,6 +202,7 @@ impl ModelRuntime {
         media: &Media,
         warm_tokens: usize,
         logits_valid: bool,
+        context: &mut Context,
     ) -> Result<()> {
         let at = Instant::now();
         if self.prefix_cache.budget != 0
@@ -226,8 +234,8 @@ impl ModelRuntime {
                 n.checked_add(r.bytes).ok_or("Prefix size overflow")
             })?;
             if minimum > self.prefix_cache.budget {
-                self.prefix_statistics.store_s += at.elapsed().as_secs_f64();
-                self.update_prefix_usage();
+                context.statistics.store_s += at.elapsed().as_secs_f64();
+                self.update_prefix_usage(context);
                 return Ok(());
             }
             let kv_names = self
@@ -238,12 +246,12 @@ impl ModelRuntime {
                 .unwrap_or_default();
             let plan = self
                 .execution
-                .plan_snapshot(ranges, &kv_names, &self.prefix_kv)?;
+                .plan_snapshot(ranges, &kv_names, &context.kv)?;
             let mut retained = BTreeMap::new();
             plan.allocations(&mut retained);
             if retained.values().sum::<usize>() + plan.new_bytes > self.prefix_cache.budget {
-                self.prefix_statistics.store_s += at.elapsed().as_secs_f64();
-                self.update_prefix_usage();
+                context.statistics.store_s += at.elapsed().as_secs_f64();
+                self.update_prefix_usage(context);
                 return Ok(());
             }
             // Reclaim before allocating so capture itself respects the budget,
@@ -255,7 +263,7 @@ impl ModelRuntime {
                     .prefix_cache
                     .evict_one()
                     .ok_or("Prefix budget planning failure")?;
-                self.prefix_statistics.evictions += 1;
+                context.statistics.evictions += 1;
                 self.execution.release_snapshot(old)?;
             }
             let snapshot = loop {
@@ -265,7 +273,7 @@ impl ModelRuntime {
                 let Some(old) = self.prefix_cache.evict_one() else {
                     break None;
                 };
-                self.prefix_statistics.evictions += 1;
+                context.statistics.evictions += 1;
                 self.execution.release_snapshot(old)?;
             };
             if let Some(snapshot) = snapshot {
@@ -279,7 +287,7 @@ impl ModelRuntime {
                             .prefix_cache
                             .evict_one()
                             .ok_or("Prefix budget accounting failure")?;
-                        self.prefix_statistics.evictions += 1;
+                        context.statistics.evictions += 1;
                         self.execution.release_snapshot(old)?;
                     }
                     // Upgrade a head-less endpoint, rather than keeping two states.
@@ -297,7 +305,7 @@ impl ModelRuntime {
                         let e = self.prefix_cache.remove(id).expect("known endpoint");
                         self.execution.release_snapshot(e.snapshot)?;
                     }
-                    self.prefix_kv.clone_from(&snapshot.kv);
+                    context.kv.clone_from(&snapshot.kv);
                     let bytes = snapshot.bytes;
                     self.prefix_cache.insert(Entry::new(
                         input.to_vec(),
@@ -307,31 +315,32 @@ impl ModelRuntime {
                         warm_tokens,
                         logits_valid,
                     ));
-                    self.prefix_statistics.checkpoints_stored += 1;
+                    context.statistics.checkpoints_stored += 1;
                 } else {
                     self.execution.release_snapshot(snapshot)?;
                 }
             }
         }
-        self.prefix_statistics.store_s += at.elapsed().as_secs_f64();
-        self.update_prefix_usage();
+        context.statistics.store_s += at.elapsed().as_secs_f64();
+        self.update_prefix_usage(context);
         Ok(())
     }
-    fn update_prefix_usage(&mut self) {
-        self.prefix_statistics.resident_bytes = self.prefix_cache.bytes;
-        self.prefix_statistics.logical_bytes =
+    fn update_prefix_usage(&self, context: &mut Context) {
+        context.statistics.resident_bytes = self.prefix_cache.bytes;
+        context.statistics.logical_bytes =
             self.prefix_cache.entries.values().map(|e| e.bytes).sum();
-        self.prefix_statistics.shared_bytes = self
-            .prefix_statistics
+        context.statistics.shared_bytes = context
+            .statistics
             .logical_bytes
             .saturating_sub(self.prefix_cache.bytes);
-        self.prefix_statistics.entries = self.prefix_cache.entries.len();
+        context.statistics.entries = self.prefix_cache.entries.len();
     }
     pub(super) fn store_decoded_prefix(
         &mut self,
         history: &[u32],
         media: &Media,
         cancelled: &impl Fn() -> bool,
+        context: &mut Context,
     ) -> Result<()> {
         let position = self.read_control(&self.manifest.position)? as usize;
         if self.prefix_cache.budget != 0
@@ -352,13 +361,13 @@ impl ModelRuntime {
             } else {
                 0
             };
-            let result = self.store_prefix(&history[..position], media, warm, false);
+            let result = self.store_prefix(&history[..position], media, warm, false, context);
             if let Some(s) = &spec {
                 self.upload_ids(&s.position, &[position as u32])?;
             }
             result?;
         }
-        self.prefix_kv.clear();
+        context.kv.clear();
         self.execution.collect_snapshots()
     }
 }

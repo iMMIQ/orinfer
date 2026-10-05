@@ -15,12 +15,11 @@ import time
 from pathlib import Path
 import numpy as np
 import torch
-from safetensors import safe_open
 from common import configure, environment, export_kernel, write_json, ROOT
 from abi import parse_host, evaluate
 from tools.quantization.w4_warp_pack import LAYOUT as WARP_LAYOUT, pack_array
 
-MODEL = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http/model.safetensors')
+from tools.model.checkpoint import Checkpoint
 H, F, V, C, MAXPOS, NP = 5120, 17408, 248320, 512, 8704, 68
 # 8704 / 128 = 68, and capacity includes all 8192+255 model inputs.
 
@@ -32,7 +31,11 @@ class Builder:
                  swiglu_a8_mode='strict', decode_register_scope='ffn',
                  decode_state_mode='immutable', decode_attention_mode='original',
                  prefill_norm_a8=False, gdn_wy_mode='simt', prefill_attention_mode='original',
-                 gdn_solve_mode='registers'):
+                 gdn_solve_mode='registers', checkpoint=None):
+        self.checkpoint = Path(checkpoint).resolve(strict=True)
+        with Checkpoint(self.checkpoint) as source:
+            source.validate_backbone()
+            self.checkpoint_identity = source.identity
         self.out = out
         self.dense_u4 = dense_u4
         self.prefill_w4a8 = prefill_w4a8
@@ -82,6 +85,8 @@ class Builder:
         if reuse_weights:
             self.report['scale_casts'] = json.loads((reuse_weights/'progress.json').read_text())['scale_casts']
             self.reused_report = json.loads((reuse_weights/'build-report.json').read_text())
+            if self.reused_report.get('checkpoint_identity') != self.checkpoint_identity:
+                raise ValueError('Reused weights belong to a different checkpoint identity')
             self.reused_buffers = {b['name']: b for b in json.loads((reuse_weights/'model.json').read_text())['buffers']}
             warp_names = {name for name, b in self.reused_buffers.items() if b['layout']==WARP_LAYOUT}
             allowed_warp = {name+'_P' for name in self.warp_weights}
@@ -481,7 +486,7 @@ class Builder:
             self.report['swiglu_lut']=dict(bytes=data.numel()*data.element_size(),sha256=digest,
                 generation_s=time.perf_counter()-started,scope='Offline table generation, not native model load')
             del codes,lut,data,generator
-        with safe_open(str(MODEL),framework='pt',device='cpu') as model:
+        with Checkpoint(self.checkpoint) as model:
             if self.dense_u4:
                 self.dense_quantize(model,'Embedding','model.language_model.embed_tokens.weight')
                 self.dense_quantize(model,'Head','lm_head.weight')
@@ -662,8 +667,8 @@ class Builder:
                   'weight_scope':('community W4 backbone + asymmetric group128 RNE U4 embedding/head candidate' if self.dense_u4 else 'community W4 backbone, original BF16 dense tables cast FP16; diagnostic above budget')+('; prefill temporary row-W8/per-token-A8 INT8, offline WS metadata counted; decode W4A16' if self.prefill_w4a8 else '')+('; '+self.decode_register_scope+' projections use one losslessly warp-packed W4 copy shared by prefill/decode' if self.decode_register_mma else '')}
         write_json(self.out/'model.json',manifest)
         self.report.update(status='built',build_s=time.perf_counter()-self.started,weight_bytes=weight_bytes,
-            effective_weight_bits=8*weight_bytes/self.weight_parameters,sources=self.sources, checkpoint=str(MODEL),
-            checkpoint_sha256='15c5b07049149c73236254d53eca1d2f3274f9fb6803540ca47b1ce657dcf583')
+            effective_weight_bits=8*weight_bytes/self.weight_parameters,sources=self.sources, checkpoint=str(self.checkpoint),
+            checkpoint_identity=self.checkpoint_identity)
         self.report['prefill_w4a8']=self.prefill_w4a8
         self.report['prefill_tokens']=C
         self.report['prefill_execution']='One layer-major full graph per chunk; W8 expanded once per projection per chunk'
@@ -695,7 +700,7 @@ class Builder:
 
 
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument('--output',required=True); parser.add_argument('--reuse-aot'); parser.add_argument('--reuse-weights'); parser.add_argument('--dense-u4',action='store_true');parser.add_argument('--prefill-w4a8',action='store_true');parser.add_argument('--w8-expand-mode',choices=('dynamic','aligned'),default='dynamic');parser.add_argument('--gdn-math',choices=('simt','compensated','factored'),default='simt');parser.add_argument('--prefill-tokens',type=int,choices=(512,2048,8192),default=512);parser.add_argument('--prefill-grid-order',choices=('auto','nfirst','mfirst'),default='auto');parser.add_argument('--decode-register-mma',action='store_true');parser.add_argument('--swiglu-a8-mode',choices=('strict','guarded-reciprocal','lut'),default='strict')
+    parser=argparse.ArgumentParser(); parser.add_argument('--checkpoint',required=True); parser.add_argument('--output',required=True); parser.add_argument('--reuse-aot'); parser.add_argument('--reuse-weights'); parser.add_argument('--dense-u4',action='store_true');parser.add_argument('--prefill-w4a8',action='store_true');parser.add_argument('--w8-expand-mode',choices=('dynamic','aligned'),default='dynamic');parser.add_argument('--gdn-math',choices=('simt','compensated','factored'),default='simt');parser.add_argument('--prefill-tokens',type=int,choices=(512,2048,8192),default=512);parser.add_argument('--prefill-grid-order',choices=('auto','nfirst','mfirst'),default='auto');parser.add_argument('--decode-register-mma',action='store_true');parser.add_argument('--swiglu-a8-mode',choices=('strict','guarded-reciprocal','lut'),default='strict')
     parser.add_argument('--decode-register-scope',choices=('ffn','all'),default='ffn')
     parser.add_argument('--decode-state-mode',choices=('immutable','inplace'),default='immutable')
     parser.add_argument('--decode-attention-mode',choices=('original','staged'),default='original')
@@ -704,7 +709,9 @@ def main():
     parser.add_argument('--prefill-attention-mode',choices=('original','staged64'),default='original')
     parser.add_argument('--gdn-solve-mode',choices=('registers','columns-register'),default='registers')
     args=parser.parse_args(); out=Path(args.output); out.mkdir(parents=True,exist_ok=True)
-    configure(); b=Builder(out,Path(args.reuse_aot) if args.reuse_aot else None,Path(args.reuse_weights) if args.reuse_weights else None,args.dense_u4,args.prefill_w4a8,args.w8_expand_mode,args.gdn_math,args.prefill_tokens,args.prefill_grid_order,args.decode_register_mma,args.swiglu_a8_mode,args.decode_register_scope,args.decode_state_mode,args.decode_attention_mode,args.prefill_norm_a8,args.gdn_wy_mode,args.prefill_attention_mode,args.gdn_solve_mode); b.compile_all(); b.weights()
+    if any((out / name).exists() for name in ('model.json', 'weights', 'aot')):
+        parser.error('Output already contains model build products')
+    b=Builder(out,Path(args.reuse_aot) if args.reuse_aot else None,Path(args.reuse_weights) if args.reuse_weights else None,args.dense_u4,args.prefill_w4a8,args.w8_expand_mode,args.gdn_math,args.prefill_tokens,args.prefill_grid_order,args.decode_register_mma,args.swiglu_a8_mode,args.decode_register_scope,args.decode_state_mode,args.decode_attention_mode,args.prefill_norm_a8,args.gdn_wy_mode,args.prefill_attention_mode,args.gdn_solve_mode,args.checkpoint); configure(); b.compile_all(); b.weights()
     if b.decode_register_mma:b.repack_warp_weights()
     b.finish()
 

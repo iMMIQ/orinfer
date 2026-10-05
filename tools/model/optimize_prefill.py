@@ -4,17 +4,13 @@ Only operator bindings and bounded workspaces change; resident weights retain
 their existing single W4 representation. The source directory stays immutable.
 """
 import argparse
-import copy
 import hashlib
 import importlib
 import json
 from pathlib import Path
-import shutil
-import subprocess
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
-from tools.model.optimize_kv import link_or_copy
-from tools.model.prepare import write_json
+from tools.model.publication import atomic_model, clone_model, commit_package, load_model
 from tools.model.screen_prefill_ffn import model_identity
 from tools.operators.abi import parse_host, evaluate
 
@@ -29,7 +25,8 @@ def publish(source, destination, engine, output, warm_sizes=(64,128,512), attent
     source=source.resolve(strict=True);destination=destination.absolute()
     if destination.exists() or destination.resolve().is_relative_to(source):
         raise ValueError('Destination must be new and outside source')
-    wrapper=json.loads((source/'cache/model.json').read_text());meta=wrapper['metadata']
+    wrapper, old, package = load_model(source)
+    meta = wrapper['metadata']
     if wrapper['architecture']!='qwen3_5' or not meta['kv_cache'].get('prefill_workspace'):
         raise ValueError('Requires prepared demand-mapped INT8 KV with prefill scratch')
     context=meta['max_context'];spec=meta['mtp'];buffers={b['name']:b for b in meta['buffers']}
@@ -53,19 +50,9 @@ def publish(source, destination, engine, output, warm_sizes=(64,128,512), attent
         geometry={'MtpEmbedding':[5120],'MtpFullX':[14336],'MtpGateUpResult':[34816]}
         if any(buffers[n]['shape'][1:] != shape for n,shape in geometry.items()):
             raise ValueError('MTP warm profiles require the 27B projection geometry')
-    old=source/'cache/operators'/wrapper['operator_package']
-    raw=(old/'package.json').read_bytes()
-    if hashlib.sha256(raw).hexdigest()!=wrapper['operator_package']:raise ValueError('Operator package hash mismatch')
-    package=json.loads(raw);kernels={k['name']:k for k in package['kernels']}
-    staging=destination.with_name(destination.name+'.staging')
-    if staging.exists():raise ValueError('Staging exists')
-    staging.mkdir(parents=True)
-    try:
-        for f in source.iterdir():
-            if f.is_file():shutil.copy2(f,staging/f.name)
-        shutil.copytree(source/'cache/weights',staging/'cache/weights',copy_function=link_or_copy)
-        pkg=staging/'cache/operators/staging'
-        shutil.copytree(old,pkg,copy_function=link_or_copy);(pkg/'package.json').unlink()
+    kernels = {k['name']: k for k in package['kernels']}
+    with atomic_model(destination, engine, command='validate-model') as staging:
+        pkg = clone_model(source, staging, old)
         exports={}
         def exported(key,factory):
             if key not in exports:
@@ -152,14 +139,9 @@ def publish(source, destination, engine, output, warm_sizes=(64,128,512), attent
                     kernels[name]=bind(name,export,arguments(template),1)
                 spec['warm_plans'].append(dict(tokens=rows,program=f'mtp_warm_m{rows}',head_program=f'mtp_head_m{rows}'))
         package['kernels']=list(kernels.values());package['buffer_contracts']=[{k:v for k,v in b.items() if k!='data'} for b in meta['buffers']]
-        write_json(pkg/'package.json',package);digest=hashlib.sha256((pkg/'package.json').read_bytes()).hexdigest();pkg.rename(pkg.with_name(digest));wrapper['operator_package']=digest
-        write_json(staging/'cache/model.json',wrapper)
-        subprocess.run([str(engine.resolve()),'validate-model',str(staging)],check=True)
-        staging.rename(destination)
-        return dict(model=str(destination),operator_package=digest,mtp_warm_sizes=list(warm_sizes),
-                    attention_choice=attention_choice)
-    except BaseException:
-        shutil.rmtree(staging);raise
+        digest = commit_package(staging, pkg, wrapper, package)
+    return dict(model=str(destination),operator_package=digest,mtp_warm_sizes=list(warm_sizes),
+                attention_choice=attention_choice)
 
 
 if __name__=='__main__':

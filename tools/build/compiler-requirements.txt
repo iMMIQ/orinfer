@@ -1,0 +1,7 @@
+tilelang==0.1.13
+apache-tvm-ffi==0.1.12
+torch-c-dlpack-ext==0.1.5
+z3-solver==4.15.4.0
+numpy==2.2.6
+safetensors==0.7.0
+transformers==4.57.6

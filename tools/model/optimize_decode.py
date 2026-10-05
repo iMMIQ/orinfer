@@ -4,17 +4,12 @@ Weights and existing operator assets are immutable hardlinks. Publication uses
 a fresh directory and checks the Rust-registered plan before an atomic rename.
 """
 import argparse
-import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
-import subprocess
 import sys
-import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.model.prepare import file_hash, write_json
+from tools.model.publication import atomic_model, clone_model, commit_package, file_hash, load_model, write_json
 from tools.model.upgrade_batching import bind
 from tools.operators.abi import parse_host
 
@@ -23,26 +18,12 @@ def upgrade(model, destination, report, specialize):
     from kernels.model.greedy_sampling import history_counts, penalized_partials, penalized_merge
     from tools.operators.common import configure, export_kernel
     configure()
-    data = json.loads((model / 'cache/model.json').read_text())
+    data, origin, package = load_model(model)
     metadata = data['metadata']
-    operator_cache = Path(os.environ.get('ORIN_OPERATOR_CACHE',
-        str(Path(os.environ.get('XDG_CACHE_HOME', str(Path.home()/'.cache'))) / 'orin-llm/operators')))
-    installed = operator_cache / data['operator_package']
-    origin = installed if installed.exists() else model / 'cache/operators' / data['operator_package']
-    if file_hash(origin / 'package.json') != data['operator_package']:
-        raise ValueError('Source operator package digest mismatch')
-    package = json.loads((origin / 'package.json').read_text())
     if not package.get('batch_profiles') or package.get('greedy_sampling'):
         raise ValueError('Expected batch package without GPU greedy processors')
-    destination.mkdir(parents=True)
-    for path in model.iterdir():
-        if path.is_file():
-            shutil.copyfile(path, destination / path.name)
     cache = destination / 'cache'
-    cache.mkdir()
-    shutil.copytree(model / 'cache/weights', cache / 'weights', copy_function=os.link)
-    operator = cache / 'operators' / '.building'
-    shutil.copytree(origin, operator, copy_function=os.link)
+    operator = clone_model(model, destination, origin)
     vocab, context = metadata['vocab'], metadata['max_context']
     blocks = (vocab + 4095) // 4096
     for name, dtype, shape in [
@@ -114,14 +95,7 @@ def upgrade(model, destination, report, specialize):
         package['kernels'] = list(kernels.values())
     package['greedy_sampling'] = True
     package['buffer_contracts'] = [{k:v for k,v in b.items() if k != 'data'} for b in metadata['buffers']]
-    raw = (json.dumps(package,ensure_ascii=False,indent=2)+'\n').encode()
-    digest = hashlib.sha256(raw).hexdigest()
-    temporary = operator / 'package.new.json'
-    temporary.write_bytes(raw)
-    temporary.replace(operator / 'package.json')
-    operator.rename(operator.parent / digest)
-    data['operator_package'] = digest
-    write_json(cache / 'model.json', data)
+    digest = commit_package(destination, operator, data, package)
     write_json(report / 'upgrade.json',dict(operator_package=digest,weight_bytes=metadata['weight_bytes'],
                                           specialized_projections=specialize,
                                           sampling_scratch_bytes=context*4+vocab*4+blocks*16+28))
@@ -137,16 +111,8 @@ def main():
     destination = args.model_output.absolute()
     if destination.exists():
         parser.error('Destination already exists')
-    staging = destination.with_name('.'+destination.name+'.building-'+uuid.uuid4().hex)
-    try:
+    with atomic_model(destination) as staging:
         upgrade(args.model.resolve(strict=True), staging, args.output, args.specialize_projections)
-        cli = Path(__file__).resolve().parents[2] / 'target/release/orin-llm'
-        subprocess.run([str(cli),'plan-model',str(staging)],check=True,stdout=subprocess.DEVNULL)
-        staging.rename(destination)
-    except BaseException:
-        if staging.exists():
-            shutil.rmtree(staging)
-        raise
     print('DECODE PACKAGE READY',destination,flush=True)
 
 

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "runtime_abi": 1,
+  "families": {
+    "qwen3_5": {
+      "text_keys": [
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "vocab_size",
+        "layer_types",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_conv_kernel_dim",
+        "hidden_act",
+        "rms_norm_eps",
+        "rope_parameters",
+        "partial_rotary_factor",
+        "attn_output_gate",
+        "output_gate_type",
+        "attention_bias",
+        "tie_word_embeddings",
+        "mtp_num_hidden_layers",
+        "mtp_use_dedicated_embeddings"
+      ]
+    }
+  }
+}

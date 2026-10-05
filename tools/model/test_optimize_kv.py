@@ -1,5 +1,4 @@
 """Offline contract tests for direct, demand-mapped KV publication."""
-import copy
 import unittest
 from tools.model.optimize_kv import transform
 

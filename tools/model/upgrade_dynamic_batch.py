@@ -5,14 +5,9 @@ nonstandard rows; common optimized batch profiles retain their existing ABI.
 """
 import argparse
 import ast
-import hashlib
-import json
-import os
 from pathlib import Path
-import shutil
-import tempfile
 
-from tools.model.prepare import file_hash, write_json
+from tools.model.publication import atomic_model, clone_model, commit_package, file_hash, load_model, write_json
 from tools.operators.abi import parse_host, evaluate
 
 
@@ -66,14 +61,7 @@ def upgrade(model, destination):
     destination = destination.absolute()
     if destination.exists():
         raise ValueError('Destination already exists')
-    data = json.loads((model/'cache/model.json').read_text())
-    operator_cache = Path(os.environ.get('ORIN_OPERATOR_CACHE',
-        str(Path(os.environ.get('XDG_CACHE_HOME',str(Path.home()/'.cache')))/'orin-llm/operators')))
-    origin = operator_cache/data['operator_package']
-    if not origin.exists(): origin = model/'cache/operators'/data['operator_package']
-    if file_hash(origin/'package.json') != data['operator_package']:
-        raise ValueError('Source package digest mismatch')
-    package = json.loads((origin/'package.json').read_text())
+    data, origin, package = load_model(model)
     if 128 not in package.get('batch_profiles', []) or package.get('dynamic_batch_kernels'):
         raise ValueError('Requires capacity128 without dynamic contracts')
     contracts, parsed = [], {}
@@ -90,24 +78,9 @@ def upgrade(model, destination):
         contracts.append(contract(kernel, hosts[0]))
     if not contracts: raise ValueError('No dynamic capacity kernels')
     package['dynamic_batch_kernels'] = contracts
-    raw = (json.dumps(package,ensure_ascii=False,indent=2)+'\n').encode()
-    digest = hashlib.sha256(raw).hexdigest()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=f'.{destination.name}.', dir=destination.parent) as temporary_root:
-        staged = Path(temporary_root)/'model'
-        staged.mkdir()
-        for path in model.iterdir():
-            if path.is_file(): shutil.copyfile(path,staged/path.name)
-        cache = staged/'cache';cache.mkdir()
-        shutil.copytree(model/'cache/weights',cache/'weights',copy_function=os.link)
-        operator = cache/'operators'/digest
-        shutil.copytree(origin,operator,copy_function=os.link)
-        # Replacement leaves the source's hardlinked metadata untouched.
-        temporary = operator/'package.json.tmp';temporary.write_bytes(raw)
-        temporary.replace(operator/'package.json')
-        data['operator_package'] = digest
-        write_json(cache/'model.json',data)
-        os.rename(staged,destination)
+    with atomic_model(destination) as staging:
+        operator = clone_model(model, staging, origin)
+        digest = commit_package(staging, operator, data, package)
     return dict(operator_package=digest, dynamic_templates=len(contracts),
                 weight_bytes=data['metadata']['weight_bytes'])
 

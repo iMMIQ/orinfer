@@ -15,7 +15,7 @@ pub(super) fn register(
         }
         return Ok(());
     }
-    let t = &config.text;
+    let t = config.qwen3_5();
     if m.batch_gdn {
         let pointers = m
             .buffers
@@ -179,6 +179,7 @@ pub(super) fn register(
         builder.programs.insert(program, ops);
     }
     m.batch_layout = Some(BatchLayout {
+        architecture: Architecture::Qwen3_5,
         layers: t.layer_types.clone(),
         row_strides: strides,
         profiles: profiles.iter().map(|p| (p.tokens, p.kind)).collect(),
@@ -664,6 +665,7 @@ mod tests {
         })).unwrap();
         m.batch_profiles = vec![2, 4, 8, 16, 32, 64, 128];
         m.batch_layout = Some(BatchLayout {
+            architecture: Architecture::Qwen3_5,
             layers: vec!["linear_attention".into(), "full_attention".into()],
             row_strides: BTreeMap::from([
                 ("Hidden".into(), 16),

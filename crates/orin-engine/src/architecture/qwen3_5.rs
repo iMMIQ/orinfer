@@ -5,6 +5,123 @@ use Extent::{Hidden, History, Residual, State, Token};
 use Step::{Copy as C, Kernel as K, Zero as Z};
 pub(super) mod batching;
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct TextConfig {
+    pub hidden_size: usize,
+    #[serde(default)]
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub vocab_size: usize,
+    pub layer_types: Vec<String>,
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+    pub linear_conv_kernel_dim: usize,
+}
+
+#[derive(Clone, Copy)]
+enum Extent {
+    Residual,
+    History,
+    State,
+    Hidden,
+    Token,
+}
+#[derive(Clone, Copy)]
+enum Step {
+    Kernel(usize),
+    Copy(&'static str, &'static str, Extent),
+    Zero(&'static str, Extent),
+}
+struct Recipe {
+    begin: &'static [Step],
+    gdn: &'static [Step],
+    attention: &'static [Step],
+    end: &'static [Step],
+}
+
+struct Builder<'a> {
+    config: &'a Configuration,
+    programs: BTreeMap<String, Vec<Operation>>,
+}
+impl Builder<'_> {
+    fn emit(
+        &self,
+        steps: &[Step],
+        program: &str,
+        section: &str,
+        tokens: usize,
+        layer: usize,
+    ) -> Result<Vec<Operation>> {
+        let t = &self.config.qwen3_5();
+        let bytes = |extent: Extent| -> Result<usize> {
+            let factors: &[usize] = match extent {
+                Extent::Residual => &[tokens, t.hidden_size, 4],
+                Extent::Hidden => &[t.hidden_size, 2],
+                Extent::Token => &[4],
+                Extent::History => &[
+                    t.linear_conv_kernel_dim - 1,
+                    t.linear_num_key_heads
+                        .checked_mul(t.linear_key_head_dim)
+                        .and_then(|n| n.checked_mul(2))
+                        .and_then(|n| {
+                            t.linear_num_value_heads
+                                .checked_mul(t.linear_value_head_dim)
+                                .and_then(|v| n.checked_add(v))
+                        })
+                        .ok_or("History dimensions overflow")?,
+                    2,
+                ],
+                Extent::State => &[
+                    t.linear_num_value_heads,
+                    t.linear_key_head_dim,
+                    t.linear_value_head_dim,
+                    4,
+                ],
+            };
+            factors.iter().try_fold(1usize, |n, v| {
+                n.checked_mul(*v)
+                    .ok_or_else(|| "Plan extent overflow".into())
+            })
+        };
+        let name = |s: &str| s.replace("{layer}", &layer.to_string());
+        steps
+            .iter()
+            .map(|step| {
+                Ok(match *step {
+                    Step::Kernel(slot) => Operation::Kernel {
+                        name: format!("{program}/{section}/k{slot}"),
+                    },
+                    Step::Copy(source, destination, extent) => Operation::Copy {
+                        source: name(source),
+                        destination: name(destination),
+                        bytes: bytes(extent)?,
+                    },
+                    Step::Zero(destination, extent) => Operation::Zero {
+                        destination: name(destination),
+                        bytes: bytes(extent)?,
+                    },
+                })
+            })
+            .collect()
+    }
+    fn text(&mut self, program: &str, recipe: &Recipe, tokens: usize) -> Result<()> {
+        let mut ops = self.emit(recipe.begin, program, "begin", tokens, 0)?;
+        for (layer, kind) in self.config.qwen3_5().layer_types.iter().enumerate() {
+            let steps = if kind == "linear_attention" {
+                recipe.gdn
+            } else {
+                recipe.attention
+            };
+            ops.extend(self.emit(steps, program, &format!("layer{layer}"), tokens, layer)?);
+        }
+        ops.extend(self.emit(recipe.end, program, "end", tokens, 0)?);
+        self.programs.insert(program.into(), ops);
+        Ok(())
+    }
+}
+
 const CHUNK_LUT4: Recipe = Recipe {
     begin: &[K(0), K(1), Z("R0", Residual)],
     gdn: &[
@@ -211,7 +328,7 @@ pub(super) fn build(
     manifest: &mut Manifest,
     profiles: &[PrefillProfile],
 ) -> Result<std::collections::BTreeSet<String>> {
-    if manifest.vocab != config.text.vocab_size || profiles.is_empty() {
+    if manifest.vocab != config.qwen3_5().vocab_size || profiles.is_empty() {
         return Err("Model vocabulary or prefill profiles differ from configuration".into());
     }
     let mut b = Builder {
@@ -368,7 +485,7 @@ pub(super) fn build(
             ops.extend(b.emit(HEAD, &program, "head", plan.tokens, 0)?);
             b.programs.insert(program, ops);
             let mut ops = vec![];
-            for (layer, kind) in config.text.layer_types.iter().enumerate() {
+            for (layer, kind) in config.qwen3_5().layer_types.iter().enumerate() {
                 if kind == "linear_attention" {
                     ops.extend(b.emit(
                         &[K(0), K(1)],
@@ -408,7 +525,7 @@ pub(super) fn build(
                         && program == &format!("prefill_m{}", p.tokens)
                 });
                 if chunk || program == "prefill" {
-                    for (layer, kind) in config.text.layer_types.iter().enumerate() {
+                    for (layer, kind) in config.qwen3_5().layer_types.iter().enumerate() {
                         if kind == "full_attention" {
                             let gather = format!("{program}/layer{layer}/k4");
                             // The alias prefill uses bindings of its largest profile.
@@ -508,4 +625,62 @@ pub(super) fn build(
         }
     }
     Ok(decode)
+}
+
+pub(super) fn parse_text(text_value: &Value) -> Result<TextConfig> {
+    let text: TextConfig =
+        serde_json::from_value(text_value.clone()).map_err(|e| format!("Text config: {e}"))?;
+    if text.hidden_size == 0
+        || text.vocab_size == 0
+        || text.num_hidden_layers == 0
+        || text.layer_types.len() != text.num_hidden_layers
+        || text
+            .layer_types
+            .iter()
+            .any(|s| !matches!(s.as_str(), "linear_attention" | "full_attention"))
+        || text.linear_num_key_heads == 0
+        || text.linear_num_value_heads == 0
+        || text.linear_key_head_dim == 0
+        || text.linear_value_head_dim == 0
+        || text.linear_conv_kernel_dim < 2
+    {
+        return Err("Invalid Qwen3_5 layer/state configuration".into());
+    }
+    Ok(text)
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::*;
+    fn config() -> Value {
+        serde_json::json!({"model_type":"qwen3_5_text","hidden_size":8,"vocab_size":16,"num_hidden_layers":2,"layer_types":["linear_attention","full_attention"],"linear_num_key_heads":1,"linear_num_value_heads":2,"linear_key_head_dim":2,"linear_value_head_dim":3,"linear_conv_kernel_dim":4})
+    }
+    #[test]
+    fn state_copy_extents_follow_configuration_and_reject_overflow() {
+        let config = Configuration::parse(config()).unwrap();
+        let builder = Builder {
+            config: &config,
+            programs: BTreeMap::new(),
+        };
+        let steps = &[
+            Step::Copy("Ho", "L{layer}_History", Extent::History),
+            Step::Copy("Sout", "L{layer}_State", Extent::State),
+        ];
+        let ops = builder.emit(steps, "prefill_m2", "layer1", 2, 1).unwrap();
+        assert!(
+            matches!(&ops[0], Operation::Copy { destination, bytes:60, .. } if destination=="L1_History")
+        );
+        assert!(matches!(&ops[1], Operation::Copy { bytes: 48, .. }));
+        assert!(
+            builder
+                .emit(
+                    &[Step::Zero("R0", Extent::Residual)],
+                    "overflow",
+                    "begin",
+                    usize::MAX,
+                    0
+                )
+                .is_err()
+        );
+    }
 }

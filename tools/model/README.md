@@ -4,9 +4,9 @@
 
 ## 本机依赖
 
-需要自行准备与模型匹配的checkpoint，并通过构建入口的`--checkpoint`指定路径。投影验证使用`artifacts/experimental-vllm/activations/`中的真实L0输入；运行前需准备这些外部数据，文件名见验证入口。LUT4验证支持`--activations-dir`。
+需要自行准备与模型匹配的checkpoint，并通过构建入口的`--checkpoint`指定HF目录。基线构建器支持asymmetric compressed-tensors W4/group128的Qwen3_5 27B，读取单文件或分片safetensors；其他格式导入不属于此入口。位于仓库外的目录设`ORIN_CHECKPOINT_DIR`进行只读挂载。投影验证使用`artifacts/experimental-vllm/activations/`中的真实L0输入；运行前需准备这些外部数据，文件名见验证入口。LUT4验证支持`--activations-dir`。
 
-GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用本机NVIDIA Docker镜像和GPU锁；镜像名为`lada-orin-tilelang:0.11.0-exp7`，实际TileLang0.1.13/Torch2.9.1/CUDA12.6。镜像及checkpoint不随源码分发。CPU组装入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
+GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用NVIDIA Docker编译镜像和GPU锁；先用`make compiler-image`从公开的固定版本基底构建`orin-llm-compiler:0.1.0`，包含TileLang0.1.13/Torch2.9.1/CUDA12.6。源码提供镜像配方，checkpoint需自行准备，详见[编译环境](../build/README.md)。CPU组装入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
 
 ## 从checkpoint重建
 
@@ -14,7 +14,7 @@ GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用本机NVIDI
 
 ```bash
 bash tools/operators/run.sh tools/model/build.py artifacts/model/rebuild512 \
-  --dense-u4 --prefill-w4a8 --prefill-tokens 512 \
+  --checkpoint /path/to/group128-checkpoint --dense-u4 --prefill-w4a8 --prefill-tokens 512 \
   --w8-expand-mode aligned --prefill-grid-order nfirst \
   --decode-register-mma --decode-register-scope all \
   --decode-state-mode inplace --decode-attention-mode staged \
@@ -98,7 +98,7 @@ python3 tools/model/prepare.py \
 
 已发布的早期greedy MTP模型可离线更新绑定，不改权重payload：`python3 tools/model/upgrade_mtp.py /path/to/prepared-model /path/to/new-model`。工具复用原算子包的视觉embedding和MRoPE导出ABI，添加移位feature index及完整验证logits的绑定，并用Rust加载器验证新目录后原子发布。在线加载器仅接受当前数据契约。
 
-`run.sh MODEL REQUESTS NEW_OUTPUT`运行Rust完整模型并记录机器状态、源代码、二进制身份和报告。`scenarios.py prepare DIR`生成固定场景请求，`scenarios.py score INPUT_DIR REPORT OUTPUT`做任务判分。`score.py`提供同历史概率诊断；这些社区权重对照不替代BF16/FP8质量评估。
+`run.sh MODEL REQUESTS NEW_OUTPUT`运行Rust完整模型并记录机器状态、源代码、二进制身份和报告。`scenarios.py --checkpoint MODEL_DIR prepare DIR`生成固定场景请求，`scenarios.py --checkpoint MODEL_DIR score INPUT_DIR REPORT OUTPUT`做任务判分。`score.py`提供同历史概率诊断；这些社区权重对照不替代BF16/FP8质量评估。
 
 `profile.sh MODEL REQUESTS NEW_OUTPUT`采集Nsight节点trace；`profile_summary.py`校验manifest映射。四输出profile不是正式TPS验收。
 

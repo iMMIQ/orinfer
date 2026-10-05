@@ -8,12 +8,10 @@ import copy
 import hashlib
 import json
 import math
-import os
 import re
-import shutil
-import subprocess
 from pathlib import Path
 
+from tools.model.publication import atomic_model, clone_model, commit_package, load_model
 from tools.operators.abi import evaluate, parse_host
 
 
@@ -115,7 +113,7 @@ def resize(source, destination, context, output, engine, max_prefill=None):
     engine = engine.resolve(strict=True)
     if destination.exists() or destination.is_symlink():
         raise ValueError('Destination must not exist')
-    wrapper = json.loads((source / 'cache/model.json').read_text())
+    wrapper, old_package, package = load_model(source)
     meta = wrapper['metadata']
     if meta.get('kv_cache'):
         raise ValueError('Resize context before optimizing KV; rebuild from the original prepared model')
@@ -125,10 +123,6 @@ def resize(source, destination, context, output, engine, max_prefill=None):
     if context % 128 or not meta['chunk_tokens'] <= context <= config['text_config']['max_position_embeddings']:
         raise ValueError('Context must be page-aligned and within checkpoint capacity')
     old_context = meta['max_context']
-    old_package = source / 'cache/operators' / wrapper['operator_package']
-    package = json.loads((old_package / 'package.json').read_text())
-    if hashlib.sha256((old_package / 'package.json').read_bytes()).hexdigest() != wrapper['operator_package']:
-        raise ValueError('Source operator package digest differs')
     if max_prefill is not None:
         trim_prefill(wrapper, package, max_prefill)
     ring = meta['chunk_tokens']
@@ -141,116 +135,96 @@ def resize(source, destination, context, output, engine, max_prefill=None):
             or rope['rope_type'] != 'default' or rope.get('mrope_interleaved') is not True:
         raise ValueError('Unsupported geometry or RoPE; this resizer targets the 27B operator family')
     pages = context // 128
-    staging = destination.with_name(destination.name + '.staging')
-    if staging.exists() or staging.is_symlink():
-        raise ValueError('Staging directory already exists')
-    staging.mkdir(parents=True)
-    for item in source.iterdir():
-        if item.name != 'cache':
-            shutil.copy2(item, staging / item.name)
-    cache = staging / 'cache'
-    weights = cache / 'weights'
-    weights.mkdir(parents=True)
-    for item in (source / 'cache/weights').glob('*.safetensors'):
-        os.link(item, weights / item.name)
-    for b in meta['buffers']:
-        if b['name'].endswith(('KPages', 'VPages')):
-            b['shape'][0] = pages
-        elif b['name'] == 'Pages':
-            b['shape'][1] = pages
-        elif b['name'] == 'MtpTargetHidden':
-            b['shape'][0] = ring
-        elif b['name'] in {'Rotary', 'FeatureIndex', 'MtpFeatureIndex', 'MRopePositions', 'Kcontig', 'Vcontig'}:
-            b['shape'][0] = context
-    freq = 1.0 / (10000000.0 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
-    angles = torch.arange(context, dtype=torch.float32)[:, None] * freq[None, :]
-    tables = {'Rotary': torch.cat((angles.cos(), angles.sin()), dim=-1).half(),
-              'Pages': torch.arange(pages, dtype=torch.int32).reshape(1, pages)}
-    index = json.loads((source / 'cache/weights/model.safetensors.index.json').read_text())
-    # Preserve original short-position tables bit for bit, even if an older
-    # builder generated them on a different Torch backend.
-    with safe_open(source / 'cache/weights' / index['weight_map']['Rotary'], framework='pt') as shard:
-        old = shard.get_tensor('Rotary')
-        count = min(old.shape[0], context)
-        tables['Rotary'][:count].copy_(old[:count])
-    layouts = {f'orin.layout.{b["name"]}': b['layout'] for b in meta['buffers'] if b['name'] in tables}
-    table_file = f'context-{context}.safetensors'
-    if (weights / table_file).exists():
-        (weights / table_file).unlink()
-    save_file(tables, weights / table_file, metadata=layouts)
-    for b in meta['buffers']:
-        if b['name'] in tables:
-            index['weight_map'][b['name']] = table_file
-            b['data'] = dict(tensor=b['name'], sha256=tensor_sha(tables[b['name']]))
-    index['metadata']['total_size'] = sum(math.prod(b['shape']) *
-        {'i8': 1, 'u8': 1, 'f16': 2, 'f32': 4, 'i32': 4}[b['dtype']]
-        for b in meta['buffers'] if b.get('data'))
-    write_json(weights / 'model.safetensors.index.json', index)
-    package_out = cache / 'operators/staging'
-    package_out.mkdir(parents=True)
-    shutil.copytree(old_package / 'kernels', package_out / 'kernels', copy_function=os.link)
-    for name in ('COPYING', 'LICENSE'):
-        if (old_package / name).exists():
-            shutil.copy2(old_package / name, package_out / name)
-    compiled = {}
-    sections = tuple(config['text_config']['rope_parameters']['mrope_section'])
-    for i, binding in enumerate(package['kernels']):
-        key = recipe(binding)
-        if key is None:
-            continue
-        rows = int(re.search(r'_m(\d+)', binding['name'])[1]) if '_m' in binding['name'] else 1
-        dimensions = dict(rows=rows, batch=1, tokens=context, pages=pages, table_width=pages)
-        old_host = (old_package / binding['host_abi']['file']).read_text()
-        if key == ('gather_kv',):
-            package['kernels'][i] = rebind(binding, old_host, old_host, dimensions)
-            continue
-        if context == old_context and key[0] not in {'capture', 'gather'}:
-            # Their capacity and arithmetic did not change; only scratch
-            # allocations shrink to the remaining existing profile contracts.
-            continue
-        if key not in compiled:
-            print('compile', key, flush=True)
-            kind = key[0]
-            if kind == 'embedding':
-                kernel = embedding_features(meta['vocab'], hidden, context, meta['vision']['max_features'])
-            elif kind == 'prepare':
-                kernel = full_prepare_mrope(pages, context, sections, max_position=context)
-            elif kind == 'capture':
-                kernel = capture_target_hidden(hidden, ring, ring=True)
-            elif kind == 'gather':
-                kernel = gather_target_hidden(key[1], hidden, ring, ring=True)
-            elif kind == 'attention':
-                kernel = paged_attention_partials_gqa_staged(pages, pages, queries=key[1])
-            elif kind == 'prefill':
-                kernel = attention_prefill_staged(1, key[1], context, kv_layout='token_major',
-                                                 block_m=32 if key[1] == 512 else 64)
-            else:
-                raise ValueError(key)
-            exported = output / ('-'.join(map(str, key)))
-            export_kernel(kernel, exported)
-            assets = {}
-            for name, file in [('source', 'kernel.cu'), ('host_abi', 'host.txt'), ('module', 'kernel.cubin')]:
-                data = (exported / file).read_bytes()
-                digest = hashlib.sha256(data).hexdigest()
-                relative = 'kernels/' + digest + Path(file).suffix
-                if not (package_out / relative).exists():
-                    (package_out / relative).write_bytes(data)
-                assets[name] = dict(file=relative, sha256=digest)
-            compiled[key] = (assets, (exported / 'host.txt').read_text())
-        assets, host = compiled[key]
-        updated = rebind(binding, old_host, host, dimensions)
-        updated.update(assets)
-        package['kernels'][i] = updated
-    meta['max_context'] = context
-    meta['mtp']['hidden_ring'] = 'MtpTargetHidden'
-    package['buffer_contracts'] = [{k: v for k, v in b.items() if k != 'data'} for b in meta['buffers']]
-    write_json(package_out / 'package.json', package)
-    digest = hashlib.sha256((package_out / 'package.json').read_bytes()).hexdigest()
-    package_out.rename(package_out.with_name(digest))
-    wrapper['operator_package'] = digest
-    write_json(cache / 'model.json', wrapper)
-    subprocess.run([str(engine), 'validate-model', str(staging)], check=True)
-    staging.rename(destination)
+    with atomic_model(destination, engine, command='validate-model') as staging:
+        package_out = clone_model(source, staging, old_package)
+        cache = staging / 'cache'
+        weights = cache / 'weights'
+        for b in meta['buffers']:
+            if b['name'].endswith(('KPages', 'VPages')):
+                b['shape'][0] = pages
+            elif b['name'] == 'Pages':
+                b['shape'][1] = pages
+            elif b['name'] == 'MtpTargetHidden':
+                b['shape'][0] = ring
+            elif b['name'] in {'Rotary', 'FeatureIndex', 'MtpFeatureIndex', 'MRopePositions', 'Kcontig', 'Vcontig'}:
+                b['shape'][0] = context
+        freq = 1.0 / (10000000.0 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
+        angles = torch.arange(context, dtype=torch.float32)[:, None] * freq[None, :]
+        tables = {'Rotary': torch.cat((angles.cos(), angles.sin()), dim=-1).half(),
+                  'Pages': torch.arange(pages, dtype=torch.int32).reshape(1, pages)}
+        index = json.loads((source / 'cache/weights/model.safetensors.index.json').read_text())
+        # Preserve original short-position tables bit for bit, even if an older
+        # builder generated them on a different Torch backend.
+        with safe_open(source / 'cache/weights' / index['weight_map']['Rotary'], framework='pt') as shard:
+            old = shard.get_tensor('Rotary')
+            count = min(old.shape[0], context)
+            tables['Rotary'][:count].copy_(old[:count])
+        layouts = {f'orin.layout.{b["name"]}': b['layout'] for b in meta['buffers'] if b['name'] in tables}
+        table_file = f'context-{context}.safetensors'
+        if (weights / table_file).exists():
+            (weights / table_file).unlink()
+        save_file(tables, weights / table_file, metadata=layouts)
+        for b in meta['buffers']:
+            if b['name'] in tables:
+                index['weight_map'][b['name']] = table_file
+                b['data'] = dict(tensor=b['name'], sha256=tensor_sha(tables[b['name']]))
+        index['metadata']['total_size'] = sum(math.prod(b['shape']) *
+            {'i8': 1, 'u8': 1, 'f16': 2, 'f32': 4, 'i32': 4}[b['dtype']]
+            for b in meta['buffers'] if b.get('data'))
+        write_json(weights / 'model.safetensors.index.json', index)
+        compiled = {}
+        sections = tuple(config['text_config']['rope_parameters']['mrope_section'])
+        for i, binding in enumerate(package['kernels']):
+            key = recipe(binding)
+            if key is None:
+                continue
+            rows = int(re.search(r'_m(\d+)', binding['name'])[1]) if '_m' in binding['name'] else 1
+            dimensions = dict(rows=rows, batch=1, tokens=context, pages=pages, table_width=pages)
+            old_host = (old_package / binding['host_abi']['file']).read_text()
+            if key == ('gather_kv',):
+                package['kernels'][i] = rebind(binding, old_host, old_host, dimensions)
+                continue
+            if context == old_context and key[0] not in {'capture', 'gather'}:
+                # Their capacity and arithmetic did not change; only scratch
+                # allocations shrink to the remaining existing profile contracts.
+                continue
+            if key not in compiled:
+                print('compile', key, flush=True)
+                kind = key[0]
+                if kind == 'embedding':
+                    kernel = embedding_features(meta['vocab'], hidden, context, meta['vision']['max_features'])
+                elif kind == 'prepare':
+                    kernel = full_prepare_mrope(pages, context, sections, max_position=context)
+                elif kind == 'capture':
+                    kernel = capture_target_hidden(hidden, ring, ring=True)
+                elif kind == 'gather':
+                    kernel = gather_target_hidden(key[1], hidden, ring, ring=True)
+                elif kind == 'attention':
+                    kernel = paged_attention_partials_gqa_staged(pages, pages, queries=key[1])
+                elif kind == 'prefill':
+                    kernel = attention_prefill_staged(1, key[1], context, kv_layout='token_major',
+                                                     block_m=32 if key[1] == 512 else 64)
+                else:
+                    raise ValueError(key)
+                exported = output / ('-'.join(map(str, key)))
+                export_kernel(kernel, exported)
+                assets = {}
+                for name, file in [('source', 'kernel.cu'), ('host_abi', 'host.txt'), ('module', 'kernel.cubin')]:
+                    data = (exported / file).read_bytes()
+                    digest = hashlib.sha256(data).hexdigest()
+                    relative = 'kernels/' + digest + Path(file).suffix
+                    if not (package_out / relative).exists():
+                        (package_out / relative).write_bytes(data)
+                    assets[name] = dict(file=relative, sha256=digest)
+                compiled[key] = (assets, (exported / 'host.txt').read_text())
+            assets, host = compiled[key]
+            updated = rebind(binding, old_host, host, dimensions)
+            updated.update(assets)
+            package['kernels'][i] = updated
+        meta['max_context'] = context
+        meta['mtp']['hidden_ring'] = 'MtpTargetHidden'
+        package['buffer_contracts'] = [{k: v for k, v in b.items() if k != 'data'} for b in meta['buffers']]
+        digest = commit_package(staging, package_out, wrapper, package)
     write_json(output / 'resize.json', dict(source=str(source), model=str(destination),
         previous_context=old_context, max_context=context, hidden_ring_tokens=ring,
         compiled_variants=len(compiled), max_prefill_tokens=meta['chunk_tokens'], operator_package=digest))

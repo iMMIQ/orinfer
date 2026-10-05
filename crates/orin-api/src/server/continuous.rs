@@ -8,6 +8,7 @@ use std::{collections::VecDeque, sync::atomic::AtomicUsize};
 
 #[derive(Default)]
 pub(super) struct Activity {
+    pub lifecycle: Arc<lifecycle::Lifecycle>,
     pub active: AtomicUsize,
     pub queued: AtomicUsize,
     pub statistics: std::sync::Mutex<scheduler::Statistics>,
@@ -40,6 +41,7 @@ struct Mailbox {
     pending: VecDeque<(ModelEvent, usize)>,
     bytes: usize,
     failed: bool,
+    progress: Instant,
 }
 impl Mailbox {
     fn new(job: Job) -> Self {
@@ -48,12 +50,27 @@ impl Mailbox {
             pending: VecDeque::new(),
             bytes: 0,
             failed: false,
+            progress: Instant::now(),
         }
     }
     fn flush(&mut self) -> bool {
+        if !self.pending.is_empty()
+            && self.progress.elapsed().as_millis() >= self.job.limits.output_ms as u128
+        {
+            self.failed = true;
+            self.pending.clear();
+            let _ = self
+                .job
+                .events
+                .try_send(ModelEvent::Failed("Client output deadline exceeded".into()));
+            return false;
+        }
         while let Some((event, size)) = self.pending.pop_front() {
             match self.job.events.try_send(event) {
-                Ok(()) => self.bytes -= size,
+                Ok(()) => {
+                    self.bytes -= size;
+                    self.progress = Instant::now();
+                }
                 Err(mpsc::error::TrySendError::Full(event)) => {
                     self.pending.push_front((event, size));
                     break;
@@ -83,6 +100,9 @@ impl Mailbox {
                 .push_back((ModelEvent::Failed("Client output buffer is full".into()), 0));
             return false;
         }
+        if self.pending.is_empty() {
+            self.progress = Instant::now();
+        }
         self.pending.push_back((event, size));
         self.bytes += size;
         self.flush()
@@ -91,16 +111,24 @@ impl Mailbox {
         self.send(ModelEvent::Chunk(chunk(&self.job, model, delta, None)))
     }
 }
+enum Ending {
+    Eos,
+    Stop,
+    Cancelled,
+    Failed(String),
+}
+impl Ending {
+    fn cacheable(&self) -> bool {
+        matches!(self, Self::Eos | Self::Stop)
+    }
+}
 struct Active<'a> {
     request: RequestState,
     mailbox: Mailbox,
     parser: output::Output,
     decoder: Decoder<'a>,
     count: usize,
-    eos: bool,
-    stopped: bool,
-    cancelled: bool,
-    error: Option<String>,
+    ending: Option<Ending>,
     started: Instant,
     queue_s: f64,
 }
@@ -119,10 +147,7 @@ impl<'a> Active<'a> {
             parser,
             decoder: codec.tokenizer.decode_stream(false),
             count: 0,
-            eos: false,
-            stopped: false,
-            cancelled: false,
-            error: None,
+            ending: None,
             started: Instant::now(),
             queue_s,
         }
@@ -130,13 +155,12 @@ impl<'a> Active<'a> {
     fn consume(&mut self, tokens: &[u32], codec: &ChatCodec, model: &str) {
         for &token in tokens {
             if self.mailbox.job.events.is_closed() || self.mailbox.failed {
-                self.cancelled = true;
+                self.ending = Some(Ending::Cancelled);
                 break;
             }
             self.count += 1;
             if codec.eos.contains(&token) {
-                self.eos = true;
-                self.stopped = true;
+                self.ending = Some(Ending::Eos);
                 break;
             }
             let parsed = self
@@ -148,34 +172,35 @@ impl<'a> Active<'a> {
                 Ok(deltas) => {
                     for delta in deltas {
                         if !self.mailbox.delta(model, delta) {
-                            self.cancelled = true;
+                            self.ending = Some(Ending::Cancelled);
                             break;
                         }
                     }
                 }
                 Err(error) => {
-                    self.error = Some(error);
+                    self.ending = Some(Ending::Failed(error));
                     break;
                 }
             }
+            if self.ending.is_some() {
+                break;
+            }
             if self.parser.stopped {
-                self.stopped = true;
+                self.ending = Some(Ending::Stop);
                 break;
             }
         }
     }
     fn finished(&self) -> bool {
-        self.request.is_finished() || self.stopped || self.cancelled || self.error.is_some()
+        self.request.is_finished() || self.ending.is_some()
     }
     fn finish(&mut self, model: &str) -> Result<()> {
-        if self.cancelled {
-            return Ok(());
+        match &self.ending {
+            Some(Ending::Cancelled) => return Ok(()),
+            Some(Ending::Failed(error)) => return Err(error.clone()),
+            _ => {}
         }
-        if let Some(error) = self.error.take() {
-            return Err(error);
-        }
-        let exhausted =
-            !self.eos && !self.parser.stopped && self.count == self.mailbox.job.prepared.max_tokens;
+        let exhausted = self.ending.is_none() && self.count == self.mailbox.job.prepared.max_tokens;
         for delta in self.parser.finish(
             exhausted,
             &self.mailbox.job.prepared.tool_choice,
@@ -233,26 +258,34 @@ pub(super) fn worker(
     options: scheduler::Options,
     activity: &Activity,
 ) {
+    let lifecycle = &activity.lifecycle;
     let mut waiting: Vec<Job> = vec![];
     let mut active: Vec<Active<'_>> = vec![];
     let mut completed: Vec<Mailbox> = vec![];
     let mut admission_costs = scheduler::AdmissionCosts::default();
     loop {
+        if shutdown.load(Ordering::Relaxed) || !lifecycle.is_ready() {
+            break;
+        }
         completed.retain_mut(|box_| box_.flush() && !box_.pending.is_empty());
         receive_waiting(&mut waiting, &mut jobs);
         for a in &mut active {
             if !a.mailbox.flush() || a.mailbox.failed || shutdown.load(Ordering::Relaxed) {
-                a.cancelled = true;
+                a.ending = Some(Ending::Cancelled);
             }
         }
         let mut index = 0;
         while index < active.len() {
             if active[index].finished() {
                 let mut a = active.remove(index);
-                let cache =
-                    !a.cancelled && a.error.is_none() && a.count == a.request.generated_tokens();
-                if let Err(error) = model.finish_request(&mut a.request, cache) {
-                    eprintln!("{}: cleanup {error}", a.mailbox.job.id);
+                let cache = a.ending.as_ref().is_none_or(Ending::cacheable)
+                    && a.count == a.request.generated_tokens();
+                if lifecycle.is_ready()
+                    && let Err(error) = model.finish_request(&mut a.request, cache)
+                {
+                    let failure = orin_engine::error::EngineError::take(error.clone(), true);
+                    lifecycle.fail(failure);
+                    a.ending = Some(Ending::Failed(error));
                 }
                 if let Err(error) = a.finish(model_id) {
                     a.mailbox.send(ModelEvent::Failed(error));
@@ -262,7 +295,7 @@ pub(super) fn worker(
                 index += 1;
             }
         }
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.load(Ordering::Relaxed) || !lifecycle.is_ready() {
             break;
         }
         let admission = Instant::now();
@@ -277,7 +310,7 @@ pub(super) fn worker(
         let mut admitted_count = 0;
         let mut cached_count = 0;
         let mut cold_deferrals = 0;
-        while active.len() < options.max_active && !waiting.is_empty() {
+        while lifecycle.is_ready() && active.len() < options.max_active && !waiting.is_empty() {
             let costs: Vec<_> = waiting
                 .iter()
                 .map(|job| {
@@ -336,6 +369,11 @@ pub(super) fn worker(
                                 active.push(a);
                             }
                             Err(error) => {
+                                let failure =
+                                    orin_engine::error::EngineError::take(error.clone(), false);
+                                if failure.is_fatal() {
+                                    lifecycle.fail(failure);
+                                }
                                 let mut mailbox = Mailbox::new(job);
                                 mailbox.send(ModelEvent::Failed(error));
                                 completed.push(mailbox);
@@ -345,6 +383,10 @@ pub(super) fn worker(
                         break;
                     }
                     Err(error) => {
+                        let failure = orin_engine::error::EngineError::take(error.clone(), false);
+                        if failure.is_fatal() {
+                            lifecycle.fail(failure);
+                        }
                         let job = waiting.remove(i);
                         let mut mailbox = Mailbox::new(job);
                         mailbox.send(ModelEvent::Failed(error));
@@ -395,6 +437,9 @@ pub(super) fn worker(
         activity
             .queued
             .store(waiting.len() + jobs.len(), Ordering::Relaxed);
+        if !lifecycle.is_ready() {
+            break;
+        }
         if !active.is_empty() {
             let before = model.scheduler_statistics();
             let step_at = Instant::now();
@@ -407,8 +452,9 @@ pub(super) fn worker(
                     }
                 }
                 Err(error) => {
+                    lifecycle.fail(orin_engine::error::EngineError::take(error.clone(), true));
                     for a in &mut active {
-                        a.error = Some(error.clone());
+                        a.ending = Some(Ending::Failed(error.clone()));
                     }
                 }
             }
@@ -431,6 +477,30 @@ pub(super) fn worker(
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
+    jobs.close();
+    for job in waiting
+        .drain(..)
+        .chain(std::iter::from_fn(|| jobs.try_recv().ok()))
+    {
+        let _ = job
+            .events
+            .try_send(ModelEvent::Failed("GPU worker stopped".into()));
+    }
+    for mut a in active.drain(..) {
+        if lifecycle.name() != "failed"
+            && let Err(error) = model.finish_request(&mut a.request, false)
+        {
+            lifecycle.fail(orin_engine::error::EngineError::take(error, true));
+        }
+        let _ = a
+            .mailbox
+            .job
+            .events
+            .try_send(ModelEvent::Failed("GPU worker stopped".into()));
+    }
+    for mailbox in &mut completed {
+        mailbox.flush();
+    }
     activity.active.store(0, Ordering::Relaxed);
     activity.queued.store(0, Ordering::Relaxed);
     if let Ok(stats) = serde_json::to_string(&model.scheduler_statistics()) {
@@ -445,7 +515,17 @@ fn receive_waiting(waiting: &mut Vec<Job>, jobs: &mut mpsc::Receiver<Job>) {
             Err(_) => break,
         }
     }
-    waiting.retain(|job| !job.events.is_closed());
+    waiting.retain(|job| {
+        if job.limits.queue_ms != 0
+            && job.queued.elapsed().as_millis() >= job.limits.queue_ms as u128
+        {
+            let _ = job
+                .events
+                .try_send(ModelEvent::Failed("Request queue deadline exceeded".into()));
+            return false;
+        }
+        !job.events.is_closed()
+    });
 }
 
 #[cfg(test)]
@@ -454,9 +534,13 @@ mod tests {
     fn mailbox() -> (Mailbox, mpsc::Receiver<ModelEvent>) {
         let (events, receiver) = mpsc::channel(1);
         let job = Job {
-            _slot: Arc::new(tokio::sync::Semaphore::new(1))
-                .try_acquire_owned()
-                .unwrap(),
+            _slot: Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
+            ),
+            _memory: None,
+            limits: Limits::default(),
             prepared: Prepared {
                 input: vec![1],
                 images: vec![],
@@ -479,6 +563,17 @@ mod tests {
         (Mailbox::new(job), receiver)
     }
 
+    #[test]
+    fn long_prefill_does_not_start_the_slow_reader_deadline_early() {
+        let (mut mailbox, _receiver) = mailbox();
+        mailbox.progress = Instant::now() - std::time::Duration::from_secs(120);
+        assert!(mailbox.send(ModelEvent::Chunk(json!(1))));
+        assert!(!mailbox.failed);
+        assert!(mailbox.send(ModelEvent::Chunk(json!(2))));
+        mailbox.progress = Instant::now() - std::time::Duration::from_secs(120);
+        assert!(!mailbox.flush());
+        assert!(mailbox.failed);
+    }
     #[test]
     fn admission_collects_arrivals_and_discards_disconnected_waiters() {
         let (sender, mut jobs) = mpsc::channel(4);

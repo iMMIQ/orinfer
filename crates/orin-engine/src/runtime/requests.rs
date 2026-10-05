@@ -22,6 +22,7 @@ pub struct GenerationInput {
 
 pub struct RequestState {
     owner: u64,
+    abandoned: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     slot: usize,
     input: Vec<u32>,
     history: Vec<u32>,
@@ -33,19 +34,28 @@ pub struct RequestState {
     media: Media,
     warm: super::speculation::PrefillWarm,
     checkpoints: BTreeSet<usize>,
-    prefix_kv: Vec<crate::cuda::snapshot::Piece>,
-    prefix: crate::prefix::Statistics,
+    prefix: super::prefix::Context,
     mtp: crate::mtp::Statistics,
     generated: usize,
     served: usize,
     mtp_blocked: bool,
+}
+impl Drop for RequestState {
+    fn drop(&mut self) {
+        if !self.released
+            && let Ok(mut abandoned) = self.abandoned.lock()
+        {
+            abandoned.push(self.slot);
+        }
+    }
 }
 impl RequestState {
     pub fn generated_tokens(&self) -> usize {
         self.generated
     }
     pub fn computed_prompt_tokens(&self) -> usize {
-        self.offset.saturating_sub(self.prefix.cached_tokens)
+        self.offset
+            .saturating_sub(self.prefix.statistics.cached_tokens)
     }
     pub fn is_prefilling(&self) -> bool {
         self.prefilling
@@ -54,7 +64,7 @@ impl RequestState {
         self.generated == self.limit || self.released
     }
     pub fn prefix_statistics(&self) -> &crate::prefix::Statistics {
-        &self.prefix
+        &self.prefix.statistics
     }
     pub fn speculation_statistics(&self) -> &crate::mtp::Statistics {
         &self.mtp
@@ -67,7 +77,41 @@ pub struct StepOutput {
     pub tokens: Vec<u32>,
 }
 
+enum Work {
+    Speculative(usize),
+    Prefill(usize),
+    Batch(Vec<(usize, usize)>),
+    Idle,
+}
+
+pub(super) struct Reservation {
+    kv_bytes: usize,
+    context: usize,
+}
+
 impl ModelRuntime {
+    pub(super) fn reap_abandoned(&mut self) -> Result<()> {
+        let slots = std::mem::take(
+            &mut *self
+                .abandoned
+                .lock()
+                .map_err(|_| "Abandoned arena queue poisoned")?,
+        );
+        for (index, &slot) in slots.iter().enumerate() {
+            if let Err(error) = self
+                .execution
+                .release_sequence(slot, &self.manifest.reset_buffers)
+            {
+                self.abandoned
+                    .lock()
+                    .map_err(|_| "Abandoned arena queue poisoned")?
+                    .extend_from_slice(&slots[index..]);
+                return Err(error);
+            }
+            self.reserved_requests.remove(&slot);
+        }
+        self.execution.collect_snapshots()
+    }
     fn validate_generation(&self, input: &GenerationInput) -> Result<usize> {
         let context = input
             .input_tokens
@@ -144,6 +188,7 @@ impl ModelRuntime {
         input: &GenerationInput,
         options: &scheduler::Options,
     ) -> Result<bool> {
+        self.reap_abandoned()?;
         options.validate()?;
         if self.reserved_requests.len() >= options.max_active {
             return Ok(false);
@@ -156,6 +201,7 @@ impl ModelRuntime {
         let future = self
             .reserved_requests
             .values()
+            .map(|r| r.kv_bytes)
             .sum::<usize>()
             .saturating_sub(self.execution.resident_kv_bytes());
         let needed = fixed
@@ -198,7 +244,13 @@ impl ModelRuntime {
     }
     fn pending_workspace(&self, context: usize) -> Result<usize> {
         self.execution.pending_prefill_workspace_bytes(
-            context.max(self.reserved_contexts.values().copied().max().unwrap_or(0)),
+            context.max(
+                self.reserved_requests
+                    .values()
+                    .map(|r| r.context)
+                    .max()
+                    .unwrap_or(0),
+            ),
         )
     }
     fn trim_request_cache(
@@ -210,6 +262,7 @@ impl ModelRuntime {
         let future = self
             .reserved_requests
             .values()
+            .map(|r| r.kv_bytes)
             .sum::<usize>()
             .saturating_sub(self.execution.resident_kv_bytes())
             .checked_add(self.pending_workspace(context)?)
@@ -236,6 +289,7 @@ impl ModelRuntime {
         input: GenerationInput,
         cancelled: &impl Fn() -> bool,
     ) -> Result<RequestState> {
+        self.reap_abandoned()?;
         let started = Instant::now();
         if self.manifest.batch_profiles.is_empty() {
             return Err(
@@ -251,7 +305,9 @@ impl ModelRuntime {
                 .reset_sequence(&self.manifest.reset_buffers)?;
             self.prepare_visual_capacity(&input.input_tokens, &input.images, context, cancelled)?;
             let media = self.prefix_media(&input.input_tokens, &input.images)?;
-            let (offset, mut warm) = self.restore_prefix(&input.input_tokens, &media)?;
+            let mut prefix = super::prefix::Context::default();
+            let (offset, mut warm) =
+                self.restore_prefix(&input.input_tokens, &media, &mut prefix)?;
             if offset > 0
                 && offset < input.input_tokens.len()
                 && let Some(spec) = self.manifest.mtp.clone()
@@ -276,7 +332,7 @@ impl ModelRuntime {
                 for hint in input
                     .prefix_hints
                     .into_iter()
-                    .chain(std::iter::once(self.prefix_statistics.matched_tokens))
+                    .chain(std::iter::once(prefix.statistics.matched_tokens))
                 {
                     if hint > offset
                         && hint < input.input_tokens.len()
@@ -291,15 +347,20 @@ impl ModelRuntime {
                     }
                 }
             }
-            self.reserved_requests
-                .insert(slot, self.execution.reserved_kv_bytes(context)?);
-            self.reserved_contexts.insert(slot, context);
+            self.reserved_requests.insert(
+                slot,
+                Reservation {
+                    kv_bytes: self.execution.reserved_kv_bytes(context)?,
+                    context,
+                },
+            );
             self.scheduler_statistics.peak_active = self
                 .scheduler_statistics
                 .peak_active
                 .max(self.reserved_requests.len());
             Ok(RequestState {
                 owner: self.owner_id,
+                abandoned: std::sync::Arc::clone(&self.abandoned),
                 slot,
                 history: input.input_tokens.clone(),
                 input: input.input_tokens,
@@ -311,8 +372,7 @@ impl ModelRuntime {
                 media,
                 warm,
                 checkpoints,
-                prefix_kv: std::mem::take(&mut self.prefix_kv),
-                prefix: std::mem::take(&mut self.prefix_statistics),
+                prefix,
                 mtp: Default::default(),
                 generated: 0,
                 served: 0,
@@ -321,15 +381,13 @@ impl ModelRuntime {
         })();
         if result.is_err() {
             self.reserved_requests.remove(&slot);
-            self.reserved_contexts.remove(&slot);
             self.execution
                 .release_sequence(slot, &self.manifest.reset_buffers)?;
-            self.prefix_kv.clear();
         }
         self.scheduler_statistics.request_start_s += started.elapsed().as_secs_f64();
         if let Ok(request) = &result {
             self.scheduler_statistics.admissions += 1;
-            self.scheduler_statistics.prefix_restore_s += request.prefix.restore_s;
+            self.scheduler_statistics.prefix_restore_s += request.prefix.statistics.restore_s;
         }
         result
     }
@@ -342,12 +400,7 @@ impl ModelRuntime {
             return Err("Request does not own a live arena in this model".into());
         }
         self.execution.activate_sequence(req.slot)?;
-        std::mem::swap(&mut self.prefix_kv, &mut req.prefix_kv);
-        std::mem::swap(&mut self.prefix_statistics, &mut req.prefix);
-        let result = run(self, req);
-        std::mem::swap(&mut self.prefix_kv, &mut req.prefix_kv);
-        std::mem::swap(&mut self.prefix_statistics, &mut req.prefix);
-        result
+        run(self, req)
     }
     fn prefill_boundary(req: &RequestState) -> usize {
         req.checkpoints
@@ -382,7 +435,13 @@ impl ModelRuntime {
             req.warm.seconds += at.elapsed().as_secs_f64();
         }
         if checkpoint {
-            self.store_prefix(&req.input[..req.offset], &req.media, req.warm.tokens, true)?;
+            self.store_prefix(
+                &req.input[..req.offset],
+                &req.media,
+                req.warm.tokens,
+                true,
+                &mut req.prefix,
+            )?;
             // Bridge only after saving the prefix-consistent P-1 draft state.
             // This consumes h[P-1] before the next target block can overwrite
             // its slot in the bounded hidden ring.
@@ -417,7 +476,13 @@ impl ModelRuntime {
                 req.warm.tokens = req.input.len() - 1;
             }
         }
-        self.store_prefix(&req.input, &req.media, req.warm.tokens, true)?;
+        self.store_prefix(
+            &req.input,
+            &req.media,
+            req.warm.tokens,
+            true,
+            &mut req.prefix,
+        )?;
         let pending = self.select_target(&req.history, &req.sampling, req.generated)?;
         self.upload_ids(&self.manifest.token, &[pending])?;
         req.history.push(pending);
@@ -577,6 +642,7 @@ impl ModelRuntime {
     ) -> Result<Vec<StepOutput>> {
         #[cfg(test)]
         profile::mark("entry");
+        self.reap_abandoned()?;
         options.validate()?;
         for r in requests.iter() {
             if r.owner != self.owner_id || r.released {
@@ -600,6 +666,43 @@ impl ModelRuntime {
             }
         }
         self.scheduler_statistics.prefill_completion_s += completion_at.elapsed().as_secs_f64();
+        match self.select_work(requests, options, &initialized)? {
+            Work::Speculative(i) => {
+                let began = Instant::now();
+                let tokens = self.with_request(requests[i], |model, req| {
+                    model.speculative_request_step(req, options.max_batch_tokens)
+                })?;
+                let per_token = began.elapsed().as_secs_f64() / tokens.len().max(1) as f64;
+                self.mtp_seconds_per_token = self.mtp_seconds_per_token * 0.8 + per_token * 0.2;
+                self.scheduler_statistics.speculative_iterations += 1;
+                self.scheduler_statistics.decode_tokens += tokens.len();
+                output.push(StepOutput { request: i, tokens });
+                *self
+                    .scheduler_statistics
+                    .batch_histogram
+                    .entry(1)
+                    .or_default() += 1;
+            }
+            Work::Prefill(i) => {
+                let (_, tokens) =
+                    self.with_request(requests[i], |model, req| model.advance_prefill(req))?;
+                requests[i].served = self.scheduler_statistics.iterations;
+                if !tokens.is_empty() {
+                    output.push(StepOutput { request: i, tokens });
+                }
+            }
+            Work::Batch(selected) => self.execute_selected(requests, &selected, &mut output)?,
+            Work::Idle => {}
+        }
+        self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
+        Ok(output)
+    }
+    fn select_work(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        options: &scheduler::Options,
+        initialized: &BTreeSet<usize>,
+    ) -> Result<Work> {
         let mut prefills: Vec<_> = requests
             .iter()
             .enumerate()
@@ -626,22 +729,7 @@ impl ModelRuntime {
         if prefer_mtp {
             let i = decode[self.scheduler_cursor % decode.len()];
             self.scheduler_cursor = self.scheduler_cursor.wrapping_add(1);
-            let began = Instant::now();
-            let tokens = self.with_request(requests[i], |model, req| {
-                model.speculative_request_step(req, options.max_batch_tokens)
-            })?;
-            let per_token = began.elapsed().as_secs_f64() / tokens.len().max(1) as f64;
-            self.mtp_seconds_per_token = self.mtp_seconds_per_token * 0.8 + per_token * 0.2;
-            self.scheduler_statistics.speculative_iterations += 1;
-            self.scheduler_statistics.decode_tokens += tokens.len();
-            output.push(StepOutput { request: i, tokens });
-            *self
-                .scheduler_statistics
-                .batch_histogram
-                .entry(1)
-                .or_default() += 1;
-            self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
-            return Ok(output);
+            return Ok(Work::Speculative(i));
         }
         let mut cap = options.max_batch_tokens.min(
             *self
@@ -675,16 +763,7 @@ impl ModelRuntime {
                     .iter()
                     .all(|&i| Self::prefill_boundary(requests[i]) - requests[i].offset <= cap));
         if decode.is_empty() && !joint_prefill {
-            if let Some(i) = prefill {
-                let (_, tokens) =
-                    self.with_request(requests[i], |model, req| model.advance_prefill(req))?;
-                requests[i].served = self.scheduler_statistics.iterations;
-                if !tokens.is_empty() {
-                    output.push(StepOutput { request: i, tokens });
-                }
-            }
-            self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
-            return Ok(output);
+            return Ok(prefill.map(Work::Prefill).unwrap_or(Work::Idle));
         }
         if !decode.is_empty() {
             let rotate = self.scheduler_cursor % decode.len();
@@ -715,11 +794,19 @@ impl ModelRuntime {
             }
         }
         if selected.is_empty() {
-            return Ok(output);
+            return Ok(Work::Idle);
         }
         // Membership selection above provides fairness. Canonical execution
         // order reuses the same graph when the API's active vector is reordered.
         selected.sort_unstable_by_key(|(i, _)| requests[*i].slot);
+        Ok(Work::Batch(selected))
+    }
+    fn execute_selected(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        selected: &[(usize, usize)],
+        output: &mut Vec<StepOutput>,
+    ) -> Result<()> {
         if selected.len() == 1 && selected[0].1 == 1 {
             let i = selected[0].0;
             let tokens = self.with_request(requests[i], |model, req| {
@@ -754,50 +841,12 @@ impl ModelRuntime {
                 .batch_histogram
                 .entry(1)
                 .or_default() += 1;
-            self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
-            return Ok(output);
+            return Ok(());
         }
-        let segments: Vec<_> = selected
-            .iter()
-            .map(|&(i, tokens)| BatchSegment {
-                slot: requests[i].slot,
-                tokens,
-            })
-            .collect();
         #[cfg(test)]
         profile::mark("policy");
         let inputs_at = Instant::now();
-        for &(i, chunk) in &selected {
-            let req = &mut requests[i];
-            self.execution.activate_sequence(req.slot)?;
-            if req.prefilling {
-                self.upload_ids(
-                    if chunk == 1 {
-                        &self.manifest.token
-                    } else {
-                        &self.manifest.input
-                    },
-                    &req.input[req.offset..req.offset + chunk],
-                )?;
-            }
-            self.upload_ids("BatchSegmentLength", &[chunk as u32])?;
-            self.upload_ids("BatchLastIndex", &[(chunk - 1) as u32])?;
-            let program = if chunk == 1 {
-                "decode".into()
-            } else {
-                format!("prefill_m{chunk}")
-            };
-            self.execution.ensure_sequence_program(req.slot, &program)?;
-        }
-        if self.manifest.batch_gdn
-            && segments.iter().map(|s| s.tokens).sum::<usize>() <= 128
-            && segments.iter().any(|s| s.tokens == 1)
-        {
-            self.execution.upload_sequence_addresses(
-                "BatchGdnPointers",
-                &crate::architecture::batch_state_bindings(&self.manifest, &segments),
-            )?;
-        }
+        let segments = self.prepare_batch_inputs(requests, selected)?;
         #[cfg(test)]
         profile::mark("inputs");
         self.scheduler_statistics.batch_inputs_s += inputs_at.elapsed().as_secs_f64();
@@ -812,7 +861,7 @@ impl ModelRuntime {
         #[cfg(test)]
         profile::mark("plan");
         self.scheduler_statistics.batch_plan_s += plan_at.elapsed().as_secs_f64();
-        let key = Self::iteration_key(requests, &selected);
+        let key = Self::iteration_key(requests, selected);
         let compute_at = Instant::now();
         self.execution
             .execute_batch(graph_key, &plan, decode_only)?;
@@ -841,7 +890,64 @@ impl ModelRuntime {
                 .entry(count)
                 .or_default() += 1;
         }
-        for &(i, chunk) in &selected {
+        self.commit_batch(requests, selected, output)?;
+        self.scheduler_statistics.batch_commit_s += commit_at.elapsed().as_secs_f64();
+        #[cfg(test)]
+        profile::mark("commit");
+        Ok(())
+    }
+    fn prepare_batch_inputs(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        selected: &[(usize, usize)],
+    ) -> Result<Vec<BatchSegment>> {
+        let segments: Vec<_> = selected
+            .iter()
+            .map(|&(i, tokens)| BatchSegment {
+                slot: requests[i].slot,
+                tokens,
+            })
+            .collect();
+        for &(i, chunk) in selected {
+            let req = &mut requests[i];
+            self.execution.activate_sequence(req.slot)?;
+            if req.prefilling {
+                self.upload_ids(
+                    if chunk == 1 {
+                        &self.manifest.token
+                    } else {
+                        &self.manifest.input
+                    },
+                    &req.input[req.offset..req.offset + chunk],
+                )?;
+            }
+            self.upload_ids("BatchSegmentLength", &[chunk as u32])?;
+            self.upload_ids("BatchLastIndex", &[(chunk - 1) as u32])?;
+            let program = if chunk == 1 {
+                "decode".into()
+            } else {
+                format!("prefill_m{chunk}")
+            };
+            self.execution.ensure_sequence_program(req.slot, &program)?;
+        }
+        if self.manifest.batch_gdn
+            && segments.iter().map(|s| s.tokens).sum::<usize>() <= 128
+            && segments.iter().any(|s| s.tokens == 1)
+        {
+            self.execution.upload_sequence_addresses(
+                "BatchGdnPointers",
+                &crate::architecture::batch_state_bindings(&self.manifest, &segments)?,
+            )?;
+        }
+        Ok(segments)
+    }
+    fn commit_batch(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        selected: &[(usize, usize)],
+        output: &mut Vec<StepOutput>,
+    ) -> Result<()> {
+        for &(i, chunk) in selected {
             let tokens = self.with_request(requests[i], |model, req| {
                 if req.prefilling {
                     model.scheduler_statistics.prefill_tokens += chunk;
@@ -855,11 +961,7 @@ impl ModelRuntime {
                 output.push(StepOutput { request: i, tokens });
             }
         }
-        self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
-        self.scheduler_statistics.batch_commit_s += commit_at.elapsed().as_secs_f64();
-        #[cfg(test)]
-        profile::mark("commit");
-        Ok(output)
+        Ok(())
     }
     fn commit_ordinary_token(&mut self, req: &mut RequestState) -> Result<Vec<u32>> {
         let position = self.read_control(&self.manifest.position)? as usize;
@@ -881,19 +983,22 @@ impl ModelRuntime {
             if cache && !req.prefilling && model.prefix_cache.budget != 0 {
                 let consistent = model.refresh_request_mtp(req, false)?;
                 if consistent {
-                    model.store_decoded_prefix(&req.history, &req.media, &|| false)?;
+                    model.store_decoded_prefix(
+                        &req.history,
+                        &req.media,
+                        &|| false,
+                        &mut req.prefix,
+                    )?;
                 }
             }
             Ok(())
         });
-        req.prefix_kv.clear();
+        self.execution
+            .release_sequence(req.slot, &self.manifest.reset_buffers)?;
+        req.prefix.kv.clear();
         self.reserved_requests.remove(&req.slot);
-        self.reserved_contexts.remove(&req.slot);
-        let released = self
-            .execution
-            .release_sequence(req.slot, &self.manifest.reset_buffers);
         req.released = true;
         self.execution.collect_snapshots()?;
-        stored.and(released)
+        stored
     }
 }

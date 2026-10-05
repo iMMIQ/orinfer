@@ -1,7 +1,7 @@
-.PHONY: check build info
+.PHONY: check build info compiler-image check-offline check-gpu
 
 build:
-	cargo build --release --offline
+	cargo build --release --locked --offline
 
 check:
 	cargo fmt --all -- --check
@@ -12,8 +12,17 @@ check:
 	python3 -m unittest discover -s tools/bench -p 'test_*.py' -v
 	python3 -m unittest discover -s tools/operators -p 'test_abi.py' -v
 	python3 -m unittest discover -s tools/vision -p 'test_*.py' -v
-	python3 -m unittest tools.model.test_prepare tools.model.test_package tools.model.test_resize_context tools.model.test_optimize_kv tools.model.test_stage_kv_prefill tools.model.test_upgrade_batching tools.model.test_upgrade_dynamic_batch -v
+	python3 -m unittest tools.model.test_prepare tools.model.test_package tools.model.test_publication tools.model.test_resize_context tools.model.test_optimize_kv tools.model.test_stage_kv_prefill tools.model.test_upgrade_batching tools.model.test_upgrade_dynamic_batch tools.model.test_checkpoint tools.release.test_package -v
 	python3 tools/bench/validate_plan.py
 
 info:
 	cargo run --offline -p orin-cli -- info
+
+compiler-image:
+	docker build -t orin-llm-compiler:0.1.0 -f tools/build/compiler.Dockerfile .
+
+check-offline:
+	docker run --rm --runtime runc -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint python3 orin-llm-compiler:0.1.0 -m unittest tools.model.test_mtp_weights -v
+
+check-gpu:
+	python3 tools/bench/check_gpu.py --model "$(MODEL)" --output "$(OUTPUT)"

@@ -234,7 +234,7 @@ fn validate_mtp_partial_prefix() {
             "Checkpoint consumed its continuation token"
         );
         let mut restored = model.start_request(input(&branch, 16), &|| false).unwrap();
-        assert_eq!(restored.prefix.cached_tokens, checkpoint);
+        assert_eq!(restored.prefix.statistics.cached_tokens, checkpoint);
         assert_eq!(restored.warm.tokens, checkpoint);
         let mut actual = vec![];
         while !restored.is_finished() {
@@ -279,7 +279,7 @@ fn validate_mtp_partial_prefix() {
                 "Restored committed KV differs: {name}"
             );
         }
-        let restore_s = restored.prefix.restore_s;
+        let restore_s = restored.prefix.statistics.restore_s;
         model.finish_request(&mut restored, true).unwrap();
         rows.push(json!({"partial_prefix_tokens":checkpoint,
             "checkpoint_mtp_tokens":checkpoint-1,"prompt_tokens":source.input_tokens.len(),
@@ -394,7 +394,7 @@ fn validate_joint_prefill_requests() {
         for i in 0..count {
             let source = &fixture.cases[i % fixture.cases.len()];
             model
-                .generate(
+                .generate_reference(
                     &source.input_tokens,
                     Some(&source.images),
                     1,
@@ -484,14 +484,47 @@ fn validate_continuous_requests() {
     )
     .unwrap();
     let options = scheduler::Options::default();
-    let mut rows = vec![];
+    let orphan = model
+        .start_request(input(&fixture.cases[0], 8), &|| false)
+        .unwrap();
+    let orphan_slot = orphan.slot;
+    drop(orphan);
+    let mut replacement = model
+        .start_request(input(&fixture.cases[0], 8), &|| false)
+        .unwrap();
+    assert_eq!(
+        replacement.slot, orphan_slot,
+        "Dropped requests must be reaped before arena reuse"
+    );
+    assert_eq!(model.reserved_requests.len(), 1);
+    model.finish_request(&mut replacement, false).unwrap();
+    let mut delivered = vec![];
+    let count = model
+        .generate(
+            &fixture.cases[0].input_tokens,
+            None,
+            8,
+            &Default::default(),
+            || false,
+            |token| {
+                delivered.push(token);
+                false
+            },
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(delivered.len(), 1);
+    assert!(model.reserved_requests.is_empty());
+    let mut rows = vec![
+        json!({"abandoned_request_reaped":true,"production_generation_early_stop_released":true}),
+    ];
     for count in [2, 3, 4, 5, 7, 8, 9, 15, 31] {
         let mut reference = Vec::new();
         for i in 0..count {
             let source = &fixture.cases[i % fixture.cases.len()];
             let mut tokens = vec![];
             model
-                .generate(
+                .generate_reference(
                     &source.input_tokens,
                     Some(&source.images),
                     16,
@@ -603,7 +636,6 @@ fn validate_continuous_requests() {
         model.finish_request(request, false).unwrap();
     }
     assert!(model.reserved_requests.is_empty());
-    assert!(model.reserved_contexts.is_empty());
     assert_eq!(model.execution.resident_kv_bytes(), 0);
     rows.push(json!({"short_request_arenas":32,"reservation_cleanup":true}));
     // Cold mixed prefill must exercise the new recurrent 32/64/128 profiles,
@@ -618,7 +650,7 @@ fn validate_continuous_requests() {
     for source in &fixture.cases {
         let mut tokens = vec![];
         model
-            .generate(
+            .generate_reference(
                 &source.input_tokens,
                 Some(&source.images),
                 16,
@@ -670,7 +702,7 @@ fn validate_continuous_requests() {
     }
     for (i, source) in fixture.cases.iter().enumerate() {
         model
-            .generate(
+            .generate_reference(
                 &source.input_tokens,
                 Some(&source.images),
                 1,

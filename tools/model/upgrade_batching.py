@@ -5,17 +5,12 @@ all batch buckets; no Python compiler runs on the online request path.
 """
 import argparse
 import copy
-import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
-import subprocess
 import sys
-import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.model.prepare import write_json, file_hash, source_path
+from tools.model.publication import atomic_model, clone_model, commit_package, file_hash, load_model, source_path, write_json
 from tools.operators.abi import parse_host, evaluate
 
 
@@ -56,28 +51,14 @@ def upgrade(model, destination, report):
     destination = destination.absolute()
     if destination.exists():
         raise ValueError('Destination already exists')
-    data = json.loads((model / 'cache/model.json').read_text())
+    data, origin, package = load_model(model)
     metadata = data['metadata']
-    operator_cache = Path(os.environ['ORIN_OPERATOR_CACHE']) if 'ORIN_OPERATOR_CACHE' in os.environ else (
-        Path(os.environ.get('XDG_CACHE_HOME', str(Path.home()/'.cache'))) / 'orin-llm/operators')
-    installed = operator_cache / data['operator_package']
-    origin = installed if installed.exists() else model / 'cache/operators' / data['operator_package']
-    if file_hash(origin / 'package.json') != data['operator_package']:
-        raise ValueError('Source operator package digest mismatch')
-    package = json.loads((origin / 'package.json').read_text())
     if package.get('batch_profiles'):
         raise ValueError('Model already has batch operators')
     if not metadata.get('mtp') or not metadata.get('kv_cache', {}).get('buffers'):
         raise ValueError('Batch upgrade requires native MTP and direct INT8 KV profiles')
-    destination.mkdir(parents=True)
-    for path in model.iterdir():
-        if path.is_file():
-            shutil.copyfile(path, destination / path.name)
     cache = destination / 'cache'
-    cache.mkdir()
-    shutil.copytree(model / 'cache/weights', cache / 'weights', copy_function=os.link)
-    operator = cache / 'operators' / '.building'
-    shutil.copytree(origin, operator, copy_function=os.link)
+    operator = clone_model(model, destination, origin)
     # Replace hardlinked package metadata atomically after compiling.
     kernels = {k['name']: k for k in package['kernels']}
     buffers = {b['name']: b for b in metadata['buffers']}
@@ -224,14 +205,7 @@ def upgrade(model, destination, report):
     package['batch_profiles'] = buckets
     package['kernels'] = list(kernels.values())
     package['buffer_contracts'] = [{k:v for k,v in b.items() if k != 'data'} for b in metadata['buffers']]
-    raw = (json.dumps(package,ensure_ascii=False,indent=2)+'\n').encode()
-    digest = hashlib.sha256(raw).hexdigest()
-    temporary = operator / 'package.new.json'
-    temporary.write_bytes(raw)
-    temporary.replace(operator / 'package.json')
-    operator.rename(operator.parent / digest)
-    data['operator_package'] = digest
-    write_json(cache / 'model.json',data)
+    digest = commit_package(destination, operator, data, package)
     write_json(report / 'upgrade.json',dict(model=str(destination),operator_package=digest,
         batch_profiles=buckets,weight_bytes=metadata['weight_bytes'],new_kernels=len(exports)))
     print('BATCH PACKAGE READY',destination,flush=True)
@@ -247,20 +221,12 @@ def main():
     if destination.exists():
         p.error('Destination already exists')
     destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = destination.with_name('.' + destination.name + '.building-' + uuid.uuid4().hex)
     a.output.mkdir(parents=True,exist_ok=True)
-    try:
+    with atomic_model(destination) as staging:
         upgrade(a.model,staging,a.output)
-        cli = Path(__file__).resolve().parents[2] / 'target/release/orin-llm'
-        subprocess.run([str(cli), 'plan-model', str(staging)], check=True, stdout=subprocess.DEVNULL)
-        staging.rename(destination)
-        report = json.loads((a.output / 'upgrade.json').read_text())
-        report['model'] = str(destination)
-        write_json(a.output / 'upgrade.json', report)
-    except BaseException:
-        if staging.exists():
-            shutil.rmtree(staging)
-        raise
+    report = json.loads((a.output / 'upgrade.json').read_text())
+    report['model'] = str(destination)
+    write_json(a.output / 'upgrade.json', report)
 
 
 if __name__ == '__main__':

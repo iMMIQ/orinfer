@@ -8,14 +8,9 @@ import argparse
 import copy
 import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
-import subprocess
-import uuid
 
-from tools.model.prepare import file_hash, write_json
-from tools.model.optimize_kv import link_or_copy
+from tools.model.publication import atomic_model, clone_model, commit_package, load_model, write_json
 from tools.model.upgrade_batching import bind
 from tools.operators.abi import parse_host
 
@@ -30,16 +25,8 @@ def upgrade(model, destination, output):
 
     configure()
     torch.empty(1, device='cuda')
-    data = json.loads((model / 'cache/model.json').read_text())
+    data, origin, package = load_model(model)
     meta = data['metadata']
-    root = Path(os.environ.get('ORIN_OPERATOR_CACHE', str(Path(os.environ.get(
-        'XDG_CACHE_HOME', str(Path.home() / '.cache'))) / 'orin-llm/operators')))
-    origin = root / data['operator_package']
-    if not origin.exists():
-        origin = model / 'cache/operators' / data['operator_package']
-    if file_hash(origin / 'package.json') != data['operator_package']:
-        raise ValueError('Source operator package digest mismatch')
-    package = json.loads((origin / 'package.json').read_text())
     config = json.loads((model / 'config.json').read_text())
     text = config.get('text_config', config)
     if (text['hidden_size'], text['intermediate_size']) != (5120, 17408):
@@ -48,13 +35,7 @@ def upgrade(model, destination, output):
         raise ValueError('Requires 2048-token workspace and staged INT8 KV')
     if not package.get('batch_profiles') or package.get('prefill_batch_profiles'):
         raise ValueError('Requires batching without joint prefill profiles')
-    destination.mkdir(parents=True)
-    for p in model.iterdir():
-        if p.is_file():
-            shutil.copyfile(p, destination / p.name)
-    shutil.copytree(model / 'cache/weights', destination / 'cache/weights', copy_function=link_or_copy)
-    target = destination / 'cache/operators/building'
-    shutil.copytree(origin, target, copy_function=link_or_copy)
+    target = clone_model(model, destination, origin)
     kernels = {k['name']: k for k in package['kernels']}
     exports = {}
     checks = []
@@ -171,13 +152,7 @@ def upgrade(model, destination, output):
                 kernels[name] = bind(export, name, pointers, dict(rows=rows, M=rows, batch=1))
     package['prefill_batch_profiles'] = [dict(tokens=n, kind='chunk_lut4') for n in [512,1024,2048]]
     package['kernels'] = list(kernels.values())
-    raw = (json.dumps(package, ensure_ascii=False, indent=2) + '\n').encode()
-    digest = hashlib.sha256(raw).hexdigest()
-    (target / 'package.new.json').write_bytes(raw)
-    (target / 'package.new.json').replace(target / 'package.json')
-    target.rename(target.with_name(digest))
-    data['operator_package'] = digest
-    write_json(destination / 'cache/model.json', data)
+    digest = commit_package(destination, target, data, package)
     write_json(output / 'upgrade.json', dict(operator_package=digest, checks=checks,
         persistent_weight_bytes_added=0, workspace_bytes_added=0, profiles=package['prefill_batch_profiles']))
 
@@ -192,16 +167,9 @@ def main():
     destination = a.model_output.absolute()
     if destination.exists():
         raise FileExistsError(destination)
-    staging = destination.with_name('.' + destination.name + '.building-' + uuid.uuid4().hex)
     a.output.mkdir(parents=True, exist_ok=True)
-    try:
+    with atomic_model(destination) as staging:
         upgrade(a.model.resolve(strict=True), staging, a.output)
-        subprocess.run([str(a.engine.resolve()), 'validate-model', str(staging)], check=True, stdout=subprocess.DEVNULL)
-        staging.rename(destination)
-    except BaseException:
-        if staging.exists():
-            shutil.rmtree(staging)
-        raise
 
 
 if __name__ == '__main__':

@@ -19,17 +19,11 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.model.prepare import file_hash, source_path, write_json
+from tools.model.publication import file_hash, source_path, write_json
 
 
-TEXT_KEYS = (
-    'hidden_size', 'intermediate_size', 'num_hidden_layers', 'vocab_size',
-    'layer_types', 'num_attention_heads', 'num_key_value_heads', 'head_dim',
-    'linear_num_key_heads', 'linear_num_value_heads', 'linear_key_head_dim',
-    'linear_value_head_dim', 'linear_conv_kernel_dim', 'hidden_act', 'rms_norm_eps',
-    'rope_parameters', 'partial_rotary_factor', 'attn_output_gate', 'output_gate_type',
-    'attention_bias', 'tie_word_embeddings', 'mtp_num_hidden_layers', 'mtp_use_dedicated_embeddings',
-)
+CONTRACT = json.loads((Path(__file__).resolve().parents[2] / 'configs/architecture-contract.json').read_text())
+TEXT_KEYS = CONTRACT['families']['qwen3_5']['text_keys']
 
 
 def config_signature(config):
@@ -174,7 +168,7 @@ def publish(directory, engine=None):
                 bindings.append(item)
                 binding_map[item['name']] = op['name']
                 slot += 1
-    package = dict(schema_version=1, runtime_abi=1, target='sm_87', architecture='qwen3_5',
+    package = dict(schema_version=1, runtime_abi=CONTRACT['runtime_abi'], target='sm_87', architecture='qwen3_5',
                    compute_policy='int8_quality', config_signature=config_signature(config),
                    prefill_profiles=profiles, kernels=bindings,
                    buffer_contracts=[{k: v for k, v in b.items() if k != 'data'} for b in model['buffers']],
@@ -194,7 +188,9 @@ def publish(directory, engine=None):
     metadata = {k: v for k, v in model.items() if k not in ('kernels', 'programs')}
     write_json(cache / 'model.json', dict(schema_version=1, architecture='qwen3_5',
                compute_policy='int8_quality', operator_package=digest,
-               buffer_scopes={b['name']: scope(b, model) for b in model['buffers']}, metadata=metadata))
+               buffer_scopes={b['name']: scope(b, model) for b in model['buffers']},
+               frontend_assets={name: file_hash(directory / name) for name in
+                                ('tokenizer.json', 'chat_template.jinja', 'generation_config.json')}, metadata=metadata))
     validate_plan(directory, model, binding_map, engine or repo / 'target/release/orin-llm')
     (cache / 'manifest.json').unlink()
     return {'operator_package': digest, 'kernel_bindings': len(bindings), 'binding_map': binding_map}
@@ -206,15 +202,9 @@ def split(model, output, engine=None):
     if output.exists() or output.is_symlink():
         raise ValueError(f'Output already exists: {output}')
     output.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f'.{output.name}-', dir=output.parent))
-    try:
-        def link_or_copy(source, destination):
-            try:
-                os.link(source, destination)
-            except OSError:
-                shutil.copyfile(source, destination)
-        # Only our immutable, prepared directory is accepted. Config/metadata are
-        # copied independently; large immutable tensors share storage on this host.
+    from tools.model.publication import staged_directory, link_or_copy
+    with staged_directory(output) as staging:
+        staging.mkdir()
         for file in model.iterdir():
             if file.is_file():
                 shutil.copyfile(file, staging / file.name)
@@ -224,13 +214,7 @@ def split(model, output, engine=None):
         for subdir in ('weights', 'kernels'):
             shutil.copytree(model / 'cache' / subdir, cache / subdir, copy_function=link_or_copy)
         report = publish(staging, engine)
-        if output.exists() or output.is_symlink():
-            raise ValueError('Output appeared during packaging')
-        staging.rename(output)
-        return report
-    except BaseException:
-        shutil.rmtree(staging)
-        raise
+    return report
 
 
 def archive(package, output):
@@ -285,6 +269,29 @@ def install(archive_path, cache):
         shutil.rmtree(staging)
 
 
+def pin_assets(directory):
+    """Explicitly seal active frontend files, without changing any weight/kernel payload."""
+    directory = directory.resolve(strict=True)
+    path = directory / 'cache/model.json'
+    descriptor = json.loads(path.read_text())
+    identities = {name: file_hash(source_path(directory, name)) for name in
+                  ('tokenizer.json', 'chat_template.jinja', 'generation_config.json')}
+    descriptor['frontend_assets'] = identities
+    fd, temporary = tempfile.mkstemp(prefix='.model-', suffix='.json', dir=path.parent)
+    try:
+        os.fchmod(fd, path.stat().st_mode & 0o777)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(descriptor, stream, indent=2, ensure_ascii=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return identities
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -297,11 +304,15 @@ def main():
     add = sub.add_parser('install')
     add.add_argument('archive', type=Path)
     add.add_argument('cache', type=Path)
+    seal = sub.add_parser('pin-assets', help='Explicitly pin existing native model frontend files')
+    seal.add_argument('model', type=Path)
     args = parser.parse_args()
     if args.command == 'split':
         report = split(args.model, args.output)
         report.pop('binding_map')
         print(json.dumps(report, indent=2))
+    elif args.command == 'pin-assets':
+        print(json.dumps(pin_assets(args.model), indent=2))
     elif args.command == 'archive':
         archive(args.package, args.output)
     else:

@@ -32,6 +32,7 @@ mod mtp_fixture_export {
                     "qwen3.8-27b",
                     descriptor["metadata"]["max_context"].as_u64().unwrap() as usize,
                     vision.as_ref(),
+                    &mut crate::server::preparation::Context::unbounded(),
                 )
                 .unwrap();
             cases.push(json!({"id":case["id"],"input_tokens":prepared.input,
@@ -94,23 +95,31 @@ pub struct Prepared {
 
 pub struct ChatCodec {
     pub tokenizer: Tokenizer,
+    pub asset_hashes: std::collections::BTreeMap<String, String>,
     template: Environment<'static>,
     pub eos: BTreeSet<u32>,
     sampling_defaults: Options,
 }
 impl ChatCodec {
     pub fn load(directory: &Path) -> Result<Self> {
+        let mut assets = std::collections::BTreeMap::new();
+        let mut asset_hashes = std::collections::BTreeMap::new();
+        for name in [
+            "tokenizer.json",
+            "chat_template.jinja",
+            "generation_config.json",
+        ] {
+            let bytes = std::fs::read(directory.join(name)).map_err(|e| e.to_string())?;
+            asset_hashes.insert(name.to_owned(), orin_engine::artifact::sha256(&bytes));
+            assets.insert(name, bytes);
+        }
         let mut tokenizer =
-            Tokenizer::from_file(directory.join("tokenizer.json")).map_err(|e| e.to_string())?;
-        // Checkpoint calibration can persist a training truncation limit.
-        // Serving validates the complete prompt against the engine context below.
+            Tokenizer::from_bytes(&assets["tokenizer.json"]).map_err(|e| e.to_string())?;
         tokenizer.with_truncation(None).map_err(|e| e.to_string())?;
-        let template = std::fs::read_to_string(directory.join("chat_template.jinja"))
+        let template = String::from_utf8(assets.remove("chat_template.jinja").unwrap())
             .map_err(|e| e.to_string())?;
-        let generation: Value = serde_json::from_slice(
-            &std::fs::read(directory.join("generation_config.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
+        let generation: Value =
+            serde_json::from_slice(&assets["generation_config.json"]).map_err(|e| e.to_string())?;
         let ids = &generation["eos_token_id"];
         let sampling_defaults = Options {
             temperature: generation["temperature"].as_f64().unwrap_or(1.0),
@@ -200,6 +209,7 @@ impl ChatCodec {
         Ok(Self {
             sampling_defaults,
             tokenizer,
+            asset_hashes,
             template: environment,
             eos,
         })
@@ -210,7 +220,9 @@ impl ChatCodec {
         model: &str,
         context_limit: usize,
         vision: Option<&orin_engine::vision::VisionSpec>,
+        preparation: &mut super::preparation::Context,
     ) -> Result<Prepared> {
+        preparation.checkpoint(0)?;
         if request.model != model {
             return Err(format!("Unknown model {}; expected {model}", request.model));
         }
@@ -303,7 +315,7 @@ impl ChatCodec {
             }
             _ => return Err("Invalid tool_choice".into()),
         };
-        let (raw_messages, images) = super::image::messages(request.messages, vision)?;
+        let (raw_messages, images) = super::image::messages(request.messages, vision, preparation)?;
         let mut messages = normalize_messages(raw_messages)?;
         if choice == "required" || choice.is_object() {
             let instruction = if let Some(name) = choice["function"]["name"].as_str() {
@@ -318,11 +330,13 @@ impl ChatCodec {
                 messages.insert(0, json!({"role":"system", "content":instruction}));
             }
         }
+        preparation.checkpoint(0)?;
         let rendered = self.template.get_template("chat").map_err(|e| e.to_string())?.render(context! {
             messages => messages, tools => tools, add_generation_prompt => true,
             enable_thinking => thinking, reasoning_effort => request.reasoning_effort.as_deref().unwrap_or("xhigh"),
             preserve_thinking => true,
         }).map_err(|e| format!("Chat template: {e}"))?;
+        preparation.checkpoint(0)?;
         let input = self
             .tokenizer
             .encode(rendered, false)
@@ -557,11 +571,38 @@ mod tests {
             .unwrap()
         };
         assert_eq!(
-            codec.prepare(request(), "test", 4, None).unwrap().input,
+            codec
+                .prepare(
+                    request(),
+                    "test",
+                    4,
+                    None,
+                    &mut crate::server::preparation::Context::unbounded()
+                )
+                .unwrap()
+                .input,
             [1, 2, 3]
         );
-        assert!(codec.prepare(request(), "test", 3, None).is_err());
-        let prepared = codec.prepare(request(), "test", 4, None).unwrap();
+        assert!(
+            codec
+                .prepare(
+                    request(),
+                    "test",
+                    3,
+                    None,
+                    &mut crate::server::preparation::Context::unbounded()
+                )
+                .is_err()
+        );
+        let prepared = codec
+            .prepare(
+                request(),
+                "test",
+                4,
+                None,
+                &mut crate::server::preparation::Context::unbounded(),
+            )
+            .unwrap();
         assert_eq!(prepared.sampling.temperature, 0.7);
         assert_eq!(prepared.sampling.top_p, 0.95);
         assert_eq!(prepared.sampling.top_k, 20);
@@ -574,7 +615,13 @@ mod tests {
         .unwrap();
         assert!(
             codec
-                .prepare(override_request, "test", 4, None)
+                .prepare(
+                    override_request,
+                    "test",
+                    4,
+                    None,
+                    &mut crate::server::preparation::Context::unbounded()
+                )
                 .unwrap()
                 .sampling
                 .is_greedy()
@@ -633,7 +680,13 @@ mod tests {
                 .get("vision")
                 .map(|v| serde_json::from_value(v.clone()).unwrap());
             let prepared = codec
-                .prepare(request, "qwen3.8-27b", 8704, vision.as_ref())
+                .prepare(
+                    request,
+                    "qwen3.8-27b",
+                    8704,
+                    vision.as_ref(),
+                    &mut crate::server::preparation::Context::unbounded(),
+                )
                 .unwrap();
             let expected: Vec<u32> = serde_json::from_value(case["ids"].clone()).unwrap();
             assert_eq!(

@@ -6,7 +6,6 @@ map replay activity back to that plan. Request/launch counts must match exactly.
 """
 import argparse
 import collections
-import hashlib
 import json
 import math
 from pathlib import Path

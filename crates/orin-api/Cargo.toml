@@ -15,7 +15,7 @@ orin-engine.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "=1.0.150"
 tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
-tokio = { version = "=1.53.0", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
+tokio = { version = "=1.53.0", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
 
 base64 = "0.22.1"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }

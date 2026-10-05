@@ -5,17 +5,12 @@ GateUp uses INT8 MMA, SwiGLU emits A8, and Down uses FP32 split-K partials.
 Other projections and all recurrent state keep their existing precision.
 """
 import argparse
-import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
-import subprocess
 import sys
-import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.model.prepare import file_hash, write_json
+from tools.model.publication import atomic_model, clone_model, commit_package, file_hash, load_model, write_json
 from tools.model.upgrade_batching import bind
 from tools.operators.abi import parse_host
 
@@ -26,15 +21,8 @@ def upgrade(model, destination, report, mode):
     from kernels.operators.op30_activation_quantization import swiglu_activation_quantization
     from tools.operators.common import configure, export_kernel
     configure()
-    data = json.loads((model/'cache/model.json').read_text())
+    data, origin, package = load_model(model)
     metadata = data['metadata']
-    cache_root = Path(os.environ.get('ORIN_OPERATOR_CACHE',
-        str(Path(os.environ.get('XDG_CACHE_HOME', str(Path.home()/'.cache')))/'orin-llm/operators')))
-    installed = cache_root/data['operator_package']
-    origin = installed if installed.exists() else model/'cache/operators'/data['operator_package']
-    if file_hash(origin/'package.json') != data['operator_package']:
-        raise ValueError('Source operator package digest mismatch')
-    package = json.loads((origin/'package.json').read_text())
     config = json.loads((model/'config.json').read_text())
     text = config.get('text_config',config)
     h,f = text['hidden_size'],text['intermediate_size']
@@ -58,14 +46,8 @@ def upgrade(model, destination, report, mode):
                     alignment=256,access='read_write',data=None)
         metadata['buffers'].append(spec)
         data['buffer_scopes'][name] = 'workspace'
-    destination.mkdir(parents=True)
-    for path in model.iterdir():
-        if path.is_file():
-            shutil.copyfile(path,destination/path.name)
-    cache = destination/'cache';cache.mkdir()
-    shutil.copytree(model/'cache/weights',cache/'weights',copy_function=os.link)
-    operator = cache/'operators'/'.building'
-    shutil.copytree(origin,operator,copy_function=os.link)
+    cache = destination / 'cache'
+    operator = clone_model(model, destination, origin)
     kernels = {k['name']:k for k in package['kernels']}
     exports = {}
     def compile_kernel(name,factory):
@@ -124,12 +106,7 @@ def upgrade(model, destination, report, mode):
                 kernels[name] = bind(exports[key],name,pointers,dims)
     package['kernels'] = list(kernels.values())
     package['buffer_contracts'] = [{k:v for k,v in b.items() if k!='data'} for b in metadata['buffers']]
-    raw = (json.dumps(package,ensure_ascii=False,indent=2)+'\n').encode()
-    digest = hashlib.sha256(raw).hexdigest()
-    new = operator/'package.new.json';new.write_bytes(raw);new.replace(operator/'package.json')
-    operator.rename(operator.parent/digest)
-    data['operator_package'] = digest
-    write_json(cache/'model.json',data)
+    digest = commit_package(destination, operator, data, package)
     report.mkdir(parents=True,exist_ok=True)
     write_json(report/'upgrade.json',dict(operator_package=digest,weight_bytes=metadata['weight_bytes'],
         weight_representation='unchanged',persistent_weight_bytes_added=0,
@@ -146,15 +123,8 @@ def main():
     destination = args.model_output.absolute()
     if destination.exists():
         parser.error('Destination already exists')
-    staging = destination.with_name('.'+destination.name+'.building-'+uuid.uuid4().hex)
-    try:
+    with atomic_model(destination) as staging:
         upgrade(args.model.resolve(strict=True),staging,args.output,args.mode)
-        cli = Path(__file__).resolve().parents[2]/'target/release/orin-llm'
-        subprocess.run([str(cli),'plan-model',str(staging)],check=True,stdout=subprocess.DEVNULL)
-        staging.rename(destination)
-    except BaseException:
-        if staging.exists():shutil.rmtree(staging)
-        raise
     print('INT8 DECODE PACKAGE READY',destination,flush=True)
 
 

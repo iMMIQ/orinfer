@@ -21,6 +21,8 @@ class PackageTests(unittest.TestCase):
         config = {'model_type': 'qwen3_5_text', 'num_hidden_layers': 1,
                   'layer_types': ['linear_attention'], 'vocab_size': 8}
         (self.model / 'config.json').write_text(json.dumps(config))
+        for name in ('tokenizer.json', 'chat_template.jinja', 'generation_config.json'):
+            (self.model / name).write_text('{}')
         raw = b'fixture cubin bytes'
         asset = {'file': 'kernels/test.cubin', 'sha256': hashlib.sha256(raw).hexdigest()}
         (self.model / 'cache/kernels/test.cubin').write_bytes(raw)

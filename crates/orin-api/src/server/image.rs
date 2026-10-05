@@ -12,7 +12,8 @@ const MAX_BYTES: usize = 24 * 1024 * 1024;
 const MIN_PIXELS: usize = 256 * 256;
 const MARKER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 
-fn load(url: &str) -> Result<Vec<u8>> {
+fn load(url: &str, preparation: &super::preparation::Context) -> Result<Vec<u8>> {
+    preparation.checkpoint(MAX_BYTES)?;
     if let Some(data) = url.strip_prefix("data:") {
         let (mime, payload) = data.split_once(',').ok_or("Invalid image data URI")?;
         if !["image/png;base64", "image/jpeg;base64", "image/webp;base64"].contains(&mime)
@@ -85,10 +86,40 @@ pub fn resize_shape(
     }
     Ok((h, w))
 }
-pub fn preprocess(data: &[u8], v: &VisionSpec, detail: &str) -> Result<ImageInput> {
+pub fn preprocess(
+    data: &[u8],
+    v: &VisionSpec,
+    detail: &str,
+    preparation: &mut super::preparation::Context,
+) -> Result<ImageInput> {
     if !["auto", "high", "low"].contains(&detail) {
         return Err("image_url.detail must be auto, high or low".into());
     }
+    preparation.checkpoint(0)?;
+    let (width, height) = ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_dimensions()
+        .map_err(|e| e.to_string())?;
+    let source_pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or("Image dimensions overflow")?;
+    if source_pixels > 16_777_216 {
+        return Err("Image exceeds decoded pixel limit".into());
+    }
+    let max_pixels = if detail == "low" {
+        MIN_PIXELS
+    } else {
+        (v.max_patches * v.patch_size * v.patch_size).min(16_777_216)
+    };
+    let (rh, rw) = resize_shape(
+        height as usize,
+        width as usize,
+        v.patch_size * v.merge_size,
+        max_pixels,
+    )?;
+    // Decode may hold RGBA/16-bit source, RGB conversion and resized patch FP32 together.
+    preparation.checkpoint(data.len() + source_pixels * 12 + rh * rw * 16)?;
     let mut reader = ImageReader::new(Cursor::new(data))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
@@ -97,6 +128,7 @@ pub fn preprocess(data: &[u8], v: &VisionSpec, detail: &str) -> Result<ImageInpu
     limits.max_image_width = Some(32768);
     limits.max_image_height = Some(32768);
     reader.limits(limits);
+    preparation.checkpoint(0)?;
     let decoded = reader
         .decode()
         .map_err(|e| format!("Image decode: {e}"))?
@@ -152,6 +184,7 @@ pub fn preprocess(data: &[u8], v: &VisionSpec, detail: &str) -> Result<ImageInpu
             }
         }
     }
+    preparation.retain(pixels.len() * std::mem::size_of::<f32>())?;
     let input = ImageInput {
         grid_height: gh,
         grid_width: gw,
@@ -163,6 +196,7 @@ pub fn preprocess(data: &[u8], v: &VisionSpec, detail: &str) -> Result<ImageInpu
 pub fn messages(
     mut messages: Vec<Value>,
     spec: Option<&VisionSpec>,
+    preparation: &mut super::preparation::Context,
 ) -> Result<(Vec<Value>, Vec<ImageInput>)> {
     let mut images = Vec::new();
     let mut features = 0usize;
@@ -172,6 +206,7 @@ pub fn messages(
         };
         let mut content = String::new();
         for part in parts {
+            preparation.checkpoint(0)?;
             match part["type"].as_str() {
                 Some("text") => {
                     content.push_str(part["text"].as_str().ok_or("Text part needs text")?)
@@ -189,7 +224,7 @@ pub fn messages(
                         .map(|v| v.as_str().ok_or("Invalid image detail"))
                         .transpose()?
                         .unwrap_or("auto");
-                    let image = preprocess(&load(url)?, v, detail)?;
+                    let image = preprocess(&load(url, preparation)?, v, detail, preparation)?;
                     features = features
                         .checked_add(v.feature_count(&image)?)
                         .ok_or("Image feature count overflow")?;
@@ -221,6 +256,7 @@ mod tests {
                 &std::fs::read(root.join(case["image"].as_str().unwrap())).unwrap(),
                 &spec,
                 "auto",
+                &mut crate::server::preparation::Context::unbounded(),
             )
             .unwrap();
             assert_eq!(
@@ -271,7 +307,13 @@ mod tests {
         image::DynamicImage::ImageRgb8(rgb)
             .write_to(&mut data, image::ImageFormat::Png)
             .unwrap();
-        let pixels = preprocess(data.get_ref(), &spec, "auto").unwrap();
+        let pixels = preprocess(
+            data.get_ref(),
+            &spec,
+            "auto",
+            &mut crate::server::preparation::Context::unbounded(),
+        )
+        .unwrap();
         assert_eq!((pixels.grid_height, pixels.grid_width), (16, 16));
         for (row, (red, green)) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)]
             .into_iter()
@@ -286,11 +328,31 @@ mod tests {
         let input = vec![
             json!({"role":"user","content":[{"type":"text","text":"A"},{"type":"image_url","image_url":{"url":url}},{"type":"text","text":"B"},{"type":"image_url","image_url":{"url":url}}]}),
         ];
-        let (out, images) = messages(input.clone(), Some(&spec)).unwrap();
+        let (out, images) = messages(
+            input.clone(),
+            Some(&spec),
+            &mut crate::server::preparation::Context::unbounded(),
+        )
+        .unwrap();
         assert_eq!(images.len(), 2);
         assert_eq!(out[0]["content"], format!("A{MARKER}B{MARKER}"));
-        assert!(messages(input, None).is_err());
-        assert!(preprocess(data.get_ref(), &spec, "invalid").is_err());
+        assert!(
+            messages(
+                input,
+                None,
+                &mut crate::server::preparation::Context::unbounded()
+            )
+            .is_err()
+        );
+        assert!(
+            preprocess(
+                data.get_ref(),
+                &spec,
+                "invalid",
+                &mut crate::server::preparation::Context::unbounded()
+            )
+            .is_err()
+        );
     }
     #[test]
     fn smart_resize_rounding_and_aspect() {
@@ -302,7 +364,19 @@ mod tests {
         );
         assert_eq!(resize_shape(500, 100, 32, 65_536).unwrap(), (576, 128));
         assert!(resize_shape(1, 300, 32, 1_048_576).is_err());
-        assert!(load("file:///tmp/image.png").is_err());
-        assert!(load("data:video/mp4;base64,AA==").is_err());
+        assert!(
+            load(
+                "file:///tmp/image.png",
+                &crate::server::preparation::Context::unbounded()
+            )
+            .is_err()
+        );
+        assert!(
+            load(
+                "data:video/mp4;base64,AA==",
+                &crate::server::preparation::Context::unbounded()
+            )
+            .is_err()
+        );
     }
 }

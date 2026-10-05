@@ -157,3 +157,19 @@ Prefill计时包含输入复制和同步，排除末位置head；decode排除首
 ## 许可证
 
 GNU LGPL version 3 or later（`LGPL-3.0-or-later`）。见[LICENSE](LICENSE)及其引用的GPLv3文本[COPYING](COPYING)。外部依赖与模型权重遵循各自许可证。
+
+服务资源与退出配置：
+
+| 参数 | 默认值 | 行为 |
+| --- | --- | --- |
+| `--preprocess-workers` | 2 | 同时执行图片/模板/tokenizer预处理的CPU任务数 |
+| `--preprocess-memory-mib` | 2048 | 预处理及队列中图片张量的预算；包含保守临时内存估算 |
+| `--queue-timeout-ms` | 0 | 0允许无限排队；不限制已经开始的长上下文计算 |
+| `--output-timeout-ms` | 60000 | 输出通道阻塞且无进展时终止，预填充时间不计入 |
+| `--drain-timeout-ms` | 30000 | SIGINT/SIGTERM后停止接收新任务并结束现有HTTP连接的期限 |
+
+`/health`显示starting/ready/draining/failed；GPU worker故障时返回503。CUDA错误与内部状态故障会使worker停止接收请求，需要重启服务；失败或异常断开的SSE返回error，不会伪装成成功的`[DONE]`。
+
+准备模型时会封存`tokenizer.json`、`chat_template.jinja`、`generation_config.json`的SHA256，并计入模型身份。要有意修改这些文件，先确认它们与checkpoint的token映射和语义一致，再执行`python3 tools/model/package.py pin-assets MODEL_DIR`重新封存；该命令不改权重。已有未封存的本机模型也需执行此命令后使用新版加载器。
+
+完整的编译环境、CPU/GPU验收和发行包工具见[构建与发布说明](tools/build/README.md)。

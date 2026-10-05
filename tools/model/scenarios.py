@@ -11,7 +11,7 @@ from pathlib import Path
 from transformers import AutoTokenizer
 
 ROOT=Path(__file__).resolve().parents[2]
-TOKENIZER=Path('/home/nvidia/model/vllm-comparison-20260930/awq-http')
+TOKENIZER=None
 
 
 def tokenizer():
@@ -58,10 +58,12 @@ def score(directory,report_path,output):
 
 
 def main():
-    ap=argparse.ArgumentParser();sub=ap.add_subparsers(dest='command',required=True)
+    ap=argparse.ArgumentParser();ap.add_argument('--checkpoint',type=Path,required=True);sub=ap.add_subparsers(dest='command',required=True)
     prep=sub.add_parser('prepare');prep.add_argument('directory',type=Path)
     scoring=sub.add_parser('score');scoring.add_argument('directory',type=Path);scoring.add_argument('report',type=Path);scoring.add_argument('output',type=Path)
     a=ap.parse_args()
+    global TOKENIZER
+    TOKENIZER=a.checkpoint
     if a.command=='prepare':prepare(a.directory)
     else:score(a.directory,a.report,a.output)
 

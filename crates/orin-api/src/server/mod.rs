@@ -1,7 +1,9 @@
 mod chat;
 mod continuous;
 mod image;
+mod lifecycle;
 mod output;
+mod preparation;
 
 use axum::{
     Json, Router,
@@ -18,6 +20,7 @@ use orin_engine::model::Model;
 use serde_json::{Value, json};
 use std::{
     convert::Infallible,
+    future::IntoFuture,
     path::PathBuf,
     sync::{
         Arc,
@@ -30,14 +33,14 @@ use tokio::sync::{mpsc, oneshot};
 type Result<T> = std::result::Result<T, String>;
 use orin_engine::execution::{CudaGraphMode, LoadOptions};
 struct Settings {
-    manifest: PathBuf,
-    tokenizer: PathBuf,
+    model_dir: PathBuf,
     model: String,
     listen: String,
     gpu_lock: PathBuf,
     cuda_graph: CudaGraphMode,
     prefix_cache_bytes: usize,
     scheduler: orin_engine::scheduler::Options,
+    limits: Limits,
 }
 impl Settings {
     fn parse(args: &[String]) -> Result<Self> {
@@ -45,20 +48,42 @@ impl Settings {
             return Err("Usage: orin-llm serve MODEL_DIR [--listen 0.0.0.0:8088] [--model qwen3.8-27b] [--cuda-graph decode_only|full|off] [--prefix-cache-mib 12288] [--gpu-lock artifacts/gpu-experiment.lock]; MODEL_DIR must contain the prepared cache and checkpoint tokenizer".into());
         }
         let mut settings = Self {
-            manifest: (&args[0]).into(),
-            tokenizer: (&args[0]).into(),
+            model_dir: (&args[0]).into(),
             model: "qwen3.8-27b".into(),
             listen: "0.0.0.0:8088".into(),
             gpu_lock: "artifacts/gpu-experiment.lock".into(),
             cuda_graph: CudaGraphMode::default(),
             prefix_cache_bytes: 12 * 1024 * 1024 * 1024,
             scheduler: Default::default(),
+            limits: Limits::default(),
         };
         for pair in args[1..].chunks(2) {
             if pair.len() != 2 {
                 return Err("Server option needs a value".into());
             }
             match pair[0].as_str() {
+                "--preprocess-workers" => {
+                    settings.limits.preprocess_workers = pair[1]
+                        .parse()
+                        .map_err(|_| "Invalid preprocessing concurrency")?
+                }
+                "--preprocess-memory-mib" => {
+                    settings.limits.memory_mib = pair[1]
+                        .parse()
+                        .map_err(|_| "Invalid preprocessing memory budget")?
+                }
+                "--queue-timeout-ms" => {
+                    settings.limits.queue_ms =
+                        pair[1].parse().map_err(|_| "Invalid queue timeout")?
+                }
+                "--output-timeout-ms" => {
+                    settings.limits.output_ms =
+                        pair[1].parse().map_err(|_| "Invalid output timeout")?
+                }
+                "--drain-timeout-ms" => {
+                    settings.limits.drain_ms =
+                        pair[1].parse().map_err(|_| "Invalid drain timeout")?
+                }
                 "--listen" => settings.listen = pair[1].clone(),
                 "--model" => settings.model = pair[1].clone(),
                 "--gpu-lock" => settings.gpu_lock = (&pair[1]).into(),
@@ -89,6 +114,15 @@ impl Settings {
         if settings.model.is_empty() {
             return Err("Model ID cannot be empty".into());
         }
+        if settings.limits.preprocess_workers == 0
+            || settings.limits.preprocess_workers > 32
+            || settings.limits.memory_mib < 512
+            || settings.limits.memory_mib > 16384
+            || settings.limits.output_ms == 0
+            || settings.limits.drain_ms == 0
+        {
+            return Err("Invalid preprocessing or timeout limits".into());
+        }
         settings.scheduler.validate()?;
         Ok(settings)
     }
@@ -107,8 +141,7 @@ mod settings_tests {
             "127.0.0.1:9999".into(),
         ])
         .unwrap();
-        assert_eq!(settings.manifest, PathBuf::from(&directory));
-        assert_eq!(settings.tokenizer, PathBuf::from(&directory));
+        assert_eq!(settings.model_dir, PathBuf::from(&directory));
         assert_eq!(settings.listen, "127.0.0.1:9999");
         assert!(Settings::parse(&[directory.clone(), directory.clone()]).is_err());
         assert!(Settings::parse(&[directory, "--listen".into()]).is_err());
@@ -178,6 +211,25 @@ mod settings_tests {
         }
     }
 }
+#[derive(Clone, Copy)]
+struct Limits {
+    preprocess_workers: usize,
+    memory_mib: usize,
+    queue_ms: u64,
+    output_ms: u64,
+    drain_ms: u64,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            preprocess_workers: 2,
+            memory_mib: 2048,
+            queue_ms: 0,
+            output_ms: 60000,
+            drain_ms: 30000,
+        }
+    }
+}
 #[derive(Clone)]
 struct Service {
     jobs: mpsc::Sender<Job>,
@@ -189,11 +241,14 @@ struct Service {
     api_key: Option<Arc<str>>,
     ids: Arc<AtomicU64>,
     scheduler: orin_engine::scheduler::Options,
-    batching: bool,
+    preparation: Arc<preparation::Pool>,
+    limits: Limits,
     activity: Arc<continuous::Activity>,
 }
 struct Job {
-    _slot: tokio::sync::OwnedSemaphorePermit,
+    _slot: Arc<tokio::sync::OwnedSemaphorePermit>,
+    _memory: Option<tokio::sync::OwnedSemaphorePermit>,
+    limits: Limits,
     prepared: Prepared,
     events: mpsc::Sender<ModelEvent>,
     id: String,
@@ -206,6 +261,15 @@ enum ModelEvent {
     Failed(String),
 }
 
+fn stream_payload(event: Option<ModelEvent>) -> (String, bool) {
+    match event {
+        Some(ModelEvent::Chunk(value)) => (value.to_string(), false),
+        Some(ModelEvent::Complete(_)) => ("[DONE]".into(), true),
+        Some(ModelEvent::Failed(message)) => (json!({"error":{"message":message,"type":"server_error","code":"generation_error"}}).to_string(), true),
+        None => (json!({"error":{"message":"GPU worker disconnected before completion","type":"server_error","code":"worker_disconnected"}}).to_string(), true),
+    }
+}
+
 pub fn run(args: &[String]) -> Result<()> {
     let settings = Settings::parse(args)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -213,10 +277,13 @@ pub fn run(args: &[String]) -> Result<()> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    runtime.block_on(serve(settings))
+    let result = runtime.block_on(serve(settings));
+    // Dropping a runtime normally waits forever for cancelled blocking tasks.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
 }
 async fn serve(settings: Settings) -> Result<()> {
-    let codec = Arc::new(ChatCodec::load(&settings.tokenizer)?);
+    let codec = Arc::new(ChatCodec::load(&settings.model_dir)?);
     let (sender, receiver) = mpsc::channel(128);
     let (ready_sender, ready_receiver) = oneshot::channel();
     let model_id: Arc<str> = settings.model.into();
@@ -226,77 +293,85 @@ async fn serve(settings: Settings) -> Result<()> {
     let worker_shutdown = Arc::clone(&shutdown);
     let scheduler = settings.scheduler;
     let activity = Arc::new(continuous::Activity::default());
+    let lifecycle = Arc::clone(&activity.lifecycle);
     let worker_activity = Arc::clone(&activity);
+    let worker_lifecycle = Arc::clone(&lifecycle);
+    let limits = settings.limits;
     let worker = std::thread::Builder::new()
         .name("orin-gpu".into())
         .spawn(move || {
-            let initialize = || -> Result<_> {
-                use std::os::fd::AsRawFd;
-                if let Some(parent) = settings
-                    .gpu_lock
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
-                let lock = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(&settings.gpu_lock)
-                    .map_err(|e| e.to_string())?;
-                // SAFETY: flock borrows this live file descriptor. The file remains
-                // owned by this worker for the complete CUDA model lifetime.
-                if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                    return Err("GPU experiment lock is busy".into());
-                }
-                let model = Model::load_with_options(
-                    &settings.manifest,
-                    LoadOptions {
-                        cuda_graph: settings.cuda_graph,
-                        prefix_cache_bytes: settings.prefix_cache_bytes,
-                    },
-                )?;
-                if worker_codec.tokenizer.get_vocab_size(true) > model.vocab() {
-                    return Err("Tokenizer exceeds model vocabulary".into());
-                }
-                let context = model.max_context();
-                let vision = model.vision().cloned();
-                let batching = model.batching_supported();
-                Ok((lock, model, context, vision, batching))
-            };
-            match initialize() {
-                Ok((_lock, mut model, context, vision, batching)) => {
-                    if ready_sender.send(Ok((context, vision, batching))).is_ok() {
-                        if batching {
-                            continuous::worker(
-                                &mut model,
-                                receiver,
-                                &worker_codec,
-                                &worker_model,
-                                &worker_shutdown,
-                                scheduler,
-                                &worker_activity,
-                            );
-                        } else {
-                            worker_loop(
-                                &mut model,
-                                receiver,
-                                &worker_codec,
-                                &worker_model,
-                                &worker_shutdown,
-                            );
+            let _ = worker_lifecycle.supervise(|| {
+                let initialize = || -> Result<_> {
+                    use std::os::fd::AsRawFd;
+                    if let Some(parent) = settings
+                        .gpu_lock
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                    {
+                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    let lock = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .read(true)
+                        .write(true)
+                        .open(&settings.gpu_lock)
+                        .map_err(|e| e.to_string())?;
+                    // SAFETY: flock borrows this live file descriptor. The file remains
+                    // owned by this worker for the complete CUDA model lifetime.
+                    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+                    {
+                        return Err("GPU experiment lock is busy".into());
+                    }
+                    let model = Model::load_with_options(
+                        &settings.model_dir,
+                        LoadOptions {
+                            cuda_graph: settings.cuda_graph,
+                            prefix_cache_bytes: settings.prefix_cache_bytes,
+                        },
+                    )?;
+                    if &worker_codec.asset_hashes != model.frontend_assets() {
+                        return Err("Frontend assets changed while loading model".into());
+                    }
+                    if worker_codec.tokenizer.get_vocab_size(true) > model.vocab() {
+                        return Err("Tokenizer exceeds model vocabulary".into());
+                    }
+                    let context = model.max_context();
+                    let vision = model.vision().cloned();
+                    if !model.batching_supported() { return Err("Serving requires the registered continuous-batching operator bindings; upgrade the operator package".into()); }
+                    Ok((lock, model, context, vision))
+                };
+                match initialize() {
+                    Ok((_lock, mut model, context, vision)) => {
+                        worker_lifecycle.ready();
+                        if ready_sender.send(Ok((context, vision))).is_ok() {
+continuous::worker(
+                                    &mut model,
+                                    receiver,
+                                    &worker_codec,
+                                    &worker_model,
+                                    &worker_shutdown,
+                                    scheduler,
+                                    &worker_activity,
+                                );
                         }
                     }
+                    Err(error) => {
+                        worker_lifecycle
+                            .fail(orin_engine::error::EngineError::take(error.clone(), true));
+                        let _ = ready_sender.send(Err(error));
+                    }
                 }
-                Err(error) => {
-                    let _ = ready_sender.send(Err(error));
-                }
+            });
+            if !worker_shutdown.load(Ordering::Relaxed) && worker_lifecycle.is_ready() {
+                worker_lifecycle.fail(orin_engine::error::EngineError::take(
+                    "GPU worker exited unexpectedly".into(),
+                    true,
+                ));
             }
         })
         .map_err(|e| e.to_string())?;
-    let (context, vision, batching) = ready_receiver.await.map_err(|e| e.to_string())??;
+    let (context, vision) = ready_receiver.await.map_err(|e| e.to_string())??;
     let state = Service {
         jobs: sender,
         slots: Arc::new(tokio::sync::Semaphore::new(128 + scheduler.max_active)),
@@ -310,31 +385,72 @@ async fn serve(settings: Settings) -> Result<()> {
             .map(Arc::from),
         ids: Arc::new(AtomicU64::new(0)),
         scheduler,
-        batching,
         activity,
+        preparation: Arc::new(preparation::Pool::new(limits)),
+        limits,
     };
     let router = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(completions))
+        .route(
+            "/v1/chat/completions",
+            post(completions).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                preparation::ingress,
+            )),
+        )
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&settings.listen)
         .await
         .map_err(|e| e.to_string())?;
     eprintln!(
-        "API READY http://{}/v1; context {context}; continuous_batching={batching}, max_active={}, queue 128",
+        "API READY http://{}/v1; context {context}; continuous_batching=true, max_active={}, queue 128",
         settings.listen, scheduler.max_active
     );
+    let shutdown_at = Arc::new(std::sync::Mutex::new(None));
+    let signal_shutdown_at = Arc::clone(&shutdown_at);
     let signal_shutdown = Arc::clone(&shutdown);
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            signal_shutdown.store(true, Ordering::Relaxed);
-        })
-        .await
-        .map_err(|e| e.to_string());
+    let draining = Arc::new(tokio::sync::Notify::new());
+    let signal_draining = Arc::clone(&draining);
+    let signal_lifecycle = Arc::clone(&lifecycle);
+    let result = {
+        let server = axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                if let Ok(mut started) = signal_shutdown_at.lock() {
+                    *started = Some(Instant::now());
+                }
+                signal_lifecycle.drain();
+                signal_shutdown.store(true, Ordering::Relaxed);
+                signal_draining.notify_one();
+            })
+            .into_future();
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => result.map_err(|e| e.to_string()),
+            _ = draining.notified() => {
+                match tokio::time::timeout(std::time::Duration::from_millis(limits.drain_ms), &mut server).await {
+                    Ok(result) => result.map_err(|e| e.to_string()),
+                    Err(_) => Err("HTTP drain deadline exceeded".into()),
+                }
+            }
+        }
+    };
     shutdown.store(true, Ordering::Relaxed);
+    let remaining_ms = shutdown_at
+        .lock()
+        .ok()
+        .and_then(|v| *v)
+        .map(|at| {
+            limits
+                .drain_ms
+                .saturating_sub(at.elapsed().as_millis().min(u64::MAX as u128) as u64)
+        })
+        .unwrap_or(limits.drain_ms);
+    if !wait_worker(&worker, remaining_ms).await {
+        return Err("GPU worker did not exit before drain deadline".into());
+    }
     worker
         .join()
         .map_err(|_| "GPU worker panicked".to_owned())?;
@@ -353,20 +469,21 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
     let kind = match status {
         StatusCode::UNAUTHORIZED => "authentication_error",
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
-        StatusCode::INTERNAL_SERVER_ERROR => "server_error",
+        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => "server_error",
         _ => "invalid_request_error",
     };
     (status, Json(json!({"error":{"message":message.into(),"type":kind,"param":null,"code":status.as_u16().to_string()}}))).into_response()
 }
-async fn health(State(state): State<Service>) -> Json<Value> {
-    Json(
-        json!({"status":"ready","model":state.model.as_ref(),"max_context":state.context,
-        "continuous_batching":state.batching,"scheduler":state.scheduler,
+async fn health(State(state): State<Service>) -> Response {
+    (if state.activity.lifecycle.is_ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(
+        json!({"status":state.activity.lifecycle.name(),"failure":state.activity.lifecycle.failure(),"model":state.model.as_ref(),"max_context":state.context,
+        "frontend_assets":state.codec.asset_hashes,
+        "continuous_batching":true,"scheduler":state.scheduler,
         "scheduler_statistics":state.activity.statistics.lock().ok().map(|s| s.clone()),
         "admission_statistics":state.activity.admission.lock().ok().map(|s| s.clone()),
         "active_requests":state.activity.active.load(Ordering::Relaxed),
         "queued_requests":state.activity.queued.load(Ordering::Relaxed)}),
-    )
+    )).into_response()
 }
 async fn models(State(state): State<Service>, headers: HeaderMap) -> Response {
     if !authorized(&state, &headers) {
@@ -376,26 +493,53 @@ async fn models(State(state): State<Service>, headers: HeaderMap) -> Response {
 }
 async fn completions(
     State(state): State<Service>,
-    headers: HeaderMap,
+    axum::Extension(admission): axum::Extension<preparation::Ingress>,
     body: std::result::Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
-    if !authorized(&state, &headers) {
-        return error(StatusCode::UNAUTHORIZED, "Invalid API key");
-    }
     let request = match body {
         Ok(Json(v)) => v,
         Err(e) => return error(e.status(), e.body_text()),
     };
-    let slot = match Arc::clone(&state.slots).try_acquire_owned() {
-        Ok(slot) => slot,
-        Err(_) => return error(StatusCode::TOO_MANY_REQUESTS, "Request queue is full"),
+    let preparation::Ingress { slot, body } = admission;
+    let memory_mib = preparation::request_memory_mib(&request, state.context);
+    if memory_mib as usize > state.limits.memory_mib {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Request exceeds preprocessing memory budget",
+        );
+    }
+    let memory = match Arc::clone(&state.preparation.memory)
+        .acquire_many_owned(memory_mib)
+        .await
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Preprocessing memory unavailable",
+            );
+        }
+    };
+    let cpu = match Arc::clone(&state.preparation.workers).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "Preprocessing unavailable"),
     };
     let codec = Arc::clone(&state.codec);
     let model = Arc::clone(&state.model);
     let context = state.context;
     let vision = state.vision.clone();
+    let cancellation = preparation::Cancellation::default();
+    let flag = cancellation.flag();
     let prepared = match tokio::task::spawn_blocking(move || {
-        codec.prepare(request, &model, context, vision.as_ref())
+        // Admission and memory belong to actual work, including after handler cancellation.
+        let _cpu = cpu;
+        let _body = body;
+        let mut preparation = preparation::Context::new(flag, memory_mib as usize * 1024 * 1024);
+        preparation.checkpoint(0)?;
+        let prepared =
+            codec.prepare(request, &model, context, vision.as_ref(), &mut preparation)?;
+        preparation.checkpoint(0)?;
+        Ok::<_, String>((prepared, slot, memory))
     })
     .await
     {
@@ -403,6 +547,10 @@ async fn completions(
         Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, e),
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    let (prepared, slot, memory) = prepared;
+    if !state.activity.lifecycle.is_ready() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker is not ready");
+    }
     let stream = prepared.stream;
     let (events, mut responses) = mpsc::channel(64);
     let created = SystemTime::now()
@@ -412,6 +560,8 @@ async fn completions(
     let serial = state.ids.fetch_add(1, Ordering::Relaxed);
     let job = Job {
         _slot: slot,
+        _memory: Some(memory),
+        limits: state.limits,
         prepared,
         events,
         id: format!("chatcmpl-{created}-{}-{serial}", std::process::id()),
@@ -427,20 +577,17 @@ async fn completions(
         };
     }
     if stream {
-        let events = futures_util::stream::unfold(
-            (responses, false),
-            |(mut receiver, done)| async move {
+        let events =
+            futures_util::stream::unfold((responses, false), |(mut receiver, done)| async move {
                 if done {
                     return None;
                 }
-                match receiver.recv().await {
-                Some(ModelEvent::Chunk(chunk)) => Some((Ok::<_, Infallible>(Event::default().data(chunk.to_string())), (receiver, false))),
-                Some(ModelEvent::Complete(_)) => Some((Ok(Event::default().data("[DONE]")), (receiver, true))),
-                Some(ModelEvent::Failed(message)) => Some((Ok(Event::default().data(json!({"error":{"message":message,"type":"server_error","code":"generation_error"}}).to_string())), (receiver, false))),
-                None => Some((Ok(Event::default().data("[DONE]")), (receiver, true))),
-            }
-            },
-        );
+                let (payload, terminal) = stream_payload(receiver.recv().await);
+                Some((
+                    Ok::<_, Infallible>(Event::default().data(payload)),
+                    (receiver, terminal),
+                ))
+            });
         Sse::new(events)
             .keep_alive(KeepAlive::default())
             .into_response()
@@ -458,211 +605,59 @@ async fn completions(
 fn chunk(job: &Job, model: &str, delta: Value, finish: Option<&str>) -> Value {
     json!({"id":job.id,"object":"chat.completion.chunk","created":job.created,"model":model,"choices":[{"index":0,"delta":delta,"finish_reason":finish,"logprobs":null}]})
 }
-fn send_delta(job: &Job, model: &str, delta: Value) -> bool {
-    job.events
-        .blocking_send(ModelEvent::Chunk(chunk(job, model, delta, None)))
-        .is_ok()
-}
-fn worker_loop(
-    model: &mut Model,
-    mut jobs: mpsc::Receiver<Job>,
-    codec: &ChatCodec,
-    model_id: &str,
-    shutdown: &AtomicBool,
-) {
-    let mut waiting = Vec::new();
-    loop {
-        if waiting.is_empty() {
-            let Some(job) = jobs.blocking_recv() else {
-                break;
-            };
-            waiting.push(job);
+async fn wait_worker(worker: &std::thread::JoinHandle<()>, timeout_ms: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    while !worker.is_finished() {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
         }
-        while waiting.len() < 128 {
-            match jobs.try_recv() {
-                Ok(job) => waiting.push(job),
-                Err(_) => break,
-            }
-        }
-        waiting.retain(|job| !job.events.is_closed());
-        if waiting.is_empty() {
-            continue;
-        }
-        // Reorder queued work only; never delay a runnable request to form a batch.
-        // Age wins after two seconds, so cache locality cannot starve cold prompts.
-        let now = Instant::now();
-        let scores: Vec<_> = waiting
-            .iter()
-            .map(|job| {
-                let cached = model
-                    .cached_prefix_tokens(&job.prepared.input, &job.prepared.images)
-                    .unwrap_or(0);
-                (now.duration_since(job.queued), cached)
-            })
-            .collect();
-        let index = select_queued(&scores);
-        let job = waiting.remove(index);
-        if job.events.is_closed() {
-            continue;
-        }
-        let result = generate_job(model, codec, model_id, &job, shutdown);
-        if let Err(error) = result {
-            eprintln!("{}: {error}", job.id);
-            let _ = job.events.blocking_send(ModelEvent::Failed(error));
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
+    true
 }
 
-fn select_queued(scores: &[(std::time::Duration, usize)]) -> usize {
-    scores
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            let aged_a = a.0 >= std::time::Duration::from_secs(2);
-            let aged_b = b.0 >= std::time::Duration::from_secs(2);
-            aged_a.cmp(&aged_b).then_with(|| {
-                if aged_a {
-                    a.0.cmp(&b.0)
-                } else {
-                    a.1.cmp(&b.1).then(a.0.cmp(&b.0))
-                }
-            })
-        })
-        .map(|(i, _)| i)
-        .expect("nonempty queue")
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]
-mod scheduling_tests {
+mod stream_tests {
     use super::*;
+    #[tokio::test]
+    async fn stuck_worker_cannot_block_shutdown_indefinitely() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            gate.recv().unwrap();
+        });
+        assert!(!wait_worker(&worker, 5).await);
+        release.send(()).unwrap();
+        assert!(wait_worker(&worker, 1000).await);
+        worker.join().unwrap();
+    }
     #[test]
-    fn locality_reorders_fresh_jobs_but_waiting_age_prevents_starvation() {
-        use std::time::Duration as D;
+    fn abnormal_worker_eof_cannot_look_like_successful_partial_output() {
+        let (payload, terminal) = stream_payload(None);
+        assert!(terminal);
+        assert!(serde_json::from_str::<Value>(&payload).unwrap()["error"].is_object());
+        assert_ne!(payload, "[DONE]");
+        assert!(stream_payload(Some(ModelEvent::Failed("fault".into()))).1);
         assert_eq!(
-            select_queued(&[(D::from_millis(100), 0), (D::from_millis(50), 8000)]),
-            1
-        );
-        assert_eq!(
-            select_queued(&[(D::from_secs(3), 0), (D::from_secs(1), 8000)]),
-            0
-        );
-        assert_eq!(
-            select_queued(&[(D::from_secs(4), 0), (D::from_secs(3), 8000)]),
-            0
+            stream_payload(Some(ModelEvent::Complete(json!({})))).0,
+            "[DONE]"
         );
     }
-}
-fn generate_job(
-    model: &mut Model,
-    codec: &ChatCodec,
-    model_id: &str,
-    job: &Job,
-    shutdown: &AtomicBool,
-) -> Result<()> {
-    if shutdown.load(Ordering::Relaxed) {
-        return Err("Server shutting down".into());
-    }
-    let start = Instant::now();
-    let queue_s = job.queued.elapsed().as_secs_f64();
-    let mut parser = output::Output::new(
-        job.prepared.thinking,
-        job.prepared.tools.clone(),
-        job.prepared.stops.clone(),
-        &job.id,
-    );
-    let mut decoder = codec.tokenizer.decode_stream(false);
-    let mut parse_error = None;
-    let mut eos = false;
-    let mut cancelled = false;
-    model.set_prefix_cache_hints(job.prepared.prefix_hints.clone());
-    if !send_delta(job, model_id, json!({"role":"assistant","content":""})) {
-        return Ok(());
-    }
-    let count = model.generate_visual(
-        &job.prepared.input,
-        &job.prepared.images,
-        job.prepared.max_tokens,
-        &job.prepared.sampling,
-        || job.events.is_closed() || shutdown.load(Ordering::Relaxed),
-        |id| {
-            if job.events.is_closed() || shutdown.load(Ordering::Relaxed) {
-                cancelled = true;
-                return false;
-            }
-            if codec.eos.contains(&id) {
-                eos = true;
-                return false;
-            }
-            let parsed = decoder
-                .step(id)
-                .map_err(|e| e.to_string())
-                .and_then(|text| parser.push(text.as_deref().unwrap_or(""), false));
-            match parsed {
-                Ok(deltas) => {
-                    for delta in deltas {
-                        if !send_delta(job, model_id, delta) {
-                            cancelled = true;
-                            return false;
-                        }
-                    }
-                }
-                Err(e) => {
-                    parse_error = Some(e);
-                    return false;
-                }
-            }
-            !parser.stopped
-        },
-    )?;
-    if cancelled {
-        return Ok(());
-    }
-    if let Some(e) = parse_error {
-        return Err(e);
-    }
-    let exhausted = !eos && !parser.stopped && count == job.prepared.max_tokens;
-    for delta in parser.finish(exhausted, &job.prepared.tool_choice, job.prepared.parallel)? {
-        if !send_delta(job, model_id, delta) {
-            return Ok(());
-        }
-    }
-    let finish = if exhausted {
-        "length"
-    } else if !parser.calls.is_empty() {
-        "tool_calls"
-    } else {
-        "stop"
-    };
-    let usage = json!({"prompt_tokens":job.prepared.input.len(),"completion_tokens":count,"total_tokens":job.prepared.input.len()+count,"prompt_tokens_details":{"cached_tokens":model.prefix_statistics().cached_tokens}});
-    let response = json!({"id":job.id,"object":"chat.completion","created":job.created,"model":model_id,
-        "choices":[{"index":0,"message":parser.message(),"finish_reason":finish,"logprobs":null}],"usage":usage});
-    let _ = job.events.blocking_send(ModelEvent::Chunk(chunk(
-        job,
-        model_id,
-        json!({}),
-        Some(finish),
-    )));
-    if job.prepared.include_usage {
-        let _ = job.events.blocking_send(ModelEvent::Chunk(json!({"id":job.id,"object":"chat.completion.chunk","created":job.created,"model":model_id,"choices":[],"usage":usage})));
-    }
-    let _ = job.events.blocking_send(ModelEvent::Complete(response));
-    eprintln!(
-        "{}: {} prompt, {count} completion tokens, queue {queue_s:.3}s, generation {:.3}s, finish {finish}",
-        job.id,
-        job.prepared.input.len(),
-        start.elapsed().as_secs_f64()
-    );
-    if let Some(stats) = model.speculation_statistics() {
-        eprintln!(
-            "{}: MTP {}",
-            job.id,
-            serde_json::to_string(stats).map_err(|e| e.to_string())?
-        );
-    }
-    eprintln!(
-        "{}: prefix {}",
-        job.id,
-        serde_json::to_string(model.prefix_statistics()).map_err(|e| e.to_string())?
-    );
-    Ok(())
 }
