@@ -212,7 +212,7 @@ pub(crate) struct Loaded {
 }
 
 pub fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 pub(crate) fn read_identity(base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {

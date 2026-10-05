@@ -233,7 +233,7 @@ fn complete_prefix_state(model: &ModelRuntime, position: usize) -> BTreeMap<Stri
                 }
                 hash.update(&raw[..count]);
             }
-            (name, format!("{:x}", hash.finalize()))
+            (name, hex::encode(hash.finalize()))
         })
         .collect()
 }
@@ -584,7 +584,7 @@ fn snapshot(model: &ModelRuntime, position: usize) -> BTreeMap<String, String> {
                 }
                 digest.update(&scratch[..count]);
             }
-            (name.clone(), format!("{:x}", digest.finalize()))
+            (name.clone(), hex::encode(digest.finalize()))
         })
         .collect()
 }

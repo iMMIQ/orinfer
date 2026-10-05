@@ -12,7 +12,8 @@ from pathlib import Path
 import shutil
 import time
 
-from safetensors import safe_open, serialize_file
+import numpy as np
+from safetensors import TensorSpec, safe_open, serialize_file
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.model.publication import file_hash, source_path, write_json, staged_directory
@@ -113,6 +114,8 @@ def _write_containers(model, checkpoint, output, shard_bytes=1024**3):
     for number, group in enumerate(groups, 1):
         filename = f'model-{number:05d}-of-{len(groups):05d}.safetensors'
         tensors = {}
+        # TensorSpec borrows storage on Python 3.10; retain every owner until serialization ends.
+        payloads = {}
         metadata = {'orin.cache_format': '1'}
         for buffer, path, dtype, _ in group:
             data = path.read_bytes()
@@ -120,7 +123,9 @@ def _write_containers(model, checkpoint, output, shard_bytes=1024**3):
             if digest != buffer['data']['sha256']:
                 raise ValueError(f'{buffer["name"]}: source sha256 mismatch')
             name = buffer['name']
-            tensors[name] = {'dtype': RAW_DTYPES[dtype], 'shape': buffer['shape'], 'data': data}
+            payloads[name] = np.frombuffer(data, dtype=np.uint8)
+            tensors[name] = TensorSpec(dtype=RAW_DTYPES[dtype], shape=buffer['shape'],
+                                       data_ptr=payloads[name].ctypes.data, data_len=len(data))
             metadata[f'orin.layout.{name}'] = buffer['layout']
             weight_map[name] = filename
             buffer['data'] = {'tensor': name, 'sha256': digest}
@@ -131,7 +136,7 @@ def _write_containers(model, checkpoint, output, shard_bytes=1024**3):
                 view = reader.get_slice(buffer['name'])
                 if view.get_shape() != buffer['shape'] or view.get_dtype() != dtype:
                     raise ValueError('Written safetensors metadata differs')
-        del tensors, data
+        del tensors, payloads, data
         print(f'prepared shard {number}/{len(groups)}', flush=True)
     write_json(weights / 'model.safetensors.index.json', {
         'metadata': {'total_size': total_size}, 'weight_map': weight_map,

@@ -6,7 +6,7 @@
 
 ## 构建
 
-主机需要aarch64 Linux、Rust、CUDA Driver和本机AOT模型产物。开发环境使用Rust1.98.1；workspace声明的最低版本为1.88。离线kernel编译需要TileLang0.1.13、PyTorch2.9.1、CUDA12.6及NVIDIA Docker。
+主机需要aarch64 Linux、Rust、CUDA Driver和本机AOT模型产物。开发环境使用Rust1.99.0；workspace声明的最低版本为1.88。离线kernel编译需要TileLang0.1.15、PyTorch2.9.1、CUDA12.6及NVIDIA Docker。 CPU开发检查用`uv`管理独立`.venv`，先执行`make python-env`再执行`make check`。
 
 ```bash
 cargo fetch --locked  # 首次安装Rust依赖

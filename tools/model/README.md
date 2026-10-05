@@ -6,7 +6,7 @@
 
 需要自行准备与模型匹配的checkpoint，并通过构建入口的`--checkpoint`指定HF目录。基线构建器支持asymmetric compressed-tensors W4/group128的Qwen3_5 27B，读取单文件或分片safetensors；其他格式导入不属于此入口。位于仓库外的目录设`ORIN_CHECKPOINT_DIR`进行只读挂载。投影验证使用`artifacts/experimental-vllm/activations/`中的真实L0输入；运行前需准备这些外部数据，文件名见验证入口。LUT4验证支持`--activations-dir`。
 
-GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用NVIDIA Docker编译镜像和GPU锁；先用`make compiler-image`从公开的固定版本基底构建`orin-llm-compiler:0.1.0`，包含TileLang0.1.13/Torch2.9.1/CUDA12.6。源码提供镜像配方，checkpoint需自行准备，详见[编译环境](../build/README.md)。CPU组装入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
+GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用NVIDIA Docker编译镜像和GPU锁；先用`make compiler-image`从公开的固定版本基底构建`orin-llm-compiler:0.1.0`，包含TileLang0.1.15/Torch2.9.1/CUDA12.6。源码提供镜像配方，checkpoint需自行准备，详见[编译环境](../build/README.md)。CPU组装先执行`make python-env`和`source .venv/bin/activate`，入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
 
 ## 从checkpoint重建
 

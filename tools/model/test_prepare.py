@@ -69,6 +69,17 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(buffer['data'], {'tensor': name, 'sha256': hashlib.sha256(self.data[name]).hexdigest()})
         self.assertEqual((self.output / 'config.json').read_bytes(), (self.checkpoint / 'config.json').read_bytes())
 
+    def test_multiple_tensor_owners_survive_single_shard_serialization(self):
+        report = self.run_prepare(size=1024)
+        self.assertEqual(report['shard_count'], 1)
+        path = next((self.output / 'cache/weights').glob('*.safetensors'))
+        raw = path.read_bytes()
+        header_size = int.from_bytes(raw[:8], 'little')
+        header = json.loads(raw[8:8 + header_size])
+        for name, expected in self.data.items():
+            begin, end = header[name]['data_offsets']
+            self.assertEqual(raw[8 + header_size + begin:8 + header_size + end], expected)
+
     def test_corruption_never_publishes_partial_directory(self):
         (self.source / 'Norm.bin').write_bytes(b'bad!')
         with self.assertRaisesRegex(ValueError, 'sha256'):

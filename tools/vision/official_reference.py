@@ -38,9 +38,8 @@ def main():
         weights = {k.removeprefix('model.visual.'): source.get_tensor(k).to(dtype)
                    for k in source.keys() if k.startswith('model.visual.')}
     model.load_state_dict(weights, strict=True, assign=True)
-    # Nonpersistent rotary buffer was created on meta; restore the official formula.
-    rope = model.rotary_pos_emb
-    rope.inv_freq = 1.0 / (rope.theta ** (torch.arange(0, rope.dim, 2).float() / rope.dim))
+    # Recreate nonpersistent meta buffers through the official initializer.
+    model.rotary_pos_emb = type(model.rotary_pos_emb)(config)
     model = model.to(args.device).eval()
     def snapshot(name, value):
         value.half().detach().cpu().contiguous().view(torch.uint8).numpy().tofile(args.output/(name+'.f16'))

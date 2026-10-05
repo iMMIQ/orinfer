@@ -28,7 +28,7 @@
 ## 开发
 
 - 先用rg检查调用者和依赖；保持修改小而完整。不要默认启动subagent。
-- `make check`执行Rust格式/编译/clippy/测试及CPU评测检查；GPU验证用`bash tools/operators/run.sh`。
+- CPU Python依赖用uv管理项目`.venv`，通过`make python-env`同步固定版本，不直接更新主机Python环境。`make check`执行Rust格式/编译/clippy/测试及CPU评测检查；GPU验证用`bash tools/operators/run.sh`的固定编译镜像。
 - GPU工作通过`artifacts/gpu-experiment.lock`串行，保留其他服务；不自行改全局频率、功耗或清缓存。
 - 新kernel验证数值、非对齐尾部和实际graph replay；状态改动另测分块、恢复和请求隔离。
 - 源码库保留实现、必要构建工具、测试、示例与使用文档。不提交研究过程、agent交付记录、历史实验报告或本机环境证据。

@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 orin-api = { path = "../orin-api" }
 orin-engine.workspace = true
-serde_json = "=1.0.150"
+serde_json = "=1.0.151"
 
 [lints]
 workspace = true
