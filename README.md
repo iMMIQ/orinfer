@@ -55,15 +55,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 ## 性能与范围
 
-Jetson AGX Orin 64GB、27B 参考配置的单流测量：关闭 MTP 和 prefix cache，每档三次、每次生成 128 tokens，取中位数。
-
-| 输入 tokens | Prefill tokens/s | Decode tokens/s |
-| --- | ---: | ---: |
-| 512 | 676.38 | 10.919 |
-| 2048 | 818.90 | 10.753 |
-| 8192 | 773.50 | 10.150 |
-
-这是固定块 token-ID 请求的引擎计时：包含输入复制与同步，prefill 排除末位置 head，decode 排除首 token；不包含 API 分词、排队或不完整输入块的尾部处理。模型包、上下文长度和并发会影响结果；测量方法见[性能工具](tools/bench/README.md)。
+Jetson AGX Orin 64GB、27B 参考配置开启 MTP 后，Python 归并排序、Rust LRU 缓存和 TypeScript 异步 map 三个代码生成场景的单流 decode 中位数分别为 **26.17、25.23、25.95 tokens/s**。每个场景测量三次，每次生成 128 tokens；decode 按实际输出 tokens 计时，排除首 token。
 
 目前只支持上述硬件和架构，不支持视频、音频、`n>1`、API logprobs 或 JSON 约束解码。量化质量使用同源 BF16/FP8 的固定场景和同历史概率对照；完整 LLM benchmark 和独立 BF16 256K 质量评测尚未覆盖，见[质量评测](tools/eval/README.md)。
 
