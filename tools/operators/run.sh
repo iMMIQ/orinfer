@@ -76,5 +76,5 @@ docker run --rm --name "$container_name" --runtime nvidia --network none \
     -e PYTHONDONTWRITEBYTECODE=1 \
     -e ORIN_OPERATOR_OUTPUT="$output_dir" -e TILELANG_CACHE_DIR="$output_dir/cache" \
     -e LD_PRELOAD=/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1 \
-    "${ORIN_OPERATOR_IMAGE:-orin-llm-compiler:0.1.0}" "${command_args[@]}" \
+    "${ORIN_OPERATOR_IMAGE:-orin-llm-compiler:0.1.1}" "${command_args[@]}" \
     --output "$output_dir" "$@" 2>&1 | tee "$output_dir/run.log"

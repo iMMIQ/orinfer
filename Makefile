@@ -25,10 +25,10 @@ info:
 	cargo run --offline -p orin-cli -- info
 
 compiler-image:
-	docker build -t orin-llm-compiler:0.1.0 -f tools/build/compiler.Dockerfile .
+	docker build -t orin-llm-compiler:0.1.1 -f tools/build/compiler.Dockerfile .
 
 check-offline:
-	docker run --rm --runtime runc -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint python3 orin-llm-compiler:0.1.0 -m unittest tools.model.test_mtp_weights -v
+	docker run --rm --runtime runc -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint python3 orin-llm-compiler:0.1.1 -m unittest tools.model.test_mtp_weights -v
 
 check-gpu:
 	$(PYTHON) tools/bench/check_gpu.py --model "$(MODEL)" --output "$(OUTPUT)"

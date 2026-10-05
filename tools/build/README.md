@@ -9,7 +9,7 @@ make compiler-image
 make check-offline
 ```
 
-`compiler.Dockerfile`使用公开 NVIDIA Jetson CUDA 12.6/PyTorch 2.9.1 镜像的固定 digest，使用固定版本uv管理镜像内的`/opt/venv`，安装TileLang 0.1.15和Transformers 5.18.0编译/参考栈，不复制模型或编译缓存。`compiler-requirements.txt`固定覆盖包版本，其余依赖由基底镜像 digest 固定；移除未使用的vLLM、PyGObject和CUTLASS Python包以避免遗留依赖约束。默认镜像名为`orin-llm-compiler:0.1.0`，可用`ORIN_OPERATOR_IMAGE`覆盖。
+`compiler.Dockerfile`使用公开 NVIDIA Jetson CUDA 12.6/PyTorch 2.9.1 镜像的固定 digest，使用固定版本uv管理镜像内的`/opt/venv`，安装TileLang 0.1.15和Transformers 5.18.0编译/参考栈，不复制模型或编译缓存。`compiler-requirements.txt`固定覆盖包版本，其余依赖由基底镜像 digest 固定；移除未使用的vLLM、PyGObject和CUTLASS Python包以避免遗留依赖约束。默认镜像名为`orin-llm-compiler:0.1.1`，可用`ORIN_OPERATOR_IMAGE`覆盖。
 
 GPU编译入口：
 
