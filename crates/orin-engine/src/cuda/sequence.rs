@@ -15,6 +15,33 @@ pub(super) struct Sequence {
 }
 
 impl Executor {
+    /// Upload an architecture-supplied pointer table. Addresses are derived only
+    /// from retained, leased arenas; null entries are inactive lanes. The upload
+    /// finishes before capture/replay and cannot change arena ownership.
+    pub(crate) fn upload_sequence_addresses(
+        &self,
+        name: &str,
+        bindings: &[Option<(usize, String)>],
+    ) -> Result<()> {
+        let mut bytes = Vec::with_capacity(bindings.len() * 8);
+        for binding in bindings {
+            let address = if let Some((slot, buffer)) = binding {
+                let arena = self
+                    .sequences
+                    .get(*slot)
+                    .filter(|s| s.leased)
+                    .ok_or("Address table references an unleased arena")?;
+                *arena
+                    .addresses
+                    .get(buffer)
+                    .ok_or("Address table requires private state")?
+            } else {
+                0
+            };
+            bytes.extend_from_slice(&address.to_le_bytes());
+        }
+        self.upload_bytes(name, &bytes)
+    }
     #[cfg(test)]
     pub(crate) fn private_buffer_sizes(&self) -> BTreeMap<String, usize> {
         let reservations = self.session.virtual_buffers.borrow();
@@ -390,8 +417,25 @@ impl Executor {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
+                let dynamic_spec;
+                let spec = if let Some(launch) = &invocation.launch {
+                    dynamic_spec = {
+                        let mut spec = k.spec.clone();
+                        spec.grid = launch.grid;
+                        spec
+                    };
+                    for &(index, value) in &launch.arguments {
+                        if !matches!(k.spec.args.get(index), Some(Argument::I32 { .. })) {
+                            return Err("Dynamic launch changed a non-i32 argument".into());
+                        }
+                        values[index] = Value::I32(value);
+                    }
+                    &dynamic_spec
+                } else {
+                    &k.spec
+                };
                 super::launch_kernel(
-                    &k.spec,
+                    spec,
                     k.function,
                     &mut values,
                     &self.session.driver,
@@ -521,6 +565,7 @@ impl Executor {
             .map(|operation| Invocation {
                 operation,
                 sequence: None,
+                launch: None,
                 views: BTreeMap::new(),
             })
             .collect();
@@ -703,6 +748,13 @@ impl Executor {
         &mut self,
         operations: &[Invocation],
     ) -> Result<Vec<Vec<f32>>> {
+        self.profile_graph_operations_at_position(operations, None)
+    }
+    pub(crate) fn profile_graph_operations_at_position(
+        &mut self,
+        operations: &[Invocation],
+        position: Option<(&str, u32)>,
+    ) -> Result<Vec<Vec<f32>>> {
         self.sync()?;
         let events = self.profile_events(operations.len() + 1)?;
         type Record = unsafe extern "C" fn(Handle, Handle, u32) -> i32;
@@ -773,6 +825,9 @@ impl Executor {
         self.session.graphs.borrow_mut().push((graph, exec));
         let mut trials = vec![];
         for trial in 0..4 {
+            if let Some((name, value)) = position {
+                self.upload_ids(name, &[value])?;
+            }
             // SAFETY: All request buffers are retained; bounded extra steps fit reservations.
             unsafe {
                 check(

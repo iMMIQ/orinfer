@@ -4,7 +4,7 @@ use std::process::ExitCode;
 fn model_options(args: &[String]) -> Result<LoadOptions, String> {
     if args.len() < 2 {
         return Err(
-            "Usage: orin-llm run-model MODEL_DIR REQUESTS.json [--cuda-graph decode_only|full|off]"
+            "Usage: orin-llm <run-model | score-model> MODEL_DIR REQUESTS.json [--cuda-graph decode_only|full|off]"
                 .into(),
         );
     }
@@ -59,7 +59,10 @@ fn main() -> ExitCode {
             }
         };
     }
-    if args.first().is_some_and(|c| c == "run-model") {
+    if args
+        .first()
+        .is_some_and(|c| c == "run-model" || c == "score-model")
+    {
         let options = match model_options(&args[1..]) {
             Ok(options) => options,
             Err(error) => {
@@ -67,19 +70,28 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        return match orin_engine::model::run_with_options(
-            std::path::Path::new(&args[1]),
-            std::path::Path::new(&args[2]),
-            options,
-        )
-        .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
-        {
+        let result = if args[0] == "score-model" {
+            orin_engine::model::score_with_options(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                options,
+            )
+            .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
+        } else {
+            orin_engine::model::run_with_options(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                options,
+            )
+            .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
+        };
+        return match result {
             Ok(json) => {
                 println!("{json}");
                 ExitCode::SUCCESS
             }
             Err(error) => {
-                eprintln!("run-model: {error}");
+                eprintln!("{}: {error}", args[0]);
                 ExitCode::FAILURE
             }
         };
@@ -128,7 +140,7 @@ fn main() -> ExitCode {
         "plan" => println!("{}", orin_engine::BENCHMARK_PLAN),
         "--version" | "-V" => println!("orin-llm {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!(
-            "Usage: orin-llm [info | plan | --version | --help]\n       orin-llm <validate-artifact | run-artifact> MANIFEST.json\n       orin-llm run-model MODEL_DIR REQUESTS.json [--cuda-graph MODE]\n       orin-llm serve MODEL_DIR [--listen HOST:PORT] [--model MODEL_ID] [--cuda-graph MODE]\n\n--cuda-graph MODE     decode_only (default), full or off\n--listen HOST:PORT    Default: 0.0.0.0:8088\n--prefix-cache-mib N  Server snapshot budget: 12288 MiB; 0 disables reuse\n--max-active-requests N  Active request limit: 32 (1..128)\n--max-batch-tokens N     Iteration token budget: 128 (1..128)\n--prefill-budget-ms N    Mixed prefill predicted budget: 200 ms\n--memory-reserve-mib N   Admission memory reserve: 1024 MiB\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nplan-model           Inspect the registered execution plan without CUDA\nvalidate-model       Verify model, operator package and tensor hashes without CUDA\nrun-model            Load custom model data and registered plans with private state"
+            "Usage: orin-llm [info | plan | --version | --help]\n       orin-llm <validate-artifact | run-artifact> MANIFEST.json\n       orin-llm <run-model | score-model> MODEL_DIR REQUESTS.json [--cuda-graph MODE]\n       orin-llm serve MODEL_DIR [--listen HOST:PORT] [--model MODEL_ID] [--cuda-graph MODE]\n\n--cuda-graph MODE     decode_only (default), full or off\n--listen HOST:PORT    Default: 0.0.0.0:8088\n--prefix-cache-mib N  Server snapshot budget: 12288 MiB; 0 disables reuse\n--max-active-requests N  Active request limit: 32 (1..128)\n--max-batch-tokens N     Iteration token budget: 128 (1..128)\n--prefill-budget-ms N    Mixed prefill predicted budget: 200 ms\n--memory-reserve-mib N   Admission memory reserve: 1024 MiB\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nplan-model           Inspect the registered execution plan without CUDA\nvalidate-model       Verify model, operator package and tensor hashes without CUDA\nrun-model            Load custom model data and registered plans with private state\nscore-model          Score frozen token histories through real prefill/decode kernels"
         ),
         other => {
             eprintln!(

@@ -136,6 +136,7 @@ impl ModelRuntime {
             age_s: 0.,
             remaining_s: self.prefill_costs.remaining(cached, input.len()),
             restore_s: self.prefill_costs.restore_cost(bytes),
+            remaining_tokens: input.len().saturating_sub(cached),
         })
     }
     pub(crate) fn can_admit_request(
@@ -164,8 +165,7 @@ impl ModelRuntime {
             .and_then(|n| n.checked_add(options.memory_reserve_bytes))
             .ok_or("Admission budget overflow")?;
         if self
-            .execution
-            .free_bytes()?
+            .admission_free_bytes()?
             .saturating_add(self.prefix_cache.bytes)
             < needed
         {
@@ -177,7 +177,7 @@ impl ModelRuntime {
             }
             return Ok(false);
         }
-        while self.execution.free_bytes()? < needed {
+        while self.admission_free_bytes()? < needed {
             let Some(snapshot) = self.prefix_cache.evict_one() else {
                 self.scheduler_statistics.admission_deferrals += 1;
                 if self.reserved_requests.is_empty() {
@@ -189,6 +189,12 @@ impl ModelRuntime {
         }
         self.trim_request_cache(options, fixed + prospective, context)?;
         Ok(true)
+    }
+    fn admission_free_bytes(&self) -> Result<usize> {
+        Ok(self
+            .execution
+            .free_bytes()?
+            .min(scheduler::usable_host_bytes()?))
     }
     fn pending_workspace(&self, context: usize) -> Result<usize> {
         self.execution.pending_prefill_workspace_bytes(
@@ -208,7 +214,7 @@ impl ModelRuntime {
             .saturating_sub(self.execution.resident_kv_bytes())
             .checked_add(self.pending_workspace(context)?)
             .ok_or("Future workspace budget overflow")?;
-        let free = self.execution.free_bytes()?;
+        let free = self.admission_free_bytes()?;
         let available = free
             .saturating_sub(future)
             .saturating_sub(additional)
@@ -250,6 +256,9 @@ impl ModelRuntime {
                 && offset < input.input_tokens.len()
                 && let Some(spec) = self.manifest.mtp.clone()
             {
+                if warm.tokens != offset - 1 {
+                    return Err("Restored prefix contains an inconsistent MTP cursor".into());
+                }
                 let at = Instant::now();
                 self.mtp_warm_state(
                     &spec,
@@ -358,7 +367,9 @@ impl ModelRuntime {
         let checkpoint = req.checkpoints.contains(&req.offset);
         if let Some(spec) = self.manifest.mtp.clone() {
             let at = Instant::now();
-            let end = if req.offset < req.input.len() {
+            // A checkpoint must exclude the next prompt token from the draft
+            // state. A different continuation can restore this same prefix.
+            let end = if !checkpoint && req.offset < req.input.len() {
                 req.offset + 1
             } else {
                 req.offset
@@ -372,6 +383,23 @@ impl ModelRuntime {
         }
         if checkpoint {
             self.store_prefix(&req.input[..req.offset], &req.media, req.warm.tokens, true)?;
+            // Bridge only after saving the prefix-consistent P-1 draft state.
+            // This consumes h[P-1] before the next target block can overwrite
+            // its slot in the bounded hidden ring.
+            if req.offset < req.input.len()
+                && let Some(spec) = self.manifest.mtp.clone()
+            {
+                let at = Instant::now();
+                self.mtp_warm_state(
+                    &spec,
+                    &req.input[req.offset..req.offset + 1],
+                    &|| false,
+                    ExecutionPhase::Prefill,
+                    false,
+                )?;
+                req.warm.tokens = req.offset;
+                req.warm.seconds += at.elapsed().as_secs_f64();
+            }
         }
         if req.offset == req.input.len() {
             self.complete_prefill(req)
@@ -450,7 +478,7 @@ impl ModelRuntime {
     fn iteration_key(
         requests: &[&mut RequestState],
         selected: &[(usize, usize)],
-    ) -> (usize, usize, usize) {
+    ) -> (usize, usize, usize, usize) {
         let rows = selected.iter().map(|(_, n)| n).sum::<usize>();
         let context = selected
             .iter()
@@ -461,6 +489,10 @@ impl ModelRuntime {
             selected.len().next_power_of_two(),
             rows.next_power_of_two(),
             context.next_power_of_two(),
+            selected
+                .iter()
+                .filter(|(i, _)| requests[*i].prefilling)
+                .count(),
         )
     }
     fn predict_iteration(
@@ -477,6 +509,66 @@ impl ModelRuntime {
             .map(|(i, n)| requests[*i].history.len() * n)
             .sum();
         0.09 + key.1 as f64 * 0.001 + kv as f64 * 0.0000001
+    }
+    fn pack_prefill(
+        &self,
+        requests: &[&mut RequestState],
+        candidates: &[usize],
+        selected: &mut Vec<(usize, usize)>,
+        cap: usize,
+        budget_ms: f64,
+    ) -> Result<()> {
+        let mut shapes = vec![1];
+        shapes.extend(
+            self.manifest
+                .batch_layout
+                .as_ref()
+                .ok_or("Missing batch layout")?
+                .profiles
+                .iter()
+                .filter(|(_, kind)| {
+                    cap > 128
+                        || matches!(
+                            kind,
+                            crate::architecture::PrefillKind::Sequence
+                                | crate::architecture::PrefillKind::Recurrent
+                        )
+                })
+                .map(|(&n, _)| n),
+        );
+        shapes.sort_unstable();
+        // Split cold prompt cohorts into real chunks before sharing the dense
+        // projections. Leave room for up to four requests in a 2048-row plan.
+        let per_request_cap = if cap > 128 {
+            cap / candidates.len().clamp(1, 4)
+        } else {
+            cap
+        };
+        let mut used: usize = selected.iter().map(|(_, n)| n).sum();
+        let mut has_prefill = false;
+        for &i in candidates {
+            if used == cap {
+                break;
+            }
+            let remaining = Self::prefill_boundary(requests[i]) - requests[i].offset;
+            let chunk = shapes
+                .iter()
+                .copied()
+                .filter(|&n| n <= cap - used && n <= remaining && n <= per_request_cap)
+                .filter(|&n| {
+                    let mut trial = selected.clone();
+                    trial.push((i, n));
+                    (n == 1 && !has_prefill)
+                        || self.predict_iteration(requests, &trial) * 1000. <= budget_ms
+                })
+                .max();
+            if let Some(chunk) = chunk {
+                selected.push((i, chunk));
+                used += chunk;
+                has_prefill = true;
+            }
+        }
+        Ok(())
     }
     pub(crate) fn advance_requests(
         &mut self,
@@ -508,12 +600,14 @@ impl ModelRuntime {
             }
         }
         self.scheduler_statistics.prefill_completion_s += completion_at.elapsed().as_secs_f64();
-        let prefill = requests
+        let mut prefills: Vec<_> = requests
             .iter()
             .enumerate()
             .filter(|(_, r)| r.prefilling)
-            .min_by_key(|(_, r)| r.served)
-            .map(|(i, _)| i);
+            .map(|(i, _)| i)
+            .collect();
+        prefills.sort_unstable_by_key(|&i| (requests[i].served, requests[i].slot));
+        let prefill = prefills.first().copied();
         let mut decode: Vec<_> = requests
             .iter()
             .enumerate()
@@ -549,7 +643,38 @@ impl ModelRuntime {
             self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
             return Ok(output);
         }
-        if decode.is_empty() {
+        let mut cap = options.max_batch_tokens.min(
+            *self
+                .manifest
+                .batch_profiles
+                .iter()
+                .max()
+                .ok_or("Missing batch profiles")?,
+        );
+        // Preserve the dense large-chunk path for long cold prompts. Short
+        // tails can share projection weights without reading across histories.
+        let long_joint = decode.is_empty()
+            && prefills.len() > 1
+            && !self.manifest.prefill_batch_profiles.is_empty()
+            && prefills
+                .iter()
+                .any(|&i| Self::prefill_boundary(requests[i]) - requests[i].offset > cap);
+        if long_joint {
+            cap = self
+                .manifest
+                .prefill_batch_profiles
+                .iter()
+                .map(|p| p.tokens)
+                .max()
+                .unwrap();
+        }
+        let joint_prefill = long_joint
+            || (decode.is_empty()
+                && prefills.len() > 1
+                && prefills
+                    .iter()
+                    .all(|&i| Self::prefill_boundary(requests[i]) - requests[i].offset <= cap));
+        if decode.is_empty() && !joint_prefill {
             if let Some(i) = prefill {
                 let (_, tokens) =
                     self.with_request(requests[i], |model, req| model.advance_prefill(req))?;
@@ -561,16 +686,10 @@ impl ModelRuntime {
             self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
             return Ok(output);
         }
-        let rotate = self.scheduler_cursor % decode.len();
-        decode.rotate_left(rotate);
-        let cap = options.max_batch_tokens.min(
-            *self
-                .manifest
-                .batch_profiles
-                .iter()
-                .max()
-                .ok_or("Missing batch profiles")?,
-        );
+        if !decode.is_empty() {
+            let rotate = self.scheduler_cursor % decode.len();
+            decode.rotate_left(rotate);
+        }
         // Even a one-row configuration must advance waiting prompt work.
         let reserve = usize::from(
             prefill.is_some()
@@ -579,40 +698,19 @@ impl ModelRuntime {
         decode.truncate(cap - reserve);
         self.scheduler_cursor = self.scheduler_cursor.wrapping_add(decode.len());
         let mut selected: Vec<_> = decode.iter().map(|&i| (i, 1)).collect();
-        if let Some(i) = prefill {
-            let remaining = Self::prefill_boundary(requests[i]) - requests[i].offset;
-            let available = cap - selected.len();
-            let mut shapes = vec![1];
-            shapes.extend(
-                self.manifest
-                    .batch_layout
-                    .as_ref()
-                    .ok_or("Missing batch layout")?
-                    .profiles
-                    .iter()
-                    .filter(|(_, kind)| {
-                        matches!(
-                            kind,
-                            crate::architecture::PrefillKind::Sequence
-                                | crate::architecture::PrefillKind::Recurrent
-                        )
-                    })
-                    .map(|(&n, _)| n),
-            );
-            shapes.sort_unstable();
-            let chunk = shapes
-                .into_iter()
-                .filter(|&n| n <= available && n <= remaining)
-                .filter(|&n| {
-                    let mut trial = selected.clone();
-                    trial.push((i, n));
-                    n == 1
-                        || self.predict_iteration(requests, &trial) * 1000.
-                            <= options.prefill_budget_ms
-                })
-                .max();
-            if let Some(chunk) = chunk {
-                selected.push((i, chunk));
+        self.pack_prefill(
+            requests,
+            &prefills,
+            &mut selected,
+            cap,
+            if joint_prefill {
+                f64::INFINITY
+            } else {
+                options.prefill_budget_ms
+            },
+        )?;
+        for &(i, _) in &selected {
+            if requests[i].prefilling {
                 requests[i].served = self.scheduler_statistics.iterations;
             }
         }
@@ -691,6 +789,15 @@ impl ModelRuntime {
             };
             self.execution.ensure_sequence_program(req.slot, &program)?;
         }
+        if self.manifest.batch_gdn
+            && segments.iter().map(|s| s.tokens).sum::<usize>() <= 128
+            && segments.iter().any(|s| s.tokens == 1)
+        {
+            self.execution.upload_sequence_addresses(
+                "BatchGdnPointers",
+                &crate::architecture::batch_state_bindings(&self.manifest, &segments),
+            )?;
+        }
         #[cfg(test)]
         profile::mark("inputs");
         self.scheduler_statistics.batch_inputs_s += inputs_at.elapsed().as_secs_f64();
@@ -724,6 +831,15 @@ impl ModelRuntime {
             .or_default() += 1;
         if !decode_only {
             self.scheduler_statistics.mixed_iterations += 1;
+            let count = selected
+                .iter()
+                .filter(|(i, _)| requests[*i].prefilling)
+                .count();
+            *self
+                .scheduler_statistics
+                .prefill_batch_histogram
+                .entry(count)
+                .or_default() += 1;
         }
         for &(i, chunk) in &selected {
             let tokens = self.with_request(requests[i], |model, req| {

@@ -45,7 +45,14 @@ pub struct Manifest {
     #[serde(skip)]
     pub(crate) batch_profiles: Vec<usize>,
     #[serde(skip)]
+    pub(crate) dynamic_batch_kernels:
+        BTreeMap<String, crate::operators::dynamic::DynamicBatchKernel>,
+    #[serde(skip)]
+    pub(crate) prefill_batch_profiles: Vec<crate::architecture::PrefillProfile>,
+    #[serde(skip)]
     pub(crate) greedy_sampling: bool,
+    #[serde(skip)]
+    pub(crate) batch_gdn: bool,
     #[serde(skip)]
     pub(crate) batch_layout: Option<crate::architecture::BatchLayout>,
 }
@@ -73,7 +80,7 @@ pub(crate) struct KvGrowth {
 }
 
 /// Fixed-shape graphs sharing one model's weights, workspace and private state.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrefillPlan {
     pub chunk_tokens: usize,
@@ -562,6 +569,16 @@ pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
 /// Thread-affine resident model. All CUDA resources remain on the creating thread.
 pub struct Model(crate::runtime::ModelRuntime);
 pub use crate::runtime::requests::{GenerationInput, RequestState, StepOutput};
+pub use crate::runtime::scoring::{Probe, ScoreCase, ScoreReport, ScoreRequests, TokenProbability};
+
+pub fn score_with_options(
+    path: &Path,
+    requests: &Path,
+    options: LoadOptions,
+) -> Result<ScoreReport> {
+    let input = read(requests)?;
+    crate::runtime::ModelRuntime::load_with_options(path, options)?.score(input)
+}
 impl Model {
     pub fn batching_supported(&self) -> bool {
         !self.0.manifest.batch_profiles.is_empty()

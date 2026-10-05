@@ -1,5 +1,5 @@
 {
-  "status": "Engineering acceptance specification; full engine not implemented or measured.",
+  "status": "Phase-one acceptance contract: implementation complete; bounded quality suite accepted and further performance optimization stopped by user. Measurements remain local artifacts.",
   "requirements": {
     "device": "Local Jetson AGX Orin 64GB",
     "model": "Qwen3.8-27B",
@@ -18,19 +18,35 @@
         2048,
         8192
       ],
-      "reference": "Existing local experimental vLLM; exact version, weights and metric definition must be pinned before comparisons.",
-      "evaluation": "Report each input length separately. Client TTFT and executed-token model prefill TPS must not be mixed."
+      "reference": "Pin exact engine/model/tokenizer/kernel identities for comparisons; quantization quality uses the same uncensored source BF16.",
+      "evaluation": "Report each input length separately. Client TTFT and executed-token model prefill TPS must not be mixed.",
+      "status": "Historical 800/10 targets retained for reporting; user accepts current measured performance and ends further optimization.",
+      "hard_gate": false
     },
     "modalities": [
-      "text"
+      "text",
+      "image",
+      "multi_image"
     ],
     "excluded_from_phase_one": [
-      "image",
       "video",
-      "vision encoder",
-      "multimodal processor"
+      "arbitrary weight-format import",
+      "additional model families",
+      "force_int8"
     ],
-    "future_architectures": "Multiple model architectures below 40B parameters on local Orin; phase one remains Qwen text only."
+    "future_architectures": "Registered Rust architecture adapters with separate weight-independent operator packages; additional families are future work.",
+    "max_context": 262144,
+    "compute_policy": "INT8 quality-first mixed precision; critical operators FP16/FP32, persistent GDN FP32.",
+    "model_format": "HF configuration/tokenizer plus custom data descriptor and standard sharded safetensors; separate ABI-checked operator package.",
+    "cuda_graph": {
+      "default": "decode_only",
+      "choices": [
+        "decode_only",
+        "full",
+        "off"
+      ]
+    },
+    "listen_default": "0.0.0.0:8088"
   },
   "weight_accounting": {
     "average_bits_formula": "8 * resident_weight_bytes / included_parameter_count",
@@ -43,17 +59,12 @@
       "codebooks",
       "outlier corrections",
       "padding",
-      "duplicate persistent representations"
+      "duplicate persistent representations",
+      "vision weights",
+      "MTP weights"
     ],
-    "optional_accelerator_weights": "Report separately and in total resident bytes.",
-    "candidate_bits_per_parameter": [
-      4.125,
-      4.25,
-      4.5
-    ],
-    "excluded_from_phase_one": [
-      "vision weights and parameters"
-    ]
+    "optional_accelerator_weights": "Included in total resident bytes and parameters; report separately as well.",
+    "resident_target": "Approximately4-bit including metadata, vision and MTP; slight overhead accepted for quality."
   },
   "metrics": {
     "native_load": "Process launch or explicit model load start to executable model Ready; split IO, context, allocation, module load, graph setup; cold versus warm OS page cache.",
@@ -235,7 +246,37 @@
       128
     ],
     "modalities": [
-      "text"
+      "text",
+      "image",
+      "multi_image"
+    ],
+    "online_long_context": [
+      "near-capacity Chat admission",
+      "MTP enabled",
+      "identical replay with valid budget-retained prefix",
+      "multi-turn continuation",
+      "over-capacity rejection"
+    ],
+    "mixed_acceptance": [
+      "heterogeneous prompt/output lengths",
+      "ordered multi-image requests",
+      "multi-turn branches",
+      "new arrivals during decode",
+      "queueing at 128 submitted clients",
+      "cache eviction under working-set pressure",
+      "cancellation and slot reuse"
+    ],
+    "nonstandard_batch_rows": [
+      3,
+      5,
+      6,
+      7,
+      9,
+      15,
+      31,
+      33,
+      63,
+      127
     ]
   },
   "dispatch": {
@@ -249,46 +290,35 @@
       "context bucket"
     ],
     "primary": "Ahead-of-time common row kernels and graph buckets.",
-    "fallback": "Precompiled symbolic-M kernel plus non-graph explicit-stream launch when needed.",
-    "optional_jit": "Asynchronous shape specialization, persisted cubin cache; new shape and cold-cache latency measured."
+    "fallback": "Precompiled symbolic-row kernels; Rust specializes exact runtime launch arguments/grid and caches per-membership execution plans/graphs. No padding for nonstandard rows in 2..128 when dynamic contracts are present.",
+    "optional_jit": "Online GPU-code JIT is outside phase one; operator packages are compiled offline."
   },
   "prefix_state_design": {
     "separate_granularities": true,
-    "candidate_gdn_checkpoint_intervals": [
-      512,
-      1024,
-      2048
-    ],
     "dense_state_checkpoint_bytes_per_prefix_endpoint": 150994944,
     "cache_contents": [
-      "paged KV",
+      "Immutable shared KV intervals backed by demand-mapped token-major request KV",
       "FP32 GDN endpoint state",
       "convolution endpoint state",
       "position state",
-      "last hidden state for exact endpoint hit"
+      "last hidden state for exact endpoint hit",
+      "MTP KV/hidden/position state"
     ],
     "key": [
       "model/quantization revision",
       "token prefix",
       "position/RoPE configuration"
     ],
-    "correctness": "Match cold execution logits within declared numeric tolerance after reuse, branching and eviction."
+    "correctness": "Match cold execution logits within declared numeric tolerance after reuse, branching and eviction.",
+    "periodic_checkpoint_interval_tokens": 8192,
+    "additional_checkpoints": "Final prompt, template history boundaries and cost-admitted branch endpoints."
   },
   "quality_evaluation": [
-    "Fixed scenario requests and seed; compare token choice and baseline top-3 probabilities under identical teacher-forced histories. Full LLM benchmarks provide final quality validation.",
+    "Accepted fixed-seed bounded BF16 quick suite: task checks and teacher-forced full-vocabulary-normalized top3/NLL. Full LLM benchmarks are deferred, not a phase-one gate.",
     "BF16 reference on representative text, code and long-state workloads",
     "Same-quantized-weight reference to isolate kernel implementation bugs",
     "Model-level probability/perplexity and task metrics; local tensor error alone is insufficient"
   ],
   "capacity": "128 requests is not equivalent to 128 resident contexts. KV and recurrent-state budgets, shared prefixes and scheduling must be reported explicitly.",
-  "fusion_candidates": {
-    "baseline": "Local fusion plus CUDA graph",
-    "experiments": [
-      "whole decoder layer persistent kernel",
-      "four-layer period persistent kernel",
-      "full decode-step persistent kernel for M=1/2/4/8"
-    ],
-    "decision": "Measured semantic equivalence, wall time, memory, occupancy and preparation cost.",
-    "generation_contract": "Model adapter -> semantic graph/explicit states -> TileLang lowering -> kernel graph or persistent schedule; no Qwen-specific common runtime."
-  }
+  "fusion_policy": "Local operator fusion plus CUDA graph; registered architecture plans own execution order and causal state."
 }

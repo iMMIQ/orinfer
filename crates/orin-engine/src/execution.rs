@@ -68,6 +68,7 @@ pub(crate) struct BufferView {
 pub(crate) struct Invocation {
     pub operation: crate::model::Operation,
     pub sequence: Option<usize>,
+    pub launch: Option<crate::operators::dynamic::RowLaunch>,
     pub views: std::collections::BTreeMap<String, BufferView>,
 }
 

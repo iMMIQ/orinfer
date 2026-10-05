@@ -1,9 +1,10 @@
-"""Small-M SM87 INT8 MMA from one resident I8-fragment W4 representation.
+"""Small-M SM87 INT8 MMA from one resident W4 representation.
 
 row mode generates the exact existing row-W8 codes in warp-local registers;
 group mode accumulates each 128-element group with its original FP16 scale.
 Neither materializes W8 globally nor adds persistent weight metadata. Split-K
 partials are FP32; the caller performs the final reduction before FP16 output.
+F16-fragment inputs are losslessly shuffled into I8 fragments in registers.
 """
 import tilelang.language as T
 from tools.operators.common import orin_jit
@@ -12,6 +13,20 @@ from tools.operators.common import orin_jit
 SOURCE = r'''
 #include <cuda_fp16.h>
 #include <tl_templates/cuda/instruction/mma.h>
+__device__ __forceinline__ unsigned orin_decode_f16_i8_word(
+    unsigned low, unsigned high, int ni, int tid) {
+    // Four neighboring lanes contain the two K halves of the same N group.
+    // Read each original packed word once; warp shuffles replace another
+    // global weight representation. This is the offline pack_array permutation.
+    int first = (tid % 2) * 2;
+    unsigned lo0 = __shfl_sync(0xffffffffu, low, first, 4);
+    unsigned lo1 = __shfl_sync(0xffffffffu, low, first + 1, 4);
+    unsigned hi0 = __shfl_sync(0xffffffffu, high, first, 4);
+    unsigned hi1 = __shfl_sync(0xffffffffu, high, first + 1, 4);
+    int shift = ni * 16 + (tid / 2) * 8;
+    return ((lo0 >> shift) & 255u) | (((lo1 >> shift) & 255u) << 8)
+         | (((hi0 >> shift) & 255u) << 16) | (((hi1 >> shift) & 255u) << 24);
+}
 __device__ __forceinline__ unsigned orin_decode_lut_word(
     int first, half_t scale, signed char zero, half_t row_scale) {
     unsigned word = 0;
@@ -52,11 +67,13 @@ __device__ __forceinline__ float orin_decode_output_scale(half_t scale, int colu
 
 @orin_jit
 def w4a8_decode(M, N: int, K: int, SPLIT=1, *, mode='group', TILE_N=64,
-                TILE_M=16, output_dtype='float16', shared_a=None, activation_group=None):
+                TILE_M=16, output_dtype='float16', shared_a=None, activation_group=None,
+                weight_layout='i8'):
     assert M is None or 1 <= M <= 2048
     shared_a = M is None if shared_a is None else shared_a
     M = T.dynamic('M') if M is None else M
     assert mode in ('row', 'group')
+    assert weight_layout in ('i8', 'f16')
     assert activation_group is None or (mode=='group' and activation_group==128)
     assert TILE_N in (64, 128) and TILE_M in (16, 32, 64)
     assert N % TILE_N == 0 and K % (128*SPLIT) == 0
@@ -78,6 +95,7 @@ def w4a8_decode(M, N: int, K: int, SPLIT=1, *, mode='group', TILE_N=64,
             warp, lane = tx//32, tx%32
             row, tid = lane//4, lane%4
             packed = T.alloc_local((blocks,8), T.uint32)
+            original = T.alloc_local((blocks,8), T.uint32)
             scales = T.alloc_local((blocks*2,), T.float16)
             zeros = T.alloc_local((blocks*2,), T.int8)
             tables = T.alloc_local((blocks*2,), T.uint32)
@@ -107,7 +125,16 @@ def w4a8_decode(M, N: int, K: int, SPLIT=1, *, mode='group', TILE_N=64,
                 for block in T.unroll(blocks):
                     for vector in T.unroll(2):
                         for j in T.vectorized(4):
-                            packed[block,vector*4+j] = PP[bx*blocks+block,gk,tx,vector*4+j]
+                            if weight_layout == 'i8':
+                                packed[block,vector*4+j] = PP[bx*blocks+block,gk,tx,vector*4+j]
+                            else:
+                                original[block,vector*4+j] = PP[bx*blocks+block,gk,tx,vector*4+j]
+                    if weight_layout == 'f16':
+                        for ki32 in T.unroll(4):
+                            for ni in T.unroll(2):
+                                packed[block,ki32*2+ni] = T.call_pure_extern(
+                                    'uint32','orin_decode_f16_i8_word',
+                                    original[block,ki32*2],original[block,ki32*2+1],ni,tid)
                 for part in T.unroll(blocks*2):
                     col = bx*TILE_N+warp*16+(part//2)*64+(part%2)*8+row
                     scales[part] = S[col,gk]

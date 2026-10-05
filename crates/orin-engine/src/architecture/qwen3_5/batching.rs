@@ -10,9 +10,37 @@ pub(super) fn register(
     builder: &mut Builder<'_>,
 ) -> Result<()> {
     if m.batch_profiles.is_empty() {
+        if m.batch_gdn {
+            return Err("Batch GDN requires batch profiles".into());
+        }
         return Ok(());
     }
     let t = &config.text;
+    if m.batch_gdn {
+        let pointers = m
+            .buffers
+            .iter()
+            .find(|b| b.name == "BatchGdnPointers")
+            .ok_or("Missing batch GDN address table")?;
+        if pointers.dtype != crate::artifact::Dtype::U64
+            || pointers.shape != [t.num_hidden_layers, 128, 3]
+            || pointers.access != crate::artifact::Access::ReadWrite
+        {
+            return Err("Invalid batch GDN address table contract".into());
+        }
+        for &rows in &m.batch_profiles {
+            builder.text(
+                &format!("batch_gdn_m{rows}"),
+                &Recipe {
+                    begin: &[],
+                    gdn: &[K(0), K(1)],
+                    attention: &[],
+                    end: &[],
+                },
+                rows,
+            )?;
+        }
+    }
     if t.intermediate_size == 0 {
         return Err("Batching requires intermediate_size".into());
     }
@@ -66,6 +94,90 @@ pub(super) fn register(
     for &rows in &m.batch_profiles {
         builder.text(&format!("batch_m{rows}"), &recipe, rows)?;
     }
+    for profile in &m.prefill_batch_profiles {
+        if profile.tokens > m.chunk_tokens {
+            return Err("Joint prefill exceeds shared workspace capacity".into());
+        }
+        let (gdn, attention): (&[Step], &[Step]) = match profile.kind {
+            PrefillKind::ChunkLut4 => (
+                &[
+                    K(0),
+                    K(1),
+                    K(2),
+                    K(3),
+                    K(4),
+                    K(12),
+                    K(13),
+                    K(14),
+                    K(15),
+                    K(16),
+                    K(17),
+                    K(18),
+                ],
+                &[
+                    K(0),
+                    K(1),
+                    K(2),
+                    K(6),
+                    K(7),
+                    K(8),
+                    K(9),
+                    K(10),
+                    K(11),
+                    K(12),
+                ],
+            ),
+            PrefillKind::ChunkExpanded => (
+                &[
+                    K(0),
+                    K(1),
+                    K(2),
+                    K(3),
+                    K(4),
+                    K(12),
+                    K(13),
+                    K(14),
+                    K(15),
+                    K(16),
+                    K(17),
+                    K(18),
+                    K(19),
+                    K(20),
+                ],
+                &[
+                    K(0),
+                    K(1),
+                    K(2),
+                    K(6),
+                    K(7),
+                    K(8),
+                    K(9),
+                    K(10),
+                    K(11),
+                    K(12),
+                    K(13),
+                    K(14),
+                ],
+            ),
+            _ => return Err("Joint prefill requires a chunk projection recipe".into()),
+        };
+        let program = format!("prefill_batch_m{}", profile.tokens);
+        let mut ops = vec![];
+        for (layer, kind) in t.layer_types.iter().enumerate() {
+            ops.extend(builder.emit(
+                if kind == "linear_attention" {
+                    gdn
+                } else {
+                    attention
+                },
+                &program,
+                &format!("layer{layer}"),
+                profile.tokens,
+                layer,
+            )?);
+        }
+        builder.programs.insert(program, ops);
+    }
     m.batch_layout = Some(BatchLayout {
         layers: t.layer_types.clone(),
         row_strides: strides,
@@ -83,6 +195,7 @@ fn invocation(
     Invocation {
         operation,
         sequence,
+        launch: None,
         views: views.clone(),
     }
 }
@@ -121,13 +234,34 @@ pub(crate) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
         n.checked_add(s.tokens)
             .ok_or("Batch token count overflow".into())
     })?;
-    let rows = m
+    let small_rows = m
         .batch_profiles
         .iter()
         .copied()
         .filter(|&n| n >= total)
-        .min()
-        .ok_or("Batch exceeds compiled row capacity")?;
+        .min();
+    let long_profile = if small_rows.is_none() {
+        Some(
+            m.prefill_batch_profiles
+                .iter()
+                .filter(|p| p.tokens >= total)
+                .min_by_key(|p| p.tokens)
+                .ok_or("Batch exceeds compiled row capacity")?,
+        )
+    } else {
+        None
+    };
+    let dynamic = !m.dynamic_batch_kernels.is_empty();
+    let rows = if dynamic && (2..=128).contains(&total) {
+        total
+    } else {
+        small_rows.unwrap_or_else(|| long_profile.unwrap().tokens)
+    };
+    let source_rows = if m.batch_profiles.contains(&rows) {
+        rows
+    } else {
+        128
+    };
     let head_rows = m
         .batch_profiles
         .iter()
@@ -135,7 +269,21 @@ pub(crate) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
         .filter(|&n| n >= segments.len())
         .min()
         .ok_or("Missing batch head capacity")?;
-    let batch = format!("batch_m{rows}");
+    let head_rows = if dynamic && segments.len() >= 2 {
+        segments.len()
+    } else {
+        head_rows
+    };
+    let head_source_rows = if m.batch_profiles.contains(&head_rows) {
+        head_rows
+    } else {
+        128
+    };
+    let batch = if long_profile.is_some() {
+        format!("prefill_batch_m{rows}")
+    } else {
+        format!("batch_m{source_rows}")
+    };
     let empty = BTreeMap::new();
     let mut out = vec![invocation(
         Operation::Zero {
@@ -202,8 +350,31 @@ pub(crate) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
     }
     for (layer, kind) in layout.layers.iter().enumerate() {
         let is_gdn = kind == "linear_attention";
-        let shared_prefix = if is_gdn { 4 } else { 2 };
-        let shared_end = if is_gdn { 12 } else { 9 };
+        let long = long_profile.is_some();
+        let shared_prefix = if is_gdn {
+            if long { 5 } else { 4 }
+        } else if long {
+            3
+        } else {
+            2
+        };
+        let shared_suffix = if long {
+            if is_gdn { 12 } else { 6 }
+        } else {
+            shared_prefix
+        };
+        let shared_end = if let Some(profile) = long_profile {
+            match (is_gdn, profile.kind) {
+                (true, PrefillKind::ChunkLut4) => 19,
+                (true, _) => 21,
+                (false, PrefillKind::ChunkLut4) => 13,
+                (false, _) => 15,
+            }
+        } else if is_gdn {
+            12
+        } else {
+            9
+        };
         for slot in 0..shared_prefix {
             out.push(kernel(
                 format!("{batch}/layer{layer}/k{slot}"),
@@ -212,24 +383,48 @@ pub(crate) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             ));
         }
         if rows > total {
-            let stride = layout.row_strides["MixerIn"];
+            let destination = if long && is_gdn { "Y" } else { "MixerIn" };
+            let stride = layout.row_strides[destination];
             let pad = BTreeMap::from([(
-                "MixerIn".into(),
+                destination.into(),
                 BufferView {
-                    buffer: "MixerIn".into(),
+                    buffer: destination.into(),
                     offset: total * stride,
                 },
             )]);
             out.push(invocation(
                 Operation::Zero {
-                    destination: "MixerIn".into(),
+                    destination: destination.into(),
                     bytes: (rows - total) * stride,
                 },
                 None,
                 &pad,
             ));
         }
+        // Decode rows can share one recurrence even alongside a prompt chunk.
+        // Prompt rows are null in the table; their causal mixer runs afterward
+        // using its own scratch and writes only that segment's Y rows.
+        let batch_gdn = !long && m.batch_gdn && is_gdn && segments.iter().any(|s| s.tokens == 1);
+        if batch_gdn {
+            let views = BTreeMap::from([(
+                "BatchGdnPointers".into(),
+                BufferView {
+                    buffer: "BatchGdnPointers".into(),
+                    offset: layer * 128 * 3 * 8,
+                },
+            )]);
+            for slot in 0..2 {
+                out.push(kernel(
+                    format!("batch_gdn_m{source_rows}/layer{layer}/k{slot}"),
+                    None,
+                    &views,
+                ));
+            }
+        }
         for (s, (program, views)) in segments.iter().zip(&starts) {
+            if batch_gdn && s.tokens == 1 {
+                continue;
+            }
             let sequence_kind = layout.profiles.get(&s.tokens);
             let ops = section(m, program, &format!("layer{layer}"));
             let selected: &[usize] = if is_gdn {
@@ -237,11 +432,18 @@ pub(crate) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
                     &[4, 5, 6, 7]
                 } else if s.tokens == 1 || sequence_kind == Some(&PrefillKind::Recurrent) {
                     &[4, 5]
+                } else if long {
+                    &[5, 6, 7, 8, 9, 10, 11]
                 } else {
                     return Err("Chunk prefill cannot use the small-row batch mixer".into());
                 }
             } else if sequence_kind == Some(&PrefillKind::Recurrent) {
                 &[2, 3]
+            } else if matches!(
+                sequence_kind,
+                Some(PrefillKind::ChunkLut4 | PrefillKind::ChunkExpanded)
+            ) {
+                &[3, 4, 5]
             } else {
                 &[2, 3, 4]
             };
@@ -253,7 +455,12 @@ pub(crate) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
                 ));
                 if is_gdn
                     && ((sequence_kind == Some(&PrefillKind::Sequence) && i == 5)
-                        || (sequence_kind != Some(&PrefillKind::Sequence) && i == 4))
+                        || (matches!(
+                            sequence_kind,
+                            Some(PrefillKind::ChunkLut4 | PrefillKind::ChunkExpanded)
+                        ) && i == 5)
+                        || ((s.tokens == 1 || sequence_kind == Some(&PrefillKind::Recurrent))
+                            && i == 4))
                 {
                     out.push(invocation(
                         Operation::Copy {
@@ -270,9 +477,31 @@ pub(crate) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
                         views,
                     ));
                 }
+                if is_gdn
+                    && i == 11
+                    && matches!(
+                        sequence_kind,
+                        Some(PrefillKind::ChunkLut4 | PrefillKind::ChunkExpanded)
+                    )
+                {
+                    out.push(invocation(
+                        Operation::Copy {
+                            source: "Sout".into(),
+                            destination: format!("L{layer}_State"),
+                            bytes: m
+                                .buffers
+                                .iter()
+                                .find(|b| b.name == format!("L{layer}_State"))
+                                .ok_or("Missing recurrent state")?
+                                .bytes()?,
+                        },
+                        Some(s.slot),
+                        views,
+                    ));
+                }
             }
         }
-        for slot in shared_prefix..shared_end {
+        for slot in shared_suffix..shared_end {
             out.push(kernel(
                 format!("{batch}/layer{layer}/k{slot}"),
                 None,
@@ -337,7 +566,11 @@ pub(crate) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             &pad,
         ));
     }
-    out.push(kernel(format!("batch_m{head_rows}/end/k0"), None, &empty));
+    out.push(kernel(
+        format!("batch_m{head_source_rows}/end/k0"),
+        None,
+        &empty,
+    ));
     for (lane, s) in segments.iter().enumerate() {
         let views = BTreeMap::from([(
             "BatchHeadLogits".into(),
@@ -359,7 +592,62 @@ pub(crate) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             out.push(kernel(format!("decode/end/k{i}"), Some(s.slot), &empty));
         }
     }
+    for invocation in &mut out {
+        if let Operation::Kernel { name } = &invocation.operation {
+            let count = if name == "batch_m128/end/k0" && head_source_rows != head_rows {
+                Some(head_rows)
+            } else if source_rows != rows
+                && (name.starts_with("batch_m128/layer")
+                    || name.starts_with("batch_gdn_m128/layer"))
+            {
+                Some(rows)
+            } else {
+                None
+            };
+            if let Some(count) = count {
+                invocation.launch = Some(
+                    m.dynamic_batch_kernels
+                        .get(name)
+                        .ok_or("Missing dynamic launch contract")?
+                        .launch(count)?,
+                );
+            }
+        }
+    }
     Ok(out)
+}
+
+/// GPU pointer table ABI: layer, token row, (state, history, position).
+/// Prompt chunks, padding and attention-only layers stay null. A decoder after
+/// a prompt chunk occupies its packed token row, not its request ordinal.
+pub(crate) fn state_bindings(
+    m: &Manifest,
+    segments: &[BatchSegment],
+) -> Vec<Option<(usize, String)>> {
+    let layout = m.batch_layout.as_ref().expect("validated batch layout");
+    let mut bindings = vec![None; layout.layers.len() * 128 * 3];
+    for (layer, kind) in layout.layers.iter().enumerate() {
+        if kind != "linear_attention" {
+            continue;
+        }
+        let mut row = 0;
+        for segment in segments {
+            if segment.tokens == 1 {
+                for (column, name) in [
+                    format!("L{layer}_State"),
+                    format!("L{layer}_History"),
+                    m.position.clone(),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    bindings[(layer * 128 + row) * 3 + column] = Some((segment.slot, name));
+                }
+            }
+            row += segment.tokens;
+        }
+    }
+    bindings
 }
 
 #[cfg(test)]
@@ -403,6 +691,67 @@ mod tests {
         section("head_m2", "body", 1);
         section("head_m32", "body", 1);
         m
+    }
+    #[test]
+    fn symbolic_rows_compile_exact_launches_and_preserve_common_profiles() {
+        use crate::operators::dynamic::{DynamicBatchKernel, RowExpression};
+        let mut m = manifest();
+        for (section, count) in [("layer0", 12), ("layer1", 9), ("end", 1)] {
+            for slot in 0..count {
+                let name = format!("batch_m128/{section}/k{slot}");
+                m.dynamic_batch_kernels.insert(
+                    name.clone(),
+                    DynamicBatchKernel {
+                        name,
+                        grid: [
+                            RowExpression::Rows,
+                            RowExpression::Constant { value: 1 },
+                            RowExpression::Constant { value: 1 },
+                        ],
+                        arguments: vec![],
+                    },
+                );
+            }
+        }
+        for count in [3, 5, 6, 7, 9, 15, 31, 33, 63, 127] {
+            let segments: Vec<_> = (0..count)
+                .map(|slot| BatchSegment { slot, tokens: 1 })
+                .collect();
+            let p = plan(&m, &segments).unwrap();
+            assert!(!p.iter().any(|i| matches!(&i.operation, Operation::Zero { destination, .. }
+                if destination == "Hidden" || destination == "MixerIn" || destination == "BatchHeadHidden")));
+            let launches: Vec<_> = p.iter().filter_map(|i| i.launch.as_ref()).collect();
+            assert_eq!(launches.len(), 22);
+            assert!(launches.iter().all(|launch| launch.grid[0] == count as u32));
+        }
+        let p = plan(
+            &m,
+            &(0..4)
+                .map(|slot| BatchSegment { slot, tokens: 1 })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(p.iter().all(|i| i.launch.is_none()));
+        let p = plan(
+            &m,
+            &[
+                BatchSegment { slot: 9, tokens: 1 },
+                BatchSegment {
+                    slot: 3,
+                    tokens: 32,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(
+            p.iter()
+                .filter_map(|i| i.launch.as_ref())
+                .all(|launch| launch.grid[0] == 33)
+        );
+        assert!(p.iter().any(
+            |i| matches!(&i.operation, Operation::Kernel { name } if name == "batch_m2/end/k0")
+                && i.launch.is_none()
+        ));
     }
     #[test]
     fn mixed_segments_have_private_mixers_shared_projections_and_safe_padding() {
@@ -455,5 +804,145 @@ mod tests {
         ] {
             assert!(plan(&m, &segments).is_err());
         }
+    }
+
+    #[test]
+    fn dense_joint_prefill_shares_projections_but_keeps_chunk_state_private() {
+        let mut m = manifest();
+        m.prefill_batch_profiles = vec![PrefillProfile {
+            tokens: 2048,
+            kind: PrefillKind::ChunkExpanded,
+        }];
+        m.batch_layout
+            .as_mut()
+            .unwrap()
+            .profiles
+            .insert(512, PrefillKind::ChunkLut4);
+        m.batch_layout
+            .as_mut()
+            .unwrap()
+            .row_strides
+            .insert("Y".into(), 12);
+        m.buffers.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"L0_State","dtype":"f32","shape":[20],"layout":"contiguous",
+                "alignment":256,"access":"read_write","data":null
+            }))
+            .unwrap(),
+        );
+        for (section, count) in [("begin", 2), ("layer0", 19), ("layer1", 13), ("end", 1)] {
+            m.programs
+                .entry("prefill_m512".into())
+                .or_default()
+                .extend((0..count).map(|i| Operation::Kernel {
+                    name: format!("prefill_m512/{section}/k{i}"),
+                }));
+        }
+        m.programs.insert(
+            "head_m512".into(),
+            vec![Operation::Kernel {
+                name: "head_m512/body/k0".into(),
+            }],
+        );
+        let p = plan(
+            &m,
+            &[
+                BatchSegment {
+                    slot: 7,
+                    tokens: 512,
+                },
+                BatchSegment {
+                    slot: 2,
+                    tokens: 512,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(p.iter().any(|i| i.sequence.is_none()
+            && matches!(&i.operation,
+            Operation::Kernel { name } if name == "prefill_batch_m2048/layer0/k17")));
+        for slot in [7, 2] {
+            let conv = p
+                .iter()
+                .find(|i| {
+                    i.sequence == Some(slot)
+                        && matches!(&i.operation,
+                Operation::Kernel { name } if name == "prefill_m512/layer0/k5")
+                })
+                .unwrap();
+            assert_eq!(conv.views["QKV"].offset, usize::from(slot == 2) * 512 * 20);
+            assert!(
+                !conv.views.contains_key("Q"),
+                "Head-major scratch must not get a token-row offset"
+            );
+            assert!(p.iter().any(|i| i.sequence == Some(slot) && matches!(&i.operation,
+                Operation::Copy { source, destination, bytes:80 } if source == "Sout" && destination == "L0_State")));
+            assert!(p.iter().any(|i| i.sequence == Some(slot)
+                && matches!(&i.operation,
+                Operation::Kernel { name } if name == "prefill_m512/layer1/k5")));
+        }
+        assert!(p.iter().any(|i| matches!(&i.operation,
+            Operation::Zero { destination, bytes:12288 } if destination == "Y")
+            && i.views["Y"].offset == 12288));
+        assert!(!p.iter().any(|i| matches!(&i.operation,
+            Operation::Kernel { name } if name.starts_with("batch_gdn_"))));
+    }
+    #[test]
+    fn batched_recurrence_isolates_decode_rows_in_mixed_work() {
+        let mut m = manifest();
+        m.batch_gdn = true;
+        let segments = [
+            BatchSegment { slot: 9, tokens: 1 },
+            BatchSegment { slot: 3, tokens: 1 },
+        ];
+        let p = plan(&m, &segments).unwrap();
+        let mixers: Vec<_> = p
+            .iter()
+            .filter(|i| {
+                matches!(&i.operation,
+            Operation::Kernel { name } if name.starts_with("batch_gdn_m2/"))
+            })
+            .collect();
+        assert_eq!(mixers.len(), 2);
+        assert!(
+            mixers
+                .iter()
+                .all(|i| i.sequence.is_none() && i.views["BatchGdnPointers"].offset == 0)
+        );
+        assert!(!p.iter().any(|i| matches!(&i.operation,
+            Operation::Copy { destination, .. } if destination.ends_with("_History"))));
+        let table = state_bindings(&m, &segments);
+        assert_eq!(table.len(), 2 * 128 * 3);
+        assert_eq!(table[0], Some((9, "L0_State".into())));
+        assert_eq!(table[3], Some((3, "L0_State".into())));
+        assert_eq!(table[5], Some((3, "Step".into())));
+        assert!(table[6..].iter().all(Option::is_none));
+        let mixed = plan(&m, &[segments[0], BatchSegment { slot: 3, tokens: 2 }]).unwrap();
+        assert!(mixed.iter().any(|i| matches!(&i.operation,
+            Operation::Kernel { name } if name.starts_with("batch_gdn_"))));
+        assert!(mixed.iter().any(|i| matches!(&i.operation,
+            Operation::Copy { destination, .. } if destination.ends_with("_History"))));
+        let segments = [
+            BatchSegment {
+                slot: 9,
+                tokens: 32,
+            },
+            BatchSegment { slot: 3, tokens: 1 },
+            BatchSegment { slot: 7, tokens: 1 },
+        ];
+        let table = state_bindings(&m, &segments);
+        assert!(table[..32 * 3].iter().all(Option::is_none));
+        assert_eq!(table[32 * 3], Some((3, "L0_State".into())));
+        assert_eq!(table[33 * 3 + 2], Some((7, "Step".into())));
+        assert!(table[34 * 3..].iter().all(Option::is_none));
+        let p = plan(&m, &segments).unwrap();
+        assert!(p.iter().any(|i| matches!(&i.operation,
+            Operation::Kernel { name } if name.starts_with("batch_gdn_m64/"))));
+        assert!(!p.iter().any(|i| i.sequence == Some(3)
+            && matches!(&i.operation,
+            Operation::Kernel { name } if name.ends_with("layer0/k5"))));
+        assert!(p.iter().any(|i| i.sequence == Some(9)
+            && matches!(&i.operation,
+            Operation::Kernel { name } if name == "prefill_m32/layer0/k5")));
     }
 }

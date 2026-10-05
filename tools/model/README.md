@@ -4,7 +4,7 @@
 
 ## 本机依赖
 
-checkpoint默认位于`/home/nvidia/model/vllm-comparison-20260930/awq-http/`。投影验证使用`artifacts/experimental-vllm/activations/`中的真实L0输入；运行前需准备这些外部数据，文件名见验证入口。LUT4验证支持`--activations-dir`。
+需要自行准备与模型匹配的checkpoint，并通过构建入口的`--checkpoint`指定路径。投影验证使用`artifacts/experimental-vllm/activations/`中的真实L0输入；运行前需准备这些外部数据，文件名见验证入口。LUT4验证支持`--activations-dir`。
 
 GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用本机NVIDIA Docker镜像和GPU锁；镜像名为`lada-orin-tilelang:0.11.0-exp7`，实际TileLang0.1.13/Torch2.9.1/CUDA12.6。镜像及checkpoint不随源码分发。CPU组装入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
 
@@ -137,6 +137,24 @@ GateUp与Down直接从原W4解包到寄存器，通过INT8 Tensor Core逐128通�
 
 `validate_int8_decode.py`使用真实权重、独立FP32参考、尾部保护及改变输入后的Graph replay验证kernel。可用ignored test `capture_decode_projections`（`ORIN_BATCH_FIXTURE`含model/output/cases）导出原路径的真实输入，再传入`--activations`；随机输入只检查实现。Down验证需使用`--families Down --modes group --group-activation`。`--dynamic-rows --tile-m 32 --tile-n 128`覆盖动态分支。验证报告与当前W4路径比较，用于判断新增计算误差；BF16/FP8量化质量需单独验收。完整模型必须另测连续请求、MTP已提交历史状态与实际吞吐。
 
+### Decode INT8 GDN输出投影
+
+27B批处理模型可为GDN输出投影加入group-128 W4A8包：
+
+```bash
+bash tools/operators/run.sh tools/model/optimize_int8_gdn.py artifacts/operators/int8-gdn \
+  --model /path/to/prepared-batch-model --model-output /path/to/int8-gdn-model
+bash tools/operators/run.sh tools/model/validate_gdn_group_norm.py artifacts/operators/gdn-norm-check \
+  --model /path/to/int8-gdn-model
+bash tools/operators/run.sh tools/model/validate_int8_decode.py artifacts/operators/gdn-out-check \
+  --model /path/to/int8-gdn-model --families Out --modes group --group-activation \
+  --dynamic-rows --tile-m 32 --tile-n 128
+```
+
+默认将48层GDN输出的W4 packed codes无损排列为I8 fragment布局，同时更新全部读取者；原scale/zero及权重字节数不变。大块prefill仍遵循原来的严格临时W8量化规则。`--weight-layout f16`保留原物理布局，在寄存器中重排后执行相同INT8计算。融合gated norm先保持原FP16输出边界，再按128通道量化；27B新增scale workspace为12 KiB，GDN持续状态保持FP32。
+
+1/2/4/8行采用固定行数kernel，其他短prefill与batch采用动态行数kernel。构建工具校验源布局、所有重排权重的roundtrip、读取者覆盖及新包，原子发布新目录。`validate_gdn_group_norm.py`对照原norm加独立A8量化，检查code/scale、尾部和Graph；完整模型另用`validate_continuous_requests`和`validate_mtp_partial_prefix`检查请求隔离、图片及前缀恢复，并对照独立BF16质量。
+
 ### 连续批处理
 
 已有批处理算子包可加入GPU历史惩罚greedy；`--specialize-projections`同时加入27B的B4/B8 GateUp及B2/B4/B8 Down固定行数kernel。其他行数仍由动态kernel处理，权重payload保持不变，输出是独立的新模型目录：
@@ -163,6 +181,16 @@ target/release/orin-llm serve /path/to/batch-model \
 工具编译动态行数TileLang投影，按实际host ABI生成2/4/8/16/32/64/128绑定；相同不可变权重与原kernel资产使用hardlink，模型描述和新包独立发布。源码目录中不包含这些二进制资产。Rust先验证注册计划，完成后原子发布新的模型目录；已有目录不覆盖，失败时清理本次临时目录。在线请求不触发编译或量化。
 
 每请求状态驻留独立GPU地址，GDN验证前缀和统计临时量由执行线程共享；混合计划只合并无状态投影，因果attention和FP32 GDN逐段执行，padding不写入请求状态。Graph按有序槽位/段长缓存，地址保持稳定，最多16个batch捕获；新成员组合首次出现需捕获。执行计划由架构模块生成，算子包不提供用户程序。
+
+可为已有批处理模型加入纯decode的批量GDN算子：
+
+```bash
+bash tools/operators/run.sh tools/model/optimize_batch_gdn.py artifacts/batch-gdn-build \
+  --model /path/to/prepared-batch-model --model-output /path/to/batch-gdn-model
+bash tools/operators/run.sh tools/model/validate_batch_gdn.py artifacts/batch-gdn-check
+```
+
+该包通过共享GPU地址表访问每个请求的私有FP32 GDN状态、FP16卷积历史和位置，按请求维度并行执行M1卷积及recurrence；卷积直接更新自己的历史，不再复制`Ho`。padding地址为空，不读取或修改请求状态。2/4/8/16/32/64/128行均离线编译；混合多token prefill时，decoder子集使用地址表，prompt段仍各自执行因果mixer。权重不变，地址表在Graph执行前由持有请求arena的Rust执行器填写，Graph仍按槽位及段长缓存。验证工具覆盖零位置、短历史、非满batch、请求重排和改变地址表后的Graph replay；完整模型另跑`validate_continuous_requests`及真实HTTP吞吐。
 
 `orin_engine::model::Model`提供`start_request`、`advance_requests`、`finish_request`，API worker负责队列与输出解析；退出或取消必须调用`finish_request`释放槽位。GPU ignored test `validate_continuous_requests`使用`ORIN_BATCH_FIXTURE`（model/output/cases/cuda_graph，cases包含原生token IDs及sampling），验证批处理输出、全部私有状态的请求隔离、取消/复用、相同历史下的概率/top-3及固定seed重排。这里的概率参考是同权重串行执行，用于检验重构；不会替代BF16/FP8量化质量评测。
 
@@ -253,3 +281,64 @@ bash tools/operators/run.sh tools/model/optimize_prefill.py artifacts/prefill-ke
 源模型目录不修改；新目录通过完整加载器校验后发布。缓存预算是运行时配置，模型不包含prefix快照。`screen_prefill_attention.py`提供TileLang候选筛选、非对齐尾部及改变输入后的Graph replay验证；所有产物写入指定的新输出目录。
 
 `validate_mtp_warm.py --model /path/to/new-model`通过相同GPU入口运行，使用实际W4权重逐位比较17/64/128/512行投影与16行执行，覆盖FP32 split-K、尾部及改变输入后的Graph replay。`kv_prefill_probe.py --context 262144 --query-tokens 64 --async-stages 1`验证反量化padding与异步attention完整链，可配合`ORIN_OPERATOR_SANITIZER=memcheck`检查越界。
+
+## Prefill FFN tile 筛选
+
+含LUT4 FFN的模型可使用`screen_prefill_ffn.py`筛选512行GateUp/Down tile。它从当前safetensors独立重建整数权重，对照精确INT32结果，验证输出guard、改变输入后的Graph replay及选中tile的513行尾部。`--activations`接收`capture_prefill_ffn_inputs`导出的真实A8/scale目录，并检查模型指纹和payload hash；不提供时使用随机实现输入，不能替代完整模型性能验收。`--bm`、`--bn`、`--stages`可缩小tile筛选范围；`--grid-orders nfirst mfirst`对比沿输出列或输入行优先的block映射，默认保留`nfirst`。`--min-blocks`控制编译时的最低驻留block数声明，默认1；它不能保证实际occupancy，过高会导致spill，必须用真实投影和完整模型验证。`--warp-m 1 2 4`将累积行分摊给多个M维warp，默认1；它保持权重布局与整数点积不变，但增加线程数与重复的权重解包，仍需实测。每个block最多512线程，超出的组合不参与筛选。
+
+```bash
+bash tools/operators/run.sh tools/model/screen_prefill_ffn.py artifacts/ffn-screen \
+  --model /path/to/model --activations /path/to/prefill-captures
+python3 -m tools.model.optimize_prefill_ffn --model /path/to/model \
+  --screen artifacts/ffn-screen --destination /path/to/new-model \
+  --output artifacts/ffn-publish.json
+```
+
+2048行临时W8路径使用`screen_prefill_gemm.py`。捕获测试同时导出实际TemporaryW8；筛选工具按原始S/Z/WS严格反量化规则独立校验它，与512行的近似LUT4 codebook分别处理。工具筛选tile、流水级数、block调度与缓存策略，`--variant occupancy`另测128/512线程配置。最终候选延长复测，并验证2049行尾部；分组调度额外覆盖321/513行的最后一个不完整M分组。
+
+```bash
+bash tools/operators/run.sh tools/model/screen_prefill_gemm.py artifacts/ffn-gemm-screen \
+  --model /path/to/model --activations /path/to/prefill-2048-captures
+python3 -m tools.model.optimize_prefill_ffn --model /path/to/model \
+  --screen artifacts/ffn-gemm-screen --destination /path/to/new-model \
+  --output artifacts/ffn-gemm-publish.json
+```
+
+发布工具保持单份W4表示和量化元数据，只替换经过整数参考与尾部校验的对应512或2048行FFN cubin/ABI，保留其他执行计划。源目录不修改，新目录通过加载器校验后原子发布。候选微测仍须通过完整模型复测后才能决定部署。
+`--screen`可接收同一源模型的512和2048两个筛选目录，一次发布两个profile；拒绝重复形状及不同模型指纹。
+
+`capture_prefill_attention_inputs`使用同类夹具，先执行历史块，再导出最后一个真实块中首个full-attention层的Q/K/V、gate及绝对位置。当前捕获器面向27B几何，输入至少两个完整prefill块。`screen_prefill_attention_capture.py`校验模型指纹和payload，筛选tile、线程、流水及指数实现，检查空查询、非对齐KV长度、输出guard和修改输入后的Graph replay；导出使用模型最大容量ABI，实际测量深度另记在报告中。
+
+```bash
+bash tools/operators/run.sh tools/model/screen_prefill_attention_capture.py artifacts/attention-screen \
+  --model /path/to/model --activations /path/to/attention-capture
+bash tools/operators/run.sh tools/model/optimize_prefill.py artifacts/attention-build \
+  --model /path/to/model --destination /path/to/new-model \
+  --attention-screen artifacts/attention-screen --warm-sizes
+```
+
+`--attention-screen`只接收同一源模型、2048行和最大容量ABI的完整通过报告，按选中tile的KV边界补零需求绑定dequant。上面的空`--warm-sizes`保留已有MTP warm计划。筛选误差属于算子诊断，替换模型仍需独立BF16质量、缓存/多请求状态回归及完整请求性能验收。
+
+## 大块联合 prefill
+
+已有批处理、LUT4 FFN、临时W8长prefill和staged INT8 KV的27B模型，可以增加512/1024/2048总行数的联合prefill算子。在线架构仍由Rust注册，包只增加容量与kernel绑定，权重和workspace复用原有表示。
+
+```bash
+bash tools/operators/run.sh tools/model/upgrade_joint_prefill.py artifacts/joint-prefill-build \
+  --model PREPARED_MODEL --model-output JOINT_MODEL
+```
+
+构建器验证新增投影的独立数值参考、输出边界和修改输入后的Graph replay。联合FFN保留512-token路径的LUT4码本；1024/2048行不会改变这份码本。多请求整模型回归还应覆盖文本、图片、多图、请求重排、取消和槽位复用。动态混合prefill/decode保留小块预测预算，单独冷请求保留原有大块路径。
+
+## 非标准 batch
+
+现有2/4/8等专用行数保持不变。动态回退复用128行容量导出的 symbolic-row cubin，算子包提供实际host ABI的整数行数与grid表达式；Rust按实际2..128行生成launch及执行计划，并沿用有界Graph缓存。3/5等batch无需填充到下一档，线上不运行Python、TileLang或GPU代码JIT。GDN地址表只启动实际行数的CTA，持续状态仍为每请求独立FP32。
+
+```bash
+PYTHONPATH=. python3 tools/model/upgrade_dynamic_batch.py \
+  --model /path/to/current-model --output /path/to/new-model \
+  --report artifacts/dynamic-package.json
+./target/release/orin-llm validate-model /path/to/new-model
+```
+
+转换不改权重或cubin，输出是新目录。构建工具通过导出的host ABI验证容量绑定；加载器检查表达式、参数类型、128行契约和模板完整性。GPU回归`validate_continuous_requests`覆盖非标准行数、图片/多图、取消、重排、槽位复用及Graph模式。

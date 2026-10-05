@@ -240,22 +240,31 @@ def int8_gemm(M: int, N: int, K: int, BM: int = 128, BN: int = 128,
     """Compute ceiling: per-channel W8 permits scaling only in the epilogue."""
     assert grid_order in ('nfirst', 'mfirst', 'grouped4', 'grouped8',
                           'n1m2','n1m4','n1m8','n2m2','n2m4')
-    assert cache_policy in ('default','a-last-b-first','a-last','b-first')
+    assert cache_policy in ('default','a-last-b-first','a-last','b-first','b-last','a-first-b-last')
     grouped = grid_order in ('grouped4','grouped8','n1m2','n1m4','n1m8','n2m2','n2m4')
     nm, nn = (M+BM-1)//BM, N//BN
     gn = 1 if grid_order.startswith('n1m') else 2 if grid_order.startswith('n2m') else 4
     requested_m = int(grid_order[-1]) if grid_order.startswith(('n1m','n2m')) else 4 if grid_order=='grouped4' else 8
     gm = min(requested_m,nm) if grouped else 1
     if grouped:
-        assert nn % gn == 0 and nm % gm == 0
+        assert nn % gn == 0
     gx, gy = (nn*nm,1) if grouped else (nn,nm) if grid_order=='nfirst' else (nm,nn)
     @T.prim_func
     def kernel(A: T.Tensor((M, K), T.int8), B: T.Tensor((N, K), T.int8),
                AS: T.Tensor((M,), T.float16), BS: T.Tensor((N,), T.float16),
                C: T.Tensor((M, N), T.float16)):
         with T.Kernel(gx, gy, threads=threads) as (blockx, blocky):
-            bx = ((blockx//(gn*gm))%(nn//gn))*gn + blockx%gn if grouped else blockx if grid_order=='nfirst' else blocky
-            by = (blockx//(nn*gm))*gm + (blockx//gn)%gm if grouped else blocky if grid_order=='nfirst' else blockx
+            # The final M group can contain fewer tiles. Keep every valid
+            # (M,N) tile exactly once, including non-aligned shape tails.
+            if grouped:
+                first_m = (blockx // (nn * gm)) * gm
+                active_m = T.min(nm - first_m, gm)
+                within = blockx % (nn * gm)
+                bx = (within // (gn * active_m)) * gn + within % gn
+                by = first_m + (within // gn) % active_m
+            else:
+                bx = blockx if grid_order == 'nfirst' else blocky
+                by = blocky if grid_order == 'nfirst' else blockx
             T.annotate_min_blocks_per_sm(min_blocks)
             a = T.alloc_shared((BM, BK), T.int8)
             b = T.alloc_shared((BN, BK), T.int8)
@@ -263,9 +272,9 @@ def int8_gemm(M: int, N: int, K: int, BM: int = 128, BN: int = 128,
             T.clear(accum)
             for ko in T.Pipelined(K // BK, num_stages=stages):
                 T.copy(A[by * BM, ko * BK], a,
-                       eviction_policy='evict_last' if cache_policy in ('a-last','a-last-b-first') else None)
+                       eviction_policy='evict_last' if cache_policy in ('a-last','a-last-b-first') else 'evict_first' if cache_policy=='a-first-b-last' else None)
                 T.copy(B[bx * BN, ko * BK], b,
-                       eviction_policy='evict_first' if cache_policy in ('b-first','a-last-b-first') else None)
+                       eviction_policy='evict_first' if cache_policy in ('b-first','a-last-b-first') else 'evict_last' if cache_policy in ('b-last','a-first-b-last') else None)
                 T.gemm(a, b, accum, transpose_B=True)
             for i, j in T.Parallel(BM, BN):
                 if by * BM + i < M:

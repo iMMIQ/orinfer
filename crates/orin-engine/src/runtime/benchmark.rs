@@ -99,11 +99,23 @@ impl ModelRuntime {
             let request_start = Instant::now();
             let mut tokens = vec![];
             let mut logits_files = vec![];
-            for chunk in q.input_tokens.chunks(chunk_tokens) {
+            for (chunk_index, chunk) in q.input_tokens.chunks(chunk_tokens).enumerate() {
                 // SAFETY: Input IDs fit this allocation and were range checked.
                 // Previous graph is complete before overwriting its input buffer.
                 unsafe {
                     check((s.driver.stream_sync)(s.stream), "prefill input dependency")?;
+                    if q.input_tokens.len() > 8192
+                        && chunk_index > 0
+                        && chunk_index.is_multiple_of(8)
+                    {
+                        eprintln!(
+                            "request {}: prefill {}/{} tokens complete after {:.3}s",
+                            q.id,
+                            chunk_index * chunk_tokens,
+                            q.input_tokens.len(),
+                            request_start.elapsed().as_secs_f64()
+                        );
+                    }
                     check(
                         (s.driver.upload)(
                             pointers[&manifest.input],

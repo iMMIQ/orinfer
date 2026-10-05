@@ -30,7 +30,7 @@
     "baseline_reference_logprob",
     "candidate_reference_logprob"
   ],
-  "context_hash": "SHA256 over canonical serialized actual token IDs and positions; multimodal identity is a future extension.",
+  "context_hash": "SHA256 over canonical actual token IDs and positions, plus normalized multimodal tensor/position identity for image scores.",
   "top3_item": {
     "token_id": "integer token ID, never decoded string identity",
     "logprob": "finite natural-log probability normalized over the entire vocabulary"
@@ -38,18 +38,17 @@
   "candidate_selected_token_id": "Optional; greedy fast suite requires top1 with stable token-ID tie breaking.",
   "analyzer": "python3 tools/eval/quick_quality.py artifacts/probes.jsonl --output artifacts/quality-report.json",
   "modalities": [
-    "text"
+    "text",
+    "image",
+    "multi_image"
   ],
   "reference_candidates": [
     {
-      "repository": "Qwen/Qwen3.8-27B",
-      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "repository": "JonathanColetti/Qwen3.8-27B-Uncensored",
+      "revision": "5bb7aa90f0efef548e87005b1fb7658e522b6b7f",
       "format": "BF16"
-    },
-    {
-      "repository": "Qwen/Qwen3.8-27B-FP8",
-      "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
-      "format": "FP8"
     }
-  ]
+  ],
+  "multimodal_suite": "Single images and ordered multi-images; fixed-seed poster, landscape, anime and color/order task checks, official BF16 visual encoder and text reference. Raw token identity is diagnostic; normalize case/leading spaces only for label task checks.",
+  "acceptance_scope": "Bounded quick evaluation accepted; no claim of comprehensive benchmark, OCR or video quality."
 }

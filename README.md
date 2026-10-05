@@ -16,7 +16,7 @@ make build
 
 模型目录使用checkpoint的配置、tokenizer和chat template；`cache/weights/`采用标准分片safetensors及HF索引，`cache/model.json`只描述模型数据、状态作用域和算子包身份。packed W4、scale、zero和LUT保留原始字节及`orin.layout.<tensor>`元数据。这是引擎专用物理布局，通用safetensors工具可读取，其他引擎需要适配布局才能执行。
 
-Rust从配置识别注册架构，在代码中生成执行计划；算子包独立保存cubin、ABI、布局和形状契约。加载器先查`ORIN_OPERATOR_CACHE`或`$XDG_CACHE_HOME/orin-llm/operators`（默认`~/.cache/orin-llm/operators`），再查模型内的`cache/operators/`。第一阶段计算策略是INT8为主、质量优先的混合精度，关键路径保留FP16/FP32。可离线加入decode INT8 FFN包：权重维持单份W4，GateUp/Down在寄存器解包后执行INT8 MMA，Down采用group-128 activation scale；其它投影与持续状态保持原精度，构建方法见[模型构建](tools/model/README.md)。`validate-model`校验完整模型；`plan-model`在CPU上输出实际生成的计划。
+Rust从配置识别注册架构，在代码中生成执行计划；算子包独立保存cubin、ABI、布局和形状契约。加载器先查`ORIN_OPERATOR_CACHE`或`$XDG_CACHE_HOME/orin-llm/operators`（默认`~/.cache/orin-llm/operators`），再查模型内的`cache/operators/`。第一阶段计算策略是INT8为主、质量优先的混合精度，关键路径保留FP16/FP32。可离线加入decode INT8 FFN与GDN输出包：权重维持单份W4，在寄存器解包后执行INT8 MMA；FFN Down及GDN输出采用group-128 activation scale。其余投影与持续状态保持原精度，构建方法见[模型构建](tools/model/README.md)。`validate-model`校验完整模型；`plan-model`在CPU上输出实际生成的计划。
 
 服务协议位于`orin-api`，CLI只处理命令；`orin-engine`分为加载器、架构注册、算子包、CUDA执行器和生成/视觉/MTP控制模块。连续批处理共享权重与workspace，为每个请求保留独立KV、FP32 GDN、卷积、位置、视觉和采样状态。
 模型权重、cubin和编译缓存不包含在源码库中。[离线构建说明](tools/model/README.md)介绍checkpoint转换、kernel导出和模型组装。
@@ -49,15 +49,19 @@ CLI接收token-ID请求，输出包含生成token、加载时间和请求时延�
 
 默认监听`0.0.0.0:8088`，可用`--listen HOST:PORT`覆盖。模型目录内保留与权重匹配的`tokenizer.json`、`chat_template.jinja`和`generation_config.json`。Rust直接渲染checkpoint模板并分词。服务只加载一次模型，通过一个GPU worker执行请求；活跃与待处理请求合计有界，默认容量为160（32+128），满时返回429。GPU worker持有`artifacts/gpu-experiment.lock`；可用`--gpu-lock`指定共享锁路径。
 
-包含批处理算子的模型自动启用continuous batching。默认最多32个活跃请求，混合prefill/decode每轮最多128个target计算tokens；`--max-active-requests 1..128`和`--max-batch-tokens 1..128`调整上限，活跃数还受请求的完整上下文/输出预算、共享prefill workspace及可用显存约束。`--memory-reserve-mib 1024`保留显存余量；不足时先收缩prefix cache，再让新请求排队。权重只常驻一份，私有KV虚拟地址按请求上下文预算预留，空闲槽位扩容时重建相关Graph。新请求加入与结束按迭代处理，断连后释放其槽位，慢客户端输出通过有界非阻塞缓冲传送。
+包含批处理算子的模型自动启用continuous batching。默认最多32个活跃请求，混合prefill/decode每轮最多128个target计算tokens；`--max-active-requests 1..128`和`--max-batch-tokens 1..128`调整上限，活跃数还受请求的完整上下文/输出预算、共享prefill workspace及可用显存约束。Orin使用统一内存，准入和缓存预算同时检查CUDA可用内存与Linux `MemAvailable`，为系统保留物理RAM的1/16，再加上`--memory-reserve-mib 1024`配置的余量；不足时先收缩prefix cache，再让新请求排队。权重只常驻一份，私有KV虚拟地址按请求上下文预算预留，空闲槽位扩容时重建相关Graph。新请求加入与结束按迭代处理，断连后释放其槽位，慢客户端输出通过有界非阻塞缓冲传送。
 
 完整提示命中的文本请求支持成批准入：无活跃decoder时最多32个、3秒预算，容纳初次分配CUDA私有槽位的成本；已有decoder时最多8个、100毫秒预算。恢复期间已到达的请求可以加入同一批，不设置等待定时器。预算在每个请求启动完成后检查；一次不可切分的恢复或视觉操作可能超出预算。冷请求、部分命中及图片沿用10毫秒准入预算，显存准入和排队老化策略继续生效。`/health`与[并发测试工具](tools/bench/README.md)提供准入及Graph分项计时。
 
-单独prefill使用原有512/2048大块计划；与decode混合时按预测耗时选择1/2/4/8/32/64/128-token块，`--prefill-budget-ms 200`是混合块的预测时间目标，首轮估计和不可切分的视觉编码/缓存复制可能超过它。投影与FFN按总行数合批，attention/GDN保持每请求独立。算子包覆盖2/4/8/16/32/64/128行，可为常见小batch加入固定行数投影，其他大小补齐到下一档，填充行不进入请求状态。Graph命中时直接重放，不重建执行计划。不含批处理算子的包继续串行执行，`/health.continuous_batching`报告实际模式；离线升级见[模型构建](tools/model/README.md)。
+单请求prefill使用512/2048大块计划；多个短prefill可以拼接执行。声明`prefill_batch_profiles`的算子包还支持512/1024/2048总行数的大块联合prefill：没有decoder等待时，每轮为至多四个请求分配真实分块，共享投影与FFN，卷积、GDN分块扫描、attention和KV保持每请求独立。联合FFN沿用512-token路径的LUT4码本，权重与workspace不重复常驻。与decode混合时按预测耗时选择1/2/4/8/32/64/128-token块，`--prefill-budget-ms 200`是混合块的预测时间目标，首轮估计和不可切分的视觉编码/缓存复制可能超过它。投影与FFN按总行数合批，attention/GDN保持每请求独立。decode算子包覆盖2/4/8/16/32/64/128行，可为常见小batch加入固定行数投影，带动态行数契约的包按实际2..128行复用symbolic-row kernel，由Rust生成执行计划与launch参数，不需要在线Python编译；未升级的包继续补齐到下一档，填充行不进入请求状态。Graph命中时直接重放，不重建执行计划。不含批处理算子的包继续串行执行，`/health.continuous_batching`报告实际模式；离线升级见[模型构建](tools/model/README.md)。
+
+冷请求准入还比较预计首token时间：若按已测decode速率完成现有请求，再用大块prefill，预计比立即混合执行快至少10%，冷请求会暂留队列。完整缓存命中的请求继续准入；已有prefill继续推进，冷请求等待30秒后也恢复通常准入规则。尚无速率观测时直接准入，混合prefill的冷启动速率估计会由实际测量替换。`/health.admission_statistics.cold_deferrals`记录延后准入的候选检查次数，不等于请求数。
+
+包含`batch_gdn`能力的包在M1批处理中使用地址表并行访问私有GDN和卷积状态，卷积直接更新历史；混入短prefill时，decoder子集仍批处理，prefill请求单独执行自己的mixer。GDN持续状态和累积保持FP32，所有路径保持请求状态隔离。
 
 包含`greedy_sampling`能力的算子包在GPU执行带历史惩罚的零温度token选择，使用FP64运算、完整历史词频和确定性的并列排序，不逐步下载完整logits；每请求约2 MiB临时缓冲。正温度及MTP接受/拒绝的分布计算保留CPU路径。
 
-`serve`和`run-model`支持`--cuda-graph decode_only|full|off`，默认`decode_only`。`decode_only`只在生成阶段使用Graph，包含普通decode及MTP草稿、验证、恢复和短步刷新；文本prefill、视觉编码及MTP首次预热直接提交。prefill尾部即使复用decode计划也不使用Graph。`full`捕获并使用全部执行计划；`off`按相同计划逐个提交kernel、copy和memset。Graph模式通过显式加载配置传入引擎。
+`serve`、`run-model`和`score-model`支持`--cuda-graph decode_only|full|off`，默认`decode_only`。`decode_only`只在生成阶段使用Graph，包含普通decode及MTP草稿、验证、恢复和短步刷新；文本prefill、视觉编码及MTP首次预热直接提交。prefill尾部即使复用decode计划也不使用Graph。`full`捕获并使用全部执行计划；`off`按相同计划逐个提交kernel、copy和memset。Graph模式通过显式加载配置传入引擎。
 
 ```bash
 ./target/release/orin-llm serve /path/to/model-dir --cuda-graph full
@@ -132,15 +136,21 @@ Prefill使用单份W4权重、临时W8/A8和INT8 Tensor Core；512的FFN使用LU
 
 ## 性能与限制
 
-本机单流、无MTP/无prefix、每档三次256输出的中位数：
+本机单流、无MTP/无prefix，含group-128 INT8 GDN输出投影：512行FFN使用BM256/BN64融合tile，2048行FFN使用BM128/BN128、128线程及M分组调度的临时W8 GEMM。每档三次128输出的中位数：
 
 | 输入tokens | Prefill TPS | Decode TPS |
 | --- | ---: | ---: |
-| 512 | 664.57 | 10.551 |
-| 2048 | 773.25 | 10.481 |
-| 8192 | 765.88 | 10.223 |
+| 512 | 676.38 | 10.919 |
+| 2048 | 818.90 | 10.753 |
+| 8192 | 773.50 | 10.150 |
 
-Prefill计时包含输入复制和同步，排除末位置head；decode排除首token，包含逐token复制和同步。上表是关闭MTP时固定块token-ID请求的引擎计时，不包含API分词、排队或M=1输入尾部。上表不代表连续批处理吞吐；并发需通过真实API另测。BF16/FP8量化质量评测尚待补充。
+Prefill计时包含输入复制和同步，排除末位置head；decode排除首token，包含逐token复制和同步。上表是关闭MTP时固定块token-ID请求的引擎计时，不包含API分词、排队或M=1输入尾部。上表不代表连续批处理吞吐；并发需通过真实API另测。用户已接受当前测得性能，第一阶段不再以所有长度达到800 TPS为硬性门槛。
+
+文本快速质量对照使用同一uncensored模型的原始BF16 checkpoint，由独立Transformers逐层加载、B1完整序列prefill评分；本引擎执行正常prefill和teacher-forced decode，固定seed20261002与原始token历史。12个场景161个位置的top1一致率为97.52%，候选选择全部位于BF16 top3，平均答案NLL变化为−0.00800；约512/2k/8k的中部资料检索共15个位置，top1全部相同，NLL变化接近0。图片和多图另用同源BF16视觉encoder与文本模型作独立B1参考：8个颜色、场景及顺序任务全部通过，14个标签位置的候选选择有92.86%位于BF16 top3；大小写和前导空白不同需结合任务结果判断。视觉参考使用相同的归一化patch输入，未独立验证图片预处理。第一阶段按约定的快速评测范围验收；完整LLM benchmark留待后续。工具与执行路径见[质量评测](tools/eval/README.md)。
+
+长上下文另有无MTP的容量探针：260096-token输入与2049个固定长度输出使主模型实际计算位置到达262144，中部校验码检索正确；单次prefill约242.21 TPS、后续decode约3.08 TPS，主模型KV峰值8.25 GiB、prefill workspace峰值约0.99 GiB。固定长度探针在EOS后继续执行以验证容量，语义答案只取首个EOS之前；它未覆盖256k的独立BF16质量、Chat API长请求准入、MTP或prefix恢复，不能用来证明这些场景的完整验收。
+
+在线Chat另测260095-token提示、相同请求重放和260126-token多轮续写，开启MTP，三次均正确输出中部校验码并正常结束；超出262144总预算的请求在准入前返回400。默认12 GiB prefix预算下，内存压力会驱逐完整端点，本次重放与续写各命中65536 tokens，剩余约194k tokens重新计算，端到端分别约1107秒和1069秒。256k容量可用，但不能保证近满上下文的完整缓存命中；独立BF16长上下文质量评测仍未覆盖。
 
 开启MTP后，固定seed20261002、greedy、关闭thinking、单请求128-token代码输出，预热后3次HTTP SSE decode中位数：Python合并排序26.04 TPS、Rust LRU缓存25.11 TPS、TypeScript异步并发映射25.82 TPS。计数通过关闭MTP时的主模型token IDs核对，排除首个输出片段和被拒绝的草稿；完整输出与主模型参考相同。额外MTP草稿权重222,342,144 bytes，含视觉与MTP的常驻权重合计约4.59 bits/parameter。
 

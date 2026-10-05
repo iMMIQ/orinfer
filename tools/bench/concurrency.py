@@ -29,7 +29,7 @@ def events(response):
         raise ValueError('Unterminated SSE event')
 
 
-def request(base_url, body, barrier=None):
+def request(base_url, body, barrier=None, *, on_content=None, collect_arrivals=False):
     headers = {'Content-Type': 'application/json'}
     if os.getenv('ORIN_API_KEY'):
         headers['Authorization'] = 'Bearer ' + os.environ['ORIN_API_KEY']
@@ -55,17 +55,22 @@ def request(base_url, body, barrier=None):
                 delta = choice.get('delta', {})
                 if delta.get('content') or delta.get('reasoning_content') or delta.get('tool_calls'):
                     arrivals.append(at)
+                    if on_content is not None:
+                        on_content(at)
                 content.append(delta.get('content', ''))
                 reasoning.append(delta.get('reasoning_content', ''))
                 finish = choice.get('finish_reason') or finish
     if not done or not usage or not finish:
         raise ValueError('Incomplete stream or missing usage')
     gaps = [b-a for a, b in zip(arrivals, arrivals[1:])]
-    return dict(usage=usage, finish_reason=finish, content=''.join(content),
+    result = dict(usage=usage, finish_reason=finish, content=''.join(content),
         reasoning=''.join(reasoning), ttft_s=arrivals[0] if arrivals else None,
         wall_s=time.perf_counter()-start,
         chunk_gap_p50_s=statistics.median(gaps) if gaps else None,
         chunk_gap_max_s=max(gaps) if gaps else None)
+    if collect_arrivals:
+        result.update(started_monotonic_s=start, arrivals_s=arrivals)
+    return result
 
 
 def percentile(values, fraction):

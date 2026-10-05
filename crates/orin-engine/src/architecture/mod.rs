@@ -32,7 +32,7 @@ pub enum PrefillKind {
     Recurrent,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrefillProfile {
     pub tokens: usize,
@@ -73,6 +73,13 @@ pub(crate) fn batch_plan(
     segments: &[BatchSegment],
 ) -> Result<Vec<crate::execution::Invocation>> {
     qwen3_5::batching::plan(manifest, segments)
+}
+
+pub(crate) fn batch_state_bindings(
+    manifest: &Manifest,
+    segments: &[BatchSegment],
+) -> Vec<Option<(usize, String)>> {
+    qwen3_5::batching::state_bindings(manifest, segments)
 }
 
 pub(crate) struct Configuration {

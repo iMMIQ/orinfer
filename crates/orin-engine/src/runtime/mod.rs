@@ -16,6 +16,7 @@ mod mtp_gpu_tests;
 mod prefill_cost;
 mod prefix;
 pub(crate) mod requests;
+pub(crate) mod scoring;
 mod speculation;
 mod vision;
 
@@ -35,7 +36,7 @@ pub(crate) struct ModelRuntime {
     prefix_cache_limit: usize,
     pub(crate) scheduler_statistics: crate::scheduler::Statistics,
     scheduler_cursor: usize,
-    iteration_costs: std::collections::BTreeMap<(usize, usize, usize), f64>,
+    iteration_costs: std::collections::BTreeMap<(usize, usize, usize, usize), f64>,
     mtp_seconds_per_token: f64,
 }
 impl ModelRuntime {

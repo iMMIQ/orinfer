@@ -34,6 +34,21 @@ class StreamingTests(unittest.TestCase):
         self.assertIsNone(row['chunk_gap_p50_s'])
         self.assertIsNotNone(row['ttft_s'])
 
+    def test_stream_trigger_ignores_empty_role_and_retains_usage_count(self):
+        stream = b'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n'
+        stream += b'data: {"choices":[{"delta":{"content":"many tokens"}}]}\n\n'
+        stream += b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+        stream += b'data: {"choices":[],"usage":{"completion_tokens":9,"prompt_tokens":5}}\n\n'
+        stream += b'data: [DONE]\n\n'
+        observed = []
+        with patch('urllib.request.urlopen', return_value=io.BytesIO(stream)):
+            row = request('http://localhost/v1', {}, on_content=observed.append,
+                          collect_arrivals=True)
+        self.assertEqual(observed, row['arrivals_s'])
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(row['usage']['completion_tokens'], 9)
+        self.assertGreater(row['started_monotonic_s'], 0)
+
 
 if __name__ == '__main__':
     unittest.main()

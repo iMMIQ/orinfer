@@ -23,6 +23,7 @@ pub(super) struct AdmissionStatistics {
     wall_s: f64,
     max_round_s: f64,
     histogram: std::collections::BTreeMap<usize, usize>,
+    cold_deferrals: usize,
 }
 
 type Decoder<'a> = tokenizers::tokenizer::DecodeStream<
@@ -235,6 +236,7 @@ pub(super) fn worker(
     let mut waiting: Vec<Job> = vec![];
     let mut active: Vec<Active<'_>> = vec![];
     let mut completed: Vec<Mailbox> = vec![];
+    let mut admission_costs = scheduler::AdmissionCosts::default();
     loop {
         completed.retain_mut(|box_| box_.flush() && !box_.pending.is_empty());
         receive_waiting(&mut waiting, &mut jobs);
@@ -265,8 +267,16 @@ pub(super) fn worker(
         }
         let admission = Instant::now();
         let has_decoders = active.iter().any(|a| !a.request.is_prefilling());
+        let has_prefills = active.iter().any(|a| a.request.is_prefilling());
+        let decoder_count = active.iter().filter(|a| !a.request.is_prefilling()).count();
+        let remaining_decode_tokens: usize = active
+            .iter()
+            .filter(|a| !a.request.is_prefilling())
+            .map(|a| a.mailbox.job.prepared.max_tokens.saturating_sub(a.count))
+            .sum();
         let mut admitted_count = 0;
         let mut cached_count = 0;
+        let mut cold_deferrals = 0;
         while active.len() < options.max_active && !waiting.is_empty() {
             let costs: Vec<_> = waiting
                 .iter()
@@ -277,6 +287,7 @@ pub(super) fn worker(
                             age_s: 0.,
                             remaining_s: f64::MAX,
                             restore_s: 0.,
+                            remaining_tokens: 0,
                         });
                     cost.age_s = job.queued.elapsed().as_secs_f64();
                     cost
@@ -291,6 +302,15 @@ pub(super) fn worker(
                 )
                 .expect("nonempty candidates");
                 let i = untried.remove(relative);
+                if admission_costs.defer_cold(
+                    costs[i],
+                    decoder_count,
+                    remaining_decode_tokens,
+                    has_prefills,
+                ) {
+                    cold_deferrals += 1;
+                    continue;
+                }
                 let job = &waiting[i];
                 let input = GenerationInput {
                     input_tokens: job.prepared.input.clone(),
@@ -340,7 +360,7 @@ pub(super) fn worker(
                 cached_count += usize::from(cached_text);
                 // HTTP arrivals continue while CUDA restores a prefix. Include
                 // already-arrived work in the cohort without a batching timer.
-                if cached_text {
+                if cached_text || !has_decoders {
                     receive_waiting(&mut waiting, &mut jobs);
                 }
             }
@@ -366,11 +386,19 @@ pub(super) fn worker(
                 *statistics.histogram.entry(admitted_count).or_default() += 1;
             }
         }
+        if cold_deferrals > 0
+            && let Ok(mut statistics) = activity.admission.lock()
+        {
+            statistics.cold_deferrals += cold_deferrals;
+        }
         activity.active.store(active.len(), Ordering::Relaxed);
         activity
             .queued
             .store(waiting.len() + jobs.len(), Ordering::Relaxed);
         if !active.is_empty() {
+            let before = model.scheduler_statistics();
+            let step_at = Instant::now();
+            let decoders = active.iter().filter(|a| !a.request.is_prefilling()).count();
             let mut requests: Vec<_> = active.iter_mut().map(|a| &mut a.request).collect();
             match model.advance_requests(&mut requests, &options) {
                 Ok(outputs) => {
@@ -384,8 +412,15 @@ pub(super) fn worker(
                     }
                 }
             }
+            let after = model.scheduler_statistics();
+            admission_costs.observe(
+                decoders,
+                after.decode_tokens.saturating_sub(before.decode_tokens),
+                after.prefill_tokens.saturating_sub(before.prefill_tokens),
+                step_at.elapsed().as_secs_f64(),
+            );
             if let Ok(mut statistics) = activity.statistics.lock() {
-                *statistics = model.scheduler_statistics();
+                *statistics = after;
             }
         } else if waiting.is_empty() && completed.is_empty() {
             let Some(job) = jobs.blocking_recv() else {

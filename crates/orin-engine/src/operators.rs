@@ -11,6 +11,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod dynamic;
+
 pub const RUNTIME_ABI: u32 = 1;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -49,7 +51,13 @@ pub struct OperatorPackage {
     #[serde(default)]
     pub batch_profiles: Vec<usize>,
     #[serde(default)]
+    pub dynamic_batch_kernels: Vec<dynamic::DynamicBatchKernel>,
+    #[serde(default)]
+    pub prefill_batch_profiles: Vec<PrefillProfile>,
+    #[serde(default)]
     pub greedy_sampling: bool,
+    #[serde(default)]
+    pub batch_gdn: bool,
     pub buffer_contracts: Vec<BufferContract>,
     pub kernels: Vec<Kernel>,
     pub toolchain: BTreeMap<String, String>,
@@ -80,6 +88,43 @@ impl OperatorPackage {
             .any(|&b| !(2..=128).contains(&b) || !b.is_power_of_two() || !seen.insert(b))
         {
             return Err("Invalid or duplicate batch profile".into());
+        }
+        let kernels: BTreeMap<_, _> = self.kernels.iter().map(|k| (k.name.as_str(), k)).collect();
+        let mut templates = std::collections::BTreeSet::new();
+        for template in &self.dynamic_batch_kernels {
+            if !templates.insert(template.name.as_str()) {
+                return Err("Duplicate dynamic batch template".into());
+            }
+            template.validate(
+                kernels
+                    .get(template.name.as_str())
+                    .ok_or("Missing dynamic batch kernel")?,
+            )?;
+        }
+        if !templates.is_empty()
+            && (!self.batch_profiles.contains(&128)
+                || kernels
+                    .keys()
+                    .filter(|name| {
+                        name.starts_with("batch_m128/") || name.starts_with("batch_gdn_m128/")
+                    })
+                    .any(|name| !templates.contains(name)))
+        {
+            return Err("Incomplete dynamic batch contracts".into());
+        }
+        seen.clear();
+        if self.prefill_batch_profiles.iter().any(|p| {
+            p.tokens <= 128
+                || !p.tokens.is_power_of_two()
+                || !seen.insert(p.tokens)
+                || !matches!(
+                    p.kind,
+                    crate::architecture::PrefillKind::ChunkLut4
+                        | crate::architecture::PrefillKind::ChunkExpanded
+                )
+        }) || (!self.prefill_batch_profiles.is_empty() && self.batch_profiles.is_empty())
+        {
+            return Err("Invalid joint prefill profile".into());
         }
         let actual: Vec<_> = buffers.iter().map(BufferContract::from).collect();
         if actual != self.buffer_contracts {

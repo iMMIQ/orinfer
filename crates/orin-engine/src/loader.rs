@@ -86,7 +86,22 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
         .metadata
         .batch_profiles
         .clone_from(&package.batch_profiles);
+    model
+        .metadata
+        .prefill_batch_profiles
+        .clone_from(&package.prefill_batch_profiles);
+    model.metadata.dynamic_batch_kernels = package
+        .dynamic_batch_kernels
+        .iter()
+        .map(|t| (t.name.clone(), t.clone()))
+        .collect();
     model.metadata.greedy_sampling = package.greedy_sampling;
+    model.metadata.batch_gdn = package.batch_gdn;
+    if package.batch_gdn
+        && model.buffer_scopes.get("BatchGdnPointers") != Some(&BufferScope::Workspace)
+    {
+        return Err("Batch GDN address table must be shared workspace".into());
+    }
     let decode_programs =
         architecture::build(&config, &mut model.metadata, &package.prefill_profiles)?;
     model.metadata.kernels = package.kernels;

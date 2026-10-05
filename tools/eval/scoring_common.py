@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import re
+import struct
 from pathlib import Path
 
 SEED = 20261002
@@ -22,10 +23,27 @@ def execution_identity(output):
     return identity
 
 
-def context_hash(token_ids):
+def image_fingerprints(images):
+    identities = []
+    for image in images:
+        if set(image) != {'grid_height', 'grid_width', 'pixels'}:
+            raise ValueError('Image scoring requires an explicit normalized patch tensor')
+        h, w, pixels = image['grid_height'], image['grid_width'], image['pixels']
+        if (type(h) is not int or type(w) is not int or h <= 0 or w <= 0 or h % 2 or w % 2
+                or len(pixels) != h * w * 1536
+                or any(not math.isfinite(x) or not -1.001 <= x <= 1.001 for x in pixels)):
+            raise ValueError('Invalid normalized image grid or pixel payload')
+        raw = struct.pack(f'<{len(pixels)}f', *pixels)
+        identities.append(dict(grid_height=h, grid_width=w, pixels_sha256=hashlib.sha256(raw).hexdigest()))
+    return identities
+
+
+def context_hash(token_ids, images=()):
     if not token_ids or any(type(x) is not int or x < 0 for x in token_ids):
         raise ValueError('A nonempty actual token-ID history is required')
     data = {'token_ids': token_ids, 'positions': list(range(len(token_ids)))}
+    if images:
+        data['images'] = image_fingerprints(images)
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
@@ -61,14 +79,14 @@ def validate_task(rule, text):
     return {'status': 'pass' if passed else 'fail', 'kind': kind, 'expected': expected}
 
 
-def validate_probes(probes, prompt_ids, target_ids, case_id, mode):
+def validate_probes(probes, prompt_ids, target_ids, case_id, mode, images=()):
     ordered = sorted(probes, key=lambda x: x['position'])
     if len(ordered) != len(target_ids):
         raise ValueError(f'{case_id}/{mode}: missing or extra probe positions')
     for position, row in enumerate(ordered):
         if (row['case_id'], row['execution_mode'], row['position'], row['seed']) != (case_id, mode, position, SEED):
             raise ValueError('Probe identity, seed or position mismatch')
-        if row['context_sha256'] != context_hash(prompt_ids + target_ids[:position]):
+        if row['context_sha256'] != context_hash(prompt_ids + target_ids[:position], images):
             raise ValueError('Scorer used a different teacher-forced history')
         if row['reference_token_id'] != target_ids[position]:
             raise ValueError('Scorer used a different reference token')

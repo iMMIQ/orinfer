@@ -15,10 +15,11 @@ import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from tools.model.optimize_kv import link_or_copy
 from tools.model.prepare import write_json
+from tools.model.screen_prefill_ffn import model_identity
 from tools.operators.abi import parse_host, evaluate
 
 
-def publish(source, destination, engine, output, warm_sizes=(64,128,512)):
+def publish(source, destination, engine, output, warm_sizes=(64,128,512), attention_screen=None):
     from tools.operators.common import configure, export_kernel
     from kernels.model.attention_prefill_staged import attention_prefill_staged
     from kernels.model.kv_int8 import dequant_prefill_kv
@@ -32,6 +33,20 @@ def publish(source, destination, engine, output, warm_sizes=(64,128,512)):
     if wrapper['architecture']!='qwen3_5' or not meta['kv_cache'].get('prefill_workspace'):
         raise ValueError('Requires prepared demand-mapped INT8 KV with prefill scratch')
     context=meta['max_context'];spec=meta['mtp'];buffers={b['name']:b for b in meta['buffers']}
+    attention_choice=None
+    if attention_screen is not None:
+        screen=json.loads((attention_screen/'result.json').read_text())
+        selected=[r for r in screen['cases'] if r.get('selected') and r.get('finalist_rechecked')]
+        if (screen['status']!='passed' or screen['fingerprint']!=model_identity(source)
+                or screen['capacity']!=context or screen['rows']!=2048 or len(selected)!=1):
+            raise ValueError('Attention screen must validate this model and the 2048-row capacity ABI')
+        attention_choice=selected[0]
+        if ({r['length'] for r in attention_choice['metadata_checks']}!={0,1,145,1025,screen['context']}
+                or not all(r['guard'] and r['empty_query'] and r['error']['finite']
+                           and r['error']['relative_l2']<.002 for r in attention_choice['metadata_checks'])
+                or not attention_choice['graph_restore_error']['finite']
+                or attention_choice['graph_restore_error']['relative_l2']>=.002):
+            raise ValueError('Incomplete attention metadata/graph checks')
     if buffers['FullQ']['shape'][1:] != [24,256]:
         raise ValueError('This attention package requires Q24/KV4, head_dim=256')
     if spec and warm_sizes:
@@ -81,8 +96,15 @@ def publish(source, destination, engine, output, warm_sizes=(64,128,512)):
             result['shared_memory_bytes']=int(evaluate(launch['sharedMemBytes'],dims))
             return result
         def attention(rows,bm):
+            if rows==2048 and attention_choice is not None:
+                return exported('attention-'+str(rows),lambda:attention_prefill_staged(
+                    1,rows,context,kv_layout='token_major',block_m=attention_choice['bm'],
+                    block_n=attention_choice['bn'],threads=attention_choice['threads'],
+                    num_stages=attention_choice['stages'],exp_mode=attention_choice['exp_mode'],
+                    interior_mask=True,contiguous_queries=True))
             return exported('attention-'+str(rows),lambda:attention_prefill_staged(1,rows,context,kv_layout='token_major',block_m=bm,num_stages=1,interior_mask=True,contiguous_queries=True))
-        dq=exported('dequant-pad32',lambda:dequant_prefill_kv(context,pad_to=32))
+        pad=attention_choice['bn'] if attention_choice is not None else 32
+        dq=exported('dequant-pad'+str(pad),lambda:dequant_prefill_kv(context,pad_to=pad))
         for name,binding in list(kernels.items()):
             if name.startswith(('prefill_m512/layer','prefill_m2048/layer')) and name.endswith('/k5') and any(a.get('name')=='FullQ' for a in binding['args']):
                 rows=int(name.split('/')[0][9:]);kernels[name]=bind(name,attention(rows,64),arguments(binding),rows)
@@ -134,7 +156,8 @@ def publish(source, destination, engine, output, warm_sizes=(64,128,512)):
         write_json(staging/'cache/model.json',wrapper)
         subprocess.run([str(engine.resolve()),'validate-model',str(staging)],check=True)
         staging.rename(destination)
-        return dict(model=str(destination),operator_package=digest,mtp_warm_sizes=list(warm_sizes))
+        return dict(model=str(destination),operator_package=digest,mtp_warm_sizes=list(warm_sizes),
+                    attention_choice=attention_choice)
     except BaseException:
         shutil.rmtree(staging);raise
 
@@ -142,5 +165,7 @@ def publish(source, destination, engine, output, warm_sizes=(64,128,512)):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--model',type=Path,required=True);p.add_argument('--destination',type=Path,required=True)
     p.add_argument('--engine',type=Path,default=Path('target/release/orin-llm'));p.add_argument('--output',type=Path,required=True)
-    p.add_argument('--warm-sizes',type=int,nargs='*',default=[64,128,512]);a=p.parse_args()
-    print(json.dumps(publish(a.model,a.destination,a.engine,a.output,tuple(a.warm_sizes)),indent=2))
+    p.add_argument('--warm-sizes',type=int,nargs='*',default=[64,128,512])
+    p.add_argument('--attention-screen',type=Path)
+    a=p.parse_args()
+    print(json.dumps(publish(a.model,a.destination,a.engine,a.output,tuple(a.warm_sizes),a.attention_screen),indent=2))

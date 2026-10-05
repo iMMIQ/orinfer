@@ -197,6 +197,12 @@ impl ModelRuntime {
         logits_valid: bool,
     ) -> Result<()> {
         let at = Instant::now();
+        if self.prefix_cache.budget != 0
+            && self.manifest.mtp.is_some()
+            && (input.is_empty() || warm_tokens != input.len() - 1)
+        {
+            return Err("Prefix checkpoint must retain exactly P-1 MTP inputs".into());
+        }
         let same = self.prefix_cache.entries.values().any(|e| {
             e.tokens == input
                 && e.media.common_tokens(media, input.len()) == input.len()
