@@ -4,6 +4,8 @@ import json
 import shutil
 import time
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
+from tools.reference import CHECKPOINT, SOURCE
 
 import torch
 import tilelang.language as T
@@ -15,10 +17,10 @@ from abi import parse_host
 from kernels.operators.op07_gdn_ab import gdn_ab_simt, gdn_ab_tensorcore, launch
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http/model.safetensors')
-LOCK = ROOT / 'artifacts/experimental-vllm/reference-lock.json'
-ACT = ROOT / 'artifacts/experimental-vllm/activations'
-NATIVE = Path('/home/nvidia/model/orin-kv8-mtp-20261001/vllm020/model_executor/layers/mamba/gdn_linear_attn.py')
+MODEL = CHECKPOINT / 'model.safetensors'
+LOCK = ROOT / 'artifacts/reference/reference-lock.json'
+ACT = REFERENCE_ACTIVATIONS
+NATIVE = (SOURCE / 'model_executor/layers/mamba/gdn_linear_attn.py')
 ROWS = (1, 2, 3, 4, 5, 7, 8, 511, 512, 513, 2048, 8192)
 
 

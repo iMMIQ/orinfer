@@ -2,15 +2,16 @@
 import hashlib
 import json
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
+from tools.reference import CHECKPOINT, checkpoint_sha256
 import statistics
 import time
 import torch
 from safetensors import safe_open
 
 ROOT=Path(__file__).resolve().parents[2]
-MODEL=Path('/home/nvidia/model/vllm-comparison-20260930/awq-http/model.safetensors')
-FULL_SHA='15c5b07049149c73236254d53eca1d2f3274f9fb6803540ca47b1ce657dcf583'
-ACTIVATIONS=ROOT/'artifacts/experimental-vllm/activations'
+MODEL=CHECKPOINT / 'model.safetensors'
+ACTIVATIONS=REFERENCE_ACTIVATIONS
 PARTS={'gate_up':['mlp.gate_proj','mlp.up_proj'],'down':['mlp.down_proj'],'gdn_qkvz':['linear_attn.in_proj_qkv','linear_attn.in_proj_z'],'gdn_out':['linear_attn.out_proj']}
 MATCH={'gate_up':'gate_up_proj','down':'down_proj','gdn_qkvz':'in_proj_qkvz','gdn_out':'out_proj'}
 

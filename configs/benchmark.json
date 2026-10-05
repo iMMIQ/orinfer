@@ -1,5 +1,5 @@
 {
-  "status": "Phase-one acceptance contract: implementation complete; bounded quality suite accepted and further performance optimization stopped by user. Measurements remain local artifacts.",
+  "status": "Benchmark workload specification; measurements are generated separately.",
   "requirements": {
     "device": "Local Jetson AGX Orin 64GB",
     "model": "Qwen3.8-27B",
@@ -8,7 +8,7 @@
     "quantization": "Any format, including custom; approximately 4-bit resident weight footprint",
     "quality_preference": "Preserve quality; may slightly exceed 4-bit footprint",
     "acceleration": "MTP is optional and selected per workload; not an engine requirement",
-    "queueing": "User explicitly allows queueing; report actual resident/running counts and queue delay.",
+    "queueing": "Queueing is permitted; report actual resident/running counts and queue delay.",
     "performance_acceptance": {
       "single_stream_prefill_tps": 800,
       "single_stream_decode_tps": 10,
@@ -18,9 +18,9 @@
         2048,
         8192
       ],
-      "reference": "Pin exact engine/model/tokenizer/kernel identities for comparisons; quantization quality uses the same uncensored source BF16.",
+      "reference": "Pin exact engine/model/tokenizer/kernel identities; quantization quality uses the same-source original BF16.",
       "evaluation": "Report each input length separately. Client TTFT and executed-token model prefill TPS must not be mixed.",
-      "status": "Historical 800/10 targets retained for reporting; user accepts current measured performance and ends further optimization.",
+      "status": "Reference reporting targets, not a universal performance guarantee.",
       "hard_gate": false
     },
     "modalities": [
@@ -314,7 +314,7 @@
     "additional_checkpoints": "Final prompt, template history boundaries and cost-admitted branch endpoints."
   },
   "quality_evaluation": [
-    "Accepted fixed-seed bounded BF16 quick suite: task checks and teacher-forced full-vocabulary-normalized top3/NLL. Full LLM benchmarks are deferred, not a phase-one gate.",
+    "Fixed-seed bounded BF16 quick suite: task checks and teacher-forced full-vocabulary-normalized top3/NLL. Full LLM benchmarks must be evaluated separately.",
     "BF16 reference on representative text, code and long-state workloads",
     "Same-quantized-weight reference to isolate kernel implementation bugs",
     "Model-level probability/perplexity and task metrics; local tensor error alone is insufficient"

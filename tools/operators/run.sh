@@ -25,10 +25,18 @@ container_name="orinfer-operator-$$"
 extra_mounts=()
 group_args=()
 for group_id in $(id -G); do group_args+=(--group-add "$group_id"); done
-if [[ -n "${ORINFER_CHECKPOINT_DIR:-}" ]]; then
-    checkpoint_dir="$(realpath -- "$ORINFER_CHECKPOINT_DIR")"
-    extra_mounts+=(-v "$checkpoint_dir:$checkpoint_dir:ro")
-fi
+reference_env=()
+declare -A mounted_inputs=()
+for variable in ORINFER_CHECKPOINT_DIR ORINFER_REFERENCE_CHECKPOINT ORINFER_REFERENCE_SOURCE ORINFER_REFERENCE_ACTIVATIONS; do
+    if [[ -n "${!variable:-}" ]]; then
+        input_path="$(realpath -- "${!variable}")"
+        if [[ -z "${mounted_inputs[$input_path]+present}" ]]; then
+            extra_mounts+=(-v "$input_path:$input_path:ro")
+            mounted_inputs["$input_path"]=1
+        fi
+        reference_env+=(-e "$variable=$input_path")
+    fi
+done
 entrypoint="${ORINFER_COMPILER_PYTHON:-/usr/bin/python3}"
 command_args=("$runner")
 if [[ -n "${ORINFER_OPERATOR_SANITIZER:-}" ]]; then
@@ -70,7 +78,7 @@ sampler_pid=$!
 docker run --rm --name "$container_name" --runtime nvidia --network none \
     --user "$(id -u):$(id -g)" "${group_args[@]}" \
     --entrypoint "$entrypoint" --shm-size 2g -v "$repo_dir:$repo_dir" -v "$output_dir:$output_dir" \
-    "${extra_mounts[@]}" -w "$repo_dir" -e OMP_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+    "${extra_mounts[@]}" "${reference_env[@]}" -w "$repo_dir" -e OMP_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
     -e PYTHONPATH="$repo_dir:$repo_dir/tools/operators:${ORINFER_COMPILER_SITE_PACKAGES:-/opt/venv/lib/python3.10/site-packages}" \
     -e TORCH_EXTENSIONS_DIR="$output_dir/cache/torch" -e XDG_CACHE_HOME="$output_dir/cache" \
     -e PYTHONDONTWRITEBYTECODE=1 \

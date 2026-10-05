@@ -9,6 +9,7 @@ import gc
 import json
 import shutil
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
 
 import numpy as np
 import torch
@@ -28,7 +29,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--model', type=Path, required=True)
     parser.add_argument('--activations-dir', type=Path,
-                        default=Path('artifacts/experimental-vllm/activations'))
+                        default=REFERENCE_ACTIVATIONS)
     parser.add_argument('--tokens', type=int, choices=(512, 513, 2048, 8192), default=512)
     parser.add_argument('--validation-only', action='store_true')
     parser.add_argument('--validation-columns', type=int)

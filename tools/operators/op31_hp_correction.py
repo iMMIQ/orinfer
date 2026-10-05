@@ -6,6 +6,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
 
 import torch
 from common import benchmark, configure, environment, error, export_kernel, identity, tensor_sha, write_json
@@ -70,7 +71,7 @@ def mutations(graph,run,a,idx,side,base,out):
 
 
 def captures(layer,report):
-    folder=ROOT/'artifacts/experimental-vllm/activations'; records=[]
+    folder=REFERENCE_ACTIVATIONS; records=[]
     for path in sorted(folder.glob('*.json')):
         import json
         m=json.loads(path.read_text())
@@ -88,7 +89,7 @@ def main():
     ap=argparse.ArgumentParser();ap.add_argument('--output',type=Path,required=True);args=ap.parse_args()
     configure();outdir=args.output
     report={'environment':environment(),'scope':'isolated HP correction and two-layer full down chain; no whole-model quality acceptance',
-            'checkpoint':{'path':screen.MODEL,'full_sha256':screen.MODEL_HASH,'hash_origin':'locked full-file identity reused; read tensor hashes verified'},
+            'checkpoint':{'path':screen.MODEL,'full_sha256':screen.checkpoint_sha256(screen.MODEL),'hash_origin':'Supplied checkpoint hashed once; read tensor hashes verified'},
             'weight_reference':'same community AWQ W4 half((q-z)*s), not official BF16 weights',
             'primitive':[],'edge_cases':[],'chains':[],'kernels':[],'input_sources':[],'layers':[],
             'quality_limitation':'historical layer0 M512 position9 target271 probability .770 -> .0635; HP32 must not enable/accept model policy',

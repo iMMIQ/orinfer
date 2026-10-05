@@ -147,7 +147,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=Path('configs/reference.json'))
     parser.add_argument('--output', type=Path, default=Path('artifacts/reference'))
-    parser.add_argument('--seed-tokens', type=Path, default=Path('/home/nvidia/model/vllm-comparison-20260930/input-seed.json'))
+    parser.add_argument('--seed-tokens', type=Path, required=True, help='JSON array of input token IDs')
     parser.add_argument('--lengths', default='512,2048,8192')
     parser.add_argument('--outputs', type=int, default=256)
     parser.add_argument('--runs', type=int, default=3)

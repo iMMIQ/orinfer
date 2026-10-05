@@ -7,6 +7,7 @@ import re
 import shutil
 import time
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
 
 import torch
 
@@ -116,7 +117,7 @@ def checked_case(kernel, x, mask, group, masked, report, label):
 
 
 def captures(kind, layer, report):
-    folder = ROOT / "artifacts/experimental-vllm/activations"
+    folder = REFERENCE_ACTIVATIONS
     records = []
     for p in sorted(folder.glob("*.json")):
         meta = json.loads(p.read_text())
@@ -206,8 +207,8 @@ def main():
     configure()
     report = {"environment": environment(), "cases": [], "fusion_cases": [],
               "input_sources": [], "exports": [], "compile": [], "edge_cases": [],
-              "status": "running", "weight_checkpoint_sha256": "15c5b07049149c73236254d53eca1d2f3274f9fb6803540ca47b1ce657dcf583",
-              "weight_identity_note": "reuse locked prior full-file hash; no weight tensor used by this operator",
+              "status": "running", "weight_checkpoint_sha256": None,
+              "weight_identity_note": "No weight tensor used by this operator; input activation identities are reported separately",
               "quality_policy": "A8 exactness is not model quality; formal M512 native threshold unchanged; no model started",
               "budget": "conditional op30 charged inside SwiGLU/linear path; no independent allocation or double counting"}
     freeze = out / "measurement-source"

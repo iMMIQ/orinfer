@@ -6,6 +6,7 @@ import json
 import re
 import time
 from pathlib import Path
+from tools.reference import CHECKPOINT
 
 import torch
 import torch.nn.functional as F
@@ -18,7 +19,7 @@ from common import (ROOT, benchmark, configure, environment, error, export_kerne
                     identity, tensor_sha, write_json)
 from kernels.operators.op17_gdn_gated_norm import gdn_gated_norm, launch
 
-MODEL = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http')
+MODEL = CHECKPOINT
 SOURCE = ROOT / 'artifacts/operators/op17_gdn_gated_norm/reference-source'
 ROWS = (1, 2, 3, 4, 5, 7, 8, 511, 512, 513, 2048, 8192)
 

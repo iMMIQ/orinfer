@@ -142,7 +142,7 @@ def main():
     parser.add_argument('--rows', default='')
     args = parser.parse_args()
     configure()
-    report = dict(environment=environment(), checkpoint=str(real.MODEL), checkpoint_sha256=real.FULL_SHA,
+    report = dict(environment=environment(), checkpoint=str(real.MODEL), checkpoint_sha256=real.checkpoint_sha256(real.MODEL),
                   phase=args.phase, candidates=[], failures=[], fixtures=[])
     def save():
         write_json(args.output / 'results.json', report)

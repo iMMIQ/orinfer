@@ -8,6 +8,7 @@ import shutil
 import time
 import types
 from pathlib import Path
+from tools.reference import CHECKPOINT, SOURCE
 import torch
 from safetensors import safe_open
 from common import (ROOT, configure, environment, error, export_kernel, benchmark,
@@ -16,8 +17,8 @@ from abi import parse_host
 from kernels.operators.op20_full_prepare import (full_prepare, reset_metadata,
     validate_metadata, validate_host_metadata, bandwidth_copy)
 
-MODEL = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http')
-SOURCE = Path('/home/nvidia/model/orin-kv8-mtp-20261001/vllm020')
+MODEL = CHECKPOINT
+SOURCE = SOURCE
 B, MP, NP, BS, MAXPOS = 8, 68, 548, 128, 8576
 
 

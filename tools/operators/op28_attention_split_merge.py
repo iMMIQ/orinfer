@@ -5,6 +5,7 @@ import re
 import shutil
 import time
 from pathlib import Path
+from tools.reference import SOURCE
 import torch
 from common import (ROOT,configure,environment,error,export_kernel,benchmark,
                     identity,write_json)
@@ -188,7 +189,7 @@ def main():
     parser.add_argument('--repetitions',type=int,default=15);parser.add_argument('--smoke',action='store_true')
     parser.add_argument('--skip-composition',action='store_true');args=parser.parse_args()
     out=Path(args.output);out.mkdir(parents=True,exist_ok=True);configure()
-    native=Path('/home/nvidia/model/orin-kv8-mtp-20261001/vllm020/model_executor/models/qwen3_next.py')
+    native=(SOURCE / 'model_executor/models/qwen3_next.py')
     shutil.copyfile(native,out/'qwen3_next.py');assert 'gate = torch.sigmoid(gate)' in native.read_text()
     results={'environment':environment(),'native_reference':identity(out/'qwen3_next.py'),
              'gate_reference_lines':[304,307,308],'cpu_policy_rejections':validate_policy(),

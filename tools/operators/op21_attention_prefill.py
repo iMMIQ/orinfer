@@ -5,13 +5,14 @@ import json
 import shutil
 import time
 from pathlib import Path
+from tools.reference import SOURCE
 import torch
 from common import (ROOT, configure, environment, error, export_kernel,
                     benchmark, identity, tensor_sha, write_json)
 from abi import parse_host
 from kernels.operators.op21_attention_prefill import attention_prefill, validate_metadata
 
-SOURCE = Path('/home/nvidia/model/orin-kv8-mtp-20261001/vllm020/model_executor/models/qwen3_next.py')
+SOURCE = (SOURCE / 'model_executor/models/qwen3_next.py')
 
 
 def reference(q,k,v,gate,pos,lengths,layout='token_major',kv_layout='head_major',

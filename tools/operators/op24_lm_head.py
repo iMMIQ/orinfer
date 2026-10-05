@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
+from tools.reference import CHECKPOINT, checkpoint_sha256
 
 import torch
 import tilelang.language as T
@@ -20,9 +22,8 @@ from kernels.projections.candidates import fp16_gemm
 from kernels.operators import op25_token_selection as select
 from kernels.operators import op26_probability_score as score
 
-MODEL = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http/model.safetensors')
-MODEL_SHA = '15c5b07049149c73236254d53eca1d2f3274f9fb6803540ca47b1ce657dcf583'
-ACTIVATIONS = ROOT / 'artifacts/experimental-vllm/activations'
+MODEL = CHECKPOINT / 'model.safetensors'
+ACTIVATIONS = REFERENCE_ACTIVATIONS
 SHAPES = (1, 2, 3, 4, 5, 7, 8)
 
 
@@ -280,8 +281,8 @@ def main():
                    'tools/operators/abi.py','tools/projections/activation_export.py','configs/quick-quality.json'):
         destination=output/'measurement-source'/source;destination.parent.mkdir(parents=True,exist_ok=True)
         shutil.copyfile(ROOT/source,destination)
-    report=dict(environment=environment(),checkpoint=dict(path=str(MODEL),locked_full_sha256=MODEL_SHA,
-                    full_file_hash_policy='reuse pinned historical full-file identity; streamed head tensor SHA freshly computed'),
+    report=dict(environment=environment(),checkpoint=dict(path=str(MODEL),full_sha256=checkpoint_sha256(MODEL),
+                    full_file_hash_policy='Supplied checkpoint hashed once; streamed head tensor SHA separately computed'),
                 identities={n:identity(MODEL.parent/n) for n in ('config.json','tokenizer.json','tokenizer_config.json','chat_template.jinja')},
                 failures=[], candidates=[],budget_ms=4.0,scope='isolated untied full vocabulary head; no full-model throughput or quality acceptance')
     def save(): write_json(output/'results.json',report)

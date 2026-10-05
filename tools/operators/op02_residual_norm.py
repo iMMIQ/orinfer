@@ -8,6 +8,8 @@ import re
 import time
 import types
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
+from tools.reference import CHECKPOINT
 
 import torch
 from safetensors import safe_open
@@ -16,9 +18,9 @@ from common import (ROOT, benchmark, configure, environment, error, export_kerne
                     identity, tensor_sha, write_json)
 from kernels.operators.op02_residual_norm import first_norm, residual_norm
 
-MODEL = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http')
+MODEL = CHECKPOINT
 SOURCE = ROOT / 'artifacts/operators/op02_residual_norm/reference-source'
-ACTIVATIONS = ROOT / 'artifacts/experimental-vllm/activations'
+ACTIVATIONS = REFERENCE_ACTIVATIONS
 ROWS = (1, 2, 3, 4, 5, 7, 8, 511, 512, 513, 2048, 8192)
 
 

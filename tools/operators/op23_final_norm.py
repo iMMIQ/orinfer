@@ -5,6 +5,8 @@ import json
 import re
 import time
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
+from tools.reference import CHECKPOINT
 
 import torch
 from safetensors import safe_open
@@ -16,8 +18,8 @@ from tools.operators.op02_residual_norm import source_reference, SOURCE
 from kernels.operators.op23_final_norm import (final_norm, final_norm_presummed,
     last_hidden_gather, validate_last_indices)
 
-MODEL = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http')
-ACTIVATIONS = ROOT / 'artifacts/experimental-vllm/activations'
+MODEL = CHECKPOINT
+ACTIVATIONS = REFERENCE_ACTIVATIONS
 BATCHES = (1, 2, 3, 4, 5, 7, 8)
 MODES = ('residual_fp32', 'presummed_fp32', 'no_residual_fp16')
 

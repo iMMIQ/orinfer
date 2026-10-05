@@ -18,7 +18,7 @@ check:
 	$(PYTHON) -m unittest discover -s tools/bench -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/operators -p 'test_abi.py' -v
 	$(PYTHON) -m unittest discover -s tools/vision -p 'test_*.py' -v
-	$(PYTHON) -m unittest tools.model.test_prepare tools.model.test_package tools.model.test_publication tools.model.test_resize_context tools.model.test_optimize_kv tools.model.test_stage_kv_prefill tools.model.test_upgrade_batching tools.model.test_upgrade_dynamic_batch tools.model.test_checkpoint tools.release.test_package -v
+	$(PYTHON) -m unittest tools.model.test_prepare tools.model.test_package tools.model.test_publication tools.model.test_resize_context tools.model.test_optimize_kv tools.model.test_stage_kv_prefill tools.model.test_upgrade_batching tools.model.test_upgrade_dynamic_batch tools.model.test_checkpoint tools.release.test_package tools.test_reference -v
 	$(PYTHON) tools/bench/validate_plan.py
 
 info:

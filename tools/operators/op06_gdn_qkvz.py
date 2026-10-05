@@ -134,7 +134,7 @@ def main():
     parser.add_argument('--layers',default='0,32');parser.add_argument('--rows',default='')
     parser.add_argument('--candidates',default='shared16,register16,shared64,register64')
     args=parser.parse_args();configure()
-    report=dict(environment=environment(),checkpoint=str(real.MODEL),checkpoint_sha256=real.FULL_SHA,
+    report=dict(environment=environment(),checkpoint=str(real.MODEL),checkpoint_sha256=real.checkpoint_sha256(real.MODEL),
         quantization='lossless repack of existing checkpoint; no new quantization',effective_weight_bits=4.1875,
         resident_weight_bytes=43909120,workspace_bytes=0,candidates=[],layers=[],failures=[],selected={})
     def save():write_json(args.output/'results.json',report)

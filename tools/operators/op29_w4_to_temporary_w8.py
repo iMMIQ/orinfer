@@ -6,6 +6,8 @@ import shutil
 import time
 import traceback
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
+from tools.reference import CHECKPOINT, checkpoint_sha256
 
 import torch
 import tilelang.language as T
@@ -16,7 +18,7 @@ from abi import parse_host
 from kernels.operators.op29_w4_to_temporary_w8 import w4_to_temporary_w8, launch
 from kernels.operators.op30_activation_quantization import activation_quantization, launch as launch_a8
 from kernels.projections.candidates import int8_gemm
-from tools.projections.screen import load_weights, activations, MODEL_HASH
+from tools.projections.screen import load_weights, activations
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -148,12 +150,12 @@ def small_cases(builds, report):
 
 def full_chain(p, s, z, ws, w8, b, expand, layer, out, report):
     n, k = w8.shape
-    sources = activations(ROOT / "artifacts/experimental-vllm/activations", "down", layer)
+    sources = activations(REFERENCE_ACTIVATIONS, "down", layer)
     pre = next(x for m, x, source in sources if m == 512)
     dec = next(x for m, x, source in sources if m == 8)
     for _, _, source in sources:
         for meta in source["sources"]:
-            path = ROOT / "artifacts/experimental-vllm/activations" / meta["file"]
+            path = REFERENCE_ACTIVATIONS / meta["file"]
             if str(path) not in {item["file"]["path"] for item in report["input_sources"]}:
                 info = {"file": identity(path), "tensor_sha256": tensor_sha(torch.load(path, map_location="cpu", weights_only=True)), "metadata": meta}
                 assert info["file"]["sha256"] == meta["file_sha256"]
@@ -229,8 +231,8 @@ def main():
     configure()
     report = {"environment": environment(), "status": "running", "exports": [], "compile": [],
               "edge_cases": [], "real_weights": [], "full_chains": [], "input_sources": [], "failures": [],
-              "checkpoint": {"path": "/home/nvidia/model/vllm-comparison-20260930/awq-http/model.safetensors", "sha256": MODEL_HASH,
-                "identity_note": "locked full-file hash reused; all read source tensors separately hashed"},
+              "checkpoint": {"path": str(CHECKPOINT / 'model.safetensors'), "sha256": checkpoint_sha256(CHECKPOINT / 'model.safetensors'),
+                "identity_note": "Supplied checkpoint hashed once; read source tensors separately hashed"},
               "budget": "conditional29 expansion and conditional30 A8 charged within complete linear budget; no standalone29 allocation",
               "quality_policy": "no model quality acceptance or enable; M512 already has known quality degradation",
               "persistent_global_LUT_bytes": 0, "persistent_full_W8_bytes": 0,

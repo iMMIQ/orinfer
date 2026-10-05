@@ -3,6 +3,7 @@ import argparse
 import json
 import shutil
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
 import numpy as np
 import torch
 from common import benchmark,configure,environment,error,export_kernel,identity,write_json
@@ -41,7 +42,7 @@ def main():
     if args.vector_load:
         p=Path('kernels/model/w4_decode_i8layout_vector.py');shutil.copyfile(p,args.output/p.name);report['sources'].append(identity(p))
     m=json.loads(args.model.read_text());bs={b['name']:b for b in m['buffers']}
-    root=Path('artifacts/experimental-vllm/activations')
+    root=REFERENCE_ACTIVATIONS
     metadata=[json.loads(p.read_text()) for p in sorted(root.glob('*.json'))]
     for name,act in [('L0_GateUp','mlp.gate_up_proj'),('L0_Down','mlp.down_proj')]:
         tensors=[]

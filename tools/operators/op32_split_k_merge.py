@@ -278,7 +278,7 @@ def main():
                     old_timing,_=benchmark(old_run,repetitions=20 if m<512 else 3,calls_per_replay=16 if m<512 else 4)
                     exact(y,old_y)
                     report['chains'].append(dict(producer=name,layer=0,M=m,K=k,N=5120,S=8,phase=phase,
-                        activation=origin,weight_source=source,checkpoint_sha256=evidence.real.FULL_SHA,
+                        activation=origin,weight_source=source,checkpoint_sha256=evidence.real.checkpoint_sha256(evidence.real.MODEL),
                         projection_ABI=projection_abi,old_merge_ABI=old_abi,error=numerical,
                         new_projection_plus_merge=measured,old_projection_plus_merge=old_timing,
                         first_launch_host_s=first,workspace_bytes=partial.numel()*4,output_bytes=y.numel()*2,

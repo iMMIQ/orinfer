@@ -5,6 +5,7 @@ import json
 import math
 import time
 from pathlib import Path
+from tools.reference import CHECKPOINT
 
 import torch
 
@@ -212,7 +213,7 @@ def main():
     ap.add_argument('--repetitions', type=int, default=20)
     args = ap.parse_args(); output = Path(args.output); configure()
     lock = ROOT/'artifacts/reference/reference-lock.json'
-    config = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http/config.json')
+    config = CHECKPOINT / 'config.json'
     cfg = json.loads(config.read_text())
     assert cfg['text_config']['vocab_size'] == VOCAB
     results = {'status': 'in_progress', 'environment': environment(), 'cases': [], 'exports': [],

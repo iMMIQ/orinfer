@@ -1,4 +1,4 @@
-"""Validate coverage of user-confirmed acceptance requirements; no GPU needed."""
+"""Validate benchmark and quality fixture coverage; no GPU needed."""
 import json
 from pathlib import Path
 
@@ -23,7 +23,7 @@ def validate():
         and {"MTP enabled", "identical replay with valid budget-retained prefix", "multi-turn continuation"}.issubset(plan["workloads"]["online_long_context"]),
         "mixed queue and cache coverage": {"queueing at 128 submitted clients", "cache eviction under working-set pressure", "multi-turn branches"}.issubset(plan["workloads"]["mixed_acceptance"]),
         "dynamic batch tails": {3, 5, 33, 127}.issubset(plan["workloads"]["nonstandard_batch_rows"]),
-        "uncensored BF16 reference": protocol["reference_candidates"][0]["format"] == "BF16"
+        "same-source BF16 reference": protocol["reference_candidates"][0]["format"] == "BF16"
         and protocol["reference_candidates"][0]["repository"] == "JonathanColetti/Qwen3.8-27B-Uncensored",
         "lifecycle/prefix/concurrency metrics": {"native_load", "import", "first_request", "warm_prefill", "warm_decode", "prefix", "concurrency"}.issubset(plan["metrics"]),
         "seed alignment": protocol["seed"] == scenes["seed"] == 20261002,

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from tools.reference import SOURCE
 
 import torch
 import triton
@@ -19,7 +20,7 @@ from common import (ROOT, benchmark, configure, environment, error, export_kerne
 from gdn_reference import recurrent
 from kernels.operators.op10_gdn_recurrent import gdn_recurrent, launch
 
-NATIVE = Path('/home/nvidia/model/orin-kv8-mtp-20261001/vllm020/model_executor/layers/fla/ops/fused_recurrent.py')
+NATIVE = (SOURCE / 'model_executor/layers/fla/ops/fused_recurrent.py')
 NATIVE_OP = NATIVE.parent / 'op.py'
 SCALE = 1 / math.sqrt(128)
 BATCHES = (1, 2, 3, 4, 5, 7, 8)
@@ -124,7 +125,7 @@ def main():
     p.add_argument('--long-lengths',default='512,2048,8192')
     args=p.parse_args();out=Path(args.output);out.mkdir(parents=True,exist_ok=True)
     configure()
-    lock=ROOT/'artifacts/experimental-vllm/reference-lock.json'
+    lock=ROOT/'artifacts/reference/reference-lock.json'
     shutil.copyfile(lock,out/'reference-lock.json')
     report={'environment':environment(),'source':identity(ROOT/'kernels/operators/op10_gdn_recurrent.py'),
         'input_scope':'Synthetic normalized Q/K,V,g,beta and full 48-head FP32 states; no actual model state trace',

@@ -17,7 +17,7 @@ ORINFER_CHAT_REFERENCE="$PWD/artifacts/chat-reference.json" \
   cargo test --offline checkpoint_matches_reference_tokens -- --ignored
 ```
 
-[OpenCode配置](../../examples/opencode.json)包含本地provider与仅开放read/write的agent。将其复制为独立目录中的`opencode.json`，放入`input.txt`，从该目录运行`opencode run --pure --agent orin --model orin/qwen3.8-27b '读取input.txt并将内容写到output.txt'`。它通过客户端执行工具，再把工具结果发送回Chat API；测试目录、生成文件、会话数据库和日志都不提交源码库。
+[OpenCode配置](../../examples/opencode.json)包含本地provider与仅开放read/write的agent。将其复制为独立目录中的`opencode.json`，放入`input.txt`，从该目录运行`opencode run --pure --agent orinfer --model orinfer/qwen3.8-27b '读取input.txt并将内容写到output.txt'`。它通过客户端执行工具，再把工具结果发送回Chat API；测试目录、生成文件、会话数据库和日志都不提交源码库。
 
 增加图片、多图、图片历史和thinking模板对照时，使用已构建的视觉manifest和本机PNG图片：
 

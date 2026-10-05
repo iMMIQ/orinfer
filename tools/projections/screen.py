@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from tools.reference import CHECKPOINT, checkpoint_sha256
 import statistics
 import subprocess
 import sys
@@ -24,8 +25,7 @@ import candidates as kernels
 import tilelang
 import tilelang.language as T
 
-MODEL = '/home/nvidia/model/vllm-comparison-20260930/awq-http/model.safetensors'
-MODEL_HASH = '15c5b07049149c73236254d53eca1d2f3274f9fb6803540ca47b1ce657dcf583'
+MODEL = str(CHECKPOINT / 'model.safetensors')
 CASES = {
  'gate_up': ['mlp.gate_proj', 'mlp.up_proj'],
  'down': ['mlp.down_proj'],
@@ -146,7 +146,7 @@ def main():
         except (OSError,TypeError,ValueError): pass
     try: power_mode=subprocess.run(['nvpmodel','-q'],capture_output=True,text=True,timeout=5).stdout
     except (OSError,subprocess.TimeoutExpired): power_mode='unavailable in container'
-    report=dict(machine_before=dict(host_meminfo=Path('/proc/meminfo').read_text(),thermal_millicelsius=thermal,power_mode=power_mode,cuda_free_total_bytes=torch.cuda.mem_get_info()),source_checkpoint=MODEL,full_file_sha256=MODEL_HASH,weight_reference='community compressed-tensors AWQ; not official BF16 model',
+    report=dict(machine_before=dict(host_meminfo=Path('/proc/meminfo').read_text(),thermal_millicelsius=thermal,power_mode=power_mode,cuda_free_total_bytes=torch.cuda.mem_get_info()),source_checkpoint=MODEL,full_file_sha256=checkpoint_sha256(MODEL),weight_reference='community compressed-tensors AWQ; not official BF16 model',
                 torch=torch.__version__,tilelang=tilelang.__version__,device=str(device),seed=20261002,
                 timing='median CUDA event time of 3 x 20 calls using replayed CUDA graph; graph output poisoning/input-change checks; compile excluded',
                 cases=records,failures=[],scope='first-pass isolated full projections; not model TPS or full model validation')

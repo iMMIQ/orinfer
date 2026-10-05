@@ -4,6 +4,8 @@ import gc
 import json
 import time
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
+from tools.reference import CHECKPOINT
 
 import torch
 from safetensors import safe_open
@@ -13,8 +15,8 @@ from common import (ROOT, SEED, benchmark, configure, environment, error,
 from tools.operators.abi import parse_host
 from kernels.operators.op01_embedding import embedding_gather, embedding_u4, validate_token_ids
 
-MODEL = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http')
-META = ROOT / 'artifacts/experimental-vllm/activations/capture-512-0-language_model_model_layers_0_linear_attn_in_proj_qkvz.json'
+MODEL = CHECKPOINT
+META = REFERENCE_ACTIVATIONS / 'capture-512-0-language_model_model_layers_0_linear_attn_in_proj_qkvz.json'
 VOCAB, HIDDEN = 248320, 5120
 ROWS = (1, 2, 3, 4, 5, 7, 8, 511, 512, 513, 2048, 8192)
 

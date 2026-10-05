@@ -7,6 +7,7 @@ import shutil
 import statistics
 import time
 from pathlib import Path
+from tools.reference import CHECKPOINT, SOURCE
 
 import torch
 import triton
@@ -17,9 +18,9 @@ from common import configure, environment, error, export_kernel, identity, tenso
 from kernels.operators.op09_gdn_gates import HEADS, gdn_gates, launch
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http/model.safetensors')
-LOCK = ROOT / 'artifacts/experimental-vllm/reference-lock.json'
-NATIVE = Path('/home/nvidia/model/orin-kv8-mtp-20261001/vllm020/model_executor/layers/mamba/gdn_linear_attn.py')
+MODEL = CHECKPOINT / 'model.safetensors'
+LOCK = ROOT / 'artifacts/reference/reference-lock.json'
+NATIVE = (SOURCE / 'model_executor/layers/mamba/gdn_linear_attn.py')
 ROWS = [1, 2, 3, 4, 5, 7, 8, 511, 512, 513, 2048, 8192]
 
 

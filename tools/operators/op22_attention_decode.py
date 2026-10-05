@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from tools.reference import CHECKPOINT, SOURCE
 import torch
 from common import (ROOT,configure,environment,error,export_kernel,benchmark,
                     identity,write_json)
@@ -331,8 +332,8 @@ def main():
             'probe':identity(args.rust_probe),'source':identity(root/'op22_driver_probe.rs')})
         print(completed.stdout,flush=True);return
     configure()
-    native=Path('/home/nvidia/model/orin-kv8-mtp-20261001/vllm020/model_executor/models/qwen3_next.py')
-    config_path=Path('/home/nvidia/model/vllm-comparison-20260930/awq-http/config.json')
+    native=(SOURCE / 'model_executor/models/qwen3_next.py')
+    config_path=CHECKPOINT / 'config.json'
     config=json.loads(config_path.read_text())['text_config']
     assert (config['num_attention_heads'],config['num_key_value_heads'],config['head_dim'])==(24,4,256)
     assert config.get('attn_output_gate',True) is True

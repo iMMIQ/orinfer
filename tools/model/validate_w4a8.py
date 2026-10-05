@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
 
 import numpy as np
 import torch
@@ -46,7 +47,7 @@ def main():
     w=((codes.float()-z[ids].float()[:,:,None])*s[ids].float()[:,:,None]).half().reshape(len(ids),5120)
     expected=(w.float()/ws[ids,None].float()).round().clamp(-127,127).to(torch.int8)
     report['expansion_code_mismatches']=int((b[ids]!=expected).sum());assert report['expansion_code_mismatches']==0
-    input_file=Path('artifacts/experimental-vllm/activations/capture-512-0-language_model_model_layers_0_linear_attn_in_proj_qkvz.pt')
+    input_file=REFERENCE_ACTIVATIONS / 'capture-512-0-language_model_model_layers_0_linear_attn_in_proj_qkvz.pt'
     x=torch.load(input_file,map_location='cpu',weights_only=True).half().cuda()
     aq=activation_quantization(5120);mask=torch.zeros(5120,device='cuda',dtype=torch.uint8)
     dynamic=gdn_qkvz_int8(T.dynamic('M'));fixed=gdn_qkvz_int8(512)

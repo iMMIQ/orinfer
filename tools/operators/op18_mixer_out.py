@@ -229,7 +229,7 @@ def main():
     args = parser.parse_args()
     configure()
     report = dict(environment=environment(), checkpoint=str(real.MODEL),
-                  checkpoint_sha256=real.FULL_SHA, checkpoint_hash_origin='previous locked identity; full 18GB not rescanned',
+                  checkpoint_sha256=real.checkpoint_sha256(real.MODEL), checkpoint_hash_origin='Supplied immutable checkpoint hashed once outside benchmark timing',
                   mathematical_reference='FP32 matmul with explicitly FP16 dequantized W; TF32 disabled',
                   budget_ms=dict(decode_M1=.105, prefill_M512=.600, prefill_M2048=2.4, prefill_M8192=9.6), layers=[], routes=[], failures=[])
     def save():

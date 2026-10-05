@@ -4,6 +4,7 @@ import re
 import shutil
 import time
 from pathlib import Path
+from tools.reference import CHECKPOINT, SOURCE
 import torch
 from common import (ROOT,configure,environment,error,export_kernel,benchmark,
                     identity,write_json)
@@ -240,11 +241,11 @@ def main():
     configure()
     for f in ('kernels/operators/op21_attention_prefill.py','kernels/operators/op22_attention_decode.py','tools/operators/abi.py'):
         dest=out/'measurement-source'/f;dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/f,dest)
-    config_path=Path('/home/nvidia/model/vllm-comparison-20260930/awq-http/config.json')
+    config_path=CHECKPOINT / 'config.json'
     import json
     config=json.loads(config_path.read_text())['text_config']
     assert (config['num_attention_heads'],config['num_key_value_heads'],config['head_dim'])==(24,4,256)
-    native=Path('/home/nvidia/model/orin-kv8-mtp-20261001/vllm020/model_executor/models/qwen3_next.py')
+    native=(SOURCE / 'model_executor/models/qwen3_next.py')
     shutil.copyfile(native,out/'qwen3_next.py');assert 'gate = torch.sigmoid(gate)' in native.read_text()
     result={'status':'in_progress','environment':environment(),'source':'synthetic original Q/K/V, no frozen actual full-attention QKV trace',
         'native_source':identity(out/'qwen3_next.py'),'model_config':identity(config_path),'scope':'optional Q8 exact pack; non-inline gather to continuous FP16 -> actual op21 Tq1 attention',

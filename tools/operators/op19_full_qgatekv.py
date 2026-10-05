@@ -2,6 +2,7 @@
 import argparse
 import json
 from pathlib import Path
+from tools.reference import SOURCE
 import re
 import shutil
 import subprocess
@@ -26,7 +27,7 @@ def freeze(output):
         src=ROOT/relative;dest=output/'measurement-source'/relative
         dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(src,dest)
         frozen.append(identity(dest))
-    src=Path('/home/nvidia/model/orin-kv8-mtp-20261001/vllm020/model_executor/models/qwen3_next.py')
+    src=(SOURCE / 'model_executor/models/qwen3_next.py')
     dest=output/'reference-source/qwen3_next.py';dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(src,dest)
     native=src.read_text()
     assert 'q_gate.view(*orig_shape, self.num_heads, -1)' in native and 'torch.chunk(q_gate, 2, dim=-1)' in native

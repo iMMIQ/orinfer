@@ -50,5 +50,5 @@
     }
   ],
   "multimodal_suite": "Single images and ordered multi-images; fixed-seed poster, landscape, anime and color/order task checks, official BF16 visual encoder and text reference. Raw token identity is diagnostic; normalize case/leading spaces only for label task checks.",
-  "acceptance_scope": "Bounded quick evaluation accepted; no claim of comprehensive benchmark, OCR or video quality."
+  "acceptance_scope": "Bounded quick evaluation; no claim of comprehensive benchmark, OCR or video quality."
 }

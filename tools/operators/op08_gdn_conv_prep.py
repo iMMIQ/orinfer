@@ -7,6 +7,8 @@ import re
 import shutil
 import time
 from pathlib import Path
+from tools.reference import ACTIVATIONS as REFERENCE_ACTIVATIONS
+from tools.reference import CHECKPOINT, SOURCE
 
 import torch
 import triton
@@ -17,8 +19,8 @@ from common import (ROOT, benchmark, configure, environment, error, export_kerne
                     identity, tensor_sha, write_json)
 from kernels.operators.op08_gdn_conv_prep import gdn_conv_decode, gdn_conv_prep, launch
 
-MODEL = Path('/home/nvidia/model/vllm-comparison-20260930/awq-http')
-NATIVE = Path('/home/nvidia/model/orin-kv8-mtp-20261001/vllm020')
+MODEL = CHECKPOINT
+NATIVE = SOURCE
 MODES = {
     'native_prefill': dict(normalize_round_fp16=True, q_scale=1., qk_output_dtype='float16', conv_product_round_fp16=True),
     'native_staged_decode': dict(normalize_round_fp16=True, q_scale=1., qk_output_dtype='float16', conv_product_round_fp16=True),
@@ -29,7 +31,7 @@ MODES = {
 
 
 def binding(out):
-    lock_path = ROOT / 'artifacts/experimental-vllm/reference-lock.json'
+    lock_path = ROOT / 'artifacts/reference/reference-lock.json'
     lock = json.loads(lock_path.read_text())
     file = next(f for f in lock['files'] if f['name'] == 'model.safetensors')
     assert file['bytes'] == (MODEL / 'model.safetensors').stat().st_size
@@ -62,7 +64,7 @@ def binding(out):
         source = NATIVE / relative
         target = source_dir / Path(relative).name
         shutil.copyfile(source, target); sources.append(identity(target))
-    metadata_path = ROOT / 'artifacts/experimental-vllm/activations/capture-512-0-language_model_model_layers_0_linear_attn_in_proj_qkvz.json'
+    metadata_path = REFERENCE_ACTIVATIONS / 'capture-512-0-language_model_model_layers_0_linear_attn_in_proj_qkvz.json'
     meta = json.loads(metadata_path.read_text())
     assert meta['shape'] == [512, 5120]
     info = {'checkpoint': dict(file, path=str(MODEL / 'model.safetensors')),

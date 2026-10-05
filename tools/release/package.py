@@ -87,6 +87,11 @@ def build(args):
         for name in ('tools/model/prepare.py', 'tools/model/package.py', 'tools/model/publication.py', 'configs/architecture-contract.json', 'tools/build/cpu-requirements.txt'):
             (bundle/name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT/name, bundle/name)
+        for name in ('docs/serving.md', 'kernels/README.md', 'examples/opencode.json',
+                     'tools/build/README.md', 'tools/model/README.md', 'tools/api/README.md',
+                     'tools/vision/README.md', 'tools/bench/README.md', 'tools/eval/README.md'):
+            (bundle/name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT/name, bundle/name)
         source = bundle/'source.tar.gz'
         subprocess.run(['git', 'archive', '--format=tar.gz', f'--output={source}', revision], cwd=ROOT, check=True)
         (bundle/'SOURCE.txt').write_text(f'Revision: {revision}\nSource: source.tar.gz\nBuild: cargo build --release --locked --offline -p orinfer-cli\n')

@@ -2,9 +2,26 @@
 
 本目录提供checkpoint转换、kernel验证与导出、模型组装和Rust运行入口。Python不参与在线推理。
 
-## 本机依赖
+## 外部输入
 
-需要自行准备与模型匹配的checkpoint，并通过构建入口的`--checkpoint`指定HF目录。基线构建器支持asymmetric compressed-tensors W4/group128的Qwen3_5 27B，读取单文件或分片safetensors；其他格式导入不属于此入口。位于仓库外的目录设`ORINFER_CHECKPOINT_DIR`进行只读挂载。投影验证使用`artifacts/experimental-vllm/activations/`中的真实L0输入；运行前需准备这些外部数据，文件名见验证入口。LUT4验证支持`--activations-dir`。
+需要自行准备与模型匹配的checkpoint，并通过构建入口的`--checkpoint`指定HF目录。基线构建器支持asymmetric compressed-tensors W4/group128的Qwen3_5 27B，读取单文件或分片safetensors；其他格式导入不属于此入口。位于仓库外的目录设`ORINFER_CHECKPOINT_DIR`进行只读挂载。
+
+基础算子和投影诊断依赖外部checkpoint、真实激活及独立参考源码，不附带这些数据。路径通过下列变量配置；GPU包装器将提供的外部路径只读挂载并传入容器，路径可包含空格。
+
+| 环境变量 | 未设置时的目录 | 内容 |
+| --- | --- | --- |
+| `ORINFER_REFERENCE_CHECKPOINT` | `artifacts/reference/checkpoint` | 与诊断匹配的checkpoint及config；早期算子工具要求单文件`model.safetensors` |
+| `ORINFER_REFERENCE_SOURCE` | `artifacts/reference/vllm` | 参考vLLM Python包根目录，包含`model_executor/` |
+| `ORINFER_REFERENCE_ACTIVATIONS` | `artifacts/reference/activations` | 真实L0/指定层输入的`.pt`和带payload hash的`.json` |
+
+部分诊断另需`artifacts/reference/reference-lock.json`，其`files`记录参考模型的文件名、字节数及SHA256。输入文件在运行期间应保持不变；投影工具在GPU计时之外计算一次所提供checkpoint的完整hash，报告逐tensor及激活身份。LUT4验证也支持`--activations-dir`。数值参考所需函数和形状会被检查，不能用任意版本源码替代。
+
+```bash
+ORINFER_REFERENCE_CHECKPOINT=/path/to/reference-checkpoint \
+ORINFER_REFERENCE_SOURCE=/path/to/vllm-package \
+ORINFER_REFERENCE_ACTIVATIONS=/path/to/captured-activations \
+  bash tools/operators/run.sh tools/operators/op07_gdn_ab.py artifacts/operators/gdn-ab
+```
 
 GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用NVIDIA Docker编译镜像和GPU锁；先用`make compiler-image`从公开的固定版本基底构建`orinfer-compiler:0.1.1`，包含TileLang0.1.15/Torch2.9.1/CUDA12.6。源码提供镜像配方，checkpoint需自行准备，详见[编译环境](../build/README.md)。CPU组装先执行`make python-env`和`source .venv/bin/activate`，入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
 
@@ -216,16 +233,16 @@ python3 tools/model/package.py install operators.tar.gz ~/.cache/orinfer/operato
 
 ## 扩展已准备模型的上下文
 
-已经包含视觉和MTP的本机Qwen3_5缓存可用以下命令扩容，无需重新量化权重：
+已经包含视觉和MTP的Qwen3_5缓存可用以下命令扩容，无需重新量化权重：
 
 ```bash
 bash tools/operators/run.sh tools/model/resize_context.py artifacts/context-build \
-  --model artifacts/models/qwen3.8-27b-uncensored \
-  --destination artifacts/models/qwen3.8-27b-uncensored-256k \
+  --model /path/to/prepared-model \
+  --destination /path/to/context-256k-model \
   --max-context 262144 --max-prefill-tokens 2048
-target/release/orinfer validate-model artifacts/models/qwen3.8-27b-uncensored-256k
+target/release/orinfer validate-model /path/to/context-256k-model
 bash tools/operators/run.sh tools/model/context_probe.py artifacts/context-probe --hidden-ring 2048
-target/release/orinfer serve artifacts/models/qwen3.8-27b-uncensored-256k
+target/release/orinfer serve /path/to/context-256k-model
 ```
 
 上下文必须按128 tokens对齐，且不超过checkpoint声明的原生容量。工具重新编译容量相关TileLang算子、按实际host ABI重新绑定参数并扩展位置表与KV；学习得到的权重分片使用硬链接。MTP随target prefill分块预热，以最大prefill块大小的hidden环形缓存代替整段hidden存储；主模型与MTP仍保留完整上下文的KV。视觉特征容量单独限制，不随文本扩容。`--max-prefill-tokens`可选择已有的较小profile，缩小文本临时workspace；提示总容量不变。
