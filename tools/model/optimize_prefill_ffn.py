@@ -119,7 +119,7 @@ def main():
     p.add_argument('--screen', type=Path, nargs='+', required=True)
     p.add_argument('--destination', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--engine', type=Path, default=Path('target/release/orin-llm'))
+    p.add_argument('--engine', type=Path, default=Path('target/release/orinfer'))
     args = p.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)

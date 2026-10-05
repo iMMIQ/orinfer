@@ -21,7 +21,7 @@ python3 -m tools.eval.reference_bf16 --checkpoint BF16_DIR --revision SOURCE_COM
   --requests artifacts/quality/requests.json --output artifacts/quality/bf16.json
 python3 -m tools.eval.offline_quality queries --requests artifacts/quality/requests.json \
   --baseline artifacts/quality/bf16.json --output artifacts/quality/queries.json
-target/release/orin-llm score-model MODEL_DIR artifacts/quality/queries.json > artifacts/quality/candidate.json
+target/release/orinfer score-model MODEL_DIR artifacts/quality/queries.json > artifacts/quality/candidate.json
 python3 -m tools.eval.offline_quality compare --requests artifacts/quality/queries.json \
   --baseline artifacts/quality/bf16.json --candidate artifacts/quality/candidate.json \
   --output artifacts/quality/comparison.json

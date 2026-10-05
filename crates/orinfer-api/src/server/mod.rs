@@ -16,7 +16,7 @@ use axum::{
     routing::{get, post},
 };
 use chat::{ChatCodec, ChatRequest, Prepared};
-use orin_engine::model::Model;
+use orinfer_engine::model::Model;
 use serde_json::{Value, json};
 use std::{
     convert::Infallible,
@@ -31,7 +31,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 type Result<T> = std::result::Result<T, String>;
-use orin_engine::execution::{CudaGraphMode, LoadOptions};
+use orinfer_engine::execution::{CudaGraphMode, LoadOptions};
 struct Settings {
     model_dir: PathBuf,
     model: String,
@@ -39,13 +39,13 @@ struct Settings {
     gpu_lock: PathBuf,
     cuda_graph: CudaGraphMode,
     prefix_cache_bytes: usize,
-    scheduler: orin_engine::scheduler::Options,
+    scheduler: orinfer_engine::scheduler::Options,
     limits: Limits,
 }
 impl Settings {
     fn parse(args: &[String]) -> Result<Self> {
         if args.is_empty() || !std::path::Path::new(&args[0]).is_dir() {
-            return Err("Usage: orin-llm serve MODEL_DIR [--listen 0.0.0.0:8088] [--model qwen3.8-27b] [--cuda-graph decode_only|full|off] [--prefix-cache-mib 12288] [--gpu-lock artifacts/gpu-experiment.lock]; MODEL_DIR must contain the prepared cache and checkpoint tokenizer".into());
+            return Err("Usage: orinfer serve MODEL_DIR [--listen 0.0.0.0:8088] [--model qwen3.8-27b] [--cuda-graph decode_only|full|off] [--prefix-cache-mib 12288] [--gpu-lock artifacts/gpu-experiment.lock]; MODEL_DIR must contain the prepared cache and checkpoint tokenizer".into());
         }
         let mut settings = Self {
             model_dir: (&args[0]).into(),
@@ -89,7 +89,8 @@ impl Settings {
                 "--gpu-lock" => settings.gpu_lock = (&pair[1]).into(),
                 "--cuda-graph" => settings.cuda_graph = pair[1].parse()?,
                 "--prefix-cache-mib" => {
-                    settings.prefix_cache_bytes = orin_engine::execution::parse_cache_mib(&pair[1])?
+                    settings.prefix_cache_bytes =
+                        orinfer_engine::execution::parse_cache_mib(&pair[1])?
                 }
                 "--max-active-requests" => {
                     settings.scheduler.max_active = pair[1]
@@ -106,7 +107,7 @@ impl Settings {
                 }
                 "--memory-reserve-mib" => {
                     settings.scheduler.memory_reserve_bytes =
-                        orin_engine::execution::parse_cache_mib(&pair[1])?
+                        orinfer_engine::execution::parse_cache_mib(&pair[1])?
                 }
                 _ => return Err(format!("Unknown server option {}", pair[0])),
             }
@@ -237,10 +238,10 @@ struct Service {
     codec: Arc<ChatCodec>,
     model: Arc<str>,
     context: usize,
-    vision: Option<orin_engine::vision::VisionSpec>,
+    vision: Option<orinfer_engine::vision::VisionSpec>,
     api_key: Option<Arc<str>>,
     ids: Arc<AtomicU64>,
-    scheduler: orin_engine::scheduler::Options,
+    scheduler: orinfer_engine::scheduler::Options,
     preparation: Arc<preparation::Pool>,
     limits: Limits,
     activity: Arc<continuous::Activity>,
@@ -298,7 +299,7 @@ async fn serve(settings: Settings) -> Result<()> {
     let worker_lifecycle = Arc::clone(&lifecycle);
     let limits = settings.limits;
     let worker = std::thread::Builder::new()
-        .name("orin-gpu".into())
+        .name("orinfer-gpu".into())
         .spawn(move || {
             let _ = worker_lifecycle.supervise(|| {
                 let initialize = || -> Result<_> {
@@ -358,13 +359,13 @@ continuous::worker(
                     }
                     Err(error) => {
                         worker_lifecycle
-                            .fail(orin_engine::error::EngineError::take(error.clone(), true));
+                            .fail(orinfer_engine::error::EngineError::take(error.clone(), true));
                         let _ = ready_sender.send(Err(error));
                     }
                 }
             });
             if !worker_shutdown.load(Ordering::Relaxed) && worker_lifecycle.is_ready() {
-                worker_lifecycle.fail(orin_engine::error::EngineError::take(
+                worker_lifecycle.fail(orinfer_engine::error::EngineError::take(
                     "GPU worker exited unexpectedly".into(),
                     true,
                 ));
@@ -379,7 +380,7 @@ continuous::worker(
         model: model_id,
         context,
         vision,
-        api_key: std::env::var("ORIN_API_KEY")
+        api_key: std::env::var("ORINFER_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())
             .map(Arc::from),
@@ -489,7 +490,7 @@ async fn models(State(state): State<Service>, headers: HeaderMap) -> Response {
     if !authorized(&state, &headers) {
         return error(StatusCode::UNAUTHORIZED, "Invalid API key");
     }
-    Json(json!({"object":"list","data":[{"id":state.model.as_ref(),"object":"model","created":0,"owned_by":"orin-llm"}]})).into_response()
+    Json(json!({"object":"list","data":[{"id":state.model.as_ref(),"object":"model","created":0,"owned_by":"orinfer"}]})).into_response()
 }
 async fn completions(
     State(state): State<Service>,

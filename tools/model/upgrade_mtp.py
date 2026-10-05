@@ -87,6 +87,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('model', type=Path)
     parser.add_argument('output', type=Path)
-    parser.add_argument('--engine', type=Path, default=Path('target/release/orin-llm'))
+    parser.add_argument('--engine', type=Path, default=Path('target/release/orinfer'))
     args = parser.parse_args()
     print(json.dumps(upgrade(args.model, args.output, args.engine), indent=2))

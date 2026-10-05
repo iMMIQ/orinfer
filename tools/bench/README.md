@@ -24,9 +24,9 @@ python3 tools/bench/concurrency.py --requests requests.json \
 `benchmark_prefill_scheduling`是默认跳过的真实GPU基准，比较同一模型的联合prefill与逐请求大块prefill。夹具包含`model`、新的`output`路径、`cuda_graph`、`batches`（2..8）、`repetitions`、`output_tokens`及`cases`；case使用`GenerationInput`字段`input_tokens`、`max_new_tokens`、`sampling`，只接受文本输入。采样应设置`temperature: 0`、`seed: 20261002`。关闭本项目GPU服务后，在独占实验锁下运行：
 
 ```bash
-ORIN_BATCH_FIXTURE=artifacts/prefill-scheduling-fixture.json \
+ORINFER_BATCH_FIXTURE=artifacts/prefill-scheduling-fixture.json \
   flock artifacts/gpu-experiment.lock \
-  cargo test --release --offline -p orin-engine benchmark_prefill_scheduling -- --ignored --nocapture
+  cargo test --release --offline -p orinfer-engine benchmark_prefill_scheduling -- --ignored --nocapture
 ```
 
 基准关闭MTP和prefix复用，交换两条路径的测试顺序，分别记录准入、所有请求完成prefill的吞吐、每请求TTFT和后续batch decode。Prefill计时包含head和首token选择，TTFT另含准入；整个cohort完成prefill后才开始decode，未测量在线混合调度的ITL。联合路径使用算子包声明的分块，逐请求路径使用其最大可用单请求块；不同块可能采用不同量化码本。输出token差异用于诊断，不能替代独立BF16/FP8质量验收。每个请求另校验最终位置及KV回收。

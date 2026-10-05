@@ -6,13 +6,13 @@ use std::sync::{
 #[derive(Default)]
 pub(super) struct Lifecycle {
     phase: AtomicU8,
-    failure: Mutex<Option<orin_engine::error::EngineError>>,
+    failure: Mutex<Option<orinfer_engine::error::EngineError>>,
 }
 impl Lifecycle {
     pub fn supervise(&self, work: impl FnOnce()) -> std::thread::Result<()> {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
         if outcome.is_err() {
-            self.fail(orin_engine::error::EngineError::take(
+            self.fail(orinfer_engine::error::EngineError::take(
                 "GPU worker panicked".into(),
                 true,
             ));
@@ -30,7 +30,7 @@ impl Lifecycle {
             .phase
             .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire);
     }
-    pub fn fail(&self, failure: orin_engine::error::EngineError) {
+    pub fn fail(&self, failure: orinfer_engine::error::EngineError) {
         if let Ok(mut value) = self.failure.lock() {
             if value.is_some() {
                 return;
@@ -52,7 +52,7 @@ impl Lifecycle {
             _ => "failed",
         }
     }
-    pub fn failure(&self) -> Option<orin_engine::error::EngineError> {
+    pub fn failure(&self) -> Option<orinfer_engine::error::EngineError> {
         self.failure.lock().ok().and_then(|v| v.clone())
     }
 }
@@ -80,12 +80,15 @@ mod tests {
         assert!(state.is_ready());
         state.drain();
         assert!(!state.is_ready());
-        state.fail(orin_engine::error::EngineError::take("panic".into(), true));
+        state.fail(orinfer_engine::error::EngineError::take(
+            "panic".into(),
+            true,
+        ));
         state.ready();
         state.drain();
         assert_eq!(state.name(), "failed");
         assert!(state.failure().is_some());
-        state.fail(orin_engine::error::EngineError::take(
+        state.fail(orinfer_engine::error::EngineError::take(
             "later cleanup failure".into(),
             true,
         ));

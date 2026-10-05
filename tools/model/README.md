@@ -4,9 +4,9 @@
 
 ## 本机依赖
 
-需要自行准备与模型匹配的checkpoint，并通过构建入口的`--checkpoint`指定HF目录。基线构建器支持asymmetric compressed-tensors W4/group128的Qwen3_5 27B，读取单文件或分片safetensors；其他格式导入不属于此入口。位于仓库外的目录设`ORIN_CHECKPOINT_DIR`进行只读挂载。投影验证使用`artifacts/experimental-vllm/activations/`中的真实L0输入；运行前需准备这些外部数据，文件名见验证入口。LUT4验证支持`--activations-dir`。
+需要自行准备与模型匹配的checkpoint，并通过构建入口的`--checkpoint`指定HF目录。基线构建器支持asymmetric compressed-tensors W4/group128的Qwen3_5 27B，读取单文件或分片safetensors；其他格式导入不属于此入口。位于仓库外的目录设`ORINFER_CHECKPOINT_DIR`进行只读挂载。投影验证使用`artifacts/experimental-vllm/activations/`中的真实L0输入；运行前需准备这些外部数据，文件名见验证入口。LUT4验证支持`--activations-dir`。
 
-GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用NVIDIA Docker编译镜像和GPU锁；先用`make compiler-image`从公开的固定版本基底构建`orin-llm-compiler:0.1.1`，包含TileLang0.1.15/Torch2.9.1/CUDA12.6。源码提供镜像配方，checkpoint需自行准备，详见[编译环境](../build/README.md)。CPU组装先执行`make python-env`和`source .venv/bin/activate`，入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
+GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用NVIDIA Docker编译镜像和GPU锁；先用`make compiler-image`从公开的固定版本基底构建`orinfer-compiler:0.1.1`，包含TileLang0.1.15/Torch2.9.1/CUDA12.6。源码提供镜像配方，checkpoint需自行准备，详见[编译环境](../build/README.md)。CPU组装先执行`make python-env`和`source .venv/bin/activate`，入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
 
 ## 从checkpoint重建
 
@@ -87,14 +87,14 @@ bash tools/operators/run.sh tools/model/assemble_mtp.py \
 python3 tools/model/prepare.py \
   --model artifacts/model/with-mtp/model.json \
   --checkpoint /path/to/checkpoint-dir --output artifacts/models/qwen3.8-27b
-./target/release/orin-llm validate-model artifacts/models/qwen3.8-27b
-./target/release/orin-llm serve artifacts/models/qwen3.8-27b \
+./target/release/orinfer validate-model artifacts/models/qwen3.8-27b
+./target/release/orinfer serve artifacts/models/qwen3.8-27b \
   --listen 127.0.0.1:8088 --model qwen3.8-27b
 ```
 
 `verification-tokens`包含一个已提交、尚未处理的输入token；4对应最多3个新草稿。验证图保存每个GDN/卷积前缀以恢复拒绝状态；主模型最终归一化hidden用于MTP预填充和验证后的KV更新。主模型embedding/head与MTP共享，不存第二份主模型权重。FP8 scale按原生语义相乘；norm保留zero-centered形式。`weights.json`和`mtp-build.json`记录权重身份、所有草稿参数字节数及合计平均bits。
 
-算子验证使用`validate_mtp_kernels.py`，覆盖实际权重布局、因果注意力、GDN恢复、hidden捕获和改变输入后的graph replay。完整生成验证使用Rust ignored test `validate_mtp_generation`（环境变量`ORIN_MTP_FIXTURE`指向含model/output/cases/repetitions/eos及可选cuda_graph的JSON）。case可携带sampling、images、stop_after；未指定sampling时使用无惩罚greedy。先用API ignored test `export_mtp_chat_fixture`按原生Chat模板导出请求（`ORIN_MTP_FIXTURE_SPEC`），再在独占GPU锁下执行验证。greedy比较关闭MTP时的真实输出；随机采样验证固定seed复现，并把已提交的输出逐token重放到普通decode，对比全部有效KV、GDN和卷积状态。测试还覆盖取消后的请求隔离。计时只统计实际交付的token，拒绝草稿不计入TPS。
+算子验证使用`validate_mtp_kernels.py`，覆盖实际权重布局、因果注意力、GDN恢复、hidden捕获和改变输入后的graph replay。完整生成验证使用Rust ignored test `validate_mtp_generation`（环境变量`ORINFER_MTP_FIXTURE`指向含model/output/cases/repetitions/eos及可选cuda_graph的JSON）。case可携带sampling、images、stop_after；未指定sampling时使用无惩罚greedy。先用API ignored test `export_mtp_chat_fixture`按原生Chat模板导出请求（`ORINFER_MTP_FIXTURE_SPEC`），再在独占GPU锁下执行验证。greedy比较关闭MTP时的真实输出；随机采样验证固定seed复现，并把已提交的输出逐token重放到普通decode，对比全部有效KV、GDN和卷积状态。测试还覆盖取消后的请求隔离。计时只统计实际交付的token，拒绝草稿不计入TPS。
 
 已发布的早期greedy MTP模型可离线更新绑定，不改权重payload：`python3 tools/model/upgrade_mtp.py /path/to/prepared-model /path/to/new-model`。工具复用原算子包的视觉embedding和MRoPE导出ABI，添加移位feature index及完整验证logits的绑定，并用Rust加载器验证新目录后原子发布。在线加载器仅接受当前数据契约。
 
@@ -110,8 +110,8 @@ python3 tools/model/prepare.py \
 python3 tools/model/prepare.py \
   --model artifacts/model/rebuild-final/model.json \
   --checkpoint /path/to/checkpoint-dir --output artifacts/models/qwen3.8-27b
-./target/release/orin-llm validate-model artifacts/models/qwen3.8-27b
-./target/release/orin-llm run-model artifacts/models/qwen3.8-27b examples/requests.json
+./target/release/orinfer validate-model artifacts/models/qwen3.8-27b
+./target/release/orinfer run-model artifacts/models/qwen3.8-27b examples/requests.json
 ```
 
 工具检查checkpoint词表、所有源payload与构建资产的hash；不重新量化、不重编译kernel，包含只读权重以及RoPE/索引等可写buffer的初始值。默认每片约1 GiB，`--shard-mib`可调整；单个tensor不会拆分，转换内存由最大分片决定。写完并用标准safetensors reader校验后，才原子发布完整目录；已有输出不覆盖，失败时删除本次临时目录。
@@ -135,7 +135,7 @@ GateUp与Down直接从原W4解包到寄存器，通过INT8 Tensor Core逐128通�
 
 1/2/4/8行使用固定行数kernel，较大batch使用动态行数kernel；32行及以上复用W4 tile计算两个MMA行块。短prefill、混合prefill和MTP主模型验证使用同一FFN策略，大块prefill沿用原包。执行计划仍由Rust注册，CLI和在线加载流程不变。工具验证布局、源包digest和生成后的计划，向新的目录原子发布；输出目录不可覆盖。
 
-`validate_int8_decode.py`使用真实权重、独立FP32参考、尾部保护及改变输入后的Graph replay验证kernel。可用ignored test `capture_decode_projections`（`ORIN_BATCH_FIXTURE`含model/output/cases）导出原路径的真实输入，再传入`--activations`；随机输入只检查实现。Down验证需使用`--families Down --modes group --group-activation`。`--dynamic-rows --tile-m 32 --tile-n 128`覆盖动态分支。验证报告与当前W4路径比较，用于判断新增计算误差；BF16/FP8量化质量需单独验收。完整模型必须另测连续请求、MTP已提交历史状态与实际吞吐。
+`validate_int8_decode.py`使用真实权重、独立FP32参考、尾部保护及改变输入后的Graph replay验证kernel。可用ignored test `capture_decode_projections`（`ORINFER_BATCH_FIXTURE`含model/output/cases）导出原路径的真实输入，再传入`--activations`；随机输入只检查实现。Down验证需使用`--families Down --modes group --group-activation`。`--dynamic-rows --tile-m 32 --tile-n 128`覆盖动态分支。验证报告与当前W4路径比较，用于判断新增计算误差；BF16/FP8量化质量需单独验收。完整模型必须另测连续请求、MTP已提交历史状态与实际吞吐。
 
 ### Decode INT8 GDN输出投影
 
@@ -174,7 +174,7 @@ bash tools/operators/run.sh tools/model/optimize_decode.py artifacts/operators/d
 make build
 bash tools/operators/run.sh tools/model/upgrade_batching.py artifacts/batch-build \
   --model /path/to/prepared-model --model-output /path/to/batch-model
-target/release/orin-llm serve /path/to/batch-model \
+target/release/orinfer serve /path/to/batch-model \
   --max-active-requests 32 --max-batch-tokens 128 --prefill-budget-ms 200
 ```
 
@@ -192,7 +192,7 @@ bash tools/operators/run.sh tools/model/validate_batch_gdn.py artifacts/batch-gd
 
 该包通过共享GPU地址表访问每个请求的私有FP32 GDN状态、FP16卷积历史和位置，按请求维度并行执行M1卷积及recurrence；卷积直接更新自己的历史，不再复制`Ho`。padding地址为空，不读取或修改请求状态。2/4/8/16/32/64/128行均离线编译；混合多token prefill时，decoder子集使用地址表，prompt段仍各自执行因果mixer。权重不变，地址表在Graph执行前由持有请求arena的Rust执行器填写，Graph仍按槽位及段长缓存。验证工具覆盖零位置、短历史、非满batch、请求重排和改变地址表后的Graph replay；完整模型另跑`validate_continuous_requests`及真实HTTP吞吐。
 
-`orin_engine::model::Model`提供`start_request`、`advance_requests`、`finish_request`，API worker负责队列与输出解析；退出或取消必须调用`finish_request`释放槽位。GPU ignored test `validate_continuous_requests`使用`ORIN_BATCH_FIXTURE`（model/output/cases/cuda_graph，cases包含原生token IDs及sampling），验证批处理输出、全部私有状态的请求隔离、取消/复用、相同历史下的概率/top-3及固定seed重排。这里的概率参考是同权重串行执行，用于检验重构；不会替代BF16/FP8量化质量评测。
+`orinfer_engine::model::Model`提供`start_request`、`advance_requests`、`finish_request`，API worker负责队列与输出解析；退出或取消必须调用`finish_request`释放槽位。GPU ignored test `validate_continuous_requests`使用`ORINFER_BATCH_FIXTURE`（model/output/cases/cuda_graph，cases包含原生token IDs及sampling），验证批处理输出、全部私有状态的请求隔离、取消/复用、相同历史下的概率/top-3及固定seed重排。这里的概率参考是同权重串行执行，用于检验重构；不会替代BF16/FP8量化质量评测。
 
 已有schema-2 safetensors缓存可离线拆分为新的目录；这是一次性构建工具，在线加载器不读取旧manifest。相同文件系统上的不可变权重与kernel资产通过hardlink复用，避免额外复制整套权重；配置和描述文件独立复制。相关目录在使用期间必须保持不变。
 
@@ -200,7 +200,7 @@ bash tools/operators/run.sh tools/model/validate_batch_gdn.py artifacts/batch-gd
 make build
 python3 tools/model/package.py split \
   --model /path/to/old-prepared-model --output /path/to/new-model
-./target/release/orin-llm plan-model /path/to/new-model
+./target/release/orinfer plan-model /path/to/new-model
 ```
 
 算子包以内容hash命名，支持tar.gz归档和离线安装。安装器检查归档路径、package digest及全部kernel资产hash，校验完成后原子发布缓存；运行时再次检查ABI、配置、buffer布局与资产身份。包契约与权重payload身份分离，同配置和布局的不同checkpoint可以复用包。
@@ -208,11 +208,11 @@ python3 tools/model/package.py split \
 ```bash
 python3 tools/model/package.py archive \
   /path/to/new-model/cache/operators/PACKAGE_DIGEST operators.tar.gz
-python3 tools/model/package.py install operators.tar.gz ~/.cache/orin-llm/operators
-./target/release/orin-llm serve /path/to/new-model
+python3 tools/model/package.py install operators.tar.gz ~/.cache/orinfer/operators
+./target/release/orinfer serve /path/to/new-model
 ```
 
-可用`ORIN_OPERATOR_CACHE`指定共享缓存位置。只有一种`int8_quality`策略，暂不提供compute-dtype切换。配置或构建变体不受当前包/架构recipe支持时，在准备或加载阶段报错；不在首次请求中编译或重新量化。
+可用`ORINFER_OPERATOR_CACHE`指定共享缓存位置。只有一种`int8_quality`策略，暂不提供compute-dtype切换。配置或构建变体不受当前包/架构recipe支持时，在准备或加载阶段报错；不在首次请求中编译或重新量化。
 
 ## 扩展已准备模型的上下文
 
@@ -223,9 +223,9 @@ bash tools/operators/run.sh tools/model/resize_context.py artifacts/context-buil
   --model artifacts/models/qwen3.8-27b-uncensored \
   --destination artifacts/models/qwen3.8-27b-uncensored-256k \
   --max-context 262144 --max-prefill-tokens 2048
-target/release/orin-llm validate-model artifacts/models/qwen3.8-27b-uncensored-256k
+target/release/orinfer validate-model artifacts/models/qwen3.8-27b-uncensored-256k
 bash tools/operators/run.sh tools/model/context_probe.py artifacts/context-probe --hidden-ring 2048
-target/release/orin-llm serve artifacts/models/qwen3.8-27b-uncensored-256k
+target/release/orinfer serve artifacts/models/qwen3.8-27b-uncensored-256k
 ```
 
 上下文必须按128 tokens对齐，且不超过checkpoint声明的原生容量。工具重新编译容量相关TileLang算子、按实际host ABI重新绑定参数并扩展位置表与KV；学习得到的权重分片使用硬链接。MTP随target prefill分块预热，以最大prefill块大小的hidden环形缓存代替整段hidden存储；主模型与MTP仍保留完整上下文的KV。视觉特征容量单独限制，不随文本扩容。`--max-prefill-tokens`可选择已有的较小profile，缩小文本临时workspace；提示总容量不变。
@@ -263,7 +263,7 @@ bash tools/operators/run.sh tools/model/stage_kv_prefill.py artifacts/kv-prefill
 bash tools/operators/run.sh tools/model/kv_prefill_probe.py artifacts/kv-prefill-probe
 ```
 
-该工具保留 INT8 权重与 KV、decode 和 MTP 算子，只替换 512/2048-token 文本 prefill 的 KV 读取。所有主模型 attention 层顺序复用同一份 K/V workspace，按实际 prefill 位置映射物理内存，并随请求 reset 释放；不保存到模型权重或恢复状态中。每 token 临时容量为 4096 字节，8k 为 32 MiB，256k 上限为 1 GiB；加载时只预留虚拟地址。报告的 `peak_prefill_workspace_bytes` 单独记录临时映射峰值，`peak_kv_bytes` 仍只包含长期 KV。`kv_prefill_probe.py --context 262144 --query-tokens 64` 可验证最大容量、非对齐尾部和真实 graph replay；`ORIN_OPERATOR_SANITIZER=memcheck` 可检查越界。
+该工具保留 INT8 权重与 KV、decode 和 MTP 算子，只替换 512/2048-token 文本 prefill 的 KV 读取。所有主模型 attention 层顺序复用同一份 K/V workspace，按实际 prefill 位置映射物理内存，并随请求 reset 释放；不保存到模型权重或恢复状态中。每 token 临时容量为 4096 字节，8k 为 32 MiB，256k 上限为 1 GiB；加载时只预留虚拟地址。报告的 `peak_prefill_workspace_bytes` 单独记录临时映射峰值，`peak_kv_bytes` 仍只包含长期 KV。`kv_prefill_probe.py --context 262144 --query-tokens 64` 可验证最大容量、非对齐尾部和真实 graph replay；`ORINFER_OPERATOR_SANITIZER=memcheck` 可检查越界。
 
 ## Dense prefill 流水线与 MTP warm
 
@@ -280,7 +280,7 @@ bash tools/operators/run.sh tools/model/optimize_prefill.py artifacts/prefill-ke
 
 源模型目录不修改；新目录通过完整加载器校验后发布。缓存预算是运行时配置，模型不包含prefix快照。`screen_prefill_attention.py`提供TileLang候选筛选、非对齐尾部及改变输入后的Graph replay验证；所有产物写入指定的新输出目录。
 
-`validate_mtp_warm.py --model /path/to/new-model`通过相同GPU入口运行，使用实际W4权重逐位比较17/64/128/512行投影与16行执行，覆盖FP32 split-K、尾部及改变输入后的Graph replay。`kv_prefill_probe.py --context 262144 --query-tokens 64 --async-stages 1`验证反量化padding与异步attention完整链，可配合`ORIN_OPERATOR_SANITIZER=memcheck`检查越界。
+`validate_mtp_warm.py --model /path/to/new-model`通过相同GPU入口运行，使用实际W4权重逐位比较17/64/128/512行投影与16行执行，覆盖FP32 split-K、尾部及改变输入后的Graph replay。`kv_prefill_probe.py --context 262144 --query-tokens 64 --async-stages 1`验证反量化padding与异步attention完整链，可配合`ORINFER_OPERATOR_SANITIZER=memcheck`检查越界。
 
 ## Prefill FFN tile 筛选
 
@@ -338,7 +338,7 @@ bash tools/operators/run.sh tools/model/upgrade_joint_prefill.py artifacts/joint
 PYTHONPATH=. python3 tools/model/upgrade_dynamic_batch.py \
   --model /path/to/current-model --output /path/to/new-model \
   --report artifacts/dynamic-package.json
-./target/release/orin-llm validate-model /path/to/new-model
+./target/release/orinfer validate-model /path/to/new-model
 ```
 
 转换不改权重或cubin，输出是新目录。构建工具通过导出的host ABI验证容量绑定；加载器检查表达式、参数类型、128行契约和模板完整性。GPU回归`validate_continuous_requests`覆盖非标准行数、图片/多图、取消、重排、槽位复用及Graph模式。

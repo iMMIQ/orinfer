@@ -25,8 +25,8 @@ def main():
     spec = json.loads(args.manifest.read_text())['vision']
     assert spec['max_patches'] == 32768, 'This capacity fixture targets the default 32768-patch adapter'
     headers = {'Content-Type':'application/json'}
-    if os.getenv('ORIN_API_KEY'):
-        headers['Authorization'] = 'Bearer '+os.environ['ORIN_API_KEY']
+    if os.getenv('ORINFER_API_KEY'):
+        headers['Authorization'] = 'Bearer '+os.environ['ORINFER_API_KEY']
     checks = []
     def save():
         args.output.write_text(json.dumps({'status':'running', 'checks':checks},ensure_ascii=False,indent=2)+'\n')

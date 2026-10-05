@@ -176,7 +176,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model',type=Path,required=True)
     p.add_argument('--destination',type=Path,required=True)
-    p.add_argument('--engine',type=Path,default=Path('target/release/orin-llm'))
+    p.add_argument('--engine',type=Path,default=Path('target/release/orinfer'))
     p.add_argument('--storage',choices=['fp16','int8'],default='fp16')
     p.add_argument('--output',type=Path)
     a=p.parse_args()

@@ -1,5 +1,5 @@
 [package]
-name = "orin-api"
+name = "orinfer-api"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ axum = "=0.8.9"
 futures-util = "=0.3.34"
 libc = "=0.2.190"
 minijinja = { version = "=2.24.0", features = ["json"] }
-orin-engine.workspace = true
+orinfer-engine.workspace = true
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }

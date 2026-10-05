@@ -9,17 +9,17 @@ make compiler-image
 make check-offline
 ```
 
-`compiler.Dockerfile`使用公开 NVIDIA Jetson CUDA 12.6/PyTorch 2.9.1 镜像的固定 digest，使用固定版本uv管理镜像内的`/opt/venv`，安装TileLang 0.1.15和Transformers 5.18.0编译/参考栈，不复制模型或编译缓存。`compiler-requirements.txt`固定覆盖包版本，其余依赖由基底镜像 digest 固定；移除未使用的vLLM、PyGObject和CUTLASS Python包以避免遗留依赖约束。默认镜像名为`orin-llm-compiler:0.1.1`，可用`ORIN_OPERATOR_IMAGE`覆盖。
+`compiler.Dockerfile`使用公开 NVIDIA Jetson CUDA 12.6/PyTorch 2.9.1 镜像的固定 digest，使用固定版本uv管理镜像内的`/opt/venv`，安装TileLang 0.1.15和Transformers 5.18.0编译/参考栈，不复制模型或编译缓存。`compiler-requirements.txt`固定覆盖包版本，其余依赖由基底镜像 digest 固定；移除未使用的vLLM、PyGObject和CUTLASS Python包以避免遗留依赖约束。默认镜像名为`orinfer-compiler:0.1.1`，可用`ORINFER_OPERATOR_IMAGE`覆盖。
 
 GPU编译入口：
 
 ```bash
-ORIN_CHECKPOINT_DIR=/path/to/checkpoint \
+ORINFER_CHECKPOINT_DIR=/path/to/checkpoint \
   bash tools/operators/run.sh tools/model/build.py artifacts/build/text512 \
   --checkpoint /path/to/checkpoint --dense-u4 --prefill-w4a8
 ```
 
-GPU入口使用调用者UID/GID及补充设备组，避免生成root所有的模型/cache。仓库与输出目录按当前绝对路径挂载；外部checkpoint通过`ORIN_CHECKPOINT_DIR`只读挂载。完整计划与后续组装参数见[模型构建说明](../model/README.md)。此构建器只接受已支持的Qwen3_5 27B asymmetric compressed-tensors W4/group128，包括标准safetensors分片索引；不接受BF16、AWQ qweight或其他架构。检查checkpoint、计算来源hash后才编译，复用权重必须具有相同来源身份。
+GPU入口使用调用者UID/GID及补充设备组，避免生成root所有的模型/cache。仓库与输出目录按当前绝对路径挂载；外部checkpoint通过`ORINFER_CHECKPOINT_DIR`只读挂载。完整计划与后续组装参数见[模型构建说明](../model/README.md)。此构建器只接受已支持的Qwen3_5 27B asymmetric compressed-tensors W4/group128，包括标准safetensors分片索引；不接受BF16、AWQ qweight或其他架构。检查checkpoint、计算来源hash后才编译，复用权重必须具有相同来源身份。
 
 新环境的最小GPU编译验收无需checkpoint：
 

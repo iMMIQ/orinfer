@@ -36,7 +36,7 @@ fn default_graph() -> String {
 #[ignore = "Requires real model, prefix fixtures and exclusive GPU lock"]
 fn validate_adaptive_prefix_cache() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(
-        std::env::var("ORIN_PREFIX_FIXTURE").unwrap(),
+        std::env::var("ORINFER_PREFIX_FIXTURE").unwrap(),
     ))
     .unwrap();
     assert!(!fixture.output.exists());
@@ -242,7 +242,7 @@ fn complete_prefix_state(model: &ModelRuntime, position: usize) -> BTreeMap<Stri
 #[ignore = "Requires real model, prefix fixtures and exclusive GPU lock"]
 fn validate_prefix_reuse() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(
-        std::env::var("ORIN_PREFIX_FIXTURE").unwrap(),
+        std::env::var("ORINFER_PREFIX_FIXTURE").unwrap(),
     ))
     .unwrap();
     assert!(!fixture.output.exists());
@@ -592,7 +592,7 @@ fn snapshot(model: &ModelRuntime, position: usize) -> BTreeMap<String, String> {
 #[test]
 #[ignore = "Requires real MTP model, tokenized chat fixtures and exclusive GPU lock"]
 fn validate_mtp_generation() {
-    let path = PathBuf::from(std::env::var("ORIN_MTP_FIXTURE").unwrap());
+    let path = PathBuf::from(std::env::var("ORINFER_MTP_FIXTURE").unwrap());
     let fixture: Fixture = crate::model::read(&path).unwrap();
     assert!(!fixture.cases.is_empty() && fixture.repetitions > 0);
     assert!(!fixture.output.exists());

@@ -162,7 +162,7 @@ def main():
     p.add_argument('--model', type=Path, required=True)
     p.add_argument('--model-output', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--engine', type=Path, default=Path('target/release/orin-llm'))
+    p.add_argument('--engine', type=Path, default=Path('target/release/orinfer'))
     a = p.parse_args()
     destination = a.model_output.absolute()
     if destination.exists():

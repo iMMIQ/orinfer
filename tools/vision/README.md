@@ -9,7 +9,7 @@
 ```bash
 bash tools/operators/run.sh tools/vision/build.py artifacts/vision/model01 \
   --text-model /path/to/text/model.json --checkpoint /path/to/checkpoint
-./target/release/orin-llm serve artifacts/vision/model01/model.json /path/to/tokenizer-dir
+./target/release/orinfer serve artifacts/vision/model01/model.json /path/to/tokenizer-dir
 ```
 
 默认最大32768 patches/8192 image tokens，单张图片容量还受总上下文约束。`--max-patches 1024|2048|4096|8192|16384|32768`可降低workspace和输入分辨率上限。encoder使用256至最大容量的固定graph桶，实际grid/length动态上传并屏蔽padding；多图复用encoder workspace，输出按顺序拷入请求私有特征表。请求之间重置特征索引和全部MRoPE坐标。
@@ -30,7 +30,7 @@ bash tools/operators/run.sh tools/vision/validate_encoder.py artifacts/vision/en
   --model artifacts/vision/model01/model.json
 python3 tools/vision/preprocess_reference.py --model artifacts/vision/model01/model.json \
   --output artifacts/vision/preprocessor01
-ORIN_IMAGE_REFERENCE="$PWD/artifacts/vision/preprocessor01" \
+ORINFER_IMAGE_REFERENCE="$PWD/artifacts/vision/preprocessor01" \
   cargo test --offline checkpoint_image_processor_reference -- --ignored --nocapture
 ```
 
@@ -46,11 +46,11 @@ python3 tools/vision/official_reference.py --checkpoint /path/to/checkpoint \
   --output artifacts/vision/official01
 ```
 
-`tools/api/template_reference.py --vision-model ... --image ...`还生成官方图文token和MRoPE参考，Rust的`checkpoint_matches_reference_tokens`检查全部输入位置及后续16个生成位置。离线逐token诊断使用忽略的`multimodal_token_probe`测试；`ORIN_VISION_PROBE`指向包含model、input_tokens、images、prefixes、target_tokens及output的JSON，model和output使用绝对路径，记录原始生成token、固定历史下top3及目标logprob。运行时须在外层持有GPU实验锁；该诊断不经过Chat API输出解析。
+`tools/api/template_reference.py --vision-model ... --image ...`还生成官方图文token和MRoPE参考，Rust的`checkpoint_matches_reference_tokens`检查全部输入位置及后续16个生成位置。离线逐token诊断使用忽略的`multimodal_token_probe`测试；`ORINFER_VISION_PROBE`指向包含model、input_tokens、images、prefixes、target_tokens及output的JSON，model和output使用绝对路径，记录原始生成token、固定历史下top3及目标logprob。运行时须在外层持有GPU实验锁；该诊断不经过Chat API输出解析。
 
 ```bash
-ORIN_VISION_PROBE=/path/to/probe.json flock artifacts/gpu-experiment.lock \
-  cargo test --release --offline -p orin-engine multimodal_token_probe -- --ignored --nocapture
+ORINFER_VISION_PROBE=/path/to/probe.json flock artifacts/gpu-experiment.lock \
+  cargo test --release --offline -p orinfer-engine multimodal_token_probe -- --ignored --nocapture
 ```
 
 运行真实服务后执行：

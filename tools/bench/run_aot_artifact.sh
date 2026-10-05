@@ -14,13 +14,13 @@ if [[ -e "$output_dir" ]]; then
 fi
 mkdir -p "$output_dir/source"
 # Freeze the CPU build before joining the shared GPU experiment queue.
-cargo build --release --offline -p orin-cli
-cp --parents Cargo.toml Cargo.lock crates/orin-engine/Cargo.toml \
-    crates/orin-engine/src/*.rs crates/orin-cli/Cargo.toml crates/orin-cli/src/*.rs \
+cargo build --release --offline -p orinfer-cli
+cp --parents Cargo.toml Cargo.lock crates/orinfer-engine/Cargo.toml \
+    crates/orinfer-engine/src/*.rs crates/orinfer-cli/Cargo.toml crates/orinfer-cli/src/*.rs \
     tools/bench/run_aot_artifact.sh "$output_dir/source/"
-cp target/release/orin-llm "$output_dir/source/orin-llm"
+cp target/release/orinfer "$output_dir/source/orinfer"
 cp "$manifest_path" "$output_dir/manifest.json"
-sha256sum "$output_dir/source/orin-llm" "$manifest_path" > "$output_dir/identities.txt"
+sha256sum "$output_dir/source/orinfer" "$manifest_path" > "$output_dir/identities.txt"
 rustc --version --verbose > "$output_dir/rustc-version.txt"
 printf '%s\n' "$manifest_path" > "$output_dir/fixture-path.txt"
 exec 9>"$repo_dir/artifacts/gpu-experiment.lock"
@@ -37,5 +37,5 @@ trap cleanup EXIT
 python3 tools/bench/sample_continuous.py --output "$output_dir/machine.jsonl" \
     --phase "$output_dir/phase.txt" --stop "$output_dir/sampler.stop" &
 sampler_pid=$!
-"$output_dir/source/orin-llm" run-artifact "$manifest_path" \
+"$output_dir/source/orinfer" run-artifact "$manifest_path" \
     2>"$output_dir/stderr.log" | tee "$output_dir/result.json"

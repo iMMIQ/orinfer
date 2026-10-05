@@ -1,4 +1,6 @@
-# Orin LLM
+# Orinfer
+
+LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang.
 
 用于 Jetson AGX Orin 64GB 的图文推理引擎。在线运行时用 Rust，GPU kernel 用 TileLang，目标固定为 CUDA SM87。
 
@@ -16,16 +18,18 @@ make build
 
 模型目录使用checkpoint的配置、tokenizer和chat template；`cache/weights/`采用标准分片safetensors及HF索引，`cache/model.json`只描述模型数据、状态作用域和算子包身份。packed W4、scale、zero和LUT保留原始字节及`orin.layout.<tensor>`元数据。这是引擎专用物理布局，通用safetensors工具可读取，其他引擎需要适配布局才能执行。
 
-Rust从配置识别注册架构，在代码中生成执行计划；算子包独立保存cubin、ABI、布局和形状契约。加载器先查`ORIN_OPERATOR_CACHE`或`$XDG_CACHE_HOME/orin-llm/operators`（默认`~/.cache/orin-llm/operators`），再查模型内的`cache/operators/`。第一阶段计算策略是INT8为主、质量优先的混合精度，关键路径保留FP16/FP32。可离线加入decode INT8 FFN与GDN输出包：权重维持单份W4，在寄存器解包后执行INT8 MMA；FFN Down及GDN输出采用group-128 activation scale。其余投影与持续状态保持原精度，构建方法见[模型构建](tools/model/README.md)。`validate-model`校验完整模型；`plan-model`在CPU上输出实际生成的计划。
+Rust从配置识别注册架构，在代码中生成执行计划；算子包独立保存cubin、ABI、布局和形状契约。加载器先查`ORINFER_OPERATOR_CACHE`或`$XDG_CACHE_HOME/orinfer/operators`（默认`~/.cache/orinfer/operators`），再查模型内的`cache/operators/`。第一阶段计算策略是INT8为主、质量优先的混合精度，关键路径保留FP16/FP32。可离线加入decode INT8 FFN与GDN输出包：权重维持单份W4，在寄存器解包后执行INT8 MMA；FFN Down及GDN输出采用group-128 activation scale。其余投影与持续状态保持原精度，构建方法见[模型构建](tools/model/README.md)。`validate-model`校验完整模型；`plan-model`在CPU上输出实际生成的计划。
 
-服务协议位于`orin-api`，CLI只处理命令；`orin-engine`分为加载器、架构注册、算子包、CUDA执行器和生成/视觉/MTP控制模块。连续批处理共享权重与workspace，为每个请求保留独立KV、FP32 GDN、卷积、位置、视觉和采样状态。
+环境变量统一使用`ORINFER_*`前缀。已有部署需更新启动脚本中的变量名，并将共享算子包安装到上述缓存目录，或通过`ORINFER_OPERATOR_CACHE`指定已有目录。模型格式、`orin.layout.<tensor>`元数据和算子包身份保持一致，已有模型无需重新转换。
+
+服务协议位于`orinfer-api`，CLI只处理命令；`orinfer-engine`分为加载器、架构注册、算子包、CUDA执行器和生成/视觉/MTP控制模块。连续批处理共享权重与workspace，为每个请求保留独立KV、FP32 GDN、卷积、位置、视觉和采样状态。
 模型权重、cubin和编译缓存不包含在源码库中。[离线构建说明](tools/model/README.md)介绍checkpoint转换、kernel导出和模型组装。
 
 ## 运行
 
 ```bash
-./target/release/orin-llm validate-model /path/to/model-dir
-./target/release/orin-llm run-model /path/to/model-dir examples/requests.json
+./target/release/orinfer validate-model /path/to/model-dir
+./target/release/orinfer run-model /path/to/model-dir examples/requests.json
 ```
 
 CLI接收token-ID请求，输出包含生成token、加载时间和请求时延的JSON。`examples/requests.json`提供一个512-token文本请求。需要自行使用模型tokenizer准备其他输入。
@@ -43,7 +47,7 @@ CLI接收token-ID请求，输出包含生成token、加载时间和请求时延�
 ## Chat API
 
 ```bash
-./target/release/orin-llm serve /path/to/model-dir \
+./target/release/orinfer serve /path/to/model-dir \
   --model qwen3.8-27b
 ```
 
@@ -64,8 +68,8 @@ CLI接收token-ID请求，输出包含生成token、加载时间和请求时延�
 `serve`、`run-model`和`score-model`支持`--cuda-graph decode_only|full|off`，默认`decode_only`。`decode_only`只在生成阶段使用Graph，包含普通decode及MTP草稿、验证、恢复和短步刷新；文本prefill、视觉编码及MTP首次预热直接提交。prefill尾部即使复用decode计划也不使用Graph。`full`捕获并使用全部执行计划；`off`按相同计划逐个提交kernel、copy和memset。Graph模式通过显式加载配置传入引擎。
 
 ```bash
-./target/release/orin-llm serve /path/to/model-dir --cuda-graph full
-./target/release/orin-llm run-model /path/to/model-dir requests.json --cuda-graph off
+./target/release/orinfer serve /path/to/model-dir --cuda-graph full
+./target/release/orinfer run-model /path/to/model-dir requests.json --cuda-graph off
 ```
 
 ```bash
@@ -74,7 +78,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"2+3等于几？"}],"temperature":0,"max_tokens":64,"stream":true}'
 ```
 
-提供`GET /health`、`GET /v1/models`和`POST /v1/chat/completions`。设置`ORIN_API_KEY`后，`/v1`请求需要对应的Bearer token。支持文本和图片messages、`tools`、`tool_choice`、`parallel_tool_calls`、SSE deltas/`[DONE]`、usage、EOS、stop、temperature、top_p、top_k、presence/frequency/repetition penalties和seed。temperature、top_p、top_k和repetition_penalty默认采用模型`generation_config.json`，请求可覆盖；presence/frequency penalties默认0。默认关闭thinking；`enable_thinking=true`启用`reasoning_content`输出。默认输出上限512 tokens，可通过`max_tokens`或`max_completion_tokens`调整。
+提供`GET /health`、`GET /v1/models`和`POST /v1/chat/completions`。设置`ORINFER_API_KEY`后，`/v1`请求需要对应的Bearer token。支持文本和图片messages、`tools`、`tool_choice`、`parallel_tool_calls`、SSE deltas/`[DONE]`、usage、EOS、stop、temperature、top_p、top_k、presence/frequency/repetition penalties和seed。temperature、top_p、top_k和repetition_penalty默认采用模型`generation_config.json`，请求可覆盖；presence/frequency penalties默认0。默认关闭thinking；`enable_thinking=true`启用`reasoning_content`输出。默认输出上限512 tokens，可通过`max_tokens`或`max_completion_tokens`调整。
 
 使用包含`mtp`执行计划的模型时，所有支持的采样参数组合及文本、图片、多图请求自动启用MTP，thinking与工具调用沿用相同路径。无惩罚的greedy使用GPU top-1；其他组合对主模型与草稿分别应用相同的历史惩罚、temperature、top-k和top-p，再按`min(1,p/q)`接受草稿，拒绝后从归一化的`(p-q)+`采样修正token，保留主模型的采样分布（[算法来源](https://arxiv.org/abs/2211.17192)）。拒绝时恢复GDN、卷积、位置和有效KV状态。固定seed可复现同模式输出；随机MTP与普通decode不要求同seed输出逐token相同。图片草稿使用对应视觉embedding与MRoPE。输出尾部不足一个验证块时执行普通decode。MTP复用主模型embedding/head，额外草稿权重采用W4；构建方式见[离线构建说明](tools/model/README.md)。连续批处理在独立decode请求时使用MTP；2–4个decoder根据实测的每提交token代价选择交替MTP或target batch，更大并发及混合prefill使用target batch。恢复MTP时从私有hidden环追赶草稿状态，若超出环容量则保持普通decode。API日志记录每个请求的MTP接受数、轮数和分段耗时；是否加速取决于接受率及采样开销。
 
@@ -110,8 +114,8 @@ API支持任意提示长度：优先选择能容纳剩余输入的最大prefill�
 [OpenCode配置示例](examples/opencode.json)使用`@ai-sdk/openai-compatible`接入`http://127.0.0.1:8088/v1`。复制到独立测试目录后运行：
 
 ```bash
-opencode run --pure --agent orin --model orin/qwen3.8-27b '读取input.txt并把内容写入output.txt'
-opencode run --pure --agent orin --model orin/qwen3.8-27b '比较两张图片' -f first.png second.png
+opencode run --pure --agent orinfer --model orinfer/qwen3.8-27b '读取input.txt并把内容写入output.txt'
+opencode run --pure --agent orinfer --model orinfer/qwen3.8-27b '比较两张图片' -f first.png second.png
 python3 tools/api/smoke.py --output artifacts/api-smoke-results.json
 ```
 
@@ -121,9 +125,9 @@ Smoke工具验证真实模型的文本/SSE、采样、停止词、状态隔离�
 
 ## 实现
 
-- `crates/orin-engine/`：CUDA Driver封装、manifest校验、权重加载、graph执行、KV/GDN/卷积状态和采样。
-- `crates/orin-api/`：Rust tokenizer/chat template、HTTP/SSE、调度队列与工具协议。
-- `crates/orin-cli/`：命令行入口。
+- `crates/orinfer-engine/`：CUDA Driver封装、manifest校验、权重加载、graph执行、KV/GDN/卷积状态和采样。
+- `crates/orinfer-api/`：Rust tokenizer/chat template、HTTP/SSE、调度队列与工具协议。
+- `crates/orinfer-cli/`：命令行入口。
 - `kernels/operators/`：基础TileLang算子。
 - `kernels/vision/`：视觉encoder、特征注入和MRoPE。
 - `kernels/model/`：模型投影、融合、GDN与attention实现。

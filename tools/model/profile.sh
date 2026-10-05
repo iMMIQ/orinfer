@@ -11,13 +11,13 @@ if [[ "$output_arg" = /* ]]; then output_dir="$output_arg"; else output_dir="$re
 if [[ -e "$output_dir" ]]; then echo "Refusing existing output $output_dir" >&2; exit 2; fi
 mkdir -p "$output_dir/measurement-source"
 cp --parents "$model_manifest" "$(dirname -- "$model_manifest")/weights/model.safetensors.index.json" "$request_manifest" tools/model/{profile.sh,profile_summary.py} \
-    crates/orin-engine/src/{model,artifact,weights,loader,operators}.rs crates/orin-cli/src/main.rs \
+    crates/orinfer-engine/src/{model,artifact,weights,loader,operators}.rs crates/orinfer-cli/src/main.rs \
     "$output_dir/measurement-source/"
 cp "$request_manifest" "$output_dir/requests.json"
-cp -r --parents crates/orin-engine/src/{cuda,runtime,architecture} "$output_dir/measurement-source/"
-cp target/release/orin-llm "$output_dir/orin-llm"
-"$output_dir/orin-llm" plan-model "$model_manifest" > "$output_dir/plan.json"
-sha256sum "$model_manifest" "$request_manifest" "$output_dir/orin-llm" > "$output_dir/identities.sha256"
+cp -r --parents crates/orinfer-engine/src/{cuda,runtime,architecture} "$output_dir/measurement-source/"
+cp target/release/orinfer "$output_dir/orinfer"
+"$output_dir/orinfer" plan-model "$model_manifest" > "$output_dir/plan.json"
+sha256sum "$model_manifest" "$request_manifest" "$output_dir/orinfer" > "$output_dir/identities.sha256"
 exec 9>"$repo_dir/artifacts/gpu-experiment.lock"
 flock 9
 python3 tools/bench/sample_machine.py --output "$output_dir/machine-before.json"
@@ -27,11 +27,11 @@ cleanup() {
 trap cleanup EXIT
 # Preserve target JSON/stderr separately from Nsight's own console output.
 # Positional shell parameters keep filenames as data, not executable text.
-ORIN_MODEL_PROGRESS="$output_dir/progress.json" nsys profile \
+ORINFER_MODEL_PROGRESS="$output_dir/progress.json" nsys profile \
     --output "$output_dir/trace" --force-overwrite=false --trace=cuda \
     --cuda-graph-trace=node --sample=none --cpuctxsw=none \
     bash -c 'exec "$1" run-model "$2" "$3" >"$4" 2>"$5"' profile-target \
-    "$output_dir/orin-llm" "$model_manifest" "$request_manifest" \
+    "$output_dir/orinfer" "$model_manifest" "$request_manifest" \
     "$output_dir/report.json" "$output_dir/run.log" > "$output_dir/nsys.log" 2>&1
 nsys export --type=sqlite --output "$output_dir/trace.sqlite" \
     "$output_dir/trace.nsys-rep" > "$output_dir/export.log" 2>&1

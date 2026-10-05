@@ -1,6 +1,6 @@
 //! Continuous worker and bounded, nonblocking per-client output mailboxes.
 use super::*;
-use orin_engine::{
+use orinfer_engine::{
     model::{GenerationInput, RequestState},
     scheduler,
 };
@@ -283,7 +283,7 @@ pub(super) fn worker(
                 if lifecycle.is_ready()
                     && let Err(error) = model.finish_request(&mut a.request, cache)
                 {
-                    let failure = orin_engine::error::EngineError::take(error.clone(), true);
+                    let failure = orinfer_engine::error::EngineError::take(error.clone(), true);
                     lifecycle.fail(failure);
                     a.ending = Some(Ending::Failed(error));
                 }
@@ -370,7 +370,7 @@ pub(super) fn worker(
                             }
                             Err(error) => {
                                 let failure =
-                                    orin_engine::error::EngineError::take(error.clone(), false);
+                                    orinfer_engine::error::EngineError::take(error.clone(), false);
                                 if failure.is_fatal() {
                                     lifecycle.fail(failure);
                                 }
@@ -383,7 +383,8 @@ pub(super) fn worker(
                         break;
                     }
                     Err(error) => {
-                        let failure = orin_engine::error::EngineError::take(error.clone(), false);
+                        let failure =
+                            orinfer_engine::error::EngineError::take(error.clone(), false);
                         if failure.is_fatal() {
                             lifecycle.fail(failure);
                         }
@@ -452,7 +453,10 @@ pub(super) fn worker(
                     }
                 }
                 Err(error) => {
-                    lifecycle.fail(orin_engine::error::EngineError::take(error.clone(), true));
+                    lifecycle.fail(orinfer_engine::error::EngineError::take(
+                        error.clone(),
+                        true,
+                    ));
                     for a in &mut active {
                         a.ending = Some(Ending::Failed(error.clone()));
                     }
@@ -490,7 +494,7 @@ pub(super) fn worker(
         if lifecycle.name() != "failed"
             && let Err(error) = model.finish_request(&mut a.request, false)
         {
-            lifecycle.fail(orin_engine::error::EngineError::take(error, true));
+            lifecycle.fail(orinfer_engine::error::EngineError::take(error, true));
         }
         let _ = a
             .mailbox

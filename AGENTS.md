@@ -18,7 +18,7 @@
 - 改变prefill/decode、恢复或分支行为时校验全部状态，不只校验KV。
 - 单份常驻W4；scale、zero、LUT、padding和持久重复表示计入权重平均bits。临时W8不作永久权重缓存。
 - 在线模型采用HF配置/tokenizer目录和`cache/model.json`数据描述；标准分片safetensors保留当前W4表示，校验payload hash、dtype、shape与物理layout。架构自动匹配独立算子包，第一阶段采用INT8为主、质量优先的混合精度，关键部分可FP16/FP32；不实现force_int8或其他格式导入。离线AOT manifest只作构建中间产物，不提供旧在线格式兼容分支。算子夹具格式独立。
-- 服务协议位于orin-api；CLI只处理命令。CUDA执行器、加载器、架构计划、生成/视觉/MTP控制分离；权重、序列状态和workspace分作用域管理。
+- 服务协议位于orinfer-api；CLI只处理命令。CUDA执行器、加载器、架构计划、生成/视觉/MTP控制分离；权重、序列状态和workspace分作用域管理。
 - Rust按实际导出host ABI绑定参数、grid/block/shared；检查CUDA返回值、unsafe边界、资源生存期和stream顺序。
 - CUDA graph需要稳定地址和预分配workspace；改输入后replay验证实际执行。
 - Cooperative launch需显式声明并校验occupancy，不假定普通launch可跨block同步。

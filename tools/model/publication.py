@@ -48,8 +48,8 @@ def load_model(model):
     digest = data['operator_package']
     if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
         raise ValueError('Invalid operator package digest')
-    root = Path(os.environ.get('ORIN_OPERATOR_CACHE', str(Path(os.environ.get(
-        'XDG_CACHE_HOME', str(Path.home() / '.cache'))) / 'orin-llm/operators')))
+    root = Path(os.environ.get('ORINFER_OPERATOR_CACHE', str(Path(os.environ.get(
+        'XDG_CACHE_HOME', str(Path.home() / '.cache'))) / 'orinfer/operators')))
     origin = root / digest
     if not origin.exists():
         origin = model / 'cache/operators' / digest
@@ -110,6 +110,6 @@ def staged_directory(destination):
 def atomic_model(destination, engine=None, command='plan-model'):
     with staged_directory(destination) as staging:
         yield staging
-        cli = engine if engine is not None else ROOT / 'target/release/orin-llm'
+        cli = engine if engine is not None else ROOT / 'target/release/orinfer'
         subprocess.run([str(cli.resolve(strict=True)), command, str(staging)],
                        check=True, stdout=subprocess.DEVNULL)

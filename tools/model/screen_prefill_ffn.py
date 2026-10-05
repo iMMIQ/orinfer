@@ -14,7 +14,7 @@ from pathlib import Path
 def model_identity(model):
     raw=(model/'cache/model.json').read_bytes()
     descriptor=json.loads(raw)
-    root=Path(os.environ.get('ORIN_OPERATOR_CACHE',str(Path(os.environ.get('XDG_CACHE_HOME',str(Path.home()/'.cache')))/'orin-llm/operators')))
+    root=Path(os.environ.get('ORINFER_OPERATOR_CACHE',str(Path(os.environ.get('XDG_CACHE_HOME',str(Path.home()/'.cache')))/'orinfer/operators')))
     package=root/descriptor['operator_package']/'package.json'
     if not package.exists():package=model/'cache/operators'/descriptor['operator_package']/'package.json'
     package_raw=package.read_bytes()

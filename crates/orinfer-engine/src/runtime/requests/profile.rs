@@ -63,7 +63,7 @@ fn category(model: &ModelRuntime, op: &Invocation) -> String {
 #[ignore = "Requires real prefill model and exclusive GPU experiment lock"]
 fn capture_prefill_ffn_inputs() {
     let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
-        std::env::var("ORIN_BATCH_FIXTURE").unwrap(),
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
     ))
     .unwrap();
     let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
@@ -172,7 +172,7 @@ fn capture_prefill_ffn_inputs() {
 #[ignore = "Requires real model and exclusive GPU experiment lock"]
 fn capture_prefill_attention_inputs() {
     let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
-        std::env::var("ORIN_BATCH_FIXTURE").unwrap(),
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
     ))
     .unwrap();
     let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
@@ -270,7 +270,7 @@ fn capture_prefill_attention_inputs() {
 #[ignore = "Requires real model and exclusive GPU experiment lock"]
 fn profile_prefill_stages() {
     let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
-        std::env::var("ORIN_BATCH_FIXTURE").unwrap(),
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
     ))
     .unwrap();
     let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
@@ -347,7 +347,7 @@ fn profile_prefill_stages() {
 fn capture_decode_projections() {
     use std::io::Write;
     let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
-        std::env::var("ORIN_BATCH_FIXTURE").unwrap(),
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
     ))
     .unwrap();
     let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
@@ -423,7 +423,7 @@ fn capture_decode_projections() {
 #[ignore = "Requires real model and exclusive GPU experiment lock"]
 fn profile_continuous_decode() {
     let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
-        std::env::var("ORIN_BATCH_FIXTURE").unwrap(),
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
     ))
     .unwrap();
     let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());

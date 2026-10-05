@@ -146,7 +146,7 @@ def publish(source, destination, engine, output, warm_sizes=(64,128,512), attent
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--model',type=Path,required=True);p.add_argument('--destination',type=Path,required=True)
-    p.add_argument('--engine',type=Path,default=Path('target/release/orin-llm'));p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--engine',type=Path,default=Path('target/release/orinfer'));p.add_argument('--output',type=Path,required=True)
     p.add_argument('--warm-sizes',type=int,nargs='*',default=[64,128,512])
     p.add_argument('--attention-screen',type=Path)
     a=p.parse_args()

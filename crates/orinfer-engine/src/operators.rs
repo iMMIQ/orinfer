@@ -138,14 +138,14 @@ impl OperatorPackage {
 }
 
 pub fn default_cache() -> PathBuf {
-    if let Some(path) = std::env::var_os("ORIN_OPERATOR_CACHE") {
+    if let Some(path) = std::env::var_os("ORINFER_OPERATOR_CACHE") {
         return path.into();
     }
     if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(path).join("orin-llm/operators");
+        return PathBuf::from(path).join("orinfer/operators");
     }
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
-        .join(".cache/orin-llm/operators")
+        .join(".cache/orinfer/operators")
 }
 
 pub(crate) fn resolve(model_cache: &Path, id: &str) -> Result<PathBuf> {

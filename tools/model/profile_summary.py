@@ -14,7 +14,7 @@ import sqlite3
 
 def summarize(directory, manifest_path):
     import subprocess
-    planned = json.loads(subprocess.check_output([str((directory / "orin-llm").resolve()),
+    planned = json.loads(subprocess.check_output([str((directory / "orinfer").resolve()),
                                                  "plan-model", str(manifest_path)], text=True))
     model = planned["manifest"]
     report = json.loads((directory / "report.json").read_text())

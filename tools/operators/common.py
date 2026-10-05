@@ -109,7 +109,7 @@ def environment():
     return {"torch": torch.__version__, "tilelang": tilelang.__version__,
             "cuda": torch.version.cuda, "device": str(torch.cuda.get_device_properties(0)),
             "sm": list(torch.cuda.get_device_capability()), "seed": SEED,
-            "output_root": os.environ.get("ORIN_OPERATOR_OUTPUT")}
+            "output_root": os.environ.get("ORINFER_OPERATOR_OUTPUT")}
 
 
 def write_json(path, data):

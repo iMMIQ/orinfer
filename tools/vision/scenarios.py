@@ -18,7 +18,7 @@ def main():
     if a.output.exists():raise FileExistsError(a.output)
     a.output.parent.mkdir(parents=True,exist_ok=True);results=[]
     headers={'Content-Type':'application/json'}
-    if os.getenv('ORIN_API_KEY'):headers['Authorization']='Bearer '+os.environ['ORIN_API_KEY']
+    if os.getenv('ORINFER_API_KEY'):headers['Authorization']='Bearer '+os.environ['ORINFER_API_KEY']
     def request(messages,**options):
         body={'model':a.model,'messages':messages,'temperature':0,'seed':20261002,'max_tokens':64,**options}
         t=time.monotonic();r=urllib.request.Request(a.base_url+'/chat/completions',data=json.dumps(body).encode(),headers=headers)

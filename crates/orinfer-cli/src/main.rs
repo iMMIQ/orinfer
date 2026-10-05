@@ -1,10 +1,10 @@
-use orin_engine::execution::LoadOptions;
+use orinfer_engine::execution::LoadOptions;
 use std::process::ExitCode;
 
 fn model_options(args: &[String]) -> Result<LoadOptions, String> {
     if args.len() < 2 {
         return Err(
-            "Usage: orin-llm <run-model | score-model> MODEL_DIR REQUESTS.json [--cuda-graph decode_only|full|off]"
+            "Usage: orinfer <run-model | score-model> MODEL_DIR REQUESTS.json [--cuda-graph decode_only|full|off]"
                 .into(),
         );
     }
@@ -24,7 +24,7 @@ fn model_options(args: &[String]) -> Result<LoadOptions, String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|c| c == "serve") {
-        return match orin_api::run(&args[1..]) {
+        return match orinfer_api::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("serve: {error}");
@@ -37,15 +37,15 @@ fn main() -> ExitCode {
         .is_some_and(|c| c == "validate-model" || c == "plan-model")
     {
         if args.len() != 2 {
-            eprintln!("Usage: orin-llm <validate-model | plan-model> MODEL_DIR");
+            eprintln!("Usage: orinfer <validate-model | plan-model> MODEL_DIR");
             return ExitCode::from(2);
         }
         let path = std::path::Path::new(&args[1]);
         let result = if args[0] == "plan-model" {
-            orin_engine::model::inspect_plan(path)
+            orinfer_engine::model::inspect_plan(path)
                 .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
         } else {
-            orin_engine::model::validate_model(path)
+            orinfer_engine::model::validate_model(path)
                 .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
         };
         return match result {
@@ -71,14 +71,14 @@ fn main() -> ExitCode {
             }
         };
         let result = if args[0] == "score-model" {
-            orin_engine::model::score_with_options(
+            orinfer_engine::model::score_with_options(
                 std::path::Path::new(&args[1]),
                 std::path::Path::new(&args[2]),
                 options,
             )
             .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
         } else {
-            orin_engine::model::run_with_options(
+            orinfer_engine::model::run_with_options(
                 std::path::Path::new(&args[1]),
                 std::path::Path::new(&args[2]),
                 options,
@@ -99,15 +99,15 @@ fn main() -> ExitCode {
     if let Some(command @ ("validate-artifact" | "run-artifact")) = args.first().map(String::as_str)
     {
         if args.len() != 2 {
-            eprintln!("Usage: orin-llm {command} MANIFEST.json");
+            eprintln!("Usage: orinfer {command} MANIFEST.json");
             return ExitCode::from(2);
         }
         let path = std::path::Path::new(&args[1]);
         let result = if command == "validate-artifact" {
-            orin_engine::artifact::validate_artifact(path)
+            orinfer_engine::artifact::validate_artifact(path)
                 .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
         } else {
-            orin_engine::artifact::run_artifact(path)
+            orinfer_engine::artifact::run_artifact(path)
                 .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
         };
         return match result {
@@ -122,29 +122,29 @@ fn main() -> ExitCode {
         };
     }
     if args.len() > 1 {
-        eprintln!("Usage: orin-llm [info | plan | --version | --help]");
+        eprintln!("Usage: orinfer [info | plan | --version | --help]");
         return ExitCode::from(2);
     }
     match args.first().map(String::as_str).unwrap_or("info") {
         "info" => {
-            println!("Orin LLM {}", env!("CARGO_PKG_VERSION"));
+            println!("Orinfer {}", env!("CARGO_PKG_VERSION"));
             println!(
                 "Target: {} / {} / {}",
-                orin_engine::TARGET_DEVICE,
-                orin_engine::TARGET_ARCH,
-                orin_engine::CUDA_ARCH
+                orinfer_engine::TARGET_DEVICE,
+                orinfer_engine::TARGET_ARCH,
+                orinfer_engine::CUDA_ARCH
             );
-            println!("Model: {}", orin_engine::FIRST_MODEL);
-            println!("Status: {}", orin_engine::STATUS);
+            println!("Model: {}", orinfer_engine::FIRST_MODEL);
+            println!("Status: {}", orinfer_engine::STATUS);
         }
-        "plan" => println!("{}", orin_engine::BENCHMARK_PLAN),
-        "--version" | "-V" => println!("orin-llm {}", env!("CARGO_PKG_VERSION")),
+        "plan" => println!("{}", orinfer_engine::BENCHMARK_PLAN),
+        "--version" | "-V" => println!("orinfer {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!(
-            "Usage: orin-llm [info | plan | --version | --help]\n       orin-llm <validate-artifact | run-artifact> MANIFEST.json\n       orin-llm <run-model | score-model> MODEL_DIR REQUESTS.json [--cuda-graph MODE]\n       orin-llm serve MODEL_DIR [--listen HOST:PORT] [--model MODEL_ID] [--cuda-graph MODE]\n\n--cuda-graph MODE     decode_only (default), full or off\n--listen HOST:PORT    Default: 0.0.0.0:8088\n--prefix-cache-mib N  Server snapshot budget: 12288 MiB; 0 disables reuse\n--max-active-requests N  Active request limit: 32 (1..128)\n--max-batch-tokens N     Iteration token budget: 128 (1..128)\n--prefill-budget-ms N    Mixed prefill predicted budget: 200 ms\n--memory-reserve-mib N   Admission memory reserve: 1024 MiB\n--preprocess-workers N  Blocking CPU preprocessing limit: 2\n--preprocess-memory-mib N  Preprocessing/queued image memory budget: 2048 MiB\n--queue-timeout-ms N    Queue wait deadline: 0 (unlimited)\n--output-timeout-ms N   Stalled output deadline: 60000 ms\n--drain-timeout-ms N    SIGINT/SIGTERM HTTP drain deadline: 30000 ms\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nplan-model           Inspect the registered execution plan without CUDA\nvalidate-model       Verify model, operator package and tensor hashes without CUDA\nrun-model            Load custom model data and registered plans with private state\nscore-model          Score frozen token histories through real prefill/decode kernels"
+            "Usage: orinfer [info | plan | --version | --help]\n       orinfer <validate-artifact | run-artifact> MANIFEST.json\n       orinfer <run-model | score-model> MODEL_DIR REQUESTS.json [--cuda-graph MODE]\n       orinfer serve MODEL_DIR [--listen HOST:PORT] [--model MODEL_ID] [--cuda-graph MODE]\n\n--cuda-graph MODE     decode_only (default), full or off\n--listen HOST:PORT    Default: 0.0.0.0:8088\n--prefix-cache-mib N  Server snapshot budget: 12288 MiB; 0 disables reuse\n--max-active-requests N  Active request limit: 32 (1..128)\n--max-batch-tokens N     Iteration token budget: 128 (1..128)\n--prefill-budget-ms N    Mixed prefill predicted budget: 200 ms\n--memory-reserve-mib N   Admission memory reserve: 1024 MiB\n--preprocess-workers N  Blocking CPU preprocessing limit: 2\n--preprocess-memory-mib N  Preprocessing/queued image memory budget: 2048 MiB\n--queue-timeout-ms N    Queue wait deadline: 0 (unlimited)\n--output-timeout-ms N   Stalled output deadline: 60000 ms\n--drain-timeout-ms N    SIGINT/SIGTERM HTTP drain deadline: 30000 ms\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nplan-model           Inspect the registered execution plan without CUDA\nvalidate-model       Verify model, operator package and tensor hashes without CUDA\nrun-model            Load custom model data and registered plans with private state\nscore-model          Score frozen token histories through real prefill/decode kernels"
         ),
         other => {
             eprintln!(
-                "Unknown command: {other}\nUsage: orin-llm [info | plan | --version | --help]"
+                "Unknown command: {other}\nUsage: orinfer [info | plan | --version | --help]"
             );
             return ExitCode::from(2);
         }
@@ -155,7 +155,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orin_engine::execution::CudaGraphMode;
+    use orinfer_engine::execution::CudaGraphMode;
 
     #[test]
     fn run_model_graph_modes_are_validated_before_loading() {

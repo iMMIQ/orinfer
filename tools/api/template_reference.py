@@ -119,7 +119,7 @@ def main():
     with args.output.open("x") as output:
         json.dump(cases, output, ensure_ascii=False)
     print("Reference lengths:", [len(case["ids"]) for case in cases])
-    print("ORIN_CHAT_REFERENCE=" + str(args.output.resolve()))
+    print("ORINFER_CHAT_REFERENCE=" + str(args.output.resolve()))
 
 
 if __name__ == "__main__":

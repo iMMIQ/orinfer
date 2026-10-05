@@ -25,8 +25,8 @@ def main():
     mime = {'.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.webp':'image/webp'}[args.image.suffix.lower()]
     image = {'type':'image_url', 'image_url':{'url':f'data:{mime};base64,'+base64.b64encode(args.image.read_bytes()).decode()}}
     headers = {'Content-Type':'application/json'}
-    if os.getenv('ORIN_API_KEY'):
-        headers['Authorization'] = 'Bearer '+os.environ['ORIN_API_KEY']
+    if os.getenv('ORINFER_API_KEY'):
+        headers['Authorization'] = 'Bearer '+os.environ['ORINFER_API_KEY']
     report = {'image':str(args.image), 'prompt':PROMPT, 'seed':SEED, 'temperature':0, 'max_tokens':args.max_tokens, 'checks':[]}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for thinking in (False, True):

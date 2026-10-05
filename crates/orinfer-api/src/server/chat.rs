@@ -1,5 +1,5 @@
 use minijinja::{Environment, context};
-use orin_engine::sampling::Options;
+use orinfer_engine::sampling::Options;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
@@ -13,7 +13,7 @@ mod mtp_fixture_export {
     #[test]
     #[ignore = "Offline export of native chat-template code fixtures for the GPU MTP test"]
     fn export_mtp_chat_fixture() {
-        let source = std::env::var("ORIN_MTP_FIXTURE_SPEC").unwrap();
+        let source = std::env::var("ORINFER_MTP_FIXTURE_SPEC").unwrap();
         let raw: Value = serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
         let codec = ChatCodec::load(Path::new(raw["tokenizer"].as_str().unwrap())).unwrap();
         let descriptor: Value = serde_json::from_slice(
@@ -21,7 +21,7 @@ mod mtp_fixture_export {
                 .unwrap(),
         )
         .unwrap();
-        let vision: Option<orin_engine::vision::VisionSpec> =
+        let vision: Option<orinfer_engine::vision::VisionSpec> =
             serde_json::from_value(descriptor["metadata"]["vision"].clone()).unwrap();
         let mut cases = vec![];
         for case in raw["cases"].as_array().unwrap() {
@@ -81,7 +81,7 @@ pub struct ChatRequest {
 pub struct Prepared {
     pub input: Vec<u32>,
     pub prefix_hints: Vec<usize>,
-    pub images: Vec<orin_engine::vision::ImageInput>,
+    pub images: Vec<orinfer_engine::vision::ImageInput>,
     pub max_tokens: usize,
     pub sampling: Options,
     pub tools: Vec<Value>,
@@ -110,7 +110,7 @@ impl ChatCodec {
             "generation_config.json",
         ] {
             let bytes = std::fs::read(directory.join(name)).map_err(|e| e.to_string())?;
-            asset_hashes.insert(name.to_owned(), orin_engine::artifact::sha256(&bytes));
+            asset_hashes.insert(name.to_owned(), orinfer_engine::artifact::sha256(&bytes));
             assets.insert(name, bytes);
         }
         let mut tokenizer =
@@ -219,7 +219,7 @@ impl ChatCodec {
         request: ChatRequest,
         model: &str,
         context_limit: usize,
-        vision: Option<&orin_engine::vision::VisionSpec>,
+        vision: Option<&orinfer_engine::vision::VisionSpec>,
         preparation: &mut super::preparation::Context,
     ) -> Result<Prepared> {
         preparation.checkpoint(0)?;
@@ -258,7 +258,7 @@ impl ChatCodec {
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             seed: request
                 .seed
-                .unwrap_or(orin_engine::sampling::EVALUATION_SEED),
+                .unwrap_or(orinfer_engine::sampling::EVALUATION_SEED),
         };
         sampling.validate()?;
         let thinking = request.enable_thinking.unwrap_or(false);
@@ -670,13 +670,13 @@ mod tests {
     #[test]
     #[ignore = "Needs local checkpoint and Transformers-generated reference cases"]
     fn checkpoint_matches_reference_tokens() {
-        let directory = std::env::var("ORIN_TOKENIZER_DIR").expect("ORIN_TOKENIZER_DIR");
-        let cases = std::env::var("ORIN_CHAT_REFERENCE").expect("ORIN_CHAT_REFERENCE");
+        let directory = std::env::var("ORINFER_TOKENIZER_DIR").expect("ORINFER_TOKENIZER_DIR");
+        let cases = std::env::var("ORINFER_CHAT_REFERENCE").expect("ORINFER_CHAT_REFERENCE");
         let codec = ChatCodec::load(Path::new(&directory)).unwrap();
         let cases: Value = serde_json::from_slice(&std::fs::read(cases).unwrap()).unwrap();
         for case in cases.as_array().unwrap() {
             let request: ChatRequest = serde_json::from_value(case["request"].clone()).unwrap();
-            let vision: Option<orin_engine::vision::VisionSpec> = case
+            let vision: Option<orinfer_engine::vision::VisionSpec> = case
                 .get("vision")
                 .map(|v| serde_json::from_value(v.clone()).unwrap());
             let prepared = codec

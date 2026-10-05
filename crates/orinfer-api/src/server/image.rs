@@ -1,7 +1,7 @@
 //! Images-only OpenAI content parts. CPU work runs outside the async executor.
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{ImageReader, imageops::FilterType};
-use orin_engine::vision::{ImageInput, VisionSpec};
+use orinfer_engine::vision::{ImageInput, VisionSpec};
 use serde_json::{Value, json};
 use std::{
     io::{Cursor, Read},
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     #[ignore = "Needs Transformers-generated image references"]
     fn checkpoint_image_processor_reference() {
-        let root = std::path::PathBuf::from(std::env::var("ORIN_IMAGE_REFERENCE").unwrap());
+        let root = std::path::PathBuf::from(std::env::var("ORINFER_IMAGE_REFERENCE").unwrap());
         let reference: Value =
             serde_json::from_slice(&std::fs::read(root.join("reference.json")).unwrap()).unwrap();
         let spec: VisionSpec = serde_json::from_value(reference["vision"].clone()).unwrap();

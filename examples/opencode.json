@@ -1,15 +1,15 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "orin/qwen3.8-27b",
-  "small_model": "orin/qwen3.8-27b",
+  "model": "orinfer/qwen3.8-27b",
+  "small_model": "orinfer/qwen3.8-27b",
   "provider": {
-    "orin": {
+    "orinfer": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Orin local",
+      "name": "Orinfer local",
       "options": {"baseURL": "http://127.0.0.1:8088/v1"},
       "models": {
         "qwen3.8-27b": {
-          "name": "Qwen3.8 27B Orin",
+          "name": "Qwen3.8 27B on Orinfer",
           "attachment": true,
           "modalities": {"input": ["text", "image"], "output": ["text"]},
           "limit": {"context": 262144, "output": 256},
@@ -19,10 +19,10 @@
     }
   },
   "agent": {
-    "orin": {
-      "description": "Local Orin model with file read/write tools",
+    "orinfer": {
+      "description": "Local Orinfer model with file read/write tools",
       "mode": "primary",
-      "model": "orin/qwen3.8-27b",
+      "model": "orinfer/qwen3.8-27b",
       "temperature": 0,
       "steps": 4,
       "prompt": "You are a coding assistant. Follow the user instructions using read and write tools. Use absolute file paths. Keep replies brief.",

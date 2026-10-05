@@ -1,6 +1,6 @@
 """Opt-in real activation capture. Import install after other runner hooks.
 
-Set ORIN_PROJECTION_OUTPUT to a mounted directory. Request extra_args
+Set ORINFER_PROJECTION_OUTPUT to a mounted directory. Request extra_args
 orin_export='capture-512' (no orin_timing) on a 512-token prompt, >=8 output tokens.
 Only this diagnostic request incurs CPU copies; no random data is generated.
 """
@@ -24,7 +24,7 @@ def install():
             return
         meta = dict(_CONTEXT)
         x = tensor.detach().reshape(-1, tensor.shape[-1]).cpu().contiguous()
-        path = Path(os.environ['ORIN_PROJECTION_OUTPUT'])
+        path = Path(os.environ['ORINFER_PROJECTION_OUTPUT'])
         path.mkdir(parents=True, exist_ok=True)
         name = f"{meta['run_id']}-{meta['computed_tokens_before']}-{kind.replace('.', '_')}.pt"
         target = path / name
@@ -59,7 +59,7 @@ def install():
                                 computed_tokens_before=start, seed=req.sampling_params.seed,
                                 prompt_token_ids=list(req.prompt_token_ids),
                                 mode='prefill' if start < len(req.prompt_token_ids) else 'decode',
-                                source_config=os.environ.get('ORIN_PROJECTION_SOURCE', 'see experiment lock'))
+                                source_config=os.environ.get('ORINFER_PROJECTION_SOURCE', 'see experiment lock'))
         try:
             return execute_original(self, scheduler_output, *args, **kwargs)
         finally:
@@ -84,7 +84,7 @@ def install():
                 return original_logits(hidden_states, *a, **kw)
             self.model.compute_logits = logits
             self._orin_projection_hooks = True
-            print('ORIN_PROJECTION_CAPTURE registered', names, flush=True)
+            print('ORINFER_PROJECTION_CAPTURE registered', names, flush=True)
         return forward_original(self, *args, **kwargs)
 
     def determine(self, *args, **kwargs):

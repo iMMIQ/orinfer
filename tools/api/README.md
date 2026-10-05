@@ -1,6 +1,6 @@
 # API验证
 
-`smoke.py`只作为客户端连接运行中的真实模型服务，覆盖任意输入长度、EOS、SSE/usage、固定seed、stop、排队和断开后的状态隔离、错误格式，以及带整数参数的工具调用和结果回传。输出路径必须不存在；启用服务鉴权时从环境变量`ORIN_API_KEY`读取凭据。
+`smoke.py`只作为客户端连接运行中的真实模型服务，覆盖任意输入长度、EOS、SSE/usage、固定seed、stop、排队和断开后的状态隔离、错误格式，以及带整数参数的工具调用和结果回传。输出路径必须不存在；启用服务鉴权时从环境变量`ORINFER_API_KEY`读取凭据。
 
 ```bash
 python3 tools/api/smoke.py --base-url http://127.0.0.1:8088/v1 \
@@ -12,8 +12,8 @@ python3 tools/api/smoke.py --base-url http://127.0.0.1:8088/v1 \
 ```bash
 python3 tools/api/template_reference.py --tokenizer-dir /path/to/tokenizer-dir \
   --output artifacts/chat-reference.json
-ORIN_TOKENIZER_DIR=/path/to/tokenizer-dir \
-ORIN_CHAT_REFERENCE="$PWD/artifacts/chat-reference.json" \
+ORINFER_TOKENIZER_DIR=/path/to/tokenizer-dir \
+ORINFER_CHAT_REFERENCE="$PWD/artifacts/chat-reference.json" \
   cargo test --offline checkpoint_matches_reference_tokens -- --ignored
 ```
 
@@ -25,8 +25,8 @@ ORIN_CHAT_REFERENCE="$PWD/artifacts/chat-reference.json" \
 python3 tools/api/template_reference.py --tokenizer-dir /path/to/tokenizer-dir \
   --vision-model /path/to/prepared-model-dir --image /path/to/image.png \
   --output artifacts/chat-image-reference.json
-ORIN_TOKENIZER_DIR=/path/to/tokenizer-dir \
-ORIN_CHAT_REFERENCE="$PWD/artifacts/chat-image-reference.json" \
+ORINFER_TOKENIZER_DIR=/path/to/tokenizer-dir \
+ORINFER_CHAT_REFERENCE="$PWD/artifacts/chat-image-reference.json" \
   cargo test --offline checkpoint_matches_reference_tokens -- --ignored
 ```
 

@@ -1,5 +1,5 @@
 [package]
-name = "orin-cli"
+name = "orinfer-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,12 +7,12 @@ publish.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "orin-llm"
+name = "orinfer"
 path = "src/main.rs"
 
 [dependencies]
-orin-api = { path = "../orin-api" }
-orin-engine.workspace = true
+orinfer-api = { path = "../orinfer-api" }
+orinfer-engine.workspace = true
 serde_json = "=1.0.151"
 
 [lints]

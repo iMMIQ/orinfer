@@ -92,5 +92,5 @@ def publish(source,destination,engine,output):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model',type=Path,required=True);p.add_argument('--destination',type=Path,required=True)
-    p.add_argument('--engine',type=Path,default=Path('target/release/orin-llm'));p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--engine',type=Path,default=Path('target/release/orinfer'));p.add_argument('--output',type=Path,required=True)
     a=p.parse_args();print(json.dumps(publish(a.model,a.destination,a.engine,a.output),indent=2))

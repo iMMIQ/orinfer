@@ -54,11 +54,11 @@ def run(args):
             result = output / f'{mode}-result.json'
             spec.write_text(json.dumps(dict(model=str(model), tokenizer=str(model), result=str(result),
                                              fixture=str(fixture), cuda_graph=mode, repetitions=1, cases=fixture_cases()), indent=2))
-            env = dict(__import__('os').environ, ORIN_MTP_FIXTURE_SPEC=str(spec), ORIN_BATCH_FIXTURE=str(fixture))
+            env = dict(__import__('os').environ, ORINFER_MTP_FIXTURE_SPEC=str(spec), ORINFER_BATCH_FIXTURE=str(fixture))
             with (output/f'{mode}.log').open('w') as log:
-                subprocess.run(['cargo', 'test', '--locked', '--offline', '-p', 'orin-api', 'export_mtp_chat_fixture',
+                subprocess.run(['cargo', 'test', '--locked', '--offline', '-p', 'orinfer-api', 'export_mtp_chat_fixture',
                                 '--', '--ignored', '--test-threads=1'], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
-                subprocess.run(['cargo', 'test', '--release', '--locked', '--offline', '-p', 'orin-engine', 'validate_continuous_requests',
+                subprocess.run(['cargo', 'test', '--release', '--locked', '--offline', '-p', 'orinfer-engine', 'validate_continuous_requests',
                                 '--', '--ignored', '--nocapture', '--test-threads=1'], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
             report = json.loads(result.read_text())
             summaries.append(dict(mode=mode, result=str(result), cases=len(report['cases'])))

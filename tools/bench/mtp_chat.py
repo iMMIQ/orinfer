@@ -32,8 +32,8 @@ def events(response):
 def request(base_url, body, ids, tokenizer):
     payload = dict(body, stream=True, stream_options={'include_usage': True})
     headers = {'Content-Type': 'application/json'}
-    if os.getenv('ORIN_API_KEY'):
-        headers['Authorization'] = 'Bearer ' + os.environ['ORIN_API_KEY']
+    if os.getenv('ORINFER_API_KEY'):
+        headers['Authorization'] = 'Bearer ' + os.environ['ORINFER_API_KEY']
     req = urllib.request.Request(base_url + '/chat/completions',
         data=json.dumps(payload).encode(), headers=headers)
     start = time.perf_counter()

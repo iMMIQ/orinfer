@@ -21,30 +21,30 @@ flock 9
 python3 tools/bench/sample_machine.py --output "$output_dir/machine-before.json"
 printf '%s\n' "compile-and-test" > "$output_dir/phase.txt"
 sampler_pid=""
-container_name="orin-operator-$$"
+container_name="orinfer-operator-$$"
 extra_mounts=()
 group_args=()
 for group_id in $(id -G); do group_args+=(--group-add "$group_id"); done
-if [[ -n "${ORIN_CHECKPOINT_DIR:-}" ]]; then
-    checkpoint_dir="$(realpath -- "$ORIN_CHECKPOINT_DIR")"
+if [[ -n "${ORINFER_CHECKPOINT_DIR:-}" ]]; then
+    checkpoint_dir="$(realpath -- "$ORINFER_CHECKPOINT_DIR")"
     extra_mounts+=(-v "$checkpoint_dir:$checkpoint_dir:ro")
 fi
-entrypoint="${ORIN_COMPILER_PYTHON:-/usr/bin/python3}"
+entrypoint="${ORINFER_COMPILER_PYTHON:-/usr/bin/python3}"
 command_args=("$runner")
-if [[ -n "${ORIN_OPERATOR_SANITIZER:-}" ]]; then
+if [[ -n "${ORINFER_OPERATOR_SANITIZER:-}" ]]; then
     entrypoint="/usr/local/cuda/bin/compute-sanitizer"
-    command_args=(--tool "$ORIN_OPERATOR_SANITIZER" --error-exitcode 99)
-    if [[ -n "${ORIN_OPERATOR_SANITIZER_KERNEL_NAME:-}" ]]; then
+    command_args=(--tool "$ORINFER_OPERATOR_SANITIZER" --error-exitcode 99)
+    if [[ -n "${ORINFER_OPERATOR_SANITIZER_KERNEL_NAME:-}" ]]; then
         # Compute Sanitizer accepts an explicit kernel filter as one argument;
         # never interpret it as shell flags. Preserve the inspection scope.
-        command_args+=(--kernel-name "$ORIN_OPERATOR_SANITIZER_KERNEL_NAME")
+        command_args+=(--kernel-name "$ORINFER_OPERATOR_SANITIZER_KERNEL_NAME")
     fi
     command_args+=(python3 "$runner")
     printf '%q ' "${command_args[@]}" > "$output_dir/sanitizer-command.txt"
     printf '\n' >> "$output_dir/sanitizer-command.txt"
 fi
-if [[ -n "${ORIN_OPERATOR_NCU:-}" ]]; then
-    if [[ -n "${ORIN_OPERATOR_SANITIZER:-}" ]]; then
+if [[ -n "${ORINFER_OPERATOR_NCU:-}" ]]; then
+    if [[ -n "${ORINFER_OPERATOR_SANITIZER:-}" ]]; then
         echo 'Cannot combine Nsight Compute and Compute Sanitizer' >&2
         exit 2
     fi
@@ -52,7 +52,7 @@ if [[ -n "${ORIN_OPERATOR_NCU:-}" ]]; then
     # Keep clocks and caches untouched. Explicit candidate symbols prevent
     # accidentally profiling a same-run reference instead of the candidate.
     command_args=(--clock-control none --cache-control none --set detailed
-        --kernel-name-base function --kernel-name "${ORIN_OPERATOR_NCU_KERNEL_NAME:-regex:^kernel_kernel$}"
+        --kernel-name-base function --kernel-name "${ORINFER_OPERATOR_NCU_KERNEL_NAME:-regex:^kernel_kernel$}"
         --launch-count 1 --export "$output_dir/ncu" python3 "$runner")
     printf '%q ' "${command_args[@]}" > "$output_dir/ncu-command.txt"
     printf '\n' >> "$output_dir/ncu-command.txt"
@@ -71,10 +71,10 @@ docker run --rm --name "$container_name" --runtime nvidia --network none \
     --user "$(id -u):$(id -g)" "${group_args[@]}" \
     --entrypoint "$entrypoint" --shm-size 2g -v "$repo_dir:$repo_dir" -v "$output_dir:$output_dir" \
     "${extra_mounts[@]}" -w "$repo_dir" -e OMP_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
-    -e PYTHONPATH="$repo_dir:$repo_dir/tools/operators:${ORIN_COMPILER_SITE_PACKAGES:-/opt/venv/lib/python3.10/site-packages}" \
+    -e PYTHONPATH="$repo_dir:$repo_dir/tools/operators:${ORINFER_COMPILER_SITE_PACKAGES:-/opt/venv/lib/python3.10/site-packages}" \
     -e TORCH_EXTENSIONS_DIR="$output_dir/cache/torch" -e XDG_CACHE_HOME="$output_dir/cache" \
     -e PYTHONDONTWRITEBYTECODE=1 \
-    -e ORIN_OPERATOR_OUTPUT="$output_dir" -e TILELANG_CACHE_DIR="$output_dir/cache" \
+    -e ORINFER_OPERATOR_OUTPUT="$output_dir" -e TILELANG_CACHE_DIR="$output_dir/cache" \
     -e LD_PRELOAD=/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1 \
-    "${ORIN_OPERATOR_IMAGE:-orin-llm-compiler:0.1.1}" "${command_args[@]}" \
+    "${ORINFER_OPERATOR_IMAGE:-orinfer-compiler:0.1.1}" "${command_args[@]}" \
     --output "$output_dir" "$@" 2>&1 | tee "$output_dir/run.log"

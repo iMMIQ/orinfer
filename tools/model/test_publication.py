@@ -31,7 +31,7 @@ class PublicationTests(unittest.TestCase):
         self.data = dict(operator_package=digest, metadata={})
         (self.source / 'cache/model.json').write_text(json.dumps(self.data))
         self.addCleanup(patch.stopall)
-        patch.dict(os.environ, ORIN_OPERATOR_CACHE=str(self.root / 'cache')).start()
+        patch.dict(os.environ, ORINFER_OPERATOR_CACHE=str(self.root / 'cache')).start()
 
     @patch('tools.model.publication.subprocess.run')
     def test_validation_precedes_publication_and_metadata_does_not_alias(self, validate):

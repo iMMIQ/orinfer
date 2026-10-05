@@ -237,7 +237,7 @@ def main():
     parser.add_argument('--destination', type=Path, required=True)
     parser.add_argument('--max-context', type=int, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--engine', type=Path, default=Path('target/release/orin-llm'))
+    parser.add_argument('--engine', type=Path, default=Path('target/release/orinfer'))
     parser.add_argument('--max-prefill-tokens', type=int)
     args = parser.parse_args()
     resize(args.model, args.destination, args.max_context, args.output, args.engine, args.max_prefill_tokens)

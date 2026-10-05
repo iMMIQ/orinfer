@@ -1227,7 +1227,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
-name = "orin-api"
+name = "orinfer-api"
 version = "0.1.1"
 dependencies = [
  "axum",
@@ -1236,7 +1236,7 @@ dependencies = [
  "image",
  "libc",
  "minijinja",
- "orin-engine",
+ "orinfer-engine",
  "reqwest",
  "serde",
  "serde_json",
@@ -1245,16 +1245,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "orin-cli"
+name = "orinfer-cli"
 version = "0.1.1"
 dependencies = [
- "orin-api",
- "orin-engine",
+ "orinfer-api",
+ "orinfer-engine",
  "serde_json",
 ]
 
 [[package]]
-name = "orin-engine"
+name = "orinfer-engine"
 version = "0.1.1"
 dependencies = [
  "half",

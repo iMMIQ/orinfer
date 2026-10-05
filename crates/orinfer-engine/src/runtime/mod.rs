@@ -137,7 +137,7 @@ mod tests {
             target_tokens: Vec<u32>,
             output: std::path::PathBuf,
         }
-        let path = std::env::var("ORIN_VISION_PROBE").expect("ORIN_VISION_PROBE");
+        let path = std::env::var("ORINFER_VISION_PROBE").expect("ORINFER_VISION_PROBE");
         let probe: Probe = crate::model::read(std::path::Path::new(&path)).unwrap();
         let mut model = crate::runtime::ModelRuntime::load(&probe.model).unwrap();
         let options = crate::sampling::Options {

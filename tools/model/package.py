@@ -191,7 +191,7 @@ def publish(directory, engine=None):
                buffer_scopes={b['name']: scope(b, model) for b in model['buffers']},
                frontend_assets={name: file_hash(directory / name) for name in
                                 ('tokenizer.json', 'chat_template.jinja', 'generation_config.json')}, metadata=metadata))
-    validate_plan(directory, model, binding_map, engine or repo / 'target/release/orin-llm')
+    validate_plan(directory, model, binding_map, engine or repo / 'target/release/orinfer')
     (cache / 'manifest.json').unlink()
     return {'operator_package': digest, 'kernel_bindings': len(bindings), 'binding_map': binding_map}
 

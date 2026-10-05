@@ -11,8 +11,8 @@ from pathlib import Path
 
 def request(base, path, payload=None):
     headers = {"Content-Type": "application/json"}
-    if os.environ.get("ORIN_API_KEY"):
-        headers["Authorization"] = "Bearer " + os.environ["ORIN_API_KEY"]
+    if os.environ.get("ORINFER_API_KEY"):
+        headers["Authorization"] = "Bearer " + os.environ["ORINFER_API_KEY"]
     encoded = None if payload is None else json.dumps(payload).encode()
     return urllib.request.urlopen(
         urllib.request.Request(base + path, data=encoded, headers=headers), timeout=180

@@ -30,7 +30,7 @@ def main():
     ]
     results=[]
     headers={'Content-Type':'application/json'}
-    if os.getenv('ORIN_API_KEY'):headers['Authorization']='Bearer '+os.environ['ORIN_API_KEY']
+    if os.getenv('ORINFER_API_KEY'):headers['Authorization']='Bearer '+os.environ['ORINFER_API_KEY']
     for name,content,expected,stream in cases:
         body={'model':a.model,'messages':[{'role':'user','content':content}],'temperature':0,'seed':20261002,'max_tokens':32,'stream':stream}
         if stream:body['stream_options']={'include_usage':True}

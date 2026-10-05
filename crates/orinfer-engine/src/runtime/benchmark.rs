@@ -216,7 +216,7 @@ impl ModelRuntime {
                 r.id, r.prefill_tps, r.decode_tps
             );
             reports.push(r);
-            if let Ok(path) = std::env::var("ORIN_MODEL_PROGRESS") {
+            if let Ok(path) = std::env::var("ORINFER_MODEL_PROGRESS") {
                 let temporary = format!("{path}.tmp");
                 fs::write(
                     &temporary,

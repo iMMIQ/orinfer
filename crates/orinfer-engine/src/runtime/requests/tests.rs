@@ -50,8 +50,10 @@ fn benchmark_prefill_scheduling() {
         repetitions: usize,
         output_tokens: usize,
     }
-    let spec: SchedulingFixture =
-        crate::model::read(&PathBuf::from(std::env::var("ORIN_BATCH_FIXTURE").unwrap())).unwrap();
+    let spec: SchedulingFixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
     let fixture = spec.fixture;
     assert!(!fixture.output.exists());
     assert!(spec.repetitions > 0 && spec.output_tokens > 1);
@@ -171,8 +173,10 @@ fn benchmark_prefill_scheduling() {
 #[test]
 #[ignore = "Requires real MTP batch model and exclusive GPU experiment lock"]
 fn validate_mtp_partial_prefix() {
-    let fixture: Fixture =
-        crate::model::read(&PathBuf::from(std::env::var("ORIN_BATCH_FIXTURE").unwrap())).unwrap();
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
     assert!(!fixture.output.exists());
     let mut model = ModelRuntime::load_with_options(
         &fixture.model,
@@ -298,8 +302,10 @@ fn validate_mtp_partial_prefix() {
 #[test]
 #[ignore = "Requires real joint prefill package and exclusive GPU experiment lock"]
 fn validate_joint_prefill_requests() {
-    let fixture: Fixture =
-        crate::model::read(&PathBuf::from(std::env::var("ORIN_BATCH_FIXTURE").unwrap())).unwrap();
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
     assert!(!fixture.output.exists());
     let mut model = ModelRuntime::load_with_options(
         &fixture.model,
@@ -472,8 +478,10 @@ fn validate_joint_prefill_requests() {
 #[test]
 #[ignore = "Requires real batch model and exclusive GPU experiment lock"]
 fn validate_continuous_requests() {
-    let fixture: Fixture =
-        crate::model::read(&PathBuf::from(std::env::var("ORIN_BATCH_FIXTURE").unwrap())).unwrap();
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
     assert!(!fixture.output.exists());
     let mut model = ModelRuntime::load_with_options(
         &fixture.model,

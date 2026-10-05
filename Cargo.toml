@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/orin-engine", "crates/orin-cli", "crates/orin-api"]
+members = ["crates/orinfer-engine", "crates/orinfer-cli", "crates/orinfer-api"]
 resolver = "3"
 
 [workspace.package]
@@ -10,7 +10,7 @@ publish = false
 license = "LGPL-3.0-or-later"
 
 [workspace.dependencies]
-orin-engine = { path = "crates/orin-engine" }
+orinfer-engine = { path = "crates/orinfer-engine" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
