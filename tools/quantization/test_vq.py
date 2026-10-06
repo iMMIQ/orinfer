@@ -4,10 +4,29 @@ import unittest
 
 import numpy as np
 
-from tools.quantization.vq import Weights, e8p_decode, rotate, save, load
+from tools.quantization.vq import Weights, e8p_decode, e8p_sign_table, rotate, save, load
 
 
 class IntegerVQTests(unittest.TestCase):
+    def test_short_sign_table_matches_all_codes(self):
+        rng = np.random.default_rng(20261002)
+        table = (rng.integers(-63,64,(256,8))*2).astype(np.int8)
+        codes = np.arange(65536,dtype=np.uint16)
+        book = e8p_sign_table(table)
+        self.assertEqual(book.nbytes,8192)
+        parity = np.array([(int(c)&255).bit_count()%2 for c in codes],np.uint16)
+        adjusted = (codes&255)^parity
+        expected = e8p_decode(codes,table)
+        for half in (0,1):
+            positive = book[(codes >> 8)+parity*256,half*2]
+            negative = book[(codes >> 8)+parity*256,half*2+1]
+            bits = [0,4,1,5] if half == 0 else [2,6,3,7]
+            mask = sum(((adjusted >> bit)&1).astype(np.uint32)*np.uint32(255 << (8*lane))
+                       for lane,bit in enumerate(bits))
+            decoded = np.ascontiguousarray(positive^((positive^negative)&mask)).view(np.int8).reshape(-1,4)
+            np.testing.assert_array_equal(decoded,expected[:,half*4:half*4+4])
+        with self.assertRaises(ValueError):e8p_sign_table(np.ones((256,8),np.int8))
+
     def test_rotation_preserves_dot_and_is_invertible_with_fixed_signs(self):
         rng = np.random.default_rng(20261002)
         x = rng.normal(size=(5,256)).astype(np.float32)

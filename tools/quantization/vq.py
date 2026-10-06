@@ -43,6 +43,24 @@ def e8p_decode(codes, table):
     return (table[c >> 8].astype(np.int16)*(1-2*negative)+shift).astype(np.int8)
 
 
+def e8p_sign_table(table):
+    """8 KiB runtime table of +/- basis coordinates with both parity shifts.
+
+    This is an exact decoder table, not a weight representation. Columns are
+    the positive/negative uint32 words for the low/high halves of a vector.
+    """
+    if (table.dtype != np.int8 or table.shape != (256,8) or
+            (table.astype(np.int16)%2).any() or np.abs(table.astype(np.int16)).max() > 126):
+        raise ValueError('Expected an even signed INT8 E8P basis')
+    values = np.empty((512,8,2),np.int8)
+    for parity in (0,1):
+        shift = 1-2*parity
+        values[parity*256:(parity+1)*256,:,0] = table.astype(np.int16)+shift
+        values[parity*256:(parity+1)*256,:,1] = -table.astype(np.int16)+shift
+    return np.stack([np.ascontiguousarray(values[:,half*4:half*4+4,sign]).view('<u4').reshape(512)
+                     for half in range(2) for sign in range(2)],axis=-1)
+
+
 @dataclass(frozen=True)
 class Weights:
     kind: str

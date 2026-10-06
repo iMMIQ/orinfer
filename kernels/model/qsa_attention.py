@@ -37,6 +37,9 @@ def sparse_attention(m: int,capacity: int,splits: int = 8,packed: bool = False):
              Den:T.Tensor((m,24,splits),T.float32),Out:T.Tensor((m,24,splits,256),T.float32)):
         with T.Kernel(m,2,splits,threads=128) as (row,kh,split):
             if packed:T.import_source(PACKED_SOURCE)
+            selected_tile=T.alloc_shared((block,),T.int32)
+            key_scales=T.alloc_shared((block,4),T.float16)
+            value_scales=T.alloc_shared((block,4),T.float16)
             q=T.alloc_shared((16,256),T.float16)
             k=T.alloc_shared((block,256),T.float16);v=T.alloc_shared((block,256),T.float16)
             p=T.alloc_shared((16,block),T.float16)
@@ -52,6 +55,21 @@ def sparse_attention(m: int,capacity: int,splits: int = 8,packed: bool = False):
             length=T.min((Position[0]+row+1)//4,512)*4+(Position[0]+row+1)%4
             count=T.ceildiv(length,splits);start=split*count;end=T.min(start+count,length)
             for tile in T.serial(T.ceildiv(T.max(0,end-start),block)):
+                # Retire all readers before reusing metadata for another tile.
+                # Prefetch once instead of serializing each channel on the
+                # same global Selected/scale loads. The masked tail reads a
+                # valid allocated slot but stores -1, never an out-of-range ID.
+                T.sync_threads()
+                for j in T.Parallel(block):
+                    slot=start+tile*block+j
+                    selected_tile[j]=T.if_then_else(slot<end,Selected[row,T.min(slot,2050)],-1)
+                T.sync_threads()
+                for j,g in T.Parallel(block,4):
+                    token=selected_tile[j]
+                    key_scales[j,g]=0;value_scales[j,g]=0
+                    if token>=0 and token<=Position[0]+row:
+                        key_scales[j,g]=KS[token,kh,g];value_scales[j,g]=VS[token,kh,g]
+                T.sync_threads()
                 # Scalar signed loads avoid the aarch64 vector-cast lowering
                 # through plain char (which is unsigned on this platform).
                 if packed:
@@ -60,12 +78,12 @@ def sparse_attention(m: int,capacity: int,splits: int = 8,packed: bool = False):
                         k[j,pair*2]=0;k[j,pair*2+1]=0
                         v[j,pair*2]=0;v[j,pair*2+1]=0
                         if slot<end:
-                            token=Selected[row,slot]
+                            token=selected_tile[j]
                             if token>=0 and token<=Position[0]+row:
                                 kw=T.call_pure_extern('uint32','qsa_dequant_pair',K[token,kh,pair//2] >> ((pair%2)*16),
-                                    T.reinterpret(T.uint16,KS[token,kh,pair//32]))
+                                    T.reinterpret(T.uint16,key_scales[j,pair//32]))
                                 vw=T.call_pure_extern('uint32','qsa_dequant_pair',V[token,kh,pair//2] >> ((pair%2)*16),
-                                    T.reinterpret(T.uint16,VS[token,kh,pair//32]))
+                                    T.reinterpret(T.uint16,value_scales[j,pair//32]))
                                 k[j,pair*2]=T.reinterpret(T.float16,T.cast(kw&65535,T.uint16))
                                 k[j,pair*2+1]=T.reinterpret(T.float16,T.cast(kw>>16,T.uint16))
                                 v[j,pair*2]=T.reinterpret(T.float16,T.cast(vw&65535,T.uint16))
@@ -75,10 +93,10 @@ def sparse_attention(m: int,capacity: int,splits: int = 8,packed: bool = False):
                         slot=start+tile*block+j
                         k[j,d]=0;v[j,d]=0
                         if slot<end:
-                            token=Selected[row,slot]
+                            token=selected_tile[j]
                             if token>=0 and token<=Position[0]+row:
-                                k[j,d]=T.cast(K[token,kh,d],T.float32)*T.cast(KS[token,kh,d//64],T.float32)
-                                v[j,d]=T.cast(V[token,kh,d],T.float32)*T.cast(VS[token,kh,d//64],T.float32)
+                                k[j,d]=T.cast(K[token,kh,d],T.float32)*T.cast(key_scales[j,d//64],T.float32)
+                                v[j,d]=T.cast(V[token,kh,d],T.float32)*T.cast(value_scales[j,d//64],T.float32)
                 T.gemm(q,k,scores,transpose_B=True,clear_accum=True)
                 for i in T.Parallel(16):previous[i]=maximum[i]
                 for i,j in T.Parallel(16,block):

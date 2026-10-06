@@ -38,6 +38,7 @@ from tools.model.flash_lookup import RowCache
 from tools.model.flash_ple import PleLookup
 from tools.model.flash_roles import role
 from tools.model.flash_validation import validate_snapshot, probe, baseline_probes
+from tools.quantization.vq import e8p_sign_table
 from tools.operators.common import configure, environment, export_kernel, write_json
 
 
@@ -45,13 +46,15 @@ class Model:
     H, F, E, K, C, R, V = 2560, 640, 512, 10, 4, 320, 248320
 
     def __init__(self, source, capacity, output, *, use_graph=True, target=None,
-                 hc_fused=True, compact_gdn=True, direct_experts=False, fused_rotation=True):
+                 hc_fused=True, compact_gdn=True, direct_experts=False, fused_rotation=True,
+                 expert_shortbook=True):
         maximum = source.config['text_config']['max_position_embeddings']
         if type(capacity) is not int or not 1 <= capacity <= min(maximum,262144):
             raise ValueError('Context exceeds the checkpoint/native 262144 limit')
         self.source, self.capacity, self.output = source, capacity, output
         self.hc_fused,self.compact_gdn,self.direct_experts=hc_fused,compact_gdn,direct_experts
         self.fused_rotation=fused_rotation
+        self.expert_shortbook=expert_shortbook
         self.draft_vocab=None
         self.is_mtp=source.config['quantization_config'].get('component')=='mtp'
         if self.is_mtp:
@@ -142,6 +145,7 @@ class Model:
                                  ('q_layernorm.weight',(128,)),('k_layernorm.weight',(128,))]:
                 if prefix+suffix not in self.source.parts or self.source.shape(prefix+suffix)!=shape:
                     raise ValueError('Missing or mismatched native QSA indexer weight')
+        shortbooks = {}
         for original in sorted(self.source.parts):
             name = role(original)
             if name is None or name == 'token_embd.weight':continue
@@ -162,6 +166,11 @@ class Model:
                 book = torch.from_numpy(table.view('<u4').reshape(1,256,2).copy()).cuda()
                 self.weights[name] = {'packed':packed,'table':book,'scale':scales,
                                       'signs':torch.from_numpy(signs).cuda()}
+                if self.expert_shortbook:
+                    key = table.tobytes()
+                    if key not in shortbooks:
+                        shortbooks[key] = torch.from_numpy(e8p_sign_table(table)[None,...]).cuda()
+                    self.weights[name]['short_table'] = shortbooks[key]
                 if name.endswith('ffn_down_exps.weight'):print('loaded expert layer',name.split('.')[1],flush=True)
                 continue
             if kind == 'int8-row':
@@ -416,6 +425,13 @@ class Model:
             projection('router',mixed,prefix+'ffn_gate_inp.weight',logits)
             call(f'router-{m}',lambda:router_topk(m,e,k),logits,ids,prob)
             direct=self.direct_experts and m==1
+            # Real M4/M8 routing benefits from the exact 8 KiB decoder and
+            # wider output tiles. Keep large prefill and other tails on their
+            # existing geometry until separately measured.
+            shortbook=self.expert_shortbook and m in (4,8)
+            book_key='short_table' if shortbook else 'table'
+            expert_bn=128 if shortbook else 64
+            expert_stages=1 if shortbook else 2
             if not direct:
                 call(f'histogram-{m}',lambda:expert_histogram(m,e,k),ids,counts,relative)
                 call('offsets',lambda:expert_offsets(e),counts,offsets,tile_offsets,tile_count)
@@ -433,8 +449,9 @@ class Model:
                      aq.view(torch.int32),gate_weight['packed'],gate_weight['table'],gate_weight['scale'],sa.view(-1),ids,gu)
             else:
                 call(f'dispatch-{m}',lambda:expert_dispatch(m,h,e,k,scale_group=h),aq,sa,ids,relative,offsets,dispatch,ds,slot_map)
-                call(f'expert-gu-{m}',lambda:integer_vq_grouped(assignments,e,tiles,2*f,h,kind='e8p',shared_table=True),
-                     dispatch,gate_weight['packed'],gate_weight['table'],patch,gate_weight['scale'],ds.view(-1),
+                call(f'expert-gu-{m}',lambda:integer_vq_grouped(assignments,e,tiles,2*f,h,kind='e8p',shared_table=True,
+                     block_n=expert_bn,shortbook=shortbook,num_stages=expert_stages),
+                     dispatch,gate_weight['packed'],gate_weight[book_key],patch,gate_weight['scale'],ds.view(-1),
                      counts,offsets,tile_expert,tile_row,tile_count,gu)
             if self.fused_rotation:
                 call(f'rotate-a8-ffn-{m}',lambda:rotate_activation_a8(assignments,f,swiglu=True),gu,down_weight['signs'],fq,fs)
@@ -445,8 +462,9 @@ class Model:
                 call('expert-down-direct',lambda:integer_e8p_gemv(e,k,h,f,shared_input=False),
                      fq.view(torch.int32),down_weight['packed'],down_weight['table'],down_weight['scale'],fs.view(-1),ids,expert_out)
             else:
-                call(f'expert-down-{m}',lambda:integer_vq_grouped(assignments,e,tiles,h,f,kind='e8p',shared_table=True),
-                     fq,down_weight['packed'],down_weight['table'],patch,down_weight['scale'],fs.view(-1),
+                call(f'expert-down-{m}',lambda:integer_vq_grouped(assignments,e,tiles,h,f,kind='e8p',shared_table=True,
+                     block_n=expert_bn,shortbook=shortbook,num_stages=expert_stages),
+                     fq,down_weight['packed'],down_weight[book_key],patch,down_weight['scale'],fs.view(-1),
                      counts,offsets,tile_expert,tile_row,tile_count,expert_out)
             shared_a8=quantize(mixed)
             projection('shared-gate',mixed,prefix+'ffn_gate_shexp.weight',shared_gate,a8=shared_a8)

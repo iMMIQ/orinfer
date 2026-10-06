@@ -6,7 +6,7 @@ import subprocess
 import numpy as np
 import torch
 
-from tools.quantization.vq import Weights, rotate
+from tools.quantization.vq import Weights, rotate, e8p_sign_table
 from tools.quantization.q2i8_ffn import swiglu
 from tools.operators.q2i8 import upload, reference
 from tools.operators.common import configure, benchmark, error, environment, export_kernel, write_json
@@ -65,6 +65,26 @@ def main():
             (folder/'kernel.sass').write_text(sass)
             report['cases'].append({'kind':kind,'rows':m,'patched':patched,'shared_table':shared_table,'integer_oracle_equal':True,'tail_guard':True,
                                     'changed_activation_and_table_graph':True,'native_int8_mma':True,'timing':timing,'export':exported})
+            if kind == 'e8p':
+                tables = bank[:1] if shared_table else bank
+                short = torch.from_numpy(np.stack([e8p_sign_table(w.table) for w in tables])).cuda()
+                fast = integer_vq(e,m,n,k,kind=kind,patched=patched,shared_table=shared_table,
+                                  shortbook=True,block_n=128,num_stages=1)
+                def run_short():fast(x.view(e*m,k),pp,short,patch,ws,sa.view(-1),out[:e*m])
+                short_timing,short_graph = benchmark(run_short,repetitions=4)
+                assert torch.equal(out[:e*m],expected),error(out[:e*m],expected)
+                assert bool((out[-1] == 91).all())
+                # Keep addresses stable while changing both input and decoded
+                # basis. Zero basis still decodes the E8P parity shifts.
+                zero = [Weights(w.kind,w.indices,np.zeros_like(w.table),w.scales,w.signs,w.patches) for w in bank]
+                short.copy_(torch.from_numpy(np.stack([e8p_sign_table(w.table) for w in (zero[:1] if shared_table else zero)])).cuda())
+                x.neg_();short_graph.replay();torch.cuda.synchronize()
+                changed = torch.from_numpy(np.stack([w.integer_weights() for w in zero])).cuda()
+                assert torch.equal(out[:e*m],reference(x,changed,ws,sa).view(e*m,n))
+                x.copy_(original_x)
+                report['cases'].append({'kind':'e8p-short','rows':m,'patched':patched,'shared_table':shared_table,
+                                        'integer_oracle_equal':True,'tail_guard':True,'changed_activation_and_table_graph':True,
+                                        'timing':short_timing,'export':export_kernel(fast,folder/'short')})
             write_json(a.output/'results.json',report)
     for fused in (False,True):
         m,k = 3,256

@@ -13,7 +13,7 @@ from safetensors import safe_open
 
 from tools.model.flash_weights import header
 from tools.model.safetensors_source import relative_name, SIZES
-from tools.quantization.embedding_vq import decode as decode_embedding
+from tools.quantization.embedding_vq import EmbeddingDecoder
 from tools.quantization.flash_next import digest
 
 
@@ -24,6 +24,7 @@ DTYPES = {'F16':'<f2','F32':'<f4','F64':'<f8','I8':'i1','U8':'u1','I16':'<i2','U
 class Checkpoint:
     def __init__(self, directory, *, verify_hashes=True):
         self.directory = Path(directory)
+        self.embedding_decoder = EmbeddingDecoder()
         self.config = json.loads((self.directory/'config.json').read_text())
         if self.config.get('quantization_config',{}).get('quant_method') != 'orinfer_e8p_int8':
             raise ValueError('Our Flash Next quantization config is required')
@@ -92,8 +93,8 @@ class Checkpoint:
                         value = f.get_slice(keys['weight'])[first:last].astype(np.float32)
                         value *= f.get_slice(keys['scale'])[first:last].astype(np.float32)[:,None]
                     elif kind == 'e8p-embedding':
-                        value = decode_embedding(f.get_slice(keys['rows'])[first:last],
-                                                 f.get_tensor(keys['table']),f.get_tensor(keys['signs']))
+                        value = self.embedding_decoder.decode(f.get_slice(keys['rows'])[first:last],
+                                                              f.get_tensor(keys['table']),f.get_tensor(keys['signs']))
                     else:raise ValueError('Unsupported quantized row kind')
             result.append(value)
         return np.concatenate(result,axis=0)

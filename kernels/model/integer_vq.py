@@ -25,17 +25,26 @@ __device__ __forceinline__ unsigned int integer_e8p_quad(unsigned int code, unsi
     unsigned int minus = (((oriented & 0x7f7f7f7fu) | 0x80808080u) - 0x01010101u) ^ (~oriented & 0x80808080u);
     return parity ? minus : plus;
 }
+__device__ __forceinline__ unsigned int integer_e8p_parity(unsigned int code) { return __popc(code & 255u) & 1u; }
+__device__ __forceinline__ unsigned int integer_e8p_sign_quad(unsigned int code, unsigned int parity, unsigned int positive, unsigned int negative, unsigned int half) {
+    unsigned int s = ((code & 255u) ^ parity) >> (half * 2u);
+    unsigned int flags = (s & 1u) | ((s & 16u) << 4u) | ((s & 2u) << 15u) | ((s & 32u) << 19u);
+    unsigned int mask = flags * 255u;
+    return positive ^ ((positive ^ negative) & mask);
+}
 '''
 
 
 @orin_jit
-def _compile(rows,E,N,K,kind,shared_table,grouped,tiles,M,BN,patched):
+def _compile(rows,E,N,K,kind,shared_table,grouped,tiles,M,BN,patched,shortbook,num_stages):
     if kind not in ('vq4','e8p') or any(type(x) is not int or x <= 0 for x in (rows,E,N,K,tiles)) or K%128 or K*128*128 > 2**31-1:
         raise ValueError('Invalid integer VQ geometry')
     if BN not in (64,128):raise ValueError('Invalid VQ output tile')
+    if num_stages not in (1,2) or shortbook and kind != 'e8p':raise ValueError('Invalid VQ decoder/pipeline')
     D = 4 if kind == 'vq4' else 8
     PD = T.uint8 if D == 4 else T.uint16
     TE = 1 if shared_table else E
+    entries,words = (512,4) if shortbook else (256,D//4)
     BM,G = 16,128
 
     @T.macro
@@ -44,13 +53,13 @@ def _compile(rows,E,N,K,kind,shared_table,grouped,tiles,M,BN,patched):
         a = T.alloc_shared((BM,G),T.int8)
         b = T.alloc_shared((BN,G),T.int8)
         packed = T.alloc_shared((BN,G//D),PD)
-        table = T.alloc_shared((256,D//4),T.uint32)
+        table = T.alloc_shared((entries,words),T.uint32)
         patch = T.alloc_shared((BN,),T.uint16)
         decoded = T.alloc_fragment((BN,G//4),T.uint32)
         acc = T.alloc_fragment((BM,BN),T.int32)
         T.copy(Book[0 if shared_table else expert,0,0],table)
         T.clear(acc)
-        for kg in T.Pipelined(K//G,num_stages=2):
+        for kg in T.Pipelined(K//G,num_stages=num_stages):
             for m,k in T.Parallel(BM,G):
                 a[m,k] = 0
                 if m < count:a[m,k] = A[offset+m,kg*G+k]
@@ -69,8 +78,15 @@ def _compile(rows,E,N,K,kind,shared_table,grouped,tiles,M,BN,patched):
                     decoded[n,q] = table[T.cast(packed[n,q],T.int32),0]
                 else:
                     code = T.cast(packed[n,q//2],T.uint32)
-                    word = table[T.cast(code >> 8,T.int32),q%2]
-                    decoded[n,q] = T.call_pure_extern('uint32','integer_e8p_quad',code,word,T.cast(q%2,T.uint32))
+                    if shortbook:
+                        parity = T.call_pure_extern('uint32','integer_e8p_parity',code)
+                        index = T.cast((code >> 8)+parity*256,T.int32)
+                        positive = table[index,(q%2)*2]
+                        negative = table[index,(q%2)*2+1]
+                        decoded[n,q] = T.call_pure_extern('uint32','integer_e8p_sign_quad',code,parity,positive,negative,T.cast(q%2,T.uint32))
+                    else:
+                        word = table[T.cast(code >> 8,T.int32),q%2]
+                        decoded[n,q] = T.call_pure_extern('uint32','integer_e8p_quad',code,word,T.cast(q%2,T.uint32))
                 if patched:
                     shift = T.cast((patch[n]&3)*8,T.uint32)
                     replacement = (decoded[n,q] & ~(T.uint32(255) << shift)) | (T.cast((patch[n] >> 7)&255,T.uint32) << shift)
@@ -84,14 +100,14 @@ def _compile(rows,E,N,K,kind,shared_table,grouped,tiles,M,BN,patched):
 
     @T.prim_func
     def direct(A:T.Tensor((rows,K),T.int8),P:T.Tensor((E,K//G,N,G//D),PD),
-               Book:T.Tensor((TE,256,D//4),T.uint32),Patch:T.Tensor((E,K//G,N) if patched else (1,),T.uint16),WS:T.Tensor((E,N),T.float16),
+               Book:T.Tensor((TE,entries,words),T.uint32),Patch:T.Tensor((E,K//G,N) if patched else (1,),T.uint16),WS:T.Tensor((E,N),T.float16),
                AS:T.Tensor((rows,),T.float16),C:T.Tensor((rows,N),T.float16)):
         with T.Kernel(T.ceildiv(M,BM),T.ceildiv(N,BN),E,threads=128) as (by,bx,e):
             project(A,P,Book,Patch,WS,AS,C,e,e*M+by*BM,T.min(BM,M-by*BM),bx)
 
     @T.prim_func
     def routed(A:T.Tensor((rows,K),T.int8),P:T.Tensor((E,K//G,N,G//D),PD),
-               Book:T.Tensor((TE,256,D//4),T.uint32),Patch:T.Tensor((E,K//G,N) if patched else (1,),T.uint16),WS:T.Tensor((E,N),T.float16),AS:T.Tensor((rows,),T.float16),
+               Book:T.Tensor((TE,entries,words),T.uint32),Patch:T.Tensor((E,K//G,N) if patched else (1,),T.uint16),WS:T.Tensor((E,N),T.float16),AS:T.Tensor((rows,),T.float16),
                Counts:T.Tensor((E,),T.int32),Offsets:T.Tensor((E,),T.int32),
                TileExpert:T.Tensor((tiles,),T.int32),TileRow:T.Tensor((tiles,),T.int32),TileCount:T.Tensor((1,),T.int32),
                C:T.Tensor((rows,N),T.float16)):
@@ -104,12 +120,12 @@ def _compile(rows,E,N,K,kind,shared_table,grouped,tiles,M,BN,patched):
     return routed if grouped else direct
 
 
-def integer_vq(E,M,N,K,*,kind,shared_table=False,block_n=64,patched=False):
-    return _compile(E*M,E,N,K,kind,shared_table,False,1,M,block_n,patched)
+def integer_vq(E,M,N,K,*,kind,shared_table=False,block_n=64,patched=False,shortbook=False,num_stages=2):
+    return _compile(E*M,E,N,K,kind,shared_table,False,1,M,block_n,patched,shortbook,num_stages)
 
 
-def integer_vq_grouped(rows,E,tiles,N,K,*,kind,shared_table=False,block_n=64,patched=False):
-    return _compile(rows,E,N,K,kind,shared_table,True,tiles,1,block_n,patched)
+def integer_vq_grouped(rows,E,tiles,N,K,*,kind,shared_table=False,block_n=64,patched=False,shortbook=False,num_stages=2):
+    return _compile(rows,E,N,K,kind,shared_table,True,tiles,1,block_n,patched,shortbook,num_stages)
 
 
 @orin_jit
