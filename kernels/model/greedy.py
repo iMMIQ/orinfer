@@ -6,16 +6,16 @@ from tools.operators.common import orin_jit
 
 
 @orin_jit
-def greedy_partials(vocab: int):
-    if type(vocab) is not int or vocab < 1:
+def greedy_partials(vocab: int, rows: int = 1):
+    if type(vocab) is not int or vocab < 1 or type(rows) is not int or rows < 1:
         raise ValueError('Positive vocabulary required')
     blocks = (vocab + 1023) // 1024
     @T.prim_func
-    def main(Logits: T.Tensor((1, vocab), T.float32),
-             Values: T.Tensor((blocks,), T.float32),
-             Indices: T.Tensor((blocks,), T.int32),
-             Invalid: T.Tensor((blocks,), T.int32)):
-        with T.Kernel(blocks, threads=256) as block:
+    def main(Logits: T.Tensor((rows, vocab), T.float32),
+             Values: T.Tensor((rows*blocks,), T.float32),
+             Indices: T.Tensor((rows*blocks,), T.int32),
+             Invalid: T.Tensor((rows*blocks,), T.int32)):
+        with T.Kernel(blocks, rows, threads=256) as (block,row):
             values = T.alloc_fragment((1024,), T.float32)
             indices = T.alloc_fragment((1024,), T.int32)
             invalid = T.alloc_fragment((1024,), T.int32)
@@ -33,7 +33,7 @@ def greedy_partials(vocab: int):
                 values[i] = -T.infinity(T.float32)
                 invalid[i] = 0
                 if block * 1024 + i < vocab:
-                    values[i] = Logits[0, block * 1024 + i]
+                    values[i] = Logits[row, block * 1024 + i]
                     invalid[i] = T.cast(not T.call_pure_extern('bool', 'isfinite', values[i]), T.int32)
             T.reduce_max(values, maximum, dim=0)
             T.reduce_max(invalid, bad, dim=0)
@@ -43,25 +43,25 @@ def greedy_partials(vocab: int):
                     indices[i] = block * 1024 + i
             T.reduce_min(indices, minimum, dim=0)
             if T.get_thread_binding() == 0:
-                Values[block] = maximum[0]
-                Indices[block] = minimum[0]
-                Invalid[block] = bad[0]
+                Values[row*blocks+block] = maximum[0]
+                Indices[row*blocks+block] = minimum[0]
+                Invalid[row*blocks+block] = bad[0]
     return main
 
 
 @orin_jit
-def greedy_merge(vocab: int):
-    if type(vocab) is not int or vocab < 1:
+def greedy_merge(vocab: int, rows: int = 1):
+    if type(vocab) is not int or vocab < 1 or type(rows) is not int or rows < 1:
         raise ValueError('Positive vocabulary required')
     blocks = (vocab + 1023) // 1024
     width = max(32,1 << (blocks - 1).bit_length())
     threads=min(256,width)
     @T.prim_func
-    def main(Values: T.Tensor((blocks,), T.float32),
-             Indices: T.Tensor((blocks,), T.int32),
-             Invalid: T.Tensor((blocks,), T.int32),
-             Output: T.Tensor((2,), T.int32)):
-        with T.Kernel(1, threads=threads):
+    def main(Values: T.Tensor((rows*blocks,), T.float32),
+             Indices: T.Tensor((rows*blocks,), T.int32),
+             Invalid: T.Tensor((rows*blocks,), T.int32),
+             Output: T.Tensor((rows*2,), T.int32)):
+        with T.Kernel(rows, threads=threads) as row:
             values = T.alloc_fragment((width,), T.float32)
             indices = T.alloc_fragment((width,), T.int32)
             invalid = T.alloc_fragment((width,), T.int32)
@@ -79,16 +79,16 @@ def greedy_merge(vocab: int):
                 values[i] = -T.infinity(T.float32)
                 invalid[i] = 0
                 if i < blocks:
-                    values[i] = Values[i]
-                    invalid[i] = Invalid[i]
+                    values[i] = Values[row*blocks+i]
+                    invalid[i] = Invalid[row*blocks+i]
             T.reduce_max(values, maximum, dim=0)
             T.reduce_max(invalid, bad, dim=0)
             for i in T.Parallel(width):
                 indices[i] = 2147483647
                 if i < blocks and values[i] == maximum[0]:
-                    indices[i] = Indices[i]
+                    indices[i] = Indices[row*blocks+i]
             T.reduce_min(indices, minimum, dim=0)
             if T.get_thread_binding() == 0:
-                Output[0] = minimum[0]
-                Output[1] = bad[0]
+                Output[row*2] = minimum[0]
+                Output[row*2+1] = bad[0]
     return main

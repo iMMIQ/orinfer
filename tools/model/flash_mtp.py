@@ -1,0 +1,108 @@
+"""Native Flash Next greedy MTP with complete target-prefix commit and restore.
+
+All GPU math is TileLang. The draft shares the target embedding cache and
+output weights, keeps its own INT8 KV/index, and never controls target tokens.
+This is the offline Flash recipe; online Rust serving remains separate.
+"""
+import torch
+
+from tools.model.flash_chunks import chunks
+from tools.model.flash_speculation import DEFAULT_DRAFTS,greedy_commit,clip_outputs,verification_size
+from tools.model.flash_validation import validate_snapshot
+
+
+class Session:
+    def __init__(self, target, draft):
+        if target.is_mtp or not draft.is_mtp or target.capacity!=draft.capacity:
+            raise ValueError('Expected matching target and MTP runtimes')
+        self.target,self.draft=target,draft
+        self.pending=None;self.draft_token=None;self.hidden=None
+        self.statistics={}
+
+    def prefill(self, tokens, chunk=128):
+        if not tokens or len(tokens)>=self.target.capacity:raise ValueError('Prompt must leave output context')
+        self.target.reset();self.draft.reset()
+        cursor=0
+        for batch in chunks(tokens,chunk):
+            end=cursor+len(batch)
+            token=self.target.execute(batch,output='token' if end==len(tokens) else 'none')
+            shifted=list(tokens[cursor+1:end+1])
+            if end==len(tokens):shifted.append(token)
+            prediction=self.draft.execute(shifted,hidden=self.target.last_plan['residual'],
+                                          output='token' if end==len(tokens) else 'none')
+            cursor=end
+        self.pending=token;self.draft_token=prediction
+        self.hidden=self.draft.last_plan['residual'][-1:].clone()
+        self.statistics={'rounds':0,'proposed':0,'accepted':0,'fallback_steps':0}
+        return token
+
+    def generate(self, budget, eos, *, drafts=DEFAULT_DRAFTS, override=None):
+        """Emit a target token, then verified rounds. override is validation-only."""
+        verification_size(drafts,budget,max(1,self.target.capacity-self.target.position))
+        if budget>self.target.capacity-self.target.position+1:raise ValueError('Generation exceeds context capacity')
+        if self.pending is None or self.target.position!=self.draft.position:raise ValueError('Prefill or restore a complete MTP session first')
+        generated,reason=clip_outputs([self.pending],eos,budget)
+        if reason is not None:return generated,reason
+        while len(generated)<budget:
+            size=verification_size(drafts,budget-len(generated),self.target.capacity-self.target.position)
+            if size==1:
+                self.pending=self.target.execute([self.pending],output='token')
+                self.draft_token=self.draft.execute([self.pending],hidden=self.target.last_plan['residual'][-1:],output='token')
+                self.hidden=self.draft.last_plan['residual'][-1:].clone()
+                self.statistics['fallback_steps']+=1
+                values,reason=clip_outputs([self.pending],eos,budget-len(generated))
+                generated.extend(values)
+                if reason is not None:break
+                continue
+            start=self.target.position
+            pending_state=self.draft.states['48:pending'].clone()
+            proposals=[self.draft_token]
+            if override is not None:proposals[0]=int(override(self.statistics['rounds'],0,proposals[0]))
+            hidden=self.hidden
+            for index in range(1,size-1):
+                value=self.draft.execute([proposals[-1]],hidden=hidden,output='token')
+                hidden=self.draft.last_plan['residual'][-1:]
+                if override is not None:value=int(override(self.statistics['rounds'],index,value))
+                proposals.append(value)
+            predictions=self.target.execute([self.pending]+proposals,output='verify')
+            committed=greedy_commit(proposals,predictions)
+            values,reason=clip_outputs(committed,eos,budget-len(generated))
+            self.target.commit(len(values))
+            # The first draft slot already used the true target condition.
+            # Discard only future proposal slots and recompute them with true HC.
+            self.draft.position=start;self.draft.position_gpu.fill_(start)
+            self.draft.states['48:pending'].copy_(pending_state)
+            self.draft_token=self.draft.execute(values,hidden=self.target.last_plan['residual'][:len(values)],output='token')
+            self.hidden=self.draft.last_plan['residual'][-1:].clone()
+            self.pending=values[-1]
+            self.statistics['rounds']+=1;self.statistics['proposed']+=len(proposals)
+            self.statistics['accepted']+=min(len(committed)-1,len(values))
+            generated.extend(values)
+            if self.target.position!=self.draft.position:raise ValueError('MTP cursor diverged')
+            if reason is not None:break
+        return generated,reason or 'length'
+
+    def snapshot(self, *, cpu=False):
+        if self.hidden is None or self.target.position!=self.draft.position:raise ValueError('No complete session')
+        return {'target':self.target.snapshot(cpu=cpu),'draft':self.draft.snapshot(cpu=cpu),
+                'hidden':self.hidden.to(device='cpu',copy=True) if cpu else self.hidden.clone(),
+                'pending':self.pending,'draft_token':self.draft_token}
+
+    def restore(self, saved):
+        if not isinstance(saved,dict) or set(saved)!={'target','draft','hidden','pending','draft_token'}:
+            raise ValueError('Invalid MTP session snapshot')
+        for key,model in (('target',self.target),('draft',self.draft)):
+            validate_snapshot(saved[key],model.states,model.capacity,model.V,model.ple.ngram-1,
+                              prefix_divisors=model.prefix_divisors,allow_cpu=True)
+            if model.ple.eos in saved[key]['history']:raise ValueError('Invalid private history')
+        hidden=saved['hidden']
+        if hidden.shape!=(1,self.target.C,self.target.H) or hidden.dtype!=torch.float16 or str(hidden.device) not in ('cpu',str(self.target.position_gpu.device)):
+            raise ValueError('Invalid MTP HC condition')
+        if saved['target']['position']!=saved['draft']['position'] or saved['draft']['history']:
+            raise ValueError('MTP snapshot cursors or history differ')
+        if any(type(saved[k]) is not int or not 0<=saved[k]<self.target.V for k in ('pending','draft_token')):
+            raise ValueError('Invalid pending or draft token')
+        self.target.restore(saved['target']);self.draft.restore(saved['draft'])
+        self.hidden=hidden.to(self.target.position_gpu.device,copy=True)
+        self.pending=saved['pending'];self.draft_token=saved['draft_token']
+        self.statistics={'rounds':0,'proposed':0,'accepted':0,'fallback_steps':0}

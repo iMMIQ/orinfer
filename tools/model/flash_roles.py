@@ -46,6 +46,15 @@ ROLES = {
 
 
 def role(name):
+    if name.startswith('mtp.'):
+        suffix=name[4:]
+        if suffix in ('fc_embedding.weight','fc_hidden.weight','pre_fc_norm_embedding.weight','pre_fc_norm_hidden.weight'):
+            return suffix
+        if suffix.startswith('layers.0.'):
+            return role('model.language_model.layers.48.'+suffix[len('layers.0.'):])
+        if suffix.startswith('hyper_connection_mixer.'):
+            return role('model.language_model.'+suffix)
+        raise ValueError(f'Unsupported Flash Next MTP parameter: {name}')
     if '.ple_embedding.' in name:
         return None  # CPU PLE metadata.
     if name == 'model.language_model.embed_tokens.weight':return 'token_embd.weight'

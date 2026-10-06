@@ -77,8 +77,9 @@ def source_and_records(converted, index):
     return source,contract,sorted(records,key=lambda r:(r['tensor'],r['first']))
 
 
-def coverage(source, records):
-    expected = {n for n in source.weight_map if n.startswith('model.language_model.') or n == 'lm_head.weight'}
+def coverage(source, records, *, component='text'):
+    if component not in ('text','mtp'):raise ValueError('Invalid Flash component')
+    expected = {n for n in source.weight_map if (n.startswith('mtp.') if component == 'mtp' else n.startswith('model.language_model.') or n == 'lm_head.weight')}
     groups = defaultdict(list)
     for r in records:
         if r['tensor'] not in expected:raise ValueError('Unexpected converted tensor')
@@ -174,11 +175,13 @@ def publish(converted, output, index, config, frontend, *, consume=True):
     converted,output = Path(converted),Path(output)
     if converted.resolve() == output.resolve():raise ValueError('Publication must use a separate directory')
     source,contract,records = source_and_records(converted,index)
-    audit = coverage(source,records)
+    component = contract.get('component','text')
+    audit = coverage(source,records,component=component)
     if not audit['complete']:raise ValueError('Conversion is incomplete; refusing publication')
     configuration = json.loads(Path(config).read_text())
     if configuration.get('model_type') != 'qwen4_exp':raise ValueError('Flash Next configuration required')
-    if contract['layers'] != [0,configuration['text_config']['num_hidden_layers']]:
+    layers = configuration['text_config'].get('mtp_num_hidden_layers') if component == 'mtp' else configuration['text_config']['num_hidden_layers']
+    if contract['layers'] != [0,layers]:
         raise ValueError('Conversion does not cover configured text layers')
     if not all((Path(frontend)/name).is_file() for name in ('tokenizer.json','tokenizer_config.json')):
         raise ValueError('Tokenizer files are required before publication')
@@ -223,6 +226,7 @@ def publish(converted, output, index, config, frontend, *, consume=True):
         'basis':contract['basis'],'expert_rotation':contract['rotation'],'embedding_rotation':'paley20-walsh8',
         'calibration':'weight-only','compute_dtype':'int8_quality','source':contract['source'],
         'source_revision':contract['revision'],'seed':contract['seed']}
+    if component == 'mtp':configuration['quantization_config']['component']='mtp'
     atomic_json(output/'config.json',configuration)
     for name in FRONTEND:
         path = Path(frontend)/name
@@ -255,7 +259,7 @@ def main():
         print(json.dumps({k:v for k,v in state.items() if k not in ('shards','signature')}),flush=True)
     else:
         source,contract,records = source_and_records(a.converted,a.index)
-        audit = coverage(source,records)
+        audit = coverage(source,records,component=contract.get('component','text'))
         for r in records:check_piece(a.converted/r['filename'],r,source)
         audit.update(verified_shards=len(records),weight_bytes=sum((a.converted/r['filename']).stat().st_size for r in records))
         audit['missing_spans'] = len(audit.pop('missing'))

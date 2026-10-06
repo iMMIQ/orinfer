@@ -53,11 +53,13 @@ def bf16(data, shape):
     return bits.view(np.float32).reshape(shape)
 
 
-def task_list(source, *, layers, chunk_experts):
+def task_list(source, *, layers, chunk_experts, component='text'):
+    if component not in ('text','mtp'):raise ValueError('Invalid Flash component')
     tasks = []
     for layer in layers:
         for family in ('gate_up','down'):
-            name = f'model.language_model.layers.{layer}.mlp.experts.{family}_proj'
+            prefix = 'model.language_model' if component == 'text' else 'mtp'
+            name = f'{prefix}.layers.{layer}.mlp.experts.{family}_proj'
             filename,begin,t = source.tensor(name)
             if t['dtype'] != 'BF16' or len(t['shape']) != 3 or t['shape'][0] != 512 or t['shape'][2]%128:
                 raise ValueError(f'Unexpected original expert bank: {name}')
@@ -104,11 +106,12 @@ def main():
     p.add_argument('--max-chunks',type=int)
     p.add_argument('--inventory-only',action='store_true')
     p.add_argument('--stage',choices=('experts','aux','all'),default='experts')
+    p.add_argument('--component',choices=('text','mtp'),default='text')
     p.add_argument('--aux-kind',choices=('original','int8-row','e8p-embedding'))
     a = p.parse_args()
     if not re.fullmatch(r'\d+:\d+',a.layers):p.error('--layers must be start:end')
     first,last = map(int,a.layers.split(':'))
-    if not 0 <= first < last <= 48 or not 1 <= a.chunk_experts <= 32 or not 1 <= a.workers <= 4:
+    if not 0 <= first < last <= (48 if a.component == 'text' else 1) or not 1 <= a.chunk_experts <= 32 or not 1 <= a.workers <= 4:
         p.error('Invalid layer range, chunk size or worker count')
     if a.max_chunks is not None and a.max_chunks <= 0:p.error('--max-chunks must be positive')
     a.output.mkdir(parents=True,exist_ok=True)
@@ -119,15 +122,17 @@ def main():
                            'source_index_sha256':digest(a.index),'seed':a.seed,'layers':[first,last],
                            'chunk_experts':a.chunk_experts,'basis':'integer-e8p-spread29-v1',
                            'rotation':'signed-block128','fit':'weight-only-ls2','layout':'expert-group-row-vector'},sort_keys=True)
+    if a.component == 'mtp':contract=json.dumps(dict(json.loads(contract),component='mtp'),sort_keys=True)
     state_path = a.output/'experts-progress.json'
     if state_path.exists():
         state = json.loads(state_path.read_text())
         if state['contract'] != contract:raise ValueError('Existing conversion uses a different contract')
     else:
         state = {'contract':contract,'shards':{},'routed_experts_complete':False,'model_complete':False,
-                 'remaining_model_stages':['non-expert text weights','PLE embedding','end-to-end quality validation']}
+                 'remaining_model_stages':(['non-expert MTP weights','end-to-end MTP validation'] if a.component=='mtp' else
+                                           ['non-expert text weights','PLE embedding','end-to-end quality validation'])}
     print('Reading original expert bank headers',flush=True)
-    tasks = task_list(source,layers=range(first,last),chunk_experts=a.chunk_experts)
+    tasks = task_list(source,layers=range(first,last),chunk_experts=a.chunk_experts,component=a.component)
     state['expected_shards'] = len(tasks)
     if a.inventory_only:
         state['source_expert_bytes'] = sum(np.prod(t['shape']).item()*2 for t in tasks)
@@ -150,7 +155,7 @@ def main():
     configure();enc = Encoder()
     if a.stage == 'aux':
         from tools.quantization.flash_next_aux import convert
-        convert(source,a.output,enc,source_contract=contract,seed=a.seed,max_chunks=a.max_chunks,kind_filter=a.aux_kind)
+        convert(source,a.output,enc,source_contract=contract,seed=a.seed,max_chunks=a.max_chunks,kind_filter=a.aux_kind,component=a.component)
         return
     sign_cache = {}
     def fetch(task):
@@ -188,14 +193,14 @@ def main():
             verify(path,task,record,contract)
             state['shards'][task['filename']] = record
             state['elapsed_seconds_this_run'] = time.perf_counter()-started
-            state['routed_experts_complete'] = first == 0 and last == 48 and len(state['shards']) == len(tasks)
+            state['routed_experts_complete'] = first == 0 and last == (48 if a.component == 'text' else 1) and len(state['shards']) == len(tasks)
             atomic_json(state_path,state)
             print(json.dumps({'done':len(state['shards']),'total':len(tasks),'shard':task['filename'],
                               'fit_seconds':record['fit_seconds'],'bytes':record['bytes']}),flush=True)
             del floating,w,target,tensors
     if a.stage == 'all' and state['routed_experts_complete']:
         from tools.quantization.flash_next_aux import convert
-        auxiliary = convert(source,a.output,enc,source_contract=contract,seed=a.seed,max_chunks=a.max_chunks,kind_filter=a.aux_kind)
+        auxiliary = convert(source,a.output,enc,source_contract=contract,seed=a.seed,max_chunks=a.max_chunks,kind_filter=a.aux_kind,component=a.component)
         state['weights_complete'] = auxiliary['complete']
         if auxiliary['complete']:state['remaining_model_stages'] = ['end-to-end quality validation']
         atomic_json(state_path,state)

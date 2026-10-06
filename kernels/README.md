@@ -13,3 +13,5 @@ kernel经离线编译生成cubin和真实host ABI，在线由Rust CUDA Driver执
 `model/integer_vq.py`提供实验性VQ4和整数E8P的shared解码、INT8投影，以及输入侧block128旋转；可选每128个权重一个整数替换槽。旋转必须在对应投影前执行，down的旋转位于SwiGLU之后。数值验证入口为`tools/operators/integer_vq.py`，完整MoE性能探针复用`q2i8_grouped.py --vq-dir ... --vq-variant ...`。
 
 `model/int8_projection.py`提供行scale的常驻INT8权重投影。`tools/model/flash_native.py`组装整数E8P专家、INT8普通投影及保留精度的HC/router，用于自有量化权重的离线整模型执行及质量对照；QSA使用`model/qsa.py`的group-4压缩索引、精确radix top-k及group-64 INT8 KV，`model/qsa_attention.py`用共享KV tile的FP16 Tensor Core计算attention，softmax和累加保持FP32；上下文上限为262144 token。压缩索引、pending ring和KV scale均纳入请求状态。算子验证入口为`tools/operators/qsa*.py`，真实长上下文执行入口为`tools/model/flash_long.py`。执行完成与质量验收分别记录，尚未提供Rust在线架构适配。转换和独立BF16对照用法见[量化工具](../tools/quantization/README.md)。
+
+`model/flash_mtp.py`提供MTP的完整HC输入归一化、embedding/分支融合和逐位置历史保存；`model/greedy.py`支持多行验证输出。目标模型验证时保存GDN、卷积、PLE及QSA pending状态，按接受长度提交，KV和压缩索引的拒绝后缀通过live cursor隔离。`tools/model/flash_mtp.py`负责离线greedy接受、草稿刷新及完整session恢复；MTP共用主模型的embedding和输出头，另有独立INT8 KV。算子验证入口为`tools/operators/flash_mtp.py`，真实请求对照入口为`tools/model/validate_flash_mtp.py`。

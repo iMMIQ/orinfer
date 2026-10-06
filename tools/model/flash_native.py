@@ -19,6 +19,7 @@ import torch
 from kernels.model import flash_next as fn
 from kernels.model import qsa
 from kernels.model import qsa_attention as qsat
+from kernels.model import flash_mtp as fm
 from kernels.model.hyperconnection import hc_norm, hc_silu, hc_projection, hc_mix, hc_combine
 from kernels.model.ple import ple_gate, ple_conv, ple_history
 from kernels.model.gdn_sequence import gdn_sequence
@@ -31,6 +32,7 @@ from kernels.operators.op09_gdn_gates import gdn_gates, launch as launch_gates
 from kernels.operators.op30_activation_quantization import activation_quantization, launch as launch_quant
 from tools.model.flash_checkpoint import Checkpoint
 from tools.model.flash_chunks import chunks
+from tools.model.flash_speculation import DEFAULT_DRAFTS
 from tools.model.flash_lookup import RowCache
 from tools.model.flash_ple import PleLookup
 from tools.model.flash_roles import role
@@ -41,23 +43,35 @@ from tools.operators.common import configure, environment, export_kernel, write_
 class Model:
     H, F, E, K, C, R, V = 2560, 640, 512, 10, 4, 320, 248320
 
-    def __init__(self, source, capacity, output, *, use_graph=True):
+    def __init__(self, source, capacity, output, *, use_graph=True, target=None):
         maximum = source.config['text_config']['max_position_embeddings']
         if type(capacity) is not int or not 1 <= capacity <= min(maximum,262144):
             raise ValueError('Context exceeds the checkpoint/native 262144 limit')
         self.source, self.capacity, self.output = source, capacity, output
+        self.is_mtp=source.config['quantization_config'].get('component')=='mtp'
+        if self.is_mtp:
+            if target is None or target.is_mtp or target.capacity!=capacity:
+                raise ValueError('MTP requires a matching target model')
+            left,right=source.config['quantization_config'],target.source.config['quantization_config']
+            if any(left.get(k)!=right.get(k) for k in ('source','source_revision','seed','basis','expert_rotation')) or source.config['text_config']!=target.source.config['text_config']:
+                raise ValueError('MTP and target checkpoint identities differ')
+        elif target is not None:raise ValueError('Target sharing is only for MTP')
+        self.layer_ids=(48,) if self.is_mtp else tuple(range(48))
         self.weights, self.states, self.plans = {}, {}, {}
         self.prefix_divisors = {}
         self.kernels = {}
         self.history = []
         self.position = 0
-        self.ple = PleLookup(source)
-        self.embedding = RowCache(source,capacity_bytes=8*1024**2)
+        self.ple = target.ple if self.is_mtp else PleLookup(source)
+        self.embedding = target.embedding if self.is_mtp else RowCache(source,capacity_bytes=8*1024**2)
         self.use_graph = use_graph
         self.position_gpu = torch.zeros(1, device='cuda', dtype=torch.int32)
         self.lengths = torch.empty_like(self.position_gpu)
         self.position_out = torch.empty_like(self.position_gpu)
         self.load()
+        if self.is_mtp:self.weights['output.weight']=target.weights['output.weight']
+        self.last_plan=None
+        self.transaction=None
 
     def load(self):
         text = self.source.config['text_config']
@@ -80,8 +94,10 @@ class Model:
         if (rope.get('rope_theta') != 1e7 or rope.get('partial_rotary_factor') != .25
                 or rope.get('rope_type') != 'default' or text.get('norm_topk_prob',True) is not True):
             raise ValueError('Unsupported rotation or expert normalization semantics')
-        for i in range(3,48,4):
-            prefix=f'model.language_model.layers.{i}.self_attn.indexer.'
+        if self.is_mtp and (text.get('mtp_num_hidden_layers')!=1 or text.get('mtp',{}).get('layer_types')!=['full_attention'] or text.get('mtp_use_dedicated_embeddings') is not False):
+            raise ValueError('Only the shared one-layer MTP is supported')
+        for i in ((0,) if self.is_mtp else range(3,48,4)):
+            prefix=f'{"mtp" if self.is_mtp else "model.language_model"}.layers.{i}.self_attn.indexer.'
             for suffix,shape in [('index_qk_proj.weight',(640,self.H)),
                                  ('q_layernorm.weight',(128,)),('k_layernorm.weight',(128,))]:
                 if prefix+suffix not in self.source.parts or self.source.shape(prefix+suffix)!=shape:
@@ -119,10 +135,10 @@ class Model:
                 continue
             if kind != 'original':raise ValueError('Unsupported GPU weight kind')
             dtype = torch.bfloat16
-            if 'norm.weight' in name or 'ple_norm_' in name or name.endswith(('ssm_a_log','ssm_dt.bias','ssm_conv1d.weight')):
+            if 'norm.weight' in name or 'ple_norm_' in name or name.startswith('pre_fc_norm_') or name.endswith(('ssm_a_log','ssm_dt.bias','ssm_conv1d.weight')):
                 dtype = torch.float32
             tensor = torch.from_numpy(self.source.tensor(original)).to(device='cuda',dtype=dtype)
-            if name.endswith(('attn_q_norm.weight','attn_k_norm.weight','index_q_norm.weight','index_k_norm.weight')):
+            if name.startswith('pre_fc_norm_') or name.endswith(('attn_q_norm.weight','attn_k_norm.weight','index_q_norm.weight','index_k_norm.weight')):
                 # Original Gemma RMSNorm stores zero-centered weights. The
                 # QSA kernel consumes ordinary FP32 gamma; add one exactly.
                 tensor = tensor+1.0
@@ -130,8 +146,8 @@ class Model:
             if 'hc_' in name and name.endswith('norm.weight') or 'ple_norm_' in name:
                 tensor = tensor.reshape(self.C,self.H)
             self.weights[name] = tensor
-        for i in range(48):
-            if i%4 != 3:
+        for i in self.layer_ids:
+            if not self.is_mtp and i%4 != 3:
                 self.states[f'{i}:conv'] = torch.zeros((1,3,10240),device='cuda',dtype=torch.float16)
                 self.states[f'{i}:gdn'] = torch.zeros((48,128,128),device='cuda')
             else:
@@ -143,7 +159,7 @@ class Model:
                 self.states[f'{i}:index'] = torch.empty(((self.capacity+3)//4,128),device='cuda',dtype=torch.float16)
                 self.prefix_divisors[f'{i}:index'] = 4
                 self.states[f'{i}:pending'] = torch.zeros((4,128),device='cuda',dtype=torch.float16)
-        self.states['ple'] = torch.zeros((9,self.C*self.H),device='cuda',dtype=torch.float16)
+        if not self.is_mtp:self.states['ple'] = torch.zeros((9,self.C*self.H),device='cuda',dtype=torch.float16)
         print('resident GPU GiB',torch.cuda.memory_allocated()/2**30,flush=True)
 
     def kernel(self, key, build):
@@ -152,14 +168,17 @@ class Model:
             export_kernel(self.kernels[key], self.output / 'aot' / key)
         return self.kernels[key]
 
-    def plan(self, m):
-        if m in self.plans:
-            return self.plans[m]
+    def plan(self, m, *, verify=False):
+        key=(m,'verify') if verify else m
+        if key in self.plans:
+            return self.plans[key]
         if not 1 <= m <= 128:
             raise ValueError('Recurrent plan supports chunks of 1..128')
+        if verify and (self.is_mtp or not 1<=m<=8):raise ValueError('Target verification supports 1..8 inputs')
         h, f, c, rank, e, k = self.H, self.F, self.C, self.R, self.E, self.K
         ops = []
         labels = []
+        prefix_states={}
         def empty(shape, dtype=torch.float16):
             return torch.empty(shape, device='cuda', dtype=dtype)
         def call(label, build, *args):
@@ -202,7 +221,7 @@ class Model:
                     call(f'hc-{m}-{n}-{width}-{bm}-{bn}',lambda:hc_projection(m,n,width,block_m=bm,dtype='float16',block_n=bn),a,weight,out)
                 else:
                     wd = str(weight.dtype).split('.')[-1];od = str(out.dtype).split('.')[-1]
-                    call(f'dense-{m}-{n}-{width}-{wd}-{od}',lambda:fn.dense_projection(m,n,width,wd,od),a,weight,out)
+                    call(f'dense-{rows}-{n}-{width}-{wd}-{od}',lambda:fn.dense_projection(rows,n,width,wd,od),a,weight,out)
                 labels[-1]=f'{label}:{labels[-1]}'
         embedding, ple_embedding = empty((m,h)), empty((m,h))
         residual, normed, up = (empty((m,c,h)) for _ in range(3))
@@ -217,7 +236,18 @@ class Model:
             call(f'hc-mix-{m}',lambda:hc_mix(m,h,c,'float16'),normed,up,mixed)
             if inject is not None:
                 projection('hc-inject',normed.flatten(1),prefix+'inject.weight',inject,True)
-        call(f'initialize-{m}',lambda:fn.hc_initialize(m),embedding,residual)
+        condition=None
+        if self.is_mtp:
+            condition=empty((m,c,h))
+            norm_embedding,fused_embedding=empty((m,h)),empty((m,h))
+            norm_hidden,fused_hidden=empty((m,c,h)),empty((m,c,h))
+            call(f'mtp-norm-{m}-{h}',lambda:fm.norm(m,h),embedding,self.weights['pre_fc_norm_embedding.weight'],norm_embedding)
+            call(f'mtp-norm-{m}-{c*h}',lambda:fm.norm(m,c*h),condition.flatten(1),self.weights['pre_fc_norm_hidden.weight'],norm_hidden.flatten(1))
+            projection('mtp-fc-embedding',norm_embedding,'fc_embedding.weight',fused_embedding)
+            projection('mtp-fc-hidden',norm_hidden.reshape(m*c,h),'fc_hidden.weight',fused_hidden.reshape(m*c,h),rows=m*c)
+            call(f'mtp-fuse-{m}',lambda:fm.fuse(m,h,c),fused_embedding,fused_hidden,residual)
+        else:
+            call(f'initialize-{m}',lambda:fn.hc_initialize(m),embedding,residual)
         qkv, z = empty((m,10240)),empty((m,6144))
         alpha,beta_raw = empty((m,48)),empty((m,48))
         g,beta = empty((m,48),torch.float32),empty((m,48),torch.float32)
@@ -262,7 +292,12 @@ class Model:
         def quant_call(kernel,*args):
             ops.append((lambda *items:launch_quant(kernel,*items,stream=torch.cuda.current_stream().cuda_stream),args))
             labels.append('expert-quant')
-        for i in range(48):
+        def save_history(name,x,history):
+            saved=empty((m,history,x.shape[-1]))
+            prefix_states[name]=saved
+            call(f'prefix-history-{m}-{x.shape[-1]}-{history}',lambda:fm.history_prefix(m,x.shape[-1],history),
+                 x,self.states[name].reshape(history,x.shape[-1]),saved)
+        for i in self.layer_ids:
             prefix=f'blk.{i}.'
             if i == 1:
                 ple_a8=quantize(ple_embedding)
@@ -273,11 +308,12 @@ class Model:
                 call(f'ple-gate-{m}',lambda:ple_gate(m,h,c),ple_normed_key,ple_normed_query,ple_value,ple_gated)
                 call(f'hc-norm-{m}',lambda:hc_norm(m,h,c,dtype='float16'),ple_gated,self.weights[prefix+'ple_norm_conv.weight'],ple_normed)
                 call(f'ple-conv-{m}',lambda:ple_conv(m,c*h),ple_normed.flatten(1),ple_gated.flatten(1),self.states['ple'],self.weights[prefix+'ple_conv1d.weight'].half(),ple_out.flatten(1))
+                if verify:save_history('ple',ple_normed.flatten(1),9)
                 call(f'ple-history-{m}',lambda:ple_history(m,c*h),ple_normed.flatten(1),self.states['ple'],self.states['ple'])
                 call(f'ple-add-{m}',lambda:fn.residual_add(m,c*h),residual.flatten(1),ple_out.flatten(1),residual.flatten(1))
             mixer(prefix+'hc_attn_',inject_attn)
             attn_a8=quantize(mixed)
-            if i % 4 != 3:
+            if not self.is_mtp and i % 4 != 3:
                 projection('gdn-qkv',mixed,prefix+'attn_qkv.weight',qkv,a8=attn_a8)
                 projection('gdn-z',mixed,prefix+'attn_gate.weight',z,a8=attn_a8)
                 projection('gdn-alpha',mixed,prefix+'ssm_alpha.weight',alpha,a8=attn_a8)
@@ -287,9 +323,15 @@ class Model:
                 labels.append('gdn-gates')
                 call(f'gdn-conv-{m}',lambda:gdn_conv_prep(B=1,tokens=m,normalize_round_fp16=False,
                     conv_product_round_fp16=False,weight_dtype='float32'),qkv.view(1,m,10240),self.weights[prefix+'ssm_conv1d.weight'],self.states[f'{i}:conv'],self.lengths,self.position_gpu,q,keys,values,ho,self.position_out)
+                if verify:save_history(f'{i}:conv',qkv,3)
                 ops.append((lambda source,destination:destination.copy_(source),(ho,self.states[f'{i}:conv'])))
                 labels.append('gdn-history-copy')
-                call(f'gdn-sequence-{m}',lambda:gdn_sequence(m,in_place=True),q[0],keys[0],values[0],g,beta,self.states[f'{i}:gdn'],prefix_state,recurrent)
+                saved=empty((m,48,128,128),torch.float32) if verify else prefix_state
+                call(f'gdn-sequence-{m}-{"prefix" if verify else "inplace"}',lambda:gdn_sequence(m,in_place=not verify),q[0],keys[0],values[0],g,beta,self.states[f'{i}:gdn'],saved,recurrent)
+                if verify:
+                    prefix_states[f'{i}:gdn']=saved
+                    ops.append((lambda a,b:b.copy_(a),(saved[-1],self.states[f'{i}:gdn'])))
+                    labels.append('gdn-prefix-final')
                 call(f'gdn-sigmoid-{m}',lambda:fn.gdn_sigmoid_norm(m),recurrent.view(m,48,128),z.view(m,48,128),self.weights[prefix+'ssm_norm.weight'],gated.view(m,48,128))
                 projection('gdn-out',gated,prefix+'ssm_out.weight',block)
             else:
@@ -301,6 +343,9 @@ class Model:
                 projection('index-qk',mixed,prefix+'index_qk.weight',index_qk,a8=attn_a8)
                 call(f'index-query-{m}',lambda:qsa.index_query(m),index_qk.view(m,5,128),self.weights[prefix+'index_q_norm.weight'],self.position_gpu,index_q)
                 call(f'index-compress-{m}',lambda:qsa.index_compress(m,self.capacity),index_qk.view(m,5,128),self.states[f'{i}:pending'],self.weights[prefix+'index_k_norm.weight'],self.position_gpu,self.states[f'{i}:index'])
+                if verify:
+                    saved=empty((m,4,128));prefix_states[f'{i}:pending']=saved
+                    call(f'prefix-pending-{m}',lambda:fm.pending_prefix(m),index_qk.view(m,5,128),self.states[f'{i}:pending'],self.position_gpu,saved)
                 call(f'index-pending-{m}',lambda:qsa.index_pending(m),index_qk.view(m,5,128),self.position_gpu,self.states[f'{i}:pending'])
                 call(f'index-scores-{m}',lambda:qsa.index_scores(m,self.capacity),index_q,self.states[f'{i}:index'],self.position_gpu,index_scores)
                 for shift in (24,16,8,0):
@@ -344,20 +389,21 @@ class Model:
             call(f'hc-combine-{m}',lambda:hc_combine(m,h,c,'float16'),block,residual,inject_ffn,residual)
         body_count=len(ops)
         mixer('output_hc_',None)
-        output=empty((1,self.V),torch.float32)
-        projection('head',mixed[-1:],'output.weight',output,rows=1)
+        head_rows=m if verify else 1
+        output=empty((head_rows,self.V),torch.float32)
+        projection('head',mixed if verify else mixed[-1:],'output.weight',output,rows=head_rows)
         blocks=(self.V+1023)//1024
-        top_values=empty((blocks,),torch.float32)
-        top_indices,top_invalid=(empty((blocks,),torch.int32) for _ in range(2))
-        token=empty((2,),torch.int32)
-        greedy_ops=[(self.kernel('greedy-partials',lambda:greedy_partials(self.V)),
+        top_values=empty((head_rows*blocks,),torch.float32)
+        top_indices,top_invalid=(empty((head_rows*blocks,),torch.int32) for _ in range(2))
+        token=empty((head_rows*2,),torch.int32)
+        greedy_ops=[(self.kernel(f'greedy-partials-{head_rows}',lambda:greedy_partials(self.V,head_rows)),
                      (output,top_values,top_indices,top_invalid)),
-                    (self.kernel('greedy-merge',lambda:greedy_merge(self.V)),
+                    (self.kernel(f'greedy-merge-{head_rows}',lambda:greedy_merge(self.V,head_rows)),
                      (top_values,top_indices,top_invalid,token))]
         plan={'ops':ops,'body_count':body_count,'greedy_ops':greedy_ops,'token':token,
               'labels':labels,'embedding':embedding,'ple_embedding':ple_embedding,'output':output,
-              'residual':residual,'graphs':{}}
-        self.plans[m]=plan
+              'residual':residual,'condition':condition,'prefix_states':prefix_states,'graphs':{}}
+        self.plans[key]=plan
         print('compiled plan',m,'ops',len(ops),flush=True)
         return plan
 
@@ -365,6 +411,7 @@ class Model:
         for name,state in self.states.items():
             if name not in self.prefix_divisors:state.zero_()
         self.history=[];self.position=0;self.position_gpu.zero_()
+        self.transaction=None;self.last_plan=None
 
     def live_states(self, position=None):
         position=self.position if position is None else position
@@ -387,20 +434,29 @@ class Model:
             live.copy_(value)
         self.history=list(snapshot['history']);self.position=int(snapshot['position'])
         self.position_gpu.fill_(self.position)
+        self.transaction=None;self.last_plan=None
 
-    def execute(self, tokens, *, output='logits'):
-        if output not in ('logits','none','token'):
-            raise ValueError('Output must be logits, none or token')
+    def execute(self, tokens, *, output='logits', hidden=None):
+        if output not in ('logits','none','token','verify'):
+            raise ValueError('Invalid output mode')
         if not tokens or self.position+len(tokens)>self.capacity:
             raise ValueError('Request exceeds native QSA context budget')
-        plan=self.plan(len(tokens))
+        if any(type(t) is not int or not 0<=t<self.V for t in tokens):raise ValueError('Invalid token ID')
+        if self.is_mtp:
+            if hidden is None or hidden.shape!=(len(tokens),self.C,self.H) or hidden.dtype!=torch.float16 or hidden.device!=self.position_gpu.device:
+                raise ValueError('MTP requires target HC conditions for every shifted token')
+        elif hidden is not None:raise ValueError('Only MTP takes hidden conditions')
+        plan=self.plan(len(tokens),verify=output=='verify')
         embedding=np.stack([self.embedding.read('model.language_model.embed_tokens.weight',token) for token in tokens])
-        features,next_history=self.ple.prepare(tokens,self.history)
+        if self.is_mtp:
+            features=None;next_history=[];plan['condition'].copy_(hidden)
+        else:features,next_history=self.ple.prepare(tokens,self.history)
         plan['embedding'].copy_(torch.from_numpy(embedding).half())
-        plan['ple_embedding'].copy_(torch.from_numpy(features).half())
+        if features is not None:plan['ple_embedding'].copy_(torch.from_numpy(features).half())
         self.position_gpu.fill_(self.position);self.lengths.fill_(len(tokens))
         ops=plan['ops'][:plan['body_count']] if output=='none' else plan['ops']
-        if output=='token':ops=ops+plan['greedy_ops']
+        if output in ('token','verify'):ops=ops+plan['greedy_ops']
+        old_position,old_history=self.position,list(self.history)
         if self.use_graph:
             if output not in plan['graphs']:
                 snapshot=self.snapshot(cpu=True)
@@ -418,12 +474,24 @@ class Model:
         if output=='logits':
             result=plan['output'][-1].cpu().numpy()
             if not np.isfinite(result).all():raise ValueError('Nonfinite model logits')
-        elif output=='token':
-            selected=plan['token'].cpu().numpy()
-            if selected[1]:raise ValueError('Nonfinite model logits')
-            result=int(selected[0])
+        elif output in ('token','verify'):
+            selected=plan['token'].cpu().numpy().reshape(-1,2)
+            if selected[:,1].any():raise ValueError('Nonfinite model logits')
+            result=selected[:,0].astype(int).tolist() if output=='verify' else int(selected[0,0])
         self.history=next_history;self.position+=len(tokens)
+        self.last_plan=plan
+        self.transaction=(plan,old_position,old_history,list(tokens)) if output=='verify' else None
         return result
+
+    def commit(self, inputs):
+        """Commit a verified input prefix; rejected KV/index tails stay invisible."""
+        if self.transaction is None:raise ValueError('No pending verification')
+        plan,start,history,tokens=self.transaction
+        if type(inputs) is not int or not 1<=inputs<=len(tokens):raise ValueError('Invalid accepted input count')
+        if self.position!=start+len(tokens):raise ValueError('Verification cursor changed')
+        for name,value in plan['prefix_states'].items():self.states[name].copy_(value[inputs-1].reshape(self.states[name].shape))
+        _,self.history=self.ple.row_ids(tokens[:inputs],history)
+        self.position=start+inputs;self.position_gpu.fill_(self.position);self.transaction=None
 
 
 def prefill(model, tokens, chunk, *, output='logits'):
@@ -496,9 +564,13 @@ def main():
     p.add_argument('--max-new-tokens',type=int,default=64)
     p.add_argument('--graph',choices=('on','off'),default='on')
     p.add_argument('--baseline',type=Path,help='Original BF16/FP8 probes on exactly these forced histories')
+    p.add_argument('--mtp-checkpoint',type=Path,help='Our separately published MTP weights; enables greedy speculation')
+    p.add_argument('--mtp-drafts',type=int,default=DEFAULT_DRAFTS,
+                   help=f'Speculative proposals per round, 1..7 (default: {DEFAULT_DRAFTS})')
     p.add_argument('--cases',nargs='+',help='Run selected scene IDs')
     a = p.parse_args()
     if a.max_new_tokens < 1:p.error('--max-new-tokens must be positive')
+    if not 1<=a.mtp_drafts<=7:p.error('--mtp-drafts must be in 1..7')
     configure();np.random.seed(SEED);a.output.mkdir(parents=True,exist_ok=True)
     started = time.perf_counter();source = Checkpoint(a.checkpoint)
     tokenizer,cases = scenes(a.checkpoint)
@@ -512,22 +584,35 @@ def main():
     baseline_map = {(row['case_id'],row['position']):row for row in baseline}
     if len(baseline_map) != len(baseline):raise ValueError('Duplicate baseline scoring positions')
     model = Model(source,a.context,a.output,use_graph=a.graph=='on')
+    session=None
+    if a.mtp_checkpoint:
+        from tools.model.flash_mtp import Session
+        draft=Model(Checkpoint(a.mtp_checkpoint),a.context,a.output/'mtp',use_graph=a.graph=='on',target=model)
+        session=Session(model,draft)
     torch.cuda.synchronize();load_s = time.perf_counter()-started
     write_json(a.output/'scenes.json',{'seed':SEED,'cases':cases,
         'frontend':[identity(a.checkpoint/name) for name in ('tokenizer.json','chat_template.jinja')]})
     warm_started = time.perf_counter();model.plan(1);model.plan(a.chunk)
     checks = state_checks(model,cases[0]['prompt_ids'][:a.chunk])
     model.reset();model.execute(cases[0]['prompt_ids'][:1],output='token');model.reset()
+    if session:
+        session.prefill(cases[0]['prompt_ids'],a.chunk)
+        warm_budget=max(8,2*(a.mtp_drafts+1)+1)
+        session.generate(min(warm_budget,model.capacity-model.position+1),set(),drafts=a.mtp_drafts)
     torch.cuda.synchronize();warm_s = time.perf_counter()-warm_started
     generation_config = json.loads((a.checkpoint/'generation_config.json').read_text())
     eos = generation_config['eos_token_id'];eos = {eos} if isinstance(eos,int) else set(eos)
     rows,probes = [],[]
     for case in cases:
         model.reset();begin = time.perf_counter()
-        logits = prefill(model,case['prompt_ids'],a.chunk)
+        if session:
+            session.prefill(case['prompt_ids'],a.chunk)
+            logits=model.last_plan['output'][-1].cpu().numpy().copy()
+        else:logits = prefill(model,case['prompt_ids'],a.chunk)
         prefill_s = time.perf_counter()-begin;prefix = model.snapshot();prompt_logits = logits.copy()
         decode_started = time.perf_counter()
-        tokens,reason=generate(model,logits,eos,a.max_new_tokens)
+        if session:tokens,reason=session.generate(a.max_new_tokens,eos,drafts=a.mtp_drafts)
+        else:tokens,reason=generate(model,logits,eos,a.max_new_tokens)
         decode_s = time.perf_counter()-decode_started
         text = tokenizer.decode(tokens,skip_special_tokens=True)
         model.restore(prefix)
@@ -549,6 +634,7 @@ def main():
                'decode_tps':max(0,len(tokens)-1)/max(decode_s,1e-9),
                'target_nll':-float(np.mean([x['reference_logprob'] for x in case_probes])),
                'task':validate_task(case['rule'],text)}
+        if session:row['mtp_statistics']=dict(session.statistics)
         rows.append(row);write_json(a.output/'requests.json',rows)
         print(json.dumps(row,ensure_ascii=False),flush=True)
     paired = []
@@ -560,6 +646,8 @@ def main():
     write_json(a.output/'results.json',{'execution_complete':True,'full_model_quality_verified':False,
         'scope':__doc__,'seed':SEED,'environment':environment(),'load_s':load_s,'warm_s':warm_s,
         'graph':a.graph,'chunk':a.chunk,'state_checks':checks,'requests':rows,'probes':probes,
+        'mtp_checkpoint':identity(a.mtp_checkpoint/'model.safetensors.index.json') if a.mtp_checkpoint else None,
+        'mtp_drafts':a.mtp_drafts if session else None,
         'baseline':identity(a.baseline) if a.baseline else None,'paired_probes':paired,
         'checkpoint_index':identity(a.checkpoint/'model.safetensors.index.json')})
 

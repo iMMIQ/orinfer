@@ -57,7 +57,69 @@ bash tools/operators/run.sh tools/model/flash_long.py \
 
 Every input traverses all 48 layers. Each milestone checks continuation after restoring the entire prefix, including INT8 codes/scales, compressed index keys, pending keys, GDN, convolution and PLE history. This repeated-text capacity workload does not establish long-context task quality. Add `--baseline` with the original short-scene BF16 probes to run the fixed regression scenes before the capacity workload. Operator oracles and high-position checks live in `tools/operators/qsa*.py`; tensor-core attention rounds local KV/probability operands to FP16 while keeping softmax and accumulators FP32. No persistent expanded KV is kept.
 
-The index semantics follow the checkpoint’s [QSA indexer](https://github.com/sgl-project/sglang/blob/c765f8818afae5a4eaa91bc7708e99e1026330ef/python/sglang/srt/layers/attention/qsa/qsa_indexer.py). Native selection uses exact radix filtering with deterministic lower-block-ID ties. Index score workspace is bounded by the chunk size and compressed capacity, avoiding a context-by-context attention matrix.
+The index semantics follow the checkpoint's [QSA indexer](https://github.com/sgl-project/sglang/blob/c765f8818afae5a4eaa91bc7708e99e1026330ef/python/sglang/srt/layers/attention/qsa/qsa_indexer.py). Native selection uses exact radix filtering with deterministic lower-block-ID ties. Index score workspace is bounded by the chunk size and compressed capacity, avoiding a context-by-context attention matrix.
+
+The native recipe optionally uses the checkpoint's one-layer MTP. Convert its
+weights separately, using the same original revision and E8P/A8 policy:
+
+```bash
+bash tools/quantization/run_flash_next.sh \
+  --index original/model.safetensors.index.json --revision SOURCE_COMMIT_SHA \
+  --output artifacts/quantization/flash-next/mtp-weights \
+  --component mtp --layers 0:1 --stage all
+.venv/bin/python -m tools.model.flash_weights \
+  --converted artifacts/quantization/flash-next/mtp-weights \
+  --index original/model.safetensors.index.json \
+  --output artifacts/models/flash-next-e8p-a8-mtp \
+  --config original/config.json --frontend original
+bash tools/operators/run.sh tools/model/flash_native.py artifacts/flash-mtp \
+  --checkpoint artifacts/models/flash-next-e8p-a8 \
+  --mtp-checkpoint artifacts/models/flash-next-e8p-a8-mtp \
+  --mtp-drafts 3 --chunk 128 --graph on
+```
+
+The draft shares embeddings and the output head with the target. Its fusion
+normalizes the complete four-stream target HC tensor, projects each branch with
+the same BF16 matrix, and adds the projected next-token embedding. Its QSA KV
+also uses INT8. Greedy verification commits only the matching draft prefix and
+one target token; GDN, convolution, PLE and pending index states are saved at
+every verification position. Rejected cache tails remain outside the live
+cursor. `--mtp-drafts` accepts 1..7 and defaults to 3. Smaller budget/context tails
+use power-of-two verification profiles, with single-token decode for the last
+slot. MTP is opt-in for this offline recipe and does not add online serving or
+stochastic sampling support. `tools/model/validate_flash_mtp.py` compares real
+requests with MTP off, tests forced rejection and complete session restoration,
+and measures draft, verification, commit and refresh together.
+
+Tune draft depth for code generation with authored Python, Rust and TypeScript
+requests. `0` disables MTP; the sweep compares every candidate with the same
+target greedy continuation and reports complete warmed decode time. Use a
+smaller context for the initial broad sweep, then repeat the leading depths
+at the deployment context, with longer outputs and `--thinking both` (default
+reasoning effort: `xhigh`):
+
+```bash
+bash tools/operators/run.sh tools/model/tune_flash_mtp.py artifacts/flash-mtp-code \
+  --checkpoint artifacts/models/flash-next-e8p-a8 \
+  --mtp-checkpoint artifacts/models/flash-next-e8p-a8-mtp \
+  --context 16384 --lengths 512 --drafts 0 1 2 3 4 5 6 7 \
+  --decode 256 --trials 2
+```
+
+Compilation, prefill and prefix restoration are outside decode timing; drafting,
+verification, accepted-state commit and draft refresh are included. Generated
+code and measurements stay under the output directory. This benchmark checks
+MTP regression against our target; independent BF16 and functional code-quality
+evaluation remain separate.
+
+For code requests with `xhigh` thinking enabled, use fixed depth 3. Start with
+depth 5 for short direct completions and depth 7 for longer direct implementations.
+These are per-request choices; the controller does not switch at the thinking
+delimiter. Keep graphs enabled and
+prefill chunks at 128. `--budgets 384 1536` tests both bounded and complete
+continuations; EOS still ends a request before its budget. Re-tune on the actual
+workload rather than choosing by acceptance rate alone. Each warmed trial also
+checks exact restoration of the complete target and draft private state.
 
 Once the original reference is complete, use a new output directory to score the same histories and explicitly query the original top3 token probabilities:
 

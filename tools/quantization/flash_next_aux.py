@@ -17,6 +17,7 @@ from tools.quantization.flash_next import atomic_json, bf16, digest, equivalent
 def policy(name, info):
     if 'ngram_embedding.' in name:return 'e8p-embedding'
     if '.experts.' in name:return 'experts'
+    if name.startswith('mtp.fc_'):return 'original'
     if len(info['shape']) == 2 and name.endswith('.weight') and not any(
             s in name for s in ('hyper_connection','norm','.mlp.gate.','.shared_expert_gate.')):
         return 'int8-row'
@@ -30,10 +31,12 @@ def int8_rows(raw):
     return np.rint(raw/scale.astype(np.float32)[:,None]).clip(-127,127).astype(np.int8),scale
 
 
-def tasks(source, chunk_bytes=32*1024**2):
+def tasks(source, chunk_bytes=32*1024**2, *, component='text'):
+    if component not in ('text','mtp'):raise ValueError('Invalid Flash component')
     result = []
     for name in sorted(source.weight_map):
-        if not (name.startswith('model.language_model.') or name == 'lm_head.weight') or '.experts.' in name:continue
+        selected = name.startswith('mtp.') if component == 'mtp' else name.startswith('model.language_model.') or name == 'lm_head.weight'
+        if not selected or '.experts.' in name:continue
         filename,begin,info = source.tensor(name)
         kind = policy(name,info)
         shape = info['shape']
@@ -82,7 +85,7 @@ def prefetch(source, queue, *, workers=2):
             for future in pending.values():future.cancel()
 
 
-def convert(source, output, encoder, *, source_contract, seed, max_chunks=None, kind_filter=None):
+def convert(source, output, encoder, *, source_contract, seed, max_chunks=None, kind_filter=None, component='text'):
     if max_chunks is not None and (type(max_chunks) is not int or max_chunks < 0):
         raise ValueError('Auxiliary chunk limit must be nonnegative')
     contract = json.dumps({'format':'orinfer.flash_next.aux.v1','source_contract':source_contract,'seed':seed,
@@ -91,7 +94,7 @@ def convert(source, output, encoder, *, source_contract, seed, max_chunks=None, 
     state_path = output/'aux-progress.json'
     state = json.loads(state_path.read_text()) if state_path.exists() else {'contract':contract,'shards':{},'complete':False}
     if state['contract'] != contract:raise ValueError('Auxiliary conversion contract changed')
-    queue = tasks(source)
+    queue = tasks(source,component=component)
     state['expected_shards'] = len(queue)
     pending=[]
     signs = np.random.default_rng(seed).choice(np.array([-1,1],np.int8),160)
