@@ -11,9 +11,11 @@ from tools.operators.common import configure,error,benchmark,write_json,export_k
 def main():
     p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True)
     p.add_argument('--metadata-check',action='store_true',help='Check metadata graph mutation, tails and the full 256k address range')
+    p.add_argument('--sanitizer-check',action='store_true',help='Small packed multi-tile cases for memory/race instrumentation')
     a=p.parse_args();configure()
     report={'complete':False,'cases':[]}
     cases=[(1,9,0),(2,35,31),(4,2053,2047),(8,8192,8184),(512,4096,3584),(8,262144,262136)] if a.metadata_check else [(1,2053,0),(4,2053,2047),(1,262144,262143),(128,262144,262016)]
+    if a.sanitizer_check:cases=[(2,35,31),(8,2053,2045)]
     for m,capacity,start in cases:
         query=torch.randn((m,24,256),device='cuda').half();gate=torch.randn_like(query)
         k=torch.randint(-128,128,(capacity,2,256),device='cuda',dtype=torch.int8);v=torch.randint_like(k,-128,128)
@@ -32,6 +34,7 @@ def main():
         oracle=attention(query,dequantize_kv(k,ks),dequantize_kv(v,vs),gate,selected)
         case={'rows':m,'capacity':capacity,'position':start,'candidates':[]};baseline=None
         variants=[(8,False),(8,True)] if a.metadata_check else [(8,False),(8,True),(4,True),(2,True),(1,True)]
+        if a.sanitizer_check:variants=[(8,True)]
         for splits,packed in variants:
             maximum=torch.empty((m,24,splits),device='cuda');den=torch.empty_like(maximum)
             partial=torch.empty((m,24,splits,256),device='cuda')
@@ -39,7 +42,8 @@ def main():
             kernel=sparse_attention(m,capacity,splits,packed);merge=sparse_merge(m,splits)
             kk,vv=(k.view(torch.uint32),v.view(torch.uint32)) if packed else (k,v)
             def run():kernel(query,kk,vv,ks,vs,selected,position,maximum,den,partial);merge(maximum,den,partial,gate,out)
-            timing,graph=benchmark(run,repetitions=5)
+            timing,graph=benchmark(run,repetitions=1 if a.sanitizer_check else 5,
+                                   warmup=1 if a.sanitizer_check else 3)
             metric=error(out,oracle);assert metric['finite'] and metric['relative_l2']<.004,metric
             if baseline is None:baseline=out.clone()
             if splits==8:assert torch.equal(out,baseline),'Packed conversion changed FP16 bits'
@@ -50,9 +54,19 @@ def main():
             assert changed['finite'] and changed['relative_l2']<.004,changed
             assert bool((guarded[-1]==91).all())
             query.copy_(old);selected.copy_(old_selected);position.fill_(start)
+            # Captured gathers must observe changed KV bytes and group scales.
+            saved_k=k.clone();saved_v=v.clone();saved_ks=ks.clone();saved_vs=vs.clone()
+            k.bitwise_xor_(37);v.bitwise_xor_(91);ks.mul_(.75);vs.mul_(1.125)
+            graph.replay();torch.cuda.synchronize()
+            kv_changed=error(out,attention(query,dequantize_kv(k,ks),dequantize_kv(v,vs),gate,selected))
+            assert kv_changed['finite'] and kv_changed['relative_l2']<.004,kv_changed
+            k.copy_(saved_k);v.copy_(saved_v);ks.copy_(saved_ks);vs.copy_(saved_vs)
+            graph.replay();torch.cuda.synchronize()
+            if splits==8:assert torch.equal(out,baseline),'Restored KV changed captured output'
+            assert bool((guarded[-1]==91).all())
             export_kernel(kernel,a.output/f'attention-{m}-{capacity}-{splits}-{packed}')
             case['candidates'].append({'splits':splits,'packed':packed,'error':metric,'changed_graph_error':changed,
-                                       'metadata_graph_mutation':a.metadata_check,'tail_guard':True,'timing':timing})
+                                       'kv_and_scale_graph_mutation':kv_changed,'metadata_graph_mutation':a.metadata_check,'tail_guard':True,'timing':timing})
             print('QSA',m,capacity,splits,packed,timing['median_ms'],flush=True)
         report['cases'].append(case);write_json(a.output/'results.json',report)
     report['complete']=True;write_json(a.output/'results.json',report)

@@ -41,7 +41,12 @@ def sparse_attention(m: int,capacity: int,splits: int = 8,packed: bool = False):
             key_scales=T.alloc_shared((block,4),T.float16)
             value_scales=T.alloc_shared((block,4),T.float16)
             q=T.alloc_shared((16,256),T.float16)
-            k=T.alloc_shared((block,256),T.float16);v=T.alloc_shared((block,256),T.float16)
+            k=T.alloc_shared((block,256),T.float16)
+            if packed:
+                raw_k=T.alloc_shared((block,64),T.uint32)
+                raw_v=T.alloc_shared((block,64),T.uint32)
+            else:
+                v=T.alloc_shared((block,256),T.float16)
             p=T.alloc_shared((16,block),T.float16)
             scores=T.alloc_fragment((16,block),T.float32)
             acc=T.alloc_fragment((16,256),T.float32)
@@ -70,24 +75,28 @@ def sparse_attention(m: int,capacity: int,splits: int = 8,packed: bool = False):
                     if token>=0 and token<=Position[0]+row:
                         key_scales[j,g]=KS[token,kh,g];value_scales[j,g]=VS[token,kh,g]
                 T.sync_threads()
-                # Scalar signed loads avoid the aarch64 vector-cast lowering
-                # through plain char (which is unsigned on this platform).
+                # Gather packed INT8 KV in 16-byte asynchronous loads. Keep
+                # packed V until softmax finishes so K and V can share one
+                # FP16 tensor-core tile without increasing shared memory.
                 if packed:
+                    for j,segment in T.Parallel(block,16):
+                        token=selected_tile[j]
+                        valid=token>=0 and token<=Position[0]+row
+                        safe=T.max(token,0)
+                        T.ptx_cp_async(
+                            T.tvm_access_ptr(T.type_annotation(T.uint32),raw_k.data,j*64+segment*4,4,2),
+                            T.tvm_access_ptr(T.type_annotation(T.uint32),K.data,(safe*2+kh)*64+segment*4,4,1),
+                            4,predicate=valid)
+                        T.ptx_cp_async(
+                            T.tvm_access_ptr(T.type_annotation(T.uint32),raw_v.data,j*64+segment*4,4,2),
+                            T.tvm_access_ptr(T.type_annotation(T.uint32),V.data,(safe*2+kh)*64+segment*4,4,1),
+                            4,predicate=valid)
+                    T.ptx_commit_group();T.ptx_wait_group(0);T.sync_threads()
                     for j,pair in T.Parallel(block,128,coalesced_width=T.int32(1)):
-                        slot=start+tile*block+j
-                        k[j,pair*2]=0;k[j,pair*2+1]=0
-                        v[j,pair*2]=0;v[j,pair*2+1]=0
-                        if slot<end:
-                            token=selected_tile[j]
-                            if token>=0 and token<=Position[0]+row:
-                                kw=T.call_pure_extern('uint32','qsa_dequant_pair',K[token,kh,pair//2] >> ((pair%2)*16),
-                                    T.reinterpret(T.uint16,key_scales[j,pair//32]))
-                                vw=T.call_pure_extern('uint32','qsa_dequant_pair',V[token,kh,pair//2] >> ((pair%2)*16),
-                                    T.reinterpret(T.uint16,value_scales[j,pair//32]))
-                                k[j,pair*2]=T.reinterpret(T.float16,T.cast(kw&65535,T.uint16))
-                                k[j,pair*2+1]=T.reinterpret(T.float16,T.cast(kw>>16,T.uint16))
-                                v[j,pair*2]=T.reinterpret(T.float16,T.cast(vw&65535,T.uint16))
-                                v[j,pair*2+1]=T.reinterpret(T.float16,T.cast(vw>>16,T.uint16))
+                        kw=T.call_pure_extern('uint32','qsa_dequant_pair',raw_k[j,pair//2] >> ((pair%2)*16),
+                            T.reinterpret(T.uint16,key_scales[j,pair//32]))
+                        k[j,pair*2]=T.reinterpret(T.float16,T.cast(kw&65535,T.uint16))
+                        k[j,pair*2+1]=T.reinterpret(T.float16,T.cast(kw>>16,T.uint16))
                 else:
                     for j,d in T.Parallel(block,256,coalesced_width=T.int32(1)):
                         slot=start+tile*block+j
@@ -112,7 +121,16 @@ def sparse_attention(m: int,capacity: int,splits: int = 8,packed: bool = False):
                     correction[i]=T.exp(previous[i]-maximum[i])
                     denom[i]=denom[i]*correction[i]+rowsum[i]
                 for i,d in T.Parallel(16,256):acc[i,d]*=correction[i]
-                T.gemm(p,v,acc)
+                if packed:
+                    T.sync_threads()
+                    for j,pair in T.Parallel(block,128,coalesced_width=T.int32(1)):
+                        vw=T.call_pure_extern('uint32','qsa_dequant_pair',raw_v[j,pair//2] >> ((pair%2)*16),
+                            T.reinterpret(T.uint16,value_scales[j,pair//32]))
+                        k[j,pair*2]=T.reinterpret(T.float16,T.cast(vw&65535,T.uint16))
+                        k[j,pair*2+1]=T.reinterpret(T.float16,T.cast(vw>>16,T.uint16))
+                    T.gemm(p,k,acc)
+                else:
+                    T.gemm(p,v,acc)
             for i,d in T.Parallel(16,256):
                 if i<12:Out[row,kh*12+i,split,d]=acc[i,d]
             for i in T.Parallel(16):

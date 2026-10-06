@@ -20,7 +20,7 @@ from kernels.model import flash_next as fn
 from kernels.model import qsa
 from kernels.model import qsa_attention as qsat
 from kernels.model import flash_mtp as fm
-from kernels.model.hyperconnection import hc_norm, hc_silu, hc_projection, hc_mix, hc_combine, hc_up_mix
+from kernels.model.hyperconnection import hc_norm, hc_silu, hc_projection, hc_mix, hc_combine, hc_up_mix, hc_injection, hc_down_partial, hc_down_finish
 from kernels.model.ple import ple_gate, ple_conv, ple_history
 from kernels.model.gdn_sequence import gdn_sequence, gdn_commit
 from kernels.model.greedy import greedy_partials, greedy_merge
@@ -47,7 +47,7 @@ class Model:
 
     def __init__(self, source, capacity, output, *, use_graph=True, target=None,
                  hc_fused=True, compact_gdn=True, direct_experts=False, fused_rotation=True,
-                 expert_shortbook=True):
+                 expert_shortbook=True, hc_parallel=True, hc_splits=4):
         maximum = source.config['text_config']['max_position_embeddings']
         if type(capacity) is not int or not 1 <= capacity <= min(maximum,262144):
             raise ValueError('Context exceeds the checkpoint/native 262144 limit')
@@ -55,6 +55,9 @@ class Model:
         self.hc_fused,self.compact_gdn,self.direct_experts=hc_fused,compact_gdn,direct_experts
         self.fused_rotation=fused_rotation
         self.expert_shortbook=expert_shortbook
+        self.hc_parallel=hc_parallel
+        if hc_splits not in (0,2,4,8,16):raise ValueError('Invalid HC split count')
+        self.hc_splits=hc_splits
         self.draft_vocab=None
         self.is_mtp=source.config['quantization_config'].get('component')=='mtp'
         if self.is_mtp:
@@ -265,7 +268,9 @@ class Model:
                 labels[-1]=f'{label}:{labels[-1]}'
             else:
                 n,width = weight.shape
-                if hc:
+                if hc and self.hc_parallel and rows<=8 and n<=c:
+                    call(f'hc-injection-{rows}-{n}-{width}',lambda:hc_injection(rows,n,width),a,weight,out)
+                elif hc:
                     bm=64 if m>=64 and n>=c*h else 16
                     bn=32 if m==1 and n<=rank else 64
                     call(f'hc-{m}-{n}-{width}-{bm}-{bn}',lambda:hc_projection(m,n,width,block_m=bm,dtype='float16',block_n=bn),a,weight,out)
@@ -278,11 +283,18 @@ class Model:
         down, activated = empty((m,rank)), empty((m,rank))
         mixed, block = empty((m,h)), empty((m,h))
         inject_attn, inject_ffn = empty((m,c)), empty((m,c))
+        hc_splits=self.hc_splits
+        hc_partials = empty((hc_splits,m,rank),torch.float32) if hc_splits and m<=8 else None
         def mixer(prefix, inject):
             call(f'hc-norm-{m}', lambda: hc_norm(m,h,c,dtype='float16'),residual,self.weights[prefix+'norm.weight'],normed)
             if self.hc_fused and m<=8:
-                call(f'hc-down-silu-{m}',lambda:hc_projection(m,rank,c*h,dtype='float16',block_n=32,silu=True),
-                     normed.flatten(1),self.weights[prefix+'down.weight'],activated)
+                if hc_partials is not None:
+                    call(f'hc-down-partial-{m}-{hc_splits}',lambda:hc_down_partial(m,rank,c*h,hc_splits),
+                         normed.flatten(1),self.weights[prefix+'down.weight'],hc_partials)
+                    call(f'hc-down-finish-{m}-{hc_splits}',lambda:hc_down_finish(m,rank,hc_splits),hc_partials,activated)
+                else:
+                    call(f'hc-down-silu-{m}',lambda:hc_projection(m,rank,c*h,dtype='float16',block_n=32,silu=True),
+                         normed.flatten(1),self.weights[prefix+'down.weight'],activated)
                 call(f'hc-up-mix-{m}',lambda:hc_up_mix(m,h,rank),activated,self.weights[prefix+'up.weight'],normed,mixed)
             else:
                 projection('hc-down',normed.flatten(1),prefix+'down.weight',down,True)

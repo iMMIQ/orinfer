@@ -185,3 +185,86 @@ def hc_up_mix(M: int, H: int, rank: int, streams: int = 4):
             for i,j in T.Parallel(bm,bn):
                 if by*bm+i<M:Out[by*bm+i,bx*bn+j]=total[i,j]/streams
     return main
+
+
+@orin_jit
+def hc_injection(M: int, N: int, K: int, dtype: str = 'float16', threads: int = 256):
+    """Small-output HC projection with one CTA per token/output channel.
+
+    Round activation operands to BF16, retain BF16 weights and reduce in FP32.
+    The reduction association differs from Tensor Core projection; all stream
+    rounding boundaries remain explicit. Output must be disjoint from inputs.
+    """
+    _dtype(dtype)
+    if (any(type(x) is not int or x <= 0 for x in (M,N,K)) or N > 16
+            or threads not in (128,256)):
+        raise ValueError('Invalid small HC projection dimensions')
+    width = (K+threads-1)//threads*threads
+    @T.prim_func
+    def main(A:T.Tensor((M,K),dtype),W:T.Tensor((N,K),T.bfloat16),Out:T.Tensor((M,N),dtype)):
+        with T.Kernel(M,N,threads=threads) as (row,col):
+            product=T.alloc_fragment((width,),T.float32)
+            total=T.alloc_fragment((1,),T.float32)
+            for d in T.Parallel(width,coalesced_width=T.int32(1)):
+                product[d]=0
+                if d<K:
+                    activation=T.cast(T.cast(A[row,d],T.bfloat16),T.float32)
+                    product[d]=activation*T.cast(W[col,d],T.float32)
+            T.reduce_sum(product,total,dim=0)
+            Out[row,col]=total[0]
+    return main
+
+
+@orin_jit
+def hc_down_partial(M: int, N: int, K: int, splits: int = 4):
+    """BF16 Tensor Core HC Down slices with FP32 partial sums.
+
+    Partials are transient plan workspace, overwritten completely on every
+    call. Do not round partials or apply SiLU before the final reduction.
+    """
+    if (any(type(x) is not int or x <= 0 for x in (M,N,K))
+            or splits not in (2,4,8,16) or K%(64*splits)):
+        raise ValueError('Invalid HC split-K dimensions')
+    bm,bn=16,32
+    @T.prim_func
+    def main(A:T.Tensor((M,K),T.float16),W:T.Tensor((N,K),T.bfloat16),
+             Partials:T.Tensor((splits,M,N),T.float32)):
+        with T.Kernel(T.ceildiv(M,bm),T.ceildiv(N,bn),splits,threads=128) as (by,bx,part):
+            a=T.alloc_shared((bm,64),T.bfloat16)
+            w=T.alloc_shared((bn,64),T.bfloat16)
+            acc=T.alloc_fragment((bm,bn),T.float32)
+            T.clear(acc)
+            for kg in T.Pipelined(K//(64*splits),num_stages=2):
+                for i,j in T.Parallel(bm,64,coalesced_width=T.int32(1)):
+                    a[i,j]=0
+                    if by*bm+i<M:a[i,j]=A[by*bm+i,part*(K//splits)+kg*64+j]
+                T.copy(W[bx*bn,part*(K//splits)+kg*64],w)
+                T.gemm(a,w,acc,transpose_B=True)
+            for i,j in T.Parallel(bm,bn):
+                if by*bm+i<M and bx*bn+j<N:
+                    Partials[part,by*bm+i,bx*bn+j]=acc[i,j]
+    return main
+
+
+@orin_jit
+def hc_down_finish(M: int, N: int, splits: int = 4, streams: int = 4):
+    """Reduce FP32 HC Down slices, then round/divide/SiLU in original order."""
+    if (any(type(x) is not int or x <= 0 for x in (M,N,streams))
+            or splits not in (2,4,8,16)):
+        raise ValueError('Invalid HC split-K epilogue dimensions')
+    @T.prim_func
+    def main(Partials:T.Tensor((splits,M,N),T.float32),Out:T.Tensor((M,N),T.float16)):
+        with T.Kernel(T.ceildiv(M*N,128),threads=128) as block:
+            acc=T.alloc_fragment((128,),T.float32)
+            T.clear(acc)
+            for part in T.serial(splits):
+                for i in T.Parallel(128):
+                    index=block*128+i
+                    if index<M*N:acc[i]+=Partials[part,index//N,index%N]
+            for i in T.Parallel(128):
+                index=block*128+i
+                if index<M*N:
+                    rounded=T.cast(acc[i],T.float16)
+                    value=T.cast(T.cast(T.cast(rounded,T.float32)/streams,T.float16),T.float32)
+                    Out[index//N,index%N]=value/(1+T.exp(-value))
+    return main
