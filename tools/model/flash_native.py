@@ -20,12 +20,13 @@ from kernels.model import flash_next as fn
 from kernels.model import qsa
 from kernels.model import qsa_attention as qsat
 from kernels.model import flash_mtp as fm
-from kernels.model.hyperconnection import hc_norm, hc_silu, hc_projection, hc_mix, hc_combine
+from kernels.model.hyperconnection import hc_norm, hc_silu, hc_projection, hc_mix, hc_combine, hc_up_mix
 from kernels.model.ple import ple_gate, ple_conv, ple_history
-from kernels.model.gdn_sequence import gdn_sequence
+from kernels.model.gdn_sequence import gdn_sequence, gdn_commit
 from kernels.model.greedy import greedy_partials, greedy_merge
 from kernels.model.int8_projection import int8_projection, int8_gemv
-from kernels.model.integer_vq import integer_vq_grouped, rotate_activation
+from kernels.model.integer_vq import integer_vq_grouped, integer_e8p_gemv, rotate_activation
+from kernels.model.rotation_a8 import rotate_activation_a8
 from kernels.model.moe import router_topk, expert_histogram, expert_offsets, expert_tiles, expert_dispatch, moe_combine
 from kernels.operators.op08_gdn_conv_prep import gdn_conv_prep
 from kernels.operators.op09_gdn_gates import gdn_gates, launch as launch_gates
@@ -43,11 +44,15 @@ from tools.operators.common import configure, environment, export_kernel, write_
 class Model:
     H, F, E, K, C, R, V = 2560, 640, 512, 10, 4, 320, 248320
 
-    def __init__(self, source, capacity, output, *, use_graph=True, target=None):
+    def __init__(self, source, capacity, output, *, use_graph=True, target=None,
+                 hc_fused=True, compact_gdn=True, direct_experts=False, fused_rotation=True):
         maximum = source.config['text_config']['max_position_embeddings']
         if type(capacity) is not int or not 1 <= capacity <= min(maximum,262144):
             raise ValueError('Context exceeds the checkpoint/native 262144 limit')
         self.source, self.capacity, self.output = source, capacity, output
+        self.hc_fused,self.compact_gdn,self.direct_experts=hc_fused,compact_gdn,direct_experts
+        self.fused_rotation=fused_rotation
+        self.draft_vocab=None
         self.is_mtp=source.config['quantization_config'].get('component')=='mtp'
         if self.is_mtp:
             if target is None or target.is_mtp or target.capacity!=capacity:
@@ -72,6 +77,41 @@ class Model:
         if self.is_mtp:self.weights['output.weight']=target.weights['output.weight']
         self.last_plan=None
         self.transaction=None
+
+    def set_draft_vocab(self, tokens):
+        if not self.is_mtp or self.plans:raise ValueError('Set draft vocabulary before compiling plans')
+        if tokens is None:
+            self.draft_vocab=None;self.weights.pop('draft_output.weight',None)
+            return
+        if (len(tokens)<256 or len(tokens)%64 or list(tokens)!=sorted(set(tokens)) or
+                any(type(t) is not int or not 0<=t<self.V for t in tokens)):
+            raise ValueError('Expected sorted unique draft token IDs, aligned to 64')
+        self.draft_vocab=list(tokens)
+        weight,scale=self.weights['output.weight']
+        selected=torch.tensor(tokens,device=weight.device,dtype=torch.int64)
+        self.weights['draft_output.weight']=(weight.index_select(0,selected),scale.index_select(0,selected))
+
+    def head_token(self, hidden):
+        """Refresh a restored draft's next token with its current head policy."""
+        if (not self.is_mtp or not isinstance(hidden,torch.Tensor) or hidden.shape!=(1,self.C,self.H)
+                or hidden.dtype!=torch.float16 or hidden.device!=self.position_gpu.device):
+            raise ValueError('Expected one FP16 draft HC row on the model device')
+        if not np.isfinite(hidden.cpu().numpy()).all():raise ValueError('Nonfinite draft HC condition')
+        plan=self.plan(1);plan['residual'].copy_(hidden)
+        ops=plan['ops'][plan['body_count']:]+plan['greedy_ops']
+        if self.use_graph:
+            if 'head-token' not in plan['graphs']:
+                graph=torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for kernel,args in ops:kernel(*args)
+                plan['graphs']['head-token']=graph
+            plan['graphs']['head-token'].replay()
+        else:
+            for kernel,args in ops:kernel(*args)
+        selected=plan['token'].cpu().numpy()
+        if selected[1]:raise ValueError('Nonfinite draft logits')
+        token=int(selected[0])
+        return self.draft_vocab[token] if self.draft_vocab is not None else token
 
     def load(self):
         text = self.source.config['text_config']
@@ -172,13 +212,14 @@ class Model:
         key=(m,'verify') if verify else m
         if key in self.plans:
             return self.plans[key]
-        if not 1 <= m <= 128:
-            raise ValueError('Recurrent plan supports chunks of 1..128')
+        if not 1 <= m <= 512:
+            raise ValueError('Recurrent plan supports chunks of 1..512')
         if verify and (self.is_mtp or not 1<=m<=8):raise ValueError('Target verification supports 1..8 inputs')
         h, f, c, rank, e, k = self.H, self.F, self.C, self.R, self.E, self.K
         ops = []
         labels = []
         prefix_states={}
+        prefix_updates={}
         def empty(shape, dtype=torch.float16):
             return torch.empty(shape, device='cuda', dtype=dtype)
         def call(label, build, *args):
@@ -230,10 +271,15 @@ class Model:
         inject_attn, inject_ffn = empty((m,c)), empty((m,c))
         def mixer(prefix, inject):
             call(f'hc-norm-{m}', lambda: hc_norm(m,h,c,dtype='float16'),residual,self.weights[prefix+'norm.weight'],normed)
-            projection('hc-down',normed.flatten(1),prefix+'down.weight',down,True)
-            call(f'hc-silu-{m}',lambda:hc_silu(m,rank,c,'float16'),down,activated)
-            projection('hc-up',activated,prefix+'up.weight',up.flatten(1),True)
-            call(f'hc-mix-{m}',lambda:hc_mix(m,h,c,'float16'),normed,up,mixed)
+            if self.hc_fused and m<=8:
+                call(f'hc-down-silu-{m}',lambda:hc_projection(m,rank,c*h,dtype='float16',block_n=32,silu=True),
+                     normed.flatten(1),self.weights[prefix+'down.weight'],activated)
+                call(f'hc-up-mix-{m}',lambda:hc_up_mix(m,h,rank),activated,self.weights[prefix+'up.weight'],normed,mixed)
+            else:
+                projection('hc-down',normed.flatten(1),prefix+'down.weight',down,True)
+                call(f'hc-silu-{m}',lambda:hc_silu(m,rank,c,'float16'),down,activated)
+                projection('hc-up',activated,prefix+'up.weight',up.flatten(1),True)
+                call(f'hc-mix-{m}',lambda:hc_mix(m,h,c,'float16'),normed,up,mixed)
             if inject is not None:
                 projection('hc-inject',normed.flatten(1),prefix+'inject.weight',inject,True)
         condition=None
@@ -326,9 +372,15 @@ class Model:
                 if verify:save_history(f'{i}:conv',qkv,3)
                 ops.append((lambda source,destination:destination.copy_(source),(ho,self.states[f'{i}:conv'])))
                 labels.append('gdn-history-copy')
-                saved=empty((m,48,128,128),torch.float32) if verify else prefix_state
-                call(f'gdn-sequence-{m}-{"prefix" if verify else "inplace"}',lambda:gdn_sequence(m,in_place=not verify),q[0],keys[0],values[0],g,beta,self.states[f'{i}:gdn'],saved,recurrent)
-                if verify:
+                compact=verify and self.compact_gdn
+                saved=empty((m,48,128) if compact else (m,48,128,128),torch.float32) if verify else prefix_state
+                call(f'gdn-sequence-{m}-{"compact" if compact else "prefix" if verify else "inplace"}',lambda:gdn_sequence(m,in_place=not verify,compact=compact),q[0],keys[0],values[0],g,beta,self.states[f'{i}:gdn'],saved,recurrent)
+                if compact:
+                    saved_k=empty((16,m,128));saved_g=empty((m,48),torch.float32)
+                    for source,destination in ((keys[0],saved_k),(g,saved_g)):
+                        ops.append((lambda a,b:b.copy_(a),(source,destination)));labels.append('gdn-update-save')
+                    prefix_updates[f'{i}:gdn']=(saved_k,saved_g,saved)
+                elif verify:
                     prefix_states[f'{i}:gdn']=saved
                     ops.append((lambda a,b:b.copy_(a),(saved[-1],self.states[f'{i}:gdn'])))
                     labels.append('gdn-prefix-final')
@@ -363,22 +415,39 @@ class Model:
             mixer(prefix+'hc_ffn_',inject_ffn)
             projection('router',mixed,prefix+'ffn_gate_inp.weight',logits)
             call(f'router-{m}',lambda:router_topk(m,e,k),logits,ids,prob)
-            call(f'histogram-{m}',lambda:expert_histogram(m,e,k),ids,counts,relative)
-            call('offsets',lambda:expert_offsets(e),counts,offsets,tile_offsets,tile_count)
-            call(f'tiles-{m}',lambda:expert_tiles(m,e,k),counts,tile_offsets,tile_expert,tile_row)
+            direct=self.direct_experts and m==1
+            if not direct:
+                call(f'histogram-{m}',lambda:expert_histogram(m,e,k),ids,counts,relative)
+                call('offsets',lambda:expert_offsets(e),counts,offsets,tile_offsets,tile_count)
+                call(f'tiles-{m}',lambda:expert_tiles(m,e,k),counts,tile_offsets,tile_expert,tile_row)
             gate_weight = self.weights[prefix+'ffn_gate_up_exps.weight']
             down_weight = self.weights[prefix+'ffn_down_exps.weight']
-            call(f'rotate-hidden-{m}',lambda:rotate_activation(m,h),mixed,gate_weight['signs'],rotated)
-            quant_call(quant,rotated,masks[0],aq,sa)
-            call(f'dispatch-{m}',lambda:expert_dispatch(m,h,e,k,scale_group=h),aq,sa,ids,relative,offsets,dispatch,ds,slot_map)
-            call(f'expert-gu-{m}',lambda:integer_vq_grouped(assignments,e,tiles,2*f,h,kind='e8p',shared_table=True),
-                 dispatch,gate_weight['packed'],gate_weight['table'],patch,gate_weight['scale'],ds.view(-1),
-                 counts,offsets,tile_expert,tile_row,tile_count,gu)
-            call(f'rotate-ffn-{m}',lambda:rotate_activation(assignments,f,swiglu=True),gu,down_weight['signs'],rotated_ffn)
-            quant_call(ffn_quant,rotated_ffn,masks[1],fq,fs)
-            call(f'expert-down-{m}',lambda:integer_vq_grouped(assignments,e,tiles,h,f,kind='e8p',shared_table=True),
-                 fq,down_weight['packed'],down_weight['table'],patch,down_weight['scale'],fs.view(-1),
-                 counts,offsets,tile_expert,tile_row,tile_count,expert_out)
+            if self.fused_rotation:
+                call(f'rotate-a8-hidden-{m}',lambda:rotate_activation_a8(m,h),mixed,gate_weight['signs'],aq,sa)
+            else:
+                call(f'rotate-hidden-{m}',lambda:rotate_activation(m,h),mixed,gate_weight['signs'],rotated)
+                quant_call(quant,rotated,masks[0],aq,sa)
+            if direct:
+                slot_map.copy_(torch.arange(k,device='cuda',dtype=torch.int32).view(1,k))
+                call('expert-gu-direct',lambda:integer_e8p_gemv(e,k,2*f,h,shared_input=True),
+                     aq.view(torch.int32),gate_weight['packed'],gate_weight['table'],gate_weight['scale'],sa.view(-1),ids,gu)
+            else:
+                call(f'dispatch-{m}',lambda:expert_dispatch(m,h,e,k,scale_group=h),aq,sa,ids,relative,offsets,dispatch,ds,slot_map)
+                call(f'expert-gu-{m}',lambda:integer_vq_grouped(assignments,e,tiles,2*f,h,kind='e8p',shared_table=True),
+                     dispatch,gate_weight['packed'],gate_weight['table'],patch,gate_weight['scale'],ds.view(-1),
+                     counts,offsets,tile_expert,tile_row,tile_count,gu)
+            if self.fused_rotation:
+                call(f'rotate-a8-ffn-{m}',lambda:rotate_activation_a8(assignments,f,swiglu=True),gu,down_weight['signs'],fq,fs)
+            else:
+                call(f'rotate-ffn-{m}',lambda:rotate_activation(assignments,f,swiglu=True),gu,down_weight['signs'],rotated_ffn)
+                quant_call(ffn_quant,rotated_ffn,masks[1],fq,fs)
+            if direct:
+                call('expert-down-direct',lambda:integer_e8p_gemv(e,k,h,f,shared_input=False),
+                     fq.view(torch.int32),down_weight['packed'],down_weight['table'],down_weight['scale'],fs.view(-1),ids,expert_out)
+            else:
+                call(f'expert-down-{m}',lambda:integer_vq_grouped(assignments,e,tiles,h,f,kind='e8p',shared_table=True),
+                     fq,down_weight['packed'],down_weight['table'],patch,down_weight['scale'],fs.view(-1),
+                     counts,offsets,tile_expert,tile_row,tile_count,expert_out)
             shared_a8=quantize(mixed)
             projection('shared-gate',mixed,prefix+'ffn_gate_shexp.weight',shared_gate,a8=shared_a8)
             projection('shared-up',mixed,prefix+'ffn_up_shexp.weight',shared_up,a8=shared_a8)
@@ -390,19 +459,23 @@ class Model:
         body_count=len(ops)
         mixer('output_hc_',None)
         head_rows=m if verify else 1
-        output=empty((head_rows,self.V),torch.float32)
-        projection('head',mixed if verify else mixed[-1:],'output.weight',output,rows=head_rows)
-        blocks=(self.V+1023)//1024
+        head_vocab=len(self.draft_vocab) if self.draft_vocab is not None else self.V
+        output=empty((head_rows,head_vocab),torch.float32)
+        projection('head',mixed if verify else mixed[-1:],
+                   'draft_output.weight' if self.draft_vocab is not None else 'output.weight',output,rows=head_rows)
+        blocks=(head_vocab+1023)//1024
         top_values=empty((head_rows*blocks,),torch.float32)
         top_indices,top_invalid=(empty((head_rows*blocks,),torch.int32) for _ in range(2))
         token=empty((head_rows*2,),torch.int32)
-        greedy_ops=[(self.kernel(f'greedy-partials-{head_rows}',lambda:greedy_partials(self.V,head_rows)),
+        greedy_ops=[(self.kernel(f'greedy-partials-{head_rows}-{head_vocab}',lambda:greedy_partials(head_vocab,head_rows)),
                      (output,top_values,top_indices,top_invalid)),
-                    (self.kernel(f'greedy-merge-{head_rows}',lambda:greedy_merge(self.V,head_rows)),
+                    (self.kernel(f'greedy-merge-{head_rows}-{head_vocab}',lambda:greedy_merge(head_vocab,head_rows)),
                      (top_values,top_indices,top_invalid,token))]
         plan={'ops':ops,'body_count':body_count,'greedy_ops':greedy_ops,'token':token,
               'labels':labels,'embedding':embedding,'ple_embedding':ple_embedding,'output':output,
-              'residual':residual,'condition':condition,'prefix_states':prefix_states,'graphs':{}}
+              'residual':residual,'condition':condition,'prefix_states':prefix_states,
+              'prefix_updates':prefix_updates,'accepted':torch.zeros(1,device='cuda',dtype=torch.int32),
+              'graphs':{}}
         self.plans[key]=plan
         print('compiled plan',m,'ops',len(ops),flush=True)
         return plan
@@ -419,6 +492,7 @@ class Model:
                 for name,value in self.states.items()}
 
     def snapshot(self, *, cpu=False):
+        if self.transaction is not None:raise ValueError('Commit verification before taking a snapshot')
         return {'states':{name:value.to(device="cpu",copy=True) if cpu else value.clone()
                           for name,value in self.live_states().items()},
                 'history':list(self.history),'position':self.position}
@@ -437,8 +511,10 @@ class Model:
         self.transaction=None;self.last_plan=None
 
     def execute(self, tokens, *, output='logits', hidden=None):
+        if self.transaction is not None:raise ValueError('Commit verification before executing again')
         if output not in ('logits','none','token','verify'):
             raise ValueError('Invalid output mode')
+        if output=='logits' and self.draft_vocab is not None:raise ValueError('Pruned draft supports token or body output only')
         if not tokens or self.position+len(tokens)>self.capacity:
             raise ValueError('Request exceeds native QSA context budget')
         if any(type(t) is not int or not 0<=t<self.V for t in tokens):raise ValueError('Invalid token ID')
@@ -478,6 +554,7 @@ class Model:
             selected=plan['token'].cpu().numpy().reshape(-1,2)
             if selected[:,1].any():raise ValueError('Nonfinite model logits')
             result=selected[:,0].astype(int).tolist() if output=='verify' else int(selected[0,0])
+            if self.draft_vocab is not None:result=self.draft_vocab[result]
         self.history=next_history;self.position+=len(tokens)
         self.last_plan=plan
         self.transaction=(plan,old_position,old_history,list(tokens)) if output=='verify' else None
@@ -489,7 +566,20 @@ class Model:
         plan,start,history,tokens=self.transaction
         if type(inputs) is not int or not 1<=inputs<=len(tokens):raise ValueError('Invalid accepted input count')
         if self.position!=start+len(tokens):raise ValueError('Verification cursor changed')
-        for name,value in plan['prefix_states'].items():self.states[name].copy_(value[inputs-1].reshape(self.states[name].shape))
+        plan['accepted'].fill_(inputs)
+        def submit():
+            for name,value in plan['prefix_states'].items():self.states[name].copy_(value[inputs-1].reshape(self.states[name].shape))
+            for name,(k,g,update) in plan['prefix_updates'].items():
+                self.kernel(f'gdn-commit-{len(tokens)}',lambda:gdn_commit(len(tokens)))(k,g,update,plan['accepted'],self.states[name])
+        if self.use_graph:
+            key=('commit',inputs)
+            if key not in plan['graphs']:
+                if plan['prefix_updates']:self.kernel(f'gdn-commit-{len(tokens)}',lambda:gdn_commit(len(tokens)))
+                graph=torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):submit()
+                plan['graphs'][key]=graph
+            plan['graphs'][key].replay()
+        else:submit()
         _,self.history=self.ple.row_ids(tokens[:inputs],history)
         self.position=start+inputs;self.position_gpu.fill_(self.position);self.transaction=None
 
@@ -560,17 +650,24 @@ def main():
     p.add_argument('--checkpoint',type=Path,required=True)
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--context',type=int,default=262144)
-    p.add_argument('--chunk',type=int,choices=(1,2,4,8,16,32,64,128),default=8)
+    p.add_argument('--chunk',type=int,choices=(1,2,4,8,16,32,64,128,256,512),default=512)
     p.add_argument('--max-new-tokens',type=int,default=64)
     p.add_argument('--graph',choices=('on','off'),default='on')
     p.add_argument('--baseline',type=Path,help='Original BF16/FP8 probes on exactly these forced histories')
     p.add_argument('--mtp-checkpoint',type=Path,help='Our separately published MTP weights; enables greedy speculation')
     p.add_argument('--mtp-drafts',type=int,default=DEFAULT_DRAFTS,
                    help=f'Speculative proposals per round, 1..7 (default: {DEFAULT_DRAFTS})')
+    p.add_argument('--mtp-vocab-size',type=int,default=65536,
+                   help='Draft-only source-code vocabulary; 0 uses the full head (default: 65536)')
+    p.add_argument('--mtp-adaptive',action='store_true',help='Opt in to measured 1/3/7 draft tiers')
+    p.add_argument('--native-optimizations',choices=('on','off'),default='on',help='HC fusion, compact GDN commit and rotation/A8 fusion')
+    p.add_argument('--direct-experts',action='store_true',help='Experimental single-token E8P DP4A routes')
     p.add_argument('--cases',nargs='+',help='Run selected scene IDs')
     a = p.parse_args()
     if a.max_new_tokens < 1:p.error('--max-new-tokens must be positive')
     if not 1<=a.mtp_drafts<=7:p.error('--mtp-drafts must be in 1..7')
+    if a.mtp_vocab_size and (not 256<=a.mtp_vocab_size<=Model.V or a.mtp_vocab_size%64):p.error('Invalid draft vocabulary size')
+    if a.mtp_adaptive and a.mtp_drafts not in (1,3,7):p.error('Adaptive initial depth must be 1, 3 or 7')
     configure();np.random.seed(SEED);a.output.mkdir(parents=True,exist_ok=True)
     started = time.perf_counter();source = Checkpoint(a.checkpoint)
     tokenizer,cases = scenes(a.checkpoint)
@@ -583,21 +680,28 @@ def main():
     baseline = baseline_probes(json.loads(a.baseline.read_text()),source.config['quantization_config'],cases) if a.baseline else []
     baseline_map = {(row['case_id'],row['position']):row for row in baseline}
     if len(baseline_map) != len(baseline):raise ValueError('Duplicate baseline scoring positions')
-    model = Model(source,a.context,a.output,use_graph=a.graph=='on')
+    options=dict(hc_fused=a.native_optimizations=='on',compact_gdn=a.native_optimizations=='on',
+                 fused_rotation=a.native_optimizations=='on',direct_experts=a.direct_experts)
+    model = Model(source,a.context,a.output,use_graph=a.graph=='on',**options)
     session=None
     if a.mtp_checkpoint:
         from tools.model.flash_mtp import Session
-        draft=Model(Checkpoint(a.mtp_checkpoint),a.context,a.output/'mtp',use_graph=a.graph=='on',target=model)
+        draft=Model(Checkpoint(a.mtp_checkpoint),a.context,a.output/'mtp',use_graph=a.graph=='on',target=model,**options)
+        if a.mtp_vocab_size:
+            from tools.model.flash_policy import code_vocabulary
+            draft.set_draft_vocab(code_vocabulary(tokenizer,Path(__file__).resolve().parents[2],a.mtp_vocab_size))
         session=Session(model,draft)
     torch.cuda.synchronize();load_s = time.perf_counter()-started
     write_json(a.output/'scenes.json',{'seed':SEED,'cases':cases,
         'frontend':[identity(a.checkpoint/name) for name in ('tokenizer.json','chat_template.jinja')]})
     warm_started = time.perf_counter();model.plan(1);model.plan(a.chunk)
-    checks = state_checks(model,cases[0]['prompt_ids'][:a.chunk])
+    checks = state_checks(model,cases[0]['prompt_ids'][:min(8,a.chunk)])
     model.reset();model.execute(cases[0]['prompt_ids'][:1],output='token');model.reset()
     if session:
+        max_depth=7 if a.mtp_adaptive else a.mtp_drafts
+        session.warm(cases[0]['prompt_ids'][0],(1,3,7) if a.mtp_adaptive else (a.mtp_drafts,))
         session.prefill(cases[0]['prompt_ids'],a.chunk)
-        warm_budget=max(8,2*(a.mtp_drafts+1)+1)
+        warm_budget=max(8,2*(max_depth+1)+1)
         session.generate(min(warm_budget,model.capacity-model.position+1),set(),drafts=a.mtp_drafts)
     torch.cuda.synchronize();warm_s = time.perf_counter()-warm_started
     generation_config = json.loads((a.checkpoint/'generation_config.json').read_text())
@@ -611,7 +715,10 @@ def main():
         else:logits = prefill(model,case['prompt_ids'],a.chunk)
         prefill_s = time.perf_counter()-begin;prefix = model.snapshot();prompt_logits = logits.copy()
         decode_started = time.perf_counter()
-        if session:tokens,reason=session.generate(a.max_new_tokens,eos,drafts=a.mtp_drafts)
+        if session:
+            from tools.model.flash_policy import AdaptiveDepth
+            tokens,reason=session.generate(a.max_new_tokens,eos,drafts=a.mtp_drafts,
+                policy=AdaptiveDepth(initial=a.mtp_drafts) if a.mtp_adaptive else None)
         else:tokens,reason=generate(model,logits,eos,a.max_new_tokens)
         decode_s = time.perf_counter()-decode_started
         text = tokenizer.decode(tokens,skip_special_tokens=True)
@@ -648,6 +755,8 @@ def main():
         'graph':a.graph,'chunk':a.chunk,'state_checks':checks,'requests':rows,'probes':probes,
         'mtp_checkpoint':identity(a.mtp_checkpoint/'model.safetensors.index.json') if a.mtp_checkpoint else None,
         'mtp_drafts':a.mtp_drafts if session else None,
+        'mtp_vocab_size':a.mtp_vocab_size if session else None,'mtp_adaptive':a.mtp_adaptive,
+        'native_optimizations':options,
         'baseline':identity(a.baseline) if a.baseline else None,'paired_probes':paired,
         'checkpoint_index':identity(a.checkpoint/'model.safetensors.index.json')})
 

@@ -19,6 +19,7 @@ from transformers import AutoTokenizer
 from tools.model.flash_checkpoint import Checkpoint
 from tools.model.flash_mtp import Session
 from tools.model.flash_speculation import verification_size
+from tools.model.flash_policy import code_vocabulary
 from tools.model.flash_native import Model, generate
 from tools.model.flash_long import state_hash
 from tools.operators.common import configure, environment, identity, write_json, SEED
@@ -117,6 +118,7 @@ def main():
     parser.add_argument('--mtp-checkpoint',type=Path,required=True)
     parser.add_argument('--compile-cache',nargs='+',type=Path,default=[])
     parser.add_argument('--context',type=int,default=262144)
+    parser.add_argument('--chunk',type=int,choices=(1,2,4,8,16,32,64,128,256,512),default=512)
     parser.add_argument('--lengths',nargs='+',type=int,default=[512,2048,8192])
     parser.add_argument('--cases',nargs='+',choices=tuple(TASKS),default=list(TASKS))
     parser.add_argument('--thinking',choices=['off','on','both'],default='off')
@@ -124,6 +126,7 @@ def main():
     parser.add_argument('--decode',type=int,default=256)
     parser.add_argument('--budgets',nargs='+',type=int,help='Sweep output budgets; overrides --decode')
     parser.add_argument('--drafts',nargs='+',type=int,default=[0,1,2,3,4,5,6,7],help='0 is MTP off')
+    parser.add_argument('--mtp-vocab-size',type=int,default=65536,help='Draft-only vocabulary; 0 uses the full head')
     parser.add_argument('--trials',type=int,default=2)
     args=parser.parse_args()
     budgets=args.budgets or [args.decode]
@@ -132,6 +135,8 @@ def main():
             any(not 0<=d<=7 for d in args.drafts) or len(set(args.drafts))!=len(args.drafts) or
             len(set(args.lengths))!=len(args.lengths) or len(set(args.cases))!=len(args.cases)):
         parser.error('Invalid tuning workload')
+    if args.mtp_vocab_size and (not 256<=args.mtp_vocab_size<=Model.V or args.mtp_vocab_size%64):
+        parser.error('Invalid draft vocabulary size')
     for cache in args.compile_cache:
         shutil.copytree(cache/'0.1.15',args.output/'cache'/'0.1.15',dirs_exist_ok=True)
     configure()
@@ -140,7 +145,7 @@ def main():
     cases=[dict(case,id=case['id']+(f'-out{budget}' if len(budgets)>1 else ''),decode_budget=budget)
            for case in cases for budget in budgets]
     report={'complete':False,'seed':SEED,'environment':environment(),'context':args.context,
-            'decode_budgets':budgets,'trials':args.trials,'measurements':[],
+            'decode_budgets':budgets,'trials':args.trials,'chunk':args.chunk,'measurements':[],'mtp_vocab_size':args.mtp_vocab_size,
             'checkpoint':identity(args.checkpoint/'model.safetensors.index.json'),
             'mtp_checkpoint':identity(args.mtp_checkpoint/'model.safetensors.index.json'),
             'cases':cases,'timing':'Warmed full decode including drafting, verification, commit and refresh; '
@@ -148,7 +153,9 @@ def main():
             'quality_scope':'Greedy equivalence to our own target, not independent BF16 code quality'}
     source_files=('tools/model/tune_flash_mtp.py','tools/model/flash_native.py',
                   'tools/model/flash_mtp.py','tools/model/flash_speculation.py','tools/model/flash_long.py',
-                  'kernels/model/flash_mtp.py','kernels/model/greedy.py')
+                  'tools/model/flash_policy.py','kernels/model/flash_mtp.py','kernels/model/greedy.py',
+                  'kernels/model/hyperconnection.py','kernels/model/gdn_sequence.py','kernels/model/integer_vq.py',
+                  'kernels/model/rotation_a8.py')
     report['sources']=[identity(Path(name)) for name in source_files]
     for name in source_files:
         destination=args.output/'measurement-source'/name
@@ -156,6 +163,9 @@ def main():
     started=time.perf_counter()
     model=Model(Checkpoint(args.checkpoint),args.context,args.output/'target',use_graph=True)
     draft=Model(Checkpoint(args.mtp_checkpoint),args.context,args.output/'draft',use_graph=True,target=model)
+    if args.mtp_vocab_size:
+        draft.set_draft_vocab(code_vocabulary(tokenizer,Path(__file__).resolve().parents[2],args.mtp_vocab_size))
+        write_json(args.output/'draft-vocabulary.json',{'ids':draft.draft_vocab,'source':'project code and authored prose'})
     session=Session(model,draft)
     eos=json.loads((args.checkpoint/'generation_config.json').read_text())['eos_token_id']
     eos={eos} if isinstance(eos,int) else set(eos)
@@ -164,7 +174,7 @@ def main():
     references={};prefixes={}
     # Freeze all shared prefixes once. CPU snapshots leave GPU memory to plans.
     for case in cases:
-        session.prefill(case['prompt_ids'],128)
+        session.prefill(case['prompt_ids'],args.chunk)
         prefixes[case['id']]=session.snapshot(cpu=True)
         logits=model.last_plan['output'][-1].cpu().numpy().copy()
         session.restore(prefixes[case['id']])

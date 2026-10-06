@@ -9,6 +9,7 @@ can lower vectorized BF16 conversions to trap-only cubins on SM87. Keeping
 coalesced_width as an explicit IntImm avoids that lowering; the projections
 still use BF16 Tensor Cores.
 """
+import tilelang
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
@@ -113,7 +114,8 @@ def hc_combine(M: int, H: int, streams: int = 4, dtype: str = 'bfloat16'):
 
 
 @orin_jit
-def hc_projection(M: int, N: int, K: int, block_m: int = 16, dtype: str = 'bfloat16', block_n: int = 64):
+def hc_projection(M: int, N: int, K: int, block_m: int = 16, dtype: str = 'bfloat16', block_n: int = 64,
+                  silu: bool = False, streams: int = 4):
     """Build (A[M,K], W[N,K], C[M,N]), stream dtype/BF16/stream dtype.
 
     FP32 accumulation, BF16 Tensor Core arithmetic, explicit output rounding.
@@ -137,5 +139,49 @@ def hc_projection(M: int, N: int, K: int, block_m: int = 16, dtype: str = 'bfloa
                     a[i, j] = T.if_then_else(by * block_m + i < M, A[by * block_m + i, kg * 64 + j], 0.0)
                 T.copy(W[bx * block_n, kg * 64], w)
                 T.gemm(a, w, acc, transpose_B=True)
-            T.copy(acc, C[by * block_m, bx * block_n])
+            if silu:
+                for i,j in T.Parallel(block_m,block_n):
+                    if by*block_m+i<M and bx*block_n+j<N:
+                        rounded=T.cast(acc[i,j],dtype)
+                        v=T.cast(T.cast(T.cast(rounded,T.float32)/streams,dtype),T.float32)
+                        C[by*block_m+i,bx*block_n+j]=v/(1+T.exp(-v))
+            else:T.copy(acc, C[by * block_m, bx * block_n])
+    return main
+
+
+@orin_jit
+def hc_up_mix(M: int, H: int, rank: int, streams: int = 4):
+    """BF16 up projection and branch mix, preserving every FP16 boundary."""
+    assert M>=1 and H%32==0 and rank%64==0 and streams==4
+    bm,bn=16,32
+    @T.prim_func
+    def main(A:T.Tensor((M,rank),T.float16), W:T.Tensor((streams*H,rank),T.bfloat16),
+             Normed:T.Tensor((M,streams,H),T.float16), Out:T.Tensor((M,H),T.float16)):
+        with T.Kernel(T.ceildiv(M,bm),T.ceildiv(H,bn),threads=128) as (by,bx):
+            a=T.alloc_shared((bm,64),T.bfloat16)
+            w=T.alloc_shared((streams*bn,64),T.bfloat16)
+            acc=T.alloc_fragment((bm,streams*bn),T.float32)
+            rounded_up=T.alloc_shared((bm,streams*bn),T.float16)
+            total=T.alloc_fragment((bm,bn),T.float32)
+            T.annotate_layout({total:tilelang.Fragment((bm,bn),
+                forward_thread_fn=lambda i,j:(i%4)*32+j,
+                forward_index_fn=lambda i,j:i//4)})
+            T.clear(acc);T.clear(total)
+            for kg in T.Pipelined(rank//64,num_stages=2):
+                for i,j in T.Parallel(bm,64):
+                    a[i,j]=0
+                    if by*bm+i<M:a[i,j]=A[by*bm+i,kg*64+j]
+                for n,j in T.Parallel(streams*bn,64):
+                    w[n,j]=W[(n//bn)*H+bx*bn+n%bn,kg*64+j]
+                T.gemm(a,w,acc,transpose_B=True)
+            T.copy(acc,rounded_up)
+            for branch in T.serial(streams):
+                for i,j in T.Parallel(bm,bn):
+                    if by*bm+i<M:
+                        up=rounded_up[i,branch*bn+j]
+                        gate=T.cast(1/(1+T.exp(-T.cast(up,T.float32))),T.float16)
+                        product=T.cast(T.cast(gate,T.float32)*T.cast(Normed[by*bm+i,branch,bx*bn+j],T.float32),T.float16)
+                        total[i,j]+=T.cast(product,T.float32)
+            for i,j in T.Parallel(bm,bn):
+                if by*bm+i<M:Out[by*bm+i,bx*bn+j]=total[i,j]/streams
     return main

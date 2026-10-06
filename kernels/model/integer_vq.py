@@ -4,6 +4,7 @@ Experimental ABI: group-major indices, integer table, output-row scale, A8
 activation and token scale. Full K is accumulated in INT32. Tables can be
 shared across experts; no persistent expanded W8 or floating inner-K scales.
 """
+import tilelang
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
@@ -109,6 +110,41 @@ def integer_vq(E,M,N,K,*,kind,shared_table=False,block_n=64,patched=False):
 
 def integer_vq_grouped(rows,E,tiles,N,K,*,kind,shared_table=False,block_n=64,patched=False):
     return _compile(rows,E,N,K,kind,shared_table,True,tiles,1,block_n,patched)
+
+
+@orin_jit
+def integer_e8p_gemv(E: int, routes: int, N: int, K: int, *, shared_input: bool, block_n: int = 8):
+    """Single-token routes directly index packed banks, using exact INT8 DP4A."""
+    assert E>0 and routes>0 and N>0 and K%128==0 and block_n in (4,8,16)
+    assert K*128*128<2**31
+    rows=1 if shared_input else routes
+    @T.prim_func
+    def main(A:T.Tensor((rows,K//4),T.int32), P:T.Tensor((E,K//128,N,16),T.uint16),
+             Book:T.Tensor((1,256,2),T.uint32), WS:T.Tensor((E,N),T.float16),
+             AS:T.Tensor((rows,),T.float16), IDs:T.Tensor((1,routes),T.int32),
+             C:T.Tensor((routes,N),T.float16)):
+        with T.Kernel(T.ceildiv(N,block_n),routes,threads=128) as (bx,route):
+            T.import_source(SOURCE+'\n__device__ __forceinline__ int flash_dp4a(int a, int b, int c) { return __dp4a(a,b,c); }\n')
+            table=T.alloc_shared((256,2),T.uint32)
+            acc=T.alloc_fragment((block_n,32),T.int32)
+            total=T.alloc_fragment((block_n,),T.int32)
+            T.annotate_layout({acc:tilelang.Fragment((block_n,32),
+                forward_thread_fn=lambda n,k:(n%4)*32+k,
+                forward_index_fn=lambda n,k:n//4)})
+            T.copy(Book[0,0,0],table);T.clear(acc)
+            expert=IDs[0,route]
+            row=0 if shared_input else route
+            for kg in T.serial(K//128):
+                for n,k in T.Parallel(block_n,32):
+                    if bx*block_n+n<N:
+                        code=T.cast(P[expert,kg,bx*block_n+n,k//2],T.uint32)
+                        word=T.call_pure_extern('uint32','integer_e8p_quad',code,table[code>>8,k%2],T.cast(k%2,T.uint32))
+                        acc[n,k]=T.call_pure_extern('int32','flash_dp4a',A[row,kg*32+k],T.cast(word,T.int32),acc[n,k])
+            T.reduce_sum(acc,total,dim=1)
+            for n in T.Parallel(block_n):
+                if bx*block_n+n<N:
+                    C[route,bx*block_n+n]=(T.cast(total[n],T.float32)*T.cast(WS[expert,bx*block_n+n],T.float32))*T.cast(AS[row],T.float32)
+    return main
 
 
 @orin_jit

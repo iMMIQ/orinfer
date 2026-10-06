@@ -66,13 +66,13 @@ def main():
     from transformers import AutoTokenizer
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--checkpoint',type=Path,required=True)
-    p.add_argument('--context',type=int,default=262144);p.add_argument('--chunk',type=int,default=128)
+    p.add_argument('--context',type=int,default=262144);p.add_argument('--chunk',type=int,default=512)
     p.add_argument('--lengths',nargs='+',type=int,default=[2049,8192,32768,65536,131072,262136])
     p.add_argument('--decode',type=int,default=8)
     p.add_argument('--baseline',type=Path,help='Original short-scene BF16 probes, optional regression check')
     a=p.parse_args()
-    if not 1<=a.chunk<=128 or a.decode<1 or not a.lengths or a.lengths!=sorted(set(a.lengths)):
-        p.error('Sorted unique lengths, chunk 1..128 and positive decode required')
+    if not 1<=a.chunk<=512 or a.decode<1 or not a.lengths or a.lengths!=sorted(set(a.lengths)):
+        p.error('Sorted unique lengths, chunk 1..512 and positive decode required')
     if a.lengths[0]<1 or a.lengths[-1]+a.decode>a.context:p.error('Leave context room for decode')
     configure();source=Checkpoint(a.checkpoint);tokenizer=AutoTokenizer.from_pretrained(a.checkpoint,local_files_only=True)
     seed_text='春天的山谷里，河水缓缓流过草地。The river flows through a green valley. 记录编号42。\n'

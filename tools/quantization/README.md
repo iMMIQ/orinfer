@@ -40,10 +40,10 @@ The experimental native execution recipe consumes only this published format:
 ```bash
 bash tools/operators/run.sh tools/model/flash_native.py \
   artifacts/quantization/flash-next/native-01 \
-  --checkpoint artifacts/models/flash-next-e8p-a8 --chunk 8 --graph on
+  --checkpoint artifacts/models/flash-next-e8p-a8 --chunk 512 --graph on
 ```
 
-It uses official chat-template tokens, deterministic greedy generation, fixed-answer teacher forcing, full-distribution top3 probabilities, target NLL and complete private-state prefix restoration checks. Dense projections use row-scaled INT8; experts remain packed E8P and decode per tile. QSA supports up to the checkpoint context limit (262144): raw index keys are averaged in groups of four, normalized and rotated at each group’s first position; per-query ReLU scores select 512 blocks plus the incomplete causal tail. KV uses group-64 symmetric INT8 with FP16 scales. Index compression and the pending ring are part of private prefix state; snapshots copy only the live prefix. `--context` defaults to 262144, and `--chunk` accepts profiles through 128 tokens. `--cases zh math` bounds an initial run; `--graph off` allows a separate execution comparison. This is an offline execution and validation recipe, not the Rust online adapter. Reports distinguish execution completion from quality acceptance. `--baseline` accepts probes from an independent original BF16/FP8 run with identical token histories; community Q2 and local FFN reconstruction do not establish model quality.
+It uses official chat-template tokens, deterministic greedy generation, fixed-answer teacher forcing, full-distribution top3 probabilities, target NLL and complete private-state prefix restoration checks. Dense projections use row-scaled INT8; experts remain packed E8P and decode per tile. QSA supports up to the checkpoint context limit (262144): raw index keys are averaged in groups of four, normalized and rotated at each group’s first position; per-query ReLU scores select 512 blocks plus the incomplete causal tail. KV uses group-64 symmetric INT8 with FP16 scales. Index compression and the pending ring are part of private prefix state; snapshots copy only the live prefix. `--context` defaults to 262144, and `--chunk` defaults to 512 and accepts profiles through 512 tokens. `--cases zh math` bounds an initial run; `--graph off` allows a separate execution comparison. This is an offline execution and validation recipe, not the Rust online adapter. Reports distinguish execution completion from quality acceptance. `--baseline` accepts probes from an independent original BF16/FP8 run with identical token histories; community Q2 and local FFN reconstruction do not establish model quality.
 
 Run the native long-context capacity and state check separately:
 
@@ -51,7 +51,7 @@ Run the native long-context capacity and state check separately:
 bash tools/operators/run.sh tools/model/flash_long.py \
   artifacts/quantization/flash-next/native-long \
   --checkpoint artifacts/models/flash-next-e8p-a8 \
-  --context 262144 --chunk 128 \
+  --context 262144 --chunk 512 \
   --lengths 2049 8192 32768 65536 131072 262136 --decode 8
 ```
 
@@ -75,21 +75,40 @@ bash tools/quantization/run_flash_next.sh \
 bash tools/operators/run.sh tools/model/flash_native.py artifacts/flash-mtp \
   --checkpoint artifacts/models/flash-next-e8p-a8 \
   --mtp-checkpoint artifacts/models/flash-next-e8p-a8-mtp \
-  --mtp-drafts 3 --chunk 128 --graph on
+  --mtp-drafts 3 --chunk 512 --graph on
 ```
 
 The draft shares embeddings and the output head with the target. Its fusion
 normalizes the complete four-stream target HC tensor, projects each branch with
 the same BF16 matrix, and adds the projected next-token embedding. Its QSA KV
 also uses INT8. Greedy verification commits only the matching draft prefix and
-one target token; GDN, convolution, PLE and pending index states are saved at
-every verification position. Rejected cache tails remain outside the live
-cursor. `--mtp-drafts` accepts 1..7 and defaults to 3. Smaller budget/context tails
+one target token. Compact GDN verification saves keys, decay and FP32 updates
+for each position, then replays the accepted prefix into the FP32 state.
+Convolution, PLE and pending index histories are saved at every position.
+Rejected cache tails remain outside the live cursor. `--mtp-drafts` accepts 1..7 and defaults to 3. Smaller budget/context tails
 use power-of-two verification profiles, with single-token decode for the last
 slot. MTP is opt-in for this offline recipe and does not add online serving or
 stochastic sampling support. `tools/model/validate_flash_mtp.py` compares real
 requests with MTP off, tests forced rejection and complete session restoration,
 and measures draft, verification, commit and refresh together.
+
+The default draft head selects from 65536 tokens using a deterministic vocabulary
+built from project source and authored prose. The target always uses the full
+vocabulary, so this changes speculation efficiency without restricting target
+output. Set `--mtp-vocab-size 0` for the full draft head. `--mtp-adaptive` optionally
+chooses depths 1, 3 and 7 from observed acceptance and complete round cost; fixed
+depth remains the default. Small-row HC fusion, compact GDN verification and
+rotation/A8 fusion are enabled by default; `--native-optimizations off` disables
+these for comparison. Direct expert DP4A is available with `--direct-experts` and
+is disabled by default.
+
+`tools/model/optimize_flash_mtp.py` compares optimizations against a frozen source
+tree containing the original native model and MTP controller. It checks target
+outputs and private-state replay, and records draft/verify/commit/refresh CUDA
+spans in separate diagnostic runs. The spans include host launch gaps; they
+are not sums of individual kernel times. Use `--variants baseline selected
+--prefill-chunk 512` to compare warmed target-plus-draft prefill and check the
+complete prefix state against the original 128-token chunks.
 
 Tune draft depth for code generation with authored Python, Rust and TypeScript
 requests. `0` disables MTP; the sweep compares every candidate with the same
@@ -116,7 +135,7 @@ For code requests with `xhigh` thinking enabled, use fixed depth 3. Start with
 depth 5 for short direct completions and depth 7 for longer direct implementations.
 These are per-request choices; the controller does not switch at the thinking
 delimiter. Keep graphs enabled and
-prefill chunks at 128. `--budgets 384 1536` tests both bounded and complete
+prefill chunks at 512. `--budgets 384 1536` tests both bounded and complete
 continuations; EOS still ends a request before its budget. Re-tune on the actual
 workload rather than choosing by acceptance rate alone. Each warmed trial also
 checks exact restoration of the complete target and draft private state.
@@ -126,7 +145,7 @@ Once the original reference is complete, use a new output directory to score the
 ```bash
 bash tools/operators/run.sh tools/model/flash_native.py \
   artifacts/quantization/flash-next/native-paired \
-  --checkpoint artifacts/models/flash-next-e8p-a8 --chunk 8 --graph on \
+  --checkpoint artifacts/models/flash-next-e8p-a8 --chunk 512 --graph on \
   --max-new-tokens 256 \
   --baseline artifacts/quantization/flash-next/bf16-reference/results.json
 ```
