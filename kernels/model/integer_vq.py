@@ -32,20 +32,30 @@ __device__ __forceinline__ unsigned int integer_e8p_sign_quad(unsigned int code,
     unsigned int mask = flags * 255u;
     return positive ^ ((positive ^ negative) & mask);
 }
+__device__ __forceinline__ unsigned int integer_e8p_sign_quad_prmt(unsigned int code, unsigned int parity, unsigned int positive, unsigned int negative, unsigned int half) {
+    unsigned int s = (code ^ parity) >> (half * 2u);
+    unsigned int selector = 0x3210u | ((s & 0x11u) << 2u) | ((s & 0x22u) << 9u);
+    unsigned int value;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(value) : "r"(positive), "r"(negative), "r"(selector));
+    return value;
+}
 '''
 
 
 @orin_jit
-def _compile(rows,E,N,K,kind,shared_table,grouped,tiles,M,BN,patched,shortbook,num_stages):
+def _compile(rows,E,N,K,kind,shared_table,grouped,tiles,M,BN,patched,shortbook,num_stages,BM,byte_permute):
     if kind not in ('vq4','e8p') or any(type(x) is not int or x <= 0 for x in (rows,E,N,K,tiles)) or K%128 or K*128*128 > 2**31-1:
         raise ValueError('Invalid integer VQ geometry')
     if BN not in (64,128):raise ValueError('Invalid VQ output tile')
+    if BM not in (16,32,64):raise ValueError('Invalid VQ row tile')
     if num_stages not in (1,2) or shortbook and kind != 'e8p':raise ValueError('Invalid VQ decoder/pipeline')
+    if type(byte_permute) is not bool or byte_permute and not shortbook:
+        raise ValueError('Byte permutation requires the E8P short table')
     D = 4 if kind == 'vq4' else 8
     PD = T.uint8 if D == 4 else T.uint16
     TE = 1 if shared_table else E
     entries,words = (512,4) if shortbook else (256,D//4)
-    BM,G = 16,128
+    G = 128
 
     @T.macro
     def project(A,P,Book,Patch,WS,AS,C,expert,offset,count,bx):
@@ -83,7 +93,9 @@ def _compile(rows,E,N,K,kind,shared_table,grouped,tiles,M,BN,patched,shortbook,n
                         index = T.cast((code >> 8)+parity*256,T.int32)
                         positive = table[index,(q%2)*2]
                         negative = table[index,(q%2)*2+1]
-                        decoded[n,q] = T.call_pure_extern('uint32','integer_e8p_sign_quad',code,parity,positive,negative,T.cast(q%2,T.uint32))
+                        decoded[n,q] = T.call_pure_extern('uint32',
+                            'integer_e8p_sign_quad_prmt' if byte_permute else 'integer_e8p_sign_quad',
+                            code,parity,positive,negative,T.cast(q%2,T.uint32))
                     else:
                         word = table[T.cast(code >> 8,T.int32),q%2]
                         decoded[n,q] = T.call_pure_extern('uint32','integer_e8p_quad',code,word,T.cast(q%2,T.uint32))
@@ -120,12 +132,12 @@ def _compile(rows,E,N,K,kind,shared_table,grouped,tiles,M,BN,patched,shortbook,n
     return routed if grouped else direct
 
 
-def integer_vq(E,M,N,K,*,kind,shared_table=False,block_n=64,patched=False,shortbook=False,num_stages=2):
-    return _compile(E*M,E,N,K,kind,shared_table,False,1,M,block_n,patched,shortbook,num_stages)
+def integer_vq(E,M,N,K,*,kind,shared_table=False,block_n=64,patched=False,shortbook=False,num_stages=2,block_m=16,byte_permute=False):
+    return _compile(E*M,E,N,K,kind,shared_table,False,1,M,block_n,patched,shortbook,num_stages,block_m,byte_permute)
 
 
-def integer_vq_grouped(rows,E,tiles,N,K,*,kind,shared_table=False,block_n=64,patched=False,shortbook=False,num_stages=2):
-    return _compile(rows,E,N,K,kind,shared_table,True,tiles,1,block_n,patched,shortbook,num_stages)
+def integer_vq_grouped(rows,E,tiles,N,K,*,kind,shared_table=False,block_n=64,patched=False,shortbook=False,num_stages=2,block_m=16,byte_permute=False):
+    return _compile(rows,E,N,K,kind,shared_table,True,tiles,1,block_n,patched,shortbook,num_stages,block_m,byte_permute)
 
 
 @orin_jit

@@ -3,7 +3,7 @@
 Each CTA keeps its initial FP32 state in registers while processing a chunk.
 Verification saves either full per-position states or compact rank-one updates;
 the caller commits only the accepted prefix, including the target token.
-In-place prefill writes only the final state and supports chunks through 512.
+In-place prefill writes only the final state and supports chunks through 4096.
 Convolution history, position, and attention KV require separate handling.
 """
 import tilelang.language as T
@@ -16,8 +16,8 @@ HK, HV, DK, DV = 16, 48, 128, 128
 def gdn_sequence(tokens: int, q_scale: float = 128 ** -.5,
                  value_tile: int = 32, threads: int = 128, in_place: bool = False,
                  compact: bool = False):
-    assert 1 <= tokens <= (512 if in_place else 16) and q_scale > 0
-    assert value_tile in (16, 32, 64, 128) and threads in (64, 128, 256)
+    assert 1 <= tokens <= (4096 if in_place else 16) and q_scale > 0
+    assert value_tile in (16, 32, 64, 128) and threads in (32, 64, 128, 256)
     assert not (compact and in_place)
 
     @T.prim_func

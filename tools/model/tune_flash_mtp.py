@@ -118,7 +118,7 @@ def main():
     parser.add_argument('--mtp-checkpoint',type=Path,required=True)
     parser.add_argument('--compile-cache',nargs='+',type=Path,default=[])
     parser.add_argument('--context',type=int,default=262144)
-    parser.add_argument('--chunk',type=int,choices=(1,2,4,8,16,32,64,128,256,512),default=512)
+    parser.add_argument('--chunk',type=int,choices=(1,2,4,8,16,32,64,128,256,512,1024,2048,4096),default=4096)
     parser.add_argument('--lengths',nargs='+',type=int,default=[512,2048,8192])
     parser.add_argument('--cases',nargs='+',choices=tuple(TASKS),default=list(TASKS))
     parser.add_argument('--thinking',choices=['off','on','both'],default='off')
@@ -190,7 +190,7 @@ def main():
     for depth in args.drafts:
         model.transaction=None;model.last_plan=None;draft.last_plan=None
         for key in list(model.plans):
-            if isinstance(key,tuple):del model.plans[key]
+            if model.plans[key]['verify']:del model.plans[key]
         gc.collect()
         # Warm every possible tail verification and accepted-prefix refresh
         # before timing. Compilation is never hidden in a candidate's TPS.

@@ -114,8 +114,48 @@ def hc_combine(M: int, H: int, streams: int = 4, dtype: str = 'bfloat16'):
 
 
 @orin_jit
+def hc_combine_norm(M: int, H: int, streams: int = 4, eps: float = 1e-6,
+                    dtype: str = 'bfloat16'):
+    """Combine residuals and normalize, retaining the rounded residual output.
+
+    Output may alias Residual. Normed must remain disjoint from all inputs and
+    Output. Each CTA owns one whole row/stream, including the FP32 reduction.
+    The intervening stream-dtype rounding matches hc_combine then hc_norm.
+    """
+    _dtype(dtype)
+    if any(type(x) is not int or x <= 0 for x in (M, H, streams)) or not 0 < eps < 1:
+        raise ValueError('Invalid HC combination/normalization dimensions')
+    width = 1 << (H - 1).bit_length()
+    @T.prim_func
+    def main(Block: T.Tensor((M, H), dtype),
+             Residual: T.Tensor((M, streams, H), dtype),
+             Inject: T.Tensor((M, streams), dtype),
+             Weight: T.Tensor((streams, H), T.float32),
+             Output: T.Tensor((M, streams, H), dtype),
+             Normed: T.Tensor((M, streams, H), dtype)):
+        with T.Kernel(M, streams, threads=256) as (row, branch):
+            values = T.alloc_fragment((width,), T.float32)
+            square = T.alloc_fragment((width,), T.float32)
+            total = T.alloc_fragment((1,), T.float32)
+            raw = T.cast(T.cast(T.cast(Inject[row, branch], T.float32) / streams, dtype), T.float32)
+            gate = T.cast(2.0 * T.cast(T.cast(1.0 / (1.0 + T.exp(-raw)), dtype), T.float32), dtype)
+            for j in T.Parallel(width, coalesced_width=T.int32(1)):
+                values[j] = 0.0
+                if j < H:
+                    injection = T.cast(T.cast(Block[row, j], T.float32) * T.cast(gate, T.float32), dtype)
+                    rounded = T.cast(T.cast(Residual[row, branch, j], T.float32) + T.cast(injection, T.float32), dtype)
+                    values[j] = T.cast(rounded, T.float32)
+                    Output[row, branch, j] = rounded
+                square[j] = values[j] * values[j]
+            T.reduce_sum(square, total, dim=0)
+            for j in T.Parallel(H, coalesced_width=T.int32(1)):
+                Normed[row, branch, j] = values[j] * T.rsqrt(total[0] / H + eps) * (1.0 + Weight[branch, j])
+    return main
+
+
+@orin_jit
 def hc_projection(M: int, N: int, K: int, block_m: int = 16, dtype: str = 'bfloat16', block_n: int = 64,
-                  silu: bool = False, streams: int = 4):
+                  silu: bool = False, streams: int = 4, group_m: int = 0):
     """Build (A[M,K], W[N,K], C[M,N]), stream dtype/BF16/stream dtype.
 
     FP32 accumulation, BF16 Tensor Core arithmetic, explicit output rounding.
@@ -123,30 +163,47 @@ def hc_projection(M: int, N: int, K: int, block_m: int = 16, dtype: str = 'bfloa
     the four-stream injection projection; K must be a multiple of 64.
     """
     _dtype(dtype)
-    if any(type(x) is not int or x <= 0 for x in (M, N, K)) or K % 64 or block_m not in (16, 32, 64):
+    if any(type(x) is not int or x <= 0 for x in (M, N, K)) or K % 64 or block_m not in (16, 32, 64, 128):
         raise ValueError('Invalid HC projection dimensions')
-    if block_n not in (16,32,64):raise ValueError('Invalid HC output tile')
+    if block_n not in (16,32,64,128):raise ValueError('Invalid HC output tile')
+    if type(group_m) is not int or group_m not in (0,1,2,4,8):
+        raise ValueError('Invalid HC row grouping')
     threads=64 if block_n==16 else 128
-    @T.prim_func
-    def main(A: T.Tensor((M, K), dtype), W: T.Tensor((N, K), T.bfloat16), C: T.Tensor((M, N), dtype)):
-        with T.Kernel(T.ceildiv(M, block_m), T.ceildiv(N, block_n), threads=threads) as (by, bx):
-            a = T.alloc_shared((block_m, 64), T.bfloat16)
-            w = T.alloc_shared((block_n, 64), T.bfloat16)
-            acc = T.alloc_fragment((block_m, block_n), T.float32)
-            T.clear(acc)
-            for kg in T.Pipelined(K // 64, num_stages=2):
-                for i, j in T.Parallel(block_m, 64, coalesced_width=T.int32(1)):
-                    a[i, j] = T.if_then_else(by * block_m + i < M, A[by * block_m + i, kg * 64 + j], 0.0)
-                T.copy(W[bx * block_n, kg * 64], w)
-                T.gemm(a, w, acc, transpose_B=True)
-            if silu:
-                for i,j in T.Parallel(block_m,block_n):
-                    if by*block_m+i<M and bx*block_n+j<N:
-                        rounded=T.cast(acc[i,j],dtype)
-                        v=T.cast(T.cast(T.cast(rounded,T.float32)/streams,dtype),T.float32)
-                        C[by*block_m+i,bx*block_n+j]=v/(1+T.exp(-v))
-            else:T.copy(acc, C[by * block_m, bx * block_n])
-    return main
+    @T.macro
+    def project(A,W,C,by,bx):
+        a = T.alloc_shared((block_m, 64), T.bfloat16)
+        w = T.alloc_shared((block_n, 64), T.bfloat16)
+        acc = T.alloc_fragment((block_m, block_n), T.float32)
+        T.clear(acc)
+        for kg in T.Pipelined(K // 64, num_stages=2):
+            for i, j in T.Parallel(block_m, 64, coalesced_width=T.int32(1)):
+                a[i, j] = T.if_then_else(by * block_m + i < M, A[by * block_m + i, kg * 64 + j], 0.0)
+            T.copy(W[bx * block_n, kg * 64], w)
+            T.gemm(a, w, acc, transpose_B=True)
+        if silu:
+            for i,j in T.Parallel(block_m,block_n):
+                if by*block_m+i<M and bx*block_n+j<N:
+                    rounded=T.cast(acc[i,j],dtype)
+                    v=T.cast(T.cast(T.cast(rounded,T.float32)/streams,dtype),T.float32)
+                    C[by*block_m+i,bx*block_n+j]=v/(1+T.exp(-v))
+        else:T.copy(acc, C[by * block_m, bx * block_n])
+    if group_m:
+        mt,nt=(M+block_m-1)//block_m,(N+block_n-1)//block_n
+        @T.prim_func
+        def grouped(A:T.Tensor((M,K),dtype),W:T.Tensor((N,K),T.bfloat16),C:T.Tensor((M,N),dtype)):
+            with T.Kernel(mt*nt,threads=threads)as pid:
+                first=(pid//(group_m*nt))*group_m
+                actual=T.min(mt-first,group_m)
+                by=first+(pid%(group_m*nt))%actual
+                bx=(pid%(group_m*nt))//actual
+                project(A,W,C,by,bx)
+        return grouped
+    else:
+        @T.prim_func
+        def main(A:T.Tensor((M,K),dtype),W:T.Tensor((N,K),T.bfloat16),C:T.Tensor((M,N),dtype)):
+            with T.Kernel(T.ceildiv(M,block_m),T.ceildiv(N,block_n),threads=threads)as (by,bx):
+                project(A,W,C,by,bx)
+        return main
 
 
 @orin_jit

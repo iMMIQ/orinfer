@@ -21,8 +21,9 @@ class Session:
         self.pending=None;self.draft_token=None;self.hidden=None
         self.statistics={}
 
-    def prefill(self, tokens, chunk=512):
+    def prefill(self, tokens, chunk=4096, *, draft_chunk=512):
         if not tokens or len(tokens)>=self.target.capacity:raise ValueError('Prompt must leave output context')
+        if type(draft_chunk) is not int or not 1<=draft_chunk<=4096:raise ValueError('Invalid draft prefill chunk')
         self.target.reset();self.draft.reset()
         cursor=0
         for batch in chunks(tokens,chunk):
@@ -30,8 +31,15 @@ class Session:
             token=self.target.execute(batch,output='token' if end==len(tokens) else 'none')
             shifted=list(tokens[cursor+1:end+1])
             if end==len(tokens):shifted.append(token)
-            prediction=self.draft.execute(shifted,hidden=self.target.last_plan['residual'],
-                                          output='token' if end==len(tokens) else 'none')
+            # The target benefits from larger expert batches. Stream its saved
+            # HC rows through the draft without duplicating a large arena.
+            condition=self.target.last_plan['residual']
+            draft_cursor=0
+            for part in chunks(shifted,min(chunk,draft_chunk)):
+                draft_end=draft_cursor+len(part)
+                prediction=self.draft.execute(part,hidden=condition[draft_cursor:draft_end],
+                    output='token' if end==len(tokens) and draft_end==len(shifted) else 'none')
+                draft_cursor=draft_end
             cursor=end
         self.pending=token;self.draft_token=prediction
         self.hidden=self.draft.last_plan['residual'][-1:].clone()

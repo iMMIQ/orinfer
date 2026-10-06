@@ -7,9 +7,9 @@ from tools.model.flash_lookup import RowCache
 
 
 class PleLookup:
-    def __init__(self, checkpoint, *, cache_bytes=32*1024**2):
+    def __init__(self, checkpoint, *, cache_bytes=32*1024**2, row_dtype=np.float32):
         self.source = checkpoint
-        self.cache = RowCache(checkpoint,capacity_bytes=cache_bytes)
+        self.cache = RowCache(checkpoint,capacity_bytes=cache_bytes,dtype=row_dtype)
         text = checkpoint.config['text_config']
         self.eos = int(text['eos_token_id'])
         self.vocab = int(text['vocab_size'])
@@ -41,6 +41,22 @@ class PleLookup:
             raise ValueError('Token outside original PLE vocabulary')
         if len(history) >= self.ngram or any(type(t) is not int or not 0 <= t < self.vocab or t == self.eos for t in history):
             raise ValueError('Invalid request-owned PLE history')
+        if len(tokens)>=256:
+            # Products stay in signed INT64 by the checkpoint bounds checked
+            # above. Reset boundaries suppress every pre-EOS history token.
+            width=self.ngram-1
+            context=np.asarray([self.eos]*(width-len(history))+list(history)+list(tokens),np.int64)
+            positions=np.arange(width,len(context))
+            resets=np.maximum.accumulate(np.where(context==self.eos,np.arange(len(context)),-1))
+            mixed=context[positions]*self.multipliers[0]
+            rows=np.empty((len(tokens),width*self.heads),np.int64)
+            for shift in range(1,self.ngram):
+                previous=np.where(positions-shift>resets[positions-1],context[positions-shift],self.eos)
+                mixed=np.bitwise_xor(mixed,previous*self.multipliers[shift])
+                first=(shift-1)*self.heads
+                rows[:,first:first+self.heads]=mixed[:,None]%np.asarray(self.sizes[first:first+self.heads])+np.asarray(self.offsets[first:first+self.heads])
+            next_history=context[max(int(resets[-1])+1,len(context)-width):].tolist()
+            return rows.reshape(-1).tolist(),next_history
         next_history = list(history)
         rows = []
         for token in tokens:
@@ -56,11 +72,11 @@ class PleLookup:
     def prepare(self, tokens, history):
         rows,next_history = self.row_ids(tokens,history)
         # Deduplicate only immutable table reads, preserving requested order.
-        values = {}
-        requests={}
-        for row in sorted(set(rows)):
+        unique,inverse=np.unique(rows,return_inverse=True)
+        values=[]
+        for row in unique:
+            row=int(row)
             shard = bisect.bisect_right(self.starts,row)-1
-            requests[row]=(self.names[shard],row-self.starts[shard],1)
-        values={row:self.cache.read(request[0],request[1]) for row,request in requests.items()}
-        features = np.stack([values[row] for row in rows]).reshape(len(tokens),-1)
+            values.append(self.cache.read(self.names[shard],row-self.starts[shard]))
+        features = np.stack(values)[inverse].reshape(len(tokens),-1)
         return features,next_history

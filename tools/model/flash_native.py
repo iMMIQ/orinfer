@@ -20,9 +20,10 @@ from kernels.model import flash_next as fn
 from kernels.model import qsa
 from kernels.model import qsa_attention as qsat
 from kernels.model import flash_mtp as fm
-from kernels.model.hyperconnection import hc_norm, hc_silu, hc_projection, hc_mix, hc_combine, hc_up_mix, hc_injection, hc_down_partial, hc_down_finish
+from kernels.model.hyperconnection import hc_norm, hc_silu, hc_projection, hc_mix, hc_combine, hc_combine_norm, hc_up_mix, hc_injection, hc_down_partial, hc_down_finish
 from kernels.model.ple import ple_gate, ple_conv, ple_history
 from kernels.model.gdn_sequence import gdn_sequence, gdn_commit
+from kernels.model.moe import expert_histogram_local, expert_histogram_offsets, expert_histogram_finish
 from kernels.model.greedy import greedy_partials, greedy_merge
 from kernels.model.int8_projection import int8_projection, int8_gemv
 from kernels.model.integer_vq import integer_vq_grouped, integer_e8p_gemv, rotate_activation
@@ -47,7 +48,14 @@ class Model:
 
     def __init__(self, source, capacity, output, *, use_graph=True, target=None,
                  hc_fused=True, compact_gdn=True, direct_experts=False, fused_rotation=True,
-                 expert_shortbook=True, hc_parallel=True, hc_splits=4):
+                 expert_shortbook=True, hc_parallel=True, hc_splits=4,
+                 prefill_expert_block_m=None, prefill_gdn_threads=32,
+                 prefill_gdn_value_tile=16,
+                 prefill_qsa_splits=2, prefill_qsa_block=32,
+                 prefill_qsa_threads=128, prefill_large_projections=True,
+                 prefill_hc_combine_norm=True, prefill_hc_silu=True,
+                 prefill_qsa_single_buffer=True, prefill_byte_permute=True,
+                 prefill_hc_narrow_inject=True):
         maximum = source.config['text_config']['max_position_embeddings']
         if type(capacity) is not int or not 1 <= capacity <= min(maximum,262144):
             raise ValueError('Context exceeds the checkpoint/native 262144 limit')
@@ -55,6 +63,30 @@ class Model:
         self.hc_fused,self.compact_gdn,self.direct_experts=hc_fused,compact_gdn,direct_experts
         self.fused_rotation=fused_rotation
         self.expert_shortbook=expert_shortbook
+        if type(prefill_large_projections) is not bool:raise ValueError('Invalid prefill projection policy')
+        self.prefill_large_projections=prefill_large_projections
+        if type(prefill_hc_combine_norm) is not bool:raise ValueError('Invalid prefill HC fusion policy')
+        self.prefill_hc_combine_norm=prefill_hc_combine_norm
+        for name,value in (('prefill_hc_silu',prefill_hc_silu),
+                           ('prefill_qsa_single_buffer',prefill_qsa_single_buffer),
+                           ('prefill_byte_permute',prefill_byte_permute),
+                           ('prefill_hc_narrow_inject',prefill_hc_narrow_inject)):
+            if type(value) is not bool:raise ValueError('Invalid prefill fusion/decoder policy')
+            setattr(self,name,value)
+        if (prefill_expert_block_m is not None and
+                (type(prefill_expert_block_m) is not int or prefill_expert_block_m not in (16,32,64))):
+            raise ValueError('Invalid prefill expert row tile')
+        self.prefill_expert_block_m=prefill_expert_block_m
+        if prefill_gdn_threads not in (32,64,128,256):raise ValueError('Invalid prefill GDN threads')
+        if prefill_gdn_value_tile not in (16,32,64,128):raise ValueError('Invalid prefill GDN value tile')
+        if prefill_qsa_splits not in (1,2,4,8):raise ValueError('Invalid prefill QSA splits')
+        self.prefill_gdn_threads=prefill_gdn_threads
+        self.prefill_gdn_value_tile=prefill_gdn_value_tile
+        self.prefill_qsa_splits=prefill_qsa_splits
+        if (prefill_qsa_block not in (32,64) or prefill_qsa_threads not in (128,256)
+                or prefill_qsa_block==32 and prefill_qsa_threads==256):raise ValueError('Invalid prefill QSA tile')
+        self.prefill_qsa_block=prefill_qsa_block
+        self.prefill_qsa_threads=prefill_qsa_threads
         self.hc_parallel=hc_parallel
         if hc_splits not in (0,2,4,8,16):raise ValueError('Invalid HC split count')
         self.hc_splits=hc_splits
@@ -69,12 +101,16 @@ class Model:
         elif target is not None:raise ValueError('Target sharing is only for MTP')
         self.layer_ids=(48,) if self.is_mtp else tuple(range(48))
         self.weights, self.states, self.plans = {}, {}, {}
+        self.workspaces = {}
+        self.prefill_workspace_rows = 0
         self.prefix_divisors = {}
         self.kernels = {}
         self.history = []
         self.position = 0
-        self.ple = target.ple if self.is_mtp else PleLookup(source)
-        self.embedding = target.embedding if self.is_mtp else RowCache(source,capacity_bytes=8*1024**2)
+        # All embedding operands are materialized as FP16. Cache that same
+        # rounding boundary once instead of converting every requested row.
+        self.ple = target.ple if self.is_mtp else PleLookup(source,row_dtype=np.float16)
+        self.embedding = target.embedding if self.is_mtp else RowCache(source,capacity_bytes=8*1024**2,dtype=np.float16)
         self.use_graph = use_graph
         self.position_gpu = torch.zeros(1, device='cuda', dtype=torch.int32)
         self.lengths = torch.empty_like(self.position_gpu)
@@ -221,19 +257,47 @@ class Model:
         return self.kernels[key]
 
     def plan(self, m, *, verify=False):
-        key=(m,'verify') if verify else m
+        from tools.model.flash_chunks import index_capacity
+        if type(m) is not int or not 1 <= m <= min(4096,self.capacity):
+            raise ValueError('Recurrent plan supports chunks of 1..4096 within context')
+        # A draft head refresh can occur at a completely filled context and
+        # runs only head operators. execute separately rejects body overflow.
+        index_cap=index_capacity(min(self.capacity,self.position+m),self.capacity)
+        key=(m,index_cap,verify)
         if key in self.plans:
             return self.plans[key]
-        if not 1 <= m <= 512:
-            raise ValueError('Recurrent plan supports chunks of 1..512')
         if verify and (self.is_mtp or not 1<=m<=8):raise ValueError('Target verification supports 1..8 inputs')
+        if m>=256 and m>self.prefill_workspace_rows:
+            # Grow the shared prefill arena before capturing graphs. Exact
+            # smaller tails use compact views of the same flat storage.
+            stale=[k for k in self.plans if k[0]>=256]
+            for old in stale:del self.plans[old]
+            self.workspaces.pop(('prefill',False),None)
+            self.prefill_workspace_rows=m
+            if stale:
+                self.last_plan=None
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
         h, f, c, rank, e, k = self.H, self.F, self.C, self.R, self.E, self.K
         ops = []
         labels = []
         prefix_states={}
         prefix_updates={}
-        def empty(shape, dtype=torch.float16):
-            return torch.empty(shape, device='cuda', dtype=dtype)
+        workspace=self.workspaces.setdefault(('prefill',False) if m>=256 else (m,verify),{})
+        allocation=0
+        def empty(shape, dtype=torch.float16, *, index=False, reserve=0):
+            nonlocal allocation
+            import math
+            slot=(allocation,index_cap if index else None,dtype)
+            allocation+=1
+            size=math.prod(shape)
+            if slot not in workspace:
+                reserve=max(reserve,self.prefill_workspace_rows*math.prod(shape[1:]) if index and m>=256 else size)
+                workspace[slot]=torch.empty(reserve,device='cuda',dtype=dtype)
+            if workspace[slot].numel()<size:
+                raise RuntimeError('Prefill scratch changed without invalidating captured graphs')
+            return workspace[slot][:size].view(shape)
         def call(label, build, *args):
             kernel = self.kernel(label, build)
             ops.append((kernel, args))
@@ -251,7 +315,7 @@ class Model:
                         stream=torch.cuda.current_stream().cuda_stream),(a,mask,q,as_)))
             labels.append(f'dense-quant-{width}')
             return q,as_
-        def projection(label,a,name,out,hc=False,rows=None,a8=None):
+        def projection(label,a,name,out,hc=False,rows=None,a8=None,silu=False):
             rows=m if rows is None else rows
             weight = self.weights[name]
             if isinstance(weight,tuple):
@@ -262,8 +326,10 @@ class Model:
                     call(f'dense-gemv-{n}-{width}-{od}',lambda:int8_gemv(n,width,od,8),
                          q.view(torch.int32),integer.view(torch.int32),scale,as_.view(-1),out)
                 else:
-                    bm=64 if rows>=64 and n>=512 else 32 if rows>=32 and n>=512 else 16
-                    call(f'dense-a8-{rows}-{n}-{width}-{od}-{bm}',lambda:int8_projection(rows,n,width,od,bm),
+                    large=self.prefill_large_projections and rows>=256 and n>=512 and width%128==0
+                    bm=128 if large else 64 if rows>=64 and n>=512 else 32 if rows>=32 and n>=512 else 16
+                    bn,bk,gm=(128,128,4) if large else (64,64,0)
+                    call(f'dense-a8-{rows}-{n}-{width}-{od}-{bm}-{bn}-{bk}-{gm}',lambda:int8_projection(rows,n,width,od,bm,bn,bk,gm),
                          q,integer,scale,as_.view(-1),out)
                 labels[-1]=f'{label}:{labels[-1]}'
             else:
@@ -271,14 +337,17 @@ class Model:
                 if hc and self.hc_parallel and rows<=8 and n<=c:
                     call(f'hc-injection-{rows}-{n}-{width}',lambda:hc_injection(rows,n,width),a,weight,out)
                 elif hc:
-                    bm=64 if m>=64 and n>=c*h else 16
-                    bn=32 if m==1 and n<=rank else 64
-                    call(f'hc-{m}-{n}-{width}-{bm}-{bn}',lambda:hc_projection(m,n,width,block_m=bm,dtype='float16',block_n=bn),a,weight,out)
+                    large=self.prefill_large_projections and m>=256 and n>=rank
+                    bm=128 if large and n>rank else 64 if m>=64 and n>=rank else 16
+                    bn=128 if large else 32 if m==1 and n<=rank else 64
+                    if self.prefill_hc_narrow_inject and m>=256 and n<=c:bn=16
+                    gm=4 if large else 0
+                    call(f'hc-{m}-{n}-{width}-{bm}-{bn}-{gm}-{silu}',lambda:hc_projection(m,n,width,block_m=bm,dtype='float16',block_n=bn,group_m=gm,silu=silu,streams=c),a,weight,out)
                 else:
                     wd = str(weight.dtype).split('.')[-1];od = str(out.dtype).split('.')[-1]
                     call(f'dense-{rows}-{n}-{width}-{wd}-{od}',lambda:fn.dense_projection(rows,n,width,wd,od),a,weight,out)
                 labels[-1]=f'{label}:{labels[-1]}'
-        embedding, ple_embedding = empty((m,h)), empty((m,h))
+        embedding, ple_embedding = empty((m,h)), empty((1 if self.is_mtp else m,h))
         residual, normed, up = (empty((m,c,h)) for _ in range(3))
         down, activated = empty((m,rank)), empty((m,rank))
         mixed, block = empty((m,h)), empty((m,h))
@@ -286,7 +355,18 @@ class Model:
         hc_splits=self.hc_splits
         hc_partials = empty((hc_splits,m,rank),torch.float32) if hc_splits and m<=8 else None
         def mixer(prefix, inject):
-            call(f'hc-norm-{m}', lambda: hc_norm(m,h,c,dtype='float16'),residual,self.weights[prefix+'norm.weight'],normed)
+            # Fold only an adjacent residual update. PLE operations consume
+            # residuals between some mixers, and the output mixer belongs to
+            # the separately captured head rather than the target body.
+            if (self.prefill_hc_combine_norm and m>=256 and prefix!='output_hc_'
+                    and labels and labels[-1]==f'hc-combine-{m}'):
+                _,combine_args=ops.pop();labels.pop()
+                previous_block,previous_residual,previous_inject,previous_output=combine_args
+                call(f'hc-combine-norm-{m}',lambda:hc_combine_norm(m,h,c,dtype='float16'),
+                     previous_block,previous_residual,previous_inject,self.weights[prefix+'norm.weight'],
+                     previous_output,normed)
+            else:
+                call(f'hc-norm-{m}', lambda: hc_norm(m,h,c,dtype='float16'),residual,self.weights[prefix+'norm.weight'],normed)
             if self.hc_fused and m<=8:
                 if hc_partials is not None:
                     call(f'hc-down-partial-{m}-{hc_splits}',lambda:hc_down_partial(m,rank,c*h,hc_splits),
@@ -297,8 +377,11 @@ class Model:
                          normed.flatten(1),self.weights[prefix+'down.weight'],activated)
                 call(f'hc-up-mix-{m}',lambda:hc_up_mix(m,h,rank),activated,self.weights[prefix+'up.weight'],normed,mixed)
             else:
-                projection('hc-down',normed.flatten(1),prefix+'down.weight',down,True)
-                call(f'hc-silu-{m}',lambda:hc_silu(m,rank,c,'float16'),down,activated)
+                if self.prefill_hc_silu and m>=256:
+                    projection('hc-down-silu',normed.flatten(1),prefix+'down.weight',activated,True,silu=True)
+                else:
+                    projection('hc-down',normed.flatten(1),prefix+'down.weight',down,True)
+                    call(f'hc-silu-{m}',lambda:hc_silu(m,rank,c,'float16'),down,activated)
                 projection('hc-up',activated,prefix+'up.weight',up.flatten(1),True)
                 call(f'hc-mix-{m}',lambda:hc_mix(m,h,c,'float16'),normed,up,mixed)
             if inject is not None:
@@ -315,34 +398,55 @@ class Model:
             call(f'mtp-fuse-{m}',lambda:fm.fuse(m,h,c),fused_embedding,fused_hidden,residual)
         else:
             call(f'initialize-{m}',lambda:fn.hc_initialize(m),embedding,residual)
-        qkv, z = empty((m,10240)),empty((m,6144))
-        alpha,beta_raw = empty((m,48)),empty((m,48))
-        g,beta = empty((m,48),torch.float32),empty((m,48),torch.float32)
-        q,keys,values = empty((1,16,m,128)),empty((1,16,m,128)),empty((1,48,m,128))
+        gdn_rows=1 if self.is_mtp else m
+        qkv, z = empty((gdn_rows,10240)),empty((gdn_rows,6144))
+        alpha,beta_raw = empty((gdn_rows,48)),empty((gdn_rows,48))
+        g,beta = empty((gdn_rows,48),torch.float32),empty((gdn_rows,48),torch.float32)
+        q,keys,values = empty((1,16,gdn_rows,128)),empty((1,16,gdn_rows,128)),empty((1,48,gdn_rows,128))
         ho = empty((1,3,10240))
         prefix_state = empty((1,48,128,128),torch.float32)  # In-place GDN never reads/writes Prefix.
-        recurrent,gated = empty((m,6144)),empty((m,6144))
+        recurrent,gated = empty((gdn_rows,6144)),empty((gdn_rows,6144))
         qgate,qsa_k,qsa_v = empty((m,12288)),empty((m,512)),empty((m,512))
         qsa_query,qsa_gate,qsa_out = (empty((m,24,256)) for _ in range(3))
         staged_key,staged_value=(empty((m,2,256)) for _ in range(2))
         index_qk,index_q = empty((m,640)),empty((m,4,128))
-        blocks=(self.capacity+3)//4;segments=(blocks+1023)//1024
-        index_scores=empty((m,blocks),torch.float32)
+        blocks=(index_cap+3)//4;segments=(blocks+1023)//1024
+        index_scores=empty((m,blocks),torch.float32,index=True)
         index_prefix,index_remaining,index_greater=(empty((m,),torch.int32) for _ in range(3))
-        index_hist=empty((m,segments,256),torch.int32)
-        index_counts,index_offsets=(empty((m,2,segments),torch.int32) for _ in range(2))
+        index_hist=empty((m,segments,256),torch.int32,index=True)
+        index_counts,index_offsets=(empty((m,2,segments),torch.int32,index=True) for _ in range(2))
         selected=empty((m,2051),torch.int32)
-        sparse_max,sparse_den=(empty((m,24,8),torch.float32) for _ in range(2))
-        sparse_out=empty((m,24,8,256),torch.float32)
-        ple_key,ple_normed_key,ple_normed_query,ple_gated,ple_normed,ple_out = (empty((m,c,h)) for _ in range(6))
-        ple_value = empty((m,h))
+        qsa_splits=self.prefill_qsa_splits if m>=256 else 8
+        qsa_block=self.prefill_qsa_block if m>=256 else 32
+        qsa_threads=self.prefill_qsa_threads if m>=256 else 128
+        sparse_max,sparse_den=(empty((m,24,qsa_splits),torch.float32) for _ in range(2))
+        sparse_out=empty((m,24,qsa_splits,256),torch.float32)
+        ple_rows=1 if self.is_mtp else m
+        # PLE finishes before the layer's HC mixer. Reuse the two HC scratch
+        # arrays, then recycle the query scratch after the gate has read it.
+        ple_key,ple_normed_key=normed,up
+        ple_normed_query=empty((ple_rows,c,h))
+        ple_gated,ple_normed,ple_out=normed,up,ple_normed_query
+        ple_value = empty((ple_rows,h))
         logits = empty((m,e),torch.float32)
         ids,prob = empty((m,k),torch.int32),empty((m,k),torch.float32)
         counts,offsets,tile_offsets = (empty((e,),torch.int32) for _ in range(3))
         relative,slot_map = empty((m,k),torch.int32),empty((m,k),torch.int32)
         assignments=m*k
-        tiles=(assignments+15)//16+min(e,assignments)
-        tile_expert,tile_row,tile_count = empty((tiles,),torch.int32),empty((tiles,),torch.int32),empty((1,),torch.int32)
+        route_segments=(assignments+1023)//1024
+        route_partial,route_offsets=(empty((e,route_segments),torch.int32) for _ in range(2)) if m>=256 else (None,None)
+        # Larger row tiles amortize expert decoding on long prompts; short
+        # requests need the smaller tile to bound padding and register costs.
+        expert_bm=(self.prefill_expert_block_m or (64 if m>=1024 else 32)) if m>=256 else 16
+        byte_permute=self.prefill_byte_permute and expert_bm==64 and self.expert_shortbook
+        tiles=(assignments+expert_bm-1)//expert_bm+min(e,assignments)
+        # An auto BM64 arena must also accommodate smaller BM32 tails.
+        # The route tile count is not monotonic in request length.
+        smallest_bm=self.prefill_expert_block_m or 32
+        arena_assignments=self.prefill_workspace_rows*k
+        route_reserve=((arena_assignments+smallest_bm-1)//smallest_bm+min(e,arena_assignments)) if m>=256 else tiles
+        tile_expert,tile_row=(empty((tiles,),torch.int32,reserve=route_reserve) for _ in range(2))
+        tile_count=empty((1,),torch.int32)
         rotated = empty((m,h))
         aq,sa = empty((m,h),torch.int8),empty((m,1))
         dispatch,ds = empty((assignments,h),torch.int8),empty((assignments,1))
@@ -395,7 +499,9 @@ class Model:
                 labels.append('gdn-history-copy')
                 compact=verify and self.compact_gdn
                 saved=empty((m,48,128) if compact else (m,48,128,128),torch.float32) if verify else prefix_state
-                call(f'gdn-sequence-{m}-{"compact" if compact else "prefix" if verify else "inplace"}',lambda:gdn_sequence(m,in_place=not verify,compact=compact),q[0],keys[0],values[0],g,beta,self.states[f'{i}:gdn'],saved,recurrent)
+                gdn_threads=self.prefill_gdn_threads if m>=256 else 128
+                gdn_value_tile=self.prefill_gdn_value_tile if m>=256 else 32
+                call(f'gdn-sequence-{m}-{gdn_threads}-{gdn_value_tile}-{"compact" if compact else "prefix" if verify else "inplace"}',lambda:gdn_sequence(m,threads=gdn_threads,value_tile=gdn_value_tile,in_place=not verify,compact=compact),q[0],keys[0],values[0],g,beta,self.states[f'{i}:gdn'],saved,recurrent)
                 if compact:
                     saved_k=empty((16,m,128));saved_g=empty((m,48),torch.float32)
                     for source,destination in ((keys[0],saved_k),(g,saved_g)):
@@ -420,34 +526,39 @@ class Model:
                     saved=empty((m,4,128));prefix_states[f'{i}:pending']=saved
                     call(f'prefix-pending-{m}',lambda:fm.pending_prefix(m),index_qk.view(m,5,128),self.states[f'{i}:pending'],self.position_gpu,saved)
                 call(f'index-pending-{m}',lambda:qsa.index_pending(m),index_qk.view(m,5,128),self.position_gpu,self.states[f'{i}:pending'])
-                call(f'index-scores-{m}',lambda:qsa.index_scores(m,self.capacity),index_q,self.states[f'{i}:index'],self.position_gpu,index_scores)
+                call(f'index-scores-{m}-{index_cap}',lambda:qsa.index_scores(m,index_cap),index_q,self.states[f'{i}:index'][:blocks],self.position_gpu,index_scores)
                 for shift in (24,16,8,0):
-                    call(f'index-hist-{m}-{shift}',lambda shift=shift:qsa.radix_histogram(m,self.capacity,shift),index_scores,index_prefix,self.position_gpu,index_hist)
-                    call(f'index-choose-{m}-{shift}',lambda shift=shift:qsa.radix_choose(m,self.capacity,shift),index_hist,index_prefix,index_remaining,self.position_gpu)
-                call(f'index-counts-{m}',lambda:qsa.selection_counts(m,self.capacity),index_scores,index_prefix,self.position_gpu,index_counts)
-                call(f'index-offsets-{m}',lambda:qsa.selection_offsets(m,self.capacity),index_counts,index_offsets,index_greater,self.position_gpu,selected)
-                call(f'index-scatter-{m}',lambda:qsa.selection_scatter(m,self.capacity),index_scores,index_prefix,index_offsets,index_greater,self.position_gpu,selected)
-                call(f'qsa-sparse-packed-{m}',lambda:qsat.sparse_attention(m,self.capacity,packed=True),
+                    call(f'index-hist-{m}-{index_cap}-{shift}',lambda shift=shift:qsa.radix_histogram(m,index_cap,shift),index_scores,index_prefix,self.position_gpu,index_hist)
+                    call(f'index-choose-{m}-{index_cap}-{shift}',lambda shift=shift:qsa.radix_choose(m,index_cap,shift),index_hist,index_prefix,index_remaining,self.position_gpu)
+                call(f'index-counts-{m}-{index_cap}',lambda:qsa.selection_counts(m,index_cap),index_scores,index_prefix,self.position_gpu,index_counts)
+                call(f'index-offsets-{m}-{index_cap}',lambda:qsa.selection_offsets(m,index_cap),index_counts,index_offsets,index_greater,self.position_gpu,selected)
+                call(f'index-scatter-{m}-{index_cap}',lambda:qsa.selection_scatter(m,index_cap),index_scores,index_prefix,index_offsets,index_greater,self.position_gpu,selected)
+                single_buffer=self.prefill_qsa_single_buffer and m>=256
+                call(f'qsa-sparse-packed-{m}-{qsa_splits}-{qsa_block}-{qsa_threads}-{single_buffer}',lambda:qsat.sparse_attention(m,self.capacity,splits=qsa_splits,packed=True,block_size=qsa_block,threads=qsa_threads,single_buffer=single_buffer),
                      qsa_query,self.states[f'{i}:key'].view(torch.uint32),self.states[f'{i}:value'].view(torch.uint32),
                      self.states[f'{i}:key_scale'],self.states[f'{i}:value_scale'],selected,self.position_gpu,sparse_max,sparse_den,sparse_out)
-                call(f'qsa-merge-{m}',lambda:qsa.sparse_merge(m),sparse_max,sparse_den,sparse_out,qsa_gate,qsa_out)
+                call(f'qsa-merge-{m}-{qsa_splits}',lambda:qsa.sparse_merge(m,qsa_splits),sparse_max,sparse_den,sparse_out,qsa_gate,qsa_out)
                 projection('qsa-out',qsa_out.flatten(1),prefix+'attn_output.weight',block)
             call(f'hc-combine-{m}',lambda:hc_combine(m,h,c,'float16'),block,residual,inject_attn,residual)
             mixer(prefix+'hc_ffn_',inject_ffn)
             projection('router',mixed,prefix+'ffn_gate_inp.weight',logits)
             call(f'router-{m}',lambda:router_topk(m,e,k),logits,ids,prob)
             direct=self.direct_experts and m==1
-            # Real M4/M8 routing benefits from the exact 8 KiB decoder and
-            # wider output tiles. Keep large prefill and other tails on their
-            # existing geometry until separately measured.
-            shortbook=self.expert_shortbook and m in (4,8)
+            # Shortbook/BM32 preserves decoded INT8 values and improves real
+            # prefill weight reuse; small verification keeps its BM16 plan.
+            shortbook=self.expert_shortbook and (m in (4,8) or m>=256)
             book_key='short_table' if shortbook else 'table'
             expert_bn=128 if shortbook else 64
-            expert_stages=1 if shortbook else 2
+            expert_stages=1 if shortbook and expert_bm<=32 else 2
             if not direct:
-                call(f'histogram-{m}',lambda:expert_histogram(m,e,k),ids,counts,relative)
-                call('offsets',lambda:expert_offsets(e),counts,offsets,tile_offsets,tile_count)
-                call(f'tiles-{m}',lambda:expert_tiles(m,e,k),counts,tile_offsets,tile_expert,tile_row)
+                if m>=256:
+                    call(f'histogram-local-{m}',lambda:expert_histogram_local(m,e,k),ids,route_partial,relative)
+                    call(f'histogram-offsets-{m}',lambda:expert_histogram_offsets(m,e,k),route_partial,route_offsets,counts)
+                    call(f'histogram-finish-{m}',lambda:expert_histogram_finish(m,e,k),ids,route_offsets,relative)
+                else:
+                    call(f'histogram-{m}',lambda:expert_histogram(m,e,k),ids,counts,relative)
+                call(f'offsets-{expert_bm}',lambda:expert_offsets(e,expert_bm),counts,offsets,tile_offsets,tile_count)
+                call(f'tiles-{m}-{expert_bm}',lambda:expert_tiles(m,e,k,expert_bm),counts,tile_offsets,tile_expert,tile_row)
             gate_weight = self.weights[prefix+'ffn_gate_up_exps.weight']
             down_weight = self.weights[prefix+'ffn_down_exps.weight']
             if self.fused_rotation:
@@ -461,8 +572,8 @@ class Model:
                      aq.view(torch.int32),gate_weight['packed'],gate_weight['table'],gate_weight['scale'],sa.view(-1),ids,gu)
             else:
                 call(f'dispatch-{m}',lambda:expert_dispatch(m,h,e,k,scale_group=h),aq,sa,ids,relative,offsets,dispatch,ds,slot_map)
-                call(f'expert-gu-{m}',lambda:integer_vq_grouped(assignments,e,tiles,2*f,h,kind='e8p',shared_table=True,
-                     block_n=expert_bn,shortbook=shortbook,num_stages=expert_stages),
+                call(f'expert-gu-{m}-{byte_permute}',lambda:integer_vq_grouped(assignments,e,tiles,2*f,h,kind='e8p',shared_table=True,
+                     block_n=expert_bn,shortbook=shortbook,num_stages=expert_stages,block_m=expert_bm,byte_permute=byte_permute),
                      dispatch,gate_weight['packed'],gate_weight[book_key],patch,gate_weight['scale'],ds.view(-1),
                      counts,offsets,tile_expert,tile_row,tile_count,gu)
             if self.fused_rotation:
@@ -474,8 +585,8 @@ class Model:
                 call('expert-down-direct',lambda:integer_e8p_gemv(e,k,h,f,shared_input=False),
                      fq.view(torch.int32),down_weight['packed'],down_weight['table'],down_weight['scale'],fs.view(-1),ids,expert_out)
             else:
-                call(f'expert-down-{m}',lambda:integer_vq_grouped(assignments,e,tiles,h,f,kind='e8p',shared_table=True,
-                     block_n=expert_bn,shortbook=shortbook,num_stages=expert_stages),
+                call(f'expert-down-{m}-{byte_permute}',lambda:integer_vq_grouped(assignments,e,tiles,h,f,kind='e8p',shared_table=True,
+                     block_n=expert_bn,shortbook=shortbook,num_stages=expert_stages,block_m=expert_bm,byte_permute=byte_permute),
                      fq,down_weight['packed'],down_weight[book_key],patch,down_weight['scale'],fs.view(-1),
                      counts,offsets,tile_expert,tile_row,tile_count,expert_out)
             shared_a8=quantize(mixed)
@@ -505,7 +616,7 @@ class Model:
               'labels':labels,'embedding':embedding,'ple_embedding':ple_embedding,'output':output,
               'residual':residual,'condition':condition,'prefix_states':prefix_states,
               'prefix_updates':prefix_updates,'accepted':torch.zeros(1,device='cuda',dtype=torch.int32),
-              'graphs':{}}
+              'graphs':{},'verify':verify,'index_capacity':index_cap}
         self.plans[key]=plan
         print('compiled plan',m,'ops',len(ops),flush=True)
         return plan
@@ -615,7 +726,7 @@ class Model:
 
 
 def prefill(model, tokens, chunk, *, output='logits'):
-    """Run bucketed chunks; the output head is needed only at the final token."""
+    """Run exact chunks; the output head is needed only at the final token."""
     if output not in ('logits','none','token'):
         raise ValueError('Output must be logits, none or token')
     cursor = 0
@@ -680,7 +791,7 @@ def main():
     p.add_argument('--checkpoint',type=Path,required=True)
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--context',type=int,default=262144)
-    p.add_argument('--chunk',type=int,choices=(1,2,4,8,16,32,64,128,256,512),default=512)
+    p.add_argument('--chunk',type=int,choices=(1,2,4,8,16,32,64,128,256,512,1024,2048,4096),default=4096)
     p.add_argument('--max-new-tokens',type=int,default=64)
     p.add_argument('--graph',choices=('on','off'),default='on')
     p.add_argument('--baseline',type=Path,help='Original BF16/FP8 probes on exactly these forced histories')

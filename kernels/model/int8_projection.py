@@ -10,29 +10,43 @@ from tools.operators.common import orin_jit
 
 
 @orin_jit
-def int8_projection(M: int, N: int, K: int, output_dtype: str = 'float16', block_m: int = 16):
+def int8_projection(M: int, N: int, K: int, output_dtype: str = 'float16', block_m: int = 16,
+                    block_n: int = 64, block_k: int = 64, group_m: int = 0):
     if any(type(v) is not int or v <= 0 for v in (M,N,K)) or K%64 or K*128*128 > 2**31-1:
         raise ValueError('Invalid INT8 projection geometry')
     if output_dtype not in ('float16','float32'):
         raise ValueError('Invalid INT8 projection output dtype')
-    if block_m not in (16,32,64):raise ValueError('Invalid INT8 row tile')
+    if block_m not in (16,32,64,128):raise ValueError('Invalid INT8 row tile')
+    if block_n not in (64,128) or block_k not in (64,128) or K%block_k:
+        raise ValueError('Invalid INT8 column/reduction tile')
+    if type(group_m) is not int or group_m not in (0,1,2,4,8):
+        raise ValueError('Invalid INT8 row grouping')
+    mt,nt=(M+block_m-1)//block_m,(N+block_n-1)//block_n
     @T.prim_func
     def main(A:T.Tensor((M,K),T.int8),Weight:T.Tensor((N,K),T.int8),
              WeightScale:T.Tensor((N,),T.float16),TokenScale:T.Tensor((M,),T.float16),
              Output:T.Tensor((M,N),output_dtype)):
-        with T.Kernel(T.ceildiv(M,block_m),T.ceildiv(N,64),threads=128) as (by,bx):
-            a = T.alloc_shared((block_m,64),T.int8)
-            w = T.alloc_shared((64,64),T.int8)
-            acc = T.alloc_fragment((block_m,64),T.int32)
+        with T.Kernel(mt*nt,threads=128) as pid:
+            by=T.alloc_var(T.int32);bx=T.alloc_var(T.int32)
+            if group_m:
+                first=(pid//(group_m*nt))*group_m
+                actual=T.min(mt-first,group_m)
+                by=first+(pid%(group_m*nt))%actual
+                bx=(pid%(group_m*nt))//actual
+            else:
+                by=pid%mt;bx=pid//mt
+            a = T.alloc_shared((block_m,block_k),T.int8)
+            w = T.alloc_shared((block_n,block_k),T.int8)
+            acc = T.alloc_fragment((block_m,block_n),T.int32)
             T.clear(acc)
-            for kg in T.Pipelined(K//64,num_stages=2):
-                T.copy(A[by*block_m,kg*64],a)
-                T.copy(Weight[bx*64,kg*64],w)
+            for kg in T.Pipelined(K//block_k,num_stages=2):
+                T.copy(A[by*block_m,kg*block_k],a)
+                T.copy(Weight[bx*block_n,kg*block_k],w)
                 T.gemm(a,w,acc,transpose_B=True)
-            for i,j in T.Parallel(block_m,64):
-                if by*block_m+i < M and bx*64+j < N:
-                    Output[by*block_m+i,bx*64+j] = ((T.cast(acc[i,j],T.float32)*
-                        T.cast(WeightScale[bx*64+j],T.float32))*T.cast(TokenScale[by*block_m+i],T.float32))
+            for i,j in T.Parallel(block_m,block_n):
+                if by*block_m+i < M and bx*block_n+j < N:
+                    Output[by*block_m+i,bx*block_n+j] = ((T.cast(acc[i,j],T.float32)*
+                        T.cast(WeightScale[bx*block_n+j],T.float32))*T.cast(TokenScale[by*block_m+i],T.float32))
     return main
 
 

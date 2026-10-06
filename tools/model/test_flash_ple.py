@@ -85,5 +85,38 @@ class FlashPleTests(unittest.TestCase):
         np.testing.assert_array_equal(expected,disabled.prepare([100,101],[])[0])
         self.assertEqual(disabled.cache.bytes,0)
 
+    def test_vectorized_hashes_preserve_reset_and_chunk_boundaries(self):
+        lookup=PleLookup(Table(self.metadata()))
+        rng=np.random.default_rng(20261002)
+        tokens=rng.integers(0,lookup.vocab,size=1025).tolist()
+        for position in (0,1,254,255,256,257,511,512,1024):tokens[position]=lookup.eos
+        for history in ([],[100],[100,101]):
+            original=list(history)
+            rows,after=lookup.row_ids(tokens,history)
+            expected=[];serial=list(history)
+            for token in tokens:
+                part,serial=lookup.row_ids([token],serial);expected.extend(part)
+            self.assertEqual(rows,expected);self.assertEqual(after,serial)
+            first,middle=lookup.row_ids(tokens[:513],history)
+            tail,end=lookup.row_ids(tokens[513:],middle)
+            self.assertEqual(rows,first+tail);self.assertEqual(after,end)
+            self.assertEqual(history,original)
+
+    def test_half_cache_preserves_operand_rounding_and_immutability(self):
+        from tools.model.flash_lookup import RowCache
+        rng=np.random.default_rng(20261002)
+        weights=rng.normal(size=(8,160)).astype(np.float32)
+        class Weights:
+            def rows(self,name,first,count):return weights[first:first+count]
+        source=Weights();full=RowCache(source,capacity_bytes=8192)
+        half=RowCache(source,capacity_bytes=8192,dtype=np.float16)
+        for row in range(len(weights)):
+            expected=full.read('test',row).astype(np.float16)
+            actual=half.read('test',row)
+            np.testing.assert_array_equal(actual.view(np.uint16),expected.view(np.uint16))
+            self.assertFalse(actual.flags.writeable)
+        self.assertLessEqual(half.bytes,half.capacity)
+        with self.assertRaises(ValueError):RowCache(source,capacity_bytes=8192,dtype=np.int8)
+
 
 if __name__ == '__main__':unittest.main()

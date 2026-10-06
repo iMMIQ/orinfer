@@ -43,7 +43,7 @@ def expert_histogram(M: int, E: int = 512, top_k: int = 10):
 @orin_jit
 def expert_offsets(E: int = 512, block_m: int = 16):
     """Build (Counts, RowOffsets[E], TileOffsets[E], TileCount[1]), INT32."""
-    if type(E) is not int or E <= 0 or block_m != 16:
+    if type(E) is not int or E <= 0 or block_m not in (16,32,64):
         raise ValueError('Invalid MoE expert prefix dimensions')
     width = 1 << (E - 1).bit_length()
 
@@ -75,14 +75,14 @@ def expert_offsets(E: int = 512, block_m: int = 16):
 def expert_tiles(M: int, E: int = 512, top_k: int = 10, block_m: int = 16):
     """Build (Counts, TileOffsets, TileExpert, TileRow), all INT32.
 
-    Output capacity ceil(M*top_k/16)+min(E,M*top_k) bounds all distributions.
+    Output capacity ceil(M*top_k/block_m)+min(E,M*top_k) bounds all distributions.
     Only the prefix indicated by expert_offsets.TileCount is initialized/read.
     """
-    if any(type(x) is not int or x <= 0 for x in (M, E, top_k)) or block_m != 16:
+    if any(type(x) is not int or x <= 0 for x in (M, E, top_k)) or block_m not in (16,32,64):
         raise ValueError('Invalid MoE tile dimensions')
     assignments = M * top_k
-    capacity = (assignments + 15) // 16 + min(E, assignments)
-    expert_capacity = (M + 15) // 16  # Each expert is selected at most once per token.
+    capacity = (assignments + block_m - 1) // block_m + min(E, assignments)
+    expert_capacity = (M + block_m - 1) // block_m  # Each expert is selected at most once per token.
 
     @T.prim_func
     def main(Counts: T.Tensor((E,), T.int32),
@@ -224,3 +224,54 @@ def moe_combine(M: int, H: int, slots: int, top_k: int = 10):
                 if col < H:
                     Output[row, col] = acc[j] + gate * T.cast(Shared[row, col], T.float32)
     return main
+
+
+@orin_jit
+def expert_histogram_local(M,E=512,K=10,block=1024):
+ if any(type(x) is not int or x<=0 for x in (M,E,K,block)) or K>E or block not in (512,1024,2048):raise ValueError('Invalid segmented MoE histogram geometry')
+ assignments=M*K;segments=(assignments+block-1)//block
+ @T.prim_func
+ def main(IDs:T.Tensor((M,K),T.int32),Partial:T.Tensor((E,segments),T.int32),Slots:T.Tensor((M,K),T.int32)):
+  with T.Kernel(segments,E,threads=128) as (segment,expert):
+   matches=T.alloc_fragment((block,),T.int32);prefix=T.alloc_fragment((block,),T.int32)
+   for j in T.Parallel(block):
+    assignment=segment*block+j;matches[j]=0
+    if assignment<assignments:matches[j]=T.cast(IDs[assignment//K,assignment%K]==expert,T.int32)
+    prefix[j]=matches[j]
+   T.cumsum(prefix,dim=0)
+   for j in T.Parallel(block):
+    assignment=segment*block+j
+    if j==block-1:Partial[expert,segment]=prefix[j]
+    if assignment<assignments and matches[j]!=0:Slots[assignment//K,assignment%K]=prefix[j]-1
+ return main
+
+@orin_jit
+def expert_histogram_offsets(M,E=512,K=10,block=1024):
+ if any(type(x) is not int or x<=0 for x in (M,E,K,block)) or K>E or block not in (512,1024,2048):raise ValueError('Invalid segmented MoE histogram geometry')
+ segments=(M*K+block-1)//block;width=1<<(segments-1).bit_length()
+ @T.prim_func
+ def main(Partial:T.Tensor((E,segments),T.int32),Offsets:T.Tensor((E,segments),T.int32),Counts:T.Tensor((E,),T.int32)):
+  with T.Kernel(E,threads=128) as expert:
+   prefix=T.alloc_fragment((width,),T.int32)
+   for j in T.Parallel(width):
+    prefix[j]=0
+    if j<segments:prefix[j]=Partial[expert,j]
+   T.cumsum(prefix,dim=0)
+   for j in T.Parallel(width):
+    if j<segments:Offsets[expert,j]=prefix[j]-Partial[expert,j]
+    if j==width-1:Counts[expert]=prefix[j]
+ return main
+
+@orin_jit
+def expert_histogram_finish(M,E=512,K=10,block=1024):
+ if any(type(x) is not int or x<=0 for x in (M,E,K,block)) or K>E or block not in (512,1024,2048):raise ValueError('Invalid segmented MoE histogram geometry')
+ assignments=M*K;segments=(assignments+block-1)//block
+ @T.prim_func
+ def main(IDs:T.Tensor((M,K),T.int32),Offsets:T.Tensor((E,segments),T.int32),Slots:T.Tensor((M,K),T.int32)):
+  with T.Kernel(T.ceildiv(assignments,256),threads=128) as tile:
+   for j in T.Parallel(256):
+    assignment=tile*256+j
+    if assignment<assignments:
+     row,rank=assignment//K,assignment%K
+     Slots[row,rank]+=Offsets[IDs[row,rank],assignment//block]
+ return main
