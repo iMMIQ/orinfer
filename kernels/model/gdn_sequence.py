@@ -25,7 +25,7 @@ def gdn_sequence(tokens: int, q_scale: float = 128 ** -.5,
              G: T.Tensor((tokens, HV), T.float32),
              Beta: T.Tensor((tokens, HV), T.float32),
              State: T.Tensor((HV, DK, DV), T.float32),
-             Prefix: T.Tensor((tokens, HV, DK, DV), T.float32),
+             Prefix: T.Tensor((1 if in_place else tokens, HV, DK, DV), T.float32),
              Out: T.Tensor((tokens, HV * DV), T.float16)):
         with T.Kernel(DV // value_tile, HV, threads=threads) as (bv, h):
             kh = h // 3

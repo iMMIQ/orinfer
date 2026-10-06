@@ -15,7 +15,8 @@ Q_SCALE = 1.0
 def gdn_conv_prep(B: int | None = None, tokens: int | None = None,
                   tile_tokens: int = 16, normalize_round_fp16: bool = True,
                   q_scale: float = 1.0, qk_output_dtype: str = "float16",
-                  conv_product_round_fp16: bool = True):
+                  conv_product_round_fp16: bool = True,
+                  weight_dtype: str = "float16"):
     """Build (X,W,HI,lengths,positions,Q,K,V,HO,positions_out).
 
     X[B,T,10240] and W[10240,4] FP16; chronological raw HI/HO[B,3,10240]
@@ -36,12 +37,13 @@ def gdn_conv_prep(B: int | None = None, tokens: int | None = None,
     """
     assert tile_tokens in (1, 2, 4, 8, 16)
     assert qk_output_dtype in ("float16", "float32") and q_scale > 0
+    assert weight_dtype in ("float16", "float32")
     batch = T.dynamic("batch") if B is None else B
     time = T.dynamic("tokens") if tokens is None else tokens
 
     @T.prim_func
     def kernel(X: T.Tensor((batch, time, CHANNELS), T.float16),
-               W: T.Tensor((CHANNELS, 4), T.float16),
+               W: T.Tensor((CHANNELS, 4), weight_dtype),
                HI: T.Tensor((batch, 3, CHANNELS), T.float16),
                lengths: T.Tensor((batch,), T.int32),
                positions: T.Tensor((batch,), T.int32),

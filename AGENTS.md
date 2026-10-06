@@ -17,6 +17,8 @@
 - GDN持续状态为FP32；KV、卷积、GDN和位置状态均属于请求私有状态。
 - 改变prefill/decode、恢复或分支行为时校验全部状态，不只校验KV。
 - 单份常驻W4；scale、zero、LUT、padding和持久重复表示计入权重平均bits。临时W8不作永久权重缓存。
+- Flash Next扩展采用Q2A8和质量优先的混合精度；其QSA长上下文KV使用group-64对称INT8及FP16 scale，压缩索引与未完成块也纳入请求私有状态；Q2专家直接索引常驻权重库，不按步复制权重或缓存整份展开W8。HC保留BF16权重；PLE表使用受预算限制的CPU缓存，其n-gram历史与卷积历史必须纳入请求状态及prefix恢复。
+- Flash Next使用我们自己的整数E8P＋旋转量化表示，运行时反量化到INT8计算，不沿用社区Q2量化编码。当前优先完成算子和真实端到端推理，允许不校准或小样本校准；原始BF16按矩阵或专家分块读取，不需要保存完整BF16模型。完整校准需单独验证专家覆盖和层间误差，不能把反量化后的社区Q2称为原始BF16基线。
 - 在线模型采用HF配置/tokenizer目录和`cache/model.json`数据描述；标准分片safetensors保留当前W4表示，校验payload hash、dtype、shape与物理layout。架构自动匹配独立算子包，第一阶段采用INT8为主、质量优先的混合精度，关键部分可FP16/FP32；不实现force_int8或其他格式导入。离线AOT manifest只作构建中间产物，不提供旧在线格式兼容分支。算子夹具格式独立。
 - 服务协议位于orinfer-api；CLI只处理命令。CUDA执行器、加载器、架构计划、生成/视觉/MTP控制分离；权重、序列状态和workspace分作用域管理。
 - Rust按实际导出host ABI绑定参数、grid/block/shared；检查CUDA返回值、unsafe边界、资源生存期和stream顺序。
