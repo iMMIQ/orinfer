@@ -7,7 +7,7 @@
 - 硬件固定本机Jetson AGX Orin 64GB，aarch64/CUDA SM87。
 - 支持Qwen3.8-27B文本、图片和多图输入，实际checkpoint为Qwen3_5架构；不包含视频。
 - 在线运行时用Rust，生产GPU kernel以TileLang为源；Python只用于离线转换、编译、参考和验证。
-- 架构通过Rust模块注册，按checkpoint配置实例化执行顺序；算子包提供实现/ABI/布局契约，不携带执行程序。公共CUDA执行器不硬编码模型层数、维度或层序。
+- 架构族与计算策略通过独立模型执行包注册。包内Rust cdylib通过版本化C ABI生成执行程序、动态batch和状态绑定，匹配的TileLang cubin与库同包发布。公共CUDA执行器不硬编码模型族、层数、维度或层序；新增架构不增加核心分派枚举。
 - 第一阶段包含prefix cache与多请求batching；缓存恢复和batch调度必须保持完整KV/GDN/卷积/MTP状态及请求隔离。
 - 项目许可证为LGPL-3.0-or-later，保留第三方版权和许可证声明。
 
@@ -19,7 +19,7 @@
 - 单份常驻W4；scale、zero、LUT、padding和持久重复表示计入权重平均bits。临时W8不作永久权重缓存。
 - Flash Next扩展采用Q2A8和质量优先的混合精度；其QSA长上下文KV使用group-64对称INT8及FP16 scale，压缩索引与未完成块也纳入请求私有状态；Q2专家直接索引常驻权重库，不按步复制权重或缓存整份展开W8。HC保留BF16权重；PLE表使用受预算限制的CPU缓存，其n-gram历史与卷积历史必须纳入请求状态及prefix恢复。
 - Flash Next使用我们自己的整数E8P＋旋转量化表示，运行时反量化到INT8计算，不沿用社区Q2量化编码。当前优先完成算子和真实端到端推理，允许不校准或小样本校准；原始BF16按矩阵或专家分块读取，不需要保存完整BF16模型。完整校准需单独验证专家覆盖和层间误差，不能把反量化后的社区Q2称为原始BF16基线。
-- 在线模型采用HF配置/tokenizer目录和`cache/model.json`数据描述；标准分片safetensors保留当前W4表示，校验payload hash、dtype、shape与物理layout。架构自动匹配独立算子包，第一阶段采用INT8为主、质量优先的混合精度，关键部分可FP16/FP32；不实现force_int8或其他格式导入。离线AOT manifest只作构建中间产物，不提供旧在线格式兼容分支。算子夹具格式独立。
+- 在线模型采用HF配置/tokenizer目录和`cache/model.json`数据描述；标准分片safetensors保留当前W4表示，校验payload hash、dtype、shape与物理layout。模型数据通过execution_package digest固定独立模型执行包，第一阶段采用INT8为主、质量优先的混合精度，关键部分可FP16/FP32；不实现force_int8或其他格式导入。离线AOT manifest只作构建中间产物，在线模型数据描述与执行包均保留schema 1，只支持当前原生模型包结构；不提供旧结构或schema 2兼容分支。算子夹具格式独立。
 - 服务协议位于orinfer-api；CLI只处理命令。CUDA执行器、加载器、架构计划、生成/视觉/MTP控制分离；权重、序列状态和workspace分作用域管理。
 - Rust按实际导出host ABI绑定参数、grid/block/shared；检查CUDA返回值、unsafe边界、资源生存期和stream顺序。
 - CUDA graph需要稳定地址和预分配workspace；改输入后replay验证实际执行。

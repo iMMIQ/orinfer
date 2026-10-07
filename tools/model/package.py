@@ -1,7 +1,7 @@
-"""Split a prepared safetensors cache into model data and an operator package.
+"""Split a prepared safetensors cache into model data and a native execution package.
 
 Only an offline schema-2 cache is imported here. The online loader builds all
-execution order from registered Rust architecture recipes. No weights are
+execution order from an independently built model library. No weights are
 requantized; existing immutable shards are hardlinked, or copied across devices.
 """
 import argparse
@@ -24,6 +24,36 @@ from tools.model.publication import file_hash, source_path, write_json
 
 CONTRACT = json.loads((Path(__file__).resolve().parents[2] / 'configs/architecture-contract.json').read_text())
 TEXT_KEYS = CONTRACT['families']['qwen3_5']['text_keys']
+
+
+def model_library():
+    path = Path(os.environ.get('ORINFER_MODEL_LIBRARY', str(Path(__file__).resolve().parents[2] /
+                                                        'target/release/liborinfer_qwen3_5_a8.so')))
+    if not path.is_file():
+        raise ValueError('Build the independent model library first and set ORINFER_MODEL_LIBRARY')
+    verify_library(path)
+    return path
+
+
+def verify_library(path):
+    with path.open('rb') as stream:
+        header = stream.read(20)
+    if (len(header) != 20 or header[:4] != b'\x7fELF' or header[4:6] != bytes((2, 1))
+            or int.from_bytes(header[16:18], 'little') != 3
+            or int.from_bytes(header[18:20], 'little') != 183):
+        raise ValueError('Execution library must be an aarch64 ELF shared object')
+
+
+def verify_execution(package, directory):
+    execution = package.get('execution', {})
+    if (package.get('schema_version') != 1 or package.get('runtime_abi') != 1
+            or execution.get('abi_version') != 1 or not execution.get('package') or not execution.get('version')):
+        raise ValueError('Unsupported model execution package schema or ABI')
+    asset = execution['library']
+    library = source_path(directory.resolve(), asset['file'])
+    if file_hash(library) != asset['sha256']:
+        raise ValueError('Execution library sha256 mismatch')
+    verify_library(library)
 
 
 def config_signature(config):
@@ -174,11 +204,16 @@ def publish(directory, engine=None):
                    buffer_contracts=[{k: v for k, v in b.items() if k != 'data'} for b in model['buffers']],
                    toolchain={k: model['toolchain'][k] for k in ('torch', 'tilelang', 'cuda')
                               if k in model['toolchain']})
+    library = model_library()
+    package['execution'] = dict(abi_version=1, library=dict(file='lib/model.so', sha256=file_hash(library)),
+                                package='orinfer-qwen3_5-a8', version='0.1.1')
     raw = (json.dumps(package, indent=2, ensure_ascii=False) + '\n').encode()
     digest = hashlib.sha256(raw).hexdigest()
-    destination = cache / 'operators' / digest
+    destination = cache / 'packages' / digest
     destination.mkdir(parents=True)
     (destination / 'package.json').write_bytes(raw)
+    (destination / 'lib').mkdir()
+    shutil.copyfile(library, destination / 'lib/model.so')
     (cache / 'kernels').rename(destination / 'kernels')
     # Include project licensing in independently distributed packages.
     repo = Path(__file__).resolve().parents[2]
@@ -187,13 +222,13 @@ def publish(directory, engine=None):
             shutil.copyfile(repo / name, destination / name)
     metadata = {k: v for k, v in model.items() if k not in ('kernels', 'programs')}
     write_json(cache / 'model.json', dict(schema_version=1, architecture='qwen3_5',
-               compute_policy='int8_quality', operator_package=digest,
+               compute_policy='int8_quality', execution_package=digest,
                buffer_scopes={b['name']: scope(b, model) for b in model['buffers']},
                frontend_assets={name: file_hash(directory / name) for name in
                                 ('tokenizer.json', 'chat_template.jinja', 'generation_config.json')}, metadata=metadata))
     validate_plan(directory, model, binding_map, engine or repo / 'target/release/orinfer')
     (cache / 'manifest.json').unlink()
-    return {'operator_package': digest, 'kernel_bindings': len(bindings), 'binding_map': binding_map}
+    return {'execution_package': digest, 'kernel_bindings': len(bindings), 'binding_map': binding_map}
 
 
 def split(model, output, engine=None):
@@ -254,6 +289,7 @@ def install(archive_path, cache):
         if file_hash(package / 'package.json') != digest:
             raise ValueError('Operator package digest mismatch')
         manifest = json.loads((package / 'package.json').read_text())
+        verify_execution(manifest, package)
         checked = set()
         for kernel in manifest['kernels']:
             for field in ('module', 'source', 'host_abi'):

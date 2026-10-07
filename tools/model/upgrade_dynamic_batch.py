@@ -81,7 +81,7 @@ def upgrade(model, destination):
     with atomic_model(destination) as staging:
         operator = clone_model(model, staging, origin)
         digest = commit_package(staging, operator, data, package)
-    return dict(operator_package=digest, dynamic_templates=len(contracts),
+    return dict(execution_package=digest, dynamic_templates=len(contracts),
                 weight_bytes=data['metadata']['weight_bytes'])
 
 

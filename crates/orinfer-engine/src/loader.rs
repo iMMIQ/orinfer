@@ -1,10 +1,10 @@
 //! Custom model-directory loader. Only initialized tensor data lives with weights;
-//! operator packages supply implementations, and architecture code builds plans.
+//! native execution packages supply kernels and build model-specific plans.
 use crate::{
-    architecture::{self, Architecture, ComputePolicy, Configuration},
+    architecture::{Architecture, ComputePolicy},
     artifact::{Access, Result, resolve_file, sha256},
     model::Manifest,
-    operators::{self, OperatorPackage},
+    operators::{self, ExecutionPackage},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,7 +27,7 @@ struct Descriptor {
     schema_version: u32,
     architecture: Architecture,
     compute_policy: ComputePolicy,
-    operator_package: String,
+    execution_package: String,
     buffer_scopes: BTreeMap<String, BufferScope>,
     frontend_assets: BTreeMap<String, String>,
     metadata: Manifest,
@@ -39,11 +39,12 @@ pub(crate) struct PreparedModel {
     pub kernel_root: PathBuf,
     pub fingerprint: String,
     pub scopes: BTreeMap<String, BufferScope>,
-    pub operator_package: String,
+    pub execution_package: String,
     pub architecture: Architecture,
     pub policy: ComputePolicy,
     pub frontend_assets: BTreeMap<String, String>,
     pub decode_programs: std::collections::BTreeSet<String>,
+    pub execution_model: crate::model_package::ModelPackage,
 }
 
 pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
@@ -56,32 +57,28 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
     let raw = fs::read(&descriptor).map_err(|e| e.to_string())?;
     let mut model: Descriptor =
         serde_json::from_slice(&raw).map_err(|e| format!("Model descriptor: {e}"))?;
-    if model.schema_version != 1
-        || !model.metadata.kernels.is_empty()
-        || !model.metadata.programs.is_empty()
-    {
+    if model.schema_version != 1 {
+        return Err("Expected model data schema 1 with a native execution package".into());
+    }
+    if !model.metadata.kernels.is_empty() || !model.metadata.programs.is_empty() {
         return Err("Expected custom model descriptor without embedded kernels or programs".into());
     }
     validate_frontend_assets(root, &model.frontend_assets)?;
     let config_path = resolve_file(root, "config.json")?;
     let config_raw = fs::read(config_path).map_err(|e| e.to_string())?;
-    let config =
-        Configuration::parse(serde_json::from_slice(&config_raw).map_err(|e| e.to_string())?)?;
-    if config.architecture != model.architecture {
-        return Err("Model architecture differs from config.json".into());
-    }
-    let kernel_root = operators::resolve(&weights_root, &model.operator_package)?;
+    let config: serde_json::Value =
+        serde_json::from_slice(&config_raw).map_err(|e| e.to_string())?;
+    let kernel_root = operators::resolve(&weights_root, &model.execution_package)?;
     let package_raw =
         fs::read(resolve_file(&kernel_root, "package.json")?).map_err(|e| e.to_string())?;
-    if sha256(&package_raw) != model.operator_package {
-        return Err("Operator package digest mismatch".into());
+    if sha256(&package_raw) != model.execution_package {
+        return Err("Model execution package digest mismatch".into());
     }
-    let package: OperatorPackage =
-        serde_json::from_slice(&package_raw).map_err(|e| format!("Operator package: {e}"))?;
+    let package: ExecutionPackage = serde_json::from_slice(&package_raw)
+        .map_err(|e| format!("Model execution package: {e}"))?;
     package.validate(
-        model.architecture,
-        model.compute_policy,
-        &config.signature,
+        &model.architecture,
+        &model.compute_policy,
         &model.metadata.buffers,
     )?;
     validate_scopes(&model.metadata, &model.buffer_scopes)?;
@@ -100,13 +97,21 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
         .collect();
     model.metadata.greedy_sampling = package.greedy_sampling;
     model.metadata.batch_gdn = package.batch_gdn;
-    if package.batch_gdn
-        && model.buffer_scopes.get("BatchGdnPointers") != Some(&BufferScope::Workspace)
-    {
-        return Err("Batch GDN address table must be shared workspace".into());
-    }
-    let decode_programs =
-        architecture::build(&config, &mut model.metadata, &package.prefill_profiles)?;
+    let (execution_model, built) = crate::model_package::ModelPackage::create(
+        &kernel_root,
+        &package.execution,
+        orinfer_model_sdk::abi::CreateRequest {
+            config,
+            architecture: model.architecture.clone(),
+            compute_policy: model.compute_policy.clone(),
+            expected_signature: package.config_signature.clone(),
+            metadata: model.metadata,
+            prefill_profiles: package.prefill_profiles,
+        },
+    )?;
+    model.metadata = built.metadata;
+    validate_scopes(&model.metadata, &model.buffer_scopes)?;
+    let decode_programs = built.decode_programs;
     model.metadata.kernels = package.kernels;
     model.metadata.validate()?;
     // The descriptor pins the package; configuration also affects generated plans.
@@ -117,11 +122,12 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
         kernel_root,
         fingerprint,
         scopes: model.buffer_scopes,
-        operator_package: model.operator_package,
+        execution_package: model.execution_package,
         architecture: model.architecture,
         policy: model.compute_policy,
         frontend_assets: model.frontend_assets,
         decode_programs,
+        execution_model,
     })
 }
 
@@ -135,6 +141,31 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
             .ok_or("Missing buffer allocation scope")?;
         if (buffer.access == Access::Read) != (*scope == BufferScope::Weights) {
             return Err(format!("{}: invalid weight allocation scope", buffer.name));
+        }
+    }
+    if let Some(table) = &model.state_pointer_table
+        && (table.max_rows == 0
+            || table.max_rows > 128
+            || scopes.get(&table.buffer) != Some(&BufferScope::Workspace)
+            || model
+                .buffers
+                .iter()
+                .find(|b| b.name == table.buffer)
+                .is_none_or(|b| b.dtype != crate::artifact::Dtype::U64))
+    {
+        return Err("Invalid model state pointer table contract".into());
+    }
+    if let Some(controls) = &model.segment_controls {
+        for name in [&controls.length, &controls.last_index] {
+            if scopes.get(name) != Some(&BufferScope::Sequence)
+                || model
+                    .buffers
+                    .iter()
+                    .find(|b| &b.name == name)
+                    .is_none_or(|b| b.dtype != crate::artifact::Dtype::I32 || b.shape != [1])
+            {
+                return Err("Invalid model segment control contract".into());
+            }
         }
     }
     if let Some(kv) = &model.kv_cache {
@@ -183,8 +214,8 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(root.join("cache")).unwrap();
-        let descriptor = serde_json::json!({"schema_version":1,"architecture":"qwen3_5",
-            "compute_policy":"int8_quality","operator_package":"0".repeat(64),"buffer_scopes":{},"frontend_assets":{},
+        let descriptor = serde_json::json!({"schema_version":1,"architecture":"test_family",
+            "compute_policy":"int8_quality","execution_package":"0".repeat(64),"buffer_scopes":{},"frontend_assets":{},
             "metadata":{"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":2,
                 "max_context":8,"vocab":4,"toolchain":{},"buffers":[],"programs":{"decode":[]},
                 "reset_buffers":[],"input":"Input","token":"Token","status":"Status",

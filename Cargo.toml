@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/orinfer-engine", "crates/orinfer-cli", "crates/orinfer-api"]
+members = ["crates/orinfer-engine", "crates/orinfer-cli", "crates/orinfer-api", "crates/orinfer-model-sdk"]
 resolver = "3"
 
 [workspace.package]

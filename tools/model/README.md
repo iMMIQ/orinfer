@@ -143,11 +143,13 @@ python3 tools/model/prepare.py \
 
 工具检查checkpoint词表、所有源payload与构建资产的hash；不重新量化、不重编译kernel，包含只读权重以及RoPE/索引等可写buffer的初始值。默认每片约1 GiB，`--shard-mib`可调整；单个tensor不会拆分，转换内存由最大分片决定。写完并用标准safetensors reader校验后，才原子发布完整目录；已有输出不覆盖，失败时删除本次临时目录。
 
-目录根保留checkpoint配置、generation config、tokenizer、chat template和图片预处理配置；不复制原始checkpoint的大权重。内部`cache/weights/`保存带dtype/shape和物理layout元数据的safetensors及HF分片索引；`cache/model.json`引用tensor名字、payload SHA256及算子包digest，并声明weight/sequence/workspace作用域。`cache/operators/<digest>/`包含独立的`package.json`、cubin、源码和ABI；包不含权重payload或执行程序，执行顺序由Rust架构模块生成。文件在加载期间必须保持不变。原始checkpoint与此物理布局缓存用途不同，不能用Transformers直接执行缓存tensor。
+目录根保留checkpoint配置、generation config、tokenizer、chat template和图片预处理配置；不复制原始checkpoint的大权重。内部`cache/weights/`保存带dtype/shape和物理layout元数据的safetensors及HF分片索引；`cache/model.json`引用tensor名字、payload SHA256及算子包digest，并声明weight/sequence/workspace作用域。`cache/packages/<digest>/`包含独立的`package.json`、cubin、源码和ABI；包不含权重payload；lib/model.so通过版本化C ABI生成执行顺序，cubin与库同包固定。文件在加载期间必须保持不变。原始checkpoint与此物理布局缓存用途不同，不能用Transformers直接执行缓存tensor。
 
 在线Rust不提供旧模型格式兼容分支，也不在首次请求中执行Python或量化。后续重新编译或改变布局时，完成离线组装后发布新的目录。GPU校验fixture的`model`字段可指向模型目录或新数据描述文件；算子测试夹具仍采用独立的原格式。
 
-## 独立算子包
+## 独立模型执行包
+
+先构建独立模型库并设置 `ORINFER_MODEL_LIBRARY`，接口、构建和执行库更新见[模型执行包](../../docs/model-packages.md)。在线数据与包均保留 schema 1，旧加载格式不保留。
 
 ### Decode INT8 FFN
 
@@ -207,7 +209,7 @@ target/release/orinfer serve /path/to/batch-model \
 
 工具编译动态行数TileLang投影，按实际host ABI生成2/4/8/16/32/64/128绑定；相同不可变权重与原kernel资产使用hardlink，模型描述和新包独立发布。源码目录中不包含这些二进制资产。Rust先验证注册计划，完成后原子发布新的模型目录；已有目录不覆盖，失败时清理本次临时目录。在线请求不触发编译或量化。
 
-每请求状态驻留独立GPU地址，GDN验证前缀和统计临时量由执行线程共享；混合计划只合并无状态投影，因果attention和FP32 GDN逐段执行，padding不写入请求状态。Graph按有序槽位/段长缓存，地址保持稳定，最多16个batch捕获；新成员组合首次出现需捕获。执行计划由架构模块生成，算子包不提供用户程序。
+每请求状态驻留独立GPU地址，GDN验证前缀和统计临时量由执行线程共享；混合计划只合并无状态投影，因果attention和FP32 GDN逐段执行，padding不写入请求状态。Graph按有序槽位/段长缓存，地址保持稳定，最多16个batch捕获；新成员组合首次出现需捕获。执行计划由独立模型执行库生成，公共CUDA执行器负责launch和graph。
 
 可为已有批处理模型加入纯decode的批量GDN算子：
 
@@ -230,16 +232,16 @@ python3 tools/model/package.py split \
 ./target/release/orinfer plan-model /path/to/new-model
 ```
 
-算子包以内容hash命名，支持tar.gz归档和离线安装。安装器检查归档路径、package digest及全部kernel资产hash，校验完成后原子发布缓存；运行时再次检查ABI、配置、buffer布局与资产身份。包契约与权重payload身份分离，同配置和布局的不同checkpoint可以复用包。
+算子包以内容hash命名，支持tar.gz归档和离线安装。安装器检查归档路径、package digest及原生库及全部kernel资产hash，校验完成后原子发布缓存；运行时再次检查ABI、配置、buffer布局与资产身份。包契约与权重payload身份分离，同配置和布局的不同checkpoint可以复用包。
 
 ```bash
 python3 tools/model/package.py archive \
-  /path/to/new-model/cache/operators/PACKAGE_DIGEST operators.tar.gz
-python3 tools/model/package.py install operators.tar.gz ~/.cache/orinfer/operators
+  /path/to/new-model/cache/packages/PACKAGE_DIGEST operators.tar.gz
+python3 tools/model/package.py install operators.tar.gz ~/.cache/orinfer/packages
 ./target/release/orinfer serve /path/to/new-model
 ```
 
-可用`ORINFER_OPERATOR_CACHE`指定共享缓存位置。只有一种`int8_quality`策略，暂不提供compute-dtype切换。配置或构建变体不受当前包/架构recipe支持时，在准备或加载阶段报错；不在首次请求中编译或重新量化。
+可用`ORINFER_EXECUTION_CACHE`指定共享缓存位置。只有一种`int8_quality`策略，暂不提供compute-dtype切换。配置或构建变体不受当前包/架构recipe支持时，在准备或加载阶段报错；不在首次请求中编译或重新量化。
 
 ## 扩展已准备模型的上下文
 

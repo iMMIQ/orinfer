@@ -12,7 +12,7 @@
 
 模型准备时封存上述前端文件的 SHA256。需要有意修改时，先确认它们与 checkpoint 的 token 映射和语义一致，再执行 `python3 tools/model/package.py pin-assets MODEL_DIR` 重新封存；此命令不改权重。模型文件在加载期间必须保持不变。
 
-先查共享算子缓存中的 `<digest>`，缺失时再查模型内的 `cache/operators/<digest>`。`ORINFER_OPERATOR_CACHE` 可覆盖共享缓存位置；默认目录是 `$XDG_CACHE_HOME/orinfer/operators`，未设置 XDG 时为 `~/.cache/orinfer/operators`。存在但损坏的包会报错。专用 safetensors 布局沿用 `orin.layout.<tensor>` 标识，模型和算子包的身份不随项目名称变化。
+先查共享执行包缓存中的 `<digest>`，缺失时再查模型内的 `cache/packages/<digest>`。`ORINFER_EXECUTION_CACHE` 可覆盖共享缓存位置；默认目录是 `$XDG_CACHE_HOME/orinfer/packages`，未设置 XDG 时为 `~/.cache/orinfer/packages`。存在但损坏的包会报错。专用 safetensors 布局沿用 `orin.layout.<tensor>` 标识，执行包 digest 固定原生执行逻辑与 kernel。
 
 ## Chat API
 
@@ -115,7 +115,7 @@ KV 区间不可变并按引用共享，持续状态单独保存；恢复仍执�
 
 ## 诊断 CLI
 
-`plan-model` 在 CPU 输出注册架构生成的执行计划，`validate-model` 校验模型、算子包和张量 hash；两者不执行 GPU 推理。
+`plan-model` 在 CPU 加载模型包原生库并输出其生成的计划，`validate-model` 校验模型、执行库、kernel 和张量 hash；两者不初始化 GPU。执行包接口与旧数据迁移见[模型执行包](model-packages.md)。
 
 `run-model MODEL_DIR REQUESTS.json` 接收 token-ID 请求，用于固定块、普通 decode 的诊断基准，逐请求重置状态。输入长度须能由声明的 prefill 计划整除；它不代表 API 的任意长度提示、MTP 和缓存路径。任意长度和多请求生成通过 Chat API 或 Rust `Model::generate` 执行。
 

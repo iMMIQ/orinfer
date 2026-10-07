@@ -108,7 +108,7 @@ def upgrade(model, destination, report, mode):
     package['buffer_contracts'] = [{k:v for k,v in b.items() if k!='data'} for b in metadata['buffers']]
     digest = commit_package(destination, operator, data, package)
     report.mkdir(parents=True,exist_ok=True)
-    write_json(report/'upgrade.json',dict(operator_package=digest,weight_bytes=metadata['weight_bytes'],
+    write_json(report/'upgrade.json',dict(execution_package=digest,weight_bytes=metadata['weight_bytes'],
         weight_representation='unchanged',persistent_weight_bytes_added=0,
         workspace_bytes_added=128*(f//128)*2 if mode=='group' else 0,ffn_mode=mode))
 

@@ -206,7 +206,7 @@ def upgrade(model, destination, report):
     package['kernels'] = list(kernels.values())
     package['buffer_contracts'] = [{k:v for k,v in b.items() if k != 'data'} for b in metadata['buffers']]
     digest = commit_package(destination, operator, data, package)
-    write_json(report / 'upgrade.json',dict(model=str(destination),operator_package=digest,
+    write_json(report / 'upgrade.json',dict(model=str(destination),execution_package=digest,
         batch_profiles=buckets,weight_bytes=metadata['weight_bytes'],new_kernels=len(exports)))
     print('BATCH PACKAGE READY',destination,flush=True)
 

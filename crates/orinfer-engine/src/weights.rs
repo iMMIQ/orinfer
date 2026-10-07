@@ -2,20 +2,14 @@
 use crate::artifact::{Buffer, Dtype, Result, resolve_file, sha256};
 use memmap2::{Mmap, MmapOptions};
 use safetensors::{SafeTensors, tensor::Metadata};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs::File,
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TensorIdentity {
-    pub tensor: String,
-    /// Hash of the tensor payload, independent of sharding and container headers.
-    pub sha256: String,
-}
+pub use orinfer_model_sdk::model::TensorIdentity;
 
 #[derive(Deserialize)]
 struct Index {

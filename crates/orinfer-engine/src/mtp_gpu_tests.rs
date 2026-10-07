@@ -744,8 +744,13 @@ fn validate_mtp_generation() {
                     model.manifest.mtp = Some(spec.clone());
                     if !case.images.is_empty() {
                         let vision = model.manifest.vision.as_ref().unwrap();
-                        let (index, _) = vision
-                            .layout(&case.input_tokens, &case.images, model.manifest.max_context)
+                        let (index, _) = model
+                            .model_package
+                            .visual_layout(
+                                &case.input_tokens,
+                                &case.images,
+                                model.manifest.max_context,
+                            )
                             .unwrap();
                         let shifted = spec.feature_index.as_ref().unwrap();
                         let actual = model.read_controls(shifted, index.len()).unwrap();

@@ -23,7 +23,7 @@ cargo fetch --locked
 make build
 ```
 
-先按[模型构建说明](tools/model/README.md)准备引擎原生模型目录及匹配的算子包。目录保留 checkpoint 的配置、tokenizer 和 chat template，权重采用带专用物理布局的分片 safetensors。**当前不能直接加载任意 HF、AWQ 或 GGUF 目录**；仓库及发行包不附带模型权重。Python、PyTorch 和 TileLang 仅用于离线准备，在线服务不需要它们。
+先按[模型构建说明](tools/model/README.md)准备引擎原生模型目录及匹配的模型执行包。目录保留 checkpoint 的配置、tokenizer 和 chat template，权重采用带专用物理布局的分片 safetensors。**当前不能直接加载任意 HF、AWQ 或 GGUF 目录**；仓库及发行包不附带模型权重。Python、PyTorch 和 TileLang 仅用于离线准备，在线服务不需要它们。模型执行逻辑通过独立 `.so + cubin` 包加载，详见[执行包接口与构建](docs/model-packages.md)。
 
 ```bash
 ./target/release/orinfer validate-model /path/to/prepared-model
@@ -51,7 +51,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 | `--max-batch-tokens` | `128` | 每轮计算 token 预算 |
 | `--prefill-budget-ms` | `200` | 混合 prefill 的预测耗时目标 |
 
-实际并发和上下文容量受算子包及可用内存限制。环境变量统一使用 `ORINFER_*`；共享算子包默认安装到 `~/.cache/orinfer/operators`，可用 `ORINFER_OPERATOR_CACHE` 指定位置。完整配置见[服务使用指南](docs/serving.md)和 `orinfer --help`。
+实际并发和上下文容量受执行包及可用内存限制。环境变量统一使用 `ORINFER_*`；共享模型包默认安装到 `~/.cache/orinfer/packages`，可用 `ORINFER_EXECUTION_CACHE` 指定位置。完整配置见[服务使用指南](docs/serving.md)和 `orinfer --help`。
 
 ## 性能与范围
 
@@ -67,7 +67,7 @@ make check       # 格式、编译、clippy、Rust/CPU 测试
 ```
 
 - [构建与发布](tools/build/README.md)：编译镜像、CPU/GPU 检查与发行包。
-- [模型与算子包](tools/model/README.md)：离线准备、布局、MTP 和上下文扩展。
+- [模型与执行包](tools/model/README.md)：离线准备、布局、MTP 和上下文扩展。
 - [服务使用](docs/serving.md)：API、图片、缓存、并发和资源配置。
 - [图文构建](tools/vision/README.md) · [API 验证](tools/api/README.md) · [TileLang kernels](kernels/README.md)。
 

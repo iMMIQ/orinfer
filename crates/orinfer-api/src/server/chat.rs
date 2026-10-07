@@ -696,11 +696,13 @@ mod tests {
             );
             if let Some(expected) = case.get("mrope_positions") {
                 let expected: Vec<u32> = serde_json::from_value(expected.clone()).unwrap();
-                let (_, positions) = vision
-                    .as_ref()
-                    .unwrap()
-                    .layout(&prepared.input, &prepared.images, prepared.input.len() + 16)
-                    .unwrap();
+                let (_, positions) = orinfer_engine::model::media_layout(
+                    Path::new(&directory),
+                    &prepared.input,
+                    &prepared.images,
+                    prepared.input.len() + 16,
+                )
+                .unwrap();
                 assert_eq!(
                     positions, expected,
                     "Official multimodal positions mismatch"

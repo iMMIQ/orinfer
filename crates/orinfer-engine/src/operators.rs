@@ -1,4 +1,4 @@
-//! Versioned, weight-independent operator packages. Plans are registered in Rust.
+//! Versioned, weight-independent model execution packages. Model control flow is supplied by a versioned native library.
 use crate::{
     architecture::{Architecture, ComputePolicy, PrefillProfile},
     artifact::{Access, Buffer, Dtype, Kernel, Result},
@@ -13,7 +13,7 @@ use std::{
 
 pub mod dynamic;
 
-pub const RUNTIME_ABI: u32 = 1;
+pub const RUNTIME_ABI: u32 = orinfer_model_sdk::abi::RUNTIME_ABI;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +40,7 @@ impl From<&Buffer<TensorIdentity>> for BufferContract {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPackage {
+pub struct ExecutionPackage {
     pub schema_version: u32,
     pub runtime_abi: u32,
     pub target: String,
@@ -61,13 +61,13 @@ pub struct OperatorPackage {
     pub buffer_contracts: Vec<BufferContract>,
     pub kernels: Vec<Kernel>,
     pub toolchain: BTreeMap<String, String>,
+    pub execution: crate::model_package::ExecutionLibrary,
 }
-impl OperatorPackage {
+impl ExecutionPackage {
     pub(crate) fn validate(
         &self,
-        architecture: Architecture,
-        policy: ComputePolicy,
-        signature: &Value,
+        architecture: &str,
+        policy: &str,
         buffers: &[Buffer<TensorIdentity>],
     ) -> Result<()> {
         if self.schema_version != 1
@@ -76,10 +76,9 @@ impl OperatorPackage {
             || self.architecture != architecture
             || self.compute_policy != policy
         {
-            return Err("Incompatible operator package architecture, policy, target or ABI".into());
-        }
-        if &self.config_signature != signature {
-            return Err("Operator package does not support this model configuration".into());
+            return Err(
+                "Incompatible model execution package architecture, policy, target or ABI".into(),
+            );
         }
         let mut seen = std::collections::BTreeSet::new();
         if self
@@ -113,23 +112,18 @@ impl OperatorPackage {
             return Err("Incomplete dynamic batch contracts".into());
         }
         seen.clear();
-        if self.prefill_batch_profiles.iter().any(|p| {
-            p.tokens <= 128
-                || !p.tokens.is_power_of_two()
-                || !seen.insert(p.tokens)
-                || !matches!(
-                    p.kind,
-                    crate::architecture::PrefillKind::ChunkLut4
-                        | crate::architecture::PrefillKind::ChunkExpanded
-                )
-        }) || (!self.prefill_batch_profiles.is_empty() && self.batch_profiles.is_empty())
+        if self
+            .prefill_batch_profiles
+            .iter()
+            .any(|p| p.tokens <= 128 || !p.tokens.is_power_of_two() || !seen.insert(p.tokens))
+            || (!self.prefill_batch_profiles.is_empty() && self.batch_profiles.is_empty())
         {
             return Err("Invalid joint prefill profile".into());
         }
         let actual: Vec<_> = buffers.iter().map(BufferContract::from).collect();
         if actual != self.buffer_contracts {
             return Err(
-                "Model buffer dtype/shape/layout/access contract differs from operator package"
+                "Model buffer dtype/shape/layout/access contract differs from model execution package"
                     .into(),
             );
         }
@@ -138,14 +132,14 @@ impl OperatorPackage {
 }
 
 pub fn default_cache() -> PathBuf {
-    if let Some(path) = std::env::var_os("ORINFER_OPERATOR_CACHE") {
+    if let Some(path) = std::env::var_os("ORINFER_EXECUTION_CACHE") {
         return path.into();
     }
     if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(path).join("orinfer/operators");
+        return PathBuf::from(path).join("orinfer/packages");
     }
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
-        .join(".cache/orinfer/operators")
+        .join(".cache/orinfer/packages")
 }
 
 pub(crate) fn resolve(model_cache: &Path, id: &str) -> Result<PathBuf> {
@@ -154,7 +148,7 @@ pub(crate) fn resolve(model_cache: &Path, id: &str) -> Result<PathBuf> {
             .bytes()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     {
-        return Err("Malformed operator package digest".into());
+        return Err("Malformed model execution package digest".into());
     }
     // An explicit shared cache takes precedence over a bundled package.
     // Missing entries fall back; a present corrupt entry fails validation.
@@ -162,7 +156,7 @@ pub(crate) fn resolve(model_cache: &Path, id: &str) -> Result<PathBuf> {
     if installed.exists() {
         return installed.canonicalize().map_err(|e| e.to_string());
     }
-    crate::artifact::resolve_file(model_cache, &format!("operators/{id}/package.json"))?
+    crate::artifact::resolve_file(model_cache, &format!("packages/{id}/package.json"))?
         .parent()
         .map(Path::to_owned)
         .ok_or_else(|| "Operator package has no directory".into())

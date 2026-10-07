@@ -14,11 +14,11 @@ from pathlib import Path
 def model_identity(model):
     raw=(model/'cache/model.json').read_bytes()
     descriptor=json.loads(raw)
-    root=Path(os.environ.get('ORINFER_OPERATOR_CACHE',str(Path(os.environ.get('XDG_CACHE_HOME',str(Path.home()/'.cache')))/'orinfer/operators')))
-    package=root/descriptor['operator_package']/'package.json'
-    if not package.exists():package=model/'cache/operators'/descriptor['operator_package']/'package.json'
+    root=Path(os.environ.get('ORINFER_EXECUTION_CACHE',str(Path(os.environ.get('XDG_CACHE_HOME',str(Path.home()/'.cache')))/'orinfer/packages')))
+    package=root/descriptor['execution_package']/'package.json'
+    if not package.exists():package=model/'cache/packages'/descriptor['execution_package']/'package.json'
     package_raw=package.read_bytes()
-    if hashlib.sha256(package_raw).hexdigest()!=descriptor['operator_package']:
+    if hashlib.sha256(package_raw).hexdigest()!=descriptor['execution_package']:
         raise ValueError('Operator package identity mismatch')
     return hashlib.sha256(raw+package_raw+(model/'config.json').read_bytes()).hexdigest()
 

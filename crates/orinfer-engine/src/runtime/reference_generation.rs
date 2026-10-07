@@ -132,10 +132,7 @@ impl ModelRuntime {
             let compute_at = Instant::now();
             let (chunk, head) = if let Some((chunk, program, head)) = selected {
                 self.upload_ids(&m.input, &input[offset..offset + chunk])?;
-                if !m.batch_profiles.is_empty() {
-                    self.upload_ids("BatchSegmentLength", &[chunk as u32])?;
-                    self.upload_ids("BatchLastIndex", &[(chunk - 1) as u32])?;
-                }
+                self.upload_segment_controls(chunk)?;
                 self.launch_program(&program, ExecutionPhase::Prefill)?;
                 (chunk, Some(head))
             } else {

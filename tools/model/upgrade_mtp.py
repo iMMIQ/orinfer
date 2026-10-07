@@ -80,7 +80,7 @@ def upgrade(model, output, engine):
     with atomic_model(output, engine, command='validate-model') as staging:
         operator = clone_model(model, staging, package_dir)
         new_digest = commit_package(staging, operator, data, package)
-    return dict(model=str(output), operator_package=new_digest, weights_unchanged=True)
+    return dict(model=str(output), execution_package=new_digest, weights_unchanged=True)
 
 
 if __name__ == '__main__':

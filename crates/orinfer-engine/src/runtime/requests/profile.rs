@@ -527,7 +527,7 @@ fn profile_continuous_decode() {
                 })
                 .collect()
         } else {
-            crate::architecture::batch_plan(&model.manifest, &segments).unwrap()
+            model.model_package.batch_plan(&segments).unwrap()
         };
         let trials = model.execution.profile_graph_operations(&plan).unwrap();
         let mut groups: BTreeMap<String, Vec<f64>> = BTreeMap::new();

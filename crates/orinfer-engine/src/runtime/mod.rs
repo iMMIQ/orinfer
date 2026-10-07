@@ -40,6 +40,7 @@ pub(crate) struct ModelRuntime {
     scheduler_cursor: usize,
     iteration_costs: std::collections::BTreeMap<(usize, usize, usize, usize), f64>,
     mtp_seconds_per_token: f64,
+    model_package: crate::model_package::ModelPackage,
 }
 impl ModelRuntime {
     pub(crate) fn scheduling_statistics(&self) -> crate::scheduler::Statistics {
@@ -95,6 +96,7 @@ impl ModelRuntime {
             scheduler_cursor: 0,
             iteration_costs: Default::default(),
             mtp_seconds_per_token: 0.055,
+            model_package: prepared.execution_model,
         })
     }
     fn launch_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {

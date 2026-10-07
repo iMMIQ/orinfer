@@ -19,3 +19,5 @@ hex = "=0.4.3"
 half = "2.7.1"
 memmap2 = "=0.9.11"
 safetensors = "=0.8.0"
+
+orinfer-model-sdk = { path = "../orinfer-model-sdk" }

@@ -227,7 +227,7 @@ def resize(source, destination, context, output, engine, max_prefill=None):
         digest = commit_package(staging, package_out, wrapper, package)
     write_json(output / 'resize.json', dict(source=str(source), model=str(destination),
         previous_context=old_context, max_context=context, hidden_ring_tokens=ring,
-        compiled_variants=len(compiled), max_prefill_tokens=meta['chunk_tokens'], operator_package=digest))
+        compiled_variants=len(compiled), max_prefill_tokens=meta['chunk_tokens'], execution_package=digest))
     print('published', destination, flush=True)
 
 

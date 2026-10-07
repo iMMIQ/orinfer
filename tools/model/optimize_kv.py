@@ -92,7 +92,7 @@ def optimize(source, destination, engine, storage='fp16', output=None):
             quantize_package(wrapper, package, old_package, pkg, output, json.loads((source / 'config.json').read_text()))
         package['buffer_contracts'] = [{k:v for k,v in b.items() if k!='data'} for b in wrapper['metadata']['buffers']]
         digest = commit_package(staging, pkg, wrapper, package)
-    return dict(model=str(destination),operator_package=digest,storage=storage,
+    return dict(model=str(destination),execution_package=digest,storage=storage,
                 kv_capacity_bytes=sum(wrapper['metadata']['kv_cache']['buffers'].values())*original['max_context'])
 
 

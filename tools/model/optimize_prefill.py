@@ -140,7 +140,7 @@ def publish(source, destination, engine, output, warm_sizes=(64,128,512), attent
                 spec['warm_plans'].append(dict(tokens=rows,program=f'mtp_warm_m{rows}',head_program=f'mtp_head_m{rows}'))
         package['kernels']=list(kernels.values());package['buffer_contracts']=[{k:v for k,v in b.items() if k!='data'} for b in meta['buffers']]
         digest = commit_package(staging, pkg, wrapper, package)
-    return dict(model=str(destination),operator_package=digest,mtp_warm_sizes=list(warm_sizes),
+    return dict(model=str(destination),execution_package=digest,mtp_warm_sizes=list(warm_sizes),
                 attention_choice=attention_choice)
 
 

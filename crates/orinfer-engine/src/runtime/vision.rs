@@ -23,7 +23,10 @@ impl ModelRuntime {
                 Err("Model has no vision adapter".into())
             };
         };
-        let (index, positions) = v.layout(input, images, capacity)?;
+        for image in images {
+            v.feature_count(image)?;
+        }
+        let (index, positions) = self.model_package.visual_layout(input, images, capacity)?;
         if let Some(name) = self
             .manifest
             .mtp

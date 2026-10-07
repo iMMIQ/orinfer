@@ -1261,10 +1261,19 @@ dependencies = [
  "hex",
  "libloading",
  "memmap2",
+ "orinfer-model-sdk",
  "safetensors",
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "orinfer-model-sdk"
+version = "0.1.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

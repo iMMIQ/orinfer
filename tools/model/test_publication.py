@@ -25,13 +25,13 @@ class PublicationTests(unittest.TestCase):
         self.package = dict(kernels=[], revision=1)
         raw = json.dumps(self.package).encode()
         digest = hashlib.sha256(raw).hexdigest()
-        self.operator = self.source / 'cache/operators' / digest
+        self.operator = self.source / 'cache/packages' / digest
         self.operator.mkdir(parents=True)
         (self.operator / 'package.json').write_bytes(raw)
-        self.data = dict(operator_package=digest, metadata={})
+        self.data = dict(execution_package=digest, metadata={})
         (self.source / 'cache/model.json').write_text(json.dumps(self.data))
         self.addCleanup(patch.stopall)
-        patch.dict(os.environ, ORINFER_OPERATOR_CACHE=str(self.root / 'cache')).start()
+        patch.dict(os.environ, ORINFER_EXECUTION_CACHE=str(self.root / 'cache')).start()
 
     @patch('tools.model.publication.subprocess.run')
     def test_validation_precedes_publication_and_metadata_does_not_alias(self, validate):
@@ -49,7 +49,7 @@ class PublicationTests(unittest.TestCase):
         validate.assert_called_once()
         self.assertTrue(destination.exists())
         self.assertEqual((self.source / 'cache/weights/model.safetensors.index.json').read_text(), '{}')
-        published = destination / 'cache/operators' / digest / 'package.json'
+        published = destination / 'cache/packages' / digest / 'package.json'
         self.assertEqual(hashlib.sha256(published.read_bytes()).hexdigest(), digest)
         self.assertEqual((destination / 'cache/weights/model.safetensors').stat().st_ino,
                          (self.source / 'cache/weights/model.safetensors').stat().st_ino)
@@ -102,7 +102,7 @@ class PublicationTests(unittest.TestCase):
         self.operator = self.operator.with_name(digest)
         self.operator.mkdir()
         (self.operator / 'package.json').write_bytes(raw)
-        self.data['operator_package'] = digest
+        self.data['execution_package'] = digest
         (self.source / 'cache/model.json').write_text(json.dumps(self.data))
         output = self.root / 'mtp'
         upgrade(self.source, output, Path('/usr/bin/true'))

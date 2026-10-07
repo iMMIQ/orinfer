@@ -89,11 +89,11 @@ impl ModelRuntime {
             );
             let reset_start = Instant::now();
             self.execution.reset_sequence(&manifest.reset_buffers)?;
-            if !manifest.batch_profiles.is_empty() {
+            if let Some(controls) = &manifest.segment_controls {
                 self.execution
-                    .upload_ids("BatchSegmentLength", &[chunk_tokens as u32])?;
+                    .upload_ids(&controls.length, &[chunk_tokens as u32])?;
                 self.execution
-                    .upload_ids("BatchLastIndex", &[(chunk_tokens - 1) as u32])?;
+                    .upload_ids(&controls.last_index, &[(chunk_tokens - 1) as u32])?;
             }
             let reset_s = reset_start.elapsed().as_secs_f64();
             let request_start = Instant::now();

@@ -96,7 +96,7 @@ def build(args):
         subprocess.run(['git', 'archive', '--format=tar.gz', f'--output={source}', revision], cwd=ROOT, check=True)
         (bundle/'SOURCE.txt').write_text(f'Revision: {revision}\nSource: source.tar.gz\nBuild: cargo build --release --locked --offline -p orinfer-cli\n')
         (bundle/'THIRD_PARTY_LICENSES.txt').write_text(notices(metadata))
-        (bundle/'RELEASE.json').write_text(json.dumps(dict(tag=tag, revision=revision, operator_package=package_id,
+        (bundle/'RELEASE.json').write_text(json.dumps(dict(tag=tag, revision=revision, execution_package=package_id,
                                                         binary_sha256=file_hash(binary)), indent=2)+'\n')
         epoch = int(command('git', 'show', '-s', '--format=%ct', revision))
         archive(bundle, output/f'{bundle.name}.tar.gz', epoch)

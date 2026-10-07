@@ -9,6 +9,7 @@ pub mod error;
 pub mod execution;
 mod loader;
 pub mod model;
+mod model_package;
 pub mod mtp;
 pub mod operators;
 pub mod ple;

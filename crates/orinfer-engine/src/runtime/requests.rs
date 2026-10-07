@@ -522,8 +522,7 @@ impl ModelRuntime {
             },
             &req.input[req.offset..req.offset + chunk],
         )?;
-        self.upload_ids("BatchSegmentLength", &[chunk as u32])?;
-        self.upload_ids("BatchLastIndex", &[(chunk - 1) as u32])?;
+        self.upload_segment_controls(chunk)?;
         let at = Instant::now();
         self.launch_program(&program, ExecutionPhase::Prefill)?;
         if let Some(spec) = &self.manifest.mtp {
@@ -584,22 +583,17 @@ impl ModelRuntime {
         budget_ms: f64,
     ) -> Result<()> {
         let mut shapes = vec![1];
+        let layout = self
+            .manifest
+            .batch_layout
+            .as_ref()
+            .ok_or("Missing batch layout")?;
         shapes.extend(
-            self.manifest
-                .batch_layout
-                .as_ref()
-                .ok_or("Missing batch layout")?
+            layout
                 .profiles
-                .iter()
-                .filter(|(_, kind)| {
-                    cap > 128
-                        || matches!(
-                            kind,
-                            crate::architecture::PrefillKind::Sequence
-                                | crate::architecture::PrefillKind::Recurrent
-                        )
-                })
-                .map(|(&n, _)| n),
+                .keys()
+                .copied()
+                .filter(|n| cap > 128 || layout.small_mixed_shapes.contains(n)),
         );
         shapes.sort_unstable();
         // Split cold prompt cohorts into real chunks before sharing the dense
@@ -856,7 +850,7 @@ impl ModelRuntime {
         let plan = if self.execution.has_batch_graph(&graph_key, decode_only) {
             Vec::new()
         } else {
-            crate::architecture::batch_plan(&self.manifest, &segments)?
+            self.model_package.batch_plan(&segments)?
         };
         #[cfg(test)]
         profile::mark("plan");
@@ -896,6 +890,17 @@ impl ModelRuntime {
         profile::mark("commit");
         Ok(())
     }
+    pub(super) fn upload_segment_controls(&self, tokens: usize) -> Result<()> {
+        if let Some(controls) = &self.manifest.segment_controls {
+            let tokens = u32::try_from(tokens).map_err(|_| "Segment length exceeds u32")?;
+            self.upload_ids(&controls.length, &[tokens])?;
+            self.upload_ids(
+                &controls.last_index,
+                &[tokens.checked_sub(1).ok_or("Empty segment")?],
+            )?;
+        }
+        Ok(())
+    }
     fn prepare_batch_inputs(
         &mut self,
         requests: &mut [&mut RequestState],
@@ -921,22 +926,27 @@ impl ModelRuntime {
                     &req.input[req.offset..req.offset + chunk],
                 )?;
             }
-            self.upload_ids("BatchSegmentLength", &[chunk as u32])?;
-            self.upload_ids("BatchLastIndex", &[(chunk - 1) as u32])?;
+            self.upload_segment_controls(chunk)?;
             let program = if chunk == 1 {
                 "decode".into()
             } else {
-                format!("prefill_m{chunk}")
+                self.manifest
+                    .prefill_plans
+                    .iter()
+                    .find(|p| p.chunk_tokens == chunk)
+                    .ok_or("Missing prefill program shape")?
+                    .prefill_program
+                    .clone()
             };
             self.execution.ensure_sequence_program(req.slot, &program)?;
         }
-        if self.manifest.batch_gdn
-            && segments.iter().map(|s| s.tokens).sum::<usize>() <= 128
-            && segments.iter().any(|s| s.tokens == 1)
-        {
+        if let Some(table) = self.manifest.state_pointer_table.as_ref().filter(|table| {
+            segments.iter().map(|s| s.tokens).sum::<usize>() <= table.max_rows
+                && segments.iter().any(|s| s.tokens == 1)
+        }) {
             self.execution.upload_sequence_addresses(
-                "BatchGdnPointers",
-                &crate::architecture::batch_state_bindings(&self.manifest, &segments)?,
+                &table.buffer,
+                &self.model_package.state_bindings(&segments)?,
             )?;
         }
         Ok(segments)

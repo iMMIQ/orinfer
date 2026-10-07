@@ -153,7 +153,7 @@ def upgrade(model, destination, output):
     package['prefill_batch_profiles'] = [dict(tokens=n, kind='chunk_lut4') for n in [512,1024,2048]]
     package['kernels'] = list(kernels.values())
     digest = commit_package(destination, target, data, package)
-    write_json(output / 'upgrade.json', dict(operator_package=digest, checks=checks,
+    write_json(output / 'upgrade.json', dict(execution_package=digest, checks=checks,
         persistent_weight_bytes_added=0, workspace_bytes_added=0, profiles=package['prefill_batch_profiles']))
 
 

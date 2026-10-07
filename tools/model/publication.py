@@ -45,14 +45,14 @@ def link_or_copy(source, destination):
 def load_model(model):
     model = model.resolve(strict=True)
     data = json.loads((model / 'cache/model.json').read_text())
-    digest = data['operator_package']
+    digest = data['execution_package']
     if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
         raise ValueError('Invalid operator package digest')
-    root = Path(os.environ.get('ORINFER_OPERATOR_CACHE', str(Path(os.environ.get(
-        'XDG_CACHE_HOME', str(Path.home() / '.cache'))) / 'orinfer/operators')))
+    root = Path(os.environ.get('ORINFER_EXECUTION_CACHE', str(Path(os.environ.get(
+        'XDG_CACHE_HOME', str(Path.home() / '.cache'))) / 'orinfer/packages')))
     origin = root / digest
     if not origin.exists():
-        origin = model / 'cache/operators' / digest
+        origin = model / 'cache/packages' / digest
     raw = (origin / 'package.json').read_bytes()
     if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError('Source operator package digest mismatch')
@@ -69,7 +69,7 @@ def clone_model(source, destination, operator):
     shutil.copytree(source / 'cache/weights', destination / 'cache/weights',
                     copy_function=lambda src, dst: link_or_copy(src, dst)
                     if Path(src).suffix == '.safetensors' else shutil.copyfile(src, dst))
-    target = destination / 'cache/operators/.building'
+    target = destination / 'cache/packages/.building'
     shutil.copytree(operator, target, copy_function=link_or_copy)
     return target
 
@@ -87,7 +87,7 @@ def commit_package(model, operator, data, package):
     finally:
         temporary.unlink(missing_ok=True)
     operator.rename(operator.with_name(digest))
-    data['operator_package'] = digest
+    data['execution_package'] = digest
     write_json(model / 'cache/model.json', data)
     return digest
 

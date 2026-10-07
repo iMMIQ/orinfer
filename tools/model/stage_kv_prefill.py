@@ -86,7 +86,7 @@ def publish(source,destination,engine,output):
         package['kernels']=kernels
         package['buffer_contracts']=[{k:v for k,v in b.items() if k!='data'} for b in w['metadata']['buffers']]
         digest = commit_package(staging, pkg, w, package)
-    return dict(model=str(destination),operator_package=digest,prefill_workspace_capacity_bytes=4096*context)
+    return dict(model=str(destination),execution_package=digest,prefill_workspace_capacity_bytes=4096*context)
 
 
 if __name__=='__main__':

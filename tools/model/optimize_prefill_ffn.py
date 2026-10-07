@@ -107,7 +107,7 @@ def publish(model, screens, destination, engine):
         if any(count != layers for count in replaced.values()):
             raise ValueError('Incomplete FFN projection replacement')
         digest = commit_package(staging, target, data, package)
-    return dict(operator_package=digest,
+    return dict(execution_package=digest,
                 selected={str(rows): {family: v['choice'] for family, v in families.items()}
                           for rows, families in selected.items()}, replaced=replaced,
                 weight_bytes=meta['weight_bytes'], persistent_weight_bytes_added=0)

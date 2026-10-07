@@ -22,7 +22,7 @@ check:
 	$(PYTHON) -m unittest tools.model.test_safetensors_source -v
 	$(PYTHON) -m unittest tools.model.test_flash_weights -v
 	$(PYTHON) -m unittest tools.model.test_flash_ple tools.model.test_flash_chunks tools.model.test_flash_validation tools.model.test_flash_original tools.model.test_flash_teacher_inputs tools.model.test_flash_speculation -v
-	$(PYTHON) -m unittest tools.model.test_prepare tools.model.test_package tools.model.test_publication tools.model.test_resize_context tools.model.test_optimize_kv tools.model.test_stage_kv_prefill tools.model.test_upgrade_batching tools.model.test_upgrade_dynamic_batch tools.model.test_checkpoint tools.model.test_gguf tools.release.test_package tools.test_reference -v
+	$(PYTHON) -m unittest tools.model.test_prepare tools.model.test_attach_execution tools.model.test_package tools.model.test_publication tools.model.test_resize_context tools.model.test_optimize_kv tools.model.test_stage_kv_prefill tools.model.test_upgrade_batching tools.model.test_upgrade_dynamic_batch tools.model.test_checkpoint tools.model.test_gguf tools.release.test_package tools.test_reference -v
 	$(PYTHON) tools/bench/validate_plan.py
 
 info:

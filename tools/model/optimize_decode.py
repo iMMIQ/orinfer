@@ -96,7 +96,7 @@ def upgrade(model, destination, report, specialize):
     package['greedy_sampling'] = True
     package['buffer_contracts'] = [{k:v for k,v in b.items() if k != 'data'} for b in metadata['buffers']]
     digest = commit_package(destination, operator, data, package)
-    write_json(report / 'upgrade.json',dict(operator_package=digest,weight_bytes=metadata['weight_bytes'],
+    write_json(report / 'upgrade.json',dict(execution_package=digest,weight_bytes=metadata['weight_bytes'],
                                           specialized_projections=specialize,
                                           sampling_scratch_bytes=context*4+vocab*4+blocks*16+28))
 

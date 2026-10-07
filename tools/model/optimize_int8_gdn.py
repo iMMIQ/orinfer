@@ -163,7 +163,7 @@ def upgrade(model, destination, report, weight_layout):
     package['buffer_contracts'] = [{k: v for k, v in b.items() if k != 'data'}
                                    for b in metadata['buffers']]
     digest = commit_package(destination, operator, data, package)
-    write_json(report / 'upgrade.json', dict(operator_package=digest, replaced=replaced,
+    write_json(report / 'upgrade.json', dict(execution_package=digest, replaced=replaced,
                weight_bytes=metadata['weight_bytes'], persistent_weight_bytes_added=0,
                workspace_bytes_added=128 * (width // 128) * 2,
                repacked_weights=repacked,
