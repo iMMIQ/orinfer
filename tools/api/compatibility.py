@@ -61,10 +61,18 @@ def main():
                                   metadata={"test": "compatibility"}, service_tier="auto"))
     assert nullable["choices"][0]["message"]["content"].strip() == "5", nullable
     record("nullable_and_signed_seed", nullable)
+    cached = complete(base, dict(common, prompt_cache_key="pi-session-probe", prompt_cache_retention="24h"))
+    assert cached["choices"] == nullable["choices"], (cached, nullable)
+    record("cache_hints_preserve_output", cached)
     invalid = [({"stream": "yes"}, "stream"), ({"top_logprobs": 3}, "top_logprobs"),
                ({"logprobs": True, "top_logprobs": 21}, "top_logprobs"),
                ({"store": True}, "store"), ({"temperature": -1}, "temperature"),
                ({"reasoning_effort": "invalid"}, "reasoning_effort"),
+               ({"thinking_token_budget": -1}, "thinking_token_budget"),
+               ({"prompt_cache_key": "x" * 65}, "prompt_cache_key"),
+               ({"prompt_cache_retention": "forever"}, "prompt_cache_retention"),
+               ({"enable_thinking": True, "thinking_token_budget": 0,
+                 "max_completion_tokens": 1}, "max_completion_tokens"),
                ({"logit_bias": {"999999999": 1}}, "logit_bias.999999999"),
                ({"response_format": {"type": "json_schema", "json_schema": {
                    "name": "remote", "schema": {"$ref": "https://example.com/schema"}}}},
@@ -82,6 +90,30 @@ def main():
         else:
             raise AssertionError(f"Invalid request accepted: {fields}")
     record("validation_errors", errors)
+    with request(base.removesuffix("/v1"), "/health") as response:
+        context_limit = json.load(response)["max_context"]
+    try:
+        complete(base, dict(common, max_completion_tokens=context_limit))
+    except urllib.error.HTTPError as error:
+        body = json.load(error)
+        assert error.code == 400 and body["error"]["code"] == "context_length_exceeded", body
+        assert "exceeds the context window" in body["error"]["message"], body
+        record("recognizable_context_overflow", body)
+    else:
+        raise AssertionError("Context overflow accepted")
+    for budget in (0, 8, 32):
+        payload = dict(common, enable_thinking=True, thinking_token_budget=budget)
+        full = complete(base, payload)
+        chunks = stream(base, payload)
+        assert full["usage"]["completion_tokens_details"]["reasoning_tokens"] <= budget, full
+        assert chunks[-1]["usage"]["completion_tokens_details"]["reasoning_tokens"] <= budget, chunks
+        text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c["choices"])
+        assert text == full["choices"][0]["message"]["content"], (text, full)
+        # Forcing an early thinking boundary can change answer style. Check
+        # the result and protocol separately from verbatim baseline output.
+        assert text.rstrip().endswith("5"), full
+        assert full["choices"][0]["finish_reason"] == "stop", full
+        record(f"thinking_budget_{budget}", {"full": full, "stream": chunks})
     for path in ("/missing", "/chat/completions"):
         try:
             request(base, path)
@@ -127,6 +159,10 @@ def main():
         "required": ["answer", "language", "items"], "additionalProperties": False}
     structured = dict(common, response_format={"type": "json_schema", "json_schema": {
         "name": "answer", "strict": True, "schema": schema}})
+    capped_json = complete(base, dict(structured, enable_thinking=True, thinking_token_budget=8))
+    assert json.loads(capped_json["choices"][0]["message"]["content"])["answer"] == 5, capped_json
+    assert capped_json["usage"]["completion_tokens_details"]["reasoning_tokens"] <= 8, capped_json
+    record("thinking_budget_with_schema", capped_json)
     for thinking in (False, True):
         result = complete(base, dict(structured, enable_thinking=thinking,
                                      reasoning_effort="low" if thinking else "none",
@@ -208,6 +244,19 @@ def main():
     result = complete(base, followup)
     assert "ORIN_CHECK_5824" in result["choices"][0]["message"]["content"], result
     record("strict_tool_history", result)
+    capped_tool = complete(base, dict(tool_request, tool_choice="required",
+                                     enable_thinking=True, thinking_token_budget=8))
+    assert capped_tool["choices"][0]["message"]["tool_calls"], capped_tool
+    assert capped_tool["usage"]["completion_tokens_details"]["reasoning_tokens"] <= 8, capped_tool
+    record("thinking_budget_with_tool", capped_tool)
+    failed_call = json.loads(json.dumps(call))
+    failed_call["function"]["arguments"] = '{"filename":'
+    recovered = complete(base, dict(tool_request, tool_choice="required", messages=tool_request["messages"] + [
+        {"role": "assistant", "content": None, "tool_calls": [failed_call]},
+        {"role": "tool", "tool_call_id": failed_call["id"],
+         "content": "Invalid truncated arguments. Retry with filename input.txt and count 2."}]))
+    assert json.loads(recovered["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]) == {"filename":"input.txt","count":2}, recovered
+    record("failed_tool_history_recovery", recovered)
     auto = complete(base, dict(tool_request, tool_choice="auto", messages=[{
         "role": "user", "content": "Do not call any tool. Reply only OK."}]))
     assert not auto["choices"][0]["message"].get("tool_calls"), auto

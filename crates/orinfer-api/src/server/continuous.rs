@@ -228,7 +228,8 @@ impl<'a> Active<'a> {
                 .and_then(|text| self.parser.push(text.as_deref().unwrap_or(""), false));
             match parsed {
                 Ok(deltas) => {
-                    if was_reasoning || deltas.iter().any(|d| d.get("reasoning_content").is_some())
+                    if (was_reasoning && codec.tokenizer.token_to_id("</think>") != Some(token))
+                        || deltas.iter().any(|d| d.get("reasoning_content").is_some())
                     {
                         self.reasoning_tokens += 1;
                     }
@@ -327,7 +328,7 @@ impl<'a> Active<'a> {
                 return Ok(());
             }
         }
-        let reason = if exhausted {
+        let reason = if exhausted || self.parser.incomplete_call {
             "length"
         } else if !self.parser.calls.is_empty() {
             "tool_calls"

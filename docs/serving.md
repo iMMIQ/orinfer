@@ -28,7 +28,11 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 默认关闭 thinking；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 开启后，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
+`thinking_token_budget` 限制本轮初始思考段的 token 数，支持 0；到达上限时解码强制选择 `</think>`，随后继续回答或调用工具。结束标记计入 completion，不计入 reasoning。预算自动缩小到总输出上限减 2，为结束标记和至少一个回答 token 留空间；开启 thinking 且指定此参数时，总输出预算至少为 2。关闭 thinking 时不应用此预算。限制是请求私有状态，MTP 的草稿和 target 共同遵守；无正文约束时结束思考后恢复普通 GPU 采样。思考期间使用 CPU 约束采样，会增加开销。effort 控制模型倾向，不能替代这个硬上限。
+
 默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 指定，二者不能同时传入。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限为 32 MiB。
+
+上下文溢出返回 `error.code=context_length_exceeded`，客户端可据此压缩历史并重试；其他无效参数仍为 `invalid_request`。
 
 `stream` 默认 false；显式 true 使用 SSE deltas 和 `[DONE]`。`stream=null` 等同默认值，`tools=null` 等同无工具。请求 `stream_options.include_usage=true` 时，普通 chunk 包含 `usage:null`，结束前另发 `choices:[]` 的完整 usage。usage 包含 reasoning 和 prefix cache token 计数。客户端断连后取消生成。异常流返回 error，不将失败后的部分输出伪装为成功完成。
 
@@ -81,7 +85,28 @@ thinking 可与 JSON 输出组合，正文仍受约束。MTP 的 target 和 draf
 
 支持 `tools`、`tool_choice`、`parallel_tool_calls`。模型的 XML 工具调用转换为标准 `tool_calls`，arguments 为 JSON 字符串。客户端执行工具，再把带 `tool_call_id` 的 `role=tool` 消息连同历史发送回来。
 
-流式调用先发 index/id/type/name，再增量发送 `function.arguments`；客户端按 index 拼接参数。`strict=true`、`tool_choice=required`、指定函数，或 `parallel_tool_calls=false` 时启用约束解码，限制函数名、参数 schema 和调用数；`required` 至少调用一次，指定函数仅能调用该函数，关闭 parallel 最多一次。未开启约束的普通 auto 调用沿用原生 XML 协议并在完成后校验。内部约束调用使用 JSON envelope，API 和历史仍为标准 `tool_calls`。[OpenCode 示例](../examples/opencode.json)使用 `orinfer` provider 和 agent。
+流式调用先发 index/id/type/name，再增量发送 `function.arguments`；客户端按 index 拼接参数。`strict=true`、`tool_choice=required`、指定函数，或 `parallel_tool_calls=false` 时启用约束解码，限制函数名、参数 schema 和调用数；`required` 至少调用一次，指定函数仅能调用该函数，关闭 parallel 最多一次。内部约束调用使用 JSON envelope，API 和历史仍为标准 `tool_calls`。
+
+未开启约束的普通 auto 调用沿用原生 XML 协议。未知函数、缺失参数或错误参数类型仍作为调用交给客户端，客户端应校验并返回 `role=tool` 错误结果，让模型重试；服务端不执行工具。XML 参数按声明类型转换，无法转换的值保留为字符串。语法损坏到无法辨认函数的输出仍报错。输出预算用尽时返回 `finish_reason=length` 并保留已生成的调用前缀，流式与非流式参数一致；不要直接执行截断调用。回传历史的参数不是有效 JSON 对象时，原始字符串在原生模板中以 `__orinfer_raw_arguments` 参数保留，不猜测或补齐内容。
+
+### OpenCode 与 Pi
+
+[OpenCode 配置](../examples/opencode.json)使用 `@ai-sdk/openai-compatible` 和默认编码 agent，启用自动压缩，声明图片、工具、thinking 及 `reasoning_content` 历史回传；不限制 agent 步数。将其复制为项目中的 `opencode.json`，按服务的 `--model` 选择对应模型：
+
+```bash
+opencode run --model orinfer/qwen-flash-next '检查并修复当前项目的测试失败'
+opencode run --model orinfer/qwen-flash-next --variant low '检查并修复当前项目的测试失败'
+```
+
+默认关闭 thinking；low/medium/high 分别使用 512/1024/2048 思考 token 上限，总输出上限为 8192。工具权限沿用 OpenCode 默认设置。
+
+[Pi 配置](../examples/pi-models.json)对应 `earendil-works/pi`。将 provider 合并到 Pi agent 目录中的 `models.json`，默认目录为 `~/.pi/agent`；配置使用 `openai-completions`，可通过 `/model` 和 `/thinking` 切换模型与思考级别：
+
+```bash
+pi --provider orinfer --model qwen-flash-next --thinking low
+```
+
+配置中的 `orinfer-local` 是无鉴权本地服务的占位 key，使模型在 Pi 中可选；启用服务鉴权后用实际凭据或环境引用替换。Pi 的 thinking budgets 通过 `thinking_token_budget` 发送；可在 Pi 设置中调整 `thinkingBudgets`。示例不声明固定缓存寿命，也不启用 long cache retention。图片和多图由用户附件或客户端 read 工具送入 messages。两端的模型 ID 必须与正在服务的模型一致，contextWindow/context 与输出上限应按实际模型包填写。
 
 ## 执行与缓存
 
@@ -112,6 +137,8 @@ Flash Next 的主模型支持 2048／4096 token 大分块，MTP 预热保持 512
 KV 区间不可变并按引用共享，持续状态单独保存；恢复仍执行 GPU 复制到 Graph 绑定地址。短前缀妨碍大块执行时可能跳过。保存最终提示、周期及按成本准入的分叉检查点；生成结束也可保存已计算的输出前缀。模型重载后缓存清空。
 
 命中免除对应文本主干计算，视觉编码、剩余提示和生成继续执行。`usage.prompt_tokens_details.cached_tokens` 报告实际恢复长度，SSE 需请求 usage。缓存不是 paged attention 或零复制映射，不保证接近满上下文时命中完整提示；内存不足会驱逐或跳过保存。
+
+接受 1–64 字符的 `prompt_cache_key` 和 `prompt_cache_retention=in-memory|24h` 作为路由、保留偏好。当前单 worker 不需要路由，缓存仍按精确 token 和图片身份匹配，key 不划分缓存或改变模型输出。缓存是可驱逐的内存缓存，`24h` 不预留容量、不写 SSD，也不保证 24 小时命中；`/health.chat_capabilities.prompt_cache` 声明这些限制。未传这些字段也自动复用前缀。
 
 ## 并发、上下文与资源
 

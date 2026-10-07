@@ -1,42 +1,108 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "orinfer/qwen3.8-27b",
-  "small_model": "orinfer/qwen3.8-27b",
+  "model": "orinfer/qwen-flash-next",
+  "small_model": "orinfer/qwen-flash-next",
   "provider": {
     "orinfer": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "Orinfer local",
-      "options": {"baseURL": "http://127.0.0.1:8088/v1"},
+      "options": {
+        "baseURL": "http://127.0.0.1:8088/v1"
+      },
       "models": {
         "qwen3.8-27b": {
           "name": "Qwen3.8 27B on Orinfer",
           "attachment": true,
-          "modalities": {"input": ["text", "image"], "output": ["text"]},
-          "limit": {"context": 262144, "output": 256},
-          "options": {"temperature": 0}
+          "reasoning": true,
+          "tool_call": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          },
+          "options": {
+            "temperature": 0,
+            "reasoningEffort": "none",
+            "thinking_token_budget": 1024
+          },
+          "variants": {
+            "off": {
+              "reasoningEffort": "none"
+            },
+            "low": {
+              "reasoningEffort": "low",
+              "thinking_token_budget": 512
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "thinking_token_budget": 1024
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "thinking_token_budget": 2048
+            }
+          }
         },
         "qwen-flash-next": {
           "name": "Qwen3.8 Flash Next on Orinfer",
           "attachment": true,
-          "modalities": {"input": ["text", "image"], "output": ["text"]},
-          "limit": {"context": 262144, "output": 8192},
-          "options": {"temperature": 0}
+          "reasoning": true,
+          "tool_call": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          },
+          "options": {
+            "temperature": 0,
+            "reasoningEffort": "none",
+            "thinking_token_budget": 1024
+          },
+          "variants": {
+            "off": {
+              "reasoningEffort": "none"
+            },
+            "low": {
+              "reasoningEffort": "low",
+              "thinking_token_budget": 512
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "thinking_token_budget": 1024
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "thinking_token_budget": 2048
+            }
+          }
         }
       }
     }
   },
-  "agent": {
-    "orinfer": {
-      "description": "Local Orinfer model with file read/write tools",
-      "mode": "primary",
-      "model": "orinfer/qwen3.8-27b",
-      "temperature": 0,
-      "steps": 4,
-      "prompt": "You are a coding assistant. Follow the user instructions using read and write tools. Use absolute file paths. Keep replies brief.",
-      "tools": {"*": false, "read": true, "write": true},
-      "permission": {"*": "deny", "read": "allow", "edit": "ask"}
-    }
+  "compaction": {
+    "auto": true
   },
-  "compaction": {"auto": false},
   "share": "disabled"
 }

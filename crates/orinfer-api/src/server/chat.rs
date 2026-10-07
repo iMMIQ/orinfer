@@ -85,6 +85,9 @@ pub struct ChatRequest {
     pub response_format: Option<Value>,
     pub enable_thinking: Option<bool>,
     pub reasoning_effort: Option<String>,
+    pub thinking_token_budget: Option<usize>,
+    pub prompt_cache_key: Option<String>,
+    pub prompt_cache_retention: Option<String>,
     pub user: Option<String>,
     pub store: Option<bool>,
     pub metadata: Option<std::collections::BTreeMap<String, String>>,
@@ -463,7 +466,7 @@ impl ChatCodec {
         if grammar.is_some() && !stops.is_empty() {
             return Err("stop: Cannot interrupt constrained JSON or tool output".into());
         }
-        let constraint = grammar
+        let mut constraint = grammar
             .map(|g| {
                 self.grammar.compile(
                     g,
@@ -541,9 +544,41 @@ impl ChatCodec {
                 .is_none_or(|n| n > context_limit)
         {
             return Err(format!(
-                "max_completion_tokens: Context limit {context_limit}: {} prompt tokens + {max_tokens} output tokens",
+                "max_completion_tokens: Request exceeds the context window of {context_limit} tokens: {} prompt tokens + {max_tokens} output tokens",
                 input.len()
             ));
+        }
+        if let Some(key) = &request.prompt_cache_key
+            && (key.is_empty() || key.chars().count() > 64)
+        {
+            return Err("prompt_cache_key: Expected 1–64 characters".into());
+        }
+        if request
+            .prompt_cache_retention
+            .as_deref()
+            .is_some_and(|v| !["in-memory", "24h"].contains(&v))
+        {
+            return Err("prompt_cache_retention: Expected in-memory or 24h".into());
+        }
+        // One local worker needs no affinity routing. Exact token/media identity
+        // still governs reuse; retention hints cannot reserve memory or prevent
+        // eviction. Neither field changes the prompt or sampling identity.
+        let constrained_tools = constraint.is_some();
+        if thinking && let Some(budget) = request.thinking_token_budget {
+            if max_tokens < 2 {
+                return Err("max_completion_tokens: Thinking budget needs room for </think> and an answer token".into());
+            }
+            let close = self
+                .tokenizer
+                .token_to_id("</think>")
+                .ok_or("thinking_token_budget: Tokenizer has no </think> token")?;
+            constraint = Some(Box::new(super::thinking::Budget::new(
+                constraint,
+                budget.min(max_tokens - 2),
+                close,
+                self.grammar.token_table()?,
+                self.eos.iter().copied().collect(),
+            )));
         }
         let include_usage = request
             .stream_options
@@ -580,7 +615,7 @@ impl ChatCodec {
             stops,
             thinking,
             structured: schema.is_some(),
-            constrained_tools: constraint.is_some(),
+            constrained_tools,
             stream: request.stream,
             include_usage,
             constraint,
@@ -686,11 +721,13 @@ fn normalize_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
                 let arguments = call["function"]["arguments"]
                     .as_str()
                     .ok_or("Tool arguments must be a JSON string")?;
-                let parsed: Value = serde_json::from_str(arguments)
-                    .map_err(|e| format!("Invalid tool arguments: {e}"))?;
-                if !parsed.is_object() {
-                    return Err("Tool arguments must encode an object".into());
-                }
+                // Preserve failed/truncated calls for client error recovery. The
+                // native template requires a parameter map, so retain raw input
+                // under an explicit marker instead of guessing missing values.
+                let parsed = match serde_json::from_str::<Value>(arguments) {
+                    Ok(value) if value.is_object() => value,
+                    _ => json!({"__orinfer_raw_arguments":arguments}),
+                };
                 call["function"]["arguments"] = parsed;
                 pending.insert(id);
             }
@@ -821,6 +858,41 @@ mod tests {
                 &mut crate::server::preparation::Context::unbounded(),
             )
             .unwrap();
+        for retention in ["in-memory", "24h"] {
+            let mut cached = request();
+            cached.prompt_cache_key = Some("session-key".into());
+            cached.prompt_cache_retention = Some(retention.into());
+            let result = codec
+                .prepare(
+                    cached,
+                    "test",
+                    4,
+                    None,
+                    &mut crate::server::preparation::Context::unbounded(),
+                )
+                .unwrap();
+            assert_eq!(result.input, prepared.input);
+            assert_eq!(result.sampling.seed, prepared.sampling.seed);
+        }
+        for (key, retention, param) in [
+            ("", "24h", "prompt_cache_key"),
+            ("key", "forever", "prompt_cache_retention"),
+        ] {
+            let mut invalid = request();
+            invalid.prompt_cache_key = Some(key.into());
+            invalid.prompt_cache_retention = Some(retention.into());
+            let error = codec
+                .prepare(
+                    invalid,
+                    "test",
+                    4,
+                    None,
+                    &mut crate::server::preparation::Context::unbounded(),
+                )
+                .err()
+                .unwrap();
+            assert!(error.starts_with(param), "{error}");
+        }
         assert_eq!(prepared.sampling.temperature, 0.7);
         assert_eq!(prepared.sampling.top_p, 0.95);
         assert_eq!(prepared.sampling.top_k, 20);
@@ -859,6 +931,16 @@ mod tests {
             "x"
         );
         assert!(normalize_messages(history[..2].to_vec()).is_err());
+        for raw in ["{\"path\":", "[]", "null"] {
+            let mut failed = history.clone();
+            failed[1]["tool_calls"][0]["function"]["arguments"] = json!(raw);
+            failed[2]["content"] = json!("Invalid arguments; retry with path.");
+            let result = normalize_messages(failed).unwrap();
+            assert_eq!(
+                result[1]["tool_calls"][0]["function"]["arguments"]["__orinfer_raw_arguments"],
+                raw
+            );
+        }
         assert!(
             normalize_messages(vec![
                 json!({"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]})

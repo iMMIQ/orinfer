@@ -13,7 +13,7 @@ type Result<T> = std::result::Result<T, String>;
 pub struct Factory {
     raw: Vec<u8>,
     eos: Vec<u32>,
-    bytes: OnceLock<Result<Vec<Vec<u8>>>>,
+    bytes: OnceLock<Result<Arc<Vec<Vec<u8>>>>>,
     parser: OnceLock<Result<ParserFactory>>,
 }
 impl Factory {
@@ -25,15 +25,20 @@ impl Factory {
             parser: OnceLock::new(),
         }
     }
-    pub fn token_bytes(&self, id: u32) -> Result<Vec<u8>> {
-        let tokens = self
-            .bytes
+    pub fn token_table(&self) -> Result<Arc<Vec<Vec<u8>>>> {
+        self.bytes
             .get_or_init(|| {
                 let raw = serde_json::from_slice(&self.raw).map_err(|e| e.to_string())?;
-                llguidance::token_bytes_from_tokenizer_json(&raw).map_err(|e| e.to_string())
+                let tokens =
+                    llguidance::token_bytes_from_tokenizer_json(&raw).map_err(|e| e.to_string())?;
+                Ok(Arc::new(tokens))
             })
             .as_ref()
-            .map_err(Clone::clone)?;
+            .cloned()
+            .map_err(Clone::clone)
+    }
+    pub fn token_bytes(&self, id: u32) -> Result<Vec<u8>> {
+        let tokens = self.token_table()?;
         let bytes = tokens.get(id as usize).ok_or("Token outside tokenizer")?;
         Ok(bytes
             .strip_prefix(&[TokTrie::SPECIAL_TOKEN_MARKER])
@@ -43,10 +48,9 @@ impl Factory {
     fn factory(&self) -> Result<&ParserFactory> {
         self.parser
             .get_or_init(|| {
-                self.token_bytes(0)?;
-                let bytes = self.bytes.get().unwrap().as_ref().map_err(Clone::clone)?;
+                let bytes = self.token_table()?;
                 let info = TokRxInfo::new(bytes.len() as u32, self.eos[0]);
-                let env: TokEnv = Arc::new(ApproximateTokEnv::new(TokTrie::from(&info, bytes)));
+                let env: TokEnv = Arc::new(ApproximateTokEnv::new(TokTrie::from(&info, &bytes)));
                 let mut factory = ParserFactory::new_simple(&env).map_err(|e| e.to_string())?;
                 factory.quiet();
                 factory.limits_mut().verbose_errors = false;

@@ -6,6 +6,10 @@ type Result<T> = std::result::Result<T, String>;
 
 pub trait Constraint: Send {
     fn fork(&self) -> Box<dyn Constraint>;
+    /// A completed control phase may relinquish masking and resume GPU sampling.
+    fn needs_mask(&self) -> bool {
+        true
+    }
     /// Packed little-endian token bits, matching the model vocabulary.
     fn mask(&mut self) -> Result<Vec<u32>>;
     fn consume(&mut self, token: u32) -> Result<()>;
@@ -35,7 +39,7 @@ impl Decoder {
         self.constraint = Some(constraint);
     }
     pub fn constrained(&self) -> bool {
-        self.constraint.is_some()
+        self.constraint.as_ref().is_some_and(|c| c.needs_mask())
     }
     pub fn finished(&self) -> bool {
         self.failure.is_some() || self.constraint.as_ref().is_some_and(|c| c.finished())

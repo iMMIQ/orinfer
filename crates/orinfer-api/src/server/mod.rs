@@ -5,6 +5,7 @@ mod image;
 mod lifecycle;
 mod output;
 mod preparation;
+mod thinking;
 
 use axum::{
     Json, Router,
@@ -552,6 +553,9 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
                 .find_map(|prefix| candidate.split_once(prefix)?.1.split_once('`').map(|p| p.0))
         });
     let code = match status {
+        StatusCode::BAD_REQUEST if message.contains("exceeds the context window") => {
+            "context_length_exceeded"
+        }
         StatusCode::BAD_REQUEST => "invalid_request",
         StatusCode::UNAUTHORIZED => "invalid_api_key",
         StatusCode::TOO_MANY_REQUESTS => "queue_full",
@@ -574,7 +578,8 @@ async fn health(State(state): State<Service>) -> Response {
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
             "tools":{"function":true,"strict":true,"required":true,"incremental_arguments":true},
             "logprobs":true,"max_top_logprobs":20,"logit_bias":true,"stored_completions":false,
-            "images":state.vision.is_some(),"video":false,"audio":false,"default_max_completion_tokens":8192},
+            "images":state.vision.is_some(),"video":false,"audio":false,"default_max_completion_tokens":8192,
+            "thinking_token_budget":true,"prompt_cache":{"key":true,"retention":["in-memory","24h"],"persistent":false,"ttl_guaranteed":false}},
         "mtp":{"enabled":state.mtp_drafts>0,"max_drafts":state.mtp_drafts},
         "continuous_batching":true,"scheduler":state.scheduler,
         "scheduler_statistics":state.activity.statistics.lock().ok().map(|s| s.clone()),
@@ -765,6 +770,20 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+    #[tokio::test]
+    async fn context_overflow_has_a_client_recognizable_code_and_parameter() {
+        let response = error(
+            StatusCode::BAD_REQUEST,
+            "max_completion_tokens: Request exceeds the context window of 100 tokens: 90 prompt tokens + 20 output tokens",
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert_eq!(body["error"]["param"], "max_completion_tokens");
+    }
     #[tokio::test]
     async fn output_memory_is_held_until_http_body_finishes_or_is_dropped() {
         for consume in [false, true] {

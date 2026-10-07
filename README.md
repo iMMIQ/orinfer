@@ -38,7 +38,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"用一句话介绍你自己。"}],"max_tokens":512,"stream":true}'
 ```
 
-提供 `/health`、`/v1/models` 和 `/v1/chat/completions`。默认关闭 thinking；请求设置 `enable_thinking=true` 后返回 `reasoning_content`。图片使用 messages 中的 `image_url`，支持 URL 和 base64 data URI。详细请求示例见[服务使用指南](docs/serving.md)，[OpenCode 示例](examples/opencode.json)可用于工具调用。
+提供 `/health`、`/v1/models` 和 `/v1/chat/completions`，支持流式文本、工具、thinking、JSON 约束与图片/多图。[服务使用指南](docs/serving.md)包含参数说明，以及 [OpenCode](examples/opencode.json) 和 [Pi](examples/pi-models.json) 接入配置。
 
 ## 常用配置
 

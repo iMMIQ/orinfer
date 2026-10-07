@@ -8,6 +8,7 @@ pub struct Output {
     reasoning: bool,
     in_tool: bool,
     pub stopped: bool,
+    pub incomplete_call: bool,
     pub content: String,
     pub reasoning_content: String,
     pub calls: Vec<Value>,
@@ -28,6 +29,7 @@ impl Output {
             reasoning: thinking,
             in_tool: false,
             stopped: false,
+            incomplete_call: false,
             content: String::new(),
             reasoning_content: String::new(),
             calls: vec![],
@@ -102,8 +104,6 @@ impl Output {
                     self.streamed_call = None;
                     continue;
                 }
-                // The incremental prefix may already be streamed; incomplete
-                // calls never become completed calls in the final response.
                 break;
             }
             let markers: &[&str] = if self.tools.is_empty() {
@@ -218,8 +218,25 @@ impl Output {
         parallel: bool,
     ) -> Result<Vec<Value>> {
         let deltas = self.push("", true)?;
-        if self.in_tool && !exhausted && !self.stopped {
-            return Err("Model emitted an incomplete tool call".into());
+        if self.in_tool {
+            if let Some((name, arguments)) = &self.streamed_call {
+                // Preserve exactly the prefix already delivered by SSE. A length
+                // stop is still reported as length; clients must not execute it
+                // blindly, but can replay the call with a tool error to recover.
+                if exhausted || !self.constrained_tools {
+                    self.calls.push(
+                        json!({"id":format!("call_{}_{}",self.call_prefix,self.calls.len()),
+                        "type":"function","function":{"name":name,"arguments":arguments}}),
+                    );
+                    self.in_tool = false;
+                    self.incomplete_call = true;
+                    self.streamed_call = None;
+                } else {
+                    return Err("Model emitted an incomplete tool call".into());
+                }
+            } else if !exhausted {
+                return Err("Model emitted an incomplete tool call".into());
+            }
         }
         if !parallel && self.calls.len() > 1 {
             return Err("Model emitted multiple calls with parallel_tool_calls=false".into());
@@ -274,7 +291,7 @@ fn json_fields(body: &str) -> Option<(Option<String>, Option<&str>)> {
         if key == "name" {
             name = end.and_then(|n| serde_json::from_str(&rest[..n]).ok());
         }
-        if key == "arguments" && rest.starts_with('{') {
+        if key == "arguments" {
             arguments = Some(&rest[..end.unwrap_or(rest.len())]);
         }
         let Some(end) = end else { break };
@@ -298,16 +315,12 @@ fn parameter_value(value: &str, schema: &Value) -> Result<Value> {
             _ => json!(value),
         }
     };
-    validate_schema(&parsed, schema)?;
     Ok(parsed)
 }
 fn partial_call(body: &str, tools: &[Value]) -> Result<Option<(String, String)>> {
     let body = body.trim_start();
     if body.starts_with('{') {
         if let Some((Some(name), arguments)) = json_fields(body) {
-            if !tools.iter().any(|t| t["function"]["name"] == name) {
-                return Err("Undeclared tool".into());
-            }
             return Ok(Some((name, arguments.unwrap_or("").into())));
         }
         return Ok(None);
@@ -321,7 +334,7 @@ fn partial_call(body: &str, tools: &[Value]) -> Result<Option<(String, String)>>
     let tool = tools
         .iter()
         .find(|t| t["function"]["name"] == name)
-        .ok_or("Undeclared tool")?;
+        .unwrap_or(&Value::Null);
     let mut arguments = String::from("{");
     let mut count = 0;
     rest = rest.trim_start();
@@ -371,23 +384,20 @@ fn parse_call(body: &str, tools: &[Value], id: &str, constrained: bool) -> Resul
     let body = body.trim();
     if body.starts_with('{') {
         let raw = body;
-        let body: Value =
-            serde_json::from_str(raw).map_err(|e| format!("Invalid JSON tool call: {e}"))?;
-        let name = body["name"].as_str().ok_or("Tool name missing")?;
-        let tool = tools
-            .iter()
-            .find(|t| t["function"]["name"] == name)
-            .ok_or("Undeclared tool")?;
-        let arguments = body.get("arguments").ok_or("Tool arguments missing")?;
-        if !arguments.is_object() {
-            return Err("Tool arguments must be an object".into());
+        let (name, raw_arguments) = json_fields(raw).ok_or("Invalid JSON tool fields")?;
+        let name = name.ok_or("Tool name missing")?;
+        let raw_arguments = raw_arguments.ok_or("Missing JSON arguments")?;
+        if constrained {
+            let arguments: Value = serde_json::from_str(raw_arguments)
+                .map_err(|e| format!("Invalid JSON tool arguments: {e}"))?;
+            let tool = tools
+                .iter()
+                .find(|t| t["function"]["name"] == name)
+                .ok_or("Undeclared tool")?;
+            validate_schema(&arguments, &tool["function"]["parameters"])?;
         }
-        if !constrained {
-            validate_schema(arguments, &tool["function"]["parameters"])?;
-        }
-        let (_, raw_arguments) = json_fields(raw).ok_or("Invalid JSON tool fields")?;
         return Ok(
-            json!({"id":id,"type":"function","function":{"name":name,"arguments":raw_arguments.ok_or("Missing JSON arguments")?}}),
+            json!({"id":id,"type":"function","function":{"name":name,"arguments":raw_arguments}}),
         );
     }
     let rest = body
@@ -399,7 +409,10 @@ fn parse_call(body: &str, tools: &[Value], id: &str, constrained: bool) -> Resul
     let tool = tools
         .iter()
         .find(|t| t["function"]["name"] == name)
-        .ok_or_else(|| format!("Undeclared tool {name}"))?;
+        .unwrap_or(&Value::Null);
+    if constrained && tool.is_null() {
+        return Err(format!("Undeclared tool {name}"));
+    }
     let schema = &tool["function"]["parameters"];
     let mut rest = rest.trim_start();
     let mut arguments = Map::new();
@@ -425,7 +438,9 @@ fn parse_call(body: &str, tools: &[Value], id: &str, constrained: bool) -> Resul
         return Err("Unexpected text inside tool call".into());
     }
     let arguments = Value::Object(arguments);
-    validate_schema(&arguments, schema)?;
+    if constrained {
+        validate_schema(&arguments, schema)?;
+    }
     Ok(
         json!({"id":id, "type":"function", "function":{"name":name,"arguments":serde_json::to_string(&arguments).map_err(|e| e.to_string())?}}),
     )
@@ -587,10 +602,14 @@ mod tests {
         assert_eq!(p.reasoning_content, "考える");
         let mut p = Output::new(false, tools(), vec![], "t");
         p.push("<tool_call><function=read>", false).unwrap();
-        assert!(p.finish(false, &json!("auto"), true).is_err());
         assert!(p.finish(true, &json!("auto"), true).is_ok());
-        assert!(p.calls.is_empty());
+        assert_eq!(p.calls[0]["function"]["arguments"], "{");
+        assert!(p.incomplete_call);
         assert!(p.content.is_empty());
+        let mut p = Output::new(false, tools(), vec![], "t");
+        p.push("<tool_call><function=read>", false).unwrap();
+        p.finish(false, &json!("auto"), true).unwrap();
+        assert!(p.incomplete_call);
     }
     #[test]
     fn tool_markup_is_literal_without_tools() {
@@ -622,17 +641,31 @@ mod tests {
         }
     }
     #[test]
-    fn invalid_and_undeclared_calls_rejected() {
-        assert!(parse_call("<function=nope></function>", &tools(), "x", false).is_err());
-        assert!(
-            parse_call(
-                "<function=read><parameter=limit>bad</parameter></function>",
-                &tools(),
-                "x",
-                false
-            )
-            .is_err()
-        );
-        assert!(parse_call("<function=read></function>", &tools(), "x", false).is_err());
+    fn ordinary_call_errors_reach_clients_while_constrained_calls_stay_strict() {
+        for body in [
+            "<function=READ><parameter=path>x</parameter></function>",
+            "<function=read><parameter=limit>bad</parameter></function>",
+            "<function=read></function>",
+            r#"{"name":"read","arguments":{"limit":"bad"}}"#,
+            r#"{"name":"read","arguments":[]}"#,
+        ] {
+            let call = parse_call(body, &tools(), "call_x_0", false).unwrap();
+            assert!(call["function"]["arguments"].is_string());
+            assert!(parse_call(body, &tools(), "x", true).is_err());
+            let raw = format!("<tool_call>{body}</tool_call>");
+            for at in (0..=raw.len()).filter(|&i| raw.is_char_boundary(i)) {
+                let mut parser = Output::new(false, tools(), vec![], "x");
+                let mut deltas = parser.push(&raw[..at], false).unwrap();
+                deltas.extend(parser.push(&raw[at..], false).unwrap());
+                deltas.extend(parser.finish(false, &json!("auto"), true).unwrap());
+                let arguments = deltas
+                    .iter()
+                    .flat_map(|d| d["tool_calls"].as_array().into_iter().flatten())
+                    .filter_map(|c| c["function"]["arguments"].as_str())
+                    .collect::<String>();
+                assert_eq!(arguments, call["function"]["arguments"]);
+                assert_eq!(parser.calls[0], call);
+            }
+        }
     }
 }
