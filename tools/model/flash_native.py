@@ -26,6 +26,7 @@ from kernels.model.gdn_sequence import gdn_sequence, gdn_commit
 from kernels.model.moe import expert_histogram_local, expert_histogram_offsets, expert_histogram_finish
 from kernels.model.greedy import greedy_partials, greedy_merge
 from kernels.model.int8_projection import int8_projection, int8_gemv
+from kernels.model.int8_swiglu import int8_swiglu
 from kernels.model.integer_vq import integer_vq_grouped, integer_e8p_gemv, rotate_activation
 from kernels.model.rotation_a8 import rotate_activation_a8
 from kernels.model.moe import router_topk, expert_histogram, expert_offsets, expert_tiles, expert_dispatch, moe_combine
@@ -55,13 +56,15 @@ class Model:
                  prefill_qsa_threads=128, prefill_large_projections=True,
                  prefill_hc_combine_norm=True, prefill_hc_silu=True,
                  prefill_qsa_single_buffer=True, prefill_byte_permute=True,
-                 prefill_hc_narrow_inject=True):
+                 prefill_hc_narrow_inject=True, decode_w8_optimized=True):
         maximum = source.config['text_config']['max_position_embeddings']
         if type(capacity) is not int or not 1 <= capacity <= min(maximum,262144):
             raise ValueError('Context exceeds the checkpoint/native 262144 limit')
         self.source, self.capacity, self.output = source, capacity, output
         self.hc_fused,self.compact_gdn,self.direct_experts=hc_fused,compact_gdn,direct_experts
         self.fused_rotation=fused_rotation
+        if type(decode_w8_optimized) is not bool:raise ValueError('Invalid decode W8 policy')
+        self.decode_w8_optimized=decode_w8_optimized
         self.expert_shortbook=expert_shortbook
         if type(prefill_large_projections) is not bool:raise ValueError('Invalid prefill projection policy')
         self.prefill_large_projections=prefill_large_projections
@@ -322,13 +325,15 @@ class Model:
                 integer,scale = weight;n,width = integer.shape
                 q,as_ = quantize(a,rows) if a8 is None else a8
                 od = str(out.dtype).split('.')[-1]
-                if rows==1 and 2048<=n<self.V and n*width>=8*1024**2 and width%128==0:
+                gemv = (2048<=n<self.V and n*width>=8*1024**2) or (self.decode_w8_optimized and 512<=n<self.V)
+                if rows==1 and gemv and width%128==0:
                     call(f'dense-gemv-{n}-{width}-{od}',lambda:int8_gemv(n,width,od,8),
                          q.view(torch.int32),integer.view(torch.int32),scale,as_.view(-1),out)
                 else:
                     large=self.prefill_large_projections and rows>=256 and n>=512 and width%128==0
                     bm=128 if large else 64 if rows>=64 and n>=512 else 32 if rows>=32 and n>=512 else 16
                     bn,bk,gm=(128,128,4) if large else (64,64,0)
+                    if self.decode_w8_optimized and rows<=8 and n>=512 and width%128==0:bk=128
                     call(f'dense-a8-{rows}-{n}-{width}-{od}-{bm}-{bn}-{bk}-{gm}',lambda:int8_projection(rows,n,width,od,bm,bn,bk,gm),
                          q,integer,scale,as_.view(-1),out)
                 labels[-1]=f'{label}:{labels[-1]}'
@@ -590,9 +595,19 @@ class Model:
                      fq,down_weight['packed'],down_weight[book_key],patch,down_weight['scale'],fs.view(-1),
                      counts,offsets,tile_expert,tile_row,tile_count,expert_out)
             shared_a8=quantize(mixed)
-            projection('shared-gate',mixed,prefix+'ffn_gate_shexp.weight',shared_gate,a8=shared_a8)
-            projection('shared-up',mixed,prefix+'ffn_up_shexp.weight',shared_up,a8=shared_a8)
-            call(f'shared-swiglu-{m}',lambda:fn.swiglu(m,f),shared_gate,shared_up,shared_act)
+            shared_weights=[self.weights[prefix+name] for name in ('ffn_gate_shexp.weight','ffn_up_shexp.weight')]
+            if self.decode_w8_optimized and m<=8 and all(isinstance(w,tuple) for w in shared_weights):
+                (gate_w,gate_s),(up_w,up_s)=shared_weights
+                aq_shared,scale_shared=shared_a8
+                call(f'shared-w8-swiglu-{m}',lambda:int8_swiglu(m,f,h,4 if m==1 else 64),
+                     aq_shared.view(torch.int32) if m==1 else aq_shared,
+                     gate_w.view(torch.int32) if m==1 else gate_w,
+                     up_w.view(torch.int32) if m==1 else up_w,
+                     gate_s,up_s,scale_shared.view(-1),shared_act)
+            else:
+                projection('shared-gate',mixed,prefix+'ffn_gate_shexp.weight',shared_gate,a8=shared_a8)
+                projection('shared-up',mixed,prefix+'ffn_up_shexp.weight',shared_up,a8=shared_a8)
+                call(f'shared-swiglu-{m}',lambda:fn.swiglu(m,f),shared_gate,shared_up,shared_act)
             projection('shared-down',shared_act,prefix+'ffn_down_shexp.weight',shared_out)
             projection('shared-router',mixed,prefix+'ffn_gate_inp_shexp.weight',shared_logit,a8=shared_a8)
             call(f'combine-{m}',lambda:moe_combine(m,h,assignments,k),expert_out,slot_map,prob,shared_out,shared_logit.view(m),block)

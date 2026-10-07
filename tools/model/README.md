@@ -25,6 +25,16 @@ ORINFER_REFERENCE_ACTIVATIONS=/path/to/captured-activations \
 
 GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用NVIDIA Docker编译镜像和GPU锁；先用`make compiler-image`从公开的固定版本基底构建`orinfer-compiler:0.1.1`，包含TileLang0.1.15/Torch2.9.1/CUDA12.6。源码提供镜像配方，checkpoint需自行准备，详见[编译环境](../build/README.md)。CPU组装先执行`make python-env`和`source .venv/bin/activate`，入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
 
+Flash Next离线执行器的小batch W8路径融合shared-expert gate/up与SwiGLU，保留两次投影的FP16舍入边界；单token的小投影采用DP4A，MTP验证使用专用Tensor Core分块。权重格式与精度策略不变。`validate_flash_w8.py`在同一进程比较原路径与优化路径的固定历史logits、完整请求吞吐和target/draft私有状态；它不是在线服务或完整质量benchmark。
+
+```bash
+bash tools/operators/run.sh tools/model/validate_flash_w8_kernels.py artifacts/w8-kernels
+bash tools/operators/run.sh tools/model/validate_flash_w8.py artifacts/w8-requests \
+  --checkpoint /path/to/flash-target --draft /path/to/flash-mtp
+```
+
+`screen_flash_w8.py --checkpoint DIR`筛选原W8投影配置，`--activations FILE`可提供本地捕获的FFN输入；未提供时使用固定seed探针，结果只代表单算子。设置`ORINFER_OPERATOR_NSYS=1`可通过上述GPU入口采集Nsight Systems节点trace；runner需在预热后调用CUDA profiler start/stop，`validate_flash_w8.py --trace-only`提供这一入口。主机需要安装Jetson版`nsys`，采集与正式TPS计时分开。
+
 ## 从checkpoint重建
 
 先分别构建512/2048/8192基线计划，使用以下参数，并把每次的`--prefill-tokens`设为相应长度。各计划需要相同权重及量化身份；可用`--reuse-weights`复用第一个完成的构建目录，避免重复转换。

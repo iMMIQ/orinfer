@@ -65,6 +65,24 @@ if [[ -n "${ORINFER_OPERATOR_NCU:-}" ]]; then
     printf '%q ' "${command_args[@]}" > "$output_dir/ncu-command.txt"
     printf '\n' >> "$output_dir/ncu-command.txt"
 fi
+if [[ -n "${ORINFER_OPERATOR_NSYS:-}" ]]; then
+    if [[ -n "${ORINFER_OPERATOR_NCU:-}${ORINFER_OPERATOR_SANITIZER:-}" ]]; then
+        echo 'Cannot combine Nsight Systems with another GPU profiler' >&2
+        exit 2
+    fi
+    entrypoint="$(realpath -- "$(command -v nsys)")"
+    nsys_directory="$(dirname -- "$(dirname -- "$entrypoint")")"
+    if [[ ! -x "$nsys_directory/host-linux-armv8/QdstrmImporter" ]]; then
+        echo 'Jetson Nsight Systems installation must include QdstrmImporter' >&2
+        exit 2
+    fi
+    extra_mounts+=(-v "$nsys_directory:$nsys_directory:ro")
+    command_args=(profile --trace cuda,nvtx --sample none --cpuctxsw none
+        --capture-range cudaProfilerApi --capture-range-end stop
+        --cuda-graph-trace node --output "$output_dir/nsys" python3 "$runner")
+    printf '%q ' "${command_args[@]}" > "$output_dir/nsys-command.txt"
+    printf '\n' >> "$output_dir/nsys-command.txt"
+fi
 cleanup() {
     docker rm -f "$container_name" >/dev/null 2>&1 || true
     touch "$output_dir/sampler.stop"
@@ -86,3 +104,7 @@ docker run --rm --name "$container_name" --runtime nvidia --network none \
     -e LD_PRELOAD=/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1 \
     "${ORINFER_OPERATOR_IMAGE:-orinfer-compiler:0.1.1}" "${command_args[@]}" \
     --output "$output_dir" "$@" 2>&1 | tee "$output_dir/run.log"
+if [[ -n "${ORINFER_OPERATOR_NSYS:-}" && ! -f "$output_dir/nsys.nsys-rep" ]]; then
+    echo 'Nsight Systems did not export a report; any raw stream remains in the output directory' >&2
+    exit 1
+fi
