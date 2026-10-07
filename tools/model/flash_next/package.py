@@ -20,6 +20,10 @@ def publish(directory, engine=None):
     build = json.loads((cache / 'build.json').read_text())
     model = copy.deepcopy(build['metadata'])
     config = json.loads((directory / 'config.json').read_text())
+    signature = dict(text=config['text_config'], quantization=config['quantization_config'])
+    if model.get('vision'):
+        signature.update(vision=config['vision_config'], image_tokens=[config[k] for k in
+                         ('image_token_id', 'vision_start_token_id', 'vision_end_token_id')])
     checked = set()
     for kernel in build['kernels']:
         for field in ('module', 'source', 'host_abi'):
@@ -32,7 +36,7 @@ def publish(directory, engine=None):
     library = model_library()
     package = dict(schema_version=1, runtime_abi=1, target='sm_87', architecture='flash_next',
                    compute_policy='int8_quality',
-                   config_signature=dict(text=config['text_config'], quantization=config['quantization_config']),
+                   config_signature=signature,
                    prefill_profiles=build['profiles'], kernels=build['kernels'],
                    buffer_contracts=[{k: v for k, v in b.items() if k != 'data'} for b in model['buffers']],
                    toolchain=model['toolchain'],

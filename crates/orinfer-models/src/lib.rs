@@ -6,6 +6,7 @@ mod flash_next;
 mod policy;
 mod qwen3_5;
 mod registry;
+mod vision;
 use orinfer_model_sdk::{
     abi::{self, CreateRequest, CreatedPlan, ModelImplementation},
     architecture::BatchSegment,

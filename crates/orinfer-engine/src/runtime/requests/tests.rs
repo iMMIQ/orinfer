@@ -856,6 +856,10 @@ fn validate_flash_mtp() {
     assert_eq!(spec.default_verification_tokens, 8);
     let options = scheduler::Options::default();
     let mut checks = vec![];
+    assert!(
+        fixture.cases[0].images.is_empty(),
+        "First fixture must provide a text prompt for short state probes"
+    );
     // Check every acceptance length at each physical four-slot index alignment.
     for start in [5, 6, 7] {
         let mut source = input(&fixture.cases[0], 16);
@@ -1005,7 +1009,7 @@ fn validate_flash_mtp() {
             model
                 .generate(
                     &source.input_tokens,
-                    None,
+                    Some(&source.images),
                     source.max_new_tokens,
                     &source.sampling,
                     || false,
@@ -1042,7 +1046,7 @@ fn validate_flash_mtp() {
             }
             depths.push(json!({"drafts":drafts,"mtp":mtp,"mtp_replay":replay}));
         }
-        generations.push(json!({"prompt_tokens":source.input_tokens.len(),"greedy":source.sampling.is_greedy(),"baseline":outputs[0],"mtp":outputs[5],"mtp_replay":outputs[6],"depths":depths}));
+        generations.push(json!({"prompt_tokens":source.input_tokens.len(),"images":source.images.len(),"greedy":source.sampling.is_greedy(),"baseline":outputs[0],"mtp":outputs[5],"mtp_replay":outputs[6],"depths":depths}));
     }
     model.manifest.mtp = Some(spec);
     let mut references = vec![];
@@ -1051,7 +1055,7 @@ fn validate_flash_mtp() {
         model
             .generate(
                 &source.input_tokens,
-                None,
+                Some(&source.images),
                 16,
                 &source.sampling,
                 || false,

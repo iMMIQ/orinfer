@@ -79,10 +79,7 @@ pub(super) fn section(
         .collect()
 }
 pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Result<()> {
-    if manifest.chunk_tokens != 512
-        || !manifest.batch_profiles.is_empty()
-        || manifest.vision.is_some()
-    {
+    if manifest.chunk_tokens != 512 || !manifest.batch_profiles.is_empty() {
         return Err("Unsupported Flash scheduling/features contract".into());
     }
     let widths: BTreeSet<_> = profiles.iter().map(|p| p.tokens).collect();
@@ -150,7 +147,12 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
             format!("prefill_m{tokens}")
         };
         let head = format!("head_m{tokens}");
-        let mut ops = section(&program, "begin", 1, None);
+        let mut ops = section(
+            &program,
+            "begin",
+            1 + usize::from(manifest.vision.is_some()),
+            None,
+        );
         for layer in 0..48 {
             let count = match layer {
                 0 => r.first,
@@ -248,6 +250,7 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
             },
         );
     }
+    super::vision::register(manifest, &mut programs)?;
     manifest.programs = programs;
     super::mtp::build(manifest)?;
     Ok(())

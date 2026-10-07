@@ -1,7 +1,7 @@
 """CPU checks for rejecting incompatible adapters before weight adoption."""
 import copy
 import unittest
-from config import validate_adapter
+from config import validate_adapter, validate_vision
 
 
 class AdapterCompatibility(unittest.TestCase):
@@ -24,6 +24,13 @@ class AdapterCompatibility(unittest.TestCase):
                 ('Embedding_Z','i8',[32,40]), ('FullX','f16',[512,14336]),
                 ('Hidden','f16',[512,5120]), ('Rotary','f16',[1024,64]),
             ]])
+
+    def test_flash_vision_uses_the_shared_encoder_with_its_own_merger(self):
+        vision = copy.deepcopy(self.config['vision_config'])
+        vision['out_hidden_size'] = 2560
+        validate_vision(vision, 2560)
+        with self.assertRaises(ValueError):
+            validate_vision(vision, 5120)
 
     def test_supported_layout(self):
         validate_adapter(self.config, self.manifest)

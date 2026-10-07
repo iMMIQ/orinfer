@@ -119,7 +119,7 @@ def gdn_sigmoid_norm(M: int, heads: int = 48, width: int = 128, eps: float = 1e-
 @orin_jit
 def qsa_prepare(M: int, capacity: int, heads: int = 24, kv_heads: int = 2,
                 width: int = 256, rotary: int = 64, theta: float = 1e7,
-                eps: float = 1e-6, is_neox_style: bool = False, staged: bool = False):
+                eps: float = 1e-6, is_neox_style: bool = False, staged: bool = False, mrope: bool = False):
     """Normalize Q/K, text RoPE, append private KV and copy gate.
 
     QGate stores interleaved [head,query_or_gate,width] output rows. Position
@@ -139,17 +139,8 @@ def qsa_prepare(M: int, capacity: int, heads: int = 24, kv_heads: int = 2,
         raise ValueError('Invalid QSA rotation/normalization')
     size = 1 << (width - 1).bit_length()
     cache_rows = M if staged else capacity
-    @T.prim_func
-    def main(QGate: T.Tensor((M, heads, 2, width), T.float16),
-             Key: T.Tensor((M, kv_heads, width), T.float16),
-             Value: T.Tensor((M, kv_heads, width), T.float16),
-             QWeight: T.Tensor((width,), T.float32),
-             KWeight: T.Tensor((width,), T.float32),
-             Position: T.Tensor((1,), T.int32),
-             Query: T.Tensor((M, heads, width), T.float16),
-             KCache: T.Tensor((cache_rows, kv_heads, width), T.float16),
-             VCache: T.Tensor((cache_rows, kv_heads, width), T.float16),
-             Gate: T.Tensor((M, heads, width), T.float16)):
+    @T.macro
+    def prepare(QGate, Key, Value, QWeight, KWeight, Position, Query, KCache, VCache, Gate, Coordinates):
         with T.Kernel(M, heads + kv_heads, threads=128) as (row, head):
             x = T.alloc_fragment((size,), T.float32)
             square = T.alloc_fragment((size,), T.float32)
@@ -172,7 +163,13 @@ def qsa_prepare(M: int, capacity: int, heads: int = 24, kv_heads: int = 2,
             for pair in T.Parallel(width // 2):
                 first_index = T.if_then_else(is_neox_style and pair < rotary // 2, pair, 2 * pair)
                 second_index = T.if_then_else(is_neox_style and pair < rotary // 2, pair + rotary // 2, 2 * pair + 1)
-                angle = T.cast(Position[0] + row, T.float32) * T.pow(theta, -2.0 * pair / rotary)
+                coordinate = T.alloc_var(T.int32)
+                coordinate = Position[0] + row
+                if mrope:
+                    axis = T.if_then_else(pair % 3 == 1 and pair < 33, 1,
+                                          T.if_then_else(pair % 3 == 2 and pair < 30, 2, 0))
+                    coordinate = Coordinates[Position[0] + row, axis]
+                angle = T.cast(coordinate, T.float32) * T.pow(theta, -2.0 * pair / rotary)
                 cosine = T.if_then_else(pair * 2 < rotary, T.cos(angle), 1.0)
                 sine = T.if_then_else(pair * 2 < rotary, T.sin(angle), 0.0)
                 first = normalized[first_index] * cosine - normalized[second_index] * sine
@@ -187,6 +184,33 @@ def qsa_prepare(M: int, capacity: int, heads: int = 24, kv_heads: int = 2,
                     KCache[T.if_then_else(staged,row,Position[0]+row), head - heads, second_index] = second
                     VCache[T.if_then_else(staged,row,Position[0]+row), head - heads, first_index] = Value[row, head - heads, first_index]
                     VCache[T.if_then_else(staged,row,Position[0]+row), head - heads, second_index] = Value[row, head - heads, second_index]
+    if mrope:
+        @T.prim_func
+        def main(QGate: T.Tensor((M, heads, 2, width), T.float16),
+                 Key: T.Tensor((M, kv_heads, width), T.float16),
+                 Value: T.Tensor((M, kv_heads, width), T.float16),
+                 QWeight: T.Tensor((width,), T.float32),
+                 KWeight: T.Tensor((width,), T.float32),
+                 Position: T.Tensor((1,), T.int32),
+                 Query: T.Tensor((M, heads, width), T.float16),
+                 KCache: T.Tensor((cache_rows, kv_heads, width), T.float16),
+                 VCache: T.Tensor((cache_rows, kv_heads, width), T.float16),
+                 Coordinates: T.Tensor((capacity, 3), T.int32),
+                 Gate: T.Tensor((M, heads, width), T.float16)):
+            prepare(QGate, Key, Value, QWeight, KWeight, Position, Query, KCache, VCache, Gate, Coordinates)
+    else:
+        @T.prim_func
+        def main(QGate: T.Tensor((M, heads, 2, width), T.float16),
+                 Key: T.Tensor((M, kv_heads, width), T.float16),
+                 Value: T.Tensor((M, kv_heads, width), T.float16),
+                 QWeight: T.Tensor((width,), T.float32),
+                 KWeight: T.Tensor((width,), T.float32),
+                 Position: T.Tensor((1,), T.int32),
+                 Query: T.Tensor((M, heads, width), T.float16),
+                 KCache: T.Tensor((cache_rows, kv_heads, width), T.float16),
+                 VCache: T.Tensor((cache_rows, kv_heads, width), T.float16),
+                 Gate: T.Tensor((M, heads, width), T.float16)):
+            prepare(QGate, Key, Value, QWeight, KWeight, Position, Query, KCache, VCache, Gate, Position)
     return main
 
 

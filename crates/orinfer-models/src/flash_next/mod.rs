@@ -2,6 +2,7 @@
 mod inputs;
 mod mtp;
 mod plan;
+mod vision;
 use crate::{adapter::Adapter, artifact::Result, model::Manifest, policy::Policy};
 use orinfer_model_sdk::{
     abi::{self, CreateRequest, CreatedPlan},
@@ -12,6 +13,22 @@ struct Flash {
     inputs: inputs::Inputs,
 }
 impl Adapter for Flash {
+    fn visual(
+        &self,
+        tokens: &[u32],
+        images: &[abi::ImageGrid],
+        capacity: usize,
+    ) -> Result<(Vec<i32>, Vec<u32>)> {
+        crate::vision::layout(
+            self.manifest
+                .vision
+                .as_ref()
+                .ok_or("Model has no vision adapter")?,
+            tokens,
+            images,
+            capacity,
+        )
+    }
     fn prepare(
         &self,
         program: &str,
@@ -77,8 +94,17 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             return Err(format!("Unsupported Flash quantization_config.{key}"));
         }
     }
-    let signature =
+    vision::validate(&request)?;
+    let mut signature =
         serde_json::json!({"text":text,"quantization":request.config["quantization_config"]});
+    if request.metadata.vision.is_some() {
+        signature["vision"] = request.config["vision_config"].clone();
+        signature["image_tokens"] = serde_json::json!([
+            request.config["image_token_id"],
+            request.config["vision_start_token_id"],
+            request.config["vision_end_token_id"]
+        ]);
+    }
     if signature != request.expected_signature
         || text.get("norm_topk_prob").is_some_and(|v| v != true)
         || request.config["quantization_config"]["quant_method"] != "orinfer_e8p_int8"
@@ -90,7 +116,6 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             .as_u64()
             .is_none_or(|v| v < request.metadata.max_context as u64)
         || request.metadata.vocab != 248320
-        || request.metadata.vision.is_some()
     {
         return Err("Flash package arithmetic/checkpoint signature mismatch".into());
     }

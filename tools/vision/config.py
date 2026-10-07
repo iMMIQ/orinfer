@@ -4,16 +4,7 @@ import math
 
 def validate_adapter(config, manifest):
     vision, text = config['vision_config'], config['text_config']
-    if (vision['hidden_size'], vision['num_heads'], vision['in_channels'],
-        vision['patch_size'], vision['spatial_merge_size'], vision['temporal_patch_size'],
-        vision['out_hidden_size'], vision['hidden_act']) != (
-            1152, 16, 3, 16, 2, 2, 5120, 'gelu_pytorch_tanh'):
-        raise ValueError('Unsupported vision architecture; need an explicit adapter')
-    positions = vision['num_position_embeddings']
-    if (vision.get('deepstack_visual_indexes') or vision['depth'] <= 0
-            or vision['intermediate_size'] <= 0 or positions <= 0
-            or math.isqrt(positions)**2 != positions):
-        raise ValueError('Unsupported vision positions, depth or DeepStack layout')
+    validate_vision(vision, 5120)
     rope = text['rope_parameters']
     if ((text['hidden_size'], text['num_attention_heads'], text['num_key_value_heads'],
          text['head_dim']) != (5120, 24, 4, 256)
@@ -42,3 +33,16 @@ def validate_adapter(config, manifest):
     if (rotary is None or rotary['dtype'] != 'f16'
             or rotary['shape'] != [manifest['max_context'], 64]):
         raise ValueError('Text plan requires a compatible rotary cache')
+
+
+def validate_vision(vision, output_hidden):
+    if (vision['hidden_size'], vision['num_heads'], vision['in_channels'],
+        vision['patch_size'], vision['spatial_merge_size'], vision['temporal_patch_size'],
+        vision['out_hidden_size'], vision['hidden_act']) != (
+            1152, 16, 3, 16, 2, 2, output_hidden, 'gelu_pytorch_tanh'):
+        raise ValueError('Unsupported vision architecture; need an explicit adapter')
+    positions = vision['num_position_embeddings']
+    if (vision.get('deepstack_visual_indexes') or vision['depth'] <= 0
+            or vision['intermediate_size'] <= 0 or positions <= 0
+            or math.isqrt(positions)**2 != positions):
+        raise ValueError('Unsupported vision positions, depth or DeepStack layout')

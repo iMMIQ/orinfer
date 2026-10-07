@@ -1,8 +1,22 @@
 # 图片和多图
 
-在线路径使用Rust解码PNG/JPEG/WebP、bicubic缩放、归一化与patch排列；GPU encoder与文本桥接均由TileLang导出AOT cubin。支持当前checkpoint的27层ViT、2D RoPE、learned position interpolation、pre-shuffle LayerNorm merger、5120维输出与文本交错MRoPE。每张图片独立编码，无视频/DeepStack分支。
+在线路径使用Rust解码PNG/JPEG/WebP、bicubic缩放、归一化与patch排列；GPU encoder与文本桥接均由TileLang导出AOT cubin。支持当前checkpoint的27层ViT、2D RoPE、learned position interpolation、pre-shuffle LayerNorm merger、5120／2560维输出与文本交错MRoPE。每张图片独立编码，无视频/DeepStack分支。
 
-## 构建
+## Flash Next
+
+Flash Next 使用共享 ViT 算子与 2560 维 merger。离线构建在已准备的 MTP 文本目录上附加视觉权重、QSA/indexer 三轴 RoPE 和移位 MTP embedding；在线仍为 Rust。完整命令见[Flash Next 构建](../model/flash_next/README.md#图片与多图)。原始视觉权重从同一 pinned revision 单独下载，约 898 MB；部署采用 FP16 视觉计算，累加和位置插值为 FP32。
+
+默认单图最大 8192 patches、多图合计 16384 image tokens，可在构建时调整。图片和多图使用现有 OpenAI `image_url` API，可同时启用 thinking、MTP 和 prefix cache；不包含视频。
+
+```bash
+bash tools/operators/run.sh tools/vision/validate_mrope.py artifacts/flash-mrope-check
+bash tools/operators/run.sh tools/vision/validate_encoder.py artifacts/flash-encoder-check \
+  --model /path/to/flash-serving-mm/cache/build.json
+```
+
+`validate_mrope.py` 覆盖查询/KV/indexer 旋转、非对齐压缩块、文本位置回归及视觉/MTP 特征的改变输入 Graph replay。`official_reference.py` 根据 checkpoint 配置调用 Transformers 的 `Qwen4ExpVisionModel` 或 `Qwen3_5VisionModel`，可用其 `features.f16` 作为 `validate_encoder.py --official-reference` 的独立对照。FP16 与 BF16 参考须分别注明，视觉验证不替代完整文本主干的 BF16 量化评测。
+
+## 27B 构建
 
 先按[文本模型构建](../model/README.md)获得W4文本manifest，再附加原始checkpoint的视觉权重。checkpoint需包含`config.json`及未量化`model.visual.*`的`model.safetensors`。默认把原始BF16视觉权重转为FP16，视觉激活为FP16，累加为FP32；文本权重以hard link保留原字节和hash。`--vision-dtype bf16`是实验路径，使用NVCC编译TileLang导出的CUDA源以避开当前NVRTC的BF16向量转换问题；该路径的全编码器精度检查尚未通过，不作为默认配置。
 

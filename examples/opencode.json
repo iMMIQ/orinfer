@@ -14,6 +14,13 @@
           "modalities": {"input": ["text", "image"], "output": ["text"]},
           "limit": {"context": 262144, "output": 256},
           "options": {"temperature": 0}
+        },
+        "qwen-flash-next": {
+          "name": "Qwen3.8 Flash Next on Orinfer",
+          "attachment": true,
+          "modalities": {"input": ["text", "image"], "output": ["text"]},
+          "limit": {"context": 262144, "output": 8192},
+          "options": {"temperature": 0}
         }
       }
     }

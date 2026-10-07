@@ -89,7 +89,7 @@ def add(hidden: int, dtype: str = 'float16'):
 
 
 @orin_jit
-def position(hidden: int, grid_side: int = 48, merge: int = 2, dtype: str = 'float16'):
+def position(hidden: int, grid_side: int = 48, merge: int = 2, dtype: str = 'float16', fp32_interpolation: bool = False):
     rows=T.dynamic('rows')
     @T.prim_func
     def kernel(X: T.Tensor((rows,hidden),dtype),
@@ -106,13 +106,22 @@ def position(hidden: int, grid_side: int = 48, merge: int = 2, dtype: str = 'flo
                 h1=T.min(h0+1,grid_side-1); w1=T.min(w0+1,grid_side-1)
                 dh=hf-T.cast(h0,T.float32);dw=wf-T.cast(w0,T.float32)
                 for j in T.Parallel(hidden):
-                    a=T.cast(T.cast(W[h0*grid_side+w0,j],T.float32)*T.cast(T.cast((1-dh)*(1-dw),dtype),T.float32),dtype)
-                    b=T.cast(T.cast(W[h0*grid_side+w1,j],T.float32)*T.cast(T.cast((1-dh)*dw,dtype),T.float32),dtype)
-                    c=T.cast(T.cast(W[h1*grid_side+w0,j],T.float32)*T.cast(T.cast(dh*(1-dw),dtype),T.float32),dtype)
-                    d=T.cast(T.cast(W[h1*grid_side+w1,j],T.float32)*T.cast(T.cast(dh*dw,dtype),T.float32),dtype)
-                    ab=T.cast(T.cast(a,T.float32)+T.cast(b,T.float32),dtype)
-                    abc=T.cast(T.cast(ab,T.float32)+T.cast(c,T.float32),dtype)
-                    total=T.cast(T.cast(abc,T.float32)+T.cast(d,T.float32),dtype)
+                    total=T.alloc_var(dtype)
+                    if fp32_interpolation:
+                        # Current Qwen4Exp interpolates the learned table in FP32,
+                        # then rounds once before the residual addition.
+                        total=(T.cast(W[h0*grid_side+w0,j],T.float32)*(1-dh)*(1-dw)
+                               +T.cast(W[h0*grid_side+w1,j],T.float32)*(1-dh)*dw
+                               +T.cast(W[h1*grid_side+w0,j],T.float32)*dh*(1-dw)
+                               +T.cast(W[h1*grid_side+w1,j],T.float32)*dh*dw)
+                    else:
+                        a=T.cast(T.cast(W[h0*grid_side+w0,j],T.float32)*T.cast(T.cast((1-dh)*(1-dw),dtype),T.float32),dtype)
+                        b=T.cast(T.cast(W[h0*grid_side+w1,j],T.float32)*T.cast(T.cast((1-dh)*dw,dtype),T.float32),dtype)
+                        c=T.cast(T.cast(W[h1*grid_side+w0,j],T.float32)*T.cast(T.cast(dh*(1-dw),dtype),T.float32),dtype)
+                        d=T.cast(T.cast(W[h1*grid_side+w1,j],T.float32)*T.cast(T.cast(dh*dw,dtype),T.float32),dtype)
+                        ab=T.cast(T.cast(a,T.float32)+T.cast(b,T.float32),dtype)
+                        abc=T.cast(T.cast(ab,T.float32)+T.cast(c,T.float32),dtype)
+                        total=T.cast(T.cast(abc,T.float32)+T.cast(d,T.float32),dtype)
                     Y[row,j]=T.cast(X[row,j],T.float32)+T.cast(total,T.float32)
             else:
                 for j in T.Parallel(hidden): Y[row,j]=0

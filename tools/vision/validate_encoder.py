@@ -13,11 +13,20 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from tools.operators.common import configure, error, write_json
+from safetensors import safe_open
 
 
 class VisionGraph:
     def __init__(self, manifest, bucket=512):
-        self.root=manifest.parent; self.m=json.loads(manifest.read_text());self.v=self.m['vision']
+        self.root=manifest.parent; self.m=json.loads(manifest.read_text())
+        self.weight_map = None
+        if 'metadata' in self.m:
+            build = self.m
+            self.m = dict(build['metadata'], kernels=build['kernels'], programs=build['programs'])
+            self.weight_map = json.loads((self.root/'weights/model.safetensors.index.json').read_text())['weight_map']
+        self.v=self.m['vision']
+        config=self.root.parent/'config.json'
+        self.fp32_interpolation=config.exists() and json.loads(config.read_text()).get('model_type')=='qwen4_exp'
         program=next(p['program'] for p in self.v['plans'] if p['patches']==bucket)
         self.ops=self.m['programs'][program];ks={k['name']:k for k in self.m['kernels']}
         self.kernels=[ks[o['name']] for o in self.ops]
@@ -30,8 +39,12 @@ class VisionGraph:
             # Verification needs only this graph's rows, avoiding giant unused workspaces.
             if name.startswith('V') and not name.startswith('Vision_') and name not in ('VGrid','VLength'):
                 shape=[bucket//4 if name in ('VMerged','VOutput') else bucket,*shape[1:]]
-            if spec['data']:
-                value=torch.from_file(str(self.root/spec['data']['file']),size=math.prod(shape),dtype=dtype).reshape(shape).cuda()
+            if spec.get('data'):
+                if self.weight_map is not None:
+                    with safe_open(self.root/'weights'/self.weight_map[name], framework='pt', device='cpu') as source:
+                        value=source.get_tensor(name).reshape(shape).cuda()
+                else:
+                    value=torch.from_file(str(self.root/spec['data']['file']),size=math.prod(shape),dtype=dtype).reshape(shape).cuda()
                 self.weights[name.removeprefix('Vision_')]=value
             else:value=torch.zeros(shape,device='cuda',dtype=dtype)
             self.b[name]=value
@@ -69,10 +82,16 @@ class VisionGraph:
         hf=torch.linspace(0,47,gh,device='cuda')[coords[:,0]];wf=torch.linspace(0,47,gw,device='cuda')[coords[:,1]]
         h0=hf.long();w0=wf.long();h1=(h0+1).clamp_max(47);w1=(w0+1).clamp_max(47);dh=hf-h0;dw=wf-w0
         table=w['pos_embed_weight']
-        pos=table[h0*48+w0]*((1-dh)*(1-dw)).to(dtype)[:,None]
-        pos=pos+table[h0*48+w1]*((1-dh)*dw).to(dtype)[:,None]
-        pos=pos+table[h1*48+w0]*(dh*(1-dw)).to(dtype)[:,None]
-        pos=pos+table[h1*48+w1]*(dh*dw).to(dtype)[:,None]
+        if self.fp32_interpolation:
+            pos=(table[h0*48+w0].float()*((1-dh)*(1-dw))[:,None]
+                 +table[h0*48+w1].float()*((1-dh)*dw)[:,None]
+                 +table[h1*48+w0].float()*(dh*(1-dw))[:,None]
+                 +table[h1*48+w1].float()*(dh*dw)[:,None]).to(dtype)
+        else:
+            pos=table[h0*48+w0]*((1-dh)*(1-dw)).to(dtype)[:,None]
+            pos=pos+table[h0*48+w1]*((1-dh)*dw).to(dtype)[:,None]
+            pos=pos+table[h1*48+w0]*(dh*(1-dw)).to(dtype)[:,None]
+            pos=pos+table[h1*48+w1]*(dh*dw).to(dtype)[:,None]
         x=F.conv3d(x.to(dtype).reshape(-1,3,2,16,16),
                    w['patch_embed_proj_weight'].reshape(1152,3,2,16,16),
                    w['patch_embed_proj_bias'],stride=(2,16,16)).reshape(-1,1152)+pos

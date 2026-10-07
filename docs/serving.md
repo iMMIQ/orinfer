@@ -32,7 +32,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 ### 图片与多图
 
-用户消息可交错文本和多张图片，支持 PNG/JPEG/WebP、HTTP(S) URL 和 base64 data URI；历史消息中的图片也会重新编码。
+27B 和附加视觉编码器的 Flash Next 均支持图片。用户消息可交错文本和多张图片，支持 PNG/JPEG/WebP、HTTP(S) URL 和 base64 data URI；历史消息中的图片也会重新编码。
 
 ```json
 {

@@ -6,8 +6,6 @@ import time
 
 import torch
 from safetensors import safe_open
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
 
 def main():
@@ -29,11 +27,18 @@ def main():
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    config = Qwen3_5VisionConfig(**json.loads((args.checkpoint/'config.json').read_text())['vision_config'])
+    checkpoint_config = json.loads((args.checkpoint/'config.json').read_text())
+    if checkpoint_config['model_type'] == 'qwen4_exp':
+        from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpVisionConfig as VisionConfig
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpVisionModel as VisionModel
+    else:
+        from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig as VisionConfig
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel as VisionModel
+    config = VisionConfig(**checkpoint_config['vision_config'])
     config._attn_implementation = 'sdpa'
     dtype = torch.bfloat16 if args.dtype == 'bf16' else torch.float16
     with torch.device('meta'):
-        model = Qwen3_5VisionModel(config).to(dtype)
+        model = VisionModel(config).to(dtype)
     with safe_open(args.checkpoint/'model.safetensors', framework='pt', device='cpu') as source:
         weights = {k.removeprefix('model.visual.'): source.get_tensor(k).to(dtype)
                    for k in source.keys() if k.startswith('model.visual.')}
@@ -59,7 +64,7 @@ def main():
     assert tuple(features.shape) == (h*w//config.spatial_merge_size**2, config.out_hidden_size)
     assert bool(torch.isfinite(features).all()), 'Nonfinite official features'
     features.half().cpu().contiguous().view(torch.uint8).numpy().tofile(args.output/'features.f16')
-    result = dict(status='passed', implementation='Transformers Qwen3_5VisionModel',
+    result = dict(status='passed', implementation='Transformers ' + VisionModel.__name__,
                   transformers=__import__('transformers').__version__, dtype=args.dtype,
                   reduced_precision_gemm_reduction=False,
                   device=args.device, grid=[1,h,w], shape=list(features.shape),

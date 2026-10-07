@@ -25,7 +25,7 @@ ORINFER_REFERENCE_ACTIVATIONS=/path/to/captured-activations \
 
 GPU入口`bash tools/operators/run.sh RUNNER NEW_OUTPUT [ARGS]`使用NVIDIA Docker编译镜像和GPU锁；先用`make compiler-image`从公开的固定版本基底构建`orinfer-compiler:0.1.1`，包含TileLang0.1.15/Torch2.9.1/CUDA12.6。源码提供镜像配方，checkpoint需自行准备，详见[编译环境](../build/README.md)。CPU组装先执行`make python-env`和`source .venv/bin/activate`，入口设`PYTHONPATH=.`；全部输出目录应为新目录，原产物不修改。构建和组装脚本产生的`model.json`及裸权重是离线中间产物，不能直接交给在线模型加载器；最后必须执行下述safetensors打包。
 
-Flash Next 的自有 Q2A8 权重、离线执行、MTP、独立 BF16 对照与验证入口统一位于 [`flash_next/`](flash_next/README.md)。稳定路径保留 W8 普通投影、INT8 KV、FP32 GDN 状态与完整 prefix 恢复；当前尚未注册 Rust 在线模型适配器。
+Flash Next 的自有 Q2A8 权重、离线执行、MTP、独立 BF16 对照与验证入口统一位于 [`flash_next/`](flash_next/README.md)。稳定路径保留 W8 普通投影、INT8 KV、FP32 GDN 状态与完整 prefix 恢复；已注册 Rust 在线模型适配器，支持文本、图片、多图和 1–7 个 MTP 草稿。
 
 ## 从checkpoint重建
 

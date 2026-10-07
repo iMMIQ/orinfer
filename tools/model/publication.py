@@ -1,6 +1,7 @@
 """Shared immutable model cloning and validated, atomic publication."""
 from contextlib import contextmanager
 import hashlib
+import errno
 import json
 import os
 from pathlib import Path
@@ -123,3 +124,27 @@ def atomic_model(destination, engine=None, command='plan-model'):
         cli = engine if engine is not None else ROOT / 'target/release/orinfer'
         subprocess.run([str(cli.resolve(strict=True)), command, str(staging)],
                        check=True, stdout=subprocess.DEVNULL)
+
+
+def seed_compile_cache(source_cache, cache):
+    """Seed completed TileLang hash entries without touching live staging files."""
+    source_cache = source_cache.resolve(strict=True)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    if not cache.exists():
+        cache.symlink_to(source_cache, target_is_directory=True)
+    elif cache.resolve() != source_cache:
+        for entry in source_cache.glob('*/kernels/*'):
+            if not entry.is_dir():
+                continue
+            destination = cache / entry.relative_to(source_cache)
+            if destination.exists():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='.seed-', dir=cache) as temp:
+                staged = Path(temp) / 'kernel'
+                shutil.copytree(entry, staged, copy_function=link_or_copy)
+                try:
+                    os.rename(staged, destination)
+                except OSError as error:
+                    if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                        raise

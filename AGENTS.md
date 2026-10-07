@@ -5,7 +5,7 @@
 ## 范围
 
 - 硬件固定本机Jetson AGX Orin 64GB，aarch64/CUDA SM87。
-- 支持Qwen3.8-27B文本、图片和多图输入，实际checkpoint为Qwen3_5架构；不包含视频。
+- 支持Qwen3.8-27B（Qwen3_5）和Qwen3.8-Flash-Next（qwen4_exp）的文本、图片和多图输入；不包含视频。
 - 在线运行时用Rust，生产GPU kernel以TileLang为源；Python只用于离线转换、编译、参考和验证。
 - 模型实现、公共执行组件、TileLang kernel和离线构建工具在统一workspace维护；不按模型×精度强制拆仓。orinfer-models分别注册模型适配器与计算策略，部署包内Rust cdylib通过版本化C ABI生成执行程序、动态batch和状态绑定，匹配的TileLang cubin与库同包发布。公共CUDA执行器不硬编码模型族、层数、维度或层序；新增架构不增加核心分派枚举。
 - 第一阶段包含prefix cache与多请求batching；缓存恢复和batch调度必须保持完整KV/GDN/卷积/MTP状态及请求隔离。

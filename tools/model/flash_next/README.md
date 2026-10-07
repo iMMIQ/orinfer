@@ -56,6 +56,27 @@ PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models
 
 可用 `score-model MODEL_DIR artifacts/flash-build/score-requests.json` 核对部署输出。这个对照验证执行迁移，独立 BF16 质量评估仍按下文进行。服务兼容 OpenCode 的 `@ai-sdk/openai-compatible` provider，模型 ID 为 `qwen-flash-next`；建议输出预算至少 4096 tokens。
 
+## 图片与多图
+
+在已准备的文本目录上附加视觉编码器；如需 MTP，先准备上述 MTP 文本目录；沿用同源 checkpoint revision，仅下载 `model.visual.*` 原始 BF16 张量，不下载整份模型。文本权重和已有 cubin 通过 hardlink 复用，视觉权重以 FP16 保存，计算使用 FP16/FP32。原始权重转换仅允许 FP16 subnormal 范围内的舍入，拒绝溢出或更大的改动。
+
+```bash
+PYTHONPATH=. .venv/bin/python -m tools.vision.source \
+  --model artifacts/models/flash-serving-mtp --output artifacts/checkpoints/flash-vision
+bash tools/operators/run.sh tools/model/flash_next/prepare_vision.py artifacts/flash-vision-build \
+  --base-model artifacts/models/flash-serving-mtp \
+  --checkpoint artifacts/checkpoints/flash-vision \
+  --model-output artifacts/models/flash-serving-mm
+PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models/flash-serving-mm
+./target/release/orinfer serve artifacts/models/flash-serving-mm \
+  --model qwen-flash-next --max-active-requests 1 \
+  --cuda-graph decode_only --prefix-cache-mib 512 --mtp-drafts 7
+```
+
+视觉编码器与 27B 共享 TileLang 算子和执行组件，merger 输出为 2560 维；QSA 查询、KV 和压缩索引使用交错三轴 MRoPE，MTP 读取移位后的图像特征。PLE 保留原始 image token ID。多图按消息次序独立编码，特征和位置索引属于请求私有状态；图片身份参与 prefix 匹配。
+
+默认单图最多 8192 patches（2048 image tokens），多图合计最多 16384 image tokens；可用 `--max-patches`、`--max-features` 调整构建容量。`--compile-cache` 可复用已有 TileLang 编译缓存。上下文仍为 256K、KV 仍为 INT8；视觉编码不被文本 prefix cache 省略。请求格式见[服务使用](../../../docs/serving.md)，独立编码器、chat template 和 MRoPE 的验证入口见[图文工具](../../vision/README.md)。
+
 ## 离线执行与验证
 
 所有输出放在新的 artifact 目录。场景包含实际 chat template、thinking、固定历史 top3 概率和 NLL；seed 为 20261002：

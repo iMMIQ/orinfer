@@ -2,7 +2,7 @@
 
 LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang.
 
-面向 **Jetson AGX Orin 64GB / CUDA SM87** 的推理引擎：Rust 负责在线运行和服务，TileLang 算子离线编译为独立 GPU 包。支持 Qwen3.8-27B（`Qwen3_5`）的文本、图片和多图，以及 Qwen3.8-Flash-Next（`qwen4_exp`）的文本推理。
+面向 **Jetson AGX Orin 64GB / CUDA SM87** 的推理引擎：Rust 负责在线运行和服务，TileLang 算子离线编译为独立 GPU 包。支持 Qwen3.8-27B（`Qwen3_5`）的文本、图片和多图，以及 Qwen3.8-Flash-Next（`qwen4_exp`）的文本、图片和多图推理。
 
 ## 功能
 

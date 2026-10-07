@@ -4,19 +4,16 @@ Target data is hardlinked and verified; embedding/head are shared with the draft
 The online Rust recipe validates this offline binding export before publication.
 """
 import argparse
-import errno
 import math
 import json
-import os
 from pathlib import Path
 import shutil
-import tempfile
 
 import torch
 from tools.model.flash_next.checkpoint import Checkpoint
 from tools.model.flash_next.native import Model
 from tools.model.flash_next.prepare import Publisher
-from tools.model.publication import write_json, link_or_copy
+from tools.model.publication import write_json, link_or_copy, seed_compile_cache
 from tools.operators.common import configure
 from kernels.model import flash_control as fc
 from kernels.model.control import advance
@@ -154,24 +151,7 @@ def main():
     p.add_argument('--compile-cache',type=Path);p.add_argument('--output',type=Path,required=True)
     a=p.parse_args();configure()
     if a.compile_cache:
-        cache=a.output/'cache/0.1.15';cache.parent.mkdir(parents=True,exist_ok=True)
-        source_cache=a.compile_cache.resolve(strict=True)
-        if not cache.exists():
-            cache.symlink_to(source_cache,target_is_directory=True)
-        elif cache.resolve()!=source_cache:
-            # TileLang initializes its cache during import. Seed completed hash
-            # entries atomically without touching its current staging files.
-            for entry in source_cache.glob('*/kernels/*'):
-                if not entry.is_dir():continue
-                destination=cache/entry.relative_to(source_cache)
-                if destination.exists():continue
-                destination.parent.mkdir(parents=True,exist_ok=True)
-                with tempfile.TemporaryDirectory(prefix='.seed-',dir=cache) as temp:
-                    staged=Path(temp)/'kernel'
-                    shutil.copytree(entry,staged,copy_function=link_or_copy)
-                    try:os.rename(staged,destination)
-                    except OSError as error:
-                        if error.errno not in (errno.EEXIST,errno.ENOTEMPTY):raise
+        seed_compile_cache(a.compile_cache, a.output/'cache/0.1.15')
     def clone(source,destination):
         if Path(source).suffix in (".json", ".jinja", ".jsonc"):return shutil.copyfile(source,destination)
         return link_or_copy(source,destination)

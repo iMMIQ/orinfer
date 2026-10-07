@@ -18,10 +18,10 @@ def geometry(m, capacity):
 
 
 @orin_jit
-def index_query(m: int):
-    @T.prim_func
-    def main(QK: T.Tensor((m,5,128),T.float16), Weight: T.Tensor((128,),T.float32),
-             Position: T.Tensor((1,),T.int32), Query: T.Tensor((m,4,128),T.float16)):
+def index_query(m: int, capacity: int = 0):
+    mrope=capacity>0
+    @T.macro
+    def prepare(QK, Weight, Position, Query, Coordinates):
         with T.Kernel(m,4,threads=128) as (row,head):
             x=T.alloc_fragment((128,),T.float32)
             square=T.alloc_fragment((128,),T.float32)
@@ -35,20 +35,34 @@ def index_query(m: int):
                 normalized[d]=x[d]*T.rsqrt(total[0]/128+1e-6)*Weight[d]
             for d in T.Parallel(128):
                 pair=T.if_then_else(d<32,d,T.if_then_else(d<64,d-32,0))
-                angle=T.cast(Position[0]+row,T.float32)*T.pow(1e7,-2.0*pair/64)
+                coordinate=T.alloc_var(T.int32)
+                coordinate=Position[0]+row
+                if mrope:
+                    axis=T.if_then_else(pair%3==1 and pair<33,1,T.if_then_else(pair%3==2 and pair<30,2,0))
+                    coordinate=Coordinates[Position[0]+row,axis]
+                angle=T.cast(coordinate,T.float32)*T.pow(1e7,-2.0*pair/64)
                 if d<32:Query[row,head,d]=normalized[d]*T.cos(angle)-normalized[d+32]*T.sin(angle)
                 elif d<64:Query[row,head,d]=normalized[d]*T.cos(angle)+normalized[d-32]*T.sin(angle)
                 else:Query[row,head,d]=normalized[d]
+    if mrope:
+        @T.prim_func
+        def main(QK: T.Tensor((m,5,128),T.float16), Weight: T.Tensor((128,),T.float32),
+                 Position: T.Tensor((1,),T.int32), Query: T.Tensor((m,4,128),T.float16),
+                 Coordinates:T.Tensor((capacity,3),T.int32)):
+            prepare(QK, Weight, Position, Query, Coordinates)
+    else:
+        @T.prim_func
+        def main(QK: T.Tensor((m,5,128),T.float16), Weight: T.Tensor((128,),T.float32),
+                 Position: T.Tensor((1,),T.int32), Query: T.Tensor((m,4,128),T.float16)):
+            prepare(QK, Weight, Position, Query, Position)
     return main
 
 
 @orin_jit
-def index_compress(m: int, capacity: int):
+def index_compress(m: int, capacity: int, mrope: bool = False):
     blocks=geometry(m,capacity)
-    @T.prim_func
-    def main(QK:T.Tensor((m,5,128),T.float16), Pending:T.Tensor((4,128),T.float16),
-             Weight:T.Tensor((128,),T.float32), Position:T.Tensor((1,),T.int32),
-             Cache:T.Tensor((blocks,128),T.float16)):
+    @T.macro
+    def prepare(QK, Pending, Weight, Position, Cache, Coordinates):
         with T.Kernel(T.ceildiv(m+3,4),threads=128) as group:
             block=Position[0]//4+group
             if (block+1)*4<=Position[0]+m:
@@ -70,10 +84,28 @@ def index_compress(m: int, capacity: int):
                     normalized[d]=x[d]*T.rsqrt(total[0]/128+1e-6)*Weight[d]
                 for d in T.Parallel(128):
                     pair=T.if_then_else(d<32,d,T.if_then_else(d<64,d-32,0))
-                    angle=T.cast(block*4,T.float32)*T.pow(1e7,-2.0*pair/64)
+                    coordinate=T.alloc_var(T.int32)
+                    coordinate=block*4
+                    if mrope:
+                        axis=T.if_then_else(pair%3==1 and pair<33,1,T.if_then_else(pair%3==2 and pair<30,2,0))
+                        coordinate=Coordinates[block*4,axis]
+                    angle=T.cast(coordinate,T.float32)*T.pow(1e7,-2.0*pair/64)
                     if d<32:Cache[block,d]=normalized[d]*T.cos(angle)-normalized[d+32]*T.sin(angle)
                     elif d<64:Cache[block,d]=normalized[d]*T.cos(angle)+normalized[d-32]*T.sin(angle)
                     else:Cache[block,d]=normalized[d]
+    if mrope:
+        @T.prim_func
+        def main(QK:T.Tensor((m,5,128),T.float16), Pending:T.Tensor((4,128),T.float16),
+                 Weight:T.Tensor((128,),T.float32), Position:T.Tensor((1,),T.int32),
+                 Cache:T.Tensor((blocks,128),T.float16),
+                 Coordinates:T.Tensor((capacity,3),T.int32)):
+            prepare(QK, Pending, Weight, Position, Cache, Coordinates)
+    else:
+        @T.prim_func
+        def main(QK:T.Tensor((m,5,128),T.float16), Pending:T.Tensor((4,128),T.float16),
+                 Weight:T.Tensor((128,),T.float32), Position:T.Tensor((1,),T.int32),
+                 Cache:T.Tensor((blocks,128),T.float16)):
+            prepare(QK, Pending, Weight, Position, Cache, Position)
     return main
 
 

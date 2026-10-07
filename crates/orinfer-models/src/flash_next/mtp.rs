@@ -67,7 +67,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         || spec.target_length != "PositionOut"
         || spec.draft_program != "mtp_draft"
         || spec.hidden_ring.as_deref() != Some("MtpHiddenRing")
-        || spec.feature_index.is_some()
+        || spec.feature_index.as_deref() != manifest.vision.as_ref().map(|_| "MtpFeatureIndex")
         || !spec.commit_always
         || spec.draft_snapshot_program.as_deref() != Some("mtp_snapshot")
         || spec.draft_restore_program.as_deref() != Some("mtp_restore_draft")
@@ -100,7 +100,12 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
             512 => (57, 10),
             _ => unreachable!(),
         };
-        let mut ops = section(&program, "begin", 7, None);
+        let mut ops = section(
+            &program,
+            "begin",
+            7 + usize::from(manifest.vision.is_some()),
+            None,
+        );
         ops.extend(section(&program, "layer48", body_count, None));
         ops.extend(section(&program, "end", 1, None));
         let head_ops = section(&head, "body", head_count, None);
@@ -119,7 +124,12 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         if p.program != program || p.restore_program != restore || p.capture_program != capture {
             return Err("Unknown Flash verification program".into());
         }
-        let mut ops = section(&program, "begin", 1, None);
+        let mut ops = section(
+            &program,
+            "begin",
+            1 + usize::from(manifest.vision.is_some()),
+            None,
+        );
         let mut commit = vec![];
         for layer in 0..48 {
             ops.extend(verification_layer(&program, layer, p.tokens));

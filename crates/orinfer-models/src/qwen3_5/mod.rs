@@ -1,8 +1,7 @@
 //! Qwen3.5 model semantics; quality policy chooses the registered mixed-precision recipe.
 mod config;
 mod plan;
-mod vision;
-use crate::{adapter::Adapter, artifact, model, policy::Policy};
+use crate::{adapter::Adapter, artifact, model, policy::Policy, vision};
 use model::Manifest;
 use orinfer_model_sdk::{
     abi::{self, CreateRequest, CreatedPlan},

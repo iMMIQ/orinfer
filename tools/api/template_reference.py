@@ -104,10 +104,22 @@ def main():
             import torch
             from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
             from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
-            config = Qwen3_5Config.from_pretrained(args.tokenizer_dir, local_files_only=True)
-            positions, delta = Qwen3_5Model.get_rope_index(
-                SimpleNamespace(config=config), torch.tensor([ids]),
-                image_grid_thw=torch.tensor(grid))
+            checkpoint_config = json.loads((args.tokenizer_dir / 'config.json').read_text())
+            if checkpoint_config['model_type'] == 'qwen4_exp':
+                from types import MethodType
+                from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
+                from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel
+                config = Qwen4ExpConfig(**checkpoint_config)
+                reference = SimpleNamespace(config=config)
+                reference.get_vision_position_ids = MethodType(Qwen4ExpModel.get_vision_position_ids, reference)
+                positions, delta = Qwen4ExpModel.get_rope_index(
+                    reference, torch.tensor([ids]), torch.tensor(encoded['mm_token_type_ids']),
+                    image_grid_thw=torch.tensor(grid))
+            else:
+                config = Qwen3_5Config.from_pretrained(args.tokenizer_dir, local_files_only=True)
+                positions, delta = Qwen3_5Model.get_rope_index(
+                    SimpleNamespace(config=config), torch.tensor([ids]),
+                    image_grid_thw=torch.tensor(grid))
             # Runtime stores token-major [t,h,w], including generated positions.
             rope = positions[:,0].T.flatten().tolist()
             start = len(ids)+int(delta[0,0])
