@@ -23,7 +23,7 @@ cargo fetch --locked
 make build
 ```
 
-先按[模型构建说明](tools/model/README.md)准备引擎原生模型目录及匹配的模型执行包。目录保留 checkpoint 的配置、tokenizer 和 chat template，权重采用带专用物理布局的分片 safetensors。**当前不能直接加载任意 HF、AWQ 或 GGUF 目录**；仓库及发行包不附带模型权重。Python、PyTorch 和 TileLang 仅用于离线准备，在线服务不需要它们。模型执行逻辑通过独立 `.so + cubin` 包加载，详见[执行包接口与构建](docs/model-packages.md)。
+先按[模型构建说明](tools/model/README.md)准备引擎原生模型目录及匹配的模型执行包。目录保留 checkpoint 的配置、tokenizer 和 chat template，权重采用带专用物理布局的分片 safetensors。**当前不能直接加载任意 HF、AWQ 或 GGUF 目录**；仓库及发行包不附带模型权重。Python、PyTorch 和 TileLang 仅用于离线准备，在线服务不需要它们。模型与 kernel 在同一工作区维护，执行逻辑通过 `.so + cubin` 部署包加载，详见[执行包接口与构建](docs/model-packages.md)。
 
 ```bash
 ./target/release/orinfer validate-model /path/to/prepared-model
@@ -71,7 +71,7 @@ make check       # 格式、编译、clippy、Rust/CPU 测试
 - [服务使用](docs/serving.md)：API、图片、缓存、并发和资源配置。
 - [图文构建](tools/vision/README.md) · [API 验证](tools/api/README.md) · [TileLang kernels](kernels/README.md)。
 
-在线代码位于 `crates/orinfer-{engine,api,cli}`，GPU 算子位于 `kernels/`，离线工具位于 `tools/`。
+在线代码位于 `crates/orinfer-{engine,api,cli}`，模型适配器及计算策略位于 `crates/orinfer-models`，公共 ABI 位于 `crates/orinfer-model-sdk`；GPU 算子与离线工具分别位于 `kernels/`、`tools/`。
 
 ## 许可证
 

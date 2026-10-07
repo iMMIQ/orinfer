@@ -147,9 +147,9 @@ python3 tools/model/prepare.py \
 
 在线Rust不提供旧模型格式兼容分支，也不在首次请求中执行Python或量化。后续重新编译或改变布局时，完成离线组装后发布新的目录。GPU校验fixture的`model`字段可指向模型目录或新数据描述文件；算子测试夹具仍采用独立的原格式。
 
-## 独立模型执行包
+## 模型执行部署包
 
-先构建独立模型库并设置 `ORINFER_MODEL_LIBRARY`，接口、构建和执行库更新见[模型执行包](../../docs/model-packages.md)。在线数据与包均保留 schema 1，旧加载格式不保留。
+先用 `make build` 构建 workspace 内的 `orinfer-models` 原生库；也可设置 `ORINFER_MODEL_LIBRARY` 指向匹配的库，接口、构建和执行库更新见[模型执行包](../../docs/model-packages.md)。在线数据与包均保留 schema 1，旧加载格式不保留。
 
 ### Decode INT8 FFN
 

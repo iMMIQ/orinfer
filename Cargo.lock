@@ -1277,6 +1277,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "orinfer-models"
+version = "0.1.1"
+dependencies = [
+ "orinfer-model-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

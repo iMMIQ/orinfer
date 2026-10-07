@@ -28,9 +28,9 @@ TEXT_KEYS = CONTRACT['families']['qwen3_5']['text_keys']
 
 def model_library():
     path = Path(os.environ.get('ORINFER_MODEL_LIBRARY', str(Path(__file__).resolve().parents[2] /
-                                                        'target/release/liborinfer_qwen3_5_a8.so')))
+                                                        'target/release/liborinfer_models.so')))
     if not path.is_file():
-        raise ValueError('Build the independent model library first and set ORINFER_MODEL_LIBRARY')
+        raise ValueError('Build the model library with make build first and set ORINFER_MODEL_LIBRARY')
     verify_library(path)
     return path
 
@@ -206,7 +206,7 @@ def publish(directory, engine=None):
                               if k in model['toolchain']})
     library = model_library()
     package['execution'] = dict(abi_version=1, library=dict(file='lib/model.so', sha256=file_hash(library)),
-                                package='orinfer-qwen3_5-a8', version='0.1.1')
+                                package='orinfer-models', version='0.1.1')
     raw = (json.dumps(package, indent=2, ensure_ascii=False) + '\n').encode()
     digest = hashlib.sha256(raw).hexdigest()
     destination = cache / 'packages' / digest
