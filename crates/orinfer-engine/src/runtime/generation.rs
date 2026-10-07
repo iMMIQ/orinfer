@@ -75,7 +75,11 @@ impl ModelRuntime {
         if self.read_control(&m.status)? != 0 {
             return Err("Model token status failure".into());
         }
-        if m.greedy_sampling && options.temperature == 0.0 && !options.is_greedy() {
+        if m.greedy_sampling
+            && options.temperature == 0.0
+            && !options.is_greedy()
+            && options.logit_bias.is_empty()
+        {
             options.validate()?;
             // Counts are rebuilt from the authoritative history, including the
             // entire prompt on prefix hits and each speculative commit. They

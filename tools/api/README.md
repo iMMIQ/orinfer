@@ -7,6 +7,16 @@ python3 tools/api/smoke.py --base-url http://127.0.0.1:8088/v1 \
   --output artifacts/api-smoke-results.json
 ```
 
+`compatibility.py`进一步验证 nullable 参数、有符号 seed、字段定位错误、JSON/schema 与 thinking、严格/指定工具及参数增量、target logprobs、Unicode bytes 和请求隔离。服务开启 MTP 时，同一套测试覆盖其约束及概率路径；传入模型目录还会验证 token-ID bias。
+
+```bash
+python3 tools/api/compatibility.py --model qwen-flash-next \
+  --tokenizer-dir /path/to/prepared-model \
+  --output artifacts/api-compatibility.json
+```
+
+增加 `--long-logprobs` 会另外生成最多 512 tokens、每 token 20 个候选概率的完整响应，检查超过 512 KiB 的非流式输出；此项耗时更长。
+
 `template_reference.py`是离线参考工具，需要Transformers。它使用原始checkpoint模板生成token IDs，对照Rust模板和分词器；包含文本、tools、工具历史和thinking四种场景。JSON对象的key顺序先与Rust一致化。
 
 ```bash

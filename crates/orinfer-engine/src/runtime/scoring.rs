@@ -61,6 +61,8 @@ fn scoring_context_hash(history: &[u32], images: &[crate::vision::ImageInput]) -
             .collect();
         context["images"] = serde_json::json!(identities);
     }
+    // Stable identity regardless of serde_json's feature-unified map backend.
+    context.as_object_mut().unwrap().sort_keys();
     Ok(crate::artifact::sha256(
         &serde_json::to_vec(&context).map_err(|e| e.to_string())?,
     ))

@@ -6,7 +6,7 @@ LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang
 
 ## 功能
 
-- OpenAI Chat Completions API，支持流式输出、thinking、采样和函数工具调用。
+- OpenAI Chat Completions API，支持流式输出、thinking、采样、严格函数调用、JSON Schema 约束和 token 概率。
 - 27B 使用单份 W4；Flash Next 使用自有 E8P Q2 专家和 W8 投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
 - 分块 prefill、独立请求状态及 prefix cache，两种模型都支持原生 MTP。27B 支持连续批处理；Flash Next 采用单个活跃请求、其余排队。 Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。
 - 混合架构 prefix cache、INT8 KV 和按需映射内存；模型包可配置最长 256K 上下文。
@@ -57,7 +57,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 Jetson AGX Orin 64GB、27B 参考配置开启 MTP 后，Python 归并排序、Rust LRU 缓存和 TypeScript 异步 map 三个代码生成场景的单流 decode 中位数分别为 **26.17、25.23、25.95 tokens/s**。每个场景测量三次，每次生成 128 tokens；decode 按实际输出 tokens 计时，排除首 token。
 
-目前只支持上述硬件和架构，不支持视频、音频、`n>1`、API logprobs 或 JSON 约束解码。量化质量使用同源 BF16/FP8 的固定场景和同历史概率对照；完整 LLM benchmark 和独立 BF16 256K 质量评测尚未覆盖，见[质量评测](tools/eval/README.md)。
+目前只支持上述硬件和架构，不支持视频、音频、`n>1` 或云端存储接口。JSON Schema 支持范围见[服务使用指南](docs/serving.md)。量化质量使用同源 BF16/FP8 的固定场景和同历史概率对照；完整 LLM benchmark 和独立 BF16 256K 质量评测尚未覆盖，见[质量评测](tools/eval/README.md)。
 
 ## 开发与文档
 

@@ -1,5 +1,6 @@
 mod chat;
 mod continuous;
+mod grammar;
 mod image;
 mod lifecycle;
 mod output;
@@ -16,6 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use chat::{ChatCodec, ChatRequest, Prepared};
+use futures_util::StreamExt;
 use orinfer_engine::model::Model;
 use serde_json::{Value, json};
 use std::{
@@ -281,7 +283,7 @@ struct Service {
 }
 struct Job {
     _slot: Arc<tokio::sync::OwnedSemaphorePermit>,
-    _memory: Option<tokio::sync::OwnedSemaphorePermit>,
+    _memory: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     limits: Limits,
     prepared: Prepared,
     events: mpsc::Sender<ModelEvent>,
@@ -436,7 +438,15 @@ continuous::worker(
                 preparation::ingress,
             )),
         )
+        .fallback(|| async { error(StatusCode::NOT_FOUND, "Unknown API endpoint") })
+        .method_not_allowed_fallback(|| async {
+            error(StatusCode::METHOD_NOT_ALLOWED, "Unsupported HTTP method")
+        })
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            request_id,
+        ))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&settings.listen)
         .await
@@ -502,6 +512,23 @@ fn authorized(state: &Service, headers: &HeaderMap) -> bool {
             == Some(key.as_ref())
     })
 }
+async fn request_id(
+    State(state): State<Service>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let serial = state.ids.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let id = format!("req-{now:x}-{:x}-{serial:x}", std::process::id());
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert("x-request-id", id.parse().unwrap());
+    response
+}
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
     let kind = match status {
         StatusCode::UNAUTHORIZED => "authentication_error",
@@ -509,12 +536,45 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => "server_error",
         _ => "invalid_request_error",
     };
-    (status, Json(json!({"error":{"message":message.into(),"type":kind,"param":null,"code":status.as_u16().to_string()}}))).into_response()
+    let message = message.into();
+    let candidate = message.split("target type: ").nth(1).unwrap_or(&message);
+    let param = candidate
+        .split_once(": ")
+        .map(|(p, _)| p)
+        .filter(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_.[]".contains(c))
+        })
+        .or_else(|| {
+            ["unknown field `", "missing field `"]
+                .iter()
+                .find_map(|prefix| candidate.split_once(prefix)?.1.split_once('`').map(|p| p.0))
+        });
+    let code = match status {
+        StatusCode::BAD_REQUEST => "invalid_request",
+        StatusCode::UNAUTHORIZED => "invalid_api_key",
+        StatusCode::TOO_MANY_REQUESTS => "queue_full",
+        StatusCode::SERVICE_UNAVAILABLE => "service_unavailable",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+        _ => "server_error",
+    };
+    (
+        status,
+        Json(json!({"error":{"message":message,"type":kind,"param":param,"code":code}})),
+    )
+        .into_response()
 }
 async fn health(State(state): State<Service>) -> Response {
     (if state.activity.lifecycle.is_ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(
         json!({"status":state.activity.lifecycle.name(),"failure":state.activity.lifecycle.failure(),"model":state.model.as_ref(),"max_context":state.context,
         "frontend_assets":state.codec.asset_hashes,
+        "chat_capabilities":{"streaming":true,"default_stream":false,"max_choices":1,
+            "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
+            "tools":{"function":true,"strict":true,"required":true,"incremental_arguments":true},
+            "logprobs":true,"max_top_logprobs":20,"logit_bias":true,"stored_completions":false,
+            "images":state.vision.is_some(),"video":false,"audio":false,"default_max_completion_tokens":8192},
         "mtp":{"enabled":state.mtp_drafts>0,"max_drafts":state.mtp_drafts},
         "continuous_batching":true,"scheduler":state.scheduler,
         "scheduler_statistics":state.activity.statistics.lock().ok().map(|s| s.clone()),
@@ -536,7 +596,16 @@ async fn completions(
 ) -> Response {
     let request = match body {
         Ok(Json(v)) => v,
-        Err(e) => return error(e.status(), e.body_text()),
+        Err(e) => {
+            return error(
+                if e.status() == StatusCode::UNPROCESSABLE_ENTITY {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    e.status()
+                },
+                e.body_text(),
+            );
+        }
     };
     let preparation::Ingress { slot, body } = admission;
     let memory_mib = preparation::request_memory_mib(&request, state.context);
@@ -586,6 +655,7 @@ async fn completions(
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let (prepared, slot, memory) = prepared;
+    let memory = Arc::new(memory);
     if !state.activity.lifecycle.is_ready() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker is not ready");
     }
@@ -598,7 +668,7 @@ async fn completions(
     let serial = state.ids.fetch_add(1, Ordering::Relaxed);
     let job = Job {
         _slot: slot,
-        _memory: Some(memory),
+        _memory: Some(Arc::clone(&memory)),
         limits: state.limits,
         prepared,
         events,
@@ -626,13 +696,18 @@ async fn completions(
                     (receiver, terminal),
                 ))
             });
-        Sse::new(events)
-            .keep_alive(KeepAlive::default())
-            .into_response()
+        retain_output_memory(
+            Sse::new(events)
+                .keep_alive(KeepAlive::default())
+                .into_response(),
+            memory,
+        )
     } else {
         while let Some(event) = responses.recv().await {
             match event {
-                ModelEvent::Complete(response) => return Json(response).into_response(),
+                ModelEvent::Complete(response) => {
+                    return retain_output_memory(Json(response).into_response(), memory);
+                }
                 ModelEvent::Failed(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
                 ModelEvent::Chunk(_) => {}
             }
@@ -640,8 +715,23 @@ async fn completions(
         error(StatusCode::INTERNAL_SERVER_ERROR, "GPU worker disconnected")
     }
 }
+fn retain_output_memory(
+    response: Response,
+    memory: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = futures_util::stream::unfold(
+        (body.into_data_stream(), memory),
+        |(mut body, memory)| async move { body.next().await.map(|data| (data, (body, memory))) },
+    );
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
 fn chunk(job: &Job, model: &str, delta: Value, finish: Option<&str>) -> Value {
-    json!({"id":job.id,"object":"chat.completion.chunk","created":job.created,"model":model,"choices":[{"index":0,"delta":delta,"finish_reason":finish,"logprobs":null}]})
+    let mut chunk = json!({"id":job.id,"object":"chat.completion.chunk","created":job.created,"model":model,"choices":[{"index":0,"delta":delta,"finish_reason":finish,"logprobs":null}]});
+    if job.prepared.include_usage {
+        chunk["usage"] = Value::Null;
+    }
+    chunk
 }
 async fn wait_worker(worker: &std::thread::JoinHandle<()>, timeout_ms: u64) -> bool {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -675,6 +765,23 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+    #[tokio::test]
+    async fn output_memory_is_held_until_http_body_finishes_or_is_dropped() {
+        for consume in [false, true] {
+            let permits = Arc::new(tokio::sync::Semaphore::new(1));
+            let memory = Arc::new(Arc::clone(&permits).try_acquire_owned().unwrap());
+            let response = retain_output_memory(Json(json!({"ok":true})).into_response(), memory);
+            assert_eq!(permits.available_permits(), 0);
+            if consume {
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+            } else {
+                drop(response);
+            }
+            assert_eq!(permits.available_permits(), 1);
+        }
+    }
     #[tokio::test]
     async fn stuck_worker_cannot_block_shutdown_indefinitely() {
         let (release, gate) = std::sync::mpsc::channel();

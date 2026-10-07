@@ -24,11 +24,38 @@ curl http://127.0.0.1:8088/v1/chat/completions \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"37×24−19×13等于多少？"}],"temperature":0,"max_tokens":512,"enable_thinking":true,"stream":true,"stream_options":{"include_usage":true}}'
 ```
 
-支持 `temperature`、`top_p`、`top_k`、presence/frequency/repetition penalties、`seed`、EOS 和 `stop`。temperature、top_p、top_k 和 repetition_penalty 默认采用模型的 generation config；presence/frequency penalties 默认 0。默认关闭 thinking；开启后思考文本位于 `reasoning_content`。
+支持 `temperature`、`top_p`、`top_k`、presence/frequency/repetition penalties、有符号 64 位 `seed`、`logit_bias`、EOS 和 `stop`。temperature、top_p、top_k 和 repetition_penalty 默认采用模型的 generation config；presence/frequency penalties 默认 0。默认 seed 为 20261002。`logit_bias` 的 key 是 tokenizer 的 token ID，值范围为 −100 到 100。
 
-默认输出预算为 512 tokens，可用 `max_tokens` 或 `max_completion_tokens` 调整。提示、历史、图片、thinking 和输出合计计入上下文容量；超出模型包容量时在准入前返回 400。HTTP body 上限为 32 MiB。
+默认关闭 thinking；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 开启后，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
-流式响应使用 SSE deltas 和 `[DONE]`；请求 `stream_options.include_usage=true` 可获得 usage。客户端断连后取消生成。异常流返回 error，不将失败后的部分输出伪装为成功完成。
+默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 指定，二者不能同时传入。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限为 32 MiB。
+
+`stream` 默认 false；显式 true 使用 SSE deltas 和 `[DONE]`。`stream=null` 等同默认值，`tools=null` 等同无工具。请求 `stream_options.include_usage=true` 时，普通 chunk 包含 `usage:null`，结束前另发 `choices:[]` 的完整 usage。usage 包含 reasoning 和 prefix cache token 计数。客户端断连后取消生成。异常流返回 error，不将失败后的部分输出伪装为成功完成。
+
+`logprobs=true` 返回正文 token 的 `token/logprob/bytes/top_logprobs`，`top_logprobs` 支持 0–20；SSE 返回对应正文 delta 的概率。概率来自 target 模型，应用惩罚、bias 和约束后、top-k/top-p 截断前；temperature=0 的 greedy 请求以 T=1 softmax 报告概率。`bytes` 可用于还原跨 token 的 UTF-8 字符；thinking、工具协议标记和工具参数不计入正文概率。开启此选项需要将 logits 下载到 CPU，会增加开销。
+
+非流式概率结果按输出预算预留 CPU 内存，计入 `--preprocess-memory-mib`，预算保持到 HTTP body 结束；过大的单请求在准备前返回 400。SSE 逐步发送概率，不累计完整概率响应，慢客户端的增量缓冲仍有上限。
+
+参数错误返回 HTTP 400 及 `error.message/type/param/code`，响应带 `x-request-id`。`/health.chat_capabilities` 声明当前能力。`store=false`、`metadata`、`safety_identifier` 和 `service_tier=auto/default` 可传入，但本地服务不持久化 completion，也不提供云端审核或服务等级调度。`store=true`、`n>1`、音频、视频和未知参数会明确报错。
+
+### JSON 输出
+
+支持 `response_format.type=text/json_object/json_schema`。后两种使用 Rust llguidance 做逐 token 约束；JSON Schema 支持嵌套对象、数组、类型、required、enum/const 及本地 `$ref` 等可编译约束。外部引用、超大或过深 schema，以及编译器无法保证的约束在请求准备阶段返回 400。
+
+```json
+{
+  "model": "qwen3.8-27b",
+  "messages": [{"role": "user", "content": "用 JSON 返回 2+3 的结果"}],
+  "response_format": {"type": "json_schema", "json_schema": {
+    "name": "answer", "strict": true,
+    "schema": {"type": "object", "properties": {"answer": {"type": "integer"}},
+      "required": ["answer"], "additionalProperties": false}
+  }},
+  "max_completion_tokens": 128
+}
+```
+
+thinking 可与 JSON 输出组合，正文仍受约束。MTP 的 target 和 draft 使用相同约束，拒绝的草稿不会改变解析器状态。达到输出预算会返回 `finish_reason=length`，正文可能尚未完成 JSON；调用方需检查 finish reason。约束输出不接受 `stop`，避免截断 JSON 或工具参数。
 
 ### 图片与多图
 
@@ -54,7 +81,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 支持 `tools`、`tool_choice`、`parallel_tool_calls`。模型的 XML 工具调用转换为标准 `tool_calls`，arguments 为 JSON 字符串。客户端执行工具，再把带 `tool_call_id` 的 `role=tool` 消息连同历史发送回来。
 
-函数调用完成后发送该调用的流式 delta；参数支持结构校验，但暂不提供完整 JSON Schema 约束解码。`tool_choice=required` 或指定函数时加入模板指令并校验结果，模型未遵守时返回生成错误。[OpenCode 示例](../examples/opencode.json)使用 `orinfer` provider 和 agent。
+流式调用先发 index/id/type/name，再增量发送 `function.arguments`；客户端按 index 拼接参数。`strict=true`、`tool_choice=required`、指定函数，或 `parallel_tool_calls=false` 时启用约束解码，限制函数名、参数 schema 和调用数；`required` 至少调用一次，指定函数仅能调用该函数，关闭 parallel 最多一次。未开启约束的普通 auto 调用沿用原生 XML 协议并在完成后校验。内部约束调用使用 JSON envelope，API 和历史仍为标准 `tool_calls`。[OpenCode 示例](../examples/opencode.json)使用 `orinfer` provider 和 agent。
 
 ## 执行与缓存
 

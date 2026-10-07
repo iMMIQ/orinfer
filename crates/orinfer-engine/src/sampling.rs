@@ -4,6 +4,9 @@
 /// Seed used by the fixed local evaluation protocol.
 pub const EVALUATION_SEED: u64 = 20_261_002;
 
+mod constrained;
+pub use constrained::{Constraint, Decoder, TokenLogprob, verify};
+
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -34,6 +37,8 @@ pub struct Options {
     pub frequency_penalty: f64,
     pub repetition_penalty: f64,
     pub seed: u64,
+    pub logit_bias: std::collections::BTreeMap<u32, f64>,
+    pub top_logprobs: Option<usize>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -45,6 +50,8 @@ impl Default for Options {
             frequency_penalty: 0.0,
             repetition_penalty: 1.0,
             seed: EVALUATION_SEED,
+            logit_bias: Default::default(),
+            top_logprobs: None,
         }
     }
 }
@@ -61,6 +68,11 @@ impl Options {
             || self.repetition_penalty <= 0.0
             || !self.frequency_penalty.is_finite()
             || !(-2.0..=2.0).contains(&self.frequency_penalty)
+            || self
+                .logit_bias
+                .values()
+                .any(|b| !b.is_finite() || !(-100.0..=100.0).contains(b))
+            || self.top_logprobs.is_some_and(|n| n > 20)
         {
             return Err("Invalid sampling parameters".into());
         }
@@ -71,6 +83,7 @@ impl Options {
             && self.presence_penalty == 0.0
             && self.frequency_penalty == 0.0
             && self.repetition_penalty == 1.0
+            && self.logit_bias.is_empty()
     }
 }
 /// Normalized target or draft law after applying the same history processors.
@@ -82,6 +95,14 @@ pub struct Distribution {
 }
 impl Distribution {
     pub fn from_logits(logits: &[f32], history: &[u32], options: &Options) -> Result<Self, String> {
+        Self::from_masked(logits, history, options, None)
+    }
+    pub fn from_masked(
+        logits: &[f32],
+        history: &[u32],
+        options: &Options,
+        mask: Option<&[u32]>,
+    ) -> Result<Self, String> {
         options.validate()?;
         if logits.is_empty()
             || logits.len() > u32::MAX as usize
@@ -109,11 +130,21 @@ impl Distribution {
                     score -= options.presence_penalty;
                 }
                 score -= options.frequency_penalty * counts[i] as f64;
+                score += options.logit_bias.get(&(i as u32)).copied().unwrap_or(0.0);
                 (i as u32, score)
             })
             .collect();
         if scores.iter().any(|(_, score)| !score.is_finite()) {
             return Err("Nonfinite processed sampling logits".into());
+        }
+        if let Some(mask) = mask {
+            scores.retain(|(id, _)| {
+                mask.get(*id as usize / 32)
+                    .is_some_and(|bits| bits & (1 << (*id % 32)) != 0)
+            });
+            if scores.is_empty() {
+                return Err("Grammar permits no tokens".into());
+            }
         }
         let compare =
             |a: &(u32, f64), b: &(u32, f64)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
@@ -259,6 +290,7 @@ fn greedy(logits: &[f32], history: &[u32], options: &Options) -> Result<u32, Str
             score -= options.presence_penalty;
         }
         score -= options.frequency_penalty * count as f64;
+        score += options.logit_bias.get(&(id as u32)).copied().unwrap_or(0.0);
         if !score.is_finite() {
             return Err("Nonfinite processed sampling logits".into());
         }

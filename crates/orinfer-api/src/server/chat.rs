@@ -5,6 +5,14 @@ use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 use tokenizers::Tokenizer;
 
+fn nullable_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 type Result<T> = std::result::Result<T, String>;
 
 #[cfg(test)]
@@ -53,7 +61,7 @@ mod mtp_fixture_export {
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_default")]
     pub tools: Vec<Value>,
     pub tool_choice: Option<Value>,
     pub parallel_tool_calls: Option<bool>,
@@ -63,19 +71,25 @@ pub struct ChatRequest {
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
     pub repetition_penalty: Option<f64>,
-    pub seed: Option<u64>,
+    pub seed: Option<i64>,
     pub max_tokens: Option<usize>,
     pub max_completion_tokens: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_default")]
     pub stream: bool,
     pub stream_options: Option<Value>,
     pub stop: Option<Value>,
     pub n: Option<usize>,
     pub logprobs: Option<bool>,
+    pub top_logprobs: Option<usize>,
+    pub logit_bias: Option<std::collections::BTreeMap<u32, f64>>,
     pub response_format: Option<Value>,
     pub enable_thinking: Option<bool>,
     pub reasoning_effort: Option<String>,
     pub user: Option<String>,
+    pub store: Option<bool>,
+    pub metadata: Option<std::collections::BTreeMap<String, String>>,
+    pub safety_identifier: Option<String>,
+    pub service_tier: Option<String>,
 }
 
 pub struct Prepared {
@@ -89,8 +103,11 @@ pub struct Prepared {
     pub parallel: bool,
     pub stops: Vec<String>,
     pub thinking: bool,
+    pub structured: bool,
+    pub constrained_tools: bool,
     pub stream: bool,
     pub include_usage: bool,
+    pub constraint: Option<Box<dyn orinfer_engine::sampling::Constraint>>,
 }
 
 pub struct ChatCodec {
@@ -99,6 +116,7 @@ pub struct ChatCodec {
     template: Environment<'static>,
     pub eos: BTreeSet<u32>,
     sampling_defaults: Options,
+    pub grammar: super::grammar::Factory,
 }
 impl ChatCodec {
     pub fn load(directory: &Path) -> Result<Self> {
@@ -172,9 +190,11 @@ impl ChatCodec {
         environment.add_filter(
             "tojson",
             |value: minijinja::Value| -> std::result::Result<minijinja::Value, minijinja::Error> {
-                let raw = serde_json::to_string(&value).map_err(|e| {
+                let mut value = serde_json::to_value(&value).map_err(|e| {
                     minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
                 })?;
+                canonical(&mut value);
+                let raw = serde_json::to_string(&value).unwrap();
                 let mut spaced = String::new();
                 let (mut quoted, mut escaped) = (false, false);
                 for c in raw.chars() {
@@ -206,12 +226,17 @@ impl ChatCodec {
         environment
             .add_template_owned("chat", template)
             .map_err(|e| e.to_string())?;
+        let grammar = super::grammar::Factory::new(
+            assets.remove("tokenizer.json").unwrap(),
+            eos.iter().copied().collect(),
+        );
         Ok(Self {
             sampling_defaults,
             tokenizer,
             asset_hashes,
             template: environment,
             eos,
+            grammar,
         })
     }
     pub fn prepare(
@@ -224,26 +249,79 @@ impl ChatCodec {
     ) -> Result<Prepared> {
         preparation.checkpoint(0)?;
         if request.model != model {
-            return Err(format!("Unknown model {}; expected {model}", request.model));
+            return Err(format!(
+                "model: Unknown model {}; expected {model}",
+                request.model
+            ));
         }
-        if request.n.is_some_and(|n| n != 1)
-            || request.logprobs == Some(true)
-            || request
-                .response_format
-                .as_ref()
-                .is_some_and(|v| v["type"] != "text")
+        if request.n.is_some_and(|n| n != 1) {
+            return Err("n: Only n=1 is supported".into());
+        }
+        if request.top_logprobs.is_some_and(|n| n > 20) {
+            return Err("top_logprobs: Expected 0–20".into());
+        }
+        if request.top_logprobs.is_some() && request.logprobs != Some(true) {
+            return Err("top_logprobs: Requires logprobs=true".into());
+        }
+        if request.store == Some(true) {
+            return Err("store: Stored completions are unsupported; use false".into());
+        }
+        if request
+            .service_tier
+            .as_deref()
+            .is_some_and(|t| !["auto", "default"].contains(&t))
         {
-            return Err("Supported: n=1, logprobs=false, response_format.type=text".into());
+            return Err("service_tier: Only auto/default are available locally".into());
         }
+        if request.metadata.as_ref().is_some_and(|m| {
+            m.len() > 16
+                || m.iter()
+                    .any(|(k, v)| k.chars().count() > 64 || v.chars().count() > 512)
+        }) {
+            return Err(
+                "metadata: At most 16 entries; keys <=64 and values <=512 characters".into(),
+            );
+        }
+        if request
+            .safety_identifier
+            .as_ref()
+            .is_some_and(|s| s.chars().count() > 128)
+        {
+            return Err("safety_identifier: At most 128 characters".into());
+        }
+        if let Some(options) = &request.stream_options {
+            let options = options
+                .as_object()
+                .ok_or("stream_options: Expected object")?;
+            if !request.stream {
+                return Err("stream_options: Requires stream=true".into());
+            }
+            for (name, value) in options {
+                if !["include_usage", "include_obfuscation"].contains(&name.as_str()) {
+                    return Err(format!("stream_options.{name}: Unsupported option"));
+                }
+                if !value.is_boolean() {
+                    return Err(format!("stream_options.{name}: Expected boolean"));
+                }
+                if name == "include_obfuscation" && value == true {
+                    return Err(
+                        "stream_options.include_obfuscation: Only false is supported".into(),
+                    );
+                }
+            }
+        }
+        let schema = super::grammar::output_schema(request.response_format.as_ref())?;
         if request.max_tokens.is_some() && request.max_completion_tokens.is_some() {
-            return Err("Specify only one output-token limit".into());
+            return Err("max_completion_tokens: Specify only one output-token limit".into());
         }
-        let max_tokens = request
+        let explicit_limit =
+            request.max_completion_tokens.is_some() || request.max_tokens.is_some();
+        let mut max_tokens = request
             .max_completion_tokens
             .or(request.max_tokens)
-            .unwrap_or(512);
+            .unwrap_or(8192);
         if max_tokens == 0 {
-            return Err("Output-token limit must be positive".into());
+            return Err("max_completion_tokens: Output-token limit must be positive".into());
         }
         let sampling = Options {
             temperature: request
@@ -258,17 +336,65 @@ impl ChatCodec {
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             seed: request
                 .seed
+                .map(|s| s as u64)
                 .unwrap_or(orinfer_engine::sampling::EVALUATION_SEED),
+            logit_bias: request.logit_bias.unwrap_or_default(),
+            top_logprobs: request
+                .logprobs
+                .unwrap_or(false)
+                .then_some(request.top_logprobs.unwrap_or(0)),
         };
-        sampling.validate()?;
-        let thinking = request.enable_thinking.unwrap_or(false);
-        if request
-            .reasoning_effort
-            .as_deref()
-            .is_some_and(|s| !["xhigh", "medium", "low"].contains(&s))
-        {
-            return Err("reasoning_effort: xhigh, medium or low".into());
+        for (&id, bias) in &sampling.logit_bias {
+            if self.tokenizer.id_to_token(id).is_none()
+                || !bias.is_finite()
+                || !(-100.0..=100.0).contains(bias)
+            {
+                return Err(format!(
+                    "logit_bias.{id}: Invalid token or bias outside -100..100"
+                ));
+            }
         }
+        for (name, value, min, max) in [
+            ("temperature", sampling.temperature, 0.0, 2.0),
+            ("top_p", sampling.top_p, 0.0, 1.0),
+            ("presence_penalty", sampling.presence_penalty, -2.0, 2.0),
+            ("frequency_penalty", sampling.frequency_penalty, -2.0, 2.0),
+        ] {
+            if !value.is_finite() || value < min || value > max || name == "top_p" && value == 0.0 {
+                return Err(format!("{name}: Invalid sampling value"));
+            }
+        }
+        if !sampling.repetition_penalty.is_finite() || sampling.repetition_penalty <= 0.0 {
+            return Err("repetition_penalty: Expected positive finite value".into());
+        }
+        sampling.validate()?;
+        if sampling.top_logprobs.is_some() {
+            self.grammar
+                .token_bytes(0)
+                .map_err(|e| format!("logprobs: {e}"))?;
+        }
+        let effort = match request.reasoning_effort.as_deref() {
+            None | Some("high" | "xhigh" | "max") => "xhigh",
+            Some("minimal" | "low") => "low",
+            Some("medium") => "medium",
+            Some("none") => "xhigh",
+            _ => {
+                return Err(
+                    "reasoning_effort: Expected none/minimal/low/medium/high/xhigh/max".into(),
+                );
+            }
+        };
+        if request.reasoning_effort.as_deref() == Some("none")
+            && request.enable_thinking == Some(true)
+        {
+            return Err("enable_thinking: Conflicts with reasoning_effort=none".into());
+        }
+        let thinking = request.enable_thinking.unwrap_or(
+            request
+                .reasoning_effort
+                .as_ref()
+                .is_some_and(|s| s != "none"),
+        );
         let stops = match request.stop {
             None | Some(Value::Null) => vec![],
             Some(Value::String(s)) => vec![s],
@@ -286,18 +412,33 @@ impl ChatCodec {
             return Err("stop allows at most four nonempty strings".into());
         }
         let mut names = BTreeSet::new();
-        for tool in &request.tools {
+        if request.tools.len() > 128 {
+            return Err("tools: At most 128 functions".into());
+        }
+        for (index, tool) in request.tools.iter().enumerate() {
             let function = &tool["function"];
             let name = function["name"].as_str().ok_or("Tool name missing")?;
             if tool["type"] != "function" || !valid_name(name) || !names.insert(name.to_owned()) {
                 return Err("Tools need unique, valid function names".into());
             }
             if !function["parameters"].is_null() && !function["parameters"].is_object() {
-                return Err("Tool parameters must be a JSON schema object".into());
+                return Err(format!(
+                    "tools[{index}].function.parameters: Expected JSON schema object"
+                ));
+            }
+            if function
+                .get("strict")
+                .is_some_and(|s| !s.is_null() && !s.is_boolean())
+            {
+                return Err(format!("tools[{index}].function.strict: Expected boolean"));
             }
         }
-        let choice = request.tool_choice.unwrap_or(json!("auto"));
-        let tools = match choice.as_str() {
+        let choice = request.tool_choice.unwrap_or(if request.tools.is_empty() {
+            json!("none")
+        } else {
+            json!("auto")
+        });
+        let mut tools = match choice.as_str() {
             Some("none") => vec![],
             Some("auto") => request.tools,
             Some("required") if !request.tools.is_empty() => request.tools,
@@ -317,6 +458,42 @@ impl ChatCodec {
         };
         let (raw_messages, images) = super::image::messages(request.messages, vision, preparation)?;
         let mut messages = normalize_messages(raw_messages)?;
+        let parallel = request.parallel_tool_calls.unwrap_or(true);
+        let grammar = super::grammar::recipe(schema.as_ref(), &tools, &choice, parallel, thinking)?;
+        if grammar.is_some() && !stops.is_empty() {
+            return Err("stop: Cannot interrupt constrained JSON or tool output".into());
+        }
+        let constraint = grammar
+            .map(|g| {
+                self.grammar.compile(
+                    g,
+                    if schema.is_some() {
+                        "response_format"
+                    } else {
+                        "tools"
+                    },
+                )
+            })
+            .transpose()?;
+        if constraint.is_some() {
+            let instruction = if tools.is_empty() {
+                format!(
+                    "Return only JSON conforming to this schema: {}",
+                    schema.as_ref().unwrap()
+                )
+            } else {
+                "When calling a tool, output <tool_call>{\"name\":\"FUNCTION_NAME\",\"arguments\":{...}}</tool_call>. Use valid JSON inside the tags.".into()
+            };
+            if messages[0]["role"] == "system" {
+                let existing = messages[0]["content"].as_str().unwrap_or("");
+                messages[0]["content"] = json!(format!("{instruction}\n\n{existing}"));
+            } else {
+                messages.insert(0, json!({"role":"system","content":instruction}));
+            }
+        }
+        for tool in &mut tools {
+            canonical(tool);
+        }
         if choice == "required" || choice.is_object() {
             let instruction = if let Some(name) = choice["function"]["name"].as_str() {
                 format!("For this response you must call the function {name}.")
@@ -331,11 +508,16 @@ impl ChatCodec {
             }
         }
         preparation.checkpoint(0)?;
-        let rendered = self.template.get_template("chat").map_err(|e| e.to_string())?.render(context! {
-            messages => messages, tools => tools, add_generation_prompt => true,
-            enable_thinking => thinking, reasoning_effort => request.reasoning_effort.as_deref().unwrap_or("xhigh"),
-            preserve_thinking => true,
-        }).map_err(|e| format!("Chat template: {e}"))?;
+        let rendered = self
+            .template
+            .get_template("chat")
+            .map_err(|e| e.to_string())?
+            .render(context! {
+                messages => messages, tools => tools, add_generation_prompt => true,
+                enable_thinking => thinking, reasoning_effort => effort,
+                preserve_thinking => true,
+            })
+            .map_err(|e| format!("Chat template: {e}"))?;
         preparation.checkpoint(0)?;
         let input = self
             .tokenizer
@@ -348,14 +530,18 @@ impl ChatCodec {
         } else {
             input
         };
+        if !explicit_limit {
+            max_tokens = max_tokens.min(context_limit.saturating_sub(input.len()));
+        }
         if input.is_empty()
+            || max_tokens == 0
             || input
                 .len()
                 .checked_add(max_tokens)
                 .is_none_or(|n| n > context_limit)
         {
             return Err(format!(
-                "Context limit {context_limit}: {} prompt tokens + {max_tokens} output tokens",
+                "max_completion_tokens: Context limit {context_limit}: {} prompt tokens + {max_tokens} output tokens",
                 input.len()
             ));
         }
@@ -390,12 +576,31 @@ impl ChatCodec {
             sampling,
             tools,
             tool_choice: choice,
-            parallel: request.parallel_tool_calls.unwrap_or(true),
+            parallel,
             stops,
             thinking,
+            structured: schema.is_some(),
+            constrained_tools: constraint.is_some(),
             stream: request.stream,
             include_usage,
+            constraint,
         })
+    }
+}
+fn canonical(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.sort_keys();
+            for value in map.values_mut() {
+                canonical(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                canonical(value);
+            }
+        }
+        _ => {}
     }
 }
 fn valid_name(s: &str) -> bool {
@@ -513,6 +718,19 @@ fn normalize_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nullable_optional_fields_and_signed_seed_match_the_wire_contract() {
+        let request: ChatRequest=serde_json::from_value(json!({"model":"test","messages":[],"tools":null,"stream":null,"seed":-1,"store":false,"metadata":{"case":"test"},"logprobs":true,"top_logprobs":3,"logit_bias":{"42":-100}})).unwrap();
+        assert!(!request.stream && request.tools.is_empty());
+        assert_eq!(request.seed, Some(-1));
+        assert_eq!(request.logit_bias.unwrap()[&42], -100.0);
+        assert!(
+            serde_json::from_value::<ChatRequest>(
+                json!({"model":"test","messages":[],"stream":"true"})
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn saved_calibration_truncation_does_not_discard_chat_history() {
         use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};

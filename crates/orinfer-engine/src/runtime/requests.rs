@@ -39,6 +39,7 @@ pub struct RequestState {
     generated: usize,
     served: usize,
     mtp_blocked: bool,
+    decoder: crate::sampling::Decoder,
 }
 impl Drop for RequestState {
     fn drop(&mut self) {
@@ -50,6 +51,19 @@ impl Drop for RequestState {
     }
 }
 impl RequestState {
+    pub fn set_constraint(
+        &mut self,
+        constraint: Box<dyn crate::sampling::Constraint>,
+    ) -> Result<()> {
+        if self.generated != 0 {
+            return Err("Attach constraint before generation".into());
+        }
+        self.decoder.set_constraint(constraint);
+        Ok(())
+    }
+    pub fn take_logprobs(&mut self) -> Vec<crate::sampling::TokenLogprob> {
+        self.decoder.take_records()
+    }
     pub fn generated_tokens(&self) -> usize {
         self.generated
     }
@@ -61,7 +75,13 @@ impl RequestState {
         self.prefilling
     }
     pub fn is_finished(&self) -> bool {
-        self.generated == self.limit || self.released
+        self.generated == self.limit || self.released || self.decoder.finished()
+    }
+    pub fn constraint_finished(&self) -> bool {
+        self.decoder.finished()
+    }
+    pub fn failure(&self) -> Option<&str> {
+        self.decoder.failure()
     }
     pub fn prefix_statistics(&self) -> &crate::prefix::Statistics {
         &self.prefix.statistics
@@ -372,6 +392,7 @@ impl ModelRuntime {
                 generated: 0,
                 served: 0,
                 mtp_blocked: false,
+                decoder: Default::default(),
             })
         })();
         if result.is_err() {
@@ -478,7 +499,11 @@ impl ModelRuntime {
             true,
             &mut req.prefix,
         )?;
-        let pending = self.select_target(&req.history, &req.sampling, req.generated)?;
+        let pending = match self.select_request_token(req) {
+            Ok(token) => token,
+            Err(_) if req.failure().is_some() => return Ok(vec![]),
+            Err(error) => return Err(error),
+        };
         self.upload_ids(&self.manifest.token, &[pending])?;
         req.history.push(pending);
         req.generated += 1;
@@ -661,9 +686,14 @@ impl ModelRuntime {
         match self.select_work(requests, options, &initialized)? {
             Work::Speculative(i) => {
                 let began = Instant::now();
-                let tokens = self.with_request(requests[i], |model, req| {
+                let result = self.with_request(requests[i], |model, req| {
                     model.speculative_request_step(req, options.max_batch_tokens)
-                })?;
+                });
+                let tokens = match result {
+                    Ok(tokens) => tokens,
+                    Err(_) if requests[i].failure().is_some() => vec![],
+                    Err(error) => return Err(error),
+                };
                 let per_token = began.elapsed().as_secs_f64() / tokens.len().max(1) as f64;
                 self.mtp_seconds_per_token = self.mtp_seconds_per_token * 0.8 + per_token * 0.2;
                 self.scheduler_statistics.speculative_iterations += 1;
@@ -982,12 +1012,43 @@ impl ModelRuntime {
         if position != req.input.len() + req.generated {
             return Err("Batched decode position mismatch".into());
         }
-        let token = self.select_target(&req.history, &req.sampling, req.generated)?;
+        let token = match self.select_request_token(req) {
+            Ok(token) => token,
+            Err(_) if req.failure().is_some() => return Ok(vec![]),
+            Err(error) => return Err(error),
+        };
         self.upload_ids(&self.manifest.token, &[token])?;
         req.history.push(token);
         req.generated += 1;
         req.mtp.committed_tokens = req.generated;
         Ok(vec![token])
+    }
+    fn select_request_token(&self, req: &mut RequestState) -> Result<u32> {
+        if !req.decoder.constrained() && req.sampling.top_logprobs.is_none() {
+            return self.select_target(&req.history, &req.sampling, req.generated);
+        }
+        if self.read_control(&self.manifest.status)? != 0 {
+            return Err("Model token status failure".into());
+        }
+        let spec = self
+            .manifest
+            .buffers
+            .iter()
+            .find(|b| b.name == self.manifest.logits)
+            .ok_or("Missing logits")?;
+        let raw = self
+            .execution
+            .download_bytes(&self.manifest.logits, spec.bytes()?)?;
+        let law = req
+            .decoder
+            .law(&floats(&raw, spec.dtype), &req.history, &req.sampling)?;
+        let token = law.distribution.draw(crate::sampling::counter_uniform(
+            req.sampling.seed,
+            0,
+            req.generated as u64,
+        ))?;
+        req.decoder.commit(token, law)?;
+        Ok(token)
     }
     pub(crate) fn finish_request(&mut self, req: &mut RequestState, cache: bool) -> Result<()> {
         if req.released {

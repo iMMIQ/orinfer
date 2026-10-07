@@ -83,6 +83,14 @@ impl ModelRuntime {
         let mut drafts = Vec::with_capacity(plan.tokens - 1);
         let mut proposals = Vec::with_capacity(plan.tokens - 1);
         let mut draft_history = req.history.clone();
+        let host_sampling = !req.sampling.is_greedy()
+            || req.decoder.constrained()
+            || req.sampling.top_logprobs.is_some();
+        let mut draft_decoder = req.decoder.fork();
+        let draft_options = crate::sampling::Options {
+            top_logprobs: None,
+            ..req.sampling.clone()
+        };
         for i in 0..plan.tokens - 1 {
             if i != 0 {
                 self.prepare_program_inputs(
@@ -96,17 +104,24 @@ impl ModelRuntime {
             if self.read_control(&spec.status)? != 0 || selected < 0 || selected as usize >= vocab {
                 return Err("Invalid request draft token".into());
             }
-            let token = if req.sampling.is_greedy() {
+            let token = if !host_sampling {
                 selected as u32
             } else {
                 let raw = self
                     .execution
                     .download_bytes(&spec.draft_logits, vocab * 4)?;
-                let distribution = crate::sampling::Distribution::from_logits(
-                    &floats(&raw, crate::artifact::Dtype::F32),
-                    &draft_history,
-                    &req.sampling,
-                )?;
+                let law = draft_decoder
+                    .law(
+                        &floats(&raw, crate::artifact::Dtype::F32),
+                        &draft_history,
+                        &draft_options,
+                    )
+                    .inspect_err(|error| {
+                        if draft_decoder.failure().is_some() {
+                            req.decoder.fail(error.clone());
+                        }
+                    })?;
+                let distribution = law.distribution;
                 let token = distribution.draw(crate::sampling::counter_uniform(
                     req.sampling.seed,
                     crate::mtp::DRAFT_STREAM,
@@ -117,13 +132,25 @@ impl ModelRuntime {
                     distribution,
                 });
                 self.upload_ids(&spec.token, &[token])?;
+                draft_decoder.consume(token).inspect_err(|error| {
+                    req.decoder.fail(error.clone());
+                })?;
                 token
             };
             drafts.push(token);
             draft_history.push(token);
+            if draft_decoder.finished() {
+                break;
+            }
         }
-        req.mtp.draft_s += at.elapsed().as_secs_f64();
+        // Fixed verification profiles may contain unused rows after EOS. They
+        // have no authority over the parser or committed probability records.
         req.mtp.proposed_tokens += drafts.len();
+        drafts.resize(
+            plan.tokens - 1,
+            *drafts.last().ok_or("Empty draft profile")?,
+        );
+        req.mtp.draft_s += at.elapsed().as_secs_f64();
         let mut verification = vec![pending];
         verification.extend_from_slice(&drafts);
         let at = Instant::now();
@@ -140,17 +167,18 @@ impl ModelRuntime {
         req.mtp.verification_s += at.elapsed().as_secs_f64();
         req.mtp.rounds += 1;
         let at = Instant::now();
-        let committed = if req.sampling.is_greedy() {
+        let committed = if !host_sampling {
             crate::mtp::greedy_commit(&drafts, &target)?
         } else {
             let raw = self
                 .execution
                 .download_bytes(&spec.verification_logits, plan.tokens * vocab * 4)?;
-            crate::mtp::sampled_commit(
+            crate::sampling::verify(
                 &proposals,
                 &floats(&raw, crate::artifact::Dtype::F32),
                 &req.history,
                 &req.sampling,
+                &mut req.decoder,
                 req.generated,
                 vocab,
             )?
@@ -159,7 +187,15 @@ impl ModelRuntime {
             return Err("Invalid speculative commit length".into());
         }
         req.mtp.sampling_s += at.elapsed().as_secs_f64();
-        req.mtp.accepted_draft_tokens += committed.len() - 1;
+        req.mtp.accepted_draft_tokens += if host_sampling {
+            committed
+                .iter()
+                .zip(&proposals)
+                .take_while(|(token, proposal)| **token == proposal.token)
+                .count()
+        } else {
+            committed.len() - 1
+        };
         let at = Instant::now();
         if spec.commit_always || committed.len() < plan.tokens {
             self.upload_ids(&spec.accepted_inputs, &[committed.len() as u32])?;

@@ -78,7 +78,27 @@ pub(super) fn request_memory_mib(request: &ChatRequest, context: usize) -> u32 {
         .saturating_mul(8)
         .saturating_add(context.saturating_mul(16))
         .saturating_add(4 << 20);
+    // Reserve nested probability JSON and serialization copies through delivery.
+    let probabilities = if request.logprobs == Some(true) {
+        let output = request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .unwrap_or(8192)
+            .min(context);
+        // SSE emits scores incrementally and retains only bounded mailboxes.
+        (if request.stream {
+            output.min(128)
+        } else {
+            output
+        })
+        .saturating_mul(request.top_logprobs.unwrap_or(0).min(20) + 1)
+        .saturating_mul(3072)
+        .saturating_add(64 << 20)
+    } else {
+        0
+    };
     (text
+        .saturating_add(probabilities)
         .saturating_add(if image { 512 << 20 } else { 0 })
         .div_ceil(1 << 20)) as u32
 }
@@ -86,6 +106,25 @@ pub(super) fn request_memory_mib(request: &ChatRequest, context: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn probability_budget_counts_completion_limit_and_streaming_retention() {
+        let mut request: ChatRequest = serde_json::from_value(json!({"model":"test",
+            "messages":[{"role":"user","content":"hello"}],"max_completion_tokens":512,
+            "logprobs":true,"top_logprobs":20}))
+        .unwrap();
+        let complete = request_memory_mib(&request, 1024);
+        request.stream = true;
+        let streaming = request_memory_mib(&request, 1024);
+        assert!(complete > streaming);
+        request.logprobs = Some(false);
+        assert!(streaming > request_memory_mib(&request, 1024));
+        request.logprobs = Some(true);
+        request.stream = false;
+        request.max_completion_tokens = Some(usize::MAX);
+        let capped = request_memory_mib(&request, 1024);
+        request.max_completion_tokens = Some(1024);
+        assert_eq!(capped, request_memory_mib(&request, 1024));
+    }
     #[tokio::test]
     async fn cancelled_handler_cannot_return_permit_while_blocking_work_runs() {
         let permits = Arc::new(tokio::sync::Semaphore::new(1));

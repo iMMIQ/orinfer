@@ -36,6 +36,22 @@ type Decoder<'a> = tokenizers::tokenizer::DecodeStream<
     tokenizers::decoders::DecoderWrapper,
 >;
 
+fn token_score(codec: &ChatCodec, score: &orinfer_engine::sampling::TokenLogprob) -> Value {
+    let entry = |id: u32, logprob: f64| {
+        let bytes = codec.grammar.token_bytes(id).unwrap_or_default();
+        json!({"token":String::from_utf8_lossy(&bytes),"logprob":logprob,"bytes":bytes})
+    };
+    let mut result = entry(score.token, score.logprob);
+    result["top_logprobs"] = json!(
+        score
+            .top
+            .iter()
+            .map(|&(id, p)| entry(id, p))
+            .collect::<Vec<_>>()
+    );
+    result
+}
+
 struct Mailbox {
     job: Job,
     pending: VecDeque<(ModelEvent, usize)>,
@@ -92,7 +108,17 @@ impl Mailbox {
             ModelEvent::Chunk(v) | ModelEvent::Complete(v) => v.to_string().len(),
             ModelEvent::Failed(s) => s.len(),
         };
-        if self.bytes.saturating_add(size) > 512 * 1024 || self.pending.len() >= 1024 {
+        let ceiling = match &event {
+            ModelEvent::Complete(_) if self.job.prepared.sampling.top_logprobs.is_some() => self
+                .job
+                .prepared
+                .max_tokens
+                .saturating_mul(self.job.prepared.sampling.top_logprobs.unwrap() + 1)
+                .saturating_mul(1024)
+                .saturating_add(512 * 1024),
+            _ => 512 * 1024,
+        };
+        if self.bytes.saturating_add(size) > ceiling || self.pending.len() >= 1024 {
             self.pending.clear();
             self.bytes = 0;
             self.failed = true;
@@ -108,7 +134,14 @@ impl Mailbox {
         self.flush()
     }
     fn delta(&mut self, model: &str, delta: Value) -> bool {
-        self.send(ModelEvent::Chunk(chunk(&self.job, model, delta, None)))
+        self.delta_scored(model, delta, None)
+    }
+    fn delta_scored(&mut self, model: &str, delta: Value, logprobs: Option<Value>) -> bool {
+        let mut payload = chunk(&self.job, model, delta, None);
+        if let Some(logprobs) = logprobs {
+            payload["choices"][0]["logprobs"] = logprobs;
+        }
+        self.send(ModelEvent::Chunk(payload))
     }
 }
 enum Ending {
@@ -131,15 +164,21 @@ struct Active<'a> {
     ending: Option<Ending>,
     started: Instant,
     queue_s: f64,
+    reasoning_tokens: usize,
+    raw_bytes: usize,
+    pending_scores: VecDeque<(std::ops::Range<usize>, Value)>,
+    content_scores: Vec<Value>,
 }
 impl<'a> Active<'a> {
     fn new(request: RequestState, job: Job, codec: &'a ChatCodec) -> Self {
-        let parser = output::Output::new(
+        let mut parser = output::Output::new(
             job.prepared.thinking,
             job.prepared.tools.clone(),
             job.prepared.stops.clone(),
             &job.id,
         );
+        parser.structured_json(job.prepared.structured);
+        parser.constrained_tools(job.prepared.constrained_tools);
         let queue_s = job.queued.elapsed().as_secs_f64();
         Self {
             request,
@@ -150,10 +189,15 @@ impl<'a> Active<'a> {
             ending: None,
             started: Instant::now(),
             queue_s,
+            reasoning_tokens: 0,
+            raw_bytes: 0,
+            pending_scores: VecDeque::new(),
+            content_scores: vec![],
         }
     }
     fn consume(&mut self, tokens: &[u32], codec: &ChatCodec, model: &str) {
-        for &token in tokens {
+        let scores = self.request.take_logprobs();
+        for (index, &token) in tokens.iter().enumerate() {
             if self.mailbox.job.events.is_closed() || self.mailbox.failed {
                 self.ending = Some(Ending::Cancelled);
                 break;
@@ -163,6 +207,20 @@ impl<'a> Active<'a> {
                 self.ending = Some(Ending::Eos);
                 break;
             }
+            if let Some(score) = scores.get(index) {
+                let bytes = match codec.grammar.token_bytes(token) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.ending = Some(Ending::Failed(error));
+                        break;
+                    }
+                };
+                let span = self.raw_bytes..self.raw_bytes + bytes.len();
+                self.raw_bytes = span.end;
+                self.pending_scores
+                    .push_back((span, token_score(codec, score)));
+            }
+            let was_reasoning = self.parser.is_reasoning();
             let parsed = self
                 .decoder
                 .step(token)
@@ -170,8 +228,13 @@ impl<'a> Active<'a> {
                 .and_then(|text| self.parser.push(text.as_deref().unwrap_or(""), false));
             match parsed {
                 Ok(deltas) => {
+                    if was_reasoning || deltas.iter().any(|d| d.get("reasoning_content").is_some())
+                    {
+                        self.reasoning_tokens += 1;
+                    }
                     for delta in deltas {
-                        if !self.mailbox.delta(model, delta) {
+                        let logprobs = self.delta_scores(&delta);
+                        if !self.mailbox.delta_scored(model, delta, logprobs) {
                             self.ending = Some(Ending::Cancelled);
                             break;
                         }
@@ -182,6 +245,13 @@ impl<'a> Active<'a> {
                     break;
                 }
             }
+            while self
+                .pending_scores
+                .front()
+                .is_some_and(|(span, _)| span.end <= self.parser.processed_bytes())
+            {
+                self.pending_scores.pop_front();
+            }
             if self.ending.is_some() {
                 break;
             }
@@ -191,22 +261,69 @@ impl<'a> Active<'a> {
             }
         }
     }
+    fn delta_scores(&mut self, delta: &Value) -> Option<Value> {
+        delta.get("content")?;
+        // Output spans are consumed in content-delta order, including text
+        // withheld across UTF-8, XML markers and stop-string boundaries.
+        let spans = self.parser.take_content_span();
+        let mut content = vec![];
+        if let Some(span) = spans {
+            while self
+                .pending_scores
+                .front()
+                .is_some_and(|(s, _)| s.end <= span.start)
+            {
+                self.pending_scores.pop_front();
+            }
+            while self
+                .pending_scores
+                .front()
+                .is_some_and(|(s, _)| s.start < span.end)
+            {
+                let (range, mut score) = self.pending_scores.pop_front().unwrap();
+                let bytes: Vec<u8> = serde_json::from_value(score["bytes"].clone()).unwrap();
+                let start = span.start.saturating_sub(range.start);
+                let end = (span.end - range.start).min(bytes.len());
+                let visible = &bytes[start..end];
+                let mut fragment = score.clone();
+                fragment["token"] = json!(String::from_utf8_lossy(visible));
+                fragment["bytes"] = json!(visible);
+                content.push(fragment);
+                if range.end > span.end {
+                    score["bytes"] = json!(&bytes[end..]);
+                    self.pending_scores.push_front((span.end..range.end, score));
+                    break;
+                }
+            }
+        }
+        self.mailbox.job.prepared.sampling.top_logprobs?;
+        if !self.mailbox.job.prepared.stream {
+            self.content_scores.extend(content.clone());
+        }
+        Some(json!({"content":content,"refusal":null}))
+    }
     fn finished(&self) -> bool {
         self.request.is_finished() || self.ending.is_some()
     }
     fn finish(&mut self, model: &str) -> Result<()> {
+        if let Some(error) = self.request.failure() {
+            return Err(error.into());
+        }
         match &self.ending {
             Some(Ending::Cancelled) => return Ok(()),
             Some(Ending::Failed(error)) => return Err(error.clone()),
             _ => {}
         }
-        let exhausted = self.ending.is_none() && self.count == self.mailbox.job.prepared.max_tokens;
+        let exhausted = self.ending.is_none()
+            && self.count == self.mailbox.job.prepared.max_tokens
+            && !self.request.constraint_finished();
         for delta in self.parser.finish(
             exhausted,
             &self.mailbox.job.prepared.tool_choice,
             self.mailbox.job.prepared.parallel,
         )? {
-            if !self.mailbox.delta(model, delta) {
+            let logprobs = self.delta_scores(&delta);
+            if !self.mailbox.delta_scored(model, delta, logprobs) {
                 return Ok(());
             }
         }
@@ -220,9 +337,21 @@ impl<'a> Active<'a> {
         let job = &self.mailbox.job;
         let usage = json!({"prompt_tokens":job.prepared.input.len(),"completion_tokens":self.count,
             "total_tokens":job.prepared.input.len()+self.count,
+            "completion_tokens_details":{"reasoning_tokens":self.reasoning_tokens},
             "prompt_tokens_details":{"cached_tokens":self.request.prefix_statistics().cached_tokens}});
-        let response = json!({"id":job.id,"object":"chat.completion","created":job.created,"model":model,
-            "choices":[{"index":0,"message":self.parser.message(),"finish_reason":reason,"logprobs":null}],"usage":usage});
+        let logprobs = job
+            .prepared
+            .sampling
+            .top_logprobs
+            .map(|_| json!({"content":self.content_scores,"refusal":null}));
+        let response = if job.prepared.stream {
+            // SSE has already delivered content and scores. Complete is only
+            // its terminal signal; do not retain a second full response.
+            json!({})
+        } else {
+            json!({"id":job.id,"object":"chat.completion","created":job.created,"model":model,
+                "choices":[{"index":0,"message":self.parser.message(),"finish_reason":reason,"logprobs":logprobs}],"usage":usage})
+        };
         let ending = chunk(job, model, json!({}), Some(reason));
         let usage_chunk=job.prepared.include_usage.then(||json!({"id":job.id,"object":"chat.completion.chunk","created":job.created,"model":model,"choices":[],"usage":usage}));
         self.mailbox.send(ModelEvent::Chunk(ending));
@@ -279,7 +408,8 @@ pub(super) fn worker(
             if active[index].finished() {
                 let mut a = active.remove(index);
                 let cache = a.ending.as_ref().is_none_or(Ending::cacheable)
-                    && a.count == a.request.generated_tokens();
+                    && a.count == a.request.generated_tokens()
+                    && a.request.failure().is_none();
                 if lifecycle.is_ready()
                     && let Err(error) = model.finish_request(&mut a.request, cache)
                 {
@@ -354,13 +484,18 @@ pub(super) fn worker(
                 };
                 match model.can_admit(&input, &options) {
                     Ok(true) => {
-                        let job = waiting.remove(i);
+                        let mut job = waiting.remove(i);
                         let text_only = input.images.is_empty();
                         let prompt_tokens = input.input_tokens.len();
                         match model.start_request(input, || {
                             job.events.is_closed() || shutdown.load(Ordering::Relaxed)
                         }) {
-                            Ok(request) => {
+                            Ok(mut request) => {
+                                if let Some(constraint) = job.prepared.constraint.take() {
+                                    request
+                                        .set_constraint(constraint)
+                                        .expect("Request has not generated tokens");
+                                }
                                 cached_text = text_only
                                     && request.prefix_statistics().cached_tokens == prompt_tokens;
                                 let mut a = Active::new(request, job, codec);
@@ -555,8 +690,11 @@ mod tests {
                 parallel: false,
                 stops: vec![],
                 thinking: false,
+                structured: false,
+                constrained_tools: false,
                 stream: true,
                 include_usage: false,
+                constraint: None,
                 prefix_hints: vec![],
             },
             events,
@@ -624,5 +762,19 @@ mod tests {
         drop(receiver);
         assert!(!mailbox.flush());
         assert!(mailbox.pending.is_empty());
+    }
+    #[test]
+    fn large_probability_completion_uses_reserved_budget_without_unbounding_chunks() {
+        let (mut mailbox, _receiver) = mailbox();
+        mailbox.job.prepared.sampling.top_logprobs = Some(20);
+        mailbox.job.prepared.max_tokens = 1024;
+        assert!(mailbox.send(ModelEvent::Chunk(json!(0))));
+        assert!(mailbox.send(ModelEvent::Complete(json!("x".repeat(640 * 1024)))));
+        assert_eq!(mailbox.pending.len(), 1);
+        assert!(!mailbox.failed);
+        let (mut mailbox, _receiver) = self::mailbox();
+        mailbox.job.prepared.sampling.top_logprobs = Some(20);
+        assert!(mailbox.send(ModelEvent::Chunk(json!(0))));
+        assert!(!mailbox.send(ModelEvent::Chunk(json!("x".repeat(640 * 1024)))));
     }
 }

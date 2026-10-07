@@ -124,9 +124,12 @@ def main():
                         messages=[{"role": "user", "content": "Call read_verification with filename input.txt and count 2. Then report the returned code."}])
     chunks = stream(base, tool_request)
     calls = [call for c in chunks if c["choices"] for call in c["choices"][0]["delta"].get("tool_calls", [])]
-    assert len(calls) == 1 and calls[0]["index"] == 0, calls
-    call = dict(calls[0])
-    call.pop("index")
+    assert calls and all(c["index"] == 0 for c in calls), calls
+    call = {"id": calls[0]["id"], "type": "function", "function": {
+        "name": calls[0]["function"]["name"],
+        "arguments": "".join(c["function"].get("arguments", "") for c in calls),
+    }}
+    assert len(calls) > 1, "Expected incremental tool arguments"
     assert call["function"]["name"] == "read_verification", call
     assert json.loads(call["function"]["arguments"]) == {"filename": "input.txt", "count": 2}, call
     assert chunks[-2]["choices"][0]["finish_reason"] == "tool_calls"
