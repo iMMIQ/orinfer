@@ -165,7 +165,8 @@ class VisionPublisher(EncoderBuilder):
             factory = f'overlay-{width}'
             if factory not in self.exports:
                 self.compile(factory, lambda: overlay(width, 2560, capacity, self.max_features), bf16=False)
-            buffers = dict(Embedding=f'{"Draft" if draft else ""}M{width}_Embedding', Features='Features',
+            arena_width=width if draft or width<256 else self.build['metadata']['chunk_tokens']
+            buffers = dict(Embedding=f'{"Draft" if draft else ""}M{arena_width}_Embedding', Features='Features',
                            Index='MtpFeatureIndex' if draft else 'FeatureIndex', Position='MtpPosition' if draft else 'Position')
             kernel = self.binding(factory, {k: dict(kind='buffer', name=v) for k, v in buffers.items()}, width, f'{program}/begin/k{insert}')
             m['kernels'].append(kernel)

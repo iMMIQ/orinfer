@@ -189,9 +189,13 @@ fn validate_mtp_partial_prefix() {
     )
     .unwrap();
     assert!(model.manifest.mtp.is_some());
-    let options = scheduler::Options::default();
+    let options = scheduler::Options {
+        memory_reserve_bytes: 0,
+        ..scheduler::Options::default()
+    };
     let mut rows = vec![];
     for &checkpoint in &fixture.checkpoint_tokens {
+        eprintln!("Validate partial prefix at {checkpoint}");
         let mut source = input(&fixture.cases[0], 16);
         let continuation = if checkpoint < 512 { 16 } else { 2048 };
         source.input_tokens.truncate(checkpoint + continuation);
@@ -210,6 +214,10 @@ fn validate_mtp_partial_prefix() {
             model.execution.release_snapshot(snapshot).unwrap();
         }
         let mut cold = model.start_request(input(&branch, 16), &|| false).unwrap();
+        // Keep the draft's P-1 warm/bridge decomposition equal on both paths.
+        // Flash's mixed-precision row plans can round differently across shapes;
+        // this check isolates snapshot restoration while retaining exact state checks.
+        cold.checkpoints.insert(checkpoint);
         let mut reference = vec![];
         while !cold.is_finished() {
             for step in model.advance_requests(&mut [&mut cold], &options).unwrap() {
@@ -233,7 +241,18 @@ fn validate_mtp_partial_prefix() {
             .entries
             .values()
             .find(|e| e.tokens.len() == checkpoint)
-            .unwrap();
+            .unwrap_or_else(|| {
+                panic!(
+                    "Missing checkpoint {checkpoint}; cache budget {}, entries {:?}",
+                    model.prefix_cache.budget,
+                    model
+                        .prefix_cache
+                        .entries
+                        .values()
+                        .map(|e| e.tokens.len())
+                        .collect::<Vec<_>>()
+                )
+            });
         assert_eq!(
             entry.warm_tokens,
             checkpoint - 1,
@@ -257,7 +276,13 @@ fn validate_mtp_partial_prefix() {
         );
         let actual_state = state(&mut model, &mut restored);
         for (name, expected) in &expected_state {
-            if name.ends_with("_State") || name.ends_with("_History") {
+            if name.ends_with("_State")
+                || name.ends_with("_History")
+                || name.ends_with("_gdn")
+                || name.ends_with("_conv")
+                || name.ends_with("_pending")
+                || name == "State_ple"
+            {
                 assert_eq!(
                     &actual_state[name], expected,
                     "Restored causal state differs: {name}"
@@ -278,7 +303,16 @@ fn validate_mtp_partial_prefix() {
             } else {
                 target_position
             };
-            let bytes = position * stride;
+            let divisor = model
+                .manifest
+                .kv_cache
+                .as_ref()
+                .unwrap()
+                .prefix_divisors
+                .get(name)
+                .copied()
+                .unwrap_or(1);
+            let bytes = position / divisor * divisor * stride;
             assert_eq!(
                 actual_state[name][..bytes],
                 expected_state[name][..bytes],

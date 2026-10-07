@@ -80,7 +80,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
     let verify_widths: BTreeSet<_> = spec.verification_plans.iter().map(|p| p.tokens).collect();
     if warm_widths != BTreeSet::from([1, 2, 3, 4, 5, 6, 7, 8, 16, 128, 512])
         || warm_widths.len() != spec.warm_plans.len()
-        || capture_widths != BTreeSet::from([1, 16, 128, 512])
+        || capture_widths != BTreeSet::from([1, 16, 128, 512, 2048, 4096])
         || capture_widths.len() != spec.capture_plans.len()
         || verify_widths != (2..=8).collect()
         || verify_widths.len() != spec.verification_plans.len()
@@ -184,6 +184,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                     .keys()
                     .filter(|n| !n.starts_with("State_48_"))
                     .cloned()
+                    .chain([super::plan::score_role(p.tokens, "Verify")])
                     .collect(),
             },
         );
@@ -199,6 +200,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                     .keys()
                     .filter(|n| n.starts_with("State_48_"))
                     .cloned()
+                    .chain([super::plan::score_role(p.tokens, "Draft")])
                     .collect(),
             },
         );
@@ -213,6 +215,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                 .keys()
                 .filter(|n| n.starts_with("State_48_"))
                 .cloned()
+                .chain([super::plan::score_role(1, "Draft")])
                 .collect(),
         },
     );

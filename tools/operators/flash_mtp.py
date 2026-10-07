@@ -3,13 +3,43 @@ import argparse
 from pathlib import Path
 import torch
 from kernels.model import flash_mtp as fm
+from kernels.model.flash_control import capture
+from kernels.model.speculation import gather_target_hidden
 from kernels.model.greedy import greedy_partials,greedy_merge
 from tools.operators.common import configure,write_json,error
 
 
+def prefill_ring():
+    """Every 512-row draft window survives a 4096-row target capture and wrap."""
+    width,capacity=10240,4096
+    ring=torch.empty((capacity,width),device='cuda',dtype=torch.float16)
+    end=torch.zeros(1,device='cuda',dtype=torch.int32)
+    begin=torch.zeros_like(end)
+    out=torch.empty((512,width),device='cuda',dtype=torch.float16)
+    gather=gather_target_hidden(512,width,capacity,ring=True)
+    cases=[]
+    for rows in (2048,4096):
+        hidden=torch.randn((rows,width),device='cuda').half()
+        kernel=capture(rows,width,capacity)
+        graph=torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):kernel(hidden,end,ring)
+        for start in (0,4093,262144-rows):
+            end.fill_(start+rows);graph.replay()
+            for offset in range(0,rows,512):
+                begin.fill_(start+offset);gather(ring,begin,out)
+                assert torch.equal(out,hidden[offset:offset+512]),(rows,start,offset)
+            cases.append(dict(rows=rows,start=start,exact=True))
+            hidden.neg_()
+    return cases
+
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--ring-only',action='store_true');a=p.parse_args()
     configure();report={'complete':False,'norm':[],'history':[],'pending':[],'greedy':[]}
+    report['prefill_ring']=prefill_ring()
+    if a.ring_only:
+        report['complete']=True;write_json(a.output/'results.json',report);return
     for rows in (1,2,3,8):
         for width in (65,2560,10240):
             x=torch.randn((rows,width),device='cuda').half();gamma=torch.randn(width,device='cuda')*.1+1

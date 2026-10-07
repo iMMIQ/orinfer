@@ -126,17 +126,20 @@ def index_pending(m: int):
 @orin_jit
 def index_scores(m: int, capacity: int):
     blocks=geometry(m,capacity)
+    stripes=min((blocks+63)//64,8 if m>=16 else 64)
     @T.prim_func
     def main(Query:T.Tensor((m,4,128),T.float16), Cache:T.Tensor((blocks,128),T.float16),
-             Position:T.Tensor((1,),T.int32), Scores:T.Tensor((m,blocks),T.float32)):
-        with T.Kernel(T.ceildiv(m,4),T.ceildiv(blocks,64),threads=128) as (qr,kb):
+             Position:T.Tensor((1,),T.int32), Scores:T.Tensor((blocks,m),T.float32)):
+        with T.Kernel(T.ceildiv(m,4),stripes,threads=128) as (qr,stripe):
             q=T.alloc_shared((16,128),T.float16)
             k=T.alloc_shared((64,128),T.float16)
             acc=T.alloc_fragment((16,64),T.float32)
             reduced=T.alloc_fragment((4,64),T.float32)
             view=T.reshape(acc,(4,4,64))
-            T.clear(reduced)
-            if kb*64<(Position[0]+T.min(m,qr*4+4))//4:
+            # Stable graph/workspace addresses, but only live causal tiles run.
+            for turn in T.serial(T.ceildiv(T.max(0,T.ceildiv((Position[0]+T.min(m,qr*4+4))//4,64)-stripe),stripes)):
+                kb=stripe+turn*stripes
+                T.clear(reduced)
                 for i,d in T.Parallel(16,128):
                     q[i,d]=0
                     if qr*4+i//4<m:q[i,d]=Query[qr*4+i//4,i%4,d]
@@ -146,50 +149,47 @@ def index_scores(m: int, capacity: int):
                 T.gemm(q,k,acc,transpose_B=True,clear_accum=True)
                 for i,j in T.Parallel(16,64):acc[i,j]=T.max(acc[i,j],0.0)
                 T.reduce_sum(view,reduced,dim=1)
-            for i,j in T.Parallel(4,64):
-                if qr*4+i<m and kb*64+j<blocks:
-                    Scores[qr*4+i,kb*64+j]=-T.infinity(T.float32)
-                    if kb*64+j<(Position[0]+qr*4+i+1)//4:
-                        Scores[qr*4+i,kb*64+j]=reduced[i,j]*128**-.5
+                for i,j in T.Parallel(4,64):
+                    if qr*4+i<m and kb*64+j<(Position[0]+qr*4+i+1)//4:
+                        Scores[kb*64+j,qr*4+i]=reduced[i,j]*128**-.5
     return main
 
 
 @orin_jit
 def radix_histogram(m: int, capacity: int, shift: int, tile: int = 1024):
     blocks=geometry(m,capacity);segments=(blocks+tile-1)//tile
+    stripes=min(segments,2)
     if shift not in (24,16,8,0):raise ValueError('Invalid radix byte')
     @T.prim_func
-    def main(Scores:T.Tensor((m,blocks),T.float32), Prefix:T.Tensor((m,),T.int32),
+    def main(Scores:T.Tensor((blocks,m),T.float32), Prefix:T.Tensor((m,),T.int32),
              Position:T.Tensor((1,),T.int32), Hist:T.Tensor((m,segments,256),T.int32)):
-        with T.Kernel(m,segments,threads=128) as (row,segment):
+        with T.Kernel(m,stripes,threads=128) as (row,stripe):
             hist=T.alloc_shared((256,),T.int32)
-            T.clear(hist)
-            if segment*tile<(Position[0]+row+1)//4:
+            for turn in T.serial(T.ceildiv(T.max(0,T.ceildiv((Position[0]+row+1)//4,tile)-stripe),stripes)):
+                segment=stripe+turn*stripes
+                T.clear(hist)
                 for i in T.Parallel(tile):
                     block=segment*tile+i
                     if block<(Position[0]+row+1)//4:
-                        key=T.reinterpret(T.int32,Scores[row,block])
+                        key=T.reinterpret(T.int32,Scores[block,row])
                         if shift==24 or key>>(shift+8)==Prefix[row]>>(shift+8):
                             T.atomic_add(hist[(key>>shift)&255],1)
-            T.copy(hist,Hist[row,segment,:])
+                T.copy(hist,Hist[row,segment,:])
     return main
 
 
 @orin_jit
 def radix_choose(m: int, capacity: int, shift: int, tile: int = 1024):
     blocks=geometry(m,capacity);segments=(blocks+tile-1)//tile
-    padded=1<<(segments-1).bit_length()
     @T.prim_func
     def main(Hist:T.Tensor((m,segments,256),T.int32), Prefix:T.Tensor((m,),T.int32),
              Remaining:T.Tensor((m,),T.int32), Position:T.Tensor((1,),T.int32)):
         with T.Kernel(m,threads=128) as row:
-            counts=T.alloc_fragment((padded,256),T.int32)
             total=T.alloc_fragment((256,),T.int32)
             shared=T.alloc_shared((256,),T.int32)
-            for s,b in T.Parallel(padded,256):
-                counts[s,b]=0
-                if s<segments:counts[s,b]=Hist[row,s,b]
-            T.reduce_sum(counts,total,dim=0)
+            T.clear(total)
+            for s in T.serial(T.ceildiv((Position[0]+row+1)//4,tile)):
+                for b in T.Parallel(256):total[b]+=Hist[row,s,b]
             T.copy(total,shared)
             if T.get_thread_binding()==0:
                 remain=T.alloc_var(T.int32)
@@ -213,23 +213,26 @@ def radix_choose(m: int, capacity: int, shift: int, tile: int = 1024):
 @orin_jit
 def selection_counts(m: int, capacity: int, tile: int = 1024):
     blocks=geometry(m,capacity);segments=(blocks+tile-1)//tile
+    stripes=min(segments,2)
     @T.prim_func
-    def main(Scores:T.Tensor((m,blocks),T.float32), Prefix:T.Tensor((m,),T.int32),
+    def main(Scores:T.Tensor((blocks,m),T.float32), Prefix:T.Tensor((m,),T.int32),
              Position:T.Tensor((1,),T.int32), Counts:T.Tensor((m,2,segments),T.int32)):
-        with T.Kernel(m,segments,threads=128) as (row,segment):
+        with T.Kernel(m,stripes,threads=128) as (row,stripe):
             greater=T.alloc_fragment((tile,),T.int32)
             equal=T.alloc_fragment((tile,),T.int32)
             g=T.alloc_fragment((1,),T.int32);e=T.alloc_fragment((1,),T.int32)
-            for i in T.Parallel(tile):
-                greater[i]=0;equal[i]=0
-                block=segment*tile+i
-                if block<(Position[0]+row+1)//4:
-                    key=T.reinterpret(T.int32,Scores[row,block])
-                    greater[i]=T.cast(key>Prefix[row],T.int32)
-                    equal[i]=T.cast(key==Prefix[row],T.int32)
-            T.reduce_sum(greater,g,dim=0);T.reduce_sum(equal,e,dim=0)
-            if T.get_thread_binding()==0:
-                Counts[row,0,segment]=g[0];Counts[row,1,segment]=e[0]
+            for turn in T.serial(T.ceildiv(T.max(0,T.ceildiv((Position[0]+row+1)//4,tile)-stripe),stripes)):
+                segment=stripe+turn*stripes
+                for i in T.Parallel(tile):
+                    greater[i]=0;equal[i]=0
+                    block=segment*tile+i
+                    if block<(Position[0]+row+1)//4:
+                        key=T.reinterpret(T.int32,Scores[block,row])
+                        greater[i]=T.cast(key>Prefix[row],T.int32)
+                        equal[i]=T.cast(key==Prefix[row],T.int32)
+                T.reduce_sum(greater,g,dim=0);T.reduce_sum(equal,e,dim=0)
+                if T.get_thread_binding()==0:
+                    Counts[row,0,segment]=g[0];Counts[row,1,segment]=e[0]
     return main
 
 
@@ -245,11 +248,13 @@ def selection_offsets(m: int, capacity: int, tile: int = 1024):
             g=T.alloc_fragment((padded,),T.int32);e=T.alloc_fragment((padded,),T.int32)
             for s in T.Parallel(padded):
                 g[s]=0;e[s]=0
-                if s<segments:g[s]=Counts[row,0,s];e[s]=Counts[row,1,s]
+                if s<segments and s*tile<(Position[0]+row+1)//4:
+                    g[s]=Counts[row,0,s];e[s]=Counts[row,1,s]
             T.cumsum(g,dim=0);T.cumsum(e,dim=0)
             for s in T.Parallel(segments):
-                Offsets[row,0,s]=g[s]-Counts[row,0,s]
-                Offsets[row,1,s]=e[s]-Counts[row,1,s]
+                if s*tile<(Position[0]+row+1)//4:
+                    Offsets[row,0,s]=g[s]-Counts[row,0,s]
+                    Offsets[row,1,s]=e[s]-Counts[row,1,s]
             for s in T.Parallel(padded):
                 if s==padded-1:Greater[row]=g[s]
             for i in T.Parallel(2051):
@@ -264,28 +269,31 @@ def selection_offsets(m: int, capacity: int, tile: int = 1024):
 @orin_jit
 def selection_scatter(m: int, capacity: int, tile: int = 1024):
     blocks=geometry(m,capacity);segments=(blocks+tile-1)//tile
+    stripes=min(segments,2)
     @T.prim_func
-    def main(Scores:T.Tensor((m,blocks),T.float32), Prefix:T.Tensor((m,),T.int32),
+    def main(Scores:T.Tensor((blocks,m),T.float32), Prefix:T.Tensor((m,),T.int32),
              Offsets:T.Tensor((m,2,segments),T.int32), Greater:T.Tensor((m,),T.int32),
              Position:T.Tensor((1,),T.int32), Selected:T.Tensor((m,2051),T.int32)):
-        with T.Kernel(m,segments,threads=128) as (row,segment):
+        with T.Kernel(m,stripes,threads=128) as (row,stripe):
             g=T.alloc_fragment((tile,),T.int32);e=T.alloc_fragment((tile,),T.int32)
             gp=T.alloc_fragment((tile,),T.int32);ep=T.alloc_fragment((tile,),T.int32)
-            for i in T.Parallel(tile):
-                g[i]=0;e[i]=0
-                block=segment*tile+i
-                if block<(Position[0]+row+1)//4:
-                    key=T.reinterpret(T.int32,Scores[row,block])
-                    g[i]=T.cast(key>Prefix[row],T.int32);e[i]=T.cast(key==Prefix[row],T.int32)
-                gp[i]=g[i];ep[i]=e[i]
-            T.cumsum(gp,dim=0);T.cumsum(ep,dim=0)
-            for i in T.Parallel(tile):
-                rank=T.alloc_var(T.int32)
-                rank=-1
-                if g[i]!=0:rank=Offsets[row,0,segment]+gp[i]-1
-                elif e[i]!=0:rank=Greater[row]+Offsets[row,1,segment]+ep[i]-1
-                if rank>=0 and rank<T.min(512,(Position[0]+row+1)//4):
-                    for offset in T.unroll(4):Selected[row,rank*4+offset]=(segment*tile+i)*4+offset
+            for turn in T.serial(T.ceildiv(T.max(0,T.ceildiv((Position[0]+row+1)//4,tile)-stripe),stripes)):
+                segment=stripe+turn*stripes
+                for i in T.Parallel(tile):
+                    g[i]=0;e[i]=0
+                    block=segment*tile+i
+                    if block<(Position[0]+row+1)//4:
+                        key=T.reinterpret(T.int32,Scores[block,row])
+                        g[i]=T.cast(key>Prefix[row],T.int32);e[i]=T.cast(key==Prefix[row],T.int32)
+                    gp[i]=g[i];ep[i]=e[i]
+                T.cumsum(gp,dim=0);T.cumsum(ep,dim=0)
+                for i in T.Parallel(tile):
+                    rank=T.alloc_var(T.int32)
+                    rank=-1
+                    if g[i]!=0:rank=Offsets[row,0,segment]+gp[i]-1
+                    elif e[i]!=0:rank=Greater[row]+Offsets[row,1,segment]+ep[i]-1
+                    if rank>=0 and rank<T.min(512,(Position[0]+row+1)//4):
+                        for offset in T.unroll(4):Selected[row,rank*4+offset]=(segment*tile+i)*4+offset
     return main
 
 

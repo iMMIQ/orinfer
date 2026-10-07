@@ -332,7 +332,7 @@ impl Inputs {
         if !draft && program != "target" {
             return Err("Unknown Flash input program".into());
         }
-        if !matches!(tokens.len(), 1..=8 | 16 | 128 | 512)
+        if !matches!(tokens.len(), 1..=8 | 16 | 128 | 512 | 2048 | 4096)
             || tokens
                 .iter()
                 .chain(history)
@@ -394,8 +394,14 @@ impl Inputs {
             )]);
         }
         Ok(vec![
-            (format!("M{}_Embedding", tokens.len()), embedding),
-            (format!("M{}_Ple", tokens.len()), ple),
+            (
+                format!("M{}_Embedding", super::plan::arena_width(tokens.len())),
+                embedding,
+            ),
+            (
+                format!("M{}_Ple", super::plan::arena_width(tokens.len())),
+                ple,
+            ),
         ])
     }
 }

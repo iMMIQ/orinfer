@@ -12,7 +12,7 @@ import shutil
 import torch
 from tools.model.flash_next.checkpoint import Checkpoint
 from tools.model.flash_next.native import Model
-from tools.model.flash_next.prepare import Publisher
+from tools.model.flash_next.prepare import Publisher, PREFILL_PROFILES, CHUNK_TOKENS
 from tools.model.publication import write_json, link_or_copy, seed_compile_cache
 from tools.operators.common import configure
 from kernels.model import flash_control as fc
@@ -24,9 +24,9 @@ class MtpPublisher(Publisher):
     def __init__(self,target,draft,base):
         self.__dict__.update(base.__dict__)
         self.target,self.draft=target,draft
-        self.ring=torch.empty((512,10240),device='cuda',dtype=torch.float16)
+        self.ring=torch.empty((CHUNK_TOKENS,10240),device='cuda',dtype=torch.float16)
         self.buffer(self.ring,'MtpHiddenRing','sequence')
-        self.buffers['MtpHiddenRing']['shape']=[512,10240]
+        self.buffers['MtpHiddenRing']['shape']=[CHUNK_TOKENS,10240]
         self.vlogits=torch.empty((8,target.V),device='cuda',dtype=torch.float32)
         self.vpairs=torch.empty((8,2),device='cuda',dtype=torch.int32)
         self.buffer(self.vlogits,'VerificationLogits','sequence');self.buffers['VerificationLogits']['shape']=[8,target.V]
@@ -55,6 +55,7 @@ class MtpPublisher(Publisher):
         self.model=model;model.position=model.capacity-m
         plan=model.plan(m,verify=verify);model.position=0
         draft=model.is_mtp
+        self.scores(plan,m,draft=draft,verify=verify)
         program=f'mtp_warm_m{m}' if draft else f'verify_m{m}'
         if verify:
             old_output,old_pairs=plan['output'],plan['token']
@@ -79,7 +80,7 @@ class MtpPublisher(Publisher):
             elif label=='gdn-update-save':self.buffer(args[0],f'VerifyM{m}_'+('Keys' if args[0].dtype==torch.float16 else 'Gates'))
         ops=[];section='begin'
         if draft:
-            ops.append(self.emit(program,section,f'control-gather-{m}',lambda:gather_target_hidden(m,10240,512,ring=True),
+            ops.append(self.emit(program,section,f'control-gather-{m}',lambda:gather_target_hidden(m,10240,CHUNK_TOKENS,ring=True),
                      (self.ring,model.position_gpu,plan['condition'].flatten(1)),m))
             ops.append(self.emit(program,section,f'control-length-{m}',lambda:fc.length(m),(model.lengths,),m))
         for (kernel,args),label in zip(plan['ops'][:plan['body_count']],plan['labels']):
@@ -125,7 +126,7 @@ class MtpPublisher(Publisher):
         return plan
     def capture(self,model,plan,m):
         self.model=model;program=f'mtp_capture_m{m}'
-        self.programs[program]=[self.emit(program,'body',f'control-capture-{m}',lambda:fc.capture(m,10240),(plan['residual'].flatten(1),model.position_gpu,self.ring),m)]
+        self.programs[program]=[self.emit(program,'body',f'control-capture-{m}',lambda:fc.capture(m,10240,CHUNK_TOKENS),(plan['residual'].flatten(1),model.position_gpu,self.ring),m)]
         self.captures.append(dict(tokens=m,program=program));return program
 
 
@@ -161,8 +162,8 @@ def main():
     draft=Model(Checkpoint(a.mtp_checkpoint,verify_hashes=False),262144,a.output/'draft',use_graph=False,target=target)
     # Register target operands first, preserving base immutable shard identities.
     publish=Publisher(target,a.model_output,reuse_data=True);register(publish,target,'',262144)
-    for name,dtype,shape in [('Input','i32',[512]),('Token','i32',[1]),('Status','i32',[1]),('LastIndex','i32',[1])]:publish.fixed(name,dtype,shape)
-    for m in (512,128,16,1):publish.plan(m)
+    for name,dtype,shape in [('Input','i32',[CHUNK_TOKENS]),('Token','i32',[1]),('Status','i32',[1]),('LastIndex','i32',[1])]:publish.fixed(name,dtype,shape)
+    for m in (*reversed(PREFILL_PROFILES),1):publish.plan(m)
     extended=MtpPublisher(target,draft,publish)
     register(extended,draft,'D',262144)
     for m in (*range(1,9),16,128,512):
@@ -170,7 +171,7 @@ def main():
             draft.position=draft.capacity-1;extended.draft_one=draft.plan(1);draft.position=0
         extended.native(draft,m)
     for m in range(2,9):extended.native(target,m,verify=True)
-    for m in (1,16,128,512):
+    for m in (1,*PREFILL_PROFILES):
         target.position=target.capacity-m;plan=target.plan(m);target.position=0
         extended.capture(target,plan,m)
     extended.programs['mtp_snapshot']=[dict(kind='copy',source='State_48_pending',destination='DraftPendingSaved',bytes=1024)]
@@ -182,7 +183,7 @@ def main():
     metadata['mtp']=dict(position='MtpPosition',input='MtpInput',token='MtpToken',status='MtpStatus',verification_tokens='VerificationTokens',verification_status='VerificationStatus',
         draft_logits='DraftLogits',verification_logits='VerificationLogits',feature_index=None,accepted_inputs='AcceptedInputs',target_length='PositionOut',draft_program='mtp_draft',hidden_ring='MtpHiddenRing',
         commit_always=True,draft_snapshot_program='mtp_snapshot',draft_restore_program='mtp_restore_draft',default_verification_tokens=4,
-        warm_plans=extended.warms,capture_plans=[p for p in extended.captures if p['tokens'] in (1,16,128,512)],verification_plans=extended.verifications)
+        warm_plans=extended.warms,capture_plans=[p for p in extended.captures if p['tokens'] in (1,*PREFILL_PROFILES)],verification_plans=extended.verifications)
     metadata['weight_parameters']+=sum(math.prod(draft.source.shape(name)) for name in draft.source.parts)
     metadata['weight_scope']+='; native Flash MTP with shared embedding and full output head'
     write_json(build_path,build);print('FLASH MTP BUILD COMPLETE',flush=True)

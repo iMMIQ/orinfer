@@ -31,6 +31,8 @@ def selections(rows: int):
 @orin_jit
 def capture(rows: int, width: int, ring: int = 512):
     """Preserve raw Flash HC branches after advancing the target cursor."""
+    if not 1<=rows<=ring or width<=0:
+        raise ValueError('Target capture must fit the hidden ring')
     @T.prim_func
     def kernel(Hidden: T.Tensor((rows, width), T.float16),
                Position: T.Tensor((1,), T.int32),

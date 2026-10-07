@@ -62,8 +62,8 @@ def publish(directory, engine=None):
     previous = (cache / 'model.json').read_bytes() if (cache / 'model.json').exists() else None
     write_json(cache / 'model.json', descriptor)
     source = dict(model, kernels=build['kernels'], programs=copy.deepcopy(build['programs']))
-    source['programs']['prefill'] = source['programs']['prefill_m512']
-    source['programs']['head'] = source['programs']['head_m512']
+    source['programs']['prefill'] = source['programs'][f'prefill_m{model["chunk_tokens"]}']
+    source['programs']['head'] = source['programs'][f'head_m{model["chunk_tokens"]}']
     try:
         validate_plan(directory, source, {k['name']: k['name'] for k in build['kernels']}, engine or ROOT / 'target/release/orinfer')
     except BaseException:

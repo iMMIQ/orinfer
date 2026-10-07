@@ -235,7 +235,7 @@ class Model:
             allocation+=1
             size=math.prod(shape)
             if slot not in workspace:
-                reserve=max(reserve,self.prefill_workspace_rows*math.prod(shape[1:]) if index and m>=256 else size)
+                reserve=max(reserve,self.prefill_workspace_rows*size//m if index and m>=256 else size)
                 workspace[slot]=torch.empty(reserve,device='cuda',dtype=dtype)
             if workspace[slot].numel()<size:
                 raise RuntimeError('Prefill scratch changed without invalidating captured graphs')
@@ -351,7 +351,7 @@ class Model:
         staged_key,staged_value=(empty((m,2,256)) for _ in range(2))
         index_qk,index_q = empty((m,640)),empty((m,4,128))
         blocks=(index_cap+3)//4;segments=(blocks+1023)//1024
-        index_scores=empty((m,blocks),torch.float32,index=True)
+        index_scores=empty((blocks,m),torch.float32,index=True)
         index_prefix,index_remaining,index_greater=(empty((m,),torch.int32) for _ in range(3))
         index_hist=empty((m,segments,256),torch.int32,index=True)
         index_counts,index_offsets=(empty((m,2,segments),torch.int32,index=True) for _ in range(2))
@@ -540,7 +540,7 @@ class Model:
               'labels':labels,'embedding':embedding,'ple_embedding':ple_embedding,'output':output,
               'residual':residual,'condition':condition,'prefix_states':prefix_states,
               'prefix_updates':prefix_updates,'accepted':torch.zeros(1,device='cuda',dtype=torch.int32),
-              'graphs':{},'verify':verify,'index_capacity':index_cap}
+              'graphs':{},'verify':verify,'index_capacity':index_cap,'index_scores':index_scores}
         self.plans[key]=plan
         print('compiled plan',m,'ops',len(ops),flush=True)
         return plan

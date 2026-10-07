@@ -9,20 +9,21 @@ import shutil
 from tools.model.flash_next.checkpoint import Checkpoint
 from tools.model.flash_next.native import Model
 from tools.model.flash_next.scenes import scenes
+from tools.model.flash_next.prepare import PREFILL_PROFILES
 from tools.operators.common import configure, write_json
 
 
 def freeze(model, checkpoint, output):
     tokenizer, cases = scenes(checkpoint)
     cases = cases[:3]
-    for width in (128, 512):
+    for width in (128, 512, 2048, 4096):
         prefix = tokenizer.encode('记录编号：甲乙丙丁。' * width, add_special_tokens=False)
         prompt = cases[2]['prompt_ids']
         # Retain the exact chat-template suffix and exercise every fixed-width plan.
         cases.append(dict(id=f'prefill-{width}', prompt_ids=prompt[:3] + prefix[:width] + prompt[3:],
                           target_ids=cases[2]['target_ids']))
     original_plan = model.plan
-    for m in (512, 128, 16, 1):
+    for m in (*reversed(PREFILL_PROFILES),1):
         model.position = model.capacity - m
         original_plan(m)
     model.position = 0
@@ -34,7 +35,7 @@ def freeze(model, checkpoint, output):
             prompt = case['prompt_ids']
             cursor = 0
             while cursor < len(prompt):
-                rows = next(m for m in (512, 128, 16, 1) if m <= len(prompt) - cursor)
+                rows = next(m for m in (*reversed(PREFILL_PROFILES),1) if m <= len(prompt) - cursor)
                 logits = model.execute(prompt[cursor:cursor+rows], output='logits' if cursor+rows == len(prompt) else 'none')
                 cursor += rows
             history = list(prompt)

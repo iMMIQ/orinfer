@@ -10,7 +10,7 @@ from tools.operators.common import configure,environment,error,export_kernel,wri
 def selection_ops(m,capacity):
     blocks=(capacity+3)//4;segments=(blocks+1023)//1024
     def empty(shape,dtype=torch.int32):return torch.empty(shape,device='cuda',dtype=dtype)
-    scores=empty((m,blocks),torch.float32);prefix=empty((m,));remaining=empty((m,))
+    scores=empty((blocks,m),torch.float32);prefix=empty((m,));remaining=empty((m,))
     hist=empty((m,segments,256));counts=empty((m,2,segments));offsets=empty((m,2,segments));greater=empty((m,))
     selected=empty((m,2051))
     ops=[]
@@ -29,9 +29,37 @@ def checked(x,y,limit=.004):
     return metric
 
 
+def live_index_replay():
+    """Reuse poisoned full-capacity scratch while graph context grows and shrinks."""
+    m,capacity=16,262144
+    position=torch.zeros(1,device='cuda',dtype=torch.int32)
+    query=torch.randn((m,4,128),device='cuda').half()
+    cache=torch.randn(((capacity+3)//4,128),device='cuda').half()
+    scores,selected,ops=selection_ops(m,capacity)
+    scores.fill_(float('nan'))
+    ops=[(qsa.index_scores(m,capacity),(query,cache,position,scores))]+[
+        (kernel,tuple(position if x is None else x for x in args)) for kernel,args in ops]
+    def run():
+        for kernel,args in ops:kernel(*args)
+    graph=torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):run()
+    cases=[]
+    for start in (8191,0,2047,4095,32767,1,262128,0):
+        position.fill_(start);graph.replay();torch.cuda.synchronize()
+        expected=select(query,cache,range(start,start+m))
+        for actual,reference in zip(selected,expected):
+            assert torch.equal(actual[actual>=0].sort().values,reference[reference>=0].sort().values),start
+        cases.append(start)
+    return dict(rows=m,capacity=capacity,positions=cases,exact_selection=True,poisoned_scratch=True)
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--live-index-only',action='store_true')
     a=p.parse_args();configure();report={'complete':False,'environment':environment(),'cases':[]}
+    report['live_index_replay']=live_index_replay()
+    if a.live_index_only:
+        report['complete']=True;write_json(a.output/'results.json',report);return
     # Chunk crosses old pending groups, several new groups and an incomplete tail.
     capacity=8192;total=2060;m=9;start=2047
     raw=torch.randn((total,5,128),device='cuda').half()

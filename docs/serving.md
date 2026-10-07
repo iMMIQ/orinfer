@@ -95,6 +95,8 @@ thinking 可与 JSON 输出组合，正文仍受约束。MTP 的 target 和 draf
 
 prefill 尾部即使复用 decode 计划，在 `decode_only` 模式下也不使用 Graph。地址及 workspace 变化会使相关 Graph 失效或重新捕获。
 
+Flash Next 的主模型支持 2048／4096 token 大分块，MTP 预热保持 512 token 分块；使用 `full` 可同时对这两条 prefill 路径启用 Graph。索引计算和临时评分缓冲区按当前有效上下文推进，缓存容量仍为 256K，Graph 使用的虚拟地址保持稳定。
+
 ### MTP
 
 包含原生 `mtp` 计划的模型自动启用 MTP，适用于文本、图片、多图、thinking、工具调用和支持的采样参数。无惩罚 greedy 使用 GPU top-1；随机采样对 target/draft 应用相同的采样处理，接受概率为 `min(1,p/q)`，拒绝后从归一化的 `(p-q)+` 分布采样，以保持主模型分布。

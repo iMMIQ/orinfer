@@ -22,6 +22,9 @@ from tools.operators.abi import parse_host, evaluate
 from kernels.model.control import advance
 from kernels.model.flash_control import selection
 
+PREFILL_PROFILES=(16,128,512,2048,4096)
+CHUNK_TOKENS=max(PREFILL_PROFILES)
+
 DTYPES={'float16':('f16','F16'),'bfloat16':('bf16','BF16'),'float32':('f32','F32'),
         'int8':('i8','I8'),'uint8':('u8','U8'),'uint16':('u16','U16'),
         'int32':('i32','I32'),'uint32':('u32','U32'),'int64':('i64','I64')}
@@ -33,7 +36,7 @@ class Publisher:
         self.cache=directory/'cache';self.weights=self.cache/'weights';self.cpu=self.cache/'cpu'
         for p in (self.weights,self.cpu,self.cache/'kernels'):p.mkdir(parents=True,exist_ok=True)
         self.buffers={};self.scopes={};self.storage={};self.weight_map={};self.kernels=[];self.groups={};self.programs={};self.exports={}
-        self.state=set();self.kv={};self.divisors={};self.number=0
+        self.state=set();self.kv={};self.divisors={};self.score_workspace={};self.number=0
     def buffer(self,tensor,name=None,scope='workspace'):
         pointer=tensor.untyped_storage().data_ptr();offset=tensor.data_ptr()-pointer
         if pointer not in self.storage:
@@ -83,6 +86,10 @@ class Publisher:
             assets={}
             for field,file in [('module','kernel.cubin'),('source','kernel.cu'),('host_abi','host.txt')]:
                 dest=self.cache/'kernels'/key/file;dest.parent.mkdir(exist_ok=True)
+                if dest.exists() and file_hash(dest)!=file_hash(path/file):
+                    # A cloned serving directory may retain an earlier kernel.
+                    # Unlink first so replacing it cannot mutate its source model.
+                    dest.unlink()
                 if not dest.exists():link_or_copy(path/file,dest)
                 assets[field]=dict(file=str(dest.relative_to(self.cache)),sha256=file_hash(dest))
             self.exports[key]=(api,launch,assets)
@@ -108,11 +115,22 @@ class Publisher:
             grid=[evaluate(dimensions['gridDim'+s],scalars) for s in 'XYZ'],block=[evaluate(dimensions['blockDim'+s],scalars) for s in 'XYZ'],
             shared_memory_bytes=evaluate(dimensions['sharedMemBytes'],scalars),cooperative=False,args=values))
         return dict(kind='kernel',name=name)
+    def scores(self,plan,m,*,draft=False,verify=False):
+        # Complete index blocks occupy a contiguous prefix of column-major scores.
+        # Reserve the full address range for graph replay; map only live context.
+        width=(512 if draft else CHUNK_TOKENS) if m>=256 else m
+        prefix='Draft' if draft else 'Verify' if verify else 'Target'
+        name,_=self.buffer(plan['index_scores'],f'{prefix}IndexScoresM{width}')
+        size=plan['index_scores'].untyped_storage().nbytes()
+        if plan['index_capacity']!=self.model.capacity or size%self.model.capacity:
+            raise ValueError('Serving index score workspace needs full-context storage')
+        self.score_workspace[name]=size//self.model.capacity
     def plan(self,m):
         print('EXPORT PROFILE',m,flush=True)
-        # Compile a full-capacity index scan; all live bounds remain device values.
+        # Stable full-capacity storage; index kernels visit only live causal tiles.
         self.model.position=self.model.capacity-m
         plan=self.model.plan(m);self.model.position=0
+        self.scores(plan,m)
         for key,name in [('embedding',f'M{m}_Embedding'),('ple_embedding',f'M{m}_Ple'),('output','Logits'),('token','Selected')]:
             self.buffer(plan[key],name,'sequence' if key in ('output','token') else 'workspace')
         for (_,args),label in zip(plan['ops'],plan['labels']):
@@ -184,13 +202,13 @@ class Publisher:
         inputs=self.cpu_assets(source)
         weight_bytes=sum(np.prod(b['shape'],dtype=np.int64).item()*{'u8':1,'i8':1,'u16':2,'f16':2,'bf16':2,'f32':4,'u32':4,'i32':4}[b['dtype']] for b in self.buffers.values() if b['access']=='read')
         write_json(self.weights/'model.safetensors.index.json',dict(metadata=dict(total_size=weight_bytes),weight_map=self.weight_map))
-        metadata=dict(schema_version=2,target='sm_87',model='Qwen3.8-Flash-Next',chunk_tokens=512,max_context=self.model.capacity,
+        metadata=dict(schema_version=2,target='sm_87',model='Qwen3.8-Flash-Next',chunk_tokens=CHUNK_TOKENS,max_context=self.model.capacity,
             vocab=self.model.V,toolchain={'tilelang':'0.1.15','torch':torch.__version__},buffers=list(self.buffers.values()),reset_buffers=sorted(self.state|{'Position','Token','Status'}),
             input='Input',token='Token',status='Status',logits='Logits',position='Position',weight_bytes=weight_bytes,
             weight_parameters=sum(np.prod(source.shape(n),dtype=np.int64).item() for n in source.parts if '.ple_embedding.' not in n),weight_scope='Flash Next GPU text weights including packed experts/scales/books',input_assets=inputs,
-            kv_cache=dict(direct_prefill=True,demand_mapping=True,buffers=self.kv,prefix_divisors=self.divisors,prefill_workspace={},growth={}))
+            kv_cache=dict(direct_prefill=True,demand_mapping=True,buffers=self.kv,prefix_divisors=self.divisors,prefill_workspace=self.score_workspace,growth={}))
         write_json(self.cache/'build.json',dict(metadata=metadata,kernels=self.kernels,groups=self.groups,programs=self.programs,scopes=self.scopes,
-            profiles=[{'tokens':m,'kind':'flash_recurrent'} for m in (16,128,512)]))
+            profiles=[{'tokens':m,'kind':'flash_recurrent'} for m in PREFILL_PROFILES]))
         return metadata
 
 def main():
@@ -212,8 +230,8 @@ def main():
             if model.prefix_divisors[logical]!=1:publish.divisors[name]=model.prefix_divisors[logical]
     publish.buffer(model.position_gpu,'Position','sequence');publish.buffer(model.lengths,'Length','sequence')
     publish.buffer(model.position_out,'PositionOut','workspace')
-    for name,dtype,shape in [('Input','i32',[512]),('Token','i32',[1]),('Status','i32',[1]),('LastIndex','i32',[1])]:publish.fixed(name,dtype,shape)
-    for m in (512,128,16,1):
+    for name,dtype,shape in [('Input','i32',[CHUNK_TOKENS]),('Token','i32',[1]),('Status','i32',[1]),('LastIndex','i32',[1])]:publish.fixed(name,dtype,shape)
+    for m in (*reversed(PREFILL_PROFILES),1):
         publish.plan(m)
         write_json(publish.cache/'bindings.json',dict(buffers=publish.buffers,scopes=publish.scopes,kernels=publish.kernels,groups=publish.groups,programs=publish.programs))
     publish.finish(source)
