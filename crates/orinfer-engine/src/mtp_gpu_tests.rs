@@ -45,6 +45,7 @@ fn validate_adaptive_prefix_cache() {
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 12usize << 30,
+            ..LoadOptions::default()
         },
     )
     .unwrap();

@@ -42,6 +42,15 @@ def link_or_copy(source, destination):
         shutil.copyfile(source, destination)
 
 
+def clone_cpu_assets(source, destination):
+    """CPU input metadata and immutable tables travel with prepared model data."""
+    assets = source / 'cache/cpu'
+    if assets.is_dir():
+        shutil.copytree(assets, destination / 'cache/cpu',
+                        copy_function=lambda src, dst: link_or_copy(src, dst)
+                        if Path(src).suffix == '.safetensors' else shutil.copyfile(src, dst))
+
+
 def load_model(model):
     model = model.resolve(strict=True)
     data = json.loads((model / 'cache/model.json').read_text())
@@ -69,6 +78,7 @@ def clone_model(source, destination, operator):
     shutil.copytree(source / 'cache/weights', destination / 'cache/weights',
                     copy_function=lambda src, dst: link_or_copy(src, dst)
                     if Path(src).suffix == '.safetensors' else shutil.copyfile(src, dst))
+    clone_cpu_assets(source, destination)
     target = destination / 'cache/packages/.building'
     shutil.copytree(operator, target, copy_function=link_or_copy)
     return target

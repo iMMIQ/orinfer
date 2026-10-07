@@ -101,6 +101,7 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
         &kernel_root,
         &package.execution,
         orinfer_model_sdk::abi::CreateRequest {
+            model_root: root.display().to_string(),
             config,
             architecture: model.architecture.clone(),
             compute_policy: model.compute_policy.clone(),

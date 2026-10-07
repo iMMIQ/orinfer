@@ -1280,9 +1280,12 @@ dependencies = [
 name = "orinfer-models"
 version = "0.1.1"
 dependencies = [
+ "half",
+ "hex",
  "orinfer-model-sdk",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

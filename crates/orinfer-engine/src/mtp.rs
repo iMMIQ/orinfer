@@ -208,6 +208,43 @@ mod tests {
         })).unwrap()
     }
     #[test]
+    fn draft_override_uses_only_an_exact_package_profile() {
+        use crate::execution::LoadOptions;
+        let mut model = manifest();
+        let options = |drafts| LoadOptions {
+            mtp_drafts: Some(drafts),
+            ..LoadOptions::default()
+        };
+        assert!(options(7).configure_mtp(&mut model).is_err());
+        model.mtp = Some(spec());
+        LoadOptions::default().configure_mtp(&mut model).unwrap();
+        assert_eq!(model.mtp.as_ref().unwrap().default_verification_tokens, 4);
+        assert!(options(7).configure_mtp(&mut model).is_err());
+        assert!(options(8).configure_mtp(&mut model).is_err());
+        let mut profile = model.mtp.as_ref().unwrap().verification_plans[0].clone();
+        profile.tokens = 8;
+        model.mtp.as_mut().unwrap().verification_plans.push(profile);
+        options(7).configure_mtp(&mut model).unwrap();
+        assert_eq!(model.mtp.as_ref().unwrap().default_verification_tokens, 8);
+        options(3).configure_mtp(&mut model).unwrap();
+        assert_eq!(model.mtp.as_ref().unwrap().default_verification_tokens, 4);
+        options(0).configure_mtp(&mut model).unwrap();
+        assert!(model.mtp.is_none());
+        options(0).configure_mtp(&mut model).unwrap();
+    }
+    #[test]
+    fn draft_state_snapshot_requires_a_matching_restore_program() {
+        let model = manifest();
+        let mut spec = spec();
+        assert!(!spec.commit_always);
+        spec.draft_snapshot_program = Some("execute".into());
+        assert!(spec.validate(&model).is_err());
+        spec.draft_restore_program = Some("execute".into());
+        assert!(spec.validate(&model).is_ok());
+        spec.draft_restore_program = Some("absent".into());
+        assert!(spec.validate(&model).is_err());
+    }
+    #[test]
     fn rejects_hidden_ring_too_small_for_prefill() {
         let mut model = manifest();
         let mut spec = spec();

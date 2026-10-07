@@ -1,6 +1,6 @@
 # Flash Next 模型准备
 
-当前提供自有 Q2A8 权重的离线完整推理、原始 BF16 参考与验证。Rust 在线适配器尚未注册，以下产物不能直接传给 `orinfer serve`。
+提供自有 Q2A8 权重、Rust 在线适配器，以及离线完整推理与原始 BF16 参考。权重转换产物先通过下述部署构建生成 `cache/model.json` 和匹配执行包，再交给 CLI。
 
 执行器固定使用已采用的 SM87 路径：专家 E8P＋block128 旋转、普通投影 W8、关键系数 BF16/FP32、group-64 INT8 KV、FP32 GDN 状态。prefill 按长度选择专家 tile；MTP 支持 1..7 个草稿和完整接受前缀提交。架构与编码约束位于 [`architecture-contract.json`](../../../configs/architecture-contract.json)，加载前拒绝不匹配的配置。
 
@@ -25,7 +25,38 @@ MTP 另用 `--component mtp --stage all` 转换，再发布到独立目录。tar
 
 发布目录保留 HF config、tokenizer、chat template 与标准 safetensors index。物理 tensor layout 存在 shard metadata 中；发布逐字节保留已转换权重，默认在验证后消费临时 shard，`--keep-temporary-shards` 可保留。`checkpoint.py` 读取发布目录，不依赖转换进度文件。模型格式和权重编码未因目录整理而改变。
 
-## 执行与验证
+## Rust 部署
+
+在线包含 W8 embedding、CPU E8P PLE 查表、48 层 HC/GDN/QSA/MoE、256K INT8 KV，以及完整请求状态和 prefix cache。prefill 提供 512／128／16 token 档位，尾部用真实 M=1 执行；不填充虚假 token。Flash 在线策略支持单个活跃请求、其余排队；可选原生 MTP 支持贪心和带惩罚项的随机采样，并发算子仍保留在离线参考中。
+
+```bash
+make build
+bash tools/operators/run.sh tools/model/flash_next/prepare.py artifacts/flash-build \
+  --checkpoint /path/to/flash-target --model-output artifacts/models/flash-serving
+PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models/flash-serving
+./target/release/orinfer serve artifacts/models/flash-serving \
+  --model qwen-flash-next --max-active-requests 1 \
+  --cuda-graph decode_only --prefix-cache-mib 512
+```
+
+可选 MTP 执行包共享主模型 embedding 和完整输出头，增加单层 draft、512 行 HC 环和验证/提交程序。在线支持每轮 1–7 个草稿，默认最多 3 个；用 `serve --mtp-drafts 7` 指定上限，`auto` 沿用包默认值，`0` 关闭 MTP 执行。短尾、上下文边界和调度 token 预算不足时自动缩小验证批次或使用普通 decode；prefix checkpoint 保留 P−1 的 draft 状态，恢复时用真实 continuation 连接。关闭 MTP 不移除包中的 draft 权重或 workspace；所指定的验证档位必须存在于执行包中。
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/prepare_mtp.py artifacts/flash-mtp-build \
+  --checkpoint /path/to/flash-target --mtp-checkpoint /path/to/flash-draft \
+  --base-model artifacts/models/flash-serving \
+  --model-output artifacts/models/flash-serving-mtp
+PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models/flash-serving-mtp
+# serve 使用上面的相同参数，改为 flash-serving-mtp 目录；包含 MTP 的包自动启用。
+```
+
+验证阶段保存 GDN 的 FP32 紧凑更新、卷积/PLE 历史和每个 QSA pending 前缀；全部接受和部分接受均执行提交。Draft 分支会恢复其原始 pending 块，再以 target HC 重算已提交位置。随机采样使用 p/q 接受和残差分布修正。
+
+构建会按实际 host ABI 导出并绑定 cubin，保存同权重的固定历史 logits；打包时逐项比较 Rust 注册计划与离线计划。CPU 表按行读取，embedding／PLE 解码缓存分别限制为 8／32 MiB，部署不用 Python。中断构建可用 `--reuse-data` 校验并复用已写入的 GPU 权重；CPU 表通过 hardlink 复用。
+
+可用 `score-model MODEL_DIR artifacts/flash-build/score-requests.json` 核对部署输出。这个对照验证执行迁移，独立 BF16 质量评估仍按下文进行。服务兼容 OpenCode 的 `@ai-sdk/openai-compatible` provider，模型 ID 为 `qwen-flash-next`；建议输出预算至少 4096 tokens。
+
+## 离线执行与验证
 
 所有输出放在新的 artifact 目录。场景包含实际 chat template、thinking、固定历史 top3 概率和 NLL；seed 为 20261002：
 
@@ -71,4 +102,4 @@ bash tools/model/run_flash_teacher.sh \
 
 `weights.py`/`checkpoint.py` 管理权重，`native.py`/`mtp.py` 是离线执行参考，`reference/` 保留独立数学与原始权重读取，`checks/` 与 `tests/` 管理回归验证。算子留在公共 `kernels/model/`，不按模型复制。
 
-正式在线接入将在 `orinfer-models` 增加适配器，复用 SDK 和 CUDA 执行器；必须覆盖 PLE 的有预算 CPU 查表/上传、请求历史、QSA KV/scale/index/pending、GDN/卷积与 MTP 接受前缀。Python 执行器只作为离线计划和数值参考。
+`orinfer-models/src/flash_next` 提供在线适配器和 CPU 查表，复用 SDK 和 CUDA 执行器；QSA KV/scale/index/pending、GDN 与卷积均为请求私有状态。Python 执行器用于离线计划、数值参考和 MTP 研究。

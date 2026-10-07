@@ -11,7 +11,7 @@ from pathlib import Path
 import shutil
 
 from tools.model.package import verify_execution, verify_library
-from tools.model.publication import atomic_model, file_hash, link_or_copy, source_path, write_json
+from tools.model.publication import atomic_model, clone_cpu_assets, file_hash, link_or_copy, source_path, write_json
 
 
 def attach(source, output, library, engine, package_name, version):
@@ -52,6 +52,7 @@ def attach(source, output, library, engine, package_name, version):
         shutil.copytree(source / 'cache/weights', staging / 'cache/weights',
                         copy_function=lambda src, dst: link_or_copy(src, dst)
                         if Path(src).suffix == '.safetensors' else shutil.copyfile(src, dst))
+        clone_cpu_assets(source, staging)
         target = staging / 'cache/packages/.building'
         shutil.copytree(bundled, target, copy_function=link_or_copy)
         target_library = target / 'lib/model.so'

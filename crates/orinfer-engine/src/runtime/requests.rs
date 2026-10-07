@@ -291,12 +291,7 @@ impl ModelRuntime {
     ) -> Result<RequestState> {
         self.reap_abandoned()?;
         let started = Instant::now();
-        if self.manifest.batch_profiles.is_empty() {
-            return Err(
-                "Model operator package lacks continuous batching; upgrade_batching.py is required"
-                    .into(),
-            );
-        }
+
         let context = self.validate_generation(&input)?;
         let limits = self.request_limits(&input)?;
         let slot = self.execution.lease_sequence(&limits)?;
@@ -522,6 +517,10 @@ impl ModelRuntime {
             },
             &req.input[req.offset..req.offset + chunk],
         )?;
+        self.prepare_inputs(
+            &req.input[req.offset..req.offset + chunk],
+            &req.input[..req.offset],
+        )?;
         self.upload_segment_controls(chunk)?;
         let at = Instant::now();
         self.launch_program(&program, ExecutionPhase::Prefill)?;
@@ -583,18 +582,17 @@ impl ModelRuntime {
         budget_ms: f64,
     ) -> Result<()> {
         let mut shapes = vec![1];
-        let layout = self
-            .manifest
-            .batch_layout
-            .as_ref()
-            .ok_or("Missing batch layout")?;
-        shapes.extend(
-            layout
-                .profiles
-                .keys()
-                .copied()
-                .filter(|n| cap > 128 || layout.small_mixed_shapes.contains(n)),
-        );
+        if let Some(layout) = &self.manifest.batch_layout {
+            shapes.extend(
+                layout
+                    .profiles
+                    .keys()
+                    .copied()
+                    .filter(|n| cap > 128 || layout.small_mixed_shapes.contains(n)),
+            );
+        } else if cap != 1 {
+            return Err("Missing batch layout".into());
+        }
         shapes.sort_unstable();
         // Split cold prompt cohorts into real chunks before sharing the dense
         // projections. Leave room for up to four requests in a 2048-row plan.
@@ -725,14 +723,9 @@ impl ModelRuntime {
             self.scheduler_cursor = self.scheduler_cursor.wrapping_add(1);
             return Ok(Work::Speculative(i));
         }
-        let mut cap = options.max_batch_tokens.min(
-            *self
-                .manifest
-                .batch_profiles
-                .iter()
-                .max()
-                .ok_or("Missing batch profiles")?,
-        );
+        let mut cap = options
+            .max_batch_tokens
+            .min(*self.manifest.batch_profiles.iter().max().unwrap_or(&1));
         // Preserve the dense large-chunk path for long cold prompts. Short
         // tails can share projection weights without reading across histories.
         let long_joint = decode.is_empty()
@@ -815,6 +808,17 @@ impl ModelRuntime {
                 } else {
                     ExecutionPhase::Decode
                 };
+                let (tokens, history) = if req.prefilling {
+                    (
+                        &req.input[req.offset..req.offset + 1],
+                        &req.input[..req.offset],
+                    )
+                } else {
+                    let last = req.history.len() - 1;
+                    (&req.history[last..], &req.history[..last])
+                };
+                model.prepare_inputs(tokens, history)?;
+                model.upload_segment_controls(1)?;
                 model.launch_program("decode", phase)?;
                 if let Some(spec) = &model.manifest.mtp {
                     model.mtp_capture(spec, 1, phase)?;

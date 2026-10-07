@@ -2,13 +2,14 @@
 
 在线引擎通过版本化 C ABI 加载模型执行逻辑。模型适配器、计算策略、共享执行组件、kernel和构建工具在同一源码workspace维护。部署包包含原生 `.so`、匹配的 cubin 和配置/布局契约；权重仍在模型目录中。部署包不要求对应独立源码仓库。A8/A4 是计算策略，包应声明实际混合精度，不代表所有算子精度相同。
 
-核心负责 API、调度、CUDA context/stream、内存、graph 和 prefix 索引；包负责配置校验、模型执行顺序、融合、动态 batch、状态绑定和视觉位置。增加模型族不需要在核心添加枚举或分派分支。当前原生库为 `orinfer-models`，注册 Qwen3.5 的 `int8_quality` 路径；Flash Next 保持现有离线验证路径。
+核心负责 API、调度、CUDA context/stream、内存、graph 和 prefix 索引；包负责配置校验、模型执行顺序、融合、动态 batch、状态绑定和视觉位置。增加模型族不需要在核心添加枚举或分派分支。当前原生库为 `orinfer-models`，注册 Qwen3.5 和 Flash Next 的 `int8_quality` 路径。
 
 ```text
 MODEL_DIR/
   config.json, tokenizer.json, chat_template.jinja, ...
   cache/model.json
   cache/weights/*.safetensors
+  cache/cpu/                         # 可选 CPU 查表数据
   cache/packages/<sha256>/
     package.json
     lib/model.so
@@ -21,6 +22,10 @@ MODEL_DIR/
 `.so` 使用 `orinfer-model-sdk`，不依赖 `orinfer-engine`。入口 `orinfer_model_v1` 返回 C 函数表，包含 describe/create/batch/visual 和对应资源释放函数。完整 C 声明位于 [`orinfer_model.h`](../crates/orinfer-model-sdk/include/orinfer_model.h)。Rust 数据结构及 trait 不跨动态库边界。
 
 创建时用 JSON 传递配置及数据契约；热路径的 batch 程序使用 C 数组，一次返回 kernel/copy/zero 指令、buffer views、动态 launch 参数和请求状态绑定。原生内存由分配方释放，库保持加载直到模型及 CUDA 资源释放完成。模型实例与 GPU 执行线程绑定。
+
+模型可声明 hash 固定的 `input_assets`，通过独立可选入口 `orinfer_model_inputs_v1` 接收执行程序名、当前 token 和请求历史，返回命名 buffer 的上传数据；原有 ABI v1 函数表不变。核心校验访问权限与上传范围，并在库释放数据前完成上传。Flash Next 在包内完成 CPU W8 embedding／E8P PLE 查表，有预算的行缓存共享，n-gram 历史从请求提供。CPU 资产随模型克隆和执行包更新一起保留。主模型、验证和 shifted draft 输入由模型包区分，核心不注册架构专属输入分派。
+
+MTP 的验证计划可声明始终提交紧凑 recurrent 更新，也可提供 draft 分支的保存/恢复程序；调度器在提出草稿前保存、刷新已提交前缀前恢复。Flash Next 使用这些通用接口保留 GDN、卷积、PLE、HC 和 QSA pending/index 的完整状态。
 
 包不创建独立 CUDA context 或隐藏 stream，不直接管理引擎的显存。核心执行明确的程序；CUDA graph 命中时不再跨包重建程序。状态绑定缓存最多 16 个槽位/段长组合，仅缓存逻辑名称，GPU 地址仍从当前请求 arena 解析。prefix 身份包含包 digest；不同执行策略和状态布局不会复用旧快照。
 

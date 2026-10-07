@@ -2,6 +2,7 @@
 //! Only the public SDK links this library to the runtime; no engine dependency.
 pub use orinfer_model_sdk::{artifact, execution, model, operators};
 mod adapter;
+mod flash_next;
 mod policy;
 mod qwen3_5;
 mod registry;
@@ -13,6 +14,14 @@ struct Models {
     adapter: Box<dyn adapter::Adapter>,
 }
 impl ModelImplementation for Models {
+    fn prepare(
+        &self,
+        program: &str,
+        tokens: &[u32],
+        history: &[u32],
+    ) -> artifact::Result<Vec<(String, Vec<u8>)>> {
+        self.adapter.prepare(program, tokens, history)
+    }
     fn describe() -> abi::PackageInfo {
         abi::PackageInfo {
             package: env!("CARGO_PKG_NAME").into(),
@@ -63,6 +72,22 @@ pub extern "C" fn orinfer_model_v1(version: u32) -> *const abi::Api {
         std::ptr::null()
     }
 }
+static INPUT_API: abi::inputs::Api = abi::inputs::Api {
+    version: 1,
+    struct_size: std::mem::size_of::<abi::inputs::Api>(),
+    prepare: abi::inputs::prepare::<Models>,
+    prepare_program: abi::inputs::prepare_program::<Models>,
+    free: abi::inputs::free,
+};
+#[unsafe(no_mangle)]
+pub extern "C" fn orinfer_model_inputs_v1(version: u32) -> *const abi::inputs::Api {
+    if version == 1 {
+        &INPUT_API
+    } else {
+        std::ptr::null()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,7 +105,7 @@ mod tests {
         unsafe { (API.free_bytes)(bytes) };
         assert_eq!(info.package, "orinfer-models");
         assert_eq!(info.runtime_abi, 1);
-        assert_eq!(info.architectures, ["qwen3_5"]);
+        assert_eq!(info.architectures, ["flash_next", "qwen3_5"]);
         assert_eq!(info.compute_policies, ["int8_quality"]);
     }
 }

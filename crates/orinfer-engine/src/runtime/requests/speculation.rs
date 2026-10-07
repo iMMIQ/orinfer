@@ -65,6 +65,8 @@ impl ModelRuntime {
         let pending = *req.history.last().ok_or("Missing pending token")?;
         let Some(plan) = plan else {
             self.upload_ids(&self.manifest.token, &[pending])?;
+            self.prepare_inputs(&[pending], &req.history[..req.history.len() - 1])?;
+            self.upload_segment_controls(1)?;
             self.launch_program("decode", ExecutionPhase::Decode)?;
             self.mtp_capture(&spec, 1, ExecutionPhase::Decode)?;
             let out = self.commit_ordinary_token(req)?;
@@ -74,12 +76,20 @@ impl ModelRuntime {
             return Ok(out);
         };
         let vocab = self.manifest.vocab;
+        if let Some(save) = &spec.draft_snapshot_program {
+            self.launch_program(save, ExecutionPhase::Decode)?;
+        }
         let at = Instant::now();
         let mut drafts = Vec::with_capacity(plan.tokens - 1);
         let mut proposals = Vec::with_capacity(plan.tokens - 1);
         let mut draft_history = req.history.clone();
         for i in 0..plan.tokens - 1 {
             if i != 0 {
+                self.prepare_program_inputs(
+                    &spec.draft_program,
+                    &[*drafts.last().ok_or("Missing draft input")?],
+                    &[],
+                )?;
                 self.launch_program(&spec.draft_program, ExecutionPhase::Decode)?;
             }
             let selected = self.read_control(&spec.token)?;
@@ -118,6 +128,8 @@ impl ModelRuntime {
         verification.extend_from_slice(&drafts);
         let at = Instant::now();
         self.upload_ids(&self.manifest.input, &verification)?;
+        self.prepare_inputs(&verification, &req.history[..req.history.len() - 1])?;
+        self.upload_segment_controls(plan.tokens)?;
         self.launch_program(&plan.program, ExecutionPhase::Decode)?;
         self.launch_program(&plan.capture_program, ExecutionPhase::Decode)?;
         let target = self.read_controls(&spec.verification_tokens, plan.tokens)?;
@@ -149,7 +161,7 @@ impl ModelRuntime {
         req.mtp.sampling_s += at.elapsed().as_secs_f64();
         req.mtp.accepted_draft_tokens += committed.len() - 1;
         let at = Instant::now();
-        if committed.len() < plan.tokens {
+        if spec.commit_always || committed.len() < plan.tokens {
             self.upload_ids(&spec.accepted_inputs, &[committed.len() as u32])?;
             self.launch_program(&plan.restore_program, ExecutionPhase::Decode)?;
             self.upload_ids(
@@ -162,6 +174,9 @@ impl ModelRuntime {
         req.history.extend_from_slice(&committed);
         req.generated += committed.len();
         let at = Instant::now();
+        if let Some(restore) = &spec.draft_restore_program {
+            self.launch_program(restore, ExecutionPhase::Decode)?;
+        }
         self.upload_ids(&spec.position, &[position as u32])?;
         self.mtp_warm(&spec, &committed, &|| false, ExecutionPhase::Decode)?;
         req.warm.tokens = position + committed.len();

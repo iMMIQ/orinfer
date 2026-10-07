@@ -2,13 +2,13 @@
 
 LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang.
 
-面向 **Jetson AGX Orin 64GB / CUDA SM87** 的推理引擎：Rust 负责在线运行和服务，TileLang 算子离线编译为独立 GPU 包。目前支持 Qwen3.8-27B 的 `Qwen3_5ForConditionalGeneration` 架构，以及文本、图片和多图输入。
+面向 **Jetson AGX Orin 64GB / CUDA SM87** 的推理引擎：Rust 负责在线运行和服务，TileLang 算子离线编译为独立 GPU 包。支持 Qwen3.8-27B（`Qwen3_5`）的文本、图片和多图，以及 Qwen3.8-Flash-Next（`qwen4_exp`）的文本推理。
 
 ## 功能
 
 - OpenAI Chat Completions API，支持流式输出、thinking、采样和函数工具调用。
-- 单份 W4 常驻权重，INT8 为主的混合精度计算，关键路径保留 FP16/FP32。
-- 连续批处理、分块 prefill、原生 MTP；请求的 KV、GDN 和卷积状态独立。
+- 27B 使用单份 W4；Flash Next 使用自有 E8P Q2 专家和 W8 投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
+- 分块 prefill、独立请求状态及 prefix cache，两种模型都支持原生 MTP。27B 支持连续批处理；Flash Next 采用单个活跃请求、其余排队。 Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。
 - 混合架构 prefix cache、INT8 KV 和按需映射内存；模型包可配置最长 256K 上下文。
 - CUDA Graph 提供 `decode_only`、`full`、`off` 三种模式，默认 `decode_only`。
 

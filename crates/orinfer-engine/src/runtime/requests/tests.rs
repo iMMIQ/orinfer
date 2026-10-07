@@ -64,6 +64,7 @@ fn benchmark_prefill_scheduling() {
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 0,
+            ..LoadOptions::default()
         },
     )
     .unwrap();
@@ -183,6 +184,7 @@ fn validate_mtp_partial_prefix() {
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 0,
+            ..LoadOptions::default()
         },
     )
     .unwrap();
@@ -312,6 +314,7 @@ fn validate_joint_prefill_requests() {
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 0,
+            ..LoadOptions::default()
         },
     )
     .unwrap();
@@ -488,6 +491,7 @@ fn validate_continuous_requests() {
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 2 << 30,
+            ..LoadOptions::default()
         },
     )
     .unwrap();
@@ -828,4 +832,298 @@ fn log_probabilities(logits: &[f32]) -> Vec<f64> {
         .ln()
         + maximum;
     logits.iter().map(|&l| l as f64 - z).collect()
+}
+
+#[test]
+#[ignore = "Requires native Flash MTP package and exclusive GPU experiment lock"]
+fn validate_flash_mtp() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(7),
+        },
+    )
+    .unwrap();
+    let spec = model.manifest.mtp.clone().expect("Native MTP package");
+    assert!(spec.commit_always);
+    assert_eq!(spec.default_verification_tokens, 8);
+    let options = scheduler::Options::default();
+    let mut checks = vec![];
+    // Check every acceptance length at each physical four-slot index alignment.
+    for start in [5, 6, 7] {
+        let mut source = input(&fixture.cases[0], 16);
+        source.input_tokens.truncate(start);
+        assert_eq!(source.input_tokens.len(), start);
+        let mut req = model.start_request(source, &|| false).unwrap();
+        while req.prefilling {
+            model.advance_requests(&mut [&mut req], &options).unwrap();
+        }
+        model.execution.activate_sequence(req.slot).unwrap();
+        let state_names: BTreeSet<_> = model
+            .manifest
+            .reset_buffers
+            .iter()
+            .filter(|n| n.starts_with("State_") && !n.starts_with("State_48_"))
+            .cloned()
+            .chain([model.manifest.position.clone()])
+            .collect();
+        let ranges: BTreeMap<_, _> = state_names
+            .iter()
+            .map(|name| {
+                let buffer = model
+                    .manifest
+                    .buffers
+                    .iter()
+                    .find(|b| &b.name == name)
+                    .unwrap();
+                let bytes = model
+                    .manifest
+                    .kv_cache
+                    .as_ref()
+                    .and_then(|k| {
+                        k.buffers.get(name).map(|stride| {
+                            (start / k.prefix_divisors.get(name).copied().unwrap_or(1)
+                                * k.prefix_divisors.get(name).copied().unwrap_or(1))
+                                * stride
+                        })
+                    })
+                    .unwrap_or(buffer.bytes().unwrap());
+                (
+                    name.clone(),
+                    crate::cuda::snapshot::Range { offset: 0, bytes },
+                )
+            })
+            .collect();
+        let plan = model
+            .execution
+            .plan_snapshot(ranges, &BTreeSet::new(), &[])
+            .unwrap();
+        let saved = model.execution.snapshot(&plan).unwrap().unwrap();
+        for verify in &spec.verification_plans {
+            for accepted in 1..=verify.tokens {
+                let tokens: Vec<u32> = (0..verify.tokens).map(|i| 11 + i as u32 * 71).collect();
+                let mut expected = None;
+                let mut expected_tokens = None;
+                for variant in 0..2 {
+                    model.execution.restore_snapshot(&saved).unwrap();
+                    let mut changed = tokens.clone();
+                    if variant == 1 {
+                        for t in &mut changed[accepted..] {
+                            *t += 19;
+                        }
+                    }
+                    model.upload_ids(&model.manifest.input, &changed).unwrap();
+                    model
+                        .prepare_inputs(&changed, &req.history[..req.history.len() - 1])
+                        .unwrap();
+                    model.upload_segment_controls(verify.tokens).unwrap();
+                    model
+                        .launch_program(&verify.program, ExecutionPhase::Decode)
+                        .unwrap();
+                    let predicted = model
+                        .read_controls(&spec.verification_tokens, accepted)
+                        .unwrap();
+                    model
+                        .upload_ids(&spec.accepted_inputs, &[accepted as u32])
+                        .unwrap();
+                    model
+                        .launch_program(&verify.restore_program, ExecutionPhase::Decode)
+                        .unwrap();
+                    model
+                        .upload_ids(&model.manifest.position, &[(start + accepted) as u32])
+                        .unwrap();
+                    let actual: BTreeMap<_, _> = state_names
+                        .iter()
+                        .map(|name| {
+                            let b = model
+                                .manifest
+                                .buffers
+                                .iter()
+                                .find(|b| &b.name == name)
+                                .unwrap();
+                            let bytes = model
+                                .manifest
+                                .kv_cache
+                                .as_ref()
+                                .and_then(|k| {
+                                    k.buffers.get(name).map(|s| {
+                                        (start + accepted)
+                                            / k.prefix_divisors.get(name).copied().unwrap_or(1)
+                                            * k.prefix_divisors.get(name).copied().unwrap_or(1)
+                                            * s
+                                    })
+                                })
+                                .unwrap_or(b.bytes().unwrap());
+                            (
+                                name.clone(),
+                                crate::artifact::sha256(
+                                    &model.execution.download_bytes(name, bytes).unwrap(),
+                                ),
+                            )
+                        })
+                        .collect();
+                    if let Some(reference) = &expected {
+                        assert_eq!(
+                            &actual, reference,
+                            "Rejected suffix changed committed state: start {start}, width {}, accepted {accepted}",
+                            verify.tokens
+                        );
+                        assert_eq!(expected_tokens.as_ref().unwrap(), &predicted);
+                    } else {
+                        expected = Some(actual);
+                        expected_tokens = Some(predicted);
+                    }
+                }
+                checks.push(json!({"start":start,"verification":verify.tokens,"accepted_inputs":accepted,"target_state_count":state_names.len(),"rejected_suffix_isolation":true}));
+            }
+        }
+        model.execution.release_snapshot(saved).unwrap();
+        model.finish_request(&mut req, false).unwrap();
+    }
+    let mut generations = vec![];
+    for source in &fixture.cases {
+        let mut outputs = vec![];
+        for drafts in [0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7] {
+            model.manifest.mtp = Some(spec.clone());
+            LoadOptions {
+                mtp_drafts: Some(drafts),
+                ..LoadOptions::default()
+            }
+            .configure_mtp(&mut model.manifest)
+            .unwrap();
+            let at = Instant::now();
+            let mut first = None;
+            let mut last = 0.;
+            let mut tokens = vec![];
+            model
+                .generate(
+                    &source.input_tokens,
+                    None,
+                    source.max_new_tokens,
+                    &source.sampling,
+                    || false,
+                    |t| {
+                        let elapsed = at.elapsed().as_secs_f64();
+                        first.get_or_insert(elapsed);
+                        last = elapsed;
+                        tokens.push(t);
+                        true
+                    },
+                )
+                .unwrap();
+            let stats = model.speculation_statistics.clone();
+            outputs.push((
+                tokens,
+                at.elapsed().as_secs_f64(),
+                stats,
+                last - first.unwrap(),
+            ));
+        }
+        let mut depths = vec![];
+        for drafts in 1..=7 {
+            let mtp = &outputs[2 * drafts - 1];
+            let replay = &outputs[2 * drafts];
+            assert_eq!(
+                mtp.0, replay.0,
+                "Same-seed MTP replay differs at depth {drafts}"
+            );
+            if source.sampling.is_greedy() {
+                assert_eq!(
+                    outputs[0].0, mtp.0,
+                    "Greedy MTP changed target output at depth {drafts}"
+                );
+            }
+            depths.push(json!({"drafts":drafts,"mtp":mtp,"mtp_replay":replay}));
+        }
+        generations.push(json!({"prompt_tokens":source.input_tokens.len(),"greedy":source.sampling.is_greedy(),"baseline":outputs[0],"mtp":outputs[5],"mtp_replay":outputs[6],"depths":depths}));
+    }
+    model.manifest.mtp = Some(spec);
+    let mut references = vec![];
+    for source in fixture.cases.iter().take(2) {
+        let mut tokens = vec![];
+        model
+            .generate(
+                &source.input_tokens,
+                None,
+                16,
+                &source.sampling,
+                || false,
+                |t| {
+                    tokens.push(t);
+                    true
+                },
+            )
+            .unwrap();
+        references.push(tokens);
+    }
+    let mut first = model
+        .start_request(input(&fixture.cases[0], 16), &|| false)
+        .unwrap();
+    while first.prefilling {
+        model.advance_requests(&mut [&mut first], &options).unwrap();
+    }
+    model.execution.activate_sequence(first.slot).unwrap();
+    assert!(
+        model
+            .execution
+            .private_buffer_sizes()
+            .contains_key("DraftM1_Condition")
+    );
+    let initial = state(&mut model, &mut first);
+    let mut second = model
+        .start_request(input(&fixture.cases[1], 16), &|| false)
+        .unwrap();
+    assert_eq!(
+        initial,
+        state(&mut model, &mut first),
+        "Admission changed another request's MTP condition/state"
+    );
+    while second.prefilling {
+        model
+            .advance_requests(&mut [&mut second], &options)
+            .unwrap();
+    }
+    assert_eq!(
+        initial,
+        state(&mut model, &mut first),
+        "Other request's prefill changed private MTP condition/state"
+    );
+    let mut interleaved = vec![
+        vec![*first.history.last().unwrap()],
+        vec![*second.history.last().unwrap()],
+    ];
+    while !first.is_finished() || !second.is_finished() {
+        // Exercise the production round controller directly; batching cost
+        // heuristics must not turn an isolation regression into ordinary decode.
+        for (index, request) in [(0, &mut first), (1, &mut second)] {
+            if !request.is_finished() {
+                let tokens = model
+                    .with_request(request, |m, r| m.speculative_request_step(r, 8))
+                    .unwrap();
+                interleaved[index].extend(tokens);
+            }
+        }
+    }
+    assert_eq!(
+        interleaved, references,
+        "Interleaving changed private draft/target generation"
+    );
+    assert!(first.mtp.rounds > 0 && second.mtp.rounds > 0);
+    model.finish_request(&mut first, false).unwrap();
+    model.finish_request(&mut second, false).unwrap();
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(
+            &json!({"seed":20261002,"state_checks":checks,"generations":generations,"interleaved_private_mtp":true}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
 }

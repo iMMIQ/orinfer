@@ -11,11 +11,18 @@ struct Factory {
     policies: &'static [Policy],
     create: fn(CreateRequest, Policy) -> Result<Built>,
 }
-const FACTORIES: &[Factory] = &[Factory {
-    architecture: "qwen3_5",
-    policies: &[Policy::Int8Quality],
-    create: crate::qwen3_5::create,
-}];
+const FACTORIES: &[Factory] = &[
+    Factory {
+        architecture: "flash_next",
+        policies: &[Policy::Int8Quality],
+        create: crate::flash_next::create,
+    },
+    Factory {
+        architecture: "qwen3_5",
+        policies: &[Policy::Int8Quality],
+        create: crate::qwen3_5::create,
+    },
+];
 fn select(architecture: &str, policy: Policy) -> Result<&'static Factory> {
     let factory = FACTORIES
         .iter()

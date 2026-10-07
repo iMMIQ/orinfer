@@ -222,6 +222,13 @@ impl Model {
     pub fn max_context(&self) -> usize {
         self.0.manifest.max_context
     }
+    pub fn mtp_drafts(&self) -> usize {
+        self.0
+            .manifest
+            .mtp
+            .as_ref()
+            .map_or(0, |s| s.default_verification_tokens - 1)
+    }
     pub fn vocab(&self) -> usize {
         self.0.manifest.vocab
     }

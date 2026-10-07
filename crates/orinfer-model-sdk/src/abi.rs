@@ -13,6 +13,9 @@ use std::{
     ptr, slice,
 };
 
+#[path = "inputs.rs"]
+pub mod inputs;
+
 pub type StateBindings = Vec<Option<(usize, String)>>;
 pub type BatchPlan = (Vec<Invocation>, StateBindings);
 
@@ -31,6 +34,8 @@ pub struct PackageInfo {
 }
 #[derive(Deserialize, Serialize)]
 pub struct CreateRequest {
+    #[serde(default)]
+    pub model_root: String,
     pub config: serde_json::Value,
     pub architecture: String,
     pub compute_policy: String,
@@ -191,6 +196,14 @@ pub struct Api {
 
 /// Rust-only implementation interface. No Rust object or vtable crosses dlopen.
 pub trait ModelImplementation: Sized {
+    fn prepare(
+        &self,
+        _program: &str,
+        _tokens: &[u32],
+        _history: &[u32],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(vec![])
+    }
     fn describe() -> PackageInfo;
     fn visual(
         &self,
@@ -480,6 +493,21 @@ mod tests {
 
     struct TestModel;
     impl ModelImplementation for TestModel {
+        fn prepare(
+            &self,
+            _program: &str,
+            tokens: &[u32],
+            history: &[u32],
+        ) -> Result<Vec<(String, Vec<u8>)>> {
+            Ok(vec![(
+                "Embedding".into(),
+                tokens
+                    .iter()
+                    .chain(history)
+                    .flat_map(|t| t.to_le_bytes())
+                    .collect(),
+            )])
+        }
         fn describe() -> PackageInfo {
             PackageInfo {
                 package: "fixture".into(),
@@ -521,6 +549,42 @@ mod tests {
                 vec![]
             };
             Ok((ops, vec![None, Some((7, "recurrent-state".into()))]))
+        }
+    }
+    #[test]
+    fn input_extension_retains_upload_names_payload_and_allocation_owner() {
+        let handle = Box::into_raw(Box::new(TestModel)).cast();
+        let mut output = inputs::Output::default();
+        let mut error = OwnedBytes::default();
+        let tokens = [7u32, 9];
+        let history = [3u32];
+        // SAFETY: all readable/writable spans and the matching model are local.
+        unsafe {
+            assert_eq!(
+                inputs::prepare_program::<TestModel>(
+                    handle,
+                    Bytes::borrowed("decode"),
+                    tokens.as_ptr(),
+                    2,
+                    history.as_ptr(),
+                    1,
+                    &mut output,
+                    &mut error
+                ),
+                0
+            );
+            let upload = &*output.uploads;
+            assert_eq!(
+                slice::from_raw_parts(upload.buffer.data, upload.buffer.len),
+                b"Embedding"
+            );
+            assert_eq!(
+                slice::from_raw_parts(upload.data.data, upload.data.len),
+                [7, 0, 0, 0, 9, 0, 0, 0, 3, 0, 0, 0]
+            );
+            free_bytes(error);
+            inputs::free(output);
+            destroy::<TestModel>(handle);
         }
     }
     #[test]

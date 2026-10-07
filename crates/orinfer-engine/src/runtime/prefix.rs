@@ -172,9 +172,15 @@ impl ModelRuntime {
                 } else {
                     tokens
                 };
+                let divisor = m
+                    .kv_cache
+                    .as_ref()
+                    .and_then(|k| k.prefix_divisors.get(&name))
+                    .copied()
+                    .unwrap_or(1);
                 Range {
                     offset: 0,
-                    bytes: count
+                    bytes: (count / divisor * divisor)
                         .checked_mul(*stride)
                         .ok_or("Prefix KV extent overflow")?,
                 }

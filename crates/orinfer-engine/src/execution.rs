@@ -41,6 +41,52 @@ pub struct LoadOptions {
     pub cuda_graph: CudaGraphMode,
     /// Maximum extra resident prefix snapshots. Zero disables reuse.
     pub prefix_cache_bytes: usize,
+    /// None keeps the package default; zero disables speculative execution.
+    pub mtp_drafts: Option<usize>,
+}
+
+pub fn parse_mtp_drafts(value: &str) -> Result<Option<usize>> {
+    if value == "auto" {
+        return Ok(None);
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n <= 7)
+        .map(Some)
+        .ok_or_else(|| "MTP drafts must be auto or an integer in 0..7".into())
+}
+
+impl LoadOptions {
+    pub(crate) fn configure_mtp(self, manifest: &mut crate::model::Manifest) -> Result<()> {
+        let Some(drafts) = self.mtp_drafts else {
+            return Ok(());
+        };
+        if drafts == 0 {
+            manifest.mtp = None;
+            return Ok(());
+        }
+        if drafts > 7 {
+            return Err("MTP drafts must be within 0..7".into());
+        }
+        let spec = manifest
+            .mtp
+            .as_mut()
+            .ok_or("Model package has no MTP support")?;
+        let rows = drafts + 1;
+        if !spec.verification_plans.iter().any(|p| p.tokens == rows) {
+            let available: Vec<_> = spec
+                .verification_plans
+                .iter()
+                .map(|p| p.tokens - 1)
+                .collect();
+            return Err(format!(
+                "Model package does not support {drafts} MTP drafts; available: {available:?}"
+            ));
+        }
+        spec.default_verification_tokens = rows;
+        Ok(())
+    }
 }
 
 pub fn parse_cache_mib(value: &str) -> Result<usize> {
@@ -88,6 +134,14 @@ mod tests {
             assert!(invalid.parse::<CudaGraphMode>().is_err());
         }
         assert_eq!(LoadOptions::default().cuda_graph, CudaGraphMode::DecodeOnly);
+        assert_eq!(LoadOptions::default().mtp_drafts, None);
+        assert_eq!(parse_mtp_drafts("auto").unwrap(), None);
+        for n in 0..=7 {
+            assert_eq!(parse_mtp_drafts(&n.to_string()).unwrap(), Some(n));
+        }
+        for invalid in ["", "-1", "8", "1.5", "AUTO", "18446744073709551615"] {
+            assert!(parse_mtp_drafts(invalid).is_err());
+        }
         assert_eq!(parse_cache_mib("0").unwrap(), 0);
         assert_eq!(parse_cache_mib("12288").unwrap(), 12usize << 30);
         for invalid in ["-1", "1.5", "", "18446744073709551615"] {

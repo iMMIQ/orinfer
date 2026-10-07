@@ -54,7 +54,8 @@ impl ModelRuntime {
     }
     pub(crate) fn load_with_options(path: &std::path::Path, options: LoadOptions) -> Result<Self> {
         let started = Instant::now();
-        let prepared = crate::loader::load(path)?;
+        let mut prepared = crate::loader::load(path)?;
+        options.configure_mtp(&mut prepared.plan)?;
         let (execution, mut stats) = Executor::load(
             &prepared.plan,
             &prepared.weights_root,
@@ -98,6 +99,27 @@ impl ModelRuntime {
             mtp_seconds_per_token: 0.055,
             model_package: prepared.execution_model,
         })
+    }
+    fn prepare_inputs(&self, tokens: &[u32], history: &[u32]) -> Result<()> {
+        self.prepare_program_inputs("target", tokens, history)
+    }
+    fn prepare_program_inputs(&self, program: &str, tokens: &[u32], history: &[u32]) -> Result<()> {
+        self.model_package
+            .prepare_inputs(program, tokens, history, |name, bytes| {
+                let buffer = self
+                    .manifest
+                    .buffers
+                    .iter()
+                    .find(|b| b.name == name)
+                    .ok_or("Unknown model input upload")?;
+                if buffer.access == crate::artifact::Access::Read
+                    || buffer.data.is_some()
+                    || bytes.len() > buffer.bytes()?
+                {
+                    return Err("Invalid model input upload extent/access".into());
+                }
+                self.upload_bytes(name, bytes)
+            })
     }
     fn launch_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
         self.execution.launch_program(name, phase)

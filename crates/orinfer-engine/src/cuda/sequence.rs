@@ -443,6 +443,9 @@ impl Executor {
                     .map(|(arg, value)| {
                         Ok(match arg {
                             Argument::Buffer { name } => Value::Pointer(address(name)?),
+                            Argument::BufferSlice { name, offset } => {
+                                Value::Pointer(address(name)? + *offset as u64)
+                            }
                             _ => *value,
                         })
                     })

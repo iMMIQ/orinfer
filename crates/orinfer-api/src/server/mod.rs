@@ -38,6 +38,7 @@ struct Settings {
     listen: String,
     gpu_lock: PathBuf,
     cuda_graph: CudaGraphMode,
+    mtp_drafts: Option<usize>,
     prefix_cache_bytes: usize,
     scheduler: orinfer_engine::scheduler::Options,
     limits: Limits,
@@ -53,6 +54,7 @@ impl Settings {
             listen: "0.0.0.0:8088".into(),
             gpu_lock: "artifacts/gpu-experiment.lock".into(),
             cuda_graph: CudaGraphMode::default(),
+            mtp_drafts: None,
             prefix_cache_bytes: 12 * 1024 * 1024 * 1024,
             scheduler: Default::default(),
             limits: Limits::default(),
@@ -88,6 +90,9 @@ impl Settings {
                 "--model" => settings.model = pair[1].clone(),
                 "--gpu-lock" => settings.gpu_lock = (&pair[1]).into(),
                 "--cuda-graph" => settings.cuda_graph = pair[1].parse()?,
+                "--mtp-drafts" => {
+                    settings.mtp_drafts = orinfer_engine::execution::parse_mtp_drafts(&pair[1])?
+                }
                 "--prefix-cache-mib" => {
                     settings.prefix_cache_bytes =
                         orinfer_engine::execution::parse_cache_mib(&pair[1])?
@@ -166,6 +171,33 @@ mod settings_tests {
     }
 
     #[test]
+    fn mtp_draft_override_accepts_auto_off_and_seven() {
+        let directory = std::env::temp_dir().to_string_lossy().into_owned();
+        assert_eq!(
+            Settings::parse(std::slice::from_ref(&directory))
+                .unwrap()
+                .mtp_drafts,
+            None
+        );
+        for (value, expected) in [
+            ("auto", None),
+            ("0", Some(0)),
+            ("1", Some(1)),
+            ("7", Some(7)),
+        ] {
+            let settings =
+                Settings::parse(&[directory.clone(), "--mtp-drafts".into(), value.into()]).unwrap();
+            assert_eq!(settings.mtp_drafts, expected);
+        }
+        for value in ["-1", "8", "foo"] {
+            assert!(
+                Settings::parse(&[directory.clone(), "--mtp-drafts".into(), value.into()]).is_err()
+            );
+        }
+        assert!(Settings::parse(&[directory, "--mtp-drafts".into()]).is_err());
+    }
+
+    #[test]
     fn prefix_budget_can_be_disabled_and_requires_integer_mib() {
         let directory = std::env::temp_dir().to_string_lossy().into_owned();
         for (value, expected) in [("0", 0), ("512", 512usize << 20)] {
@@ -238,6 +270,7 @@ struct Service {
     codec: Arc<ChatCodec>,
     model: Arc<str>,
     context: usize,
+    mtp_drafts: usize,
     vision: Option<orinfer_engine::vision::VisionSpec>,
     api_key: Option<Arc<str>>,
     ids: Arc<AtomicU64>,
@@ -329,6 +362,7 @@ async fn serve(settings: Settings) -> Result<()> {
                         LoadOptions {
                             cuda_graph: settings.cuda_graph,
                             prefix_cache_bytes: settings.prefix_cache_bytes,
+                            mtp_drafts: settings.mtp_drafts,
                         },
                     )?;
                     if &worker_codec.asset_hashes != model.frontend_assets() {
@@ -339,13 +373,14 @@ async fn serve(settings: Settings) -> Result<()> {
                     }
                     let context = model.max_context();
                     let vision = model.vision().cloned();
-                    if !model.batching_supported() { return Err("Serving requires the registered continuous-batching operator bindings; upgrade the operator package".into()); }
+                    if !model.batching_supported() && scheduler.max_active != 1 { return Err("This execution package schedules one active request; set --max-active-requests 1 (additional requests queue)".into()); }
                     Ok((lock, model, context, vision))
                 };
                 match initialize() {
                     Ok((_lock, mut model, context, vision)) => {
                         worker_lifecycle.ready();
-                        if ready_sender.send(Ok((context, vision))).is_ok() {
+                        let mtp_drafts = model.mtp_drafts();
+                        if ready_sender.send(Ok((context, vision, mtp_drafts))).is_ok() {
 continuous::worker(
                                     &mut model,
                                     receiver,
@@ -372,13 +407,14 @@ continuous::worker(
             }
         })
         .map_err(|e| e.to_string())?;
-    let (context, vision) = ready_receiver.await.map_err(|e| e.to_string())??;
+    let (context, vision, mtp_drafts) = ready_receiver.await.map_err(|e| e.to_string())??;
     let state = Service {
         jobs: sender,
         slots: Arc::new(tokio::sync::Semaphore::new(128 + scheduler.max_active)),
         codec,
         model: model_id,
         context,
+        mtp_drafts,
         vision,
         api_key: std::env::var("ORINFER_API_KEY")
             .ok()
@@ -479,6 +515,7 @@ async fn health(State(state): State<Service>) -> Response {
     (if state.activity.lifecycle.is_ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(
         json!({"status":state.activity.lifecycle.name(),"failure":state.activity.lifecycle.failure(),"model":state.model.as_ref(),"max_context":state.context,
         "frontend_assets":state.codec.asset_hashes,
+        "mtp":{"enabled":state.mtp_drafts>0,"max_drafts":state.mtp_drafts},
         "continuous_batching":true,"scheduler":state.scheduler,
         "scheduler_statistics":state.activity.statistics.lock().ok().map(|s| s.clone()),
         "admission_statistics":state.activity.admission.lock().ok().map(|s| s.clone()),

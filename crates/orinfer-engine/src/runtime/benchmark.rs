@@ -126,6 +126,12 @@ impl ModelRuntime {
                     )?;
                     check((s.driver.context_sync)(), "prefill upload dependency")?;
                 }
+                self.model_package.prepare_inputs(
+                    "target",
+                    chunk,
+                    &q.input_tokens[..chunk_index * chunk_tokens],
+                    |name, data| self.execution.upload_bytes(name, data),
+                )?;
                 self.execution
                     .submit_program(prefill_program, ExecutionPhase::Prefill)?;
             }
@@ -153,6 +159,7 @@ impl ModelRuntime {
             let ttft_s = request_start.elapsed().as_secs_f64();
             dump_logits(s, q, 0, &mut logits_files)?;
             let decode_start = Instant::now();
+            let mut history = q.input_tokens.clone();
             for step in 1..q.max_new_tokens {
                 if let Some(id) = q.forced_tokens.get(step - 1) {
                     // SAFETY: Previous graph completed, valid token ID and 4-byte
@@ -169,8 +176,22 @@ impl ModelRuntime {
                         check((s.driver.context_sync)(), "teacher-force dependency")?;
                     }
                 }
+                let input = q
+                    .forced_tokens
+                    .get(step - 1)
+                    .copied()
+                    .unwrap_or(*tokens.last().ok_or("Missing pending token")?);
+                self.model_package
+                    .prepare_inputs("target", &[input], &history, |name, data| {
+                        self.execution.upload_bytes(name, data)
+                    })?;
+                if let Some(controls) = &manifest.segment_controls {
+                    self.execution.upload_ids(&controls.length, &[1])?;
+                    self.execution.upload_ids(&controls.last_index, &[0])?;
+                }
                 self.execution
                     .submit_program("decode", ExecutionPhase::Decode)?;
+                history.push(input);
                 // SAFETY: This session owns the live stream and all queued work.
                 unsafe {
                     check((s.driver.stream_sync)(s.stream), "decode complete")?;

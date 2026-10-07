@@ -77,7 +77,9 @@ impl Manifest {
             }
             for a in &k.args {
                 match a {
-                    Argument::Buffer { name } if !names.contains(name.as_str()) => {
+                    Argument::Buffer { name } | Argument::BufferSlice { name, .. }
+                        if !names.contains(name.as_str()) =>
+                    {
                         return Err(format!("{}: unknown buffer {name}", k.name));
                     }
                     Argument::F32 { value } if !value.is_finite() => {

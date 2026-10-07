@@ -70,6 +70,18 @@ class PublicationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_model(self.source)
 
+    def test_model_clone_retains_cpu_tables_and_independent_metadata(self):
+        cpu = self.source / 'cache/cpu'
+        cpu.mkdir()
+        (cpu / 'inputs.json').write_text('{"version":1}')
+        (cpu / 'rows.safetensors').write_bytes(b'immutable CPU rows')
+        destination = self.root / 'with-cpu'
+        clone_model(self.source, destination, self.operator)
+        copied = destination / 'cache/cpu'
+        self.assertEqual((copied / 'rows.safetensors').stat().st_ino, (cpu / 'rows.safetensors').stat().st_ino)
+        (copied / 'inputs.json').write_text('{"version":2}')
+        self.assertEqual((cpu / 'inputs.json').read_text(), '{"version":1}')
+
     def test_compiler_failure_and_existing_output_preserve_ownership(self):
         destination = self.root / 'output'
         with self.assertRaises(RuntimeError):

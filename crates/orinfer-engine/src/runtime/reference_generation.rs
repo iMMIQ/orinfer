@@ -132,11 +132,14 @@ impl ModelRuntime {
             let compute_at = Instant::now();
             let (chunk, head) = if let Some((chunk, program, head)) = selected {
                 self.upload_ids(&m.input, &input[offset..offset + chunk])?;
+                self.prepare_inputs(&input[offset..offset + chunk], &input[..offset])?;
                 self.upload_segment_controls(chunk)?;
                 self.launch_program(&program, ExecutionPhase::Prefill)?;
                 (chunk, Some(head))
             } else {
                 self.upload_ids(&m.token, &input[offset..offset + 1])?;
+                self.prepare_inputs(&input[offset..offset + 1], &input[..offset])?;
+                self.upload_segment_controls(1)?;
                 self.launch_program("decode", ExecutionPhase::Prefill)?;
                 (1, None)
             };
@@ -238,6 +241,9 @@ impl ModelRuntime {
                 break;
             }
             if step + 1 < limit {
+                let last = history.len() - 1;
+                self.prepare_inputs(&history[last..], &history[..last])?;
+                self.upload_segment_controls(1)?;
                 self.launch_program("decode", ExecutionPhase::Decode)?;
             }
         }

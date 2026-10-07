@@ -49,7 +49,9 @@ impl ModelRuntime {
                 .filter(|p| p.tokens <= remaining)
                 .max_by_key(|p| p.tokens)
                 .ok_or("No compatible MTP warm plan")?;
-            self.upload_ids(&spec.input, &shifted_ids[offset..offset + plan.tokens])?;
+            let ids = &shifted_ids[offset..offset + plan.tokens];
+            self.upload_ids(&spec.input, ids)?;
+            self.prepare_program_inputs(&plan.program, ids, &[])?;
             self.launch_program(&plan.program, phase)?;
             offset += plan.tokens;
             if produce_head && offset == shifted_ids.len() {
@@ -117,6 +119,8 @@ impl ModelRuntime {
                 // Final single-token tail or a context edge. The ordinary
                 // target graph preserves existing sampling/state semantics.
                 self.upload_ids(&self.manifest.token, &[pending])?;
+                self.prepare_inputs(&[pending], &history[..history.len() - 1])?;
+                self.upload_segment_controls(1)?;
                 self.launch_program("decode", ExecutionPhase::Decode)?;
                 self.mtp_capture(spec, 1, ExecutionPhase::Decode)?;
                 pending = self.select_target(&history, options, generated)?;
@@ -132,6 +136,9 @@ impl ModelRuntime {
                 }
                 continue;
             };
+            if let Some(save) = &spec.draft_snapshot_program {
+                self.launch_program(save, ExecutionPhase::Decode)?;
+            }
             let at = Instant::now();
             let mut drafts = Vec::with_capacity(plan.tokens - 1);
             let mut proposals = Vec::with_capacity(plan.tokens - 1);
@@ -141,6 +148,11 @@ impl ModelRuntime {
                     return Err("Request cancelled during MTP draft".into());
                 }
                 if i != 0 {
+                    self.prepare_program_inputs(
+                        &spec.draft_program,
+                        &[*drafts.last().ok_or("Missing draft input")?],
+                        &[],
+                    )?;
                     self.launch_program(&spec.draft_program, ExecutionPhase::Decode)?;
                 }
                 let token = self.read_control(&spec.token)?;
@@ -179,6 +191,8 @@ impl ModelRuntime {
             verification_input.extend_from_slice(&drafts);
             let at = Instant::now();
             self.upload_ids(&self.manifest.input, &verification_input)?;
+            self.prepare_inputs(&verification_input, &history[..history.len() - 1])?;
+            self.upload_segment_controls(plan.tokens)?;
             self.launch_program(&plan.program, ExecutionPhase::Decode)?;
             self.launch_program(&plan.capture_program, ExecutionPhase::Decode)?;
             let target = self.read_controls(&spec.verification_tokens, plan.tokens)?;
@@ -223,7 +237,7 @@ impl ModelRuntime {
             history.extend_from_slice(&committed);
             stats.accepted_draft_tokens += accepted_drafts.min(emitted);
             let at = Instant::now();
-            if emitted < plan.tokens {
+            if spec.commit_always || emitted < plan.tokens {
                 self.upload_ids(&spec.accepted_inputs, &[emitted as u32])?;
                 self.launch_program(&plan.restore_program, ExecutionPhase::Decode)?;
                 self.upload_ids(&self.manifest.position, &[(position + emitted) as u32])?;
@@ -238,6 +252,9 @@ impl ModelRuntime {
             // accepted tokens and the target correction/bonus. The final row
             // also produces the first draft of the next round.
             let at = Instant::now();
+            if let Some(restore) = &spec.draft_restore_program {
+                self.launch_program(restore, ExecutionPhase::Decode)?;
+            }
             self.upload_ids(&spec.position, &[position as u32])?;
             self.mtp_warm(spec, &committed, cancelled, ExecutionPhase::Decode)?;
             stats.refresh_s += at.elapsed().as_secs_f64();

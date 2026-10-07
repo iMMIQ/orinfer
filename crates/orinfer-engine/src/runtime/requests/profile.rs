@@ -74,6 +74,7 @@ fn capture_prefill_ffn_inputs() {
         LoadOptions {
             cuda_graph: crate::execution::CudaGraphMode::Off,
             prefix_cache_bytes: 0,
+            ..LoadOptions::default()
         },
     )
     .unwrap();
@@ -184,6 +185,7 @@ fn capture_prefill_attention_inputs() {
         LoadOptions {
             cuda_graph: crate::execution::CudaGraphMode::Off,
             prefix_cache_bytes: 0,
+            ..LoadOptions::default()
         },
     )
     .unwrap();
@@ -281,6 +283,7 @@ fn profile_prefill_stages() {
         LoadOptions {
             cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
+            ..LoadOptions::default()
         },
     )
     .unwrap();
@@ -358,6 +361,7 @@ fn capture_decode_projections() {
         LoadOptions {
             cuda_graph: crate::execution::CudaGraphMode::Off,
             prefix_cache_bytes: 0,
+            ..LoadOptions::default()
         },
     )
     .unwrap();
@@ -434,6 +438,7 @@ fn profile_continuous_decode() {
         LoadOptions {
             cuda_graph: fixture["cuda_graph"].as_str().unwrap().parse().unwrap(),
             prefix_cache_bytes: 0,
+            ..LoadOptions::default()
         },
     )
     .unwrap();

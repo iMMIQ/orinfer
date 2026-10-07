@@ -302,6 +302,9 @@ impl Executor {
                 .iter()
                 .map(|a| match a {
                     Argument::Buffer { name } => Value::Pointer(pointers[name]),
+                    Argument::BufferSlice { name, offset } => {
+                        Value::Pointer(pointers[name] + *offset as u64)
+                    }
                     Argument::I32 { value } => Value::I32(*value),
                     Argument::U32 { value } => Value::U32(*value),
                     Argument::I64 { value } => Value::I64(*value),
@@ -610,11 +613,15 @@ impl Executor {
                         // Switching requests must not walk every kernel in every
                         // compiled profile; weights and workspace stay fixed.
                         for (argument, value) in kernel.spec.args.iter().zip(&mut kernel.values) {
-                            if let Argument::Buffer { name } = argument
-                                && let Some(&address) =
-                                    self.sequences[self.active_sequence].addresses.get(name)
+                            let (name, offset) = match argument {
+                                Argument::Buffer { name } => (name, 0),
+                                Argument::BufferSlice { name, offset } => (name, *offset),
+                                _ => continue,
+                            };
+                            if let Some(&address) =
+                                self.sequences[self.active_sequence].addresses.get(name)
                             {
-                                *value = Value::Pointer(address);
+                                *value = Value::Pointer(address + offset as u64);
                             }
                         }
                         launch_kernel(

@@ -575,6 +575,9 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
                 .iter()
                 .map(|a| match a {
                     Argument::Buffer { name } => Value::Pointer(device_buffers[name]),
+                    Argument::BufferSlice { name, offset } => {
+                        Value::Pointer(device_buffers[name] + *offset as u64)
+                    }
                     Argument::I32 { value } => Value::I32(*value),
                     Argument::U32 { value } => Value::U32(*value),
                     Argument::I64 { value } => Value::I64(*value),

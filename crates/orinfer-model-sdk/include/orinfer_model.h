@@ -50,4 +50,15 @@ typedef struct {
     void (*free_visual)(OrinferVisual);
 } OrinferModelApi;
 const OrinferModelApi *orinfer_model_v1(uint32_t version);
+/* Optional independent extension; preserves the original model ABI table. */
+typedef struct { OrinferBytes buffer, data; } OrinferInputUpload;
+typedef struct { void *owner; const OrinferInputUpload *uploads; size_t count; } OrinferInputs;
+typedef struct {
+    uint32_t version;
+    size_t struct_size;
+    int32_t (*prepare)(void *, const uint32_t *, size_t, const uint32_t *, size_t, OrinferInputs *, OrinferOwnedBytes *);
+    void (*free)(OrinferInputs);
+    int32_t (*prepare_program)(void *, OrinferBytes, const uint32_t *, size_t, const uint32_t *, size_t, OrinferInputs *, OrinferOwnedBytes *);
+} OrinferInputApi;
+const OrinferInputApi *orinfer_model_inputs_v1(uint32_t version);
 #endif

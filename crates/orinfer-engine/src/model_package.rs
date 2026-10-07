@@ -28,6 +28,7 @@ type BindingCache = std::cell::RefCell<
 pub(crate) struct ModelPackage {
     handle: *mut c_void,
     api: *const abi::Api,
+    input_api: Option<*const abi::inputs::Api>,
     // Retain code until the opaque model and all of its buffers are destroyed.
     _library: Library,
     bindings: BindingCache,
@@ -79,10 +80,33 @@ impl ModelPackage {
         if header.version != abi::ABI_VERSION || header.size != std::mem::size_of::<abi::Api>() {
             return Err("Incompatible model library function table".into());
         }
+        let input_api = if request.metadata.input_assets.is_some() {
+            // SAFETY: hash-verified native library exports the documented C extension.
+            let entry = unsafe {
+                library.get::<unsafe extern "C" fn(u32) -> *const abi::inputs::Api>(
+                    abi::inputs::ENTRYPOINT,
+                )
+            }
+            .map_err(|e| format!("Model input adapter: {e}"))?;
+            // SAFETY: the extension returns a static table retained by the library.
+            let table = unsafe { entry(1) };
+            if table.is_null() {
+                return Err("Model rejects input ABI".into());
+            }
+            // SAFETY: ABI v1 supplies the version and size prefix.
+            let header = unsafe { &*table.cast::<Header>() };
+            if header.version != 1 || header.size != std::mem::size_of::<abi::inputs::Api>() {
+                return Err("Incompatible model input function table".into());
+            }
+            Some(table)
+        } else {
+            None
+        };
         let input = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
         let mut model = Self {
             handle: ptr::null_mut(),
             api,
+            input_api,
             _library: library,
             bindings: Default::default(),
         };
@@ -125,6 +149,60 @@ impl ModelPackage {
         }
         let plan = serde_json::from_slice(&bytes).map_err(|e| format!("Model plan: {e}"))?;
         Ok((model, plan))
+    }
+    pub(crate) fn prepare_inputs(
+        &self,
+        program: &str,
+        tokens: &[u32],
+        history: &[u32],
+        mut upload: impl FnMut(&str, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let Some(api) = self.input_api else {
+            return Ok(());
+        };
+        // SAFETY: self retains the validated extension and native model lifetime.
+        let table = unsafe { &*api };
+        let mut output = abi::inputs::Output::default();
+        let mut error = OwnedBytes::default();
+        // SAFETY: borrowed tokens/history and output slots are live for the call.
+        let status = unsafe {
+            (table.prepare_program)(
+                self.handle,
+                Bytes::borrowed(program),
+                tokens.as_ptr(),
+                tokens.len(),
+                history.as_ptr(),
+                history.len(),
+                &mut output,
+                &mut error,
+            )
+        };
+        let result = (|| {
+            let message = self.consume_bytes(error)?;
+            if status != 0 {
+                return Err(format!(
+                    "Model inputs: {}",
+                    String::from_utf8_lossy(&message)
+                ));
+            }
+            let mut names = std::collections::BTreeSet::new();
+            for item in span(output.uploads, output.count, 16)? {
+                let name = string(item.buffer)?;
+                if !names.insert(name.clone()) {
+                    return Err("Duplicate input upload".into());
+                }
+                upload(
+                    &name,
+                    span(item.data.data, item.data.len, 128 * 1024 * 1024)?,
+                )?;
+            }
+            Ok(())
+        })();
+        // SAFETY: all borrowed upload data have finished use; return producer ownership.
+        unsafe {
+            (table.free)(output);
+        }
+        result
     }
     fn table(&self) -> &abi::Api {
         // SAFETY: _library keeps the validated function table mapped.
@@ -384,6 +462,7 @@ mod tests {
             root,
             spec,
             CreateRequest {
+                model_root: String::new(),
                 config: serde_json::json!({"model_type":"test_family"}),
                 architecture: "test_family".into(),
                 compute_policy: "test_policy".into(),

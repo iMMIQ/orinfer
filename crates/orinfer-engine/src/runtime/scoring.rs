@@ -156,22 +156,39 @@ impl ModelRuntime {
         let start = Instant::now();
         let mut probes = vec![];
         for case in requests.cases {
-            self.generate(
-                &case.prompt_ids,
-                (!case.images.is_empty()).then_some(case.images.as_slice()),
-                1,
-                &options,
-                || false,
-                |_| false,
+            // Keep the normal request arena leased while scoring. Whole-request
+            // generation releases and resets it before returning to its caller.
+            let mut request = self.start_request(
+                requests::GenerationInput {
+                    input_tokens: case.prompt_ids.clone(),
+                    images: case.images.clone(),
+                    max_new_tokens: case.target_ids.len(),
+                    sampling: options.clone(),
+                    prefix_hints: vec![],
+                },
+                &|| false,
             )?;
+            let schedule = crate::scheduler::Options {
+                max_active: 1,
+                ..Default::default()
+            };
+            while request.is_prefilling() {
+                self.advance_requests(&mut [&mut request], &schedule)?;
+            }
             let mut history = case.prompt_ids;
             for (position, &target) in case.target_ids.iter().enumerate() {
                 if position != 0 {
                     self.upload_ids(&self.manifest.token, &[case.target_ids[position - 1]])?;
+                    let last = history.len() - 1;
+                    self.prepare_inputs(&history[last..], &history[..last])?;
+                    self.upload_segment_controls(1)?;
                     self.launch_program("decode", ExecutionPhase::Decode)?;
                 }
                 if self.read_control(&self.manifest.position)? as usize != history.len() {
-                    return Err("Teacher-forced scoring position mismatch".into());
+                    return Err(format!(
+                        "{}: teacher-forced scoring position mismatch at {position}",
+                        case.id
+                    ));
                 }
                 let spec = self
                     .manifest
@@ -203,6 +220,7 @@ impl ModelRuntime {
                 });
                 history.push(target);
             }
+            self.finish_request(&mut request, false)?;
         }
         Ok(ScoreReport {
             manifest_sha256: self.stats.manifest_sha256,

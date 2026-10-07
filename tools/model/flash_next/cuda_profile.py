@@ -1,4 +1,4 @@
-"""Optional CUDA-event diagnostic phases; excluded from throughput trials."""
+"""Optional CUDA-event phases; keep the standard library profile import intact."""
 from collections import defaultdict
 from contextlib import contextmanager
 import time

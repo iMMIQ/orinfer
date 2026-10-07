@@ -86,6 +86,7 @@ impl Weights {
         let dtype = match buffer.dtype {
             Dtype::U8 => safetensors::Dtype::U8,
             Dtype::I8 => safetensors::Dtype::I8,
+            Dtype::U16 => safetensors::Dtype::U16,
             Dtype::F16 => safetensors::Dtype::F16,
             Dtype::Bf16 => safetensors::Dtype::BF16,
             Dtype::F32 => safetensors::Dtype::F32,

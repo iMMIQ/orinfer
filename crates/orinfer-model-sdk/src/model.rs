@@ -10,6 +10,9 @@ pub struct TensorIdentity {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// Hash-pinned CPU input assets interpreted by the model implementation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_assets: Option<crate::artifact::FileIdentity>,
     pub schema_version: u32,
     pub target: String,
     pub model: String,
@@ -73,6 +76,8 @@ pub struct StatePointerTable {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KvCache {
+    #[serde(default)]
+    pub prefix_divisors: BTreeMap<String, usize>,
     pub direct_prefill: bool,
     pub demand_mapping: bool,
     /// Bytes per token for each payload or scale buffer (including metadata).
@@ -152,6 +157,9 @@ impl Manifest {
             }
             Ok(())
         };
+        if let Some(asset) = &self.input_assets {
+            identity(asset)?;
+        }
         let mut buffers = BTreeMap::new();
         let mut tensors = BTreeMap::new();
         let mut total = 0usize;
@@ -201,6 +209,14 @@ impl Manifest {
                 .ok_or_else(|| format!("Unknown buffer {name}"))
         };
         if let Some(kv) = &self.kv_cache {
+            for (name, divisor) in &kv.prefix_divisors {
+                if *divisor == 0
+                    || !kv.buffers.contains_key(name)
+                    || !self.max_context.is_multiple_of(*divisor)
+                {
+                    return Err("Invalid compressed prefix row divisor".into());
+                }
+            }
             if kv.buffers.is_empty() {
                 return Err("Empty KV allocation contract".into());
             }
@@ -285,6 +301,12 @@ impl Manifest {
                 match a {
                     Argument::Buffer { name } => {
                         lookup(name)?;
+                    }
+                    Argument::BufferSlice { name, offset } => {
+                        let b = lookup(name)?;
+                        if *offset >= b.bytes()? || !offset.is_multiple_of(b.dtype.bytes()) {
+                            return Err("Invalid kernel buffer slice".into());
+                        }
                     }
                     Argument::F32 { value } if !value.is_finite() => {
                         return Err("Nonfinite scalar".into());

@@ -24,6 +24,14 @@ pub struct Spec {
     /// When present, consume each target prefill chunk before reusing this ring.
     #[serde(default)]
     pub hidden_ring: Option<String>,
+    /// Compact recurrent verification needs a commit even on full acceptance.
+    #[serde(default)]
+    pub commit_always: bool,
+    /// Draft physical state that cannot be repaired by rewinding its cursor.
+    #[serde(default)]
+    pub draft_snapshot_program: Option<String>,
+    #[serde(default)]
+    pub draft_restore_program: Option<String>,
     pub default_verification_tokens: usize,
     pub warm_plans: Vec<WarmPlan>,
     pub capture_plans: Vec<CapturePlan>,
@@ -63,6 +71,14 @@ impl Spec {
             Ok(())
         };
         program(&self.draft_program)?;
+        match (&self.draft_snapshot_program, &self.draft_restore_program) {
+            (Some(save), Some(restore)) => {
+                program(save)?;
+                program(restore)?;
+            }
+            (None, None) => {}
+            _ => return Err("MTP draft snapshot/restore must be paired".into()),
+        }
         let mut capture_sizes = BTreeSet::new();
         for p in &self.capture_plans {
             if p.tokens == 0 || p.tokens > model.chunk_tokens || !capture_sizes.insert(p.tokens) {

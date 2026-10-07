@@ -18,7 +18,7 @@ from tools.model.flash_next.checkpoint import Checkpoint
 from tools.model.flash_next.mtp import Session
 from tools.model.flash_next.native import Model, generate, prefill, state_checks
 from tools.model.flash_next.policy import code_vocabulary
-from tools.model.flash_next.profile import PhaseTrace
+from tools.model.flash_next.cuda_profile import PhaseTrace
 from tools.model.flash_next.scenes import scenes
 from tools.model.flash_next.validation import baseline_probes, probe
 from tools.model.flash_next.workloads import requests, session_state
