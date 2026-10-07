@@ -16,4 +16,4 @@ exec docker run --rm --name "orinfer-flash-teacher-$$" --runtime nvidia --networ
     -e TILELANG_CACHE_DIR="$repo_dir/artifacts/quantization/flash-next/teacher-cache/tilelang" \
     -e PYTHONDONTWRITEBYTECODE=1 -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
     -e LD_PRELOAD=/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1 \
-    orinfer-compiler:0.1.1 -m tools.model.flash_teacher "$@"
+    orinfer-compiler:0.1.1 -m tools.model.flash_next.reference.teacher "$@"

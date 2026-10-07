@@ -5,7 +5,7 @@ import torch
 from kernels.model.flash_next import qsa_prepare
 from kernels.model.qsa import kv_store
 from tools.operators.flash_next import rotate
-from tools.model.flash_qsa_reference import quantize_kv
+from tools.model.flash_next.reference.qsa import quantize_kv
 from tools.operators.common import configure,error,write_json
 
 

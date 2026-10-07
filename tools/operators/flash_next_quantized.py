@@ -11,7 +11,7 @@ from kernels.model.integer_vq import integer_vq, rotate_activation
 from kernels.operators.op30_activation_quantization import activation_quantization, launch
 from tools.operators.common import configure, benchmark, error, identity, write_json
 from tools.quantization.vq import Weights, rotate
-from tools.quantization.q2i8_ffn import a8, swiglu, floating_ffn
+from tools.quantization.reference_math import a8, swiglu, floating_ffn
 
 
 def matrix(path):

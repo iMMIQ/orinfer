@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 from kernels.model.qsa import sparse_merge
 from kernels.model.qsa_attention import sparse_attention
-from tools.model.flash_qsa_reference import attention,quantize_kv,dequantize_kv
+from tools.model.flash_next.reference.qsa import attention,quantize_kv,dequantize_kv
 from tools.operators.common import configure,error,benchmark,write_json,export_kernel
 
 

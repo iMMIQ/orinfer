@@ -3,8 +3,8 @@ import argparse
 from pathlib import Path
 import torch
 from kernels.model.qsa import index_query,index_compress,index_pending
-from tools.model.flash_qsa_reference import rope
-from tools.model.flash_reference_math import norm
+from tools.model.flash_next.reference.qsa import rope
+from tools.model.flash_next.reference.math import norm
 from tools.operators.common import configure,error,write_json
 
 

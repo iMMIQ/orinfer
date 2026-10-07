@@ -9,7 +9,7 @@ from kernels.model.integer_vq import integer_e8p_gemv,rotate_activation
 from kernels.model.rotation_a8 import rotate_activation_a8
 from kernels.operators.op30_activation_quantization import activation_quantization,launch
 from tools.quantization.vq import Weights
-from tools.operators.q2i8 import upload
+from tools.operators.quantized_reference import upload
 from tools.operators.common import configure,benchmark,error,write_json,export_kernel
 
 

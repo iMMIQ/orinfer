@@ -20,8 +20,8 @@ check:
 	$(PYTHON) -m unittest discover -s tools/vision -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/quantization -p 'test_*.py' -v
 	$(PYTHON) -m unittest tools.model.test_safetensors_source -v
-	$(PYTHON) -m unittest tools.model.test_flash_weights -v
-	$(PYTHON) -m unittest tools.model.test_flash_ple tools.model.test_flash_chunks tools.model.test_flash_validation tools.model.test_flash_original tools.model.test_flash_teacher_inputs tools.model.test_flash_speculation -v
+	$(PYTHON) -m unittest tools.model.flash_next.tests.test_weights -v
+	$(PYTHON) -m unittest tools.model.flash_next.tests.test_ple tools.model.flash_next.tests.test_chunks tools.model.flash_next.tests.test_validation tools.model.flash_next.tests.test_original tools.model.flash_next.tests.test_teacher_inputs tools.model.flash_next.tests.test_speculation tools.model.flash_next.tests.test_config -v
 	$(PYTHON) -m unittest tools.model.test_prepare tools.model.test_attach_execution tools.model.test_package tools.model.test_publication tools.model.test_resize_context tools.model.test_optimize_kv tools.model.test_stage_kv_prefill tools.model.test_upgrade_batching tools.model.test_upgrade_dynamic_batch tools.model.test_checkpoint tools.model.test_gguf tools.release.test_package tools.test_reference -v
 	$(PYTHON) tools/bench/validate_plan.py
 
@@ -32,7 +32,7 @@ compiler-image:
 	docker build -t orinfer-compiler:0.1.1 -f tools/build/compiler.Dockerfile .
 
 check-offline:
-	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint python3 orinfer-compiler:0.1.1 -m unittest tools.model.test_mtp_weights tools.model.test_flash_scenes tools.model.test_flash_reference_math tools.model.test_flash_teacher tools.model.test_flash_qsa_reference -v
+	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint python3 orinfer-compiler:0.1.1 -m unittest tools.model.test_mtp_weights tools.model.flash_next.tests.test_scenes tools.model.flash_next.tests.test_reference_math tools.model.flash_next.tests.test_teacher tools.model.flash_next.tests.test_qsa_reference tools.model.flash_next.tests.test_native_contract -v
 
 check-gpu:
 	$(PYTHON) tools/bench/check_gpu.py --model "$(MODEL)" --output "$(OUTPUT)"

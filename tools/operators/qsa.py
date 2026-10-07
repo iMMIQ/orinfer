@@ -3,7 +3,7 @@ import argparse
 from pathlib import Path
 import torch
 from kernels.model import qsa
-from tools.model.flash_qsa_reference import index,select,attention,quantize_kv,dequantize_kv
+from tools.model.flash_next.reference.qsa import index,select,attention,quantize_kv,dequantize_kv
 from tools.operators.common import configure,environment,error,export_kernel,write_json,benchmark
 
 

@@ -12,7 +12,6 @@ pub mod model;
 mod model_package;
 pub mod mtp;
 pub mod operators;
-pub mod ple;
 pub mod prefix;
 mod runtime;
 pub mod sampling;

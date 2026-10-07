@@ -7,8 +7,8 @@ import numpy as np
 import torch
 
 from tools.quantization.vq import Weights, rotate, e8p_sign_table
-from tools.quantization.q2i8_ffn import swiglu
-from tools.operators.q2i8 import upload, reference
+from tools.quantization.reference_math import swiglu
+from tools.operators.quantized_reference import upload, reference
 from tools.operators.common import configure, benchmark, error, environment, export_kernel, write_json
 from kernels.model.integer_vq import integer_vq, rotate_activation
 
