@@ -3,10 +3,11 @@ import tilelang
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 @orin_jit
-def int8_swiglu(M: int, N: int, K: int, block_n: int = 64):
+def int8_swiglu(M: int, N: int, K: int, block_n: int = 64, dynamic_rows: bool = False):
     if any(type(v) is not int or v <= 0 for v in (M, N, K)) or M > 8 or K % 128:
         raise ValueError('Invalid small-batch INT8 SwiGLU geometry')
     if K * 128 * 128 > 2**31 - 1 or block_n not in (4, 8, 16, 32, 64):
@@ -15,6 +16,7 @@ def int8_swiglu(M: int, N: int, K: int, block_n: int = 64):
         raise ValueError('Batched INT8 SwiGLU requires a 64-column tile')
     packed = M == 1
     width = K // 4 if packed else K
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(A: T.Tensor((M, width), T.int32 if packed else T.int8),
              Gate: T.Tensor((N, width), T.int32 if packed else T.int8),

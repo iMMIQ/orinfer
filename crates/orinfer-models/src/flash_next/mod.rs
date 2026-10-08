@@ -45,7 +45,7 @@ impl Adapter for Flash {
             } else {
                 vec![]
             },
-            vec![],
+            batching::state_bindings(&self.manifest, segments)?,
         ))
     }
 }

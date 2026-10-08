@@ -8,16 +8,18 @@ is chronological, request-owned, and includes (taps-1)*dilation rows.
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 from kernels.model.hyperconnection import _dtype
 
 
 @orin_jit
-def ple_gate(M: int, H: int, streams: int = 4, dtype: str = 'float16'):
+def ple_gate(M: int, H: int, streams: int = 4, dtype: str = 'float16', dynamic_rows: bool = False):
     """(NormedKey[M,streams,H], NormedQuery, Value[M,H], Gated)."""
     _dtype(dtype)
     if any(type(x) is not int or x <= 0 for x in (M, H, streams)):
         raise ValueError('Invalid PLE gate dimensions')
     width = 1 << (H - 1).bit_length()
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(Key: T.Tensor((M, streams, H), dtype),
              Query: T.Tensor((M, streams, H), dtype),

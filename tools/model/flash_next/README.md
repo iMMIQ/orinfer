@@ -39,7 +39,7 @@ PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models
   --cuda-graph decode_only --prefix-cache-mib 512
 ```
 
-可选 MTP 执行包共享主模型 embedding 和完整输出头，增加单层 draft、512 行 HC 环和验证/提交程序。在线支持每轮 1–7 个草稿，默认最多 3 个；用 `serve --mtp-drafts 7` 指定上限，`auto` 沿用包默认值，`0` 关闭 MTP 执行。短尾、上下文边界和调度 token 预算不足时自动缩小验证批次或使用普通 decode；prefix checkpoint 保留 P−1 的 draft 状态，恢复时用真实 continuation 连接。关闭 MTP 不移除包中的 draft 权重或 workspace；所指定的验证档位必须存在于执行包中。
+可选 MTP 执行包共享主模型 embedding 和完整输出头，增加单层 draft、512 行 HC 环和验证/提交程序。在线支持每轮 1–7 个草稿，默认最多 3 个；用 `serve --mtp-drafts 7` 指定上限，`auto` 沿用包默认值，`0` 关闭 MTP 执行并跳过草稿专用权重的上传。短尾、上下文边界和调度 token 预算不足时自动缩小验证批次或使用普通 decode；prefix checkpoint 保留 P−1 的 draft 状态，恢复时用真实 continuation 连接。模型文件与可共享的状态、workspace 保留；所指定的验证档位必须存在于执行包中。
 
 ```bash
 bash tools/operators/run.sh tools/model/flash_next/prepare_mtp.py artifacts/flash-mtp-build \
@@ -92,7 +92,27 @@ bash tools/operators/run.sh tools/model/flash_next/batching.py artifacts/flash-b
 
 不需要再次执行 `package.py`。可用 `--compile-cache` 复用完成的 TileLang 缓存。2/4/8/16/32/64/128 档共享 HC、普通投影、路由、专家、共享专家和输出头；其余请求数补零到下一档。GDN、PLE 卷积和 QSA 沿用已验证的单序列状态 kernel，只推进真实 lane。MTP 捕获每个请求的 target HC，调度器根据收益在 target batch 和逐请求 MTP 之间选择。CPU PLE 的行缓存共享，历史独立。
 
-Prefill 使用原有大块，与 decode 交替调度；每请求 KV/context 预留参与内存准入，超出活跃或内存预算的请求排队。128 个提交请求不要求同时在显存中驻留 128 份满上下文状态。Graph 按槽位和形状缓存；取消、槽位复用和 prefix 恢复保持请求隔离。
+冷 prefill 使用原有大块；已有 decoder 时，与 decode 交替执行按 `--prefill-budget-ms` 和在线耗时估计选择的真实小块。预算包含输入准备、target、MTP 预热及 checkpoint 工作的实测耗时，是软目标；至少推进一个 token。每请求 KV/context 预留参与内存准入，超出活跃或内存预算的请求排队。128 个提交请求不要求同时在显存中驻留 128 份满上下文状态。Graph 按槽位和形状缓存；取消、槽位复用和 prefix 恢复保持请求隔离。
+
+进一步把 GDN/QSA 私有阶段改成跨请求并行 kernel：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/private_mixers.py artifacts/flash-private-build \
+  --model artifacts/models/flash-serving-batch \
+  --model-output artifacts/models/flash-serving-parallel
+```
+
+该构建复用已有权重和批量投影，保持 schema 1。地址表按请求、层、缓冲区列存储，列顺序属于 `batch_layout.state_columns` 的存储布局；只上传当前批次及其空行。TileLang M1 算子在降低到 CUDA 前增加请求维度，保留原有 CTA 几何、计算顺序和精度；GDN/卷积、QSA KV/scale/index/pending、多图坐标和临时索引/softmax 缓冲均通过私有地址访问。20 个临时缓冲区按 256 字节对齐合并为每请求一块连续内存，避免大量小块分配；各层顺序复用此块，持续状态保持独立。空行不读写状态，卷积历史用批量 kernel 提交。单请求沿用 M1 程序，prefill 与 MTP 的执行语义不变。
+
+为非常见请求数量附加动态行数回退：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/dynamic_batch.py artifacts/flash-dynamic-build \
+  --model artifacts/models/flash-serving-parallel \
+  --model-output artifacts/models/flash-serving-dynamic
+```
+
+2/4/8/16/32/64/128 档仍使用原有专用计划；其他数量复用邻近容量的 AOT 算子，以真实行数执行 HC、投影、路由、dispatch、输出头和私有 GDN/QSA。专家 workspace 保留容量，实际 Counts/TileCount 和 launch 上界只覆盖有效分派。无需清零或计算虚构请求，线上不编译。动态 launch 合约记录容量及受校验的整数表达式，仍使用 schema 1；权重和精度不变。发布前检查 CUDA 签名与 host ABI 的参数数量，行数显式绑定为标量，避免依赖 affine shape 的隐式推导。
 
 ## 离线执行与验证
 

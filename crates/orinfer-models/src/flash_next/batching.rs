@@ -8,6 +8,7 @@ use orinfer_model_sdk::architecture::BatchSegment;
 use std::collections::{BTreeMap, BTreeSet};
 
 const PROFILES: [usize; 7] = [2, 4, 8, 16, 32, 64, 128];
+const POINTERS: &str = "FlashBatchPointers";
 
 fn stages(rows: usize) -> Vec<(String, usize)> {
     let small = rows <= 8;
@@ -74,6 +75,35 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
     {
         return Err("Invalid Flash decode row/state layout".into());
     }
+    let columns = layout.state_columns.clone();
+    if !columns.is_empty() {
+        if columns.windows(2).any(|p| p[0] >= p[1])
+            || m.buffers
+                .iter()
+                .find(|b| b.name == POINTERS)
+                .is_none_or(|b| {
+                    b.dtype != crate::artifact::Dtype::U64
+                        || b.shape != [128, 48, columns.len()]
+                        || b.data.is_some()
+                })
+            || columns.iter().any(|name| {
+                !(0..48).any(|layer| {
+                    let target = private_role(name, layer);
+                    m.buffers
+                        .iter()
+                        .any(|b| b.name == target && b.data.is_none())
+                })
+            })
+        {
+            return Err("Invalid Flash private address-table layout".into());
+        }
+        m.state_pointer_table = Some(crate::model::StatePointerTable {
+            buffer: POINTERS.into(),
+            max_rows: 128,
+        });
+    } else if m.buffers.iter().any(|b| b.name == POINTERS) {
+        return Err("Flash private address table needs column identities".into());
+    }
     for rows in PROFILES {
         for (name, stride) in &layout.row_strides {
             let role = format!("BatchM{rows}_{name}");
@@ -95,8 +125,113 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
                 super::plan::section(&format!("flash_batch_m{rows}"), &section, count, None),
             );
         }
+        if !columns.is_empty() {
+            for layer in 0..48 {
+                let prefix = format!("flash_private_m{rows}");
+                m.programs.insert(
+                    format!("{prefix}/layer{layer}"),
+                    super::plan::section(
+                        &prefix,
+                        &format!("layer{layer}"),
+                        if layer % 4 == 3 { 19 } else { 3 },
+                        None,
+                    ),
+                );
+            }
+        }
+    }
+    for rows in [4, 8, 16, 32, 64, 128] {
+        let prefix = format!("flash_dynamic_m{rows}");
+        if m.dynamic_batch_kernels
+            .contains_key(&format!("{prefix}/begin/k0"))
+        {
+            if columns.is_empty() {
+                return Err("Dynamic Flash batches require parallel private mixers".into());
+            }
+            for (section, count) in stages(rows) {
+                if section.ends_with("/private") {
+                    continue;
+                }
+                let program = format!("{prefix}/{section}");
+                let ops = super::plan::section(&prefix, &section, count, None);
+                for op in &ops {
+                    if let Operation::Kernel { name } = op
+                        && !m.dynamic_batch_kernels.contains_key(name)
+                    {
+                        return Err(format!("Missing dynamic Flash launch {name}"));
+                    }
+                }
+                m.programs.insert(program, ops);
+            }
+            for layer in 0..48 {
+                for op in &m.programs[&format!("flash_private_m{rows}/layer{layer}")] {
+                    if let Operation::Kernel { name } = op
+                        && !m.dynamic_batch_kernels.contains_key(name)
+                    {
+                        return Err(format!("Missing dynamic private launch {name}"));
+                    }
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn private_role(column: &str, layer: usize) -> String {
+    column.strip_prefix("State_").map_or_else(
+        || column.to_owned(),
+        |suffix| format!("State_{layer}_{suffix}"),
+    )
+}
+
+pub(super) fn state_bindings(
+    m: &Manifest,
+    segments: &[BatchSegment],
+) -> Result<orinfer_model_sdk::abi::StateBindings> {
+    let Some(layout) = &m.batch_layout else {
+        return Ok(vec![]);
+    };
+    if layout.state_columns.is_empty() {
+        return Ok(vec![]);
+    }
+    if segments.len() > 128
+        || segments.iter().any(|s| s.tokens != 1)
+        || segments
+            .iter()
+            .map(|s| s.slot)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != segments.len()
+    {
+        return Err("Flash private table requires distinct single-token requests".into());
+    }
+    if segments.len() <= 1 {
+        return Ok(vec![]);
+    }
+    let names: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
+    let roles: Vec<_> = (0..48)
+        .flat_map(|layer| {
+            let names = &names;
+            layout.state_columns.iter().map(move |column| {
+                let name = private_role(column, layer);
+                names.contains(name.as_str()).then_some(name)
+            })
+        })
+        .collect();
+    let rows = segments.len().next_power_of_two();
+    let mut result = Vec::with_capacity(rows * roles.len());
+    for lane in 0..rows {
+        if let Some(segment) = segments.get(lane) {
+            result.extend(
+                roles
+                    .iter()
+                    .map(|name| name.as_ref().map(|n| (segment.slot, n.clone()))),
+            );
+        } else {
+            result.extend(std::iter::repeat_n(None, roles.len()));
+        }
+    }
+    Ok(result)
 }
 
 fn invocation(
@@ -156,13 +291,24 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             }))
             .collect());
     }
-    let rows = *m
-        .batch_profiles
-        .iter()
-        .find(|&&r| r >= segments.len())
-        .ok_or("Missing Flash batch profile")?;
+    let dynamic_capacity = segments.len().next_power_of_two();
+    let dynamic = !PROFILES.contains(&segments.len())
+        && m.dynamic_batch_kernels
+            .contains_key(&format!("flash_dynamic_m{dynamic_capacity}/begin/k0"));
+    let rows = if dynamic {
+        dynamic_capacity
+    } else {
+        *m.batch_profiles
+            .iter()
+            .find(|&&r| r >= segments.len())
+            .ok_or("Missing Flash batch profile")?
+    };
     let layout = m.batch_layout.as_ref().ok_or("Missing Flash row layout")?;
-    let prefix = format!("flash_batch_m{rows}");
+    let prefix = format!(
+        "flash_{}_m{rows}",
+        if dynamic { "dynamic" } else { "batch" }
+    );
+    let fixed_prefix = format!("flash_batch_m{rows}");
     let empty = BTreeMap::new();
     let views: Vec<_> = (0..segments.len())
         .map(|lane| {
@@ -204,7 +350,7 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             ));
         }
     }
-    if rows > segments.len() {
+    if !dynamic && rows > segments.len() {
         // Private mixers do not write inactive lanes. Clear their row roles as
         // well, so shrinking a batch cannot reuse stale/nonfinite activations.
         for (name, stride) in &layout.row_strides {
@@ -231,7 +377,7 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
     }
     append(&mut out, m, &format!("{prefix}/begin"), None, &empty)?;
     for layer in 0..48 {
-        let private = &m.programs[&format!("{prefix}/layer{layer}/private")];
+        let private = &m.programs[&format!("{fixed_prefix}/layer{layer}/private")];
         let mut first = 0;
         if layer == 1 {
             append(&mut out, m, &format!("{prefix}/layer1/ple"), None, &empty)?;
@@ -252,19 +398,29 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             None,
             &empty,
         )?;
-        for (lane, s) in segments.iter().enumerate() {
-            for (i, op) in private[first..].iter().enumerate() {
-                out.push(invocation(op.clone(), Some(s.slot), &views[lane]));
-                if layer % 4 != 3 && i == 0 {
-                    out.push(invocation(
-                        Operation::Copy {
-                            source: "M1_HistoryOut".into(),
-                            destination: format!("State_{layer}_conv"),
-                            bytes: 61440,
-                        },
-                        Some(s.slot),
-                        &empty,
-                    ));
+        if !layout.state_columns.is_empty() {
+            append(
+                &mut out,
+                m,
+                &format!("flash_private_m{rows}/layer{layer}"),
+                None,
+                &empty,
+            )?;
+        } else {
+            for (lane, s) in segments.iter().enumerate() {
+                for (i, op) in private[first..].iter().enumerate() {
+                    out.push(invocation(op.clone(), Some(s.slot), &views[lane]));
+                    if layer % 4 != 3 && i == 0 {
+                        out.push(invocation(
+                            Operation::Copy {
+                                source: "M1_HistoryOut".into(),
+                                destination: format!("State_{layer}_conv"),
+                                bytes: 61440,
+                            },
+                            Some(s.slot),
+                            &empty,
+                        ));
+                    }
                 }
             }
         }
@@ -338,6 +494,20 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             ));
         }
     }
+    if dynamic {
+        for op in &mut out {
+            if let Operation::Kernel { name } = &op.operation
+                && (name.starts_with("flash_dynamic_") || name.starts_with("flash_private_"))
+            {
+                op.launch = Some(
+                    m.dynamic_batch_kernels
+                        .get(name)
+                        .ok_or("Missing dynamic Flash invocation contract")?
+                        .launch(segments.len())?,
+                );
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -372,6 +542,7 @@ mod tests {
             ]),
             profiles: Default::default(),
             small_mixed_shapes: vec![],
+            state_columns: vec![],
         });
         for rows in PROFILES {
             for (name, stride) in &m.batch_layout.as_ref().unwrap().row_strides {
@@ -454,5 +625,150 @@ mod tests {
             .row_strides
             .insert("M1_Ple".into(), 20480);
         assert!(register(&mut broken).is_err());
+    }
+    #[test]
+    fn parallel_private_stages_keep_state_rows_and_padding_separate() {
+        let mut m = manifest();
+        let columns = ["M1_HistoryOut", "Position", "State_conv", "State_gdn"];
+        m.batch_layout.as_mut().unwrap().state_columns =
+            columns.iter().map(|n| (*n).into()).collect();
+        for name in ["M1_HistoryOut", "Position"] {
+            m.buffers.push(
+                serde_json::from_value(serde_json::json!({
+                    "name":name,"dtype":"u8","shape":[4],"layout":"native_contiguous",
+                    "alignment":256,"access":"read_write","data":null
+                }))
+                .unwrap(),
+            );
+        }
+        for layer in (0..48).filter(|l| l % 4 != 3) {
+            for suffix in ["conv", "gdn"] {
+                m.buffers.push(serde_json::from_value(serde_json::json!({
+                    "name":format!("State_{layer}_{suffix}"),"dtype":"u8","shape":[4],
+                    "layout":"native_contiguous","alignment":256,"access":"read_write","data":null
+                })).unwrap());
+            }
+        }
+        m.buffers.push(
+            serde_json::from_value(serde_json::json!({
+            "name":POINTERS,"dtype":"u64","shape":[128,48,4],"layout":"native_contiguous",
+                "alignment":256,"access":"read_write","data":null
+            }))
+            .unwrap(),
+        );
+        register(&mut m).unwrap();
+        assert_eq!(m.state_pointer_table.as_ref().unwrap().max_rows, 128);
+        for count in [2, 3, 8, 15, 128] {
+            let segments: Vec<_> = (0..count)
+                .map(|lane| BatchSegment {
+                    slot: 129 - lane,
+                    tokens: 1,
+                })
+                .collect();
+            let bindings = state_bindings(&m, &segments).unwrap();
+            assert_eq!(bindings.len(), 48 * count.next_power_of_two() * 4);
+            for layer in 0..48 {
+                for (lane, s) in segments.iter().enumerate() {
+                    let start = (lane * 48 + layer) * 4;
+                    assert_eq!(bindings[start], Some((s.slot, "M1_HistoryOut".into())));
+                    assert_eq!(bindings[start + 1], Some((s.slot, "Position".into())));
+                    assert_eq!(
+                        bindings[start + 2],
+                        (layer % 4 != 3).then(|| (s.slot, format!("State_{layer}_conv")))
+                    );
+                }
+            }
+            assert!(bindings[count * 48 * 4..].iter().all(Option::is_none));
+            let p = plan(&m, &segments).unwrap();
+            let private: Vec<_> = p
+                .iter()
+                .filter(|i| {
+                    matches!(&i.operation,
+                Operation::Kernel{name} if name.starts_with("flash_private_"))
+                })
+                .collect();
+            assert_eq!(private.len(), 36 * 3 + 12 * 19);
+            assert!(
+                private
+                    .iter()
+                    .all(|i| i.sequence.is_none() && i.views.is_empty())
+            );
+            assert!(!p.iter().any(|i| matches!(&i.operation,
+                Operation::Copy{destination,..} if destination=="State_0_conv")));
+        }
+        m.batch_layout.as_mut().unwrap().state_columns.swap(0, 1);
+        assert!(register(&mut m).is_err());
+    }
+    #[test]
+    fn dynamic_rows_keep_fixed_profiles_and_never_create_padding_requests() {
+        use crate::operators::dynamic::{DynamicBatchKernel, RowExpression};
+        let mut m = manifest();
+        m.batch_layout.as_mut().unwrap().state_columns = vec!["Position".into()];
+        for (name, dtype, shape) in [
+            ("Position", "i32", vec![1]),
+            (POINTERS, "u64", vec![128, 48, 1]),
+        ] {
+            m.buffers.push(
+                serde_json::from_value(serde_json::json!({
+                    "name":name,"dtype":dtype,"shape":shape,"layout":"native_contiguous",
+                    "alignment":256,"access":"read_write","data":null
+                }))
+                .unwrap(),
+            );
+        }
+        register(&mut m).unwrap();
+        for capacity in [4, 8, 16, 32, 64, 128] {
+            let prefix = format!("flash_dynamic_m{capacity}");
+            let shared = stages(capacity)
+                .into_iter()
+                .filter(|(s, _)| !s.ends_with("/private"))
+                .flat_map(|(section, count)| {
+                    super::super::plan::section(&prefix, &section, count, None)
+                });
+            let private = (0..48).flat_map(|layer| {
+                m.programs[&format!("flash_private_m{capacity}/layer{layer}")].clone()
+            });
+            for op in shared.chain(private) {
+                if let Operation::Kernel { name } = op {
+                    m.dynamic_batch_kernels.insert(
+                        name.clone(),
+                        DynamicBatchKernel {
+                            name,
+                            capacity,
+                            grid: [
+                                RowExpression::Rows,
+                                RowExpression::Constant { value: 1 },
+                                RowExpression::Constant { value: 1 },
+                            ],
+                            arguments: vec![],
+                        },
+                    );
+                }
+            }
+        }
+        register(&mut m).unwrap();
+        for count in [
+            2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128,
+        ] {
+            let segments: Vec<_> = (0..count)
+                .map(|slot| BatchSegment { slot, tokens: 1 })
+                .collect();
+            let p = plan(&m, &segments).unwrap();
+            let fixed = PROFILES.contains(&count);
+            assert!(
+                !p.iter()
+                    .any(|i| matches!(i.operation, Operation::Zero { .. }))
+            );
+            let overridden: Vec<_> = p.iter().filter_map(|i| i.launch.as_ref()).collect();
+            if fixed {
+                assert!(overridden.is_empty());
+            } else {
+                assert!(!overridden.is_empty());
+                assert!(overridden.iter().all(|l| l.grid[0] == count as u32));
+            }
+            assert_eq!(p.iter().filter(|i| matches!(&i.operation, Operation::Copy { destination, .. } if destination == "Logits")).count(), count);
+        }
+        m.dynamic_batch_kernels.remove("flash_dynamic_m128/head/k0");
+        assert!(register(&mut m).is_err());
     }
 }

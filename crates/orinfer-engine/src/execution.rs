@@ -95,6 +95,27 @@ fn disable_mtp(manifest: &mut crate::model::Manifest) {
     let Some(spec) = manifest.mtp.take() else {
         return;
     };
+    // Keep inactive draft KV virtual, but exclude it from prefix snapshots.
+    // Pruning its programs below also removes the growth records that identify
+    // its ownership. No target program maps or advances these buffers.
+    if let Some(kv) = &manifest.kv_cache {
+        let shared: BTreeSet<_> = kv
+            .growth
+            .values()
+            .filter(|growth| growth.position != spec.position)
+            .flat_map(|growth| &growth.buffers)
+            .collect();
+        let draft_kv: BTreeSet<_> = kv
+            .growth
+            .values()
+            .filter(|growth| growth.position == spec.position)
+            .flat_map(|growth| &growth.buffers)
+            .filter(|name| kv.buffers.contains_key(*name) && !shared.contains(name))
+            .collect();
+        manifest
+            .reset_buffers
+            .retain(|name| !draft_kv.contains(name));
+    }
     let mut disabled = BTreeSet::from([spec.draft_program]);
     disabled.extend(spec.draft_snapshot_program);
     disabled.extend(spec.draft_restore_program);

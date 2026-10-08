@@ -7,10 +7,11 @@ These kernels do not copy or expand weights. Dispatch owns the output-slot map.
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 @orin_jit
-def expert_histogram(M: int, E: int = 512, top_k: int = 10):
+def expert_histogram(M: int, E: int = 512, top_k: int = 10, dynamic_rows: bool = False):
     """Build (IDs, Counts[E], RelativeSlot[M,top_k]), all INT32.
 
     Stable assignment order is token first, route rank second. No atomics or
@@ -20,6 +21,7 @@ def expert_histogram(M: int, E: int = 512, top_k: int = 10):
         raise ValueError('Invalid MoE dispatch dimensions')
     width = 1 << (M * top_k - 1).bit_length()
 
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(IDs: T.Tensor((M, top_k), T.int32),
              Counts: T.Tensor((E,), T.int32),
@@ -99,7 +101,7 @@ def expert_tiles(M: int, E: int = 512, top_k: int = 10, block_m: int = 16):
 
 
 @orin_jit
-def expert_dispatch(M: int, H: int, E: int = 512, top_k: int = 10, scale_group: int = 64):
+def expert_dispatch(M: int, H: int, E: int = 512, top_k: int = 10, scale_group: int = 64, dynamic_rows: bool = False):
     """Build (A, Scale, IDs, RelativeSlot, RowOffsets, D, DS, SlotMap).
 
     A[M,H]/D[M*top_k,H] are INT8; Scale/DS are FP16. Others INT32.
@@ -113,6 +115,7 @@ def expert_dispatch(M: int, H: int, E: int = 512, top_k: int = 10, scale_group: 
     if type(scale_group) is not int or scale_group <= 0 or H % scale_group:
         raise ValueError('Invalid activation scale group')
     groups = H // scale_group
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(A: T.Tensor((M, H), T.int8),
              Scale: T.Tensor((M, groups), T.float16),
@@ -134,7 +137,7 @@ def expert_dispatch(M: int, H: int, E: int = 512, top_k: int = 10, scale_group: 
 
 
 @orin_jit
-def router_topk(M: int, E: int = 512, top_k: int = 10, renormalize: bool = True):
+def router_topk(M: int, E: int = 512, top_k: int = 10, renormalize: bool = True, dynamic_rows: bool = False):
     """Build (Logits[M,E], IDs[M,top_k], Prob[M,top_k]), F32/I32/F32.
 
     Logits must be finite. The normalized route is equivalent to FP32 softmax,
@@ -147,6 +150,7 @@ def router_topk(M: int, E: int = 512, top_k: int = 10, renormalize: bool = True)
     width = 1 << (E - 1).bit_length()
     selected_width = 1 << (top_k - 1).bit_length()
 
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(Logits: T.Tensor((M, E), T.float32),
              IDs: T.Tensor((M, top_k), T.int32),
@@ -189,7 +193,7 @@ def router_topk(M: int, E: int = 512, top_k: int = 10, renormalize: bool = True)
 
 
 @orin_jit
-def moe_combine(M: int, H: int, slots: int, top_k: int = 10):
+def moe_combine(M: int, H: int, slots: int, top_k: int = 10, dynamic_rows: bool = False):
     """Build (Expert, SlotMap, Prob, Shared, SharedGate, Output).
 
     Expert[slots,H], Shared[M,H], SharedGate[M] and Output[M,H] are FP16.
@@ -201,6 +205,7 @@ def moe_combine(M: int, H: int, slots: int, top_k: int = 10):
         raise ValueError('Invalid MoE mixture dimensions')
     width = 256
 
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(Expert: T.Tensor((slots, H), T.float16),
              SlotMap: T.Tensor((M, top_k), T.int32),

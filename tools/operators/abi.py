@@ -1,5 +1,22 @@
 """CPU-only extraction of actual generated NVRTC launch ABI, without eval."""
 import ast
+import re
+
+
+def validate_parameter_count(source, host):
+    """Reject incomplete generated wrappers before they reach cuLaunchKernel.
+
+    Symbolic affine tensor dimensions can leave a CUDA scalar out of a
+    compiler-generated host wrapper. The emitted CUDA prototype is independent
+    evidence of parameter count; never pad missing arguments speculatively.
+    """
+    prototype = re.search(r'\b' + re.escape(host['symbol']) +
+                          r'\s*\(([^)]*)\)\s*(?:;|\{)', source)
+    if prototype is None:
+        raise ValueError('Missing CUDA kernel prototype')
+    parameters = [p.strip() for p in prototype[1].split(',') if p.strip() not in ('', 'void')]
+    if len(parameters) != len(host['ordered_arguments']):
+        raise ValueError('CUDA and generated host parameter counts differ')
 
 
 def _items(node):

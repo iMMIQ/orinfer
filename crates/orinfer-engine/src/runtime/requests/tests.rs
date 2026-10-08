@@ -12,6 +12,10 @@ struct Fixture {
     cuda_graph: String,
     #[serde(default = "partial_prefix_boundaries")]
     checkpoint_tokens: Vec<usize>,
+    #[serde(default)]
+    batches: Vec<usize>,
+    #[serde(default)]
+    mtp_drafts: Option<usize>,
 }
 
 fn partial_prefix_boundaries() -> Vec<usize> {

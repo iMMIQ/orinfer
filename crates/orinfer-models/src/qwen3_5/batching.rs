@@ -191,6 +191,7 @@ pub(super) fn register(
             .filter(|p| matches!(p.kind.as_str(), "sequence" | "recurrent"))
             .map(|p| p.tokens)
             .collect(),
+        state_columns: vec![],
     });
     Ok(())
 }
@@ -673,6 +674,7 @@ mod tests {
             profiles: BTreeMap::from([(2, "sequence".into()), (32, "recurrent".into())]),
             hidden: 8,
             small_mixed_shapes: vec![2, 32],
+            state_columns: vec![],
         });
         let mut section = |program: &str, name: &str, count: usize| {
             m.programs
@@ -702,6 +704,7 @@ mod tests {
                 m.dynamic_batch_kernels.insert(
                     name.clone(),
                     DynamicBatchKernel {
+                        capacity: 128,
                         name,
                         grid: [
                             RowExpression::Rows,

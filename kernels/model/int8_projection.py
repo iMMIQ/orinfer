@@ -7,11 +7,12 @@ import tilelang
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 @orin_jit
 def int8_projection(M: int, N: int, K: int, output_dtype: str = 'float16', block_m: int = 16,
-                    block_n: int = 64, block_k: int = 64, group_m: int = 0):
+                    block_n: int = 64, block_k: int = 64, group_m: int = 0, dynamic_rows: bool = False):
     if any(type(v) is not int or v <= 0 for v in (M,N,K)) or K%64 or K*128*128 > 2**31-1:
         raise ValueError('Invalid INT8 projection geometry')
     if output_dtype not in ('float16','float32'):
@@ -21,6 +22,7 @@ def int8_projection(M: int, N: int, K: int, output_dtype: str = 'float16', block
         raise ValueError('Invalid INT8 column/reduction tile')
     if type(group_m) is not int or group_m not in (0,1,2,4,8):
         raise ValueError('Invalid INT8 row grouping')
+    M = row_count(M, dynamic_rows)
     mt,nt=(M+block_m-1)//block_m,(N+block_n-1)//block_n
     @T.prim_func
     def main(A:T.Tensor((M,K),T.int8),Weight:T.Tensor((N,K),T.int8),

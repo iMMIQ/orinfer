@@ -1,6 +1,6 @@
 import unittest
 
-from abi import evaluate, parse_host
+from abi import evaluate, parse_host, validate_parameter_count
 
 
 HOST = '''
@@ -38,6 +38,16 @@ class ActualAbiTests(unittest.TestCase):
                 evaluate(expression, {"rows": 17})
         with self.assertRaises(KeyError):
             evaluate("undefined + 1", {})
+
+    def test_missing_symbolic_scalar_is_rejected_before_cuda_launch(self):
+        host = parse_host(HOST)[0]
+        source = 'extern "C" __global__ void main_kernel(half* C, const half* A, int rows);'
+        validate_parameter_count(source, host)
+        host['ordered_arguments'].pop()
+        with self.assertRaisesRegex(ValueError, 'parameter counts'):
+            validate_parameter_count(source, host)
+        with self.assertRaisesRegex(ValueError, 'prototype'):
+            validate_parameter_count('void other();', host)
 
 
 if __name__ == "__main__":

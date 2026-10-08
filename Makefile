@@ -32,7 +32,7 @@ compiler-image:
 	docker build -t orinfer-compiler:0.1.1 -f tools/build/compiler.Dockerfile .
 
 check-offline:
-	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint python3 orinfer-compiler:0.1.1 -m unittest tools.model.test_mtp_weights tools.model.flash_next.tests.test_scenes tools.model.flash_next.tests.test_reference_math tools.model.flash_next.tests.test_teacher tools.model.flash_next.tests.test_qsa_reference tools.model.flash_next.tests.test_native_contract -v
+	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint python3 orinfer-compiler:0.1.1 -m unittest tools.model.test_mtp_weights tools.model.flash_next.tests.test_scenes tools.model.flash_next.tests.test_reference_math tools.model.flash_next.tests.test_teacher tools.model.flash_next.tests.test_qsa_reference tools.model.flash_next.tests.test_native_contract tools.model.flash_next.tests.test_dynamic_batch -v
 
 check-gpu:
 	$(PYTHON) tools/bench/check_gpu.py --model "$(MODEL)" --output "$(OUTPUT)"

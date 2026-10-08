@@ -199,6 +199,8 @@ pub fn admission_should_yield(
 /// Host timings; replay includes stream synchronization, not GPU event timing.
 #[derive(Default, Clone, Copy, Debug, Serialize)]
 pub struct BatchExecutionStatistics {
+    pub dynamic_graph_captures: usize,
+    pub dynamic_direct_iterations: usize,
     pub graph_hits: usize,
     pub graph_misses: usize,
     pub graph_evictions: usize,
@@ -218,6 +220,9 @@ pub struct Statistics {
     pub batch_histogram: std::collections::BTreeMap<usize, usize>,
     pub prefill_batch_histogram: std::collections::BTreeMap<usize, usize>,
     pub prefill_tokens: usize,
+    pub prefill_chunk_histogram: std::collections::BTreeMap<usize, usize>,
+    pub bounded_prefill_iterations: usize,
+    pub max_bounded_prefill_s: f64,
     pub decode_tokens: usize,
     pub mixed_iterations: usize,
     pub speculative_iterations: usize,

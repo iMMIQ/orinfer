@@ -9,16 +9,18 @@ qsa.py and qsa_attention.py; prepared FP16 KV tiles are only temporary.
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 @orin_jit
 def dense_projection(M: int, N: int, K: int, weight_dtype: str = 'float16',
-                     output_dtype: str = 'float16'):
+                     output_dtype: str = 'float16', dynamic_rows: bool = False):
     """FP16 input, FP16/BF16 weights, FP32 accumulation; optional F32 output."""
     if any(type(v) is not int or v <= 0 for v in (M, N, K)) or K % 64:
         raise ValueError('Invalid dense projection dimensions')
     if weight_dtype not in ('float16', 'bfloat16') or output_dtype not in ('float16', 'float32'):
         raise ValueError('Invalid dense projection dtype')
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(A: T.Tensor((M, K), T.float16),
              Weight: T.Tensor((N, K), weight_dtype),
@@ -38,10 +40,11 @@ def dense_projection(M: int, N: int, K: int, weight_dtype: str = 'float16',
 
 
 @orin_jit
-def hc_initialize(M: int, H: int = 2560, streams: int = 4):
+def hc_initialize(M: int, H: int = 2560, streams: int = 4, dynamic_rows: bool = False):
     """Broadcast token embeddings into every independent residual stream."""
     if any(type(v) is not int or v <= 0 for v in (M, H, streams)):
         raise ValueError('Invalid residual dimensions')
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(Embedding: T.Tensor((M, H), T.float16),
              Residual: T.Tensor((M, streams, H), T.float16)):
@@ -53,10 +56,11 @@ def hc_initialize(M: int, H: int = 2560, streams: int = 4):
 
 
 @orin_jit
-def residual_add(M: int, C: int):
+def residual_add(M: int, C: int, dynamic_rows: bool = False):
     """FP16 residual update, with one owner per element; Output may alias X."""
     if any(type(v) is not int or v <= 0 for v in (M, C)):
         raise ValueError('Invalid residual dimensions')
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(X: T.Tensor((M, C), T.float16),
              Update: T.Tensor((M, C), T.float16),
@@ -70,10 +74,11 @@ def residual_add(M: int, C: int):
 
 
 @orin_jit
-def swiglu(M: int, width: int):
+def swiglu(M: int, width: int, dynamic_rows: bool = False):
     """Separate FP16 gate/up projections into a FP16 shared-expert activation."""
     if any(type(v) is not int or v <= 0 for v in (M, width)):
         raise ValueError('Invalid SwiGLU dimensions')
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(Gate: T.Tensor((M, width), T.float16),
              Up: T.Tensor((M, width), T.float16),
@@ -88,7 +93,7 @@ def swiglu(M: int, width: int):
 
 
 @orin_jit
-def gdn_sigmoid_norm(M: int, heads: int = 48, width: int = 128, eps: float = 1e-6):
+def gdn_sigmoid_norm(M: int, heads: int = 48, width: int = 128, eps: float = 1e-6, dynamic_rows: bool = False):
     """(X[M,heads,width], Z, Weight[width] F32, Y), FP16 activations.
 
     Weight is ordinary RMSNorm gamma, not zero-centered gamma. The output
@@ -97,6 +102,7 @@ def gdn_sigmoid_norm(M: int, heads: int = 48, width: int = 128, eps: float = 1e-
     if any(type(v) is not int or v <= 0 for v in (M, heads, width)) or not 0 < eps < 1:
         raise ValueError('Invalid GDN norm dimensions')
     size = 1 << (width - 1).bit_length()
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(X: T.Tensor((M, heads, width), T.float16),
              Z: T.Tensor((M, heads, width), T.float16),

@@ -12,6 +12,7 @@ pub enum RowExpression {
     Multiply { lhs: Box<Self>, rhs: Box<Self> },
     Divide { lhs: Box<Self>, rhs: Box<Self> },
     Remainder { lhs: Box<Self>, rhs: Box<Self> },
+    Minimum { lhs: Box<Self>, rhs: Box<Self> },
 }
 impl RowExpression {
     fn evaluate(&self, rows: u32, depth: usize) -> Result<u32> {
@@ -47,6 +48,10 @@ impl RowExpression {
                 let (a, b) = binary(lhs, rhs)?;
                 a.checked_rem(b)
             }
+            Self::Minimum { lhs, rhs } => {
+                let (a, b) = binary(lhs, rhs)?;
+                Some(a.min(b))
+            }
         };
         value.ok_or_else(|| "Invalid row expression arithmetic".into())
     }
@@ -62,8 +67,13 @@ pub struct RowArgument {
 #[serde(deny_unknown_fields)]
 pub struct DynamicBatchKernel {
     pub name: String,
+    #[serde(default = "default_capacity")]
+    pub capacity: usize,
     pub grid: [RowExpression; 3],
     pub arguments: Vec<RowArgument>,
+}
+fn default_capacity() -> usize {
+    128
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RowLaunch {
@@ -72,8 +82,8 @@ pub struct RowLaunch {
 }
 impl DynamicBatchKernel {
     pub fn launch(&self, rows: usize) -> Result<RowLaunch> {
-        if !(2..=128).contains(&rows) {
-            return Err("Dynamic batch rows must be in 2..128".into());
+        if !(2..=128).contains(&self.capacity) || !(2..=self.capacity).contains(&rows) {
+            return Err("Dynamic batch rows exceed the kernel capacity".into());
         }
         let mut grid = [0; 3];
         for (target, expression) in grid.iter_mut().zip(&self.grid) {
@@ -98,7 +108,6 @@ impl DynamicBatchKernel {
     pub fn validate(&self, kernel: &Kernel) -> Result<()> {
         let mut indices = std::collections::BTreeSet::new();
         if self.name != kernel.name
-            || !(self.name.starts_with("batch_m128/") || self.name.starts_with("batch_gdn_m128/"))
             || self.arguments.iter().any(|a| {
                 !indices.insert(a.index)
                     || !matches!(kernel.args.get(a.index), Some(Argument::I32 { .. }))
@@ -106,12 +115,12 @@ impl DynamicBatchKernel {
         {
             return Err("Invalid dynamic batch kernel ABI".into());
         }
-        let capacity = self.launch(128)?;
+        let capacity = self.launch(self.capacity)?;
         if capacity.grid != kernel.grid || capacity.arguments.iter().any(|(index, value)|
             !matches!(kernel.args[*index], Argument::I32 { value: v } if v == *value)) {
             return Err("Dynamic batch capacity binding differs from host ABI".into());
         }
-        for rows in 2..128 {
+        for rows in 2..self.capacity {
             self.launch(rows)?;
         }
         Ok(())
@@ -133,6 +142,7 @@ mod tests {
         .unwrap();
         let mut template = DynamicBatchKernel {
             name: kernel.name.clone(),
+            capacity: 128,
             grid: [
                 RowExpression::Rows,
                 RowExpression::Constant { value: 1 },

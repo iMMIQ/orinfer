@@ -3,13 +3,15 @@ import tilelang
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 @orin_jit
-def greedy_partials(vocab: int, rows: int = 1):
+def greedy_partials(vocab: int, rows: int = 1, dynamic_rows: bool = False):
     if type(vocab) is not int or vocab < 1 or type(rows) is not int or rows < 1:
         raise ValueError('Positive vocabulary required')
     blocks = (vocab + 1023) // 1024
+    rows = row_count(rows, dynamic_rows)
     @T.prim_func
     def main(Logits: T.Tensor((rows, vocab), T.float32),
              Values: T.Tensor((rows*blocks,), T.float32),
@@ -50,12 +52,13 @@ def greedy_partials(vocab: int, rows: int = 1):
 
 
 @orin_jit
-def greedy_merge(vocab: int, rows: int = 1):
+def greedy_merge(vocab: int, rows: int = 1, dynamic_rows: bool = False):
     if type(vocab) is not int or vocab < 1 or type(rows) is not int or rows < 1:
         raise ValueError('Positive vocabulary required')
     blocks = (vocab + 1023) // 1024
     width = max(32,1 << (blocks - 1).bit_length())
     threads=min(256,width)
+    rows = row_count(rows, dynamic_rows)
     @T.prim_func
     def main(Values: T.Tensor((rows*blocks,), T.float32),
              Indices: T.Tensor((rows*blocks,), T.int32),

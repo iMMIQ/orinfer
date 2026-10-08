@@ -99,7 +99,7 @@ pub struct StepOutput {
 
 enum Work {
     Speculative(usize),
-    Prefill(usize),
+    Prefill(usize, Option<f64>),
     Batch(Vec<(usize, usize)>),
     Idle,
 }
@@ -572,13 +572,20 @@ impl ModelRuntime {
         req.mtp.committed_tokens = req.generated;
         Ok(vec![pending])
     }
-    fn advance_prefill(&mut self, req: &mut RequestState) -> Result<(usize, Vec<u32>)> {
+    fn advance_prefill(
+        &mut self,
+        req: &mut RequestState,
+        budget_ms: Option<f64>,
+    ) -> Result<(usize, Vec<u32>)> {
         let remaining = Self::prefill_boundary(req) - req.offset;
+        let maximum = budget_ms.map_or(remaining, |ms| {
+            self.prefill_costs.bounded_chunk(remaining, ms)
+        });
         let plan = self
             .manifest
             .prefill_plans
             .iter()
-            .filter(|p| p.chunk_tokens <= remaining)
+            .filter(|p| p.chunk_tokens <= maximum)
             .max_by_key(|p| p.chunk_tokens);
         let (chunk, program, head) = plan
             .map(|p| {
@@ -589,6 +596,7 @@ impl ModelRuntime {
                 )
             })
             .unwrap_or((1, "decode".into(), None));
+        let at = Instant::now();
         self.upload_ids(
             if chunk == 1 {
                 &self.manifest.token
@@ -602,7 +610,6 @@ impl ModelRuntime {
             &req.input[..req.offset],
         )?;
         self.upload_segment_controls(chunk)?;
-        let at = Instant::now();
         self.launch_program(&program, ExecutionPhase::Prefill)?;
         if let Some(spec) = &self.manifest.mtp {
             self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
@@ -613,10 +620,21 @@ impl ModelRuntime {
         {
             self.launch_program(&head, ExecutionPhase::Prefill)?;
         }
+        let tokens = self.after_prefill(req, chunk)?;
         let seconds = at.elapsed().as_secs_f64();
         self.prefill_costs.observe(chunk, seconds);
         self.scheduler_statistics.prefill_tokens += chunk;
-        Ok((chunk, self.after_prefill(req, chunk)?))
+        *self
+            .scheduler_statistics
+            .prefill_chunk_histogram
+            .entry(chunk)
+            .or_default() += 1;
+        if budget_ms.is_some() {
+            self.scheduler_statistics.bounded_prefill_iterations += 1;
+            self.scheduler_statistics.max_bounded_prefill_s =
+                self.scheduler_statistics.max_bounded_prefill_s.max(seconds);
+        }
+        Ok((chunk, tokens))
     }
     fn iteration_key(
         requests: &[&mut RequestState],
@@ -760,9 +778,10 @@ impl ModelRuntime {
                     .entry(1)
                     .or_default() += 1;
             }
-            Work::Prefill(i) => {
-                let (_, tokens) =
-                    self.with_request(requests[i], |model, req| model.advance_prefill(req))?;
+            Work::Prefill(i, budget_ms) => {
+                let (_, tokens) = self.with_request(requests[i], |model, req| {
+                    model.advance_prefill(req, budget_ms)
+                })?;
                 requests[i].served = self.scheduler_statistics.iterations;
                 if !tokens.is_empty() {
                     output.push(StepOutput { request: i, tokens });
@@ -839,19 +858,21 @@ impl ModelRuntime {
                     .iter()
                     .all(|&i| Self::prefill_boundary(requests[i]) - requests[i].offset <= cap));
         if decode.is_empty() && !joint_prefill {
-            return Ok(prefill.map(Work::Prefill).unwrap_or(Work::Idle));
+            return Ok(prefill
+                .map(|i| Work::Prefill(i, None))
+                .unwrap_or(Work::Idle));
         }
         if !decode.is_empty() {
             let rotate = self.scheduler_cursor % decode.len();
             decode.rotate_left(rotate);
         }
-        // Packages without mixed prompt profiles retain their dense chunk path.
-        // Alternate prompt and decode work so arrivals cannot starve either side.
+        // Packages without joint mixed profiles run a bounded real prompt
+        // chunk between decode iterations; cold-only prompts keep large tiles.
         if let Some(i) = prefill
             && !mixed
             && self.scheduler_statistics.iterations.is_multiple_of(2)
         {
-            return Ok(Work::Prefill(i));
+            return Ok(Work::Prefill(i, Some(options.prefill_budget_ms)));
         }
         // Even a one-row configuration must advance waiting prompt work.
         let reserve = usize::from(

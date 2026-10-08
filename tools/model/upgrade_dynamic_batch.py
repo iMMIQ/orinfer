@@ -11,22 +11,30 @@ from tools.model.publication import atomic_model, clone_model, commit_package, f
 from tools.operators.abi import parse_host, evaluate
 
 
-def expression(source):
+def expression(source, row_multiplier=1):
     def visit(node):
         if isinstance(node, ast.Constant) and type(node.value) is int and 0 <= node.value <= 0xffffffff:
             return dict(op='constant', value=node.value)
-        if isinstance(node, ast.Name) and node.id in ('M', 'rows', 'batch'):
-            return dict(op='rows')
+        if isinstance(node, ast.Name) and node.id in ('M', 'm', 'rows', 'batch'):
+            rows = dict(op='rows')
+            return rows if row_multiplier == 1 else dict(op='multiply', lhs=rows,
+                                                        rhs=dict(op='constant', value=row_multiplier))
         operators = {ast.Add:'add', ast.Sub:'subtract', ast.Mult:'multiply',
                      ast.FloorDiv:'divide', ast.Mod:'remainder'}
         if isinstance(node, ast.BinOp) and type(node.op) in operators:
             return dict(op=operators[type(node.op)], lhs=visit(node.left), rhs=visit(node.right))
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == 'min' and len(node.args) == 2 and not node.keywords):
+            return dict(op='minimum', lhs=visit(node.args[0]), rhs=visit(node.args[1]))
         raise ValueError(f'Unsupported row expression: {source}')
     return visit(ast.parse(source, mode='eval').body)
 
 
-def contract(kernel, host):
-    dimensions = dict(M=128, rows=128, batch=128)
+def contract(kernel, host, capacity=128, row_multiplier=1):
+    if type(row_multiplier) is not int or row_multiplier < 1:
+        raise ValueError('Invalid launch row multiplier')
+    rows = capacity * row_multiplier
+    dimensions = dict(M=rows, m=rows, rows=rows, batch=rows)
     launch = host['launch_expressions']
     if kernel['grid'] != [evaluate(launch['gridDim'+axis], dimensions) for axis in 'XYZ']:
         raise ValueError('Host grid differs from capacity binding')
@@ -41,10 +49,11 @@ def contract(kernel, host):
         if exported['ctype'] in ('ctypes.c_int32', 'c_int32'):
             if bound != dict(kind='i32', value=evaluate(exported['value'], dimensions)):
                 raise ValueError('Host scalar differs from capacity binding')
-            args.append(dict(index=index, value=expression(exported['value'])))
-        elif exported['ctype'] not in ('ctypes.c_void_p', 'c_void_p') or bound['kind'] != 'buffer':
+            args.append(dict(index=index, value=expression(exported['value'], row_multiplier)))
+        elif (exported['ctype'] not in ('ctypes.c_void_p', 'c_void_p')
+              or bound['kind'] not in ('buffer', 'buffer_slice')):
             raise ValueError('Unsupported dynamic host ABI')
-    grid = [expression(launch['gridDim'+axis]) for axis in 'XYZ']
+    grid = [expression(launch['gridDim'+axis], row_multiplier) for axis in 'XYZ']
     if kernel['name'].startswith('batch_gdn_m128/'):
         # These row-independent CTA bodies address one private arena per b.
         # The fixed capacity export changes only the number of batch CTAs.
@@ -53,7 +62,7 @@ def contract(kernel, host):
         if axis is None or kernel['grid'][axis] != 128 or args:
             raise ValueError('Unsupported batched GDN launch')
         grid[axis] = dict(op='rows')
-    return dict(name=kernel['name'], grid=grid, arguments=args)
+    return dict(name=kernel['name'], capacity=capacity, grid=grid, arguments=args)
 
 
 def upgrade(model, destination):

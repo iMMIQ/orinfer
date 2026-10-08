@@ -1,12 +1,14 @@
 """Signed block128 rotation and row A8 with exact FP16 materialization boundaries."""
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 @orin_jit
-def rotate_activation_a8(M:int,K:int,swiglu=False,reciprocal=True):
+def rotate_activation_a8(M:int,K:int,swiglu=False,reciprocal=True, dynamic_rows: bool = False):
     assert M>0 and K%128==0
     width=2*K if swiglu else K
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(X:T.Tensor((M,width),T.float16),Signs:T.Tensor((K,),T.int8),
              Q:T.Tensor((M,K),T.int8),S:T.Tensor((M,1),T.float16)):

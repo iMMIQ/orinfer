@@ -154,7 +154,9 @@ KV 区间不可变并按引用共享，持续状态单独保存；恢复仍执�
 
 单请求冷 prefill 使用大块计划；兼容的多个短请求可联合执行。与 decode 混合时，按预测耗时选择小块 prefill。常见 batch 可使用固定形状 kernel，其余 2–128 行可由支持动态行数的 AOT 包执行，线上不编译。请求按迭代加入和结束；不为凑 batch 额外等待。
 
-Flash Next 的 batch 包共享投影、MoE 路由、专家和输出头计算，GDN、卷积、PLE、QSA/KV/index/pending 与 MTP 状态按请求隔离。提供 2/4/8/16/32/64/128 档，其他数量补零到下一档，只推进真实请求的位置。Prefill 保留单请求大块路径，与 decode 交替推进；该包不合并不同请求的 prompt chunk，`--prefill-budget-ms` 不限制其单块耗时。构建入口见[Flash 模型工具](../tools/model/flash_next/README.md)。
+Flash Next 的 batch 包共享投影、MoE 路由、专家和输出头计算，GDN、卷积、PLE、QSA/KV/index/pending 与 MTP 状态按请求隔离。提供 2/4/8/16/32/64/128 专用档；附加动态回退包后，其他数量复用邻近容量的 AOT 算子，按真实行数执行。未附加动态回退的包仍补零到下一档。冷 prefill 保留单请求大块路径；有 decoder 等待时，按 `--prefill-budget-ms` 和完整分块实测耗时选择真实小块，与 decode 交替推进。该包不合并不同请求的 prompt chunk。预算是预测软目标，冷启动、长上下文和 checkpoint 可能超出；至少推进一个 token 以避免饥饿。预算控制文本主干分块，视觉编码器仍独立执行。调度统计提供 `prefill_chunk_histogram`、`bounded_prefill_iterations` 和 `max_bounded_prefill_s`；`batch_execution` 中的 `dynamic_graph_captures`、`dynamic_direct_iterations` 与 `graph_hits` 可用于核对动态回退和重放。构建入口见[Flash 模型工具](../tools/model/flash_next/README.md)。
+
+包含私有地址表的 Flash 包在每层用一套 GDN/QSA kernel 并行处理全部请求，包含临时缓冲区的隔离和批量卷积历史提交。请求地址在 Graph 重放前更新，补零行的地址为空；单请求仍走 M1 程序。
 
 请求的 KV 和 MTP hidden ring 按总 token 预算分配，长请求仍可使用完整容量。槽位复用时收缩过大的私有分配；显存准入受阻时保留一个空闲槽位并回收其余空闲槽位的普通缓冲区，下次准入前重新分配。实际活跃数取决于请求预算和可用显存，超过准入容量的请求排队。
 

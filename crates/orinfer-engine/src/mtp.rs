@@ -274,6 +274,45 @@ mod tests {
         }
     }
     #[test]
+    fn disabling_mtp_excludes_unmapped_draft_kv_from_prefix_snapshots() {
+        let mut model = manifest();
+        let mut draft = spec();
+        draft.draft_program = "draft".into();
+        for plan in &mut draft.warm_plans {
+            plan.program = "draft".into();
+        }
+        model.programs.insert("draft".into(), vec![]);
+        model
+            .reset_buffers
+            .extend(["TargetKV", "DraftKV", "SharedKV"].map(String::from));
+        model.kv_cache = Some(
+            serde_json::from_value(serde_json::json!({
+                "direct_prefill":true,"demand_mapping":true,
+                "buffers":{"TargetKV":8,"DraftKV":8,"SharedKV":8},
+                "growth":{
+                    "execute":{"position":"Step","tokens":1,"buffers":["TargetKV","SharedKV"]},
+                    "draft":{"position":"MtpStep","tokens":1,"buffers":["DraftKV","SharedKV"]}
+                }
+            }))
+            .unwrap(),
+        );
+        model.mtp = Some(draft);
+        crate::execution::LoadOptions {
+            mtp_drafts: Some(0),
+            ..Default::default()
+        }
+        .configure_mtp(&mut model)
+        .unwrap();
+        assert!(!model.reset_buffers.iter().any(|n| n == "DraftKV"));
+        for name in ["TargetKV", "SharedKV"] {
+            assert!(model.reset_buffers.iter().any(|n| n == name));
+        }
+        let kv = model.kv_cache.as_ref().unwrap();
+        assert!(kv.buffers.contains_key("DraftKV")); // Retain virtual allocation.
+        assert!(!kv.growth.contains_key("draft"));
+        assert!(kv.growth.contains_key("execute"));
+    }
+    #[test]
     fn draft_state_snapshot_requires_a_matching_restore_program() {
         let model = manifest();
         let mut spec = spec();

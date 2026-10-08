@@ -410,6 +410,22 @@ impl Executor {
     /// Retire captures before destroying reusable buffers. Graphs belonging to
     /// active sequences remain valid; idle sequence state is still warm.
     pub(crate) fn reclaim_idle_graphs(&mut self) -> Result<()> {
+        let has_idle_graphs = self
+            .batch_graphs
+            .borrow()
+            .keys()
+            .any(|key| key.iter().all(|(slot, _)| !self.sequences[*slot].leased))
+            || self.sequences.iter().enumerate().any(|(slot, sequence)| {
+                !sequence.leased
+                    && if slot == self.active_sequence {
+                        !self.graphs.borrow().is_empty()
+                    } else {
+                        !sequence.graphs.is_empty()
+                    }
+            });
+        if !has_idle_graphs {
+            return Ok(());
+        }
         self.sync()?;
         let keys: Vec<_> = self
             .batch_graphs
@@ -560,6 +576,27 @@ impl Executor {
                 .sum::<usize>()
         });
         for &slot in &idle {
+            // Admission retries must not synchronize and switch arenas that
+            // were already reclaimed. Keep the warm fixed buffers unchanged.
+            let release_fixed = Some(slot) != keep
+                && self.sequence_specs.iter().any(|b| {
+                    !self.sequence_strides.contains_key(&b.name)
+                        && self.sequences[slot].sizes[&b.name] != 0
+                });
+            let release_kv = {
+                let current = self.session.virtual_buffers.borrow();
+                let buffers = if slot == self.active_sequence {
+                    &*current
+                } else {
+                    &self.sequences[slot].reservations
+                };
+                self.sequence_strides
+                    .keys()
+                    .any(|name| buffers[name].mapped != 0)
+            };
+            if !release_fixed && !release_kv {
+                continue;
+            }
             self.activate_sequence(slot)?;
             self.sync()?;
             for (name, buffer) in self.session.virtual_buffers.get_mut().iter_mut() {
@@ -855,10 +892,10 @@ impl Executor {
         operations: &[Invocation],
         decode: bool,
     ) -> Result<()> {
+        let dynamic = operations.iter().any(|op| op.launch.is_some());
         let graph_enabled = (self.cuda_graph == crate::execution::CudaGraphMode::Full
             || (decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly))
-            && operations.len() <= BATCH_GRAPH_NODES
-            && key.len().is_power_of_two();
+            && operations.len() <= BATCH_GRAPH_NODES;
         if graph_enabled {
             let tick = self.batch_graph_clock.get().wrapping_add(1);
             self.batch_graph_clock.set(tick);
@@ -898,6 +935,7 @@ impl Executor {
                 let graph = self.capture(operations)?;
                 let mut statistics = self.batch_statistics.get();
                 statistics.capture_s += at.elapsed().as_secs_f64();
+                statistics.dynamic_graph_captures += usize::from(dynamic);
                 statistics.captured_operations += operations.len();
                 self.batch_statistics.set(statistics);
                 self.batch_graphs
@@ -925,6 +963,7 @@ impl Executor {
             self.sync()?;
             let mut statistics = self.batch_statistics.get();
             statistics.direct_s += at.elapsed().as_secs_f64();
+            statistics.dynamic_direct_iterations += usize::from(dynamic);
             self.batch_statistics.set(statistics);
         }
         Ok(())

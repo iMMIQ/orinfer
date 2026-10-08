@@ -18,6 +18,9 @@ pub struct BatchLayout {
     pub hidden: usize,
     #[serde(default)]
     pub small_mixed_shapes: Vec<usize>,
+    /// Architecture-owned address-table column order for private decode arenas.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_columns: Vec<String>,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

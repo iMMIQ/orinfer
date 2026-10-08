@@ -13,6 +13,7 @@ import tilelang
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 def _dtype(value):
@@ -22,12 +23,13 @@ def _dtype(value):
 
 
 @orin_jit
-def hc_norm(M: int, H: int, streams: int = 4, eps: float = 1e-6, dtype: str = 'bfloat16'):
+def hc_norm(M: int, H: int, streams: int = 4, eps: float = 1e-6, dtype: str = 'bfloat16', dynamic_rows: bool = False):
     """Build (Residual[M,streams,H], Weight[streams,H], Normed), dtype/F32/dtype."""
     _dtype(dtype)
     if any(type(x) is not int or x <= 0 for x in (M, H, streams)) or not 0 < eps < 1:
         raise ValueError('Invalid HC normalization dimensions/epsilon')
     width = 1 << (H - 1).bit_length()
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(Residual: T.Tensor((M, streams, H), dtype),
              Weight: T.Tensor((streams, H), T.float32),
@@ -46,11 +48,12 @@ def hc_norm(M: int, H: int, streams: int = 4, eps: float = 1e-6, dtype: str = 'b
 
 
 @orin_jit
-def hc_silu(M: int, rank: int, streams: int = 4, dtype: str = 'bfloat16'):
+def hc_silu(M: int, rank: int, streams: int = 4, dtype: str = 'bfloat16', dynamic_rows: bool = False):
     """Build (Down[M,rank], Activated), dividing by stream count before SiLU."""
     _dtype(dtype)
     if any(type(x) is not int or x <= 0 for x in (M, rank, streams)):
         raise ValueError('Invalid HC low-rank dimensions')
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(Down: T.Tensor((M, rank), dtype), Activated: T.Tensor((M, rank), dtype)):
         with T.Kernel(M, threads=128) as row:
@@ -61,11 +64,12 @@ def hc_silu(M: int, rank: int, streams: int = 4, dtype: str = 'bfloat16'):
 
 
 @orin_jit
-def hc_mix(M: int, H: int, streams: int = 4, dtype: str = 'bfloat16'):
+def hc_mix(M: int, H: int, streams: int = 4, dtype: str = 'bfloat16', dynamic_rows: bool = False):
     """Build (Normed[M,streams,H], Up[M,streams,H], Mixed[M,H])."""
     _dtype(dtype)
     if any(type(x) is not int or x <= 0 for x in (M, H, streams)):
         raise ValueError('Invalid HC mixing dimensions')
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(Normed: T.Tensor((M, streams, H), dtype),
              Up: T.Tensor((M, streams, H), dtype),
@@ -87,7 +91,7 @@ def hc_mix(M: int, H: int, streams: int = 4, dtype: str = 'bfloat16'):
 
 
 @orin_jit
-def hc_combine(M: int, H: int, streams: int = 4, dtype: str = 'bfloat16'):
+def hc_combine(M: int, H: int, streams: int = 4, dtype: str = 'bfloat16', dynamic_rows: bool = False):
     """Build (Block[M,H], Residual[M,streams,H], Inject[M,streams], Output).
 
     Inject is the linear projection of normed residuals before division/sigmoid.
@@ -97,6 +101,7 @@ def hc_combine(M: int, H: int, streams: int = 4, dtype: str = 'bfloat16'):
     _dtype(dtype)
     if any(type(x) is not int or x <= 0 for x in (M, H, streams)):
         raise ValueError('Invalid HC combination dimensions')
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(Block: T.Tensor((M, H), dtype),
              Residual: T.Tensor((M, streams, H), dtype),
@@ -155,7 +160,7 @@ def hc_combine_norm(M: int, H: int, streams: int = 4, eps: float = 1e-6,
 
 @orin_jit
 def hc_projection(M: int, N: int, K: int, block_m: int = 16, dtype: str = 'bfloat16', block_n: int = 64,
-                  silu: bool = False, streams: int = 4, group_m: int = 0):
+                  silu: bool = False, streams: int = 4, group_m: int = 0, dynamic_rows: bool = False):
     """Build (A[M,K], W[N,K], C[M,N]), stream dtype/BF16/stream dtype.
 
     FP32 accumulation, BF16 Tensor Core arithmetic, explicit output rounding.
@@ -169,6 +174,7 @@ def hc_projection(M: int, N: int, K: int, block_m: int = 16, dtype: str = 'bfloa
     if type(group_m) is not int or group_m not in (0,1,2,4,8):
         raise ValueError('Invalid HC row grouping')
     threads=64 if block_n==16 else 128
+    M = row_count(M, dynamic_rows)
     @T.macro
     def project(A,W,C,by,bx):
         a = T.alloc_shared((block_m, 64), T.bfloat16)
@@ -207,10 +213,11 @@ def hc_projection(M: int, N: int, K: int, block_m: int = 16, dtype: str = 'bfloa
 
 
 @orin_jit
-def hc_up_mix(M: int, H: int, rank: int, streams: int = 4):
+def hc_up_mix(M: int, H: int, rank: int, streams: int = 4, dynamic_rows: bool = False):
     """BF16 up projection and branch mix, preserving every FP16 boundary."""
     assert M>=1 and H%32==0 and rank%64==0 and streams==4
     bm,bn=16,32
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(A:T.Tensor((M,rank),T.float16), W:T.Tensor((streams*H,rank),T.bfloat16),
              Normed:T.Tensor((M,streams,H),T.float16), Out:T.Tensor((M,H),T.float16)):
@@ -245,7 +252,7 @@ def hc_up_mix(M: int, H: int, rank: int, streams: int = 4):
 
 
 @orin_jit
-def hc_injection(M: int, N: int, K: int, dtype: str = 'float16', threads: int = 256):
+def hc_injection(M: int, N: int, K: int, dtype: str = 'float16', threads: int = 256, dynamic_rows: bool = False):
     """Small-output HC projection with one CTA per token/output channel.
 
     Round activation operands to BF16, retain BF16 weights and reduce in FP32.
@@ -257,6 +264,7 @@ def hc_injection(M: int, N: int, K: int, dtype: str = 'float16', threads: int = 
             or threads not in (128,256)):
         raise ValueError('Invalid small HC projection dimensions')
     width = (K+threads-1)//threads*threads
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(A:T.Tensor((M,K),dtype),W:T.Tensor((N,K),T.bfloat16),Out:T.Tensor((M,N),dtype)):
         with T.Kernel(M,N,threads=threads) as (row,col):
@@ -273,7 +281,7 @@ def hc_injection(M: int, N: int, K: int, dtype: str = 'float16', threads: int = 
 
 
 @orin_jit
-def hc_down_partial(M: int, N: int, K: int, splits: int = 4):
+def hc_down_partial(M: int, N: int, K: int, splits: int = 4, dynamic_rows: bool = False):
     """BF16 Tensor Core HC Down slices with FP32 partial sums.
 
     Partials are transient plan workspace, overwritten completely on every
@@ -283,6 +291,7 @@ def hc_down_partial(M: int, N: int, K: int, splits: int = 4):
             or splits not in (2,4,8,16) or K%(64*splits)):
         raise ValueError('Invalid HC split-K dimensions')
     bm,bn=16,32
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(A:T.Tensor((M,K),T.float16),W:T.Tensor((N,K),T.bfloat16),
              Partials:T.Tensor((splits,M,N),T.float32)):
@@ -304,11 +313,12 @@ def hc_down_partial(M: int, N: int, K: int, splits: int = 4):
 
 
 @orin_jit
-def hc_down_finish(M: int, N: int, splits: int = 4, streams: int = 4):
+def hc_down_finish(M: int, N: int, splits: int = 4, streams: int = 4, dynamic_rows: bool = False):
     """Reduce FP32 HC Down slices, then round/divide/SiLU in original order."""
     if (any(type(x) is not int or x <= 0 for x in (M,N,streams))
             or splits not in (2,4,8,16)):
         raise ValueError('Invalid HC split-K epilogue dimensions')
+    M = row_count(M, dynamic_rows)
     @T.prim_func
     def main(Partials:T.Tensor((splits,M,N),T.float32),Out:T.Tensor((M,N),T.float16)):
         with T.Kernel(T.ceildiv(M*N,128),threads=128) as block:

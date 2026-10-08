@@ -35,6 +35,23 @@ impl Costs {
     pub fn restore_cost(&self, bytes: usize) -> f64 {
         bytes as f64 * self.restore_s_per_byte
     }
+    pub fn chunk_cost(&self, tokens: usize) -> f64 {
+        self.shapes
+            .get(&tokens)
+            .copied()
+            .flatten()
+            .unwrap_or(self.weight_pass_s * (tokens as f64 / 64.).max(1.))
+    }
+    /// Largest real profile within the estimated budget; one token guarantees
+    /// progress even when no profile fits. This is a soft scheduling target.
+    pub fn bounded_chunk(&self, remaining: usize, budget_ms: f64) -> usize {
+        self.shapes
+            .keys()
+            .copied()
+            .filter(|&n| n <= remaining && self.chunk_cost(n) * 1000. <= budget_ms)
+            .max()
+            .unwrap_or(1)
+    }
     fn span(&self, mut tokens: usize) -> f64 {
         let mut total = 0.;
         for (&chunk, &seconds) in self.shapes.iter().rev() {
@@ -124,5 +141,18 @@ mod tests {
         assert!(costs.admit(8, 512, 160 << 20, 0, &BTreeSet::new()));
         costs.observe_restore(160 << 20, 100.);
         assert!(costs.score(8, 512, 160 << 20).is_none());
+    }
+    #[test]
+    fn mixed_chunks_follow_measured_cost_and_never_pad_a_tail() {
+        let mut costs = Costs::new([16, 128, 512, 2048, 4096]);
+        assert_eq!(costs.bounded_chunk(8192, 200.), 128);
+        costs.observe(16, 0.04);
+        costs.observe(128, 0.25);
+        costs.observe(512, 0.6);
+        assert_eq!(costs.bounded_chunk(8192, 200.), 16);
+        assert_eq!(costs.bounded_chunk(8192, 700.), 512);
+        assert_eq!(costs.bounded_chunk(15, 200.), 1);
+        assert_eq!(costs.bounded_chunk(8192, 1.), 1);
+        assert_eq!(costs.bounded_chunk(8192, f64::INFINITY), 4096);
     }
 }
