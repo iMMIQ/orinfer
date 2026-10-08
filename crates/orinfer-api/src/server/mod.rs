@@ -66,6 +66,7 @@ enum ModelEvent {
     Chunk(Value),
     Complete(Value),
     Failed(String),
+    Unavailable(String),
 }
 
 fn stream_payload(event: Option<ModelEvent>) -> (String, bool) {
@@ -73,6 +74,7 @@ fn stream_payload(event: Option<ModelEvent>) -> (String, bool) {
         Some(ModelEvent::Chunk(value)) => (value.to_string(), false),
         Some(ModelEvent::Complete(_)) => ("[DONE]".into(), true),
         Some(ModelEvent::Failed(message)) => (json!({"error":{"message":message,"type":"server_error","code":"generation_error"}}).to_string(), true),
+        Some(ModelEvent::Unavailable(message)) => (json!({"error":{"message":message,"type":"server_error","code":"service_unavailable"}}).to_string(), true),
         None => (json!({"error":{"message":"GPU worker disconnected before completion","type":"server_error","code":"worker_disconnected"}}).to_string(), true),
     }
 }
@@ -485,6 +487,7 @@ async fn completions(
                     return retain_output_memory(Json(response).into_response(), memory);
                 }
                 ModelEvent::Failed(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+                ModelEvent::Unavailable(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e),
                 ModelEvent::Chunk(_) => {}
             }
         }
@@ -582,6 +585,23 @@ mod stream_tests {
         release.send(()).unwrap();
         assert!(wait_worker(&worker, 1000).await);
         worker.join().unwrap();
+    }
+    #[tokio::test]
+    async fn capacity_rejection_is_a_service_error_in_http_and_sse() {
+        use axum::body::to_bytes;
+        let (payload, terminal) = stream_payload(Some(ModelEvent::Unavailable("capacity".into())));
+        assert!(terminal);
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap()["error"]["code"],
+            "service_unavailable"
+        );
+        let response = error(StatusCode::SERVICE_UNAVAILABLE, "capacity");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+            "service_unavailable"
+        );
     }
     #[test]
     fn abnormal_worker_eof_cannot_look_like_successful_partial_output() {

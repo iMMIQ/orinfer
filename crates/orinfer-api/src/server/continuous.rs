@@ -109,7 +109,7 @@ impl Mailbox {
         }
         let size = match &event {
             ModelEvent::Chunk(v) | ModelEvent::Complete(v) => v.to_string().len(),
-            ModelEvent::Failed(s) => s.len(),
+            ModelEvent::Failed(s) | ModelEvent::Unavailable(s) => s.len(),
         };
         let ceiling = match &event {
             ModelEvent::Complete(_) if self.job.prepared.sampling.top_logprobs.is_some() => self
@@ -576,11 +576,17 @@ pub(super) fn worker(
                             Err(error) => {
                                 let failure =
                                     orinfer_engine::error::EngineError::take(error.clone(), false);
+                                let unavailable =
+                                    failure.kind == orinfer_engine::error::ErrorKind::Capacity;
                                 if failure.is_fatal() {
                                     lifecycle.fail(failure);
                                 }
                                 let mut mailbox = Mailbox::new(job);
-                                mailbox.send(ModelEvent::Failed(error));
+                                mailbox.send(if unavailable {
+                                    ModelEvent::Unavailable(error)
+                                } else {
+                                    ModelEvent::Failed(error)
+                                });
                                 completed.push(mailbox);
                             }
                         }
@@ -590,12 +596,18 @@ pub(super) fn worker(
                     Err(error) => {
                         let failure =
                             orinfer_engine::error::EngineError::take(error.clone(), false);
+                        let unavailable =
+                            failure.kind == orinfer_engine::error::ErrorKind::Capacity;
                         if failure.is_fatal() {
                             lifecycle.fail(failure);
                         }
                         let job = waiting.remove(i);
                         let mut mailbox = Mailbox::new(job);
-                        mailbox.send(ModelEvent::Failed(error));
+                        mailbox.send(if unavailable {
+                            ModelEvent::Unavailable(error)
+                        } else {
+                            ModelEvent::Failed(error)
+                        });
                         completed.push(mailbox);
                         admitted = true;
                         break;

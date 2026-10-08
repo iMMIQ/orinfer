@@ -424,7 +424,7 @@ impl ModelRuntime {
         if self.reserved_requests.is_empty() {
             let since = self.idle_admission_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= std::time::Duration::from_secs(2) {
-                return Err(format!(
+                let message = format!(
                     "Request context/output budget exceeds available inference memory (free {} MiB, CUDA free {}, host budget {}, required {} MiB: state {}, KV {}, future {}, workspace {})",
                     self.admission_free_bytes()? >> 20,
                     self.execution.free_bytes()? >> 20,
@@ -434,7 +434,9 @@ impl ModelRuntime {
                     kv >> 20,
                     future >> 20,
                     workspace >> 20
-                ));
+                );
+                crate::error::record_capacity();
+                return Err(message);
             }
         } else {
             self.idle_admission_since = None;
