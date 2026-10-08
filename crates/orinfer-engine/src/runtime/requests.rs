@@ -164,6 +164,19 @@ impl ModelRuntime {
                 );
             }
         }
+        if let Some(name) = &self.request_hidden_ring {
+            let buffer = self
+                .manifest
+                .buffers
+                .iter()
+                .find(|b| &b.name == name)
+                .ok_or("Missing request hidden ring")?;
+            let rows = buffer.shape[0];
+            // Kernels retain their full-ring modulo. A request shorter than
+            // that ring can only address rows below its total token budget.
+            let allocated_rows = context.next_power_of_two().min(rows);
+            limits.insert(name.clone(), allocated_rows * (buffer.bytes()? / rows));
+        }
         if let Some(v) = &self.manifest.vision {
             let features = input.images.iter().try_fold(0usize, |sum, image| {
                 sum.checked_add(v.feature_count(image)?)
@@ -215,21 +228,40 @@ impl ModelRuntime {
         }
         let context = self.validate_generation(input)?;
         let limits = self.request_limits(input)?;
-        let fixed = self.execution.additional_state_bytes(&limits)?;
-        let prospective = self.execution.reserved_kv_bytes(context)?;
+        let mut fixed = self.execution.additional_state_bytes(&limits)?;
+        let mut prospective = self.execution.additional_kv_bytes(context, &limits)?;
         let workspace = self.pending_workspace(context)?;
         let future = self
             .reserved_requests
             .values()
             .map(|r| r.kv_bytes)
             .sum::<usize>()
-            .saturating_sub(self.execution.resident_kv_bytes());
-        let needed = fixed
+            .saturating_sub(self.execution.active_kv_bytes());
+        let mut needed = fixed
             .checked_add(prospective)
             .and_then(|n| n.checked_add(future))
             .and_then(|n| n.checked_add(workspace))
             .and_then(|n| n.checked_add(options.memory_reserve_bytes))
             .ok_or("Admission budget overflow")?;
+        // Reclaim idle arenas before evicting useful prefixes. Snapshot bytes
+        // are only prospective capacity; they must not hide idle allocations
+        // or graphs that need releasing under current memory pressure.
+        if self.admission_free_bytes()? < needed {
+            self.execution.reclaim_idle_graphs()?;
+        }
+        if self.admission_free_bytes()? < needed {
+            self.execution.reclaim_idle_state()?;
+            let additional = self.execution.additional_kv_bytes(context, &limits)?;
+            let state = self.execution.additional_state_bytes(&limits)?;
+            needed = needed
+                .checked_sub(prospective)
+                .and_then(|n| n.checked_sub(fixed))
+                .and_then(|n| n.checked_add(additional))
+                .and_then(|n| n.checked_add(state))
+                .ok_or("Reclaimed KV budget overflow")?;
+            fixed = state;
+            prospective = additional;
+        }
         if self
             .admission_free_bytes()?
             .saturating_add(self.prefix_cache.bytes)
@@ -237,24 +269,47 @@ impl ModelRuntime {
         {
             // Releasing every cache entry still cannot satisfy the outstanding
             // reservations. Keep useful prefixes until active work completes.
-            self.scheduler_statistics.admission_deferrals += 1;
-            if self.reserved_requests.is_empty() {
-                return Err("Request context/output budget exceeds available GPU memory".into());
-            }
-            return Ok(false);
+            return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
         }
         while self.admission_free_bytes()? < needed {
             let Some(snapshot) = self.prefix_cache.evict_one() else {
-                self.scheduler_statistics.admission_deferrals += 1;
-                if self.reserved_requests.is_empty() {
-                    return Err("Request context/output budget exceeds available GPU memory".into());
-                }
-                return Ok(false);
+                return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
             };
             self.execution.release_snapshot(snapshot)?;
         }
         self.trim_request_cache(options, fixed + prospective, context)?;
+        self.idle_admission_since = None;
         Ok(true)
+    }
+    fn defer_memory_admission(
+        &mut self,
+        needed: usize,
+        fixed: usize,
+        kv: usize,
+        future: usize,
+        workspace: usize,
+    ) -> Result<bool> {
+        self.scheduler_statistics.admission_deferrals += 1;
+        // Driver/host accounting can recover after releasing the last arena.
+        // Let the worker queue and recheck instead of failing in that transient
+        // window. A persistently oversized request still fails after two seconds.
+        if self.reserved_requests.is_empty() {
+            let since = self.idle_admission_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= std::time::Duration::from_secs(2) {
+                return Err(format!(
+                    "Request context/output budget exceeds available GPU memory (free {} MiB, required {} MiB: state {}, KV {}, future {}, workspace {})",
+                    self.admission_free_bytes()? >> 20,
+                    needed >> 20,
+                    fixed >> 20,
+                    kv >> 20,
+                    future >> 20,
+                    workspace >> 20
+                ));
+            }
+        } else {
+            self.idle_admission_since = None;
+        }
+        Ok(false)
     }
     fn admission_free_bytes(&self) -> Result<usize> {
         Ok(self
@@ -284,7 +339,7 @@ impl ModelRuntime {
             .values()
             .map(|r| r.kv_bytes)
             .sum::<usize>()
-            .saturating_sub(self.execution.resident_kv_bytes())
+            .saturating_sub(self.execution.active_kv_bytes())
             .checked_add(self.pending_workspace(context)?)
             .ok_or("Future workspace budget overflow")?;
         let free = self.admission_free_bytes()?;
@@ -317,7 +372,7 @@ impl ModelRuntime {
         let slot = self.execution.lease_sequence(&limits)?;
         let result = (|| {
             self.execution
-                .reset_sequence(&self.manifest.reset_buffers)?;
+                .reset_sequence_reusing_pages(&self.manifest.reset_buffers)?;
             self.prepare_visual_capacity(&input.input_tokens, &input.images, context, cancelled)?;
             let media = self.prefix_media(&input.input_tokens, &input.images)?;
             let mut prefix = super::prefix::Context::default();
@@ -773,8 +828,12 @@ impl ModelRuntime {
                 .max()
                 .unwrap();
         }
+        let mixed = self.manifest.batch_layout.as_ref().is_none_or(|layout| {
+            !layout.small_mixed_shapes.is_empty() || self.manifest.batch_profiles.is_empty()
+        });
         let joint_prefill = long_joint
-            || (decode.is_empty()
+            || (mixed
+                && decode.is_empty()
                 && prefills.len() > 1
                 && prefills
                     .iter()
@@ -786,9 +845,18 @@ impl ModelRuntime {
             let rotate = self.scheduler_cursor % decode.len();
             decode.rotate_left(rotate);
         }
+        // Packages without mixed prompt profiles retain their dense chunk path.
+        // Alternate prompt and decode work so arrivals cannot starve either side.
+        if let Some(i) = prefill
+            && !mixed
+            && self.scheduler_statistics.iterations.is_multiple_of(2)
+        {
+            return Ok(Work::Prefill(i));
+        }
         // Even a one-row configuration must advance waiting prompt work.
         let reserve = usize::from(
             prefill.is_some()
+                && mixed
                 && (cap > 1 || self.scheduler_statistics.iterations.is_multiple_of(2)),
         );
         decode.truncate(cap - reserve);
@@ -796,7 +864,7 @@ impl ModelRuntime {
         let mut selected: Vec<_> = decode.iter().map(|&i| (i, 1)).collect();
         self.pack_prefill(
             requests,
-            &prefills,
+            if mixed { &prefills } else { &[] },
             &mut selected,
             cap,
             if joint_prefill {
@@ -973,6 +1041,16 @@ impl ModelRuntime {
                     .clone()
             };
             self.execution.ensure_sequence_program(req.slot, &program)?;
+            let (tokens, history) = if req.prefilling {
+                (
+                    &req.input[req.offset..req.offset + chunk],
+                    &req.input[..req.offset],
+                )
+            } else {
+                let last = req.history.len() - 1;
+                (&req.history[last..], &req.history[..last])
+            };
+            self.prepare_inputs(tokens, history)?;
         }
         if let Some(table) = self.manifest.state_pointer_table.as_ref().filter(|table| {
             segments.iter().map(|s| s.tokens).sum::<usize>() <= table.max_rows

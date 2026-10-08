@@ -198,14 +198,16 @@ class Model:
             export_kernel(self.kernels[key], self.output / 'aot' / key)
         return self.kernels[key]
 
-    def plan(self, m, *, verify=False):
+    def plan(self, m, *, verify=False, all_logits=False):
         from tools.model.flash_next.chunks import index_capacity
         if type(m) is not int or not 1 <= m <= min(4096,self.capacity):
             raise ValueError('Recurrent plan supports chunks of 1..4096 within context')
         # A draft head refresh can occur at a completely filled context and
         # runs only head operators. execute separately rejects body overflow.
         index_cap=index_capacity(min(self.capacity,self.position+m),self.capacity)
-        key=(m,index_cap,verify)
+        if all_logits and (verify or self.is_mtp or m > 128):
+            raise ValueError('Decode batch head supports target rows 1..128')
+        key=(m,index_cap,verify,True) if all_logits else (m,index_cap,verify)
         if key in self.plans:
             return self.plans[key]
         if verify and (self.is_mtp or not 1<=m<=8):raise ValueError('Target verification supports 1..8 inputs')
@@ -226,7 +228,8 @@ class Model:
         labels = []
         prefix_states={}
         prefix_updates={}
-        workspace=self.workspaces.setdefault(('prefill',False) if m>=256 else (m,verify),{})
+        workspace_key=('prefill',False) if m>=256 else (m,verify,True) if all_logits else (m,verify)
+        workspace=self.workspaces.setdefault(workspace_key,{})
         allocation=0
         def empty(shape, dtype=torch.float16, *, index=False, reserve=0):
             nonlocal allocation
@@ -523,10 +526,10 @@ class Model:
             call(f'hc-combine-{m}',lambda:hc_combine(m,h,c,'float16'),block,residual,inject_ffn,residual)
         body_count=len(ops)
         mixer('output_hc_',None)
-        head_rows=m if verify else 1
+        head_rows=m if verify or all_logits else 1
         head_vocab=len(self.draft_vocab) if self.draft_vocab is not None else self.V
         output=empty((head_rows,head_vocab),torch.float32)
-        projection('head',mixed if verify else mixed[-1:],
+        projection('head',mixed if verify or all_logits else mixed[-1:],
                    'draft_output.weight' if self.draft_vocab is not None else 'output.weight',output,rows=head_rows)
         blocks=(head_vocab+1023)//1024
         top_values=empty((head_rows*blocks,),torch.float32)

@@ -1,3 +1,4 @@
+mod flash_batch;
 use super::*;
 use serde::Deserialize;
 use serde_json::json;
@@ -146,6 +147,7 @@ fn benchmark_prefill_scheduling() {
                             .unwrap();
                         model.finish_request(request, false).unwrap();
                     }
+                    model.execution.reclaim_idle_state().unwrap();
                     assert_eq!(model.execution.resident_kv_bytes(), 0);
                     let tokens = source.input_tokens.len() * count;
                     let row = json!({"mode":if joint {"joint"} else {"serial_large"},
@@ -421,6 +423,7 @@ fn validate_joint_prefill_requests() {
         for request in &mut requests {
             model.finish_request(request, false).unwrap();
         }
+        model.execution.reclaim_idle_state().unwrap();
         assert_eq!(model.execution.resident_kv_bytes(), 0);
         let prompt_tokens: usize = (0..count)
             .map(|i| fixture.cases[i % fixture.cases.len()].input_tokens.len())
@@ -665,6 +668,7 @@ fn validate_continuous_requests() {
     model.finish_request(&mut reused, true).unwrap();
     model.finish_request(&mut survivor, true).unwrap();
     assert!(model.reserved_requests.is_empty());
+    model.execution.reclaim_idle_state().unwrap();
     assert_eq!(model.execution.resident_kv_bytes(), 0);
     rows.push(json!({"cancel_reuse_reorder_state_equal":true}));
     eprintln!("all private buffers: cancellation and reuse isolation passed");
@@ -682,6 +686,7 @@ fn validate_continuous_requests() {
         model.finish_request(request, false).unwrap();
     }
     assert!(model.reserved_requests.is_empty());
+    model.execution.reclaim_idle_state().unwrap();
     assert_eq!(model.execution.resident_kv_bytes(), 0);
     rows.push(json!({"short_request_arenas":32,"reservation_cleanup":true}));
     // Cold mixed prefill must exercise the new recurrent 32/64/128 profiles,

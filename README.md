@@ -8,7 +8,7 @@ LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang
 
 - OpenAI Chat Completions API，支持流式输出、thinking、采样、严格函数调用、JSON Schema 约束和 token 概率。
 - 27B 使用单份 W4；Flash Next 使用自有 E8P Q2 专家和 W8 投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
-- 分块 prefill、独立请求状态及 prefix cache，两种模型都支持原生 MTP。27B 支持连续批处理；Flash Next 采用单个活跃请求、其余排队。 Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。
+- 分块 prefill、独立请求状态及 prefix cache，两种模型都支持原生 MTP。两种模型均可通过对应算子包启用连续批处理，内存不足时排队。Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。
 - 混合架构 prefix cache、INT8 KV 和按需映射内存；模型包可配置最长 256K 上下文。
 - CUDA Graph 提供 `decode_only`、`full`、`off` 三种模式，默认 `decode_only`。
 

@@ -5,6 +5,26 @@ use crate::{execution::Invocation, model::Operation};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+// Count nodes as well as entries: a large batch graph has thousands of nodes.
+// Oversized plans retain direct execution rather than exceeding this budget.
+const BATCH_GRAPH_NODES: usize = 12288;
+
+fn batch_graph_victim(
+    cache: &super::executor::BatchGraphCache,
+    incoming: usize,
+) -> Option<Vec<(usize, usize)>> {
+    if cache.len() < 16
+        && cache.values().map(|(_, _, nodes, _)| nodes).sum::<usize>() + incoming
+            <= BATCH_GRAPH_NODES
+    {
+        return None;
+    }
+    cache
+        .iter()
+        .min_by_key(|(_, (_, last, _, hits))| (*hits, *last))
+        .map(|(key, _)| key.clone())
+}
+
 #[derive(Default)]
 pub(super) struct Sequence {
     pub addresses: BTreeMap<String, u64>,
@@ -49,7 +69,12 @@ impl Executor {
         self.sequences[self.active_sequence]
             .sizes
             .iter()
-            .map(|(n, &bytes)| (n.clone(), reservations.get(n).map_or(bytes, |r| r.mapped)))
+            .map(|(n, &bytes)| {
+                (
+                    n.clone(),
+                    reservations.get(n).map_or(bytes, |r| r.mapped.min(bytes)),
+                )
+            })
             .collect()
     }
     pub(crate) fn free_bytes(&self) -> Result<usize> {
@@ -73,10 +98,7 @@ impl Executor {
             })
     }
     pub(crate) fn lease_sequence(&mut self, limits: &BTreeMap<String, usize>) -> Result<usize> {
-        let reused = self
-            .sequences
-            .iter()
-            .position(|s| !s.leased && !s.quarantined);
+        let reused = self.idle_sequence(limits)?;
         let result = self.lease_sequence_inner(limits);
         if result.is_err()
             && let Some(slot) = reused
@@ -84,6 +106,43 @@ impl Executor {
             self.sequences[slot].quarantined = true;
         }
         result
+    }
+    fn idle_sequence(&self, limits: &BTreeMap<String, usize>) -> Result<Option<usize>> {
+        let current = self.session.virtual_buffers.borrow();
+        let mut best = None;
+        for (slot, sequence) in self.sequences.iter().enumerate() {
+            if sequence.leased || sequence.quarantined {
+                continue;
+            }
+            let reservations = if slot == self.active_sequence {
+                &*current
+            } else {
+                &sequence.reservations
+            };
+            let cost = self.sequence_specs.iter().try_fold(0usize, |sum, b| {
+                let bytes = limits.get(&b.name).copied().unwrap_or(b.bytes()?);
+                let additional = if let Some(&stride) = self.sequence_strides.get(&b.name) {
+                    let r = &reservations[&b.name];
+                    let extent = r.required_extent(bytes.div_ceil(stride))?;
+                    if extent > r.bytes {
+                        extent
+                    } else {
+                        extent.saturating_sub(r.mapped)
+                    }
+                } else {
+                    bytes.saturating_sub(sequence.sizes[&b.name])
+                };
+                sum.checked_add(additional)
+                    .ok_or("Idle sequence budget overflow".to_string())
+            })?;
+            if best.is_none_or(|(_, old)| cost < old) {
+                best = Some((slot, cost));
+            }
+            if cost == 0 {
+                break;
+            }
+        }
+        Ok(best.map(|(slot, _)| slot))
     }
     fn lease_sequence_inner(&mut self, limits: &BTreeMap<String, usize>) -> Result<usize> {
         for (name, &bytes) in limits {
@@ -97,11 +156,7 @@ impl Executor {
                 return Err("Invalid private buffer limit".into());
             }
         }
-        if let Some(slot) = self
-            .sequences
-            .iter()
-            .position(|s| !s.leased && !s.quarantined)
-        {
+        if let Some(slot) = self.idle_sequence(limits)? {
             self.activate_sequence(slot)?;
             let needed: Vec<_> = self
                 .sequence_specs
@@ -114,13 +169,27 @@ impl Executor {
                 })
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
-                .filter(|(n, b)| self.sequences[slot].sizes[n] < *b)
+                .filter(|(n, b)| {
+                    let old = self.sequences[slot].sizes[n];
+                    old < *b || (limits.contains_key(n) && old.saturating_sub(*b) >= 65536)
+                })
                 .collect();
             if !needed.is_empty() {
                 self.sync()?;
-                self.invalidate_current_graphs()?;
+                let replace = needed.iter().any(|(name, bytes)| {
+                    !self.sequence_strides.contains_key(name)
+                        || *bytes > self.session.virtual_buffers.borrow()[name].bytes
+                });
+                if replace {
+                    self.invalidate_current_graphs()?;
+                }
                 for (name, bytes) in needed {
                     if let Some(&stride) = self.sequence_strides.get(&name) {
+                        if bytes <= self.session.virtual_buffers.get_mut()[&name].bytes {
+                            self.sequences[slot].sizes.insert(name.clone(), bytes);
+                            self.sizes.insert(name, bytes);
+                            continue;
+                        }
                         let replacement = super::virtual_memory::Reservation::reserve(
                             &self.session,
                             bytes,
@@ -174,8 +243,10 @@ impl Executor {
                             "initialize request metadata",
                         )?;
                         let old = self.sequences[slot].addresses[&name];
-                        check((self.session.driver.free)(old), "free idle metadata")?;
-                        self.session.buffers.retain(|&p| p != old);
+                        if old != 0 {
+                            check((self.session.driver.free)(old), "free idle metadata")?;
+                            self.session.buffers.retain(|&p| p != old);
+                        }
                     }
                     self.sequences[slot].addresses.insert(name.clone(), address);
                     self.sequences[slot].sizes.insert(name.clone(), bytes);
@@ -293,17 +364,25 @@ impl Executor {
         Ok(())
     }
     fn invalidate_current_graphs(&mut self) -> Result<()> {
+        let keys: Vec<_> = self
+            .batch_graphs
+            .get_mut()
+            .keys()
+            .filter(|key| key.iter().any(|(slot, _)| *slot == self.active_sequence))
+            .cloned()
+            .collect();
         let mut statistics = self.batch_statistics.get();
-        statistics.graph_invalidations += self.batch_graphs.get_mut().len();
+        statistics.graph_invalidations += keys.len();
         self.batch_statistics.set(statistics);
         let mut execs: Vec<_> = std::mem::take(self.graphs.get_mut())
             .into_values()
             .collect();
-        execs.extend(
-            std::mem::take(self.batch_graphs.get_mut())
-                .into_values()
-                .map(|(g, _)| g),
-        );
+        for key in keys {
+            execs.push(self.batch_graphs.get_mut().remove(&key).unwrap().0);
+        }
+        self.destroy_graphs(&execs)
+    }
+    fn destroy_graphs(&self, execs: &[Handle]) -> Result<()> {
         let mut owned = self.session.graphs.borrow_mut();
         let mut index = 0;
         while index < owned.len() {
@@ -328,6 +407,36 @@ impl Executor {
         }
         Ok(())
     }
+    /// Retire captures before destroying reusable buffers. Graphs belonging to
+    /// active sequences remain valid; idle sequence state is still warm.
+    pub(crate) fn reclaim_idle_graphs(&mut self) -> Result<()> {
+        self.sync()?;
+        let keys: Vec<_> = self
+            .batch_graphs
+            .get_mut()
+            .keys()
+            .filter(|key| key.iter().all(|(slot, _)| !self.sequences[*slot].leased))
+            .cloned()
+            .collect();
+        let mut execs = Vec::new();
+        for key in keys {
+            execs.push(self.batch_graphs.get_mut().remove(&key).unwrap().0);
+        }
+        for (slot, sequence) in self.sequences.iter_mut().enumerate() {
+            if !sequence.leased {
+                let graphs = if slot == self.active_sequence {
+                    self.graphs.get_mut()
+                } else {
+                    &mut sequence.graphs
+                };
+                execs.extend(std::mem::take(graphs).into_values());
+            }
+        }
+        let mut statistics = self.batch_statistics.get();
+        statistics.graph_evictions += execs.len();
+        self.batch_statistics.set(statistics);
+        self.destroy_graphs(&execs)
+    }
     pub(crate) fn reserved_kv_bytes(&self, tokens: usize) -> Result<usize> {
         self.sequence_strides.keys().try_fold(0usize, |sum, name| {
             let r = self.session.virtual_buffers.borrow();
@@ -339,6 +448,7 @@ impl Executor {
             .ok_or("KV reservation sum overflow".into())
         })
     }
+    #[cfg(test)]
     pub(crate) fn resident_kv_bytes(&self) -> usize {
         self.session
             .virtual_buffers
@@ -354,6 +464,54 @@ impl Executor {
                 .map(|r| r.mapped)
                 .sum::<usize>()
     }
+    pub(crate) fn active_kv_bytes(&self) -> usize {
+        let current = if self.sequences[self.active_sequence].leased {
+            self.session
+                .virtual_buffers
+                .borrow()
+                .iter()
+                .filter(|(name, _)| self.sequence_strides.contains_key(*name))
+                .map(|(_, r)| r.mapped)
+                .sum()
+        } else {
+            0
+        };
+        current
+            + self
+                .sequences
+                .iter()
+                .filter(|s| s.leased)
+                .flat_map(|s| s.reservations.values())
+                .map(|r| r.mapped)
+                .sum::<usize>()
+    }
+    pub(crate) fn additional_kv_bytes(
+        &self,
+        tokens: usize,
+        limits: &BTreeMap<String, usize>,
+    ) -> Result<usize> {
+        let Some(slot) = self.idle_sequence(limits)? else {
+            return self.reserved_kv_bytes(tokens);
+        };
+        let sequence = &self.sequences[slot];
+        let current = self.session.virtual_buffers.borrow();
+        let buffers = if slot == self.active_sequence {
+            &*current
+        } else {
+            &sequence.reservations
+        };
+        self.sequence_strides.keys().try_fold(0usize, |sum, name| {
+            let r = buffers.get(name).ok_or("Missing idle KV reservation")?;
+            let extent = r.required_extent(tokens)?;
+            let additional = if extent > r.bytes {
+                extent
+            } else {
+                extent.saturating_sub(r.mapped)
+            };
+            sum.checked_add(additional)
+                .ok_or("Additional KV budget overflow".into())
+        })
+    }
     pub(crate) fn pending_prefill_workspace_bytes(&self, tokens: usize) -> Result<usize> {
         let reservations = self.session.virtual_buffers.borrow();
         self.prefill_workspace
@@ -365,20 +523,93 @@ impl Executor {
             })
     }
     pub(crate) fn additional_state_bytes(&self, limits: &BTreeMap<String, usize>) -> Result<usize> {
-        if let Some(s) = self.sequences.iter().find(|s| !s.leased && !s.quarantined) {
-            Ok(limits
+        if let Some(slot) = self.idle_sequence(limits)? {
+            let s = &self.sequences[slot];
+            self.sequence_specs
                 .iter()
-                .filter(|(name, _)| !self.sequence_strides.contains_key(*name))
-                .map(|(n, b)| b.saturating_sub(s.sizes[n]))
-                .sum())
+                .filter(|b| !self.sequence_strides.contains_key(&b.name))
+                .try_fold(0usize, |sum, b| {
+                    sum.checked_add(
+                        limits
+                            .get(&b.name)
+                            .copied()
+                            .unwrap_or(b.bytes()?)
+                            .saturating_sub(s.sizes[&b.name]),
+                    )
+                    .ok_or("Additional state budget overflow".into())
+                })
         } else {
             self.request_fixed_bytes(limits)
         }
     }
+    /// Keep one warm idle arena; reclaim the others only under admission
+    /// pressure. Empty ordinary buffers are rebuilt before their next lease.
+    pub(crate) fn reclaim_idle_state(&mut self) -> Result<()> {
+        let idle: Vec<_> = self
+            .sequences
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.leased && !s.quarantined)
+            .map(|(i, _)| i)
+            .collect();
+        let keep = idle.iter().copied().max_by_key(|&slot| {
+            self.sequence_specs
+                .iter()
+                .filter(|b| !self.sequence_strides.contains_key(&b.name))
+                .map(|b| self.sequences[slot].sizes[&b.name])
+                .sum::<usize>()
+        });
+        for &slot in &idle {
+            self.activate_sequence(slot)?;
+            self.sync()?;
+            for (name, buffer) in self.session.virtual_buffers.get_mut().iter_mut() {
+                if self.sequence_strides.contains_key(name) {
+                    buffer.release_slabs(&self.session.driver)?;
+                }
+            }
+            if Some(slot) == keep {
+                continue;
+            }
+            let names: Vec<_> = self
+                .sequence_specs
+                .iter()
+                .filter(|b| {
+                    !self.sequence_strides.contains_key(&b.name)
+                        && self.sequences[slot].sizes[&b.name] != 0
+                })
+                .map(|b| b.name.clone())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            self.activate_sequence(slot)?;
+            self.sync()?;
+            self.invalidate_current_graphs()?;
+            self.sequences[slot].quarantined = true;
+            for name in names {
+                let address = self.sequences[slot].addresses[&name];
+                // SAFETY: Unleased arena, synchronized stream, invalidated
+                // graphs. Ownership is removed immediately after successful free.
+                unsafe {
+                    check(
+                        (self.session.driver.free)(address),
+                        "reclaim idle request state",
+                    )?;
+                }
+                self.session.buffers.retain(|&p| p != address);
+                self.sequences[slot].addresses.insert(name.clone(), 0);
+                self.sequences[slot].sizes.insert(name.clone(), 0);
+                self.pointers.insert(name.clone(), 0);
+                self.sizes.insert(name, 0);
+            }
+            self.sequences[slot].quarantined = false;
+        }
+        Ok(())
+    }
     pub(crate) fn release_sequence(&mut self, slot: usize, resets: &[String]) -> Result<()> {
         let result = self
             .activate_sequence(slot)
-            .and_then(|()| self.reset_sequence(resets));
+            .and_then(|()| self.reset_sequence_reusing_pages(resets));
         if let Err(error) = result {
             self.sequences[slot].quarantined = true;
             return Err(error);
@@ -624,8 +855,10 @@ impl Executor {
         operations: &[Invocation],
         decode: bool,
     ) -> Result<()> {
-        let graph_enabled = self.cuda_graph == crate::execution::CudaGraphMode::Full
-            || (decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly);
+        let graph_enabled = (self.cuda_graph == crate::execution::CudaGraphMode::Full
+            || (decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly))
+            && operations.len() <= BATCH_GRAPH_NODES
+            && key.len().is_power_of_two();
         if graph_enabled {
             let tick = self.batch_graph_clock.get().wrapping_add(1);
             self.batch_graph_clock.set(tick);
@@ -633,8 +866,9 @@ impl Executor {
                 .batch_graphs
                 .borrow_mut()
                 .get_mut(&key)
-                .map(|(g, last)| {
+                .map(|(g, last, _, hits)| {
                     *last = tick;
+                    *hits = hits.saturating_add(1);
                     *g
                 });
             let graph = if let Some(graph) = cached {
@@ -648,34 +882,13 @@ impl Executor {
                 self.batch_statistics.set(statistics);
                 // Bound graph cache size; varying slot memberships cannot retain
                 // unbounded captures. Stream is synchronized before destruction.
-                if self.batch_graphs.borrow().len() >= 16 {
+                loop {
+                    let victim = batch_graph_victim(&self.batch_graphs.borrow(), operations.len());
+                    let Some(key) = victim else { break };
                     let at = Instant::now();
                     self.sync()?;
-                    let victim = self
-                        .batch_graphs
-                        .borrow()
-                        .iter()
-                        .min_by_key(|(_, (_, last))| *last)
-                        .map(|(k, (g, _))| (k.clone(), *g))
-                        .expect("nonempty graphs");
-                    self.batch_graphs.borrow_mut().remove(&victim.0);
-                    let mut owned = self.session.graphs.borrow_mut();
-                    if let Some(index) = owned.iter().position(|(_, e)| *e == victim.1) {
-                        let (g, e) = owned[index];
-                        // SAFETY: Completed graph is removed from all owners.
-                        unsafe {
-                            check(
-                                (self.session.driver.graph_exec_destroy)(e),
-                                "evict batch graph",
-                            )?;
-                            owned[index].1 = std::ptr::null_mut();
-                            check(
-                                (self.session.driver.graph_destroy)(g),
-                                "evict batch capture",
-                            )?;
-                        }
-                        owned.remove(index);
-                    }
+                    let graph = self.batch_graphs.borrow_mut().remove(&key).unwrap().0;
+                    self.destroy_graphs(&[graph])?;
                     let mut statistics = self.batch_statistics.get();
                     statistics.graph_evictions += 1;
                     statistics.eviction_s += at.elapsed().as_secs_f64();
@@ -687,7 +900,9 @@ impl Executor {
                 statistics.capture_s += at.elapsed().as_secs_f64();
                 statistics.captured_operations += operations.len();
                 self.batch_statistics.set(statistics);
-                self.batch_graphs.borrow_mut().insert(key, (graph, tick));
+                self.batch_graphs
+                    .borrow_mut()
+                    .insert(key, (graph, tick, operations.len(), 1));
                 graph
             };
             let at = Instant::now();
@@ -901,5 +1116,29 @@ impl Drop for Executor {
                 buffers.insert(format!("@{slot}/{name}"), reservation);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod graph_cache_tests {
+    use super::*;
+    #[test]
+    fn node_budget_evicts_coldest_before_entry_limit() {
+        let mut cache = super::super::executor::BatchGraphCache::new();
+        cache.insert(vec![(2, 1)], (ptr::null_mut(), 8, 8000, 1));
+        cache.insert(vec![(0, 1)], (ptr::null_mut(), 3, 3000, 1));
+        assert_eq!(batch_graph_victim(&cache, 1288), None);
+        assert_eq!(batch_graph_victim(&cache, 1289), Some(vec![(0, 1)]));
+        cache.get_mut(&vec![(0, 1)]).unwrap().3 = 10;
+        assert_eq!(batch_graph_victim(&cache, 1289), Some(vec![(2, 1)]));
+        cache.remove(&vec![(0, 1)]);
+        assert_eq!(batch_graph_victim(&cache, 4000), None);
+    }
+    #[test]
+    fn entry_limit_bounds_small_graphs() {
+        let cache = (0..16)
+            .map(|slot| (vec![(slot, 1)], (ptr::null_mut(), slot as u64, 1, 1)))
+            .collect();
+        assert_eq!(batch_graph_victim(&cache, 1), Some(vec![(0, 1)]));
     }
 }

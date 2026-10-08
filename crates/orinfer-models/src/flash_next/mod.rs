@@ -1,4 +1,5 @@
 //! Flash Next execution order and immutable CPU lookup owned by the model package.
+mod batching;
 mod inputs;
 mod mtp;
 mod plan;
@@ -38,23 +39,14 @@ impl Adapter for Flash {
         self.inputs.prepare_for(program, tokens, history)
     }
     fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<abi::BatchPlan> {
-        if segments.len() != 1 || segments[0].tokens != 1 {
-            return Err("Flash Next currently schedules one sequence per iteration".into());
-        }
-        let ops = if include_plan {
-            self.manifest.programs["decode"]
-                .iter()
-                .map(|op| crate::execution::Invocation {
-                    operation: op.clone(),
-                    sequence: Some(segments[0].slot),
-                    launch: None,
-                    views: Default::default(),
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-        Ok((ops, vec![]))
+        Ok((
+            if include_plan {
+                batching::plan(&self.manifest, segments)?
+            } else {
+                vec![]
+            },
+            vec![],
+        ))
     }
 }
 pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate::registry::Built> {

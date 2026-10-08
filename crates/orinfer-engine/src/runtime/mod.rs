@@ -41,6 +41,8 @@ pub(crate) struct ModelRuntime {
     iteration_costs: std::collections::BTreeMap<(usize, usize, usize, usize), f64>,
     mtp_seconds_per_token: f64,
     model_package: crate::model_package::ModelPackage,
+    request_hidden_ring: Option<String>,
+    idle_admission_since: Option<Instant>,
 }
 impl ModelRuntime {
     pub(crate) fn scheduling_statistics(&self) -> crate::scheduler::Statistics {
@@ -55,7 +57,15 @@ impl ModelRuntime {
     pub(crate) fn load_with_options(path: &std::path::Path, options: LoadOptions) -> Result<Self> {
         let started = Instant::now();
         let mut prepared = crate::loader::load(path)?;
+        let request_hidden_ring = prepared
+            .plan
+            .mtp
+            .as_ref()
+            .and_then(|s| s.hidden_ring.clone());
         options.configure_mtp(&mut prepared.plan)?;
+        prepared
+            .decode_programs
+            .retain(|name| prepared.plan.programs.contains_key(name));
         let (execution, mut stats) = Executor::load(
             &prepared.plan,
             &prepared.weights_root,
@@ -98,6 +108,8 @@ impl ModelRuntime {
             iteration_costs: Default::default(),
             mtp_seconds_per_token: 0.055,
             model_package: prepared.execution_model,
+            request_hidden_ring,
+            idle_admission_since: None,
         })
     }
     fn prepare_inputs(&self, tokens: &[u32], history: &[u32]) -> Result<()> {

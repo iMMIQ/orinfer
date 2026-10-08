@@ -1,7 +1,7 @@
 use super::*;
 use crate::execution::{CudaGraphMode, ExecutionPhase, LoadOptions};
 use std::cell::RefCell;
-type BatchGraphCache = BTreeMap<Vec<(usize, usize)>, (Handle, u64)>;
+pub(super) type BatchGraphCache = BTreeMap<Vec<(usize, usize)>, (Handle, u64, usize, u64)>;
 
 pub(super) struct DirectKernel {
     pub(super) spec: Kernel,
@@ -75,7 +75,6 @@ impl Executor {
         decode_programs: &std::collections::BTreeSet<String>,
         options: LoadOptions,
     ) -> Result<(Self, LoadStats)> {
-        use crate::model::Operation;
         let cuda_graph = options.cuda_graph;
         if decode_programs
             .iter()
@@ -98,7 +97,45 @@ impl Executor {
                 b.bytes()
                     .and_then(|n| sum.checked_add(n).ok_or("KV sum overflow".into()))
             })?;
-        let buffer_bytes = capacity_bytes - lazy_bytes;
+        let mut used = std::collections::BTreeSet::new();
+        for kernel in &manifest.kernels {
+            for arg in &kernel.args {
+                match arg {
+                    Argument::Buffer { name } | Argument::BufferSlice { name, .. } => {
+                        used.insert(name.as_str());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for op in manifest.programs.values().flatten() {
+            match op {
+                crate::model::Operation::Copy {
+                    source,
+                    destination,
+                    ..
+                } => {
+                    used.extend([source.as_str(), destination.as_str()]);
+                }
+                crate::model::Operation::Zero { destination, .. } => {
+                    used.insert(destination.as_str());
+                }
+                _ => {}
+            }
+        }
+        let unused_weights = manifest
+            .buffers
+            .iter()
+            .filter(|b| {
+                b.data.is_some()
+                    && b.access == crate::artifact::Access::Read
+                    && !used.contains(b.name.as_str())
+            })
+            .try_fold(0usize, |sum, b| {
+                sum.checked_add(b.bytes()?)
+                    .ok_or_else(|| "Unused weight sum overflow".to_string())
+            })?;
+        let buffer_bytes = capacity_bytes - lazy_bytes - unused_weights;
         let mut s = Session::new(Driver::load()?);
         let mut pointers = BTreeMap::new();
         let mut sizes = BTreeMap::new();
@@ -141,6 +178,12 @@ impl Executor {
         let (mut weight_io_hash_s, mut weight_upload_s) = (0.0, 0.0);
         let mut weights = crate::weights::Weights::open(base)?;
         for b in &manifest.buffers {
+            if b.data.is_some()
+                && b.access == crate::artifact::Access::Read
+                && !used.contains(b.name.as_str())
+            {
+                continue;
+            }
             let bytes = b.bytes()?;
             let mut address = 0;
             // SAFETY: Allocation length is checked by manifest validation and owned
@@ -327,79 +370,11 @@ impl Executor {
         unsafe {
             check((s.driver.context_sync)(), "model uploads complete")?;
         }
-        let capture_started = Instant::now();
-        let mut graphs = BTreeMap::new();
-        for (phase, ops) in &manifest.programs {
-            if cuda_graph == CudaGraphMode::Off
-                || (cuda_graph == CudaGraphMode::DecodeOnly && !decode_programs.contains(phase))
-            {
-                continue;
-            }
-            // SAFETY: Capture records operations against stable owned buffers.
-            // Each copy/zero range and graph kernel reference was validated above.
-            unsafe {
-                check((s.driver.capture_begin)(s.stream, 0), "begin model capture")?;
-            }
-            s.capturing = true;
-            for op in ops {
-                match op {
-                    Operation::Kernel { name } => launches
-                        .get_mut(name)
-                        .ok_or("Unbound kernel")?
-                        .execute(&s.driver, s.stream)?,
-                    Operation::Copy {
-                        source,
-                        destination,
-                        bytes,
-                    } => {
-                        // SAFETY: Distinct allocations, validated byte ranges, same
-                        // stream ordering as their producers and consumers.
-                        unsafe {
-                            check(
-                                (s.driver.copy)(
-                                    pointers[destination],
-                                    pointers[source],
-                                    *bytes,
-                                    s.stream,
-                                ),
-                                "capture state copy",
-                            )?;
-                        }
-                    }
-                    Operation::Zero { destination, bytes } => {
-                        // SAFETY: Validated writable range, ordered before use.
-                        unsafe {
-                            check(
-                                (s.driver.memset)(pointers[destination], 0, *bytes, s.stream),
-                                "capture residual reset",
-                            )?;
-                        }
-                    }
-                }
-            }
-            // SAFETY: Session records graph immediately, so all later failures
-            // release capture products. Instantiate does not execute model state.
-            unsafe {
-                check(
-                    (s.driver.capture_end)(s.stream, &mut s.graph),
-                    "end model capture",
-                )?;
-                s.capturing = false;
-                check(
-                    (s.driver.graph_instantiate)(&mut s.exec, s.graph, 0),
-                    "instantiate model graph",
-                )?;
-            }
-            graphs.insert(phase.clone(), s.exec);
-            s.graphs.borrow_mut().push((s.graph, s.exec));
-            s.graph = ptr::null_mut();
-            s.exec = ptr::null_mut();
-        }
-        let graph_capture_s = if !graphs.is_empty() {
-            capture_started.elapsed().as_secs_f64()
-        } else {
-            0.0
-        };
+        // Request limits can replace initial private buffers on the first lease.
+        // Capture only when a program is submitted with its final arena bindings;
+        // this also avoids retaining unused MTP and prefill graphs at startup.
+        let graphs = BTreeMap::new();
+        let graph_capture_s = 0.0;
         let direct = Some(DirectPrograms {
             kernels: RefCell::new(
                 launches
@@ -500,11 +475,33 @@ impl Executor {
         }
     }
     pub(crate) fn reset_sequence(&self, names: &[String]) -> Result<()> {
+        self.reset_sequence_inner(names, false)
+    }
+    pub(crate) fn reset_sequence_reusing_pages(&self, names: &[String]) -> Result<()> {
+        self.reset_sequence_inner(names, true)
+    }
+    fn reset_sequence_inner(&self, names: &[String], reuse: bool) -> Result<()> {
         self.sync()?;
-        // Return physical KV pages after each request; virtual addresses survive.
+        // Keep at most one allocation granule per KV buffer for short requests.
+        // Clear retained pages before reuse; larger contexts release their slabs.
         for (name, buffer) in self.session.virtual_buffers.borrow_mut().iter_mut() {
             if self.sequence_strides.contains_key(name) {
-                buffer.release_slabs(&self.session.driver)?;
+                if reuse && buffer.mapped != 0 && buffer.mapped <= buffer.granularity {
+                    // SAFETY: Completed stream, owned mapping and full mapped range.
+                    unsafe {
+                        check(
+                            (self.session.driver.memset)(
+                                buffer.address,
+                                0,
+                                buffer.mapped,
+                                self.session.stream,
+                            ),
+                            "clear reusable KV page",
+                        )?;
+                    }
+                } else {
+                    buffer.release_slabs(&self.session.driver)?;
+                }
             }
         }
         for name in names {

@@ -63,7 +63,7 @@ impl LoadOptions {
             return Ok(());
         };
         if drafts == 0 {
-            manifest.mtp = None;
+            disable_mtp(manifest);
             return Ok(());
         }
         if drafts > 7 {
@@ -86,6 +86,56 @@ impl LoadOptions {
         }
         spec.default_verification_tokens = rows;
         Ok(())
+    }
+}
+
+fn disable_mtp(manifest: &mut crate::model::Manifest) {
+    use crate::model::Operation;
+    use std::collections::BTreeSet;
+    let Some(spec) = manifest.mtp.take() else {
+        return;
+    };
+    let mut disabled = BTreeSet::from([spec.draft_program]);
+    disabled.extend(spec.draft_snapshot_program);
+    disabled.extend(spec.draft_restore_program);
+    for p in spec.warm_plans {
+        disabled.extend([p.program, p.head_program]);
+    }
+    for p in spec.verification_plans {
+        disabled.extend([p.program, p.restore_program, p.capture_program]);
+    }
+    // Target capture is also a dependency of architecture-owned batch plans.
+    let mut required: BTreeSet<_> = spec.capture_plans.into_iter().map(|p| p.program).collect();
+    required.extend(["decode".into(), "prefill".into(), "head".into()]);
+    for p in &manifest.prefill_plans {
+        required.extend([p.prefill_program.clone(), p.head_program.clone()]);
+    }
+    if let Some(vision) = &manifest.vision {
+        required.extend(vision.plans.iter().map(|p| p.program.clone()));
+    }
+    disabled.retain(|name| !required.contains(name));
+    let mut dead = BTreeSet::new();
+    manifest.programs.retain(|name, ops| {
+        if !disabled.contains(name) {
+            return true;
+        }
+        dead.extend(ops.iter().filter_map(|op| match op {
+            Operation::Kernel { name } => Some(name.clone()),
+            _ => None,
+        }));
+        false
+    });
+    for op in manifest.programs.values().flatten() {
+        if let Operation::Kernel { name } = op {
+            dead.remove(name);
+        }
+    }
+    manifest
+        .kernels
+        .retain(|kernel| !dead.contains(&kernel.name));
+    if let Some(kv) = &mut manifest.kv_cache {
+        kv.growth
+            .retain(|program, _| manifest.programs.contains_key(program));
     }
 }
 

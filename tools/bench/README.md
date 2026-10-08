@@ -48,3 +48,13 @@ python3 -m tools.bench.mixed --requests mixed-requests.json \
 python3 -m tools.bench.acceptance --requests acceptance-requests.json \
   --output artifacts/acceptance.json
 ```
+
+`validate_flash_decode_batches` 使用同一 `ORINFER_BATCH_FIXTURE` 格式，检查 2/3/4/8/16/32 请求的同历史 logits/top3/NLL、图片与多图、取消/槽位复用，以及 target batch 后继续 MTP。需 native Flash batch 包和独占 GPU 锁：
+
+```bash
+ORINFER_BATCH_FIXTURE=/absolute/path/to/flash-fixture.json \
+  flock artifacts/gpu-experiment.lock \
+  cargo test --release --offline -p orinfer-engine validate_flash_decode_batches -- --ignored --nocapture
+```
+
+该检查关闭 prefix cache，对照同权重、相同冷 prefill 和 teacher-forced 历史的单序列执行，验证 batch 迁移的算术与隔离；不替代原始 BF16/FP8 量化质量验收。性能与缓存命中的功能验收另用真实 Chat/SSE 的 `concurrency.py`、`acceptance.py` 测量。

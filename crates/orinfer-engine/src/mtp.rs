@@ -233,6 +233,47 @@ mod tests {
         options(0).configure_mtp(&mut model).unwrap();
     }
     #[test]
+    fn disabling_mtp_preserves_target_capture_and_shared_head() {
+        let mut model = manifest();
+        let mut mtp = spec();
+        mtp.draft_program = "draft".into();
+        for p in &mut mtp.warm_plans {
+            p.program = "draft".into();
+            p.head_program = "shared_head".into();
+        }
+        for p in &mut mtp.capture_plans {
+            p.program = "capture".into();
+        }
+        for p in &mut mtp.verification_plans {
+            p.program = "verify".into();
+            p.restore_program = "rollback".into();
+            p.capture_program = "capture".into();
+        }
+        let ops = model.programs["execute"].clone();
+        for name in ["draft", "verify", "rollback", "capture", "shared_head"] {
+            model.programs.insert(name.into(), ops.clone());
+        }
+        model.prefill_plans.push(crate::model::PrefillPlan {
+            chunk_tokens: 8,
+            prefill_program: "execute".into(),
+            head_program: "shared_head".into(),
+        });
+        model.mtp = Some(mtp);
+        crate::execution::LoadOptions {
+            mtp_drafts: Some(0),
+            ..Default::default()
+        }
+        .configure_mtp(&mut model)
+        .unwrap();
+        assert!(model.mtp.is_none());
+        for name in ["execute", "capture", "shared_head"] {
+            assert!(model.programs.contains_key(name));
+        }
+        for name in ["draft", "verify", "rollback"] {
+            assert!(!model.programs.contains_key(name));
+        }
+    }
+    #[test]
     fn draft_state_snapshot_requires_a_matching_restore_program() {
         let model = manifest();
         let mut spec = spec();

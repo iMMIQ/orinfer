@@ -27,7 +27,7 @@ MTP 另用 `--component mtp --stage all` 转换，再发布到独立目录。tar
 
 ## Rust 部署
 
-在线包含 W8 embedding、CPU E8P PLE 查表、48 层 HC/GDN/QSA/MoE、256K INT8 KV，以及完整请求状态和 prefix cache。prefill 提供 512／128／16 token 档位，尾部用真实 M=1 执行；不填充虚假 token。Flash 在线策略支持单个活跃请求、其余排队；可选原生 MTP 支持贪心和带惩罚项的随机采样，并发算子仍保留在离线参考中。
+在线包含 W8 embedding、CPU E8P PLE 查表、48 层 HC/GDN/QSA/MoE、256K INT8 KV，以及完整请求状态和 prefix cache。prefill 提供 4096／2048／512／128／16 token 档位，尾部用真实 M=1 执行；不填充虚假 token。基础包支持单个活跃请求、其余排队；下述 batch 构建可启用多请求 decode。可选原生 MTP 支持贪心和带惩罚项的随机采样。
 
 ```bash
 make build
@@ -76,6 +76,23 @@ PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models
 视觉编码器与 27B 共享 TileLang 算子和执行组件，merger 输出为 2560 维；QSA 查询、KV 和压缩索引使用交错三轴 MRoPE，MTP 读取移位后的图像特征。PLE 保留原始 image token ID。多图按消息次序独立编码，特征和位置索引属于请求私有状态；图片身份参与 prefix 匹配。
 
 默认单图最多 8192 patches（2048 image tokens），多图合计最多 16384 image tokens；可用 `--max-patches`、`--max-features` 调整构建容量。`--compile-cache` 可复用已有 TileLang 编译缓存。上下文仍为 256K、KV 仍为 INT8；视觉编码不被文本 prefix cache 省略。请求格式见[服务使用](../../../docs/serving.md)，独立编码器、chat template 和 MRoPE 的验证入口见[图文工具](../../vision/README.md)。
+
+## 多请求 decode
+
+在已发布的文本或多模态包上离线增加 batch 算子。先执行 `make build`，使用新的目标目录；权重逐字节复用，shape-only 编译不需要加载第二份模型：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/batching.py artifacts/flash-batch-build \
+  --model artifacts/models/flash-serving-mm \
+  --model-output artifacts/models/flash-serving-batch
+./target/release/orinfer serve artifacts/models/flash-serving-batch \
+  --model qwen-flash-next --max-active-requests 32 \
+  --cuda-graph decode_only --prefix-cache-mib 512 --mtp-drafts 7
+```
+
+不需要再次执行 `package.py`。可用 `--compile-cache` 复用完成的 TileLang 缓存。2/4/8/16/32/64/128 档共享 HC、普通投影、路由、专家、共享专家和输出头；其余请求数补零到下一档。GDN、PLE 卷积和 QSA 沿用已验证的单序列状态 kernel，只推进真实 lane。MTP 捕获每个请求的 target HC，调度器根据收益在 target batch 和逐请求 MTP 之间选择。CPU PLE 的行缓存共享，历史独立。
+
+Prefill 使用原有大块，与 decode 交替调度；每请求 KV/context 预留参与内存准入，超出活跃或内存预算的请求排队。128 个提交请求不要求同时在显存中驻留 128 份满上下文状态。Graph 按槽位和形状缓存；取消、槽位复用和 prefix 恢复保持请求隔离。
 
 ## 离线执行与验证
 

@@ -93,7 +93,7 @@ pub(super) fn section(
         .collect()
 }
 pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Result<()> {
-    if manifest.chunk_tokens != 4096 || !manifest.batch_profiles.is_empty() {
+    if manifest.chunk_tokens != 4096 {
         return Err("Unsupported Flash scheduling/features contract".into());
     }
     let widths: BTreeSet<_> = profiles.iter().map(|p| p.tokens).collect();
@@ -299,5 +299,6 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
     super::vision::register(manifest, &mut programs)?;
     manifest.programs = programs;
     super::mtp::build(manifest)?;
+    super::batching::register(manifest)?;
     Ok(())
 }
