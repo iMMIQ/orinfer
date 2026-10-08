@@ -4,6 +4,7 @@ No Torch/reference calls occur here. ``parameter_mode='exp_a'`` consumes an
 offline FP32 exp(A_log) buffer instead of A_log; its preparation identity and
 rounding are caller responsibilities. Every launch uses the caller's stream.
 """
+
 import tilelang
 import tilelang.language as T
 
@@ -21,11 +22,15 @@ def stable_sigmoid(x):
     return T.if_then_else(x >= 0.0, 1.0 / (1.0 + e), e / (1.0 + e))
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc",
-              target={"kind": "cuda", "arch": "sm_87"})
-def _compile_gates(dtype: str = "float16", block: int = 256,
-                   threads: int = 128, parameter_mode: str = "a_log",
-                   packed_ab: bool = False, beta_round_fp16: bool = False):
+@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
+def _compile_gates(
+    dtype: str = "float16",
+    block: int = 256,
+    threads: int = 128,
+    parameter_mode: str = "a_log",
+    packed_ab: bool = False,
+    beta_round_fp16: bool = False,
+):
     assert dtype in ("float16", "float32")
     assert parameter_mode in ("a_log", "exp_a")
     assert block >= threads and block % threads == 0
@@ -34,12 +39,14 @@ def _compile_gates(dtype: str = "float16", block: int = 256,
     b_offset = HEADS if packed_ab else 0
 
     @T.prim_func
-    def main(A: T.Tensor((rows, input_columns), dtype),
-             B: T.Tensor((rows, input_columns), dtype),
-             Parameter: T.Tensor((HEADS,), "float32"),
-             DtBias: T.Tensor((HEADS,), "float32"),
-             G: T.Tensor((rows, HEADS), "float32"),
-             Beta: T.Tensor((rows, HEADS), "float32")):
+    def main(
+        A: T.Tensor((rows, input_columns), dtype),
+        B: T.Tensor((rows, input_columns), dtype),
+        Parameter: T.Tensor((HEADS,), "float32"),
+        DtBias: T.Tensor((HEADS,), "float32"),
+        G: T.Tensor((rows, HEADS), "float32"),
+        Beta: T.Tensor((rows, HEADS), "float32"),
+    ):
         with T.Kernel(T.ceildiv(rows * HEADS, block), threads=threads) as bx:
             g = T.alloc_fragment((block,), "float32")
             beta = T.alloc_fragment((block,), "float32")
@@ -64,8 +71,14 @@ def _compile_gates(dtype: str = "float16", block: int = 256,
     return main
 
 
-def gdn_gates(dtype="float16", block=256, threads=128, parameter_mode="a_log",
-              packed_ab=False, beta_round_fp16=False):
+def gdn_gates(
+    dtype="float16",
+    block=256,
+    threads=128,
+    parameter_mode="a_log",
+    packed_ab=False,
+    beta_round_fp16=False,
+):
     """Compile/load one dynamic-M cubin, isolating TileLang's entry mapping."""
     kernel = _compile_gates(dtype, block, threads, parameter_mode, packed_ab, beta_round_fp16)
     kernel.adapter.kernels = dict(kernel.adapter.kernels)

@@ -1,4 +1,5 @@
 """Offline SM87 operator helpers; runtime kernels remain independent of Torch."""
+
 import hashlib
 import json
 import os
@@ -24,8 +25,9 @@ def configure():
 
 
 def orin_jit(function):
-    compiled = tilelang.jit(out_idx=[], execution_backend="nvrtc",
-                            target={"kind": "cuda", "arch": "sm_87"})(function)
+    compiled = tilelang.jit(
+        out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"}
+    )(function)
 
     @wraps(function)
     def build(*args, **kwargs):
@@ -53,8 +55,9 @@ def identity(path):
 
 
 def tensor_sha(tensor):
-    return hashlib.sha256(tensor.detach().contiguous().cpu().view(torch.uint8)
-                          .numpy().tobytes()).hexdigest()
+    return hashlib.sha256(
+        tensor.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
+    ).hexdigest()
 
 
 def error(actual, reference):
@@ -62,9 +65,13 @@ def error(actual, reference):
     delta = actual - reference
     norm = float(reference.norm())
     finite = bool(torch.isfinite(actual).all() and torch.isfinite(reference).all())
-    return {"finite": finite, "relative_l2": float(delta.norm()) / max(norm, 1e-30),
-            "reference_l2": norm, "max_abs": float(delta.abs().max()),
-            "rms_abs": float(delta.square().mean().sqrt())}
+    return {
+        "finite": finite,
+        "relative_l2": float(delta.norm()) / max(norm, 1e-30),
+        "reference_l2": norm,
+        "max_abs": float(delta.abs().max()),
+        "rms_abs": float(delta.square().mean().sqrt()),
+    }
 
 
 def export_kernel(kernel, output):
@@ -73,10 +80,11 @@ def export_kernel(kernel, output):
     (output / "kernel.cu").write_text(kernel.get_kernel_source())
     (output / "host.txt").write_text(Path(kernel.adapter.lib_generator.pypath).read_text())
     shutil.copyfile(kernel.adapter.lib_generator.libpath, output / "kernel.cubin")
-    return {"files": [identity(output / name) for name in
-                      ("kernel.cu", "host.txt", "kernel.cubin")],
-            "symbols": list(kernel.adapter.function_names),
-            "abi_note": "Use actual host.txt argument order/config, never PrimFunc order"}
+    return {
+        "files": [identity(output / name) for name in ("kernel.cu", "host.txt", "kernel.cubin")],
+        "symbols": list(kernel.adapter.function_names),
+        "abi_note": "Use actual host.txt argument order/config, never PrimFunc order",
+    }
 
 
 def benchmark(run, repetitions=20, warmup=3, calls_per_replay=1):
@@ -99,17 +107,26 @@ def benchmark(run, repetitions=20, warmup=3, calls_per_replay=1):
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end) / (repetitions * calls_per_replay))
-    return {"median_ms": statistics.median(samples), "trials_ms": samples,
-            "repetitions": repetitions, "graph_capture_s": capture_s,
-            "calls_per_replay": calls_per_replay,
-            "timing_scope": "CUDA-event graph replay; reset/work within run included"}, graph
+    return {
+        "median_ms": statistics.median(samples),
+        "trials_ms": samples,
+        "repetitions": repetitions,
+        "graph_capture_s": capture_s,
+        "calls_per_replay": calls_per_replay,
+        "timing_scope": "CUDA-event graph replay; reset/work within run included",
+    }, graph
 
 
 def environment():
-    return {"torch": torch.__version__, "tilelang": tilelang.__version__,
-            "cuda": torch.version.cuda, "device": str(torch.cuda.get_device_properties(0)),
-            "sm": list(torch.cuda.get_device_capability()), "seed": SEED,
-            "output_root": os.environ.get("ORINFER_OPERATOR_OUTPUT")}
+    return {
+        "torch": torch.__version__,
+        "tilelang": tilelang.__version__,
+        "cuda": torch.version.cuda,
+        "device": str(torch.cuda.get_device_properties(0)),
+        "sm": list(torch.cuda.get_device_capability()),
+        "seed": SEED,
+        "output_root": os.environ.get("ORINFER_OPERATOR_OUTPUT"),
+    }
 
 
 def write_json(path, data):

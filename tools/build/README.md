@@ -9,7 +9,7 @@ make compiler-image
 make check-offline
 ```
 
-`compiler.Dockerfile`使用公开 NVIDIA Jetson CUDA 12.6/PyTorch 2.9.1 镜像的固定 digest，使用固定版本uv管理镜像内的`/opt/venv`，安装TileLang 0.1.15和Transformers 5.18.0编译/参考栈，不复制模型或编译缓存。`compiler-requirements.txt`固定覆盖包版本，其余依赖由基底镜像 digest 固定；移除未使用的vLLM、PyGObject和CUTLASS Python包以避免遗留依赖约束。默认镜像名为`orinfer-compiler:0.1.1`，可用`ORINFER_OPERATOR_IMAGE`覆盖。
+`compiler.Dockerfile`使用公开 NVIDIA Jetson CUDA 12.6/PyTorch 2.9.1 镜像的固定 digest，使用固定版本uv管理镜像内的`/opt/venv`，安装TileLang 0.1.15和Transformers 5.19.0编译/参考栈，不复制模型或编译缓存。`compiler-requirements.txt`固定覆盖包版本，其余依赖由基底镜像 digest 固定；移除未使用的vLLM、PyGObject和CUTLASS Python包以避免遗留依赖约束。TVM FFI、Z3受TileLang版本约束，Hub受Tokenizers的`<2`约束，NumPy使用Python3.10兼容版本。默认镜像名为`orinfer-compiler:0.1.1`，可用`ORINFER_OPERATOR_IMAGE`覆盖。
 
 GPU编译入口：
 
@@ -27,13 +27,13 @@ GPU入口使用调用者UID/GID及补充设备组，避免生成root所有的模
 bash tools/operators/run.sh tools/build/smoke.py artifacts/build/compiler-smoke
 ```
 
-它从空缓存编译实际生产norm，检查非对齐尾部、改变输入的graph replay并导出AOT。
+它从空缓存编译实际生产norm与动态行数greedy归约，检查非对齐尾部、3/7行共用cubin、仿射shape的标量ABI、输出guard和改变输入的graph replay，并导出AOT。
 
 ## 自动检查
 
-`make check`包含格式、编译、clippy、Rust/CPU Python测试和验收配置校验；GitHub Actions执行同一入口。使用`uv`隔离CPU依赖：`make python-env`创建Python3.10的`.venv`并同步固定版本；检查默认使用`.venv/bin/python`，无需修改主机Python环境，可通过`PYTHON`覆盖解释器；CI和编译镜像固定uv0.12.23，Rust版本由`rust-toolchain.toml`固定。
+`make check`包含Rust/Ruff格式、Python静态检查、编译、clippy、Rust/CPU Python测试和验收配置校验；GitHub Actions执行同一入口并读取`rust-toolchain.toml`。`make fmt`统一格式，`make lint`执行格式和静态检查；Rust编译拒绝死代码，clippy拒绝警告。使用`uv`隔离CPU依赖：`make python-env`创建Python3.10的`.venv`并同步固定版本；检查默认使用`.venv/bin/python`，无需修改主机Python环境，可通过`PYTHON`覆盖解释器；CI和编译镜像固定uv0.12.23，Rust版本由`rust-toolchain.toml`固定。
 
-`make check-offline`在编译镜像中执行需要Torch的CPU FP8/BF16 MTP导入检查，不使用GPU。
+`make check-offline`在编译镜像中检查全部离线模块引用，并执行需要Torch的CPU FP8/BF16 MTP导入及动态行数ABI测试，不使用GPU。
 
 ```bash
 make check-gpu MODEL=/path/to/prepared-model OUTPUT=artifacts/check-gpu/new-run

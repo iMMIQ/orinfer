@@ -4,6 +4,7 @@ Q/K share 16 heads; the 48 value heads map through hv//3. q_scale is a
 required specialization: normalized unscaled Q uses 128**-0.5, already-scaled
 FP32 Q uses 1. All buffers are contiguous, disjoint and caller-owned.
 """
+
 import math
 
 import tilelang
@@ -12,18 +13,19 @@ import tilelang.language as T
 HK, HV, DK = 16, 48, 128
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc",
-              target={"kind": "cuda", "arch": "sm_87"})
+@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
 def _compile(bt: int, q_scale: float, qk_dtype: str):
     batch, chunks = T.dynamic("batch"), T.dynamic("chunks")
 
     @T.prim_func
-    def main(Q: T.Tensor((batch, HK, chunks, bt, DK), qk_dtype),
-             K: T.Tensor((batch, HK, chunks, bt, DK), qk_dtype),
-             G: T.Tensor((batch, HV, chunks, bt), "float32"),
-             Beta: T.Tensor((batch, HV, chunks, bt), "float32"),
-             L: T.Tensor((batch, HV, chunks, bt, bt), "float32"),
-             QK: T.Tensor((batch, HV, chunks, bt, bt), "float32")):
+    def main(
+        Q: T.Tensor((batch, HK, chunks, bt, DK), qk_dtype),
+        K: T.Tensor((batch, HK, chunks, bt, DK), qk_dtype),
+        G: T.Tensor((batch, HV, chunks, bt), "float32"),
+        Beta: T.Tensor((batch, HV, chunks, bt), "float32"),
+        L: T.Tensor((batch, HV, chunks, bt, bt), "float32"),
+        QK: T.Tensor((batch, HV, chunks, bt, bt), "float32"),
+    ):
         if qk_dtype == "float16":
             with T.Kernel(HV, chunks, batch, threads=64 if bt == 16 else 128) as (h, c, b):
                 qs = T.alloc_shared((bt, DK), "float16")
@@ -75,6 +77,7 @@ def _compile(bt: int, q_scale: float, qk_dtype: str):
                     QK[b, h, c, i, j] = sumqk[0] * q_scale * decay
                 else:
                     QK[b, h, c, i, j] = 0.0
+
     return main
 
 
@@ -90,7 +93,12 @@ def gdn_chunk_matrices(*, q_scale, bt=64, qk_dtype="float16"):
         raise ValueError("BT must be 16, 32 or 64")
     if qk_dtype not in ("float16", "float32"):
         raise ValueError("qk_dtype must be float16 or float32")
-    if isinstance(q_scale, bool) or not isinstance(q_scale, (int, float)) or not math.isfinite(q_scale) or q_scale <= 0:
+    if (
+        isinstance(q_scale, bool)
+        or not isinstance(q_scale, (int, float))
+        or not math.isfinite(q_scale)
+        or q_scale <= 0
+    ):
         raise ValueError("q_scale must be an explicit finite positive number")
     kernel = _compile(bt, float(q_scale), qk_dtype)
     kernel.adapter.kernels = dict(kernel.adapter.kernels)

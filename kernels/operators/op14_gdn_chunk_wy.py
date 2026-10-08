@@ -4,27 +4,28 @@ K shares sixteen heads across 48 value heads via kh=vh//3. Each CTA owns
 one [BT,32] output tile. Products, A and accumulators remain FP32: no TF32,
 tensorcore operand casts, q_scale or materialized repeated K.
 """
+
 import tilelang
 import tilelang.language as T
 
 HK, HV, D = 16, 48, 128
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc",
-              target={"kind": "cuda", "arch": "sm_87"})
+@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
 def _compile(bt: int, k_dtype: str, value_tile: int):
     batch, chunks = T.dynamic("batch"), T.dynamic("chunks")
 
     @T.prim_func
-    def main(A: T.Tensor((batch, HV, chunks, bt, bt), "float32"),
-             K: T.Tensor((batch, HK, chunks, bt, D), k_dtype),
-             V: T.Tensor((batch, HV, chunks, bt, D), "float16"),
-             G: T.Tensor((batch, HV, chunks, bt), "float32"),
-             Beta: T.Tensor((batch, HV, chunks, bt), "float32"),
-             W: T.Tensor((batch, HV, chunks, bt, D), "float32"),
-             U: T.Tensor((batch, HV, chunks, bt, D), "float32")):
-        with T.Kernel(D // value_tile, HV * chunks, batch,
-                      threads=128) as (tile, hc, b):
+    def main(
+        A: T.Tensor((batch, HV, chunks, bt, bt), "float32"),
+        K: T.Tensor((batch, HK, chunks, bt, D), k_dtype),
+        V: T.Tensor((batch, HV, chunks, bt, D), "float16"),
+        G: T.Tensor((batch, HV, chunks, bt), "float32"),
+        Beta: T.Tensor((batch, HV, chunks, bt), "float32"),
+        W: T.Tensor((batch, HV, chunks, bt, D), "float32"),
+        U: T.Tensor((batch, HV, chunks, bt, D), "float32"),
+    ):
+        with T.Kernel(D // value_tile, HV * chunks, batch, threads=128) as (tile, hc, b):
             h, c = hc // chunks, hc % chunks
             a = T.alloc_shared((bt, bt), "float32")
             bk = T.alloc_shared((bt, value_tile), "float32")
@@ -38,9 +39,13 @@ def _compile(bt: int, k_dtype: str, value_tile: int):
                     a[i, j] = 0.0
             for i, d in T.Parallel(bt, value_tile):
                 if Beta[b, h, c, i] != 0.0:
-                    bk[i, d] = (Beta[b, h, c, i] *
-                                T.cast(K[b, h // 3, c, i, tile * value_tile + d], "float32")) * T.exp(G[b, h, c, i])
-                    bv[i, d] = Beta[b, h, c, i] * T.cast(V[b, h, c, i, tile * value_tile + d], "float32")
+                    bk[i, d] = (
+                        Beta[b, h, c, i]
+                        * T.cast(K[b, h // 3, c, i, tile * value_tile + d], "float32")
+                    ) * T.exp(G[b, h, c, i])
+                    bv[i, d] = Beta[b, h, c, i] * T.cast(
+                        V[b, h, c, i, tile * value_tile + d], "float32"
+                    )
                 else:
                     # Zero beta suppresses reads of padded K/V/G, including NaN.
                     bk[i, d] = 0.0
@@ -56,6 +61,7 @@ def _compile(bt: int, k_dtype: str, value_tile: int):
             for i, d in T.Parallel(bt, value_tile):
                 W[b, h, c, i, tile * value_tile + d] = w[i, d]
                 U[b, h, c, i, tile * value_tile + d] = u[i, d]
+
     return main
 
 

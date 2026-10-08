@@ -4,6 +4,7 @@ Only an offline schema-2 cache is imported here. The online loader builds all
 execution order from an independently built model library. No weights are
 requantized; existing immutable shards are hardlinked, or copied across devices.
 """
+
 import argparse
 import copy
 import hashlib
@@ -22,168 +23,230 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.model.publication import file_hash, source_path, write_json
 
 
-CONTRACT = json.loads((Path(__file__).resolve().parents[2] / 'configs/architecture-contract.json').read_text())
-TEXT_KEYS = CONTRACT['families']['qwen3_5']['text_keys']
+CONTRACT = json.loads(
+    (Path(__file__).resolve().parents[2] / "configs/architecture-contract.json").read_text()
+)
+TEXT_KEYS = CONTRACT["families"]["qwen3_5"]["text_keys"]
 
 
 def model_library():
-    path = Path(os.environ.get('ORINFER_MODEL_LIBRARY', str(Path(__file__).resolve().parents[2] /
-                                                        'target/release/liborinfer_models.so')))
+    path = Path(
+        os.environ.get(
+            "ORINFER_MODEL_LIBRARY",
+            str(Path(__file__).resolve().parents[2] / "target/release/liborinfer_models.so"),
+        )
+    )
     if not path.is_file():
-        raise ValueError('Build the model library with make build first and set ORINFER_MODEL_LIBRARY')
+        raise ValueError(
+            "Build the model library with make build first and set ORINFER_MODEL_LIBRARY"
+        )
     verify_library(path)
     return path
 
 
 def verify_library(path):
-    with path.open('rb') as stream:
+    with path.open("rb") as stream:
         header = stream.read(20)
-    if (len(header) != 20 or header[:4] != b'\x7fELF' or header[4:6] != bytes((2, 1))
-            or int.from_bytes(header[16:18], 'little') != 3
-            or int.from_bytes(header[18:20], 'little') != 183):
-        raise ValueError('Execution library must be an aarch64 ELF shared object')
+    if (
+        len(header) != 20
+        or header[:4] != b"\x7fELF"
+        or header[4:6] != bytes((2, 1))
+        or int.from_bytes(header[16:18], "little") != 3
+        or int.from_bytes(header[18:20], "little") != 183
+    ):
+        raise ValueError("Execution library must be an aarch64 ELF shared object")
 
 
 def verify_execution(package, directory):
-    execution = package.get('execution', {})
-    if (package.get('schema_version') != 1 or package.get('runtime_abi') != 1
-            or execution.get('abi_version') != 1 or not execution.get('package') or not execution.get('version')):
-        raise ValueError('Unsupported model execution package schema or ABI')
-    asset = execution['library']
-    library = source_path(directory.resolve(), asset['file'])
-    if file_hash(library) != asset['sha256']:
-        raise ValueError('Execution library sha256 mismatch')
+    execution = package.get("execution", {})
+    if (
+        package.get("schema_version") != 1
+        or package.get("runtime_abi") != 1
+        or execution.get("abi_version") != 1
+        or not execution.get("package")
+        or not execution.get("version")
+    ):
+        raise ValueError("Unsupported model execution package schema or ABI")
+    asset = execution["library"]
+    library = source_path(directory.resolve(), asset["file"])
+    if file_hash(library) != asset["sha256"]:
+        raise ValueError("Execution library sha256 mismatch")
     verify_library(library)
 
 
 def config_signature(config):
-    text = config.get('text_config', config)
-    return {'text': {k: text[k] for k in TEXT_KEYS if k in text},
-            'vision': config.get('vision_config')}
+    text = config.get("text_config", config)
+    return {
+        "text": {k: text[k] for k in TEXT_KEYS if k in text},
+        "vision": config.get("vision_config"),
+    }
 
 
 def section_ops(model, config):
     """Assign stable implementation slots; never publish source control flow."""
-    kernels = {k['name']: k for k in model['kernels']}
-    text = config.get('text_config', config)
+    kernels = {k["name"]: k for k in model["kernels"]}
+    text = config.get("text_config", config)
     sections = {}
     profiles = []
 
     def layer_start(op):
-        if op['kind'] != 'kernel':
+        if op["kind"] != "kernel":
             return None
-        return next((int(match[1]) for arg in kernels[op['name']]['args']
-                     if (match := re.fullmatch(r'L(\d+)_PreWeight', arg.get('name', '')))), None)
+        return next(
+            (
+                int(match[1])
+                for arg in kernels[op["name"]]["args"]
+                if (match := re.fullmatch(r"L(\d+)_PreWeight", arg.get("name", "")))
+            ),
+            None,
+        )
 
-    for profile in model['prefill_plans'] + [{'chunk_tokens': 1, 'prefill_program': 'decode'}]:
-        tokens = profile['chunk_tokens']
-        program = profile['prefill_program']
-        ops = model['programs'][program]
+    for profile in model["prefill_plans"] + [{"chunk_tokens": 1, "prefill_program": "decode"}]:
+        tokens = profile["chunk_tokens"]
+        program = profile["prefill_program"]
+        ops = model["programs"][program]
         starts = [(i, layer_start(op)) for i, op in enumerate(ops) if layer_start(op) is not None]
-        if [layer for _, layer in starts] != list(range(text['num_hidden_layers'])):
-            raise ValueError(f'{program}: layer bindings differ from config')
-        end = next((i for i in range(starts[-1][0], len(ops))
-                    if ops[i]['kind'] == 'kernel' and '_advance_' in ops[i]['name']), None)
+        if [layer for _, layer in starts] != list(range(text["num_hidden_layers"])):
+            raise ValueError(f"{program}: layer bindings differ from config")
+        end = next(
+            (
+                i
+                for i in range(starts[-1][0], len(ops))
+                if ops[i]["kind"] == "kernel" and "_advance_" in ops[i]["name"]
+            ),
+            None,
+        )
         if end is None:
-            raise ValueError(f'{program}: missing advance binding')
-        sections[program] = {'begin': ops[:starts[0][0]], 'end': ops[end:]}
+            raise ValueError(f"{program}: missing advance binding")
+        sections[program] = {"begin": ops[: starts[0][0]], "end": ops[end:]}
         for j, (index, layer) in enumerate(starts):
             stop = starts[j + 1][0] if j + 1 < len(starts) else end
-            sections[program][f'layer{layer}'] = ops[index:stop]
-        if program != 'decode':
+            sections[program][f"layer{layer}"] = ops[index:stop]
+        if program != "decode":
             # Recipe selection comes from the actual implementation, not token count.
-            names = [op['name'] for op in ops if op['kind'] == 'kernel']
-            kind = ('sequence' if any('_sequence_' in f'_{n}' for n in names) else
-                    'chunk_lut4' if any('_lut4_native' in n for n in names) else 'chunk_expanded')
-            profiles.append({'tokens': tokens, 'kind': kind})
-            head = profile['head_program']
-            sections[head] = {'body': model['programs'][head]}
-    if model.get('vision'):
-        depth = config['vision_config']['depth']
-        for plan in model['vision']['plans']:
-            program = plan['program']
-            ops = model['programs'][program]
+            names = [op["name"] for op in ops if op["kind"] == "kernel"]
+            kind = (
+                "sequence"
+                if any("_sequence_" in f"_{n}" for n in names)
+                else "chunk_lut4"
+                if any("_lut4_native" in n for n in names)
+                else "chunk_expanded"
+            )
+            profiles.append({"tokens": tokens, "kind": kind})
+            head = profile["head_program"]
+            sections[head] = {"body": model["programs"][head]}
+    if model.get("vision"):
+        depth = config["vision_config"]["depth"]
+        for plan in model["vision"]["plans"]:
+            program = plan["program"]
+            ops = model["programs"][program]
             if len(ops) != 2 + depth * 10 + 3:
-                raise ValueError('Unsupported vision operator recipe')
-            sections[program] = {'begin': ops[:2], 'end': ops[-3:]}
+                raise ValueError("Unsupported vision operator recipe")
+            sections[program] = {"begin": ops[:2], "end": ops[-3:]}
             for layer in range(depth):
-                sections[program][f'layer{layer}'] = ops[2 + layer * 10:2 + (layer + 1) * 10]
-    if model.get('mtp'):
-        mtp = model['mtp']
-        for plan in mtp['capture_plans']:
-            sections[plan['program']] = {'body': model['programs'][plan['program']]}
-        for plan in mtp['warm_plans']:
-            for field in ('program', 'head_program'):
-                sections[plan[field]] = {'body': model['programs'][plan[field]]}
-        gdn = [i for i, kind in enumerate(text['layer_types']) if kind == 'linear_attention']
-        for plan in mtp['verification_plans']:
-            verify = model['programs'][plan['program']]
-            prefill = model['programs'][f'prefill_m{plan["tokens"]}']
-            if verify[:-4] != prefill or any(op['kind'] != 'kernel' for op in verify[-4:]):
-                raise ValueError('Unsupported MTP verification head recipe')
-            sections[plan['program']] = {'head': verify[-4:]}
-            ops = model['programs'][plan['restore_program']]
+                sections[program][f"layer{layer}"] = ops[2 + layer * 10 : 2 + (layer + 1) * 10]
+    if model.get("mtp"):
+        mtp = model["mtp"]
+        for plan in mtp["capture_plans"]:
+            sections[plan["program"]] = {"body": model["programs"][plan["program"]]}
+        for plan in mtp["warm_plans"]:
+            for field in ("program", "head_program"):
+                sections[plan[field]] = {"body": model["programs"][plan[field]]}
+        gdn = [i for i, kind in enumerate(text["layer_types"]) if kind == "linear_attention"]
+        for plan in mtp["verification_plans"]:
+            verify = model["programs"][plan["program"]]
+            prefill = model["programs"][f"prefill_m{plan['tokens']}"]
+            if verify[:-4] != prefill or any(op["kind"] != "kernel" for op in verify[-4:]):
+                raise ValueError("Unsupported MTP verification head recipe")
+            sections[plan["program"]] = {"head": verify[-4:]}
+            ops = model["programs"][plan["restore_program"]]
             if len(ops) != len(gdn) * 2:
-                raise ValueError('Unsupported MTP restore recipe')
-            sections[plan['restore_program']] = {f'layer{layer}': ops[j * 2:j * 2 + 2]
-                                                 for j, layer in enumerate(gdn)}
+                raise ValueError("Unsupported MTP restore recipe")
+            sections[plan["restore_program"]] = {
+                f"layer{layer}": ops[j * 2 : j * 2 + 2] for j, layer in enumerate(gdn)
+            }
     return sections, profiles
 
 
 def scope(buffer, model):
-    if buffer['access'] == 'read':
-        return 'weights'
-    name = buffer['name']
-    state = set(model['reset_buffers']) | {model[k] for k in ('input', 'token', 'status', 'position')}
-    state.update(('Features', 'FeatureIndex', 'MtpFeatureIndex', 'MRopePositions', 'MtpCondition',
-                  'MtpTargetHidden', 'MtpInput', 'MtpToken', 'MtpStatus', 'MtpSeqLength', 'MtpPositions',
-                  'SeqLength', 'SequenceTokens', 'SequenceStatus', 'AcceptedInputs'))
-    if name in state or re.match(r'L\d+_(Sequence|Saved|State|History|KPages|VPages)', name):
-        return 'sequence'
-    return 'workspace'
+    if buffer["access"] == "read":
+        return "weights"
+    name = buffer["name"]
+    state = set(model["reset_buffers"]) | {
+        model[k] for k in ("input", "token", "status", "position")
+    }
+    state.update(
+        (
+            "Features",
+            "FeatureIndex",
+            "MtpFeatureIndex",
+            "MRopePositions",
+            "MtpCondition",
+            "MtpTargetHidden",
+            "MtpInput",
+            "MtpToken",
+            "MtpStatus",
+            "MtpSeqLength",
+            "MtpPositions",
+            "SeqLength",
+            "SequenceTokens",
+            "SequenceStatus",
+            "AcceptedInputs",
+        )
+    )
+    if name in state or re.match(r"L\d+_(Sequence|Saved|State|History|KPages|VPages)", name):
+        return "sequence"
+    return "workspace"
 
 
 def validate_plan(directory, source, mapping, engine):
     """Require exact graph, ABI and launch equivalence before publishing."""
-    completed = subprocess.run([str(engine.resolve(strict=True)), 'plan-model', str(directory)],
-                               check=True, capture_output=True, text=True)
-    plan = json.loads(completed.stdout)['manifest']
-    if set(plan['programs']) != set(source['programs']):
-        raise ValueError('Registered architecture does not cover all source programs')
-    before = {k['name']: k for k in source['kernels']}
-    after = {k['name']: k for k in plan['kernels']}
-    for program, original_ops in source['programs'].items():
-        generated_ops = plan['programs'][program]
+    completed = subprocess.run(
+        [str(engine.resolve(strict=True)), "plan-model", str(directory)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    plan = json.loads(completed.stdout)["manifest"]
+    if set(plan["programs"]) != set(source["programs"]):
+        raise ValueError("Registered architecture does not cover all source programs")
+    before = {k["name"]: k for k in source["kernels"]}
+    after = {k["name"]: k for k in plan["kernels"]}
+    for program, original_ops in source["programs"].items():
+        generated_ops = plan["programs"][program]
         if len(original_ops) != len(generated_ops):
-            raise ValueError(f'{program}: registered operation count differs')
+            raise ValueError(f"{program}: registered operation count differs")
         for index, (left, right) in enumerate(zip(original_ops, generated_ops)):
-            if left['kind'] != 'kernel':
+            if left["kind"] != "kernel":
                 equal = left == right
             else:
-                equal = (right['kind'] == 'kernel' and mapping[right['name']] == left['name']
-                         and {k: v for k, v in before[left['name']].items() if k != 'name'}
-                         == {k: v for k, v in after[right['name']].items() if k != 'name'})
+                equal = (
+                    right["kind"] == "kernel"
+                    and mapping[right["name"]] == left["name"]
+                    and {k: v for k, v in before[left["name"]].items() if k != "name"}
+                    == {k: v for k, v in after[right["name"]].items() if k != "name"}
+                )
             if not equal:
-                raise ValueError(f'{program}/{index}: registered operation or binding differs')
+                raise ValueError(f"{program}/{index}: registered operation or binding differs")
 
 
 def publish(directory, engine=None):
     """Replace a staging-only schema-2 plan with data/implementation contracts."""
-    cache = directory / 'cache'
-    model = json.loads((cache / 'manifest.json').read_text())
-    config = json.loads((directory / 'config.json').read_text())
-    if model['schema_version'] != 2 or config.get('model_type') not in ('qwen3_5', 'qwen3_5_text'):
-        raise ValueError('Expected a prepared Qwen3_5 safetensors model')
+    cache = directory / "cache"
+    model = json.loads((cache / "manifest.json").read_text())
+    config = json.loads((directory / "config.json").read_text())
+    if model["schema_version"] != 2 or config.get("model_type") not in ("qwen3_5", "qwen3_5_text"):
+        raise ValueError("Expected a prepared Qwen3_5 safetensors model")
     sections, profiles = section_ops(model, config)
-    original = {k['name']: k for k in model['kernels']}
+    original = {k["name"]: k for k in model["kernels"]}
     checked = set()
     for kernel in original.values():
-        for field in ('module', 'source', 'host_abi'):
+        for field in ("module", "source", "host_abi"):
             asset = kernel[field]
-            key = (asset['file'], asset['sha256'])
+            key = (asset["file"], asset["sha256"])
             if key not in checked:
-                if file_hash(source_path(cache.resolve(), asset['file'])) != asset['sha256']:
-                    raise ValueError('Source operator asset sha256 mismatch')
+                if file_hash(source_path(cache.resolve(), asset["file"])) != asset["sha256"]:
+                    raise ValueError("Source operator asset sha256 mismatch")
                 checked.add(key)
     bindings = []
     binding_map = {}
@@ -191,63 +254,92 @@ def publish(directory, engine=None):
         for group, ops in groups.items():
             slot = 0
             for op in ops:
-                if op['kind'] != 'kernel':
+                if op["kind"] != "kernel":
                     continue
-                item = copy.deepcopy(original[op['name']])
-                item['name'] = f'{program}/{group}/k{slot}'
+                item = copy.deepcopy(original[op["name"]])
+                item["name"] = f"{program}/{group}/k{slot}"
                 bindings.append(item)
-                binding_map[item['name']] = op['name']
+                binding_map[item["name"]] = op["name"]
                 slot += 1
-    package = dict(schema_version=1, runtime_abi=CONTRACT['runtime_abi'], target='sm_87', architecture='qwen3_5',
-                   compute_policy='int8_quality', config_signature=config_signature(config),
-                   prefill_profiles=profiles, kernels=bindings,
-                   buffer_contracts=[{k: v for k, v in b.items() if k != 'data'} for b in model['buffers']],
-                   toolchain={k: model['toolchain'][k] for k in ('torch', 'tilelang', 'cuda')
-                              if k in model['toolchain']})
+    package = dict(
+        schema_version=1,
+        runtime_abi=CONTRACT["runtime_abi"],
+        target="sm_87",
+        architecture="qwen3_5",
+        compute_policy="int8_quality",
+        config_signature=config_signature(config),
+        prefill_profiles=profiles,
+        kernels=bindings,
+        buffer_contracts=[{k: v for k, v in b.items() if k != "data"} for b in model["buffers"]],
+        toolchain={
+            k: model["toolchain"][k]
+            for k in ("torch", "tilelang", "cuda")
+            if k in model["toolchain"]
+        },
+    )
     library = model_library()
-    package['execution'] = dict(abi_version=1, library=dict(file='lib/model.so', sha256=file_hash(library)),
-                                package='orinfer-models', version='0.1.1')
-    raw = (json.dumps(package, indent=2, ensure_ascii=False) + '\n').encode()
+    package["execution"] = dict(
+        abi_version=1,
+        library=dict(file="lib/model.so", sha256=file_hash(library)),
+        package="orinfer-models",
+        version="0.1.1",
+    )
+    raw = (json.dumps(package, indent=2, ensure_ascii=False) + "\n").encode()
     digest = hashlib.sha256(raw).hexdigest()
-    destination = cache / 'packages' / digest
+    destination = cache / "packages" / digest
     destination.mkdir(parents=True)
-    (destination / 'package.json').write_bytes(raw)
-    (destination / 'lib').mkdir()
-    shutil.copyfile(library, destination / 'lib/model.so')
-    (cache / 'kernels').rename(destination / 'kernels')
+    (destination / "package.json").write_bytes(raw)
+    (destination / "lib").mkdir()
+    shutil.copyfile(library, destination / "lib/model.so")
+    (cache / "kernels").rename(destination / "kernels")
     # Include project licensing in independently distributed packages.
     repo = Path(__file__).resolve().parents[2]
-    for name in ('LICENSE', 'COPYING.LESSER', 'COPYING', 'THIRD_PARTY_NOTICES.md'):
+    for name in ("LICENSE", "COPYING.LESSER", "COPYING", "THIRD_PARTY_NOTICES.md"):
         if (repo / name).is_file():
             shutil.copyfile(repo / name, destination / name)
-    metadata = {k: v for k, v in model.items() if k not in ('kernels', 'programs')}
-    write_json(cache / 'model.json', dict(schema_version=1, architecture='qwen3_5',
-               compute_policy='int8_quality', execution_package=digest,
-               buffer_scopes={b['name']: scope(b, model) for b in model['buffers']},
-               frontend_assets={name: file_hash(directory / name) for name in
-                                ('tokenizer.json', 'chat_template.jinja', 'generation_config.json')}, metadata=metadata))
-    validate_plan(directory, model, binding_map, engine or repo / 'target/release/orinfer')
-    (cache / 'manifest.json').unlink()
-    return {'execution_package': digest, 'kernel_bindings': len(bindings), 'binding_map': binding_map}
+    metadata = {k: v for k, v in model.items() if k not in ("kernels", "programs")}
+    write_json(
+        cache / "model.json",
+        dict(
+            schema_version=1,
+            architecture="qwen3_5",
+            compute_policy="int8_quality",
+            execution_package=digest,
+            buffer_scopes={b["name"]: scope(b, model) for b in model["buffers"]},
+            frontend_assets={
+                name: file_hash(directory / name)
+                for name in ("tokenizer.json", "chat_template.jinja", "generation_config.json")
+            },
+            metadata=metadata,
+        ),
+    )
+    validate_plan(directory, model, binding_map, engine or repo / "target/release/orinfer")
+    (cache / "manifest.json").unlink()
+    return {
+        "execution_package": digest,
+        "kernel_bindings": len(bindings),
+        "binding_map": binding_map,
+    }
 
 
 def split(model, output, engine=None):
     model = model.resolve(strict=True)
     output = output.absolute()
     if output.exists() or output.is_symlink():
-        raise ValueError(f'Output already exists: {output}')
+        raise ValueError(f"Output already exists: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     from tools.model.publication import staged_directory, link_or_copy
+
     with staged_directory(output) as staging:
         staging.mkdir()
         for file in model.iterdir():
             if file.is_file():
                 shutil.copyfile(file, staging / file.name)
-        cache = staging / 'cache'
+        cache = staging / "cache"
         cache.mkdir()
-        shutil.copyfile(model / 'cache/manifest.json', cache / 'manifest.json')
-        for subdir in ('weights', 'kernels'):
-            shutil.copytree(model / 'cache' / subdir, cache / subdir, copy_function=link_or_copy)
+        shutil.copyfile(model / "cache/manifest.json", cache / "manifest.json")
+        for subdir in ("weights", "kernels"):
+            shutil.copytree(model / "cache" / subdir, cache / subdir, copy_function=link_or_copy)
         report = publish(staging, engine)
     return report
 
@@ -255,10 +347,10 @@ def split(model, output, engine=None):
 def archive(package, output):
     package = package.resolve(strict=True)
     if output.exists():
-        raise ValueError('Archive already exists')
-    temporary = output.with_suffix(output.suffix + '.tmp')
+        raise ValueError("Archive already exists")
+    temporary = output.with_suffix(output.suffix + ".tmp")
     try:
-        with tarfile.open(temporary, 'w:gz') as stream:
+        with tarfile.open(temporary, "w:gz") as stream:
             stream.add(package, arcname=package.name)
         temporary.rename(output)
     except BaseException:
@@ -268,36 +360,36 @@ def archive(package, output):
 
 def install(archive_path, cache):
     cache.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix='.install-', dir=cache))
+    staging = Path(tempfile.mkdtemp(prefix=".install-", dir=cache))
     try:
-        with tarfile.open(archive_path, 'r:gz') as stream:
+        with tarfile.open(archive_path, "r:gz") as stream:
             members = stream.getmembers()
             roots = {Path(m.name).parts[0] for m in members if Path(m.name).parts}
             if len(roots) != 1 or any(not (m.isfile() or m.isdir()) for m in members):
-                raise ValueError('Expected one package directory containing regular files')
+                raise ValueError("Expected one package directory containing regular files")
             digest = roots.pop()
-            if not re.fullmatch('[0-9a-f]{64}', digest):
-                raise ValueError('Malformed operator package digest')
+            if not re.fullmatch("[0-9a-f]{64}", digest):
+                raise ValueError("Malformed operator package digest")
             if (cache / digest).exists():
-                raise ValueError('Operator package already installed')
+                raise ValueError("Operator package already installed")
             for member in members:
                 p = Path(member.name)
-                if p.is_absolute() or '..' in p.parts:
-                    raise ValueError('Unsafe archive path')
+                if p.is_absolute() or ".." in p.parts:
+                    raise ValueError("Unsafe archive path")
             stream.extractall(staging)
         package = staging / digest
-        if file_hash(package / 'package.json') != digest:
-            raise ValueError('Operator package digest mismatch')
-        manifest = json.loads((package / 'package.json').read_text())
+        if file_hash(package / "package.json") != digest:
+            raise ValueError("Operator package digest mismatch")
+        manifest = json.loads((package / "package.json").read_text())
         verify_execution(manifest, package)
         checked = set()
-        for kernel in manifest['kernels']:
-            for field in ('module', 'source', 'host_abi'):
+        for kernel in manifest["kernels"]:
+            for field in ("module", "source", "host_abi"):
                 asset = kernel[field]
-                key = (asset['file'], asset['sha256'])
+                key = (asset["file"], asset["sha256"])
                 if key not in checked:
-                    if file_hash(source_path(package.resolve(), asset['file'])) != asset['sha256']:
-                        raise ValueError('Operator asset sha256 mismatch')
+                    if file_hash(source_path(package.resolve(), asset["file"])) != asset["sha256"]:
+                        raise ValueError("Operator asset sha256 mismatch")
                     checked.add(key)
         package.rename(cache / digest)
         return digest
@@ -308,17 +400,19 @@ def install(archive_path, cache):
 def pin_assets(directory):
     """Explicitly seal active frontend files, without changing any weight/kernel payload."""
     directory = directory.resolve(strict=True)
-    path = directory / 'cache/model.json'
+    path = directory / "cache/model.json"
     descriptor = json.loads(path.read_text())
-    identities = {name: file_hash(source_path(directory, name)) for name in
-                  ('tokenizer.json', 'chat_template.jinja', 'generation_config.json')}
-    descriptor['frontend_assets'] = identities
-    fd, temporary = tempfile.mkstemp(prefix='.model-', suffix='.json', dir=path.parent)
+    identities = {
+        name: file_hash(source_path(directory, name))
+        for name in ("tokenizer.json", "chat_template.jinja", "generation_config.json")
+    }
+    descriptor["frontend_assets"] = identities
+    fd, temporary = tempfile.mkstemp(prefix=".model-", suffix=".json", dir=path.parent)
     try:
         os.fchmod(fd, path.stat().st_mode & 0o777)
-        with os.fdopen(fd, 'w') as stream:
+        with os.fdopen(fd, "w") as stream:
             json.dump(descriptor, stream, indent=2, ensure_ascii=False)
-            stream.write('\n')
+            stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -330,30 +424,30 @@ def pin_assets(directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest='command', required=True)
-    build = sub.add_parser('split')
-    build.add_argument('--model', type=Path, required=True)
-    build.add_argument('--output', type=Path, required=True)
-    pack = sub.add_parser('archive')
-    pack.add_argument('package', type=Path)
-    pack.add_argument('output', type=Path)
-    add = sub.add_parser('install')
-    add.add_argument('archive', type=Path)
-    add.add_argument('cache', type=Path)
-    seal = sub.add_parser('pin-assets', help='Explicitly pin existing native model frontend files')
-    seal.add_argument('model', type=Path)
+    sub = parser.add_subparsers(dest="command", required=True)
+    build = sub.add_parser("split")
+    build.add_argument("--model", type=Path, required=True)
+    build.add_argument("--output", type=Path, required=True)
+    pack = sub.add_parser("archive")
+    pack.add_argument("package", type=Path)
+    pack.add_argument("output", type=Path)
+    add = sub.add_parser("install")
+    add.add_argument("archive", type=Path)
+    add.add_argument("cache", type=Path)
+    seal = sub.add_parser("pin-assets", help="Explicitly pin existing native model frontend files")
+    seal.add_argument("model", type=Path)
     args = parser.parse_args()
-    if args.command == 'split':
+    if args.command == "split":
         report = split(args.model, args.output)
-        report.pop('binding_map')
+        report.pop("binding_map")
         print(json.dumps(report, indent=2))
-    elif args.command == 'pin-assets':
+    elif args.command == "pin-assets":
         print(json.dumps(pin_assets(args.model), indent=2))
-    elif args.command == 'archive':
+    elif args.command == "archive":
         archive(args.package, args.output)
     else:
         print(install(args.archive, args.cache))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -3,6 +3,7 @@
 No Torch math or allocations. Buffers and explicit caller stream are supplied.
 Each [request, head, chunk] scan starts at zero; no recurrent state is owned.
 """
+
 import operator
 
 import tilelang
@@ -17,7 +18,12 @@ def validate_lengths(lengths, *, batch, tokens):
     Returns immutable Python ints; no device readback or implicit synchronization.
     The Rust caller must perform the same 0 <= length <= T int32 validation.
     """
-    if type(batch) is not int or type(tokens) is not int or not 0 < batch < 2**31 or not 0 < tokens < 2**31:
+    if (
+        type(batch) is not int
+        or type(tokens) is not int
+        or not 0 < batch < 2**31
+        or not 0 < tokens < 2**31
+    ):
         raise ValueError("batch/tokens must be positive Python ints, tokens < 2**31")
     values = tuple(lengths)
     if len(values) != batch:
@@ -36,8 +42,7 @@ def validate_lengths(lengths, *, batch, tokens):
     return tuple(result)
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc",
-              target={"kind": "cuda", "arch": "sm_87"})
+@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
 def _compile_headmajor(bt: int = 64, heads_tile: int = 4, threads: int = 128):
     assert bt in (16, 32, 64)
     assert heads_tile in (4, 8, 16) and HEADS % heads_tile == 0
@@ -45,8 +50,10 @@ def _compile_headmajor(bt: int = 64, heads_tile: int = 4, threads: int = 128):
     batch, chunks = T.dynamic("batch"), T.dynamic("chunks")
 
     @T.prim_func
-    def main(G: T.Tensor((batch, HEADS, chunks, bt), "float32"),
-             CumulativeG: T.Tensor((batch, HEADS, chunks, bt), "float32")):
+    def main(
+        G: T.Tensor((batch, HEADS, chunks, bt), "float32"),
+        CumulativeG: T.Tensor((batch, HEADS, chunks, bt), "float32"),
+    ):
         with T.Kernel(HEADS // heads_tile, chunks, batch, threads=threads) as (hh, c, b):
             scan = T.alloc_shared((heads_tile, bt), "float32")
             last_nonzero = T.alloc_shared((heads_tile, bt), "int32")
@@ -60,13 +67,14 @@ def _compile_headmajor(bt: int = 64, heads_tile: int = 4, threads: int = 128):
                     CumulativeG[b, hh * heads_tile + h, c, t] = scan[h, last_nonzero[h, t]]
                 else:
                     CumulativeG[b, hh * heads_tile + h, c, t] = 0.0
+
     return main
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc",
-              target={"kind": "cuda", "arch": "sm_87"})
-def _compile_pack(bt: int = 64, heads_tile: int = 4, threads: int = 128,
-                  beta_dtype: str = "float32"):
+@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
+def _compile_pack(
+    bt: int = 64, heads_tile: int = 4, threads: int = 128, beta_dtype: str = "float32"
+):
     assert bt in (16, 32, 64)
     assert heads_tile in (4, 8, 16) and HEADS % heads_tile == 0
     assert threads == 128 and beta_dtype in ("float16", "float32")
@@ -74,11 +82,13 @@ def _compile_pack(bt: int = 64, heads_tile: int = 4, threads: int = 128,
     chunks = T.ceildiv(tokens, bt)
 
     @T.prim_func
-    def main(G: T.Tensor((batch, tokens, HEADS), "float32"),
-             Beta: T.Tensor((batch, tokens, HEADS), beta_dtype),
-             Lengths: T.Tensor((batch,), "int32"),
-             CumulativeG: T.Tensor((batch, HEADS, chunks, bt), "float32"),
-             PaddedBeta: T.Tensor((batch, HEADS, chunks, bt), "float32")):
+    def main(
+        G: T.Tensor((batch, tokens, HEADS), "float32"),
+        Beta: T.Tensor((batch, tokens, HEADS), beta_dtype),
+        Lengths: T.Tensor((batch,), "int32"),
+        CumulativeG: T.Tensor((batch, HEADS, chunks, bt), "float32"),
+        PaddedBeta: T.Tensor((batch, HEADS, chunks, bt), "float32"),
+    ):
         with T.Kernel(HEADS // heads_tile, chunks, batch, threads=threads) as (hh, c, b):
             scan = T.alloc_shared((heads_tile, bt), "float32")
             length = T.min(T.max(Lengths[b], 0), tokens)
@@ -101,6 +111,7 @@ def _compile_pack(bt: int = 64, heads_tile: int = 4, threads: int = 128,
                     CumulativeG[b, hh * heads_tile + h, c, t] = scan[h, length - c * bt - 1]
                 else:
                     CumulativeG[b, hh * heads_tile + h, c, t] = 0.0
+
     return main
 
 

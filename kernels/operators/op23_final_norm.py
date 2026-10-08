@@ -3,6 +3,7 @@
 Only B selected rows are read/normalized; no full-prompt norm intermediate.
 Outputs are caller-owned and immutable inputs make graph repetitions safe.
 """
+
 import tilelang.language as T
 from tools.operators.common import orin_jit
 
@@ -27,9 +28,14 @@ def validate_last_indices(indices, rows: int, batch: int | None = None):
 
 
 @orin_jit
-def final_norm(M: int | None = None, B: int | None = None,
-               hidden: int = 5120, epsilon: float = 1e-6, threads: int = 256,
-               last_row: bool = False):
+def final_norm(
+    M: int | None = None,
+    B: int | None = None,
+    hidden: int = 5120,
+    epsilon: float = 1e-6,
+    threads: int = 256,
+    last_row: bool = False,
+):
     """Build (X, R, I, W, Y): FP16 hidden plus FP32 residual, FP16 Y.
 
     Contiguous X/R[M,H], int32 I[B], zero-centered FP16 W[H], Y[B,H].
@@ -47,11 +53,13 @@ def final_norm(M: int | None = None, B: int | None = None,
     columns = ((hidden + threads - 1) // threads) * threads
 
     @T.prim_func
-    def kernel(X: T.Tensor((rows, hidden), T.float16),
-               R: T.Tensor((rows, hidden), T.float32),
-               I: T.Tensor((batch,), T.int32),
-               W: T.Tensor((hidden,), T.float16),
-               Y: T.Tensor((batch, hidden), T.float16)):
+    def kernel(
+        X: T.Tensor((rows, hidden), T.float16),
+        R: T.Tensor((rows, hidden), T.float32),
+        I: T.Tensor((batch,), T.int32),
+        W: T.Tensor((hidden,), T.float16),
+        Y: T.Tensor((batch, hidden), T.float16),
+    ):
         with T.Kernel(batch, threads=threads) as b:
             value = T.alloc_fragment((columns,), T.float32)
             square = T.alloc_fragment((columns,), T.float32)
@@ -59,20 +67,30 @@ def final_norm(M: int | None = None, B: int | None = None,
             for j in T.Parallel(columns):
                 value[j] = 0.0
                 if j < hidden:
-                    value[j] = T.cast(X[rows-1 if last_row else I[b], j], T.float32) + R[rows-1 if last_row else I[b], j]
+                    value[j] = (
+                        T.cast(X[rows - 1 if last_row else I[b], j], T.float32)
+                        + R[rows - 1 if last_row else I[b], j]
+                    )
                 square[j] = value[j] * value[j]
             T.reduce_sum(square, total, dim=0)
             for j in T.Parallel(columns):
                 if j < hidden:
                     Y[b, j] = (value[j] * T.rsqrt(total[0] / hidden + epsilon)) * (
-                        T.cast(W[j], T.float32) + 1.0)
+                        T.cast(W[j], T.float32) + 1.0
+                    )
+
     return kernel
 
 
 @orin_jit
-def final_norm_presummed(M: int | None = None, B: int | None = None,
-                         hidden: int = 5120, epsilon: float = 1e-6,
-                         input_dtype: str = "float32", threads: int = 256):
+def final_norm_presummed(
+    M: int | None = None,
+    B: int | None = None,
+    hidden: int = 5120,
+    epsilon: float = 1e-6,
+    input_dtype: str = "float32",
+    threads: int = 256,
+):
     """Build (U, I, W, Y), normalizing selected already-summed rows.
 
     FP32 U preserves the FP32 residual sum. FP16 U is a separate no-residual
@@ -89,10 +107,12 @@ def final_norm_presummed(M: int | None = None, B: int | None = None,
     columns = ((hidden + threads - 1) // threads) * threads
 
     @T.prim_func
-    def kernel(U: T.Tensor((rows, hidden), input_dtype),
-               I: T.Tensor((batch,), T.int32),
-               W: T.Tensor((hidden,), T.float16),
-               Y: T.Tensor((batch, hidden), T.float16)):
+    def kernel(
+        U: T.Tensor((rows, hidden), input_dtype),
+        I: T.Tensor((batch,), T.int32),
+        W: T.Tensor((hidden,), T.float16),
+        Y: T.Tensor((batch, hidden), T.float16),
+    ):
         with T.Kernel(batch, threads=threads) as b:
             value = T.alloc_fragment((columns,), T.float32)
             square = T.alloc_fragment((columns,), T.float32)
@@ -106,22 +126,26 @@ def final_norm_presummed(M: int | None = None, B: int | None = None,
             for j in T.Parallel(columns):
                 if j < hidden:
                     Y[b, j] = (value[j] * T.rsqrt(total[0] / hidden + epsilon)) * (
-                        T.cast(W[j], T.float32) + 1.0)
+                        T.cast(W[j], T.float32) + 1.0
+                    )
+
     return kernel
 
 
 @orin_jit
-def last_hidden_gather(dtype: str = "float16", hidden: int = 5120,
-                       threads: int = 256):
+def last_hidden_gather(dtype: str = "float16", hidden: int = 5120, threads: int = 256):
     """Exact-copy diagnostic/cache helper (X,I,G); not needed by fused norm."""
     assert dtype in ("float16", "float32") and hidden > 0
     rows, batch = T.dynamic("rows"), T.dynamic("batch")
 
     @T.prim_func
-    def kernel(X: T.Tensor((rows, hidden), dtype),
-               I: T.Tensor((batch,), T.int32),
-               G: T.Tensor((batch, hidden), dtype)):
+    def kernel(
+        X: T.Tensor((rows, hidden), dtype),
+        I: T.Tensor((batch,), T.int32),
+        G: T.Tensor((batch, hidden), dtype),
+    ):
         with T.Kernel(batch, threads=threads) as b:
             for j in T.Parallel(hidden):
                 G[b, j] = X[I[b], j]
+
     return kernel

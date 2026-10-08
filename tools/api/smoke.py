@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Integration checks against a running real-model Chat Completions server."""
+
 import argparse
 import concurrent.futures
 import json
@@ -27,8 +28,11 @@ def complete(base, payload):
 def stream(base, payload):
     chunks = []
     done = False
-    with request(base, "/chat/completions", dict(payload, stream=True,
-                 stream_options={"include_usage": True})) as response:
+    with request(
+        base,
+        "/chat/completions",
+        dict(payload, stream=True, stream_options={"include_usage": True}),
+    ) as response:
         assert response.headers["Content-Type"].startswith("text/event-stream")
         for line in response:
             if not line.startswith(b"data: "):
@@ -52,10 +56,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8088/v1")
     parser.add_argument("--model", default="qwen3.8-27b")
-    parser.add_argument("--expect-prefix-cache", action="store_true",
-                        help="Require complete prompt reuse on repeated requests")
-    parser.add_argument("--output", type=Path, required=True,
-                        help="New JSON result path outside tracked source")
+    parser.add_argument(
+        "--expect-prefix-cache",
+        action="store_true",
+        help="Require complete prompt reuse on repeated requests",
+    )
+    parser.add_argument(
+        "--output", type=Path, required=True, help="New JSON result path outside tracked source"
+    )
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
@@ -77,11 +85,17 @@ def main():
     content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c["choices"])
     assert content == first["choices"][0]["message"]["content"]
     if args.expect_prefix_cache:
-        assert chunks[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == first["usage"]["prompt_tokens"]
+        assert (
+            chunks[-1]["usage"]["prompt_tokens_details"]["cached_tokens"]
+            == first["usage"]["prompt_tokens"]
+        )
     evidence["stream"] = chunks
     print("PASS SSE text matches non-streaming", flush=True)
     stopped = complete(base, dict(text, stop="5"))
-    assert not stopped["choices"][0]["message"]["content"] and stopped["choices"][0]["finish_reason"] == "stop"
+    assert (
+        not stopped["choices"][0]["message"]["content"]
+        and stopped["choices"][0]["finish_reason"] == "stop"
+    )
     evidence["stop"] = stopped
     stochastic = dict(text, temperature=0.7, top_p=0.9)
     a = complete(base, stochastic)
@@ -107,8 +121,17 @@ def main():
     assert after_cancel["choices"] == first["choices"]
     evidence["after_cancel"] = after_cancel
     print("PASS disconnected request cancels and next request resets", flush=True)
-    for invalid in [dict(text, model="unknown"), dict(text, n=2), dict(text, max_tokens=context + 1),
-                    dict(text, messages=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}])]:
+    for invalid in [
+        dict(text, model="unknown"),
+        dict(text, n=2),
+        dict(text, max_tokens=context + 1),
+        dict(
+            text,
+            messages=[
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}
+            ],
+        ),
+    ]:
         try:
             complete(base, invalid)
         except urllib.error.HTTPError as error:
@@ -117,25 +140,64 @@ def main():
         else:
             raise AssertionError("Invalid request was accepted")
     print("PASS OpenAI-shaped validation errors", flush=True)
-    tools = [{"type": "function", "function": {"name": "read_verification", "description": "Read a local verification code.",
-              "parameters": {"type": "object", "properties": {"filename": {"type": "string"}, "count": {"type": "integer"}},
-                             "required": ["filename", "count"], "additionalProperties": False}}}]
-    tool_request = dict(common, max_tokens=128, tools=tools, tool_choice="required", parallel_tool_calls=False,
-                        messages=[{"role": "user", "content": "Call read_verification with filename input.txt and count 2. Then report the returned code."}])
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_verification",
+                "description": "Read a local verification code.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"filename": {"type": "string"}, "count": {"type": "integer"}},
+                    "required": ["filename", "count"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    tool_request = dict(
+        common,
+        max_tokens=128,
+        tools=tools,
+        tool_choice="required",
+        parallel_tool_calls=False,
+        messages=[
+            {
+                "role": "user",
+                "content": "Call read_verification with filename input.txt and count 2. Then report the returned code.",
+            }
+        ],
+    )
     chunks = stream(base, tool_request)
-    calls = [call for c in chunks if c["choices"] for call in c["choices"][0]["delta"].get("tool_calls", [])]
+    calls = [
+        call
+        for c in chunks
+        if c["choices"]
+        for call in c["choices"][0]["delta"].get("tool_calls", [])
+    ]
     assert calls and all(c["index"] == 0 for c in calls), calls
-    call = {"id": calls[0]["id"], "type": "function", "function": {
-        "name": calls[0]["function"]["name"],
-        "arguments": "".join(c["function"].get("arguments", "") for c in calls),
-    }}
+    call = {
+        "id": calls[0]["id"],
+        "type": "function",
+        "function": {
+            "name": calls[0]["function"]["name"],
+            "arguments": "".join(c["function"].get("arguments", "") for c in calls),
+        },
+    }
     assert len(calls) > 1, "Expected incremental tool arguments"
     assert call["function"]["name"] == "read_verification", call
     assert json.loads(call["function"]["arguments"]) == {"filename": "input.txt", "count": 2}, call
     assert chunks[-2]["choices"][0]["finish_reason"] == "tool_calls"
-    followup = dict(common, max_tokens=64, tools=tools, messages=tool_request["messages"] + [
-        {"role": "assistant", "content": None, "tool_calls": [call]},
-        {"role": "tool", "tool_call_id": call["id"], "content": '{"code":"ORIN_CHECK_5824"}'}])
+    followup = dict(
+        common,
+        max_tokens=64,
+        tools=tools,
+        messages=tool_request["messages"]
+        + [
+            {"role": "assistant", "content": None, "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": call["id"], "content": '{"code":"ORIN_CHECK_5824"}'},
+        ],
+    )
     final = complete(base, followup)
     assert "ORIN_CHECK_5824" in (final["choices"][0]["message"]["content"] or ""), final
     assert final["choices"][0]["finish_reason"] == "stop", final

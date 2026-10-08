@@ -3,6 +3,7 @@
 No compensation or model quality policy is implemented here. All buffers are
 explicit; callers own validation, stable addresses and CUDA stream selection.
 """
+
 import tilelang
 import tilelang.language as T
 
@@ -17,18 +18,19 @@ def quantized_code(value, scale):
     return T.cast(T.max(-127.0, T.min(127.0, T.round(ratio))), T.int8)
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc",
-              target={"kind": "cuda", "arch": "sm_87"})
+@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
 def _compile(K: int, group: int, masked: bool, fused: bool, threads: int):
     rows = T.dynamic("rows")
     groups = (K + group - 1) // group
     tile = ((group + threads - 1) // threads) * threads
 
     @T.prim_func
-    def main(X: T.Tensor((rows, (2 * K if fused else K)), T.float16),
-             Mask: T.Tensor((K,), T.uint8),
-             Q: T.Tensor((rows, K), T.int8),
-             S: T.Tensor((rows, groups), T.float16)):
+    def main(
+        X: T.Tensor((rows, (2 * K if fused else K)), T.float16),
+        Mask: T.Tensor((K,), T.uint8),
+        Q: T.Tensor((rows, K), T.int8),
+        S: T.Tensor((rows, groups), T.float16),
+    ):
         with T.Kernel(rows, groups, threads=threads) as (row, block):
             value = T.alloc_fragment((tile,), T.float32)
             absolute = T.alloc_fragment((tile,), T.float32)
@@ -52,7 +54,8 @@ def _compile(K: int, group: int, masked: bool, fused: bool, threads: int):
             scale[0] = T.if_then_else(
                 maximum[0] > 0.0,
                 T.max(T.call_extern("float32", "__fdiv_rn", maximum[0], 127.0), 2**-24),
-                1.0)
+                1.0,
+            )
             S[row, block] = scale[0]
             for j in T.Parallel(tile):
                 col = block * group + j
@@ -62,8 +65,9 @@ def _compile(K: int, group: int, masked: bool, fused: bool, threads: int):
     return main
 
 
-def activation_quantization(K: int, group_size: int | None = None, *,
-                            masked: bool = False, threads: int = 256):
+def activation_quantization(
+    K: int, group_size: int | None = None, *, masked: bool = False, threads: int = 256
+):
     """Build dynamic-M (X, Mask, Q, S), FP16/uint8/int8/FP16.
 
     group_size=None means per-token. S[M,ceildiv(K,group_size)] is contiguous.
@@ -75,8 +79,9 @@ def activation_quantization(K: int, group_size: int | None = None, *,
     return _build(K, group_size, masked, False, threads)
 
 
-def swiglu_activation_quantization(K: int = 17408, group_size: int | None = None,
-                                   *, masked: bool = False, threads: int = 256):
+def swiglu_activation_quantization(
+    K: int = 17408, group_size: int | None = None, *, masked: bool = False, threads: int = 256
+):
     """Build the same ABI with split-layout X[M,2*K]=[gate|up].
 
     The imported op04 macro returns FP16 before the FP32 amax/code arithmetic.

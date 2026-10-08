@@ -8,6 +8,7 @@ Reference expands Q/K for readability only; production maps hv//(HV/HK).
 Intermediate formulas define shared op11..16 semantics; model rounding is
 separately locked and compared. All gates are natural logarithmic decays.
 """
+
 import torch
 
 
@@ -51,8 +52,7 @@ def triangle_transform(system):
     bt = system.shape[-1]
     eye = torch.eye(bt, dtype=torch.float32, device=system.device)
     identity = eye.expand_as(system)
-    return torch.linalg.solve_triangular(system.float(), identity, upper=False,
-                                         unitriangular=True)
+    return torch.linalg.solve_triangular(system.float(), identity, upper=False, unitriangular=True)
 
 
 def wy(transform, k, v, cumulative_g, beta):
@@ -92,6 +92,17 @@ def chunked(q, k, v, g, beta, state, q_scale=1.0):
     w, u = wy(transform, k, v, gc, beta)
     states, r, final = chunk_scan(k, gc, w, u, state)
     output = chunk_output(q, gc, qk, states, r, q_scale=q_scale)
-    return output, final, {"gc": gc, "system": system, "qk": qk,
-                          "transform": transform, "w": w, "u": u,
-                          "entering_states": states, "residuals": r}
+    return (
+        output,
+        final,
+        {
+            "gc": gc,
+            "system": system,
+            "qk": qk,
+            "transform": transform,
+            "w": w,
+            "u": u,
+            "entering_states": states,
+            "residuals": r,
+        },
+    )

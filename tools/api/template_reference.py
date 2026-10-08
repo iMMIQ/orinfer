@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Generate offline Transformers token references for Rust chat codec tests."""
+
 import argparse
 import json
 from pathlib import Path
@@ -17,16 +18,52 @@ def main():
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir, local_files_only=True)
-    tools = [{"type": "function", "function": {"name": "lookup", "description": "Lookup a city",
-              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
     requests = [
         {"messages": [{"role": "user", "content": "你好，2+3等于几？"}]},
-        {"messages": [{"role": "system", "content": "Answer briefly."},
-                      {"role": "user", "content": [{"type": "text", "text": "天气"}]}], "tools": tools},
-        {"messages": [{"role": "user", "content": "查一下北京"},
-                      {"role": "assistant", "content": None, "tool_calls": [{"id": "a", "type": "function", "function": {"name": "lookup", "arguments": '{"city":"北京"}'}}]},
-                      {"role": "tool", "tool_call_id": "a", "content": "晴朗"}], "tools": tools},
-        {"messages": [{"role": "user", "content": "2+3?"}], "enable_thinking": True, "reasoning_effort": "low"},
+        {
+            "messages": [
+                {"role": "system", "content": "Answer briefly."},
+                {"role": "user", "content": [{"type": "text", "text": "天气"}]},
+            ],
+            "tools": tools,
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "查一下北京"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "a",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": '{"city":"北京"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "a", "content": "晴朗"},
+            ],
+            "tools": tools,
+        },
+        {
+            "messages": [{"role": "user", "content": "2+3?"}],
+            "enable_thinking": True,
+            "reasoning_effort": "low",
+        },
     ]
     processor = None
     vision = None
@@ -36,13 +73,23 @@ def main():
         from PIL import Image
         from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
         from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+
         if args.image is None:
             parser.error("--vision-model requires --image")
-        vision_model = args.vision_model / 'cache/model.json' if args.vision_model.is_dir() else args.vision_model
+        vision_model = (
+            args.vision_model / "cache/model.json"
+            if args.vision_model.is_dir()
+            else args.vision_model
+        )
         data = json.loads(vision_model.read_text())
         vision = data.get("metadata", data)["vision"]
-        image_processor = Qwen2VLImageProcessor.from_pretrained(args.tokenizer_dir, local_files_only=True)
-        image_processor.max_pixels = min(16777216, vision["max_patches"] * vision["patch_size"]**2)
+        image_processor = Qwen2VLImageProcessor.from_pretrained(
+            args.tokenizer_dir, local_files_only=True
+        )
+        image_processor.max_pixels = min(
+            16777216, vision["max_patches"] * vision["patch_size"] ** 2
+        )
+
         class ImagesProcessor(Qwen3VLProcessor):
             def check_argument_for_proper_class(self, argument_name, argument):
                 # No videos are used. Allow an absent optional video backend on
@@ -50,23 +97,92 @@ def main():
                 if argument_name == "video_processor" and argument is None:
                     return type(None)
                 return super().check_argument_for_proper_class(argument_name, argument)
-        processor = ImagesProcessor(image_processor, tokenizer, video_processor=None,
-                                    chat_template=(args.tokenizer_dir / "chat_template.jinja").read_text())
-        image = {"type":"image_url", "image_url":{"url":"data:image/png;base64," + base64.b64encode(args.image.read_bytes()).decode()}}
+
+        processor = ImagesProcessor(
+            image_processor,
+            tokenizer,
+            video_processor=None,
+            chat_template=(args.tokenizer_dir / "chat_template.jinja").read_text(),
+        )
+        image = {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(args.image.read_bytes()).decode()
+            },
+        }
         buf = io.BytesIO()
-        Image.new("RGB",(256,256),"blue").save(buf,format="PNG")
-        second = {"type":"image_url", "image_url":{"url":"data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()}}
-        text = lambda s: {"type":"text","text":s}
-        requests.extend([
-            {"messages":[{"role":"user","content":[text("Read the large text in this image. Output only the text."),image]}]},
-            {"messages":[{"role":"user","content":[text("Read the large text in this image. Output only the text."),image]}],"enable_thinking":True,"reasoning_effort":"xhigh"},
-            {"messages":[{"role":"user","content":[image,text("Describe this image.")]}],"enable_thinking":True},
-            {"messages":[{"role":"user","content":[text("Compare"),image,text("and"),second]}]},
-            {"messages":[{"role":"user","content":[image,text("What is written?")]},
-                         {"role":"assistant","content":"ORIN 2026"},
-                         {"role":"user","content":[second,text("Compare with the previous image.")]}]},
-            {"messages":[{"role":"user","content":[image,text("Use lookup for the city named in the picture.")]}],"tools":tools},
-        ])
+        Image.new("RGB", (256, 256), "blue").save(buf, format="PNG")
+        second = {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+            },
+        }
+
+        def text(s):
+            return {"type": "text", "text": s}
+
+        requests.extend(
+            [
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                text("Read the large text in this image. Output only the text."),
+                                image,
+                            ],
+                        }
+                    ]
+                },
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                text("Read the large text in this image. Output only the text."),
+                                image,
+                            ],
+                        }
+                    ],
+                    "enable_thinking": True,
+                    "reasoning_effort": "xhigh",
+                },
+                {
+                    "messages": [
+                        {"role": "user", "content": [image, text("Describe this image.")]}
+                    ],
+                    "enable_thinking": True,
+                },
+                {
+                    "messages": [
+                        {"role": "user", "content": [text("Compare"), image, text("and"), second]}
+                    ]
+                },
+                {
+                    "messages": [
+                        {"role": "user", "content": [image, text("What is written?")]},
+                        {"role": "assistant", "content": "ORIN 2026"},
+                        {
+                            "role": "user",
+                            "content": [second, text("Compare with the previous image.")],
+                        },
+                    ]
+                },
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                image,
+                                text("Use lookup for the city named in the picture."),
+                            ],
+                        }
+                    ],
+                    "tools": tools,
+                },
+            ]
+        )
     cases = []
     for request in requests:
         request.update(model="qwen3.8-27b", max_tokens=16)
@@ -76,56 +192,76 @@ def main():
         for message in normalized["messages"]:
             for call in message.get("tool_calls", []):
                 call["function"]["arguments"] = json.loads(call["function"]["arguments"])
-        template_options = dict(tools=normalized.get("tools", []),
+        template_options = dict(
+            tools=normalized.get("tools", []),
             enable_thinking=request.get("enable_thinking", False),
             reasoning_effort=request.get("reasoning_effort", "xhigh"),
-            preserve_thinking=True, add_generation_prompt=True)
+            preserve_thinking=True,
+            add_generation_prompt=True,
+        )
         images = []
         if processor:
             for message in normalized["messages"]:
                 if isinstance(message.get("content"), list):
                     for part in message["content"]:
                         if part["type"] == "image_url":
-                            images.append(Image.open(io.BytesIO(base64.b64decode(part["image_url"]["url"].split(",",1)[1]))).convert("RGB"))
+                            images.append(
+                                Image.open(
+                                    io.BytesIO(
+                                        base64.b64decode(part["image_url"]["url"].split(",", 1)[1])
+                                    )
+                                ).convert("RGB")
+                            )
         if images:
-            rendered = processor.apply_chat_template(normalized["messages"],tokenize=False,**template_options)
-            encoded = processor(text=[rendered],images=images,return_tensors="np")
+            rendered = processor.apply_chat_template(
+                normalized["messages"], tokenize=False, **template_options
+            )
+            encoded = processor(text=[rendered], images=images, return_tensors="np")
             ids = encoded["input_ids"][0].tolist()
             grid = encoded["image_grid_thw"].tolist()
         else:
-            ids = tokenizer.apply_chat_template(normalized["messages"],**template_options)
+            ids = tokenizer.apply_chat_template(normalized["messages"], **template_options)
         if hasattr(ids, "get"):
             ids = ids["input_ids"]
         # The processor itself expands vision markers; the reference does not
         # copy the Rust marker expansion implementation.
-        case = {"request":request,"ids":ids}
+        case = {"request": request, "ids": ids}
         if images:
             from types import SimpleNamespace
             import torch
             from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
             from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
-            checkpoint_config = json.loads((args.tokenizer_dir / 'config.json').read_text())
-            if checkpoint_config['model_type'] == 'qwen4_exp':
+
+            checkpoint_config = json.loads((args.tokenizer_dir / "config.json").read_text())
+            if checkpoint_config["model_type"] == "qwen4_exp":
                 from types import MethodType
                 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
                 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel
+
                 config = Qwen4ExpConfig(**checkpoint_config)
                 reference = SimpleNamespace(config=config)
-                reference.get_vision_position_ids = MethodType(Qwen4ExpModel.get_vision_position_ids, reference)
+                reference.get_vision_position_ids = MethodType(
+                    Qwen4ExpModel.get_vision_position_ids, reference
+                )
                 positions, delta = Qwen4ExpModel.get_rope_index(
-                    reference, torch.tensor([ids]), torch.tensor(encoded['mm_token_type_ids']),
-                    image_grid_thw=torch.tensor(grid))
+                    reference,
+                    torch.tensor([ids]),
+                    torch.tensor(encoded["mm_token_type_ids"]),
+                    image_grid_thw=torch.tensor(grid),
+                )
             else:
                 config = Qwen3_5Config.from_pretrained(args.tokenizer_dir, local_files_only=True)
                 positions, delta = Qwen3_5Model.get_rope_index(
-                    SimpleNamespace(config=config), torch.tensor([ids]),
-                    image_grid_thw=torch.tensor(grid))
+                    SimpleNamespace(config=config),
+                    torch.tensor([ids]),
+                    image_grid_thw=torch.tensor(grid),
+                )
             # Runtime stores token-major [t,h,w], including generated positions.
-            rope = positions[:,0].T.flatten().tolist()
-            start = len(ids)+int(delta[0,0])
+            rope = positions[:, 0].T.flatten().tolist()
+            start = len(ids) + int(delta[0, 0])
             for step in range(16):
-                rope.extend([start+step]*3)
-            case.update(vision=vision,image_grid_thw=grid,mrope_positions=rope)
+                rope.extend([start + step] * 3)
+            case.update(vision=vision, image_grid_thw=grid, mrope_positions=rope)
         cases.append(case)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x") as output:

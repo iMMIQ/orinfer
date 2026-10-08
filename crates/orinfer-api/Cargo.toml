@@ -12,8 +12,8 @@ futures-util = "=0.3.34"
 libc = "=0.2.190"
 minijinja = { version = "=2.24.0", features = ["json"] }
 orinfer-engine.workspace = true
-serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+serde.workspace = true
+serde_json.workspace = true
 tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
 

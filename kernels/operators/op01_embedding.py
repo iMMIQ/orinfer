@@ -4,6 +4,7 @@ The raw device ABI assumes validated IDs; scheduler must reject invalid IDs
 before upload and after changes. Stable addresses and explicit current stream
 are required for graph capture/replay. BF16 -> FP16 is a numeric conversion.
 """
+
 import tilelang.language as T
 from tools.operators.common import orin_jit
 
@@ -22,9 +23,14 @@ def validate_token_ids(ids, vocab: int, rows: int | None = None):
 
 
 @orin_jit
-def embedding_gather(vocab: int = 248320, hidden: int = 5120,
-                     dtype: str = "float16", stride: int | None = None,
-                     block: int = 1024, threads: int = 128):
+def embedding_gather(
+    vocab: int = 248320,
+    hidden: int = 5120,
+    dtype: str = "float16",
+    stride: int | None = None,
+    block: int = 1024,
+    threads: int = 128,
+):
     """Build (W, I, Y): row-major W[V,stride], int32 I[M], FP16 Y[M,H].
 
     FP16 copies exactly, BF16 casts to FP16 (round-to-nearest-even). W/I/Y
@@ -37,21 +43,26 @@ def embedding_gather(vocab: int = 248320, hidden: int = 5120,
     rows = T.dynamic("rows")
 
     @T.prim_func
-    def kernel(W: T.Tensor((vocab, stride), dtype),
-               I: T.Tensor((rows,), T.int32),
-               Y: T.Tensor((rows, hidden), T.float16)):
+    def kernel(
+        W: T.Tensor((vocab, stride), dtype),
+        I: T.Tensor((rows,), T.int32),
+        Y: T.Tensor((rows, hidden), T.float16),
+    ):
         with T.Kernel(T.ceildiv(rows * hidden, block), threads=threads) as bx:
             for j in T.Parallel(block):
                 index = bx * block + j
                 if index < rows * hidden:
                     Y[index // hidden, index % hidden] = T.cast(
-                        W[I[index // hidden], index % hidden], T.float16)
+                        W[I[index // hidden], index % hidden], T.float16
+                    )
+
     return kernel
 
 
 @orin_jit
-def embedding_u4(vocab: int = 248320, hidden: int = 5120,
-                 group: int = 128, block: int = 512, threads: int = 128):
+def embedding_u4(
+    vocab: int = 248320, hidden: int = 5120, group: int = 128, block: int = 512, threads: int = 128
+):
     """Build (P,S,Z,I,Y); unpack only requested rows, no whole-table expansion.
 
     Kp=ceildiv(H,group)*group. P[V,Kp/2] uint8 stores adjacent low/high U4;
@@ -67,11 +78,13 @@ def embedding_u4(vocab: int = 248320, hidden: int = 5120,
     rows = T.dynamic("rows")
 
     @T.prim_func
-    def kernel(P: T.Tensor((vocab, padded // 2), T.uint8),
-               S: T.Tensor((vocab, padded // group), T.float16),
-               Z: T.Tensor((vocab, padded // group), T.int8),
-               I: T.Tensor((rows,), T.int32),
-               Y: T.Tensor((rows, hidden), T.float16)):
+    def kernel(
+        P: T.Tensor((vocab, padded // 2), T.uint8),
+        S: T.Tensor((vocab, padded // group), T.float16),
+        Z: T.Tensor((vocab, padded // group), T.int8),
+        I: T.Tensor((rows,), T.int32),
+        Y: T.Tensor((rows, hidden), T.float16),
+    ):
         with T.Kernel(T.ceildiv(rows * pairs, block), threads=threads) as bx:
             for j in T.Parallel(block):
                 index = bx * block + j
@@ -84,5 +97,8 @@ def embedding_u4(vocab: int = 248320, hidden: int = 5120,
                     scale = T.cast(S[token, col // group], T.float32)
                     Y[row, col] = T.cast((T.cast(packed & 15, T.float32) - zero) * scale, T.float16)
                     if col + 1 < hidden:
-                        Y[row, col + 1] = T.cast((T.cast(packed >> 4, T.float32) - zero) * scale, T.float16)
+                        Y[row, col + 1] = T.cast(
+                            (T.cast(packed >> 4, T.float32) - zero) * scale, T.float16
+                        )
+
     return kernel

@@ -4,6 +4,7 @@ Q scaling is an explicit build parameter; default Q is unscaled native prefill.
 All buffers are caller owned, contiguous and mutually non-aliasing. No Torch
 mathematics is used in this production kernel.
 """
+
 import tilelang.language as T
 from tools.operators.common import orin_jit
 
@@ -12,11 +13,16 @@ Q_SCALE = 1.0
 
 
 @orin_jit
-def gdn_conv_prep(B: int | None = None, tokens: int | None = None,
-                  tile_tokens: int = 16, normalize_round_fp16: bool = True,
-                  q_scale: float = 1.0, qk_output_dtype: str = "float16",
-                  conv_product_round_fp16: bool = True,
-                  weight_dtype: str = "float16"):
+def gdn_conv_prep(
+    B: int | None = None,
+    tokens: int | None = None,
+    tile_tokens: int = 16,
+    normalize_round_fp16: bool = True,
+    q_scale: float = 1.0,
+    qk_output_dtype: str = "float16",
+    conv_product_round_fp16: bool = True,
+    weight_dtype: str = "float16",
+):
     """Build (X,W,HI,lengths,positions,Q,K,V,HO,positions_out).
 
     X[B,T,10240] and W[10240,4] FP16; chronological raw HI/HO[B,3,10240]
@@ -42,16 +48,18 @@ def gdn_conv_prep(B: int | None = None, tokens: int | None = None,
     time = T.dynamic("tokens") if tokens is None else tokens
 
     @T.prim_func
-    def kernel(X: T.Tensor((batch, time, CHANNELS), T.float16),
-               W: T.Tensor((CHANNELS, 4), weight_dtype),
-               HI: T.Tensor((batch, 3, CHANNELS), T.float16),
-               lengths: T.Tensor((batch,), T.int32),
-               positions: T.Tensor((batch,), T.int32),
-               Q: T.Tensor((batch, KEY_HEADS, time, DIM), qk_output_dtype),
-               K: T.Tensor((batch, KEY_HEADS, time, DIM), qk_output_dtype),
-               V: T.Tensor((batch, VALUE_HEADS, time, DIM), T.float16),
-               HO: T.Tensor((batch, 3, CHANNELS), T.float16),
-               positions_out: T.Tensor((batch,), T.int32)):
+    def kernel(
+        X: T.Tensor((batch, time, CHANNELS), T.float16),
+        W: T.Tensor((CHANNELS, 4), weight_dtype),
+        HI: T.Tensor((batch, 3, CHANNELS), T.float16),
+        lengths: T.Tensor((batch,), T.int32),
+        positions: T.Tensor((batch,), T.int32),
+        Q: T.Tensor((batch, KEY_HEADS, time, DIM), qk_output_dtype),
+        K: T.Tensor((batch, KEY_HEADS, time, DIM), qk_output_dtype),
+        V: T.Tensor((batch, VALUE_HEADS, time, DIM), T.float16),
+        HO: T.Tensor((batch, 3, CHANNELS), T.float16),
+        positions_out: T.Tensor((batch,), T.int32),
+    ):
         with T.Kernel(T.ceildiv(time, tile_tokens), 80, batch, threads=128) as (bt, head, b):
             acc = T.alloc_fragment((tile_tokens, DIM), T.float32)
             raw = T.alloc_fragment((tile_tokens, DIM), T.float32)
@@ -67,9 +75,13 @@ def gdn_conv_prep(B: int | None = None, tokens: int | None = None,
                     raw[ti, d] = 0.0
                     if bt * tile_tokens + ti < lengths[b]:
                         if bt * tile_tokens + ti + tap >= 3:
-                            raw[ti, d] = T.cast(X[b, bt * tile_tokens + ti + tap - 3, head * DIM + d], T.float32)
+                            raw[ti, d] = T.cast(
+                                X[b, bt * tile_tokens + ti + tap - 3, head * DIM + d], T.float32
+                            )
                         elif positions[b] + bt * tile_tokens + ti + tap >= 3:
-                            raw[ti, d] = T.cast(HI[b, bt * tile_tokens + ti + tap, head * DIM + d], T.float32)
+                            raw[ti, d] = T.cast(
+                                HI[b, bt * tile_tokens + ti + tap, head * DIM + d], T.float32
+                            )
                     if conv_product_round_fp16:
                         product[ti, d] = raw[ti, d] * T.cast(W[head * DIM + d, tap], T.float32)
                         acc[ti, d] += T.cast(product[ti, d], T.float32)
@@ -110,14 +122,13 @@ def gdn_conv_prep(B: int | None = None, tokens: int | None = None,
                         HO[b, i, head * DIM + d] = 0.0
                 if head == 0:
                     positions_out[b] = positions[b] + lengths[b]
+
     return kernel
 
 
-def launch(kernel, X, W, HI, lengths, positions, Q, K, V, HO, positions_out,
-           stream=None):
+def launch(kernel, X, W, HI, lengths, positions, Q, K, V, HO, positions_out, stream=None):
     """Explicit-buffer launch. Resolve the current capture stream at every call."""
-    return kernel(X, W, HI, lengths, positions, Q, K, V, HO, positions_out,
-                  stream=stream)
+    return kernel(X, W, HI, lengths, positions, Q, K, V, HO, positions_out, stream=stream)
 
 
 def gdn_conv_decode(B: int | None = None, **rounding_and_scale):

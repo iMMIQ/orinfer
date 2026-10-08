@@ -13,9 +13,9 @@ crate-type = ["cdylib", "rlib"]
 workspace = true
 
 [dependencies]
-orinfer-model-sdk = { path = "../orinfer-model-sdk" }
-serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
-half = "2.7.1"
-sha2 = "=0.11.0"
-hex = "=0.4.3"
+orinfer-model-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+half.workspace = true
+sha2.workspace = true
+hex.workspace = true

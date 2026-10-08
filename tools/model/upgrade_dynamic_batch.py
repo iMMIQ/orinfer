@@ -3,105 +3,144 @@
 No weights or cubins change. Rust specializes launch/graph plans for exact
 nonstandard rows; common optimized batch profiles retain their existing ABI.
 """
+
 import argparse
 import ast
 from pathlib import Path
 
-from tools.model.publication import atomic_model, clone_model, commit_package, file_hash, load_model, write_json
+from tools.model.publication import (
+    atomic_model,
+    clone_model,
+    commit_package,
+    file_hash,
+    load_model,
+    write_json,
+)
 from tools.operators.abi import parse_host, evaluate
 
 
 def expression(source, row_multiplier=1):
     def visit(node):
-        if isinstance(node, ast.Constant) and type(node.value) is int and 0 <= node.value <= 0xffffffff:
-            return dict(op='constant', value=node.value)
-        if isinstance(node, ast.Name) and node.id in ('M', 'm', 'rows', 'batch'):
-            rows = dict(op='rows')
-            return rows if row_multiplier == 1 else dict(op='multiply', lhs=rows,
-                                                        rhs=dict(op='constant', value=row_multiplier))
-        operators = {ast.Add:'add', ast.Sub:'subtract', ast.Mult:'multiply',
-                     ast.FloorDiv:'divide', ast.Mod:'remainder'}
+        if (
+            isinstance(node, ast.Constant)
+            and type(node.value) is int
+            and 0 <= node.value <= 0xFFFFFFFF
+        ):
+            return dict(op="constant", value=node.value)
+        if isinstance(node, ast.Name) and node.id in ("M", "m", "rows", "batch"):
+            rows = dict(op="rows")
+            return (
+                rows
+                if row_multiplier == 1
+                else dict(op="multiply", lhs=rows, rhs=dict(op="constant", value=row_multiplier))
+            )
+        operators = {
+            ast.Add: "add",
+            ast.Sub: "subtract",
+            ast.Mult: "multiply",
+            ast.FloorDiv: "divide",
+            ast.Mod: "remainder",
+        }
         if isinstance(node, ast.BinOp) and type(node.op) in operators:
             return dict(op=operators[type(node.op)], lhs=visit(node.left), rhs=visit(node.right))
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == 'min' and len(node.args) == 2 and not node.keywords):
-            return dict(op='minimum', lhs=visit(node.args[0]), rhs=visit(node.args[1]))
-        raise ValueError(f'Unsupported row expression: {source}')
-    return visit(ast.parse(source, mode='eval').body)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "min"
+            and len(node.args) == 2
+            and not node.keywords
+        ):
+            return dict(op="minimum", lhs=visit(node.args[0]), rhs=visit(node.args[1]))
+        raise ValueError(f"Unsupported row expression: {source}")
+
+    return visit(ast.parse(source, mode="eval").body)
 
 
 def contract(kernel, host, capacity=128, row_multiplier=1):
     if type(row_multiplier) is not int or row_multiplier < 1:
-        raise ValueError('Invalid launch row multiplier')
+        raise ValueError("Invalid launch row multiplier")
     rows = capacity * row_multiplier
     dimensions = dict(M=rows, m=rows, rows=rows, batch=rows)
-    launch = host['launch_expressions']
-    if kernel['grid'] != [evaluate(launch['gridDim'+axis], dimensions) for axis in 'XYZ']:
-        raise ValueError('Host grid differs from capacity binding')
-    if kernel['block'] != [evaluate(launch['blockDim'+axis], dimensions) for axis in 'XYZ']:
-        raise ValueError('Host block differs from capacity binding')
-    if kernel['shared_memory_bytes'] != evaluate(launch['sharedMemBytes'], dimensions):
-        raise ValueError('Host shared memory differs from capacity binding')
-    if len(kernel['args']) != len(host['ordered_arguments']):
-        raise ValueError('Host argument count differs')
+    launch = host["launch_expressions"]
+    if kernel["grid"] != [evaluate(launch["gridDim" + axis], dimensions) for axis in "XYZ"]:
+        raise ValueError("Host grid differs from capacity binding")
+    if kernel["block"] != [evaluate(launch["blockDim" + axis], dimensions) for axis in "XYZ"]:
+        raise ValueError("Host block differs from capacity binding")
+    if kernel["shared_memory_bytes"] != evaluate(launch["sharedMemBytes"], dimensions):
+        raise ValueError("Host shared memory differs from capacity binding")
+    if len(kernel["args"]) != len(host["ordered_arguments"]):
+        raise ValueError("Host argument count differs")
     args = []
-    for index, (bound, exported) in enumerate(zip(kernel['args'], host['ordered_arguments'])):
-        if exported['ctype'] in ('ctypes.c_int32', 'c_int32'):
-            if bound != dict(kind='i32', value=evaluate(exported['value'], dimensions)):
-                raise ValueError('Host scalar differs from capacity binding')
-            args.append(dict(index=index, value=expression(exported['value'], row_multiplier)))
-        elif (exported['ctype'] not in ('ctypes.c_void_p', 'c_void_p')
-              or bound['kind'] not in ('buffer', 'buffer_slice')):
-            raise ValueError('Unsupported dynamic host ABI')
-    grid = [expression(launch['gridDim'+axis], row_multiplier) for axis in 'XYZ']
-    if kernel['name'].startswith('batch_gdn_m128/'):
+    for index, (bound, exported) in enumerate(zip(kernel["args"], host["ordered_arguments"])):
+        if exported["ctype"] in ("ctypes.c_int32", "c_int32"):
+            if bound != dict(kind="i32", value=evaluate(exported["value"], dimensions)):
+                raise ValueError("Host scalar differs from capacity binding")
+            args.append(dict(index=index, value=expression(exported["value"], row_multiplier)))
+        elif exported["ctype"] not in ("ctypes.c_void_p", "c_void_p") or bound["kind"] not in (
+            "buffer",
+            "buffer_slice",
+        ):
+            raise ValueError("Unsupported dynamic host ABI")
+    grid = [expression(launch["gridDim" + axis], row_multiplier) for axis in "XYZ"]
+    if kernel["name"].startswith("batch_gdn_m128/"):
         # These row-independent CTA bodies address one private arena per b.
         # The fixed capacity export changes only the number of batch CTAs.
-        slot = kernel['name'].rsplit('/k', 1)[1]
-        axis = {'0':1, '1':2}.get(slot)
-        if axis is None or kernel['grid'][axis] != 128 or args:
-            raise ValueError('Unsupported batched GDN launch')
-        grid[axis] = dict(op='rows')
-    return dict(name=kernel['name'], capacity=capacity, grid=grid, arguments=args)
+        slot = kernel["name"].rsplit("/k", 1)[1]
+        axis = {"0": 1, "1": 2}.get(slot)
+        if axis is None or kernel["grid"][axis] != 128 or args:
+            raise ValueError("Unsupported batched GDN launch")
+        grid[axis] = dict(op="rows")
+    return dict(name=kernel["name"], capacity=capacity, grid=grid, arguments=args)
 
 
 def upgrade(model, destination):
     model = model.resolve(strict=True)
     destination = destination.absolute()
     if destination.exists():
-        raise ValueError('Destination already exists')
+        raise ValueError("Destination already exists")
     data, origin, package = load_model(model)
-    if 128 not in package.get('batch_profiles', []) or package.get('dynamic_batch_kernels'):
-        raise ValueError('Requires capacity128 without dynamic contracts')
+    if 128 not in package.get("batch_profiles", []) or package.get("dynamic_batch_kernels"):
+        raise ValueError("Requires capacity128 without dynamic contracts")
     contracts, parsed = [], {}
-    for kernel in package['kernels']:
-        if not kernel['name'].startswith(('batch_m128/', 'batch_gdn_m128/')): continue
-        identity = kernel['host_abi']
-        host_path = (origin/identity['file']).resolve(strict=True)
-        if not host_path.is_relative_to(origin.resolve()) or file_hash(host_path) != identity['sha256']:
-            raise ValueError('Host ABI identity mismatch')
-        if host_path not in parsed: parsed[host_path] = parse_host(host_path.read_text())
+    for kernel in package["kernels"]:
+        if not kernel["name"].startswith(("batch_m128/", "batch_gdn_m128/")):
+            continue
+        identity = kernel["host_abi"]
+        host_path = (origin / identity["file"]).resolve(strict=True)
+        if (
+            not host_path.is_relative_to(origin.resolve())
+            or file_hash(host_path) != identity["sha256"]
+        ):
+            raise ValueError("Host ABI identity mismatch")
+        if host_path not in parsed:
+            parsed[host_path] = parse_host(host_path.read_text())
         hosts = parsed[host_path]
-        if len(hosts) != 1 or hosts[0]['symbol'] != kernel['symbol']:
-            raise ValueError('Expected one matching host export')
+        if len(hosts) != 1 or hosts[0]["symbol"] != kernel["symbol"]:
+            raise ValueError("Expected one matching host export")
         contracts.append(contract(kernel, hosts[0]))
-    if not contracts: raise ValueError('No dynamic capacity kernels')
-    package['dynamic_batch_kernels'] = contracts
+    if not contracts:
+        raise ValueError("No dynamic capacity kernels")
+    package["dynamic_batch_kernels"] = contracts
     with atomic_model(destination) as staging:
         operator = clone_model(model, staging, origin)
         digest = commit_package(staging, operator, data, package)
-    return dict(execution_package=digest, dynamic_templates=len(contracts),
-                weight_bytes=data['metadata']['weight_bytes'])
+    return dict(
+        execution_package=digest,
+        dynamic_templates=len(contracts),
+        weight_bytes=data["metadata"]["weight_bytes"],
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model',type=Path,required=True)
-    parser.add_argument('--output',type=Path,required=True)
-    parser.add_argument('--report',type=Path,required=True)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
-    if args.report.exists(): parser.error('Report must be a fresh path')
-    write_json(args.report,upgrade(args.model,args.output))
+    if args.report.exists():
+        parser.error("Report must be a fresh path")
+    write_json(args.report, upgrade(args.model, args.output))
 
 
-if __name__ == '__main__': main()
+if __name__ == "__main__":
+    main()

@@ -4,10 +4,11 @@ torch-c-dlpack-ext==0.1.5
 z3-solver==4.15.4.0
 numpy==2.2.6
 safetensors==0.8.0
-transformers==5.18.0
+transformers==5.19.0
 # Transformers dependencies that replace or extend the fixed base image.
+# Tokenizers 0.23.2 requires Hub <2.
 huggingface-hub==1.33.0
 tokenizers==0.23.2
 click==8.5.0
-hf-xet==1.6.0
+hf-xet==1.7.0
 idna==3.20

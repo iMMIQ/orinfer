@@ -3,6 +3,7 @@
 Only offline compilation imports common.orin_jit. Production math is TileLang.
 Counter uniforms are a CPU/Rust ABI contract, not batch-index seeded GPU RNG.
 """
+
 import math
 import tilelang
 import tilelang.language as T
@@ -32,23 +33,25 @@ def counter_uniform(request_id, absolute_step, seed=SEED):
     """
     for value in (request_id, absolute_step, seed):
         if type(value) is not int or not 0 <= value <= MASK64:
-            raise ValueError('seed/request_id/absolute_step must be u64')
+            raise ValueError("seed/request_id/absolute_step must be u64")
     return (splitmix64(splitmix64(seed ^ request_id) ^ absolute_step) >> 11) * 2.0**-53
 
 
 @orin_jit
-def topk_partials(dtype='float16', vocab=VOCAB, k=3, chunk=4096, threads=256):
-    assert dtype in ('float16', 'bfloat16', 'float32')
+def topk_partials(dtype="float16", vocab=VOCAB, k=3, chunk=4096, threads=256):
+    assert dtype in ("float16", "bfloat16", "float32")
     assert 1 <= k <= min(16, vocab) and chunk % threads == 0
-    rows = T.dynamic('rows')
-    storage_dtype = 'uint16' if dtype == 'bfloat16' else dtype
+    rows = T.dynamic("rows")
+    storage_dtype = "uint16" if dtype == "bfloat16" else dtype
     blocks = (vocab + chunk - 1) // chunk
 
     @T.prim_func
-    def kernel(X: T.Tensor((rows, vocab), storage_dtype),
-               PV: T.Tensor((rows, blocks, k), T.float32),
-               PI: T.Tensor((rows, blocks, k), T.int32),
-               Bad: T.Tensor((rows, blocks), T.int32)):
+    def kernel(
+        X: T.Tensor((rows, vocab), storage_dtype),
+        PV: T.Tensor((rows, blocks, k), T.float32),
+        PI: T.Tensor((rows, blocks, k), T.int32),
+        Bad: T.Tensor((rows, blocks), T.int32),
+    ):
         with T.Kernel(blocks, rows, threads=threads) as (block, row):
             values = T.alloc_fragment((chunk,), T.float32)
             indices = T.alloc_fragment((chunk,), T.int32)
@@ -56,23 +59,44 @@ def topk_partials(dtype='float16', vocab=VOCAB, k=3, chunk=4096, threads=256):
             maximum = T.alloc_fragment((1,), T.float32)
             minimum = T.alloc_fragment((1,), T.int32)
             count = T.alloc_fragment((1,), T.int32)
-            T.annotate_layout({
-                values: tilelang.Fragment((chunk,), forward_thread_fn=lambda j: j % threads, forward_index_fn=lambda j: j // threads),
-                indices: tilelang.Fragment((chunk,), forward_thread_fn=lambda j: j % threads, forward_index_fn=lambda j: j // threads),
-                invalid: tilelang.Fragment((chunk,), forward_thread_fn=lambda j: j % threads, forward_index_fn=lambda j: j // threads),
-                maximum: tilelang.Fragment((1,), forward_thread_fn=lambda j, rep: rep, replicate=threads),
-                minimum: tilelang.Fragment((1,), forward_thread_fn=lambda j, rep: rep, replicate=threads),
-                count: tilelang.Fragment((1,), forward_thread_fn=lambda j, rep: rep, replicate=threads)})
+            T.annotate_layout(
+                {
+                    values: tilelang.Fragment(
+                        (chunk,),
+                        forward_thread_fn=lambda j: j % threads,
+                        forward_index_fn=lambda j: j // threads,
+                    ),
+                    indices: tilelang.Fragment(
+                        (chunk,),
+                        forward_thread_fn=lambda j: j % threads,
+                        forward_index_fn=lambda j: j // threads,
+                    ),
+                    invalid: tilelang.Fragment(
+                        (chunk,),
+                        forward_thread_fn=lambda j: j % threads,
+                        forward_index_fn=lambda j: j // threads,
+                    ),
+                    maximum: tilelang.Fragment(
+                        (1,), forward_thread_fn=lambda j, rep: rep, replicate=threads
+                    ),
+                    minimum: tilelang.Fragment(
+                        (1,), forward_thread_fn=lambda j, rep: rep, replicate=threads
+                    ),
+                    count: tilelang.Fragment(
+                        (1,), forward_thread_fn=lambda j, rep: rep, replicate=threads
+                    ),
+                }
+            )
             for j in T.Parallel(chunk):
                 col = block * chunk + j
                 values[j] = -T.infinity(T.float32)
                 invalid[j] = 0
                 if col < vocab:
-                    if dtype == 'bfloat16':
+                    if dtype == "bfloat16":
                         values[j] = T.reinterpret(T.float32, T.cast(X[row, col], T.uint32) << 16)
                     else:
                         values[j] = T.cast(X[row, col], T.float32)
-                    invalid[j] = T.if_then_else(T.call_extern('bool', 'isfinite', values[j]), 0, 1)
+                    invalid[j] = T.if_then_else(T.call_extern("bool", "isfinite", values[j]), 0, 1)
                     values[j] = T.if_then_else(invalid[j] > 0, -T.infinity(T.float32), values[j])
             T.reduce_sum(invalid, count, dim=0)
             if T.get_thread_binding() == 0:
@@ -90,24 +114,27 @@ def topk_partials(dtype='float16', vocab=VOCAB, k=3, chunk=4096, threads=256):
                 for j in T.Parallel(chunk):
                     if block * chunk + j == minimum[0]:
                         values[j] = -T.infinity(T.float32)
+
     return kernel
 
 
 @orin_jit
 def topk_merge(vocab=VOCAB, k=3, chunk=4096, threads=128):
     assert 1 <= k <= min(16, vocab)
-    rows = T.dynamic('rows')
+    rows = T.dynamic("rows")
     blocks = (vocab + chunk - 1) // chunk
     tile = ((blocks * k + threads - 1) // threads) * threads
 
     @T.prim_func
-    def kernel(PV: T.Tensor((rows, blocks, k), T.float32),
-               PI: T.Tensor((rows, blocks, k), T.int32),
-               Bad: T.Tensor((rows, blocks), T.int32),
-               Values: T.Tensor((rows, k), T.float32),
-               IDs: T.Tensor((rows, k), T.int32),
-               Token: T.Tensor((rows,), T.int32),
-               Status: T.Tensor((rows,), T.int32)):
+    def kernel(
+        PV: T.Tensor((rows, blocks, k), T.float32),
+        PI: T.Tensor((rows, blocks, k), T.int32),
+        Bad: T.Tensor((rows, blocks), T.int32),
+        Values: T.Tensor((rows, k), T.float32),
+        IDs: T.Tensor((rows, k), T.int32),
+        Token: T.Tensor((rows,), T.int32),
+        Status: T.Tensor((rows,), T.int32),
+    ):
         with T.Kernel(rows, threads=threads) as row:
             values = T.alloc_fragment((tile,), T.float32)
             indices = T.alloc_fragment((tile,), T.int32)
@@ -115,13 +142,34 @@ def topk_merge(vocab=VOCAB, k=3, chunk=4096, threads=128):
             maximum = T.alloc_fragment((1,), T.float32)
             minimum = T.alloc_fragment((1,), T.int32)
             count = T.alloc_fragment((1,), T.int32)
-            T.annotate_layout({
-                values: tilelang.Fragment((tile,), forward_thread_fn=lambda j: j % threads, forward_index_fn=lambda j: j // threads),
-                indices: tilelang.Fragment((tile,), forward_thread_fn=lambda j: j % threads, forward_index_fn=lambda j: j // threads),
-                invalid: tilelang.Fragment((tile,), forward_thread_fn=lambda j: j % threads, forward_index_fn=lambda j: j // threads),
-                maximum: tilelang.Fragment((1,), forward_thread_fn=lambda j, rep: rep, replicate=threads),
-                minimum: tilelang.Fragment((1,), forward_thread_fn=lambda j, rep: rep, replicate=threads),
-                count: tilelang.Fragment((1,), forward_thread_fn=lambda j, rep: rep, replicate=threads)})
+            T.annotate_layout(
+                {
+                    values: tilelang.Fragment(
+                        (tile,),
+                        forward_thread_fn=lambda j: j % threads,
+                        forward_index_fn=lambda j: j // threads,
+                    ),
+                    indices: tilelang.Fragment(
+                        (tile,),
+                        forward_thread_fn=lambda j: j % threads,
+                        forward_index_fn=lambda j: j // threads,
+                    ),
+                    invalid: tilelang.Fragment(
+                        (tile,),
+                        forward_thread_fn=lambda j: j % threads,
+                        forward_index_fn=lambda j: j // threads,
+                    ),
+                    maximum: tilelang.Fragment(
+                        (1,), forward_thread_fn=lambda j, rep: rep, replicate=threads
+                    ),
+                    minimum: tilelang.Fragment(
+                        (1,), forward_thread_fn=lambda j, rep: rep, replicate=threads
+                    ),
+                    count: tilelang.Fragment(
+                        (1,), forward_thread_fn=lambda j, rep: rep, replicate=threads
+                    ),
+                }
+            )
             for j in T.Parallel(tile):
                 values[j] = -T.infinity(T.float32)
                 invalid[j] = 0
@@ -140,7 +188,9 @@ def topk_merge(vocab=VOCAB, k=3, chunk=4096, threads=128):
                         indices[j] = PI[row, j // k, j % k]
                 T.reduce_min(indices, minimum, dim=0)
                 if T.get_thread_binding() == 0:
-                    Values[row, rank] = T.if_then_else(count[0] > 0, -T.infinity(T.float32), maximum[0])
+                    Values[row, rank] = T.if_then_else(
+                        count[0] > 0, -T.infinity(T.float32), maximum[0]
+                    )
                     IDs[row, rank] = T.if_then_else(count[0] > 0, -1, minimum[0])
                     if rank == 0:
                         Token[row] = T.if_then_else(count[0] > 0, -1, minimum[0])
@@ -148,52 +198,75 @@ def topk_merge(vocab=VOCAB, k=3, chunk=4096, threads=128):
                     if j < blocks * k:
                         if PI[row, j // k, j % k] == minimum[0]:
                             values[j] = -T.infinity(T.float32)
+
     return kernel
 
 
 @orin_jit
-def sampling_mass(dtype='float16', vocab=VOCAB, k=3, temperature=1.0,
-                  chunk=4096, threads=256):
-    assert dtype in ('float16', 'bfloat16', 'float32')
+def sampling_mass(dtype="float16", vocab=VOCAB, k=3, temperature=1.0, chunk=4096, threads=256):
+    assert dtype in ("float16", "bfloat16", "float32")
     assert math.isfinite(temperature) and temperature > 0
-    rows = T.dynamic('rows'); blocks = (vocab + chunk - 1) // chunk
-    storage_dtype = 'uint16' if dtype == 'bfloat16' else dtype
+    rows = T.dynamic("rows")
+    blocks = (vocab + chunk - 1) // chunk
+    storage_dtype = "uint16" if dtype == "bfloat16" else dtype
 
     @T.prim_func
-    def kernel(X: T.Tensor((rows, vocab), storage_dtype),
-               Values: T.Tensor((rows, k), T.float32),
-               Mass: T.Tensor((rows, blocks), T.float64)):
+    def kernel(
+        X: T.Tensor((rows, vocab), storage_dtype),
+        Values: T.Tensor((rows, k), T.float32),
+        Mass: T.Tensor((rows, blocks), T.float64),
+    ):
         with T.Kernel(blocks, rows, threads=threads) as (block, row):
             weights = T.alloc_fragment((chunk,), T.float64)
             total = T.alloc_fragment((1,), T.float64)
-            T.annotate_layout({
-                weights: tilelang.Fragment((chunk,), forward_thread_fn=lambda j: j % threads, forward_index_fn=lambda j: j // threads),
-                total: tilelang.Fragment((1,), forward_thread_fn=lambda j, rep: rep, replicate=threads)})
+            T.annotate_layout(
+                {
+                    weights: tilelang.Fragment(
+                        (chunk,),
+                        forward_thread_fn=lambda j: j % threads,
+                        forward_index_fn=lambda j: j // threads,
+                    ),
+                    total: tilelang.Fragment(
+                        (1,), forward_thread_fn=lambda j, rep: rep, replicate=threads
+                    ),
+                }
+            )
             for j in T.Parallel(chunk):
                 weights[j] = 0.0
-                if block * chunk + j < vocab and T.call_extern('bool', 'isfinite', Values[row, 0]):
+                if block * chunk + j < vocab and T.call_extern("bool", "isfinite", Values[row, 0]):
                     # Double transform/exponential prevents finite FP32 range
                     # subtraction overflow and premature probability underflow.
-                    if dtype == 'bfloat16':
-                        x = T.cast(T.reinterpret(T.float32, T.cast(X[row, block * chunk + j], T.uint32) << 16), T.float64)
+                    if dtype == "bfloat16":
+                        x = T.cast(
+                            T.reinterpret(
+                                T.float32, T.cast(X[row, block * chunk + j], T.uint32) << 16
+                            ),
+                            T.float64,
+                        )
                     else:
                         x = T.cast(X[row, block * chunk + j], T.float64)
-                    weights[j] = T.exp((x - T.cast(Values[row, 0], T.float64)) / T.float64(temperature))
+                    weights[j] = T.exp(
+                        (x - T.cast(Values[row, 0], T.float64)) / T.float64(temperature)
+                    )
             T.reduce_sum(weights, total, dim=0)
             if T.get_thread_binding() == 0:
                 Mass[row, block] = total[0]
+
     return kernel
 
 
 @orin_jit
 def sampling_prefix(vocab=VOCAB, chunk=4096):
-    rows = T.dynamic('rows'); blocks = (vocab + chunk - 1) // chunk
+    rows = T.dynamic("rows")
+    blocks = (vocab + chunk - 1) // chunk
 
     @T.prim_func
-    def kernel(Mass: T.Tensor((rows, blocks), T.float64),
-               Uniform: T.Tensor((rows,), T.float64),
-               Meta: T.Tensor((rows, 2), T.float64),
-               Status: T.Tensor((rows,), T.int32)):
+    def kernel(
+        Mass: T.Tensor((rows, blocks), T.float64),
+        Uniform: T.Tensor((rows,), T.float64),
+        Meta: T.Tensor((rows, 2), T.float64),
+        Status: T.Tensor((rows,), T.int32),
+    ):
         with T.Kernel(rows, threads=32) as row:
             total = T.alloc_local((1,), T.float64)
             target = T.alloc_local((1,), T.float64)
@@ -202,7 +275,13 @@ def sampling_prefix(vocab=VOCAB, chunk=4096):
             if T.get_thread_binding() == 0:
                 Meta[row, 0] = -1.0
                 Meta[row, 1] = 0.0
-                Status[row] = Status[row] + T.if_then_else(T.call_extern('bool', 'isfinite', Uniform[row]) and Uniform[row] >= 0.0 and Uniform[row] < 1.0, 0, 2)
+                Status[row] = Status[row] + T.if_then_else(
+                    T.call_extern("bool", "isfinite", Uniform[row])
+                    and Uniform[row] >= 0.0
+                    and Uniform[row] < 1.0,
+                    0,
+                    2,
+                )
                 if Status[row] == 0:
                     total[0] = 0.0
                     for b in T.serial(blocks):
@@ -223,22 +302,24 @@ def sampling_prefix(vocab=VOCAB, chunk=4096):
                     if found[0] == 0:
                         Meta[row, 0] = T.cast(last[0], T.float64)
                         Meta[row, 1] = Mass[row, last[0]]
+
     return kernel
 
 
 @orin_jit
-def sampling_select(dtype='float16', vocab=VOCAB, k=3, temperature=1.0,
-                    chunk=4096, threads=256):
+def sampling_select(dtype="float16", vocab=VOCAB, k=3, temperature=1.0, chunk=4096, threads=256):
     assert math.isfinite(temperature) and temperature > 0
-    rows = T.dynamic('rows')
-    storage_dtype = 'uint16' if dtype == 'bfloat16' else dtype
+    rows = T.dynamic("rows")
+    storage_dtype = "uint16" if dtype == "bfloat16" else dtype
 
     @T.prim_func
-    def kernel(X: T.Tensor((rows, vocab), storage_dtype),
-               Values: T.Tensor((rows, k), T.float32),
-               Meta: T.Tensor((rows, 2), T.float64),
-               Token: T.Tensor((rows,), T.int32),
-               Status: T.Tensor((rows,), T.int32)):
+    def kernel(
+        X: T.Tensor((rows, vocab), storage_dtype),
+        Values: T.Tensor((rows, k), T.float32),
+        Meta: T.Tensor((rows, 2), T.float64),
+        Token: T.Tensor((rows,), T.int32),
+        Status: T.Tensor((rows,), T.int32),
+    ):
         with T.Kernel(rows, threads=threads) as row:
             weights = T.alloc_shared((chunk,), T.float64)
             target = T.alloc_local((1,), T.float64)
@@ -248,11 +329,15 @@ def sampling_select(dtype='float16', vocab=VOCAB, k=3, temperature=1.0,
                 weights[j] = 0.0
                 col = T.cast(Meta[row, 0], T.int32) * chunk + j
                 if Status[row] == 0 and col >= 0 and col < vocab:
-                    if dtype == 'bfloat16':
-                        x = T.cast(T.reinterpret(T.float32, T.cast(X[row, col], T.uint32) << 16), T.float64)
+                    if dtype == "bfloat16":
+                        x = T.cast(
+                            T.reinterpret(T.float32, T.cast(X[row, col], T.uint32) << 16), T.float64
+                        )
                     else:
                         x = T.cast(X[row, col], T.float64)
-                    weights[j] = T.exp((x - T.cast(Values[row, 0], T.float64)) / T.float64(temperature))
+                    weights[j] = T.exp(
+                        (x - T.cast(Values[row, 0], T.float64)) / T.float64(temperature)
+                    )
             T.sync_threads()
             if T.get_thread_binding() == 0:
                 Token[row] = -1
@@ -272,12 +357,28 @@ def sampling_select(dtype='float16', vocab=VOCAB, k=3, temperature=1.0,
                     # Endpoint rounding fallback: last positive-mass token.
                     if found[0] == 0:
                         Token[row] = last[0]
+
     return kernel
 
 
-def launch(partials, merge, logits, partial_values, partial_ids, bad,
-           values, ids, token, status, *, stream, sampling=None,
-           uniform=None, mass=None, meta=None):
+def launch(
+    partials,
+    merge,
+    logits,
+    partial_values,
+    partial_ids,
+    bad,
+    values,
+    ids,
+    token,
+    status,
+    *,
+    stream,
+    sampling=None,
+    uniform=None,
+    mass=None,
+    meta=None,
+):
     """Two topk launches; optionally three additional full-CDF launches.
 
     Temperature zero uses sampling=None and ignores uniform. No penalties and

@@ -3,6 +3,7 @@
 Base must EXCLUDE every selected column (masked A8 GEMM). W_hp is the
 prepacked SAME FP16-dequantized W4 selected columns; no model policy here.
 """
+
 import tilelang
 import tilelang.language as T
 
@@ -11,12 +12,15 @@ import tilelang.language as T
 def _compile(N: int, K: int, O: int, dtype: str, BM: int, BN: int):
     M = T.dynamic("M")
     BK = 32
+
     @T.prim_func
-    def main(A: T.Tensor((M, K), T.float16),
-             Idx: T.Tensor((O,), T.int32),
-             W_hp: T.Tensor((N, O), T.float16),
-             Base: T.Tensor((M, N), T.float32),
-             C: T.Tensor((M, N), dtype)):
+    def main(
+        A: T.Tensor((M, K), T.float16),
+        Idx: T.Tensor((O,), T.int32),
+        W_hp: T.Tensor((N, O), T.float16),
+        Base: T.Tensor((M, N), T.float32),
+        C: T.Tensor((M, N), dtype),
+    ):
         with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=128) as (bx, by):
             if O > 0:
                 a = T.alloc_shared((BM, BK), T.float16)
@@ -42,10 +46,13 @@ def _compile(N: int, K: int, O: int, dtype: str, BM: int, BN: int):
                 for i, j in T.Parallel(BM, BN):
                     if by * BM + i < M and bx * BN + j < N:
                         C[by * BM + i, bx * BN + j] = Base[by * BM + i, bx * BN + j]
+
     return main
 
 
-def hp_correction(N: int, K: int, O: int = 32, *, output_dtype: str = "float16", small: bool = False):
+def hp_correction(
+    N: int, K: int, O: int = 32, *, output_dtype: str = "float16", small: bool = False
+):
     """Build (A, Idx, W_hp, Base, C); M is symbolic. Output is FP16/FP32.
 
     C = cast_output(Base_F32 + sum_o(float(A[:,Idx[o]])*float(W_hp[:,o]))).
@@ -53,8 +60,14 @@ def hp_correction(N: int, K: int, O: int = 32, *, output_dtype: str = "float16",
     Call validate_indices once per new index VALUES before launch/capture;
     stable-address graph mutations must uphold that validation contract.
     """
-    if not (isinstance(N, int) and N > 0 and isinstance(K, int) and K > 0
-            and isinstance(O, int) and 0 <= O <= K):
+    if not (
+        isinstance(N, int)
+        and N > 0
+        and isinstance(K, int)
+        and K > 0
+        and isinstance(O, int)
+        and 0 <= O <= K
+    ):
         raise ValueError("Require N,K>0 and 0<=O<=K")
     if output_dtype not in ("float16", "float32"):
         raise ValueError("output_dtype must be float16 or float32")
@@ -86,15 +99,26 @@ def launch(kernel, A, Idx, W_hp, Base, C, *, stream, base_is_masked: bool):
     N, K, O, dtype = kernel.op31_spec
     if A.ndim != 2 or len(A) <= 0:
         raise ValueError("A must be nonempty [M,K]")
-    specs = [(A, (len(A), K), "torch.float16"), (Idx, (O,), "torch.int32"),
-             (W_hp, (N, O), "torch.float16"), (Base, (len(A), N), "torch.float32"),
-             (C, (len(A), N), "torch." + dtype)]
+    specs = [
+        (A, (len(A), K), "torch.float16"),
+        (Idx, (O,), "torch.int32"),
+        (W_hp, (N, O), "torch.float16"),
+        (Base, (len(A), N), "torch.float32"),
+        (C, (len(A), N), "torch." + dtype),
+    ]
     ranges = []
     for tensor, shape, dt in specs:
-        if tuple(tensor.shape) != shape or str(tensor.dtype) != dt or not tensor.is_contiguous() or not tensor.is_cuda or tensor.device != A.device:
+        if (
+            tuple(tensor.shape) != shape
+            or str(tensor.dtype) != dt
+            or not tensor.is_contiguous()
+            or not tensor.is_cuda
+            or tensor.device != A.device
+        ):
             raise ValueError("Tensor shape/dtype/layout/device violates op31 ABI")
         if tensor.numel():
-            start = tensor.data_ptr(); end = start + tensor.numel() * tensor.element_size()
+            start = tensor.data_ptr()
+            end = start + tensor.numel() * tensor.element_size()
             if any(start < hi and lo < end for lo, hi in ranges):
                 raise ValueError("op31 buffers must not alias")
             ranges.append((start, end))
@@ -111,10 +135,15 @@ def masked_base_gemm(N: int, K: int, *, small: bool = False):
     """
     M = T.dynamic("M")
     BM, BN, threads = (16, 64, 128) if small else (256, 128, 256)
+
     @T.prim_func
-    def main(A: T.Tensor((M, K), T.int8), B: T.Tensor((N, K), T.int8),
-             AS: T.Tensor((M, 1), T.float16), BS: T.Tensor((N,), T.float16),
-             Base: T.Tensor((M, N), T.float32)):
+    def main(
+        A: T.Tensor((M, K), T.int8),
+        B: T.Tensor((N, K), T.int8),
+        AS: T.Tensor((M, 1), T.float16),
+        BS: T.Tensor((N,), T.float16),
+        Base: T.Tensor((M, N), T.float32),
+    ):
         with T.Kernel(N // BN, T.ceildiv(M, BM), threads=threads) as (bx, by):
             a = T.alloc_shared((BM, 128), T.int8)
             b = T.alloc_shared((BN, 128), T.int8)
@@ -126,5 +155,10 @@ def masked_base_gemm(N: int, K: int, *, small: bool = False):
                 T.gemm(a, b, acc, transpose_B=True)
             for i, j in T.Parallel(BM, BN):
                 if by * BM + i < M:
-                    Base[by * BM + i, bx * BN + j] = T.cast(acc[i,j], T.float32) * T.cast(AS[by * BM+i,0], T.float32) * T.cast(BS[bx * BN+j], T.float32)
+                    Base[by * BM + i, bx * BN + j] = (
+                        T.cast(acc[i, j], T.float32)
+                        * T.cast(AS[by * BM + i, 0], T.float32)
+                        * T.cast(BS[bx * BN + j], T.float32)
+                    )
+
     return main

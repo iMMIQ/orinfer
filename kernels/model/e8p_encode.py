@@ -1,10 +1,11 @@
 """Offline fused E8P nearest-neighbor search: one warp per vector."""
+
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
 
 
-SOURCE = r'''
+SOURCE = r"""
 __device__ unsigned int orin_e8p_nearest(const float* x, const signed char* book, int lane) {
     const int bits[8] = {0,4,1,5,2,6,3,7};
     float best = 3.402823466e38f;
@@ -53,21 +54,29 @@ __device__ unsigned int orin_e8p_nearest(const float* x, const signed char* book
     }
     return chosen;
 }
-'''
+"""
 
 
 @orin_jit
 def encode(vectors):
     if type(vectors) is not int or vectors <= 0:
-        raise ValueError('Invalid vector count')
+        raise ValueError("Invalid vector count")
+
     @T.prim_func
-    def main(X:T.Tensor((vectors,8),T.float32),Book:T.Tensor((256,8),T.int8),
-             Codes:T.Tensor((vectors,),T.uint16)):
-        with T.Kernel(T.ceildiv(vectors,4),threads=128) as block:
+    def main(
+        X: T.Tensor((vectors, 8), T.float32),
+        Book: T.Tensor((256, 8), T.int8),
+        Codes: T.Tensor((vectors,), T.uint16),
+    ):
+        with T.Kernel(T.ceildiv(vectors, 4), threads=128) as block:
             T.import_source(SOURCE)
             tx = T.get_thread_binding()
-            row = block*4+tx//32
+            row = block * 4 + tx // 32
             if row < vectors:
-                code = T.call_extern('uint32','orin_e8p_nearest',T.address_of(X[row,0]),Book.data,tx%32)
-                if tx%32 == 0:Codes[row] = T.cast(code,T.uint16)
+                code = T.call_extern(
+                    "uint32", "orin_e8p_nearest", T.address_of(X[row, 0]), Book.data, tx % 32
+                )
+                if tx % 32 == 0:
+                    Codes[row] = T.cast(code, T.uint16)
+
     return main

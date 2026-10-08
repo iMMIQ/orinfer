@@ -9,61 +9,9 @@ and state/graph validation is required. Defaults retain hi/lo compensation;
 explicit policy flags omit selected low products while persistent state and
 MMA accumulation stay FP32. AOT model binding selects the measured policy.
 """
+
 import tilelang.language as T
 from kernels.operators.op03_ffn_gate_up import _orin_jit
-
-
-@_orin_jit
-def gdn_chunk_wy_factored(bt=64, value_tile=32):
-    assert bt in (16,32,64) and value_tile in (32,64)
-    batch,chunks=T.dynamic('batch'),T.dynamic('chunks')
-    @T.prim_func
-    def main(A:T.Tensor((batch,48,chunks,bt,bt),T.float32),
-             K:T.Tensor((batch,16,chunks,bt,128),T.float16),
-             V:T.Tensor((batch,48,chunks,bt,128),T.float16),
-             G:T.Tensor((batch,48,chunks,bt),T.float32),
-             Beta:T.Tensor((batch,48,chunks,bt),T.float32),
-             W:T.Tensor((batch,48,chunks,bt,128),T.float32),
-             U:T.Tensor((batch,48,chunks,bt,128),T.float32)):
-        with T.Kernel(128//value_tile,48*chunks,batch,threads=128) as (tile,hc,b):
-            h,c=hc//chunks,hc%chunks
-            awhi=T.alloc_shared((bt,bt),T.float16)
-            awlo=T.alloc_shared((bt,bt),T.float16)
-            auhi=T.alloc_shared((bt,bt),T.float16)
-            aulo=T.alloc_shared((bt,bt),T.float16)
-            key=T.alloc_shared((bt,value_tile),T.float16)
-            value=T.alloc_shared((bt,value_tile),T.float16)
-            beta_shared=T.alloc_shared((bt,),T.float32)
-            exp_shared=T.alloc_shared((bt,),T.float32)
-            w=T.alloc_fragment((bt,value_tile),T.float32)
-            u=T.alloc_fragment((bt,value_tile),T.float32)
-            for j in T.Parallel(bt):
-                bj=T.alloc_var(T.float32);ej=T.alloc_var(T.float32)
-                bj=Beta[b,h,c,j];ej=0.0
-                if bj!=0.0:
-                    ej=T.exp(G[b,h,c,j])
-                beta_shared[j]=bj;exp_shared[j]=ej
-            for i,j in T.Parallel(bt,bt):
-                av=T.alloc_var(T.float32);wv=T.alloc_var(T.float32)
-                av=0.0;wv=0.0
-                if j<=i and beta_shared[j]!=0.0:
-                    av=A[b,h,c,i,j]*beta_shared[j]
-                    wv=av*exp_shared[j]
-                auhi[i,j]=av;aulo[i,j]=av-T.cast(auhi[i,j],T.float32)
-                awhi[i,j]=wv;awlo[i,j]=wv-T.cast(awhi[i,j],T.float32)
-            for i,d in T.Parallel(bt,value_tile):
-                kv=T.alloc_var(T.float16);vv=T.alloc_var(T.float16)
-                kv=0.0;vv=0.0
-                if beta_shared[i]!=0.0:
-                    kv=K[b,h//3,c,i,tile*value_tile+d]
-                    vv=V[b,h,c,i,tile*value_tile+d]
-                key[i,d]=kv;value[i,d]=vv
-            T.clear(w);T.clear(u)
-            T.gemm(awlo,key,w);T.gemm(awhi,key,w)
-            T.gemm(aulo,value,u);T.gemm(auhi,value,u)
-            T.copy(w,W[b,h,c,0,tile*value_tile])
-            T.copy(u,U[b,h,c,0,tile*value_tile])
-    return main
 
 
 @T.macro
@@ -74,21 +22,24 @@ def gemm3(ahi, alo, bhi, blo, output):
 
 
 @_orin_jit
-def gdn_chunk_state_factored(bt=64, value_tile=32, operand_dtype="float16",
-                             compensate_residual=True, compensate_update=True):
+def gdn_chunk_state_factored(
+    bt=64, value_tile=32, operand_dtype="float16", compensate_residual=True, compensate_update=True
+):
     assert bt in (16, 32, 64) and value_tile in (16, 32)
     assert operand_dtype == "float16"
     batch, chunks = T.dynamic("batch"), T.dynamic("chunks")
 
     @T.prim_func
-    def main(K: T.Tensor((batch, 16, chunks, bt, 128), T.float16),
-             G: T.Tensor((batch, 48, chunks, bt), T.float32),
-             W: T.Tensor((batch, 48, chunks, bt, 128), T.float32),
-             U: T.Tensor((batch, 48, chunks, bt, 128), T.float32),
-             Sin: T.Tensor((batch, 48, 128, 128), T.float32),
-             Senter: T.Tensor((batch, 48, chunks, 128, 128), T.float32),
-             R: T.Tensor((batch, 48, chunks, bt, 128), T.float32),
-             Sfinal: T.Tensor((batch, 48, 128, 128), T.float32)):
+    def main(
+        K: T.Tensor((batch, 16, chunks, bt, 128), T.float16),
+        G: T.Tensor((batch, 48, chunks, bt), T.float32),
+        W: T.Tensor((batch, 48, chunks, bt, 128), T.float32),
+        U: T.Tensor((batch, 48, chunks, bt, 128), T.float32),
+        Sin: T.Tensor((batch, 48, 128, 128), T.float32),
+        Senter: T.Tensor((batch, 48, chunks, 128, 128), T.float32),
+        R: T.Tensor((batch, 48, chunks, bt, 128), T.float32),
+        Sfinal: T.Tensor((batch, 48, 128, 128), T.float32),
+    ):
         with T.Kernel(128 // value_tile, batch * 48, threads=128) as (bv, bh):
             b, h = bh // 48, bh % 48
             state = T.alloc_shared((128, value_tile), T.float32)
@@ -144,23 +95,32 @@ def gdn_chunk_state_factored(bt=64, value_tile=32, operand_dtype="float16",
                     state[i, j] = T.exp(G[b, h, c, bt - 1]) * state[i, j] + update[i, j]
             for i, j in T.Parallel(128, value_tile):
                 Sfinal[b, h, i, bv * value_tile + j] = state[i, j]
+
     return main
 
 
 @_orin_jit
-def gdn_chunk_output_factored(q_scale=128**-.5, bt=64, value_tile=32, operand_dtype="float16",
-                              compensate_cross=True, compensate_local=True):
+def gdn_chunk_output_factored(
+    q_scale=128**-0.5,
+    bt=64,
+    value_tile=32,
+    operand_dtype="float16",
+    compensate_cross=True,
+    compensate_local=True,
+):
     assert bt in (16, 32, 64) and value_tile in (16, 32)
     assert operand_dtype == "float16"
     batch, chunks = T.dynamic("batch"), T.dynamic("chunks")
 
     @T.prim_func
-    def main(Q: T.Tensor((batch, 16, chunks, bt, 128), T.float16),
-             G: T.Tensor((batch, 48, chunks, bt), T.float32),
-             QK: T.Tensor((batch, 48, chunks, bt, bt), T.float32),
-             Senter: T.Tensor((batch, 48, chunks, 128, 128), T.float32),
-             R: T.Tensor((batch, 48, chunks, bt, 128), T.float32),
-             Y: T.Tensor((batch, chunks * bt, 48, 128), T.float16)):
+    def main(
+        Q: T.Tensor((batch, 16, chunks, bt, 128), T.float16),
+        G: T.Tensor((batch, 48, chunks, bt), T.float32),
+        QK: T.Tensor((batch, 48, chunks, bt, bt), T.float32),
+        Senter: T.Tensor((batch, 48, chunks, 128, 128), T.float32),
+        R: T.Tensor((batch, 48, chunks, bt, 128), T.float32),
+        Y: T.Tensor((batch, chunks * bt, 48, 128), T.float16),
+    ):
         with T.Kernel(128 // value_tile, 48 * chunks, batch, threads=128) as (bv, hc, b):
             h, c = hc // chunks, hc % chunks
             qhi = T.alloc_shared((bt, 128), operand_dtype)
@@ -196,12 +156,13 @@ def gdn_chunk_output_factored(q_scale=128**-.5, bt=64, value_tile=32, operand_dt
             if compensate_cross:
                 T.gemm(qhi, slo, output)
             T.gemm(qhi, shi, output)
-            for t,j in T.Parallel(bt,value_tile):
-                output[t,j] = (output[t,j] * q_scale) * T.exp(G[b,h,c,t])
+            for t, j in T.Parallel(bt, value_tile):
+                output[t, j] = (output[t, j] * q_scale) * T.exp(G[b, h, c, t])
             if compensate_local:
                 gemm3(khi, klo, rhi, rlo, output)
             else:
                 T.gemm(khi, rhi, output)
             for t, j in T.Parallel(bt, value_tile):
                 Y[b, c * bt + t, h, bv * value_tile + j] = output[t, j]
+
     return main

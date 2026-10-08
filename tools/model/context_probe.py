@@ -1,4 +1,5 @@
 """GPU boundary and graph-replay checks for the prepared context capacity."""
+
 import argparse
 import gc
 from pathlib import Path
@@ -13,7 +14,7 @@ from kernels.operators.op27_state_lifecycle import paged_kv_gather
 
 def run(context, output, ring):
     configure()
-    device = 'cuda'
+    device = "cuda"
     pages = context // 128
     table = torch.arange(pages, dtype=torch.int32, device=device).reshape(1, pages)
     k = torch.zeros((pages, 128, 4, 256), dtype=torch.float16, device=device)
@@ -33,7 +34,9 @@ def run(context, output, ring):
     prepare = full_prepare_mrope(pages, context, (11, 11, 10), max_position=context)
 
     def launch_prepare():
-        prepare.torch_function(x, weight, weight, rope, request, positions, table, status, mrope, q, gate, k, v)
+        prepare.torch_function(
+            x, weight, weight, rope, request, positions, table, status, mrope, q, gate, k, v
+        )
 
     launch_prepare()
     graph = torch.cuda.CUDAGraph()
@@ -42,15 +45,20 @@ def run(context, output, ring):
     x.copy_(torch.randn_like(x))
     graph.replay()
     expected_k = x[:, 12288:13312].reshape(3, 4, 256).float()
-    expected_k = (expected_k * torch.rsqrt(expected_k.square().mean(-1, keepdim=True) + 1e-6)).half()
+    expected_k = (
+        expected_k * torch.rsqrt(expected_k.square().mean(-1, keepdim=True) + 1e-6)
+    ).half()
     actual_k = k.reshape(context, 4, 256)[positions.long()]
     check = error(actual_k, expected_k)
-    assert check['relative_l2'] < 0.001, check
-    assert torch.equal(v.reshape(context, 4, 256)[positions.long()], x[:, 13312:].reshape(3, 4, 256))
+    assert check["relative_l2"] < 0.001, check
+    assert torch.equal(
+        v.reshape(context, 4, 256)[positions.long()], x[:, 13312:].reshape(3, 4, 256)
+    )
     assert int(status.item()) == 0
     # Uniform attention makes the last-token contribution analytically known.
     # Moving QueryPos by one must exclude it, including graph replay.
-    k.zero_(); v.zero_()
+    k.zero_()
+    v.zero_()
     v.reshape(context, 4, 256)[-1].fill_(65504)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device=device)
     length = torch.tensor([context], dtype=torch.int32, device=device)
@@ -72,35 +80,69 @@ def run(context, output, ring):
     pos.fill_(context - 2)
     attention_graph.replay()
     assert torch.count_nonzero(partial).item() == 0
-    assert torch.equal(denom.sum(2), torch.full((1, 24), context - 1, device=device, dtype=torch.float32))
+    assert torch.equal(
+        denom.sum(2), torch.full((1, 24), context - 1, device=device, dtype=torch.float32)
+    )
     # Bitwise gather ABI uses packed pairs of FP16; do not reinterpret as floats.
     out_k = torch.empty((1, context, 512), dtype=torch.int32, device=device)
     out_v = torch.empty_like(out_k)
     gather = paged_kv_gather()
-    gather.torch_function(k.view(torch.int32).reshape(pages, 128, 512),
-        v.view(torch.int32).reshape(pages, 128, 512), table, length, out_k, out_v)
-    assert torch.equal(out_v.view(torch.float16).reshape(context, 4, 256)[-1],
-                       torch.full((4, 256), 65504, device=device, dtype=torch.float16))
+    gather.torch_function(
+        k.view(torch.int32).reshape(pages, 128, 512),
+        v.view(torch.int32).reshape(pages, 128, 512),
+        table,
+        length,
+        out_k,
+        out_v,
+    )
+    assert torch.equal(
+        out_v.view(torch.float16).reshape(context, 4, 256)[-1],
+        torch.full((4, 256), 65504, device=device, dtype=torch.float16),
+    )
     length.fill_(context - 1)
     gather_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(gather_graph):
-        gather.torch_function(k.view(torch.int32).reshape(pages, 128, 512),
-            v.view(torch.int32).reshape(pages, 128, 512), table, length, out_k, out_v)
+        gather.torch_function(
+            k.view(torch.int32).reshape(pages, 128, 512),
+            v.view(torch.int32).reshape(pages, 128, 512),
+            table,
+            length,
+            out_k,
+            out_v,
+        )
     out_v.fill_(-1)
     gather_graph.replay()
     assert torch.count_nonzero(out_v[0, -1]).item() == 0
-    del graph, attention_graph, gather_graph, k, v, out_k, out_v, rope, mrope
+    del graph
+    del attention_graph
+    del gather_graph
+    k = None
+    v = None
+    del out_k
+    del out_v
+    rope = None
+    mrope = None
     gc.collect()
     ring_error = run_ring(context, ring)
-    write_json(output / 'result.json', dict(status='passed', max_context=context,
-        last_page=pages - 1, prepare_error=check, ring_error=ring_error,
-        attention_last_token=True, causal_tail=True, gather_tail=True,
-        replay_changed_inputs=True))
-    print('256k boundary and ring replay passed', flush=True)
+    write_json(
+        output / "result.json",
+        dict(
+            status="passed",
+            max_context=context,
+            last_page=pages - 1,
+            prepare_error=check,
+            ring_error=ring_error,
+            attention_last_token=True,
+            causal_tail=True,
+            gather_tail=True,
+            replay_changed_inputs=True,
+        ),
+    )
+    print("256k boundary and ring replay passed", flush=True)
 
 
 def run_ring(context, ring):
-    device = 'cuda'
+    device = "cuda"
     # Capture a non-aligned chunk crossing the hidden ring wrap, then gather
     # the same absolute positions. Change both inputs and Step before replay.
     rows, hidden = 8, 5120
@@ -122,30 +164,34 @@ def run_ring(context, ring):
     ring_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(ring_graph):
         launch_ring()
-    step.fill_(context); read_step.fill_(context - rows)
+    step.fill_(context)
+    read_step.fill_(context - rows)
     x.copy_(torch.randn_like(x))
     ring_graph.replay()
     expected = x.float() + residual
     expected = (expected * torch.rsqrt(expected.square().mean(-1, keepdim=True) + 1e-6)).half()
     ring_error = error(result, expected)
-    assert ring_error['relative_l2'] < 0.001, ring_error
+    assert ring_error["relative_l2"] < 0.001, ring_error
     return ring_error
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--max-context', type=int, default=262144)
-    parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--hidden-ring', type=int, default=8192)
-    parser.add_argument('--only-ring', action='store_true')
+    parser.add_argument("--max-context", type=int, default=262144)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--hidden-ring", type=int, default=8192)
+    parser.add_argument("--only-ring", action="store_true")
     args = parser.parse_args()
     if args.only_ring:
         configure()
         result = run_ring(args.max_context, args.hidden_ring)
-        write_json(args.output / 'result.json', dict(status='passed', ring_tokens=args.hidden_ring, ring_error=result))
+        write_json(
+            args.output / "result.json",
+            dict(status="passed", ring_tokens=args.hidden_ring, ring_error=result),
+        )
     else:
         run(args.max_context, args.output, args.hidden_ring)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

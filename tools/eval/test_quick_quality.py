@@ -1,4 +1,5 @@
 """Synthetic correctness/rejection tests, not actual model quality measurements."""
+
 import copy
 import math
 import unittest
@@ -9,11 +10,17 @@ from quick_quality import SEED, analyze
 def record():
     scores = [{"token_id": i, "logprob": math.log(p)} for i, p in [(1, 0.8), (2, 0.1), (3, 0.05)]]
     return {
-        "case_id": "example", "execution_mode": "decode", "position": 0,
-        "seed": SEED, "baseline_context_sha256": "a" * 64, "candidate_context_sha256": "a" * 64,
-        "baseline_top3": scores, "candidate_top3": copy.deepcopy(scores),
+        "case_id": "example",
+        "execution_mode": "decode",
+        "position": 0,
+        "seed": SEED,
+        "baseline_context_sha256": "a" * 64,
+        "candidate_context_sha256": "a" * 64,
+        "baseline_top3": scores,
+        "candidate_top3": copy.deepcopy(scores),
         "candidate_logprobs_on_baseline_top3": {str(x["token_id"]): x["logprob"] for x in scores},
-        "reference_token_id": 1, "baseline_reference_logprob": math.log(0.8),
+        "reference_token_id": 1,
+        "baseline_reference_logprob": math.log(0.8),
         "candidate_reference_logprob": math.log(0.8),
     }
 
@@ -27,7 +34,9 @@ class QualityTests(unittest.TestCase):
 
     def test_candidate_selection_outside_baseline_top3(self):
         row = record()
-        row["candidate_top3"] = [{"token_id": i, "logprob": math.log(p)} for i, p in [(4, 0.4), (1, 0.3), (2, 0.1)]]
+        row["candidate_top3"] = [
+            {"token_id": i, "logprob": math.log(p)} for i, p in [(4, 0.4), (1, 0.3), (2, 0.1)]
+        ]
         row["candidate_logprobs_on_baseline_top3"]["1"] = math.log(0.3)
         row["candidate_reference_logprob"] = math.log(0.3)
         summary = analyze([row])["aggregate"]
@@ -61,8 +70,13 @@ class QualityTests(unittest.TestCase):
 
     def test_top3_renormalization_would_hide_loss(self):
         row = record()
-        row["candidate_top3"] = [{"token_id": x["token_id"], "logprob": x["logprob"] - math.log(0.95)} for x in row["baseline_top3"]]
-        row["candidate_logprobs_on_baseline_top3"] = {str(x["token_id"]): x["logprob"] for x in row["candidate_top3"]}
+        row["candidate_top3"] = [
+            {"token_id": x["token_id"], "logprob": x["logprob"] - math.log(0.95)}
+            for x in row["baseline_top3"]
+        ]
+        row["candidate_logprobs_on_baseline_top3"] = {
+            str(x["token_id"]): x["logprob"] for x in row["candidate_top3"]
+        }
         row["candidate_reference_logprob"] = row["candidate_top3"][0]["logprob"]
         # Valid-looking subset probabilities cannot prove full-vocabulary normalization.
         # The scorer must supply it; the analyzer preserves, rather than normalizes, inputs.

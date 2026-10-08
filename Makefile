@@ -1,4 +1,4 @@
-.PHONY: check build info python-env compiler-image check-offline check-gpu
+.PHONY: check fmt lint build info python-env compiler-image check-offline check-gpu
 
 PYTHON ?= .venv/bin/python
 
@@ -9,11 +9,19 @@ python-env:
 build:
 	cargo build --release --locked --offline
 
-check:
+fmt:
+	cargo fmt --all
+	$(PYTHON) -m ruff format tools kernels
+
+lint:
 	cargo fmt --all -- --check
-	cargo check --workspace --offline
-	cargo clippy --workspace --all-targets --offline -- -D warnings
-	cargo test --workspace --offline
+	$(PYTHON) -m ruff format --check tools kernels
+	$(PYTHON) -m ruff check tools kernels
+	cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+
+check: lint
+	cargo check --workspace --locked --offline
+	cargo test --workspace --locked --offline
 	$(PYTHON) -m unittest discover -s tools/eval -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/bench -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/operators -p 'test_abi.py' -v
@@ -32,6 +40,7 @@ compiler-image:
 	docker build -t orinfer-compiler:0.1.1 -f tools/build/compiler.Dockerfile .
 
 check-offline:
+	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR):$(CURDIR)/tools/operators" --entrypoint python3 orinfer-compiler:0.1.1 -m tools.build.check_imports
 	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint python3 orinfer-compiler:0.1.1 -m unittest tools.model.test_mtp_weights tools.model.flash_next.tests.test_scenes tools.model.flash_next.tests.test_reference_math tools.model.flash_next.tests.test_teacher tools.model.flash_next.tests.test_qsa_reference tools.model.flash_next.tests.test_native_contract tools.model.flash_next.tests.test_dynamic_batch -v
 
 check-gpu:

@@ -5,6 +5,7 @@
 The dynamic-M cubin supports arbitrary positive row counts. Use explicit output
 buffers and ``launch(..., stream=<CUDA stream handle>)`` for stable graph ABI.
 """
+
 import tilelang
 import tilelang.language as T
 
@@ -25,16 +26,14 @@ def swiglu_fp16(gate, up):
     return T.cast((g * sigmoid) * u, T.float16)
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc",
-              target={"kind": "cuda", "arch": "sm_87"})
+@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
 def _compile_swiglu(block: int = 1024, threads: int = 256, layout: str = "split"):
     assert layout in ("split", "interleaved")
     assert block > 0 and block % threads == 0
     rows = T.dynamic("rows")
 
     @T.prim_func
-    def main(X: T.Tensor((rows, 2 * HIDDEN), T.float16),
-             Y: T.Tensor((rows, HIDDEN), T.float16)):
+    def main(X: T.Tensor((rows, 2 * HIDDEN), T.float16), Y: T.Tensor((rows, HIDDEN), T.float16)):
         with T.Kernel(T.ceildiv(rows * HIDDEN, block), threads=threads) as bx:
             gate = T.alloc_fragment((block,), T.float32)
             up = T.alloc_fragment((block,), T.float32)
