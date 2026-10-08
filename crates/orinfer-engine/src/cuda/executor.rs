@@ -35,6 +35,7 @@ pub(crate) struct Executor {
     pub(super) sequence_specs: Vec<crate::artifact::Buffer<crate::weights::TensorIdentity>>,
     pub(super) sequence_strides: BTreeMap<String, usize>,
     pub(super) batch_graphs: RefCell<BatchGraphCache>,
+    pub(super) batch_graph_trials: RefCell<BTreeMap<Vec<(usize, usize)>, usize>>,
     pub(super) batch_graph_clock: std::cell::Cell<u64>,
     pub(crate) batch_statistics: std::cell::Cell<crate::scheduler::BatchExecutionStatistics>,
 }
@@ -438,6 +439,7 @@ impl Executor {
                 .collect(),
             sequence_strides: lazy.map(|kv| kv.buffers.clone()).unwrap_or_default(),
             batch_graphs: Default::default(),
+            batch_graph_trials: Default::default(),
             batch_statistics: Default::default(),
             batch_graph_clock: std::cell::Cell::new(0),
         };

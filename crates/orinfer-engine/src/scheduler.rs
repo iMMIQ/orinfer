@@ -49,6 +49,7 @@ pub struct Options {
     pub max_active: usize,
     pub max_batch_tokens: usize,
     pub prefill_budget_ms: f64,
+    pub target_tpot_ms: f64,
     pub memory_reserve_bytes: usize,
 }
 impl Default for Options {
@@ -57,6 +58,7 @@ impl Default for Options {
             max_active: 32,
             max_batch_tokens: 128,
             prefill_budget_ms: 200.,
+            target_tpot_ms: 400.,
             memory_reserve_bytes: 1 << 30,
         }
     }
@@ -67,9 +69,11 @@ impl Options {
             || !(1..=128).contains(&self.max_batch_tokens)
             || !self.prefill_budget_ms.is_finite()
             || self.prefill_budget_ms <= 0.
+            || !self.target_tpot_ms.is_finite()
+            || self.target_tpot_ms <= 0.
         {
             return Err(
-                "Scheduler requires active/batch limits in 1..128 and positive prefill budget"
+                "Scheduler requires active/batch limits in 1..128 and positive scheduling time budgets"
                     .into(),
             );
         }
@@ -77,100 +81,109 @@ impl Options {
     }
 }
 
-#[derive(Clone, Copy)]
+/// Immutable queue descriptor. Media hashes are calculated once, while cache
+/// matches and timing estimates remain live as checkpoints arrive or disappear.
+pub struct RequestHint {
+    pub(crate) owner: u64,
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) media: crate::prefix::Media,
+    pub(crate) image_work: usize,
+}
+impl RequestHint {
+    pub fn common_tokens(&self, other: &Self) -> usize {
+        if self.owner != other.owner {
+            return 0;
+        }
+        let common = self
+            .tokens
+            .iter()
+            .zip(&other.tokens)
+            .take_while(|(a, b)| a == b)
+            .count();
+        self.media.common_tokens(&other.media, common)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct Waiting {
     pub age_s: f64,
     pub remaining_s: f64,
     pub restore_s: f64,
+    pub startup_s: f64,
     pub remaining_tokens: usize,
 }
-
-/// Compare a cold request's predicted first-token time under mixed execution
-/// with letting the current decoder cohort finish first. Cached admissions do
-/// not join this queue; aging bounds deferral even under continuous hot traffic.
-#[derive(Default)]
-pub struct AdmissionCosts {
-    decode_rate_per_request: std::collections::BTreeMap<usize, f64>,
-    mixed_prefill_rate: std::collections::BTreeMap<usize, f64>,
-}
-impl AdmissionCosts {
-    pub fn observe(
-        &mut self,
-        decoders: usize,
-        decode_tokens: usize,
-        prefill_tokens: usize,
-        seconds: f64,
-    ) {
-        if decoders == 0 || !seconds.is_finite() || seconds <= 0. {
-            return;
-        }
-        let key = decoders.next_power_of_two();
-        let (rates, rate) = if prefill_tokens > 0 {
-            (
-                &mut self.mixed_prefill_rate,
-                prefill_tokens as f64 / seconds,
-            )
-        } else if decode_tokens > 0 {
-            (
-                &mut self.decode_rate_per_request,
-                decode_tokens as f64 / seconds / decoders as f64,
-            )
-        } else {
-            return;
-        };
-        rates
-            .entry(key)
-            .and_modify(|old| *old = *old * 0.8 + rate * 0.2)
-            .or_insert(rate);
-    }
-
-    pub fn defer_cold(
-        &self,
-        waiting: Waiting,
-        decoders: usize,
-        remaining_decode_tokens: usize,
-        has_prefills: bool,
-    ) -> bool {
-        if decoders == 0 || has_prefills || waiting.remaining_tokens == 0 || waiting.age_s >= 30. {
-            return false;
-        }
-        let key = decoders.next_power_of_two();
-        let Some(&decode_rate) = self.decode_rate_per_request.get(&key) else {
-            return false;
-        };
-        // Cold-start prior: a few prompt tokens fit into one decoder interval.
-        // Measured mixed iterations replace it as soon as they are available.
-        let mixed_rate = self
-            .mixed_prefill_rate
-            .get(&key)
-            .copied()
-            .unwrap_or(decode_rate * 4.);
-        let drain_s = remaining_decode_tokens as f64 / (decode_rate * decoders as f64);
-        let queued_s = drain_s + waiting.remaining_s + waiting.restore_s;
-        let mixed_s = waiting.remaining_tokens as f64 / mixed_rate + waiting.restore_s;
-        queued_s.is_finite() && mixed_s.is_finite() && queued_s * 1.1 < mixed_s
+impl Waiting {
+    pub fn cost_s(self) -> f64 {
+        (self.remaining_s + self.restore_s + self.startup_s).max(0.001)
     }
 }
-/// Aging takes precedence after two seconds; fresh work uses estimated cost,
-/// including expensive small-shape tails and prefix restoration.
+
+/// Smooth aging preserves cost ordering under sustained load. Only the hard
+/// promotion horizon changes to oldest-first; unlike the old two-second rule,
+/// a burst does not immediately collapse the entire queue to FCFS.
 pub fn select_waiting(requests: &[Waiting]) -> Option<usize> {
     requests
         .iter()
         .enumerate()
         .min_by(|(_, a), (_, b)| {
-            let old_a = a.age_s >= 2.;
-            let old_b = b.age_s >= 2.;
+            let old_a = a.age_s >= 30.;
+            let old_b = b.age_s >= 30.;
             old_b.cmp(&old_a).then_with(|| {
                 if old_a {
                     b.age_s.total_cmp(&a.age_s)
                 } else {
-                    (a.remaining_s + a.restore_s)
-                        .total_cmp(&(b.remaining_s + b.restore_s))
+                    (a.cost_s() / (1. + a.age_s / 2.))
+                        .total_cmp(&(b.cost_s() / (1. + b.age_s / 2.)))
                         .then(b.age_s.total_cmp(&a.age_s))
                 }
             })
         })
         .map(|(index, _)| index)
+}
+
+/// EWMA plus an error allowance, rather than treating a mean as a deadline
+/// guarantee. Invalid measurements never poison subsequent scheduling.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Estimate {
+    pub mean: f64,
+    error: f64,
+    pub samples: usize,
+}
+impl Estimate {
+    pub fn observe(&mut self, seconds: f64) {
+        if !seconds.is_finite() || seconds <= 0. {
+            return;
+        }
+        if self.samples == 0 {
+            self.mean = seconds;
+        } else {
+            self.error = self.error * 0.8 + (seconds - self.mean).abs() * 0.2;
+            self.mean = self.mean * 0.8 + seconds * 0.2;
+        }
+        self.samples += 1;
+    }
+    pub fn upper(self) -> f64 {
+        self.mean + 2. * self.error
+    }
+}
+
+/// Prefill requests spend real wall time, not iteration counts. Deficits may
+/// become negative after a large indivisible chunk; refill enough rounds for
+/// some request to become eligible without spinning or leaving the GPU idle.
+pub(crate) fn replenish(credits: &mut [f64], quantum_s: f64) {
+    let highest = credits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if highest <= 0. && highest.is_finite() {
+        let refill = ((-highest / quantum_s).floor() + 1.) * quantum_s;
+        for credit in credits {
+            *credit += refill;
+        }
+    }
+}
+
+/// Largest useful prefill window after reserving the next decoder step. A
+/// minimum execution quantum bounds starvation when the target is infeasible.
+pub(crate) fn prefill_window(slack_s: f64, decode_s: f64, ceiling_ms: f64) -> f64 {
+    (slack_s - decode_s).max(0.).min(ceiling_ms / 1000.)
 }
 
 /// Cached text admissions can form a cohort before the first decode. During
@@ -201,6 +214,7 @@ pub fn admission_should_yield(
 pub struct BatchExecutionStatistics {
     pub dynamic_graph_captures: usize,
     pub dynamic_direct_iterations: usize,
+    pub graph_capture_deferrals: usize,
     pub graph_hits: usize,
     pub graph_misses: usize,
     pub graph_evictions: usize,
@@ -230,6 +244,10 @@ pub struct Statistics {
     pub compute_s: f64,
     pub admission_deferrals: usize,
     pub admissions: usize,
+    pub deadline_decode_iterations: usize,
+    pub prefill_progress_overrides: usize,
+    pub max_decode_gap_s: f64,
+    pub decode_budget_overruns: usize,
     pub request_start_s: f64,
     pub prefix_restore_s: f64,
     pub prefill_completion_s: f64,
@@ -284,59 +302,82 @@ mod tests {
         assert!(admission_should_yield(false, 1, 0.201, false));
     }
     #[test]
-    fn aging_overrides_locality_and_restore_cost_is_charged() {
+    fn aging_preserves_cost_order_and_eventually_promotes_long_work() {
         let req = |age_s, remaining_s, restore_s| Waiting {
             age_s,
             remaining_s,
             restore_s,
+            startup_s: 0.,
             remaining_tokens: 0,
         };
         assert_eq!(select_waiting(&[]), None);
         assert_eq!(
-            select_waiting(&[req(0.1, 0., 0.5), req(0.2, 0.2, 0.)]),
+            select_waiting(&[req(3., 10., 1.), req(2., 0.2, 0.)]),
             Some(1)
         );
         assert_eq!(
-            select_waiting(&[req(3., 10., 1.), req(1., 0., 0.)]),
+            select_waiting(&[req(31., 10., 1.), req(2., 0.2, 0.)]),
             Some(0)
         );
         assert_eq!(
-            select_waiting(&[req(3., 0., 0.), req(4., 10., 0.)]),
+            select_waiting(&[req(31., 0., 0.), req(32., 10., 0.)]),
+            Some(1)
+        );
+        assert_eq!(
+            select_waiting(&[req(0.1, 0., 0.5), req(0.2, 0.2, 0.)]),
+            Some(1)
+        );
+        let expensive_start = Waiting {
+            startup_s: 2.,
+            ..req(0., 0., 0.)
+        };
+        assert_eq!(
+            select_waiting(&[expensive_start, req(0., 0.1, 0.)]),
             Some(1)
         );
     }
-
     #[test]
-    fn cold_admission_uses_measured_cost_and_preserves_cache_hits_and_progress() {
-        let mut costs = AdmissionCosts::default();
-        let cold = Waiting {
-            age_s: 0.,
-            remaining_s: 2.5,
-            restore_s: 0.,
-            remaining_tokens: 2048,
+    fn real_service_deficits_charge_large_chunks_without_idling() {
+        let mut credits = [0., 0.];
+        replenish(&mut credits, 0.2);
+        credits[0] -= 2.;
+        credits[1] -= 0.3;
+        replenish(&mut credits, 0.2);
+        assert!(credits[0] < 0. && credits[1] > 0.);
+        credits[1] -= 2.;
+        replenish(&mut credits, 0.2);
+        assert!(credits.iter().any(|&c| c > 0.));
+        let old = credits;
+        replenish(&mut credits, 0.2);
+        assert_eq!(old, credits);
+    }
+    #[test]
+    fn timing_reserves_decoder_time_and_accounts_for_prediction_error() {
+        assert_eq!(prefill_window(0.3, 0.1, 200.), 0.19999999999999998);
+        assert_eq!(prefill_window(0.05, 0.1, 200.), 0.);
+        let mut estimate = Estimate::default();
+        estimate.observe(0.1);
+        estimate.observe(0.4);
+        assert!(estimate.upper() > estimate.mean);
+        let before = estimate.upper();
+        estimate.observe(f64::NAN);
+        assert_eq!(estimate.upper(), before);
+        let options = Options {
+            target_tpot_ms: f64::NAN,
+            ..Default::default()
         };
-        assert!(!costs.defer_cold(cold, 1, 200, false));
-        costs.observe(1, 15, 0, 0.6);
-        assert!(costs.defer_cold(cold, 1, 200, false));
-        assert!(!costs.defer_cold(cold, 1, 4000, false));
-        assert!(!costs.defer_cold(cold, 1, 200, true));
-        assert!(!costs.defer_cold(cold, 0, 0, false));
-        assert!(!costs.defer_cold(Waiting { age_s: 30., ..cold }, 1, 200, false));
-        assert!(!costs.defer_cold(
-            Waiting {
-                remaining_tokens: 0,
-                remaining_s: 0.,
-                ..cold
-            },
-            1,
-            200,
-            false
-        ));
-        // An efficient mixed backend must admit immediately instead of using
-        // the conservative cold-start estimate forever.
-        costs.observe(1, 1, 256, 0.2);
-        assert!(!costs.defer_cold(cold, 1, 200, false));
-        costs.observe(1, 0, 0, f64::NAN);
-        assert!(!costs.defer_cold(cold, 1, 200, false));
+        assert!(options.validate().is_err());
+    }
+    #[test]
+    fn queue_locality_never_crosses_image_identity_or_model_owners() {
+        let hint = |owner, image| RequestHint {
+            owner,
+            tokens: vec![1, 2, 3, 4],
+            media: crate::prefix::Media(vec![(2, [image; 32])]),
+            image_work: 16,
+        };
+        assert_eq!(hint(1, 0).common_tokens(&hint(1, 0)), 4);
+        assert_eq!(hint(1, 0).common_tokens(&hint(1, 1)), 2);
+        assert_eq!(hint(1, 0).common_tokens(&hint(2, 0)), 0);
     }
 }

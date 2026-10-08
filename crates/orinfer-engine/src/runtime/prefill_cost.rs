@@ -5,6 +5,7 @@ pub(super) struct Costs {
     // None means this shape has not yet been measured on this model instance.
     shapes: BTreeMap<usize, Option<f64>>,
     weight_pass_s: f64,
+    contexts: BTreeMap<(usize, usize), crate::scheduler::Estimate>,
     restore_s_per_byte: f64,
 }
 impl Costs {
@@ -15,6 +16,7 @@ impl Costs {
             shapes,
             // Conservative cold-start prior; online timings replace it.
             weight_pass_s: 0.1,
+            contexts: Default::default(),
             restore_s_per_byte: 1.0 / 20e9,
         }
     }
@@ -26,6 +28,50 @@ impl Costs {
             let cost = self.shapes.entry(chunk).or_default();
             *cost = Some(cost.map_or(seconds, |old| old * 0.8 + seconds * 0.2));
         }
+    }
+    pub fn observe_at(&mut self, chunk: usize, context: usize, seconds: f64) {
+        if !seconds.is_finite() || seconds <= 0. {
+            return;
+        }
+        self.observe(chunk, seconds);
+        self.contexts
+            .entry((chunk, context.next_power_of_two()))
+            .or_default()
+            .observe(seconds);
+    }
+    pub fn chunk_upper(&self, chunk: usize, context: usize) -> f64 {
+        self.contexts
+            .get(&(chunk, context.next_power_of_two()))
+            .map(|e| e.upper())
+            .unwrap_or_else(|| self.chunk_cost(chunk) * 1.2)
+    }
+    pub fn bounded_chunk_at(&self, remaining: usize, context: usize, budget_ms: f64) -> usize {
+        let fitting = self
+            .shapes
+            .keys()
+            .copied()
+            .filter(|&n| {
+                n <= remaining
+                    && self.chunk_upper(n, context.saturating_add(n)) * 1000. <= budget_ms
+            })
+            .max()
+            .unwrap_or(1);
+        // A cold measurement or indivisible tail/head cost can make every
+        // compiled tile exceed the soft budget. Repeated one-token weight
+        // passes are then much worse than one minimum useful tile. Explore
+        // that tile again so later measurements can correct the estimate.
+        let minimum = self
+            .shapes
+            .keys()
+            .copied()
+            .find(|&n| n > 1 && n <= 16 && n <= remaining);
+        minimum
+            .filter(|&n| {
+                fitting == 1
+                    && self.chunk_upper(n, context.saturating_add(n)) / (n as f64)
+                        < self.chunk_upper(1, context.saturating_add(1)) * 0.5
+            })
+            .unwrap_or(fitting)
     }
     pub fn observe_restore(&mut self, bytes: usize, seconds: f64) {
         if bytes > 0 && seconds.is_finite() && seconds > 0. {
@@ -44,6 +90,7 @@ impl Costs {
     }
     /// Largest real profile within the estimated budget; one token guarantees
     /// progress even when no profile fits. This is a soft scheduling target.
+    #[cfg(test)]
     pub fn bounded_chunk(&self, remaining: usize, budget_ms: f64) -> usize {
         self.shapes
             .keys()
@@ -154,5 +201,27 @@ mod tests {
         assert_eq!(costs.bounded_chunk(15, 200.), 1);
         assert_eq!(costs.bounded_chunk(8192, 1.), 1);
         assert_eq!(costs.bounded_chunk(8192, f64::INFINITY), 4096);
+    }
+    #[test]
+    fn context_buckets_do_not_reuse_a_short_attention_timing_for_a_long_prompt() {
+        let mut costs = Costs::new([128, 512]);
+        costs.observe_at(128, 1024, 0.1);
+        costs.observe_at(128, 8192, 0.5);
+        assert_eq!(costs.bounded_chunk_at(8192, 896, 200.), 128);
+        assert_eq!(costs.bounded_chunk_at(8192, 8064, 200.), 1);
+        costs.observe_at(512, 8192, f64::NAN);
+        assert!(costs.chunk_upper(512, 8192) > 0.);
+    }
+    #[test]
+    fn soft_budget_does_not_lock_prefill_into_one_token_weight_passes() {
+        let mut costs = Costs::new([16, 128]);
+        costs.observe_at(16, 16, 0.4);
+        costs.observe_at(128, 128, 0.8);
+        assert_eq!(costs.bounded_chunk_at(512, 0, 200.), 16);
+        // No padding across a tail, and no large tile forced beyond a budget.
+        assert_eq!(costs.bounded_chunk_at(15, 0, 1.), 1);
+        assert_eq!(costs.bounded_chunk_at(512, 0, 1000.), 128);
+        costs.observe_at(16, 16, 5.);
+        assert_eq!(costs.bounded_chunk_at(512, 0, 1.), 1);
     }
 }

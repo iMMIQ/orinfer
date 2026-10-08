@@ -38,6 +38,10 @@ pub struct RequestState {
     mtp: crate::mtp::Statistics,
     generated: usize,
     served: usize,
+    last_output: Instant,
+    last_prefill: Instant,
+    credit_s: f64,
+    speculation_costs: BTreeMap<usize, (scheduler::Estimate, f64)>,
     mtp_blocked: bool,
     decoder: crate::sampling::Decoder,
 }
@@ -71,8 +75,19 @@ impl RequestState {
         self.offset
             .saturating_sub(self.prefix.statistics.cached_tokens)
     }
+    pub fn decode_slack_s(&self, target_tpot_ms: f64) -> Option<f64> {
+        (!self.prefilling && !self.is_finished())
+            .then(|| target_tpot_ms / 1000. - self.last_output.elapsed().as_secs_f64())
+    }
     pub fn is_prefilling(&self) -> bool {
         self.prefilling
+    }
+    pub fn remaining_prefill_tokens(&self) -> usize {
+        if self.prefilling {
+            self.input.len().saturating_sub(self.offset)
+        } else {
+            0
+        }
     }
     pub fn is_finished(&self) -> bool {
         self.generated == self.limit || self.released || self.decoder.finished()
@@ -98,7 +113,7 @@ pub struct StepOutput {
 }
 
 enum Work {
-    Speculative(usize),
+    Speculative(usize, usize),
     Prefill(usize, Option<f64>),
     Batch(Vec<(usize, usize)>),
     Idle,
@@ -201,20 +216,133 @@ impl ModelRuntime {
         }
         Ok(limits)
     }
+    pub(crate) fn request_hint(
+        &self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+    ) -> Result<scheduler::RequestHint> {
+        let image_work = images.iter().try_fold(0usize, |n, image| {
+            let patches = image
+                .grid_height
+                .checked_mul(image.grid_width)
+                .ok_or("Image work overflow")?;
+            n.checked_add(patches).ok_or("Image work overflow")
+        })?;
+        Ok(scheduler::RequestHint {
+            owner: self.owner_id,
+            tokens: input.to_vec(),
+            media: self.prefix_media(input, images)?,
+            image_work,
+        })
+    }
     pub(crate) fn waiting_cost(
         &self,
         input: &[u32],
         images: &[crate::vision::ImageInput],
     ) -> Result<scheduler::Waiting> {
-        // The checkpoint already records the actual restored payload bytes.
-        // Rebuilding every tensor range for each queued request is unnecessary.
-        let (cached, bytes) = self.prefix_match_cost(input, images)?;
+        self.hint_cost(&self.request_hint(input, images)?)
+    }
+    fn startup_key(image_work: usize, context: usize, cached: bool) -> (usize, usize, bool) {
+        (
+            image_work.next_power_of_two(),
+            context.next_power_of_two(),
+            cached,
+        )
+    }
+    pub(crate) fn hint_cost(&self, hint: &scheduler::RequestHint) -> Result<scheduler::Waiting> {
+        if hint.owner != self.owner_id {
+            return Err("Queue descriptor belongs to another model".into());
+        }
+        let (cached, bytes) = self.prefix_match_media(&hint.tokens, &hint.media);
+        let startup_s = self
+            .startup_costs
+            .get(&Self::startup_key(
+                hint.image_work,
+                hint.tokens.len(),
+                cached > 0,
+            ))
+            .map(|e| e.upper())
+            .unwrap_or(0.01 + hint.image_work as f64 * 0.001);
         Ok(scheduler::Waiting {
             age_s: 0.,
-            remaining_s: self.prefill_costs.remaining(cached, input.len()),
+            remaining_s: self.prefill_costs.remaining(cached, hint.tokens.len()),
             restore_s: self.prefill_costs.restore_cost(bytes),
-            remaining_tokens: input.len().saturating_sub(cached),
+            startup_s,
+            remaining_tokens: hint.tokens.len().saturating_sub(cached),
         })
+    }
+    pub(crate) fn share_prefill_checkpoint(
+        &self,
+        req: &mut RequestState,
+        hint: &scheduler::RequestHint,
+    ) -> Result<bool> {
+        if req.owner != self.owner_id
+            || hint.owner != self.owner_id
+            || !req.prefilling
+            || self.prefix_cache.budget == 0
+        {
+            return Ok(false);
+        }
+        let common = req
+            .input
+            .iter()
+            .zip(&hint.tokens)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let common = req.media.common_tokens(&hint.media, common);
+        if common < 32 {
+            return Ok(false);
+        }
+        let bytes: usize = self.prefix_ranges(common)?.values().map(|r| r.bytes).sum();
+        if bytes > self.prefix_cache.budget
+            || self
+                .prefill_costs
+                .score(common, hint.tokens.len(), bytes)
+                .is_none()
+        {
+            return Ok(false);
+        }
+        if common == req.input.len() || req.checkpoints.contains(&common) {
+            return Ok(true);
+        }
+        if common <= req.offset {
+            return Ok(false);
+        }
+        if self.admit_prefix_checkpoint(common, req.input.len(), req.offset, &req.checkpoints)? {
+            req.checkpoints.insert(common);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    pub(crate) fn decode_admission_allowed(
+        &self,
+        active: &[&RequestState],
+        prompt_tokens: usize,
+        options: &scheduler::Options,
+    ) -> bool {
+        if active.len() < 2 || active.iter().any(|r| r.prefilling) {
+            return true;
+        }
+        let context: usize = active.iter().map(|r| r.history.len()).sum();
+        let key = (
+            active.len() + 1,
+            active.len() + 1,
+            (context + prompt_tokens).next_power_of_two(),
+            0,
+        );
+        let Some(next) = self.iteration_costs.get(&key).filter(|e| e.samples >= 4) else {
+            return true;
+        };
+        if next.upper() * 1000. > options.target_tpot_ms {
+            return false;
+        }
+        let previous = (active.len(), active.len(), context.next_power_of_two(), 0);
+        self.iteration_costs
+            .get(&previous)
+            .filter(|e| e.samples >= 4)
+            .is_none_or(|old| {
+                (active.len() + 1) as f64 / next.mean >= active.len() as f64 / old.mean * 0.99
+            })
     }
     pub(crate) fn can_admit_request(
         &mut self,
@@ -297,8 +425,10 @@ impl ModelRuntime {
             let since = self.idle_admission_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= std::time::Duration::from_secs(2) {
                 return Err(format!(
-                    "Request context/output budget exceeds available GPU memory (free {} MiB, required {} MiB: state {}, KV {}, future {}, workspace {})",
+                    "Request context/output budget exceeds available inference memory (free {} MiB, CUDA free {}, host budget {}, required {} MiB: state {}, KV {}, future {}, workspace {})",
                     self.admission_free_bytes()? >> 20,
+                    self.execution.free_bytes()? >> 20,
+                    scheduler::usable_host_bytes()? >> 20,
                     needed >> 20,
                     fixed >> 20,
                     kv >> 20,
@@ -368,6 +498,12 @@ impl ModelRuntime {
         let started = Instant::now();
 
         let context = self.validate_generation(&input)?;
+        let image_work: usize = input
+            .images
+            .iter()
+            .map(|image| image.grid_height * image.grid_width)
+            .sum();
+        let prompt_len = input.input_tokens.len();
         let limits = self.request_limits(&input)?;
         let slot = self.execution.lease_sequence(&limits)?;
         let result = (|| {
@@ -446,10 +582,27 @@ impl ModelRuntime {
                 mtp: Default::default(),
                 generated: 0,
                 served: 0,
+                last_output: Instant::now(),
+                last_prefill: Instant::now(),
+                credit_s: 0.,
+                speculation_costs: Default::default(),
                 mtp_blocked: false,
                 decoder: Default::default(),
             })
         })();
+        if let Ok(req) = &result {
+            self.startup_costs
+                .entry(Self::startup_key(
+                    image_work,
+                    prompt_len,
+                    req.prefix.statistics.cached_tokens > 0,
+                ))
+                .or_default()
+                .observe(
+                    (started.elapsed().as_secs_f64() - req.prefix.statistics.restore_s)
+                        .max(0.000001),
+                );
+        }
         if result.is_err() {
             self.reserved_requests.remove(&slot);
             self.execution
@@ -579,7 +732,8 @@ impl ModelRuntime {
     ) -> Result<(usize, Vec<u32>)> {
         let remaining = Self::prefill_boundary(req) - req.offset;
         let maximum = budget_ms.map_or(remaining, |ms| {
-            self.prefill_costs.bounded_chunk(remaining, ms)
+            self.prefill_costs
+                .bounded_chunk_at(remaining, req.offset, ms)
         });
         let plan = self
             .manifest
@@ -622,7 +776,7 @@ impl ModelRuntime {
         }
         let tokens = self.after_prefill(req, chunk)?;
         let seconds = at.elapsed().as_secs_f64();
-        self.prefill_costs.observe(chunk, seconds);
+        self.prefill_costs.observe_at(chunk, req.offset, seconds);
         self.scheduler_statistics.prefill_tokens += chunk;
         *self
             .scheduler_statistics
@@ -643,13 +797,14 @@ impl ModelRuntime {
         let rows = selected.iter().map(|(_, n)| n).sum::<usize>();
         let context = selected
             .iter()
-            .map(|(i, _)| requests[*i].history.len())
-            .max()
+            .map(|(i, n)| requests[*i].history.len().saturating_mul(*n))
+            .sum::<usize>()
+            .checked_next_power_of_two()
             .unwrap_or(1);
         (
-            selected.len().next_power_of_two(),
-            rows.next_power_of_two(),
-            context.next_power_of_two(),
+            selected.len(),
+            rows,
+            context,
             selected
                 .iter()
                 .filter(|(i, _)| requests[*i].prefilling)
@@ -662,8 +817,8 @@ impl ModelRuntime {
         selected: &[(usize, usize)],
     ) -> f64 {
         let key = Self::iteration_key(requests, selected);
-        if let Some(&seconds) = self.iteration_costs.get(&key) {
-            return seconds;
+        if let Some(estimate) = self.iteration_costs.get(&key) {
+            return estimate.upper();
         }
         let kv: usize = selected
             .iter()
@@ -756,18 +911,34 @@ impl ModelRuntime {
             }
         }
         self.scheduler_statistics.prefill_completion_s += completion_at.elapsed().as_secs_f64();
+        let has_decoders = requests
+            .iter()
+            .enumerate()
+            .any(|(i, r)| !r.prefilling && !r.is_finished() && !initialized.contains(&i));
+        if !has_decoders {
+            self.unmerged_prefill_s = 0.;
+        }
         match self.select_work(requests, options, &initialized)? {
-            Work::Speculative(i) => {
+            Work::Speculative(i, rows) => {
+                self.unmerged_prefill_s = 0.;
                 let began = Instant::now();
                 let result = self.with_request(requests[i], |model, req| {
-                    model.speculative_request_step(req, options.max_batch_tokens)
+                    model.speculative_request_step(req, rows)
                 });
                 let tokens = match result {
                     Ok(tokens) => tokens,
                     Err(_) if requests[i].failure().is_some() => vec![],
                     Err(error) => return Err(error),
                 };
-                let per_token = began.elapsed().as_secs_f64() / tokens.len().max(1) as f64;
+                let seconds = began.elapsed().as_secs_f64();
+                let per_token = seconds / tokens.len().max(1) as f64;
+                let cost = requests[i].speculation_costs.entry(rows).or_default();
+                cost.0.observe(seconds);
+                cost.1 = if cost.0.samples == 1 {
+                    tokens.len() as f64
+                } else {
+                    cost.1 * 0.8 + tokens.len() as f64 * 0.2
+                };
                 self.mtp_seconds_per_token = self.mtp_seconds_per_token * 0.8 + per_token * 0.2;
                 self.scheduler_statistics.speculative_iterations += 1;
                 self.scheduler_statistics.decode_tokens += tokens.len();
@@ -783,12 +954,35 @@ impl ModelRuntime {
                     model.advance_prefill(req, budget_ms)
                 })?;
                 requests[i].served = self.scheduler_statistics.iterations;
+                requests[i].credit_s -= at.elapsed().as_secs_f64();
+                if has_decoders {
+                    self.unmerged_prefill_s += at.elapsed().as_secs_f64();
+                }
+                requests[i].last_prefill = Instant::now();
                 if !tokens.is_empty() {
                     output.push(StepOutput { request: i, tokens });
                 }
             }
-            Work::Batch(selected) => self.execute_selected(requests, &selected, &mut output)?,
+            Work::Batch(selected) => {
+                if selected.iter().any(|&(i, _)| !requests[i].prefilling) {
+                    self.unmerged_prefill_s = 0.;
+                }
+                self.execute_selected(requests, &selected, &mut output)?;
+            }
             Work::Idle => {}
+        }
+        for step in &output {
+            if !step.tokens.is_empty() {
+                let req = &mut requests[step.request];
+                if req.generated > step.tokens.len() {
+                    let gap = req.last_output.elapsed().as_secs_f64();
+                    self.scheduler_statistics.max_decode_gap_s =
+                        self.scheduler_statistics.max_decode_gap_s.max(gap);
+                    self.scheduler_statistics.decode_budget_overruns +=
+                        usize::from(gap * 1000. > options.target_tpot_ms);
+                }
+                req.last_output = Instant::now();
+            }
         }
         self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
         Ok(output)
@@ -805,7 +999,24 @@ impl ModelRuntime {
             .filter(|(_, r)| r.prefilling)
             .map(|(i, _)| i)
             .collect();
-        prefills.sort_unstable_by_key(|&i| (requests[i].served, requests[i].slot));
+        let mut credits: Vec<_> = prefills.iter().map(|&i| requests[i].credit_s).collect();
+        scheduler::replenish(&mut credits, options.prefill_budget_ms / 1000.);
+        for (&i, credit) in prefills.iter().zip(credits) {
+            requests[i].credit_s = credit;
+        }
+        prefills.sort_unstable_by(|&a, &b| {
+            let urgent = |i: usize| requests[i].last_prefill.elapsed().as_secs_f64() >= 30.;
+            let score = |i: usize| {
+                self.prefill_costs
+                    .remaining(requests[i].offset, requests[i].input.len())
+                    / (1. + requests[i].last_prefill.elapsed().as_secs_f64() / 2.)
+            };
+            urgent(b)
+                .cmp(&urgent(a))
+                .then_with(|| (requests[b].credit_s > 0.).cmp(&(requests[a].credit_s > 0.)))
+                .then_with(|| score(a).total_cmp(&score(b)))
+                .then_with(|| requests[a].slot.cmp(&requests[b].slot))
+        });
         let prefill = prefills.first().copied();
         let mut decode: Vec<_> = requests
             .iter()
@@ -825,7 +1036,60 @@ impl ModelRuntime {
         if prefer_mtp {
             let i = decode[self.scheduler_cursor % decode.len()];
             self.scheduler_cursor = self.scheduler_cursor.wrapping_add(1);
-            return Ok(Work::Speculative(i));
+            let req = &requests[i];
+            let spec = self.manifest.mtp.as_ref().unwrap();
+            let plans: Vec<_> = spec
+                .verification_plans
+                .iter()
+                .map(|p| p.tokens)
+                .filter(|&n| {
+                    n <= options.max_batch_tokens
+                        && n <= spec.default_verification_tokens
+                        && n <= req.limit - req.generated
+                })
+                .collect();
+            let slack = decode
+                .iter()
+                .filter(|&&j| j != i)
+                .filter_map(|&j| requests[j].decode_slack_s(options.target_tpot_ms))
+                .fold(f64::INFINITY, f64::min);
+            let candidate = plans
+                .iter()
+                .copied()
+                .filter(|n| {
+                    req.speculation_costs
+                        .get(n)
+                        .map_or(self.mtp_seconds_per_token * *n as f64, |(time, _)| {
+                            time.upper()
+                        })
+                        <= slack
+                })
+                .min_by(|a, b| {
+                    let score = |n: &usize| {
+                        req.speculation_costs
+                            .get(n)
+                            .map(|(time, tokens)| time.mean / tokens.max(1.))
+                    };
+                    match (score(a), score(b)) {
+                        (None, None) => b.cmp(a),
+                        (None, Some(_)) => std::cmp::Ordering::Less,
+                        (Some(_), None) => std::cmp::Ordering::Greater,
+                        (Some(a), Some(b)) => a.total_cmp(&b),
+                    }
+                });
+            if let Some(rows) = candidate {
+                let worthwhile = req
+                    .speculation_costs
+                    .get(&rows)
+                    .is_none_or(|(time, tokens)| {
+                        time.samples < 2
+                            || time.mean / tokens.max(1.)
+                                < self.predict_iteration(requests, &target) / decode.len() as f64
+                    });
+                if worthwhile {
+                    return Ok(Work::Speculative(i, rows));
+                }
+            }
         }
         let mut cap = options
             .max_batch_tokens
@@ -866,32 +1130,60 @@ impl ModelRuntime {
             let rotate = self.scheduler_cursor % decode.len();
             decode.rotate_left(rotate);
         }
-        // Packages without joint mixed profiles run a bounded real prompt
-        // chunk between decode iterations; cold-only prompts keep large tiles.
+        let decode_s = self.predict_iteration(requests, &target);
+        let slack_s = decode
+            .iter()
+            .filter_map(|&i| requests[i].decode_slack_s(options.target_tpot_ms))
+            .fold(f64::INFINITY, f64::min);
+        let window_s = scheduler::prefill_window(slack_s, decode_s, options.prefill_budget_ms);
+        // Unmerged prompt kernels spend a separate weight pass. Account across
+        // iterations instead of resetting the prefill allowance on every call.
+        // Permit one bounded block after a decode; further prompt work must
+        // fit within the decoder's predicted step time. Joint kernels already
+        // advance both classes together.
+        let window_s = if mixed || self.unmerged_prefill_s == 0. {
+            window_s
+        } else {
+            window_s.min((decode_s - self.unmerged_prefill_s).max(0.))
+        };
+        let progress_due = prefill.is_some_and(|i| {
+            requests[i].last_prefill.elapsed().as_secs_f64()
+                >= (options.target_tpot_ms / 1000. * 4.).max(2.)
+        });
+        let permit_prefill = prefill
+            .is_some_and(|i| self.prefill_costs.chunk_upper(1, requests[i].offset + 1) <= window_s)
+            || progress_due;
         if let Some(i) = prefill
             && !mixed
-            && self.scheduler_statistics.iterations.is_multiple_of(2)
+            && permit_prefill
         {
-            return Ok(Work::Prefill(i, Some(options.prefill_budget_ms)));
+            if progress_due && window_s <= 0. {
+                self.scheduler_statistics.prefill_progress_overrides += 1;
+            }
+            return Ok(Work::Prefill(i, Some((window_s * 1000.).max(1.))));
         }
-        // Even a one-row configuration must advance waiting prompt work.
-        let reserve = usize::from(
-            prefill.is_some()
-                && mixed
-                && (cap > 1 || self.scheduler_statistics.iterations.is_multiple_of(2)),
-        );
+        if prefill.is_some() && !permit_prefill {
+            self.scheduler_statistics.deadline_decode_iterations += 1;
+        }
+        let reserve = usize::from(prefill.is_some() && mixed && permit_prefill && progress_due);
         decode.truncate(cap - reserve);
         self.scheduler_cursor = self.scheduler_cursor.wrapping_add(decode.len());
         let mut selected: Vec<_> = decode.iter().map(|&i| (i, 1)).collect();
         self.pack_prefill(
             requests,
-            if mixed { &prefills } else { &[] },
+            if mixed && permit_prefill {
+                &prefills
+            } else {
+                &[]
+            },
             &mut selected,
             cap,
             if joint_prefill {
                 f64::INFINITY
             } else {
-                options.prefill_budget_ms
+                // A mixed iteration already contains the reserved decoder
+                // step. Compare its full cost with the full time window.
+                ((decode_s + window_s) * 1000.).max(1.)
             },
         )?;
         for &(i, _) in &selected {
@@ -914,6 +1206,9 @@ impl ModelRuntime {
         output: &mut Vec<StepOutput>,
     ) -> Result<()> {
         if selected.len() == 1 && selected[0].1 == 1 {
+            let at = Instant::now();
+            let key = Self::iteration_key(requests, selected);
+            let capture_before = self.execution.batch_statistics.get().sequence_capture_s;
             let i = selected[0].0;
             let tokens = self.with_request(requests[i], |model, req| {
                 if req.prefilling {
@@ -958,6 +1253,12 @@ impl ModelRuntime {
                 .batch_histogram
                 .entry(1)
                 .or_default() += 1;
+            let capture_s =
+                self.execution.batch_statistics.get().sequence_capture_s - capture_before;
+            self.iteration_costs
+                .entry(key)
+                .or_default()
+                .observe((at.elapsed().as_secs_f64() - capture_s).max(0.000001));
             return Ok(());
         }
         #[cfg(test)]
@@ -979,17 +1280,18 @@ impl ModelRuntime {
         profile::mark("plan");
         self.scheduler_statistics.batch_plan_s += plan_at.elapsed().as_secs_f64();
         let key = Self::iteration_key(requests, selected);
-        let compute_at = Instant::now();
-        self.execution
-            .execute_batch(graph_key, &plan, decode_only)?;
+        let capture_before = self.execution.batch_statistics.get().capture_s;
+        self.execution.execute_batch(
+            graph_key,
+            &plan,
+            decode_only,
+            selected
+                .iter()
+                .all(|&(i, _)| requests[i].limit - requests[i].generated >= 2),
+        )?;
         #[cfg(test)]
         profile::mark("execute");
         let commit_at = Instant::now();
-        let seconds = compute_at.elapsed().as_secs_f64();
-        self.iteration_costs
-            .entry(key)
-            .and_modify(|old| *old = *old * 0.8 + seconds * 0.2)
-            .or_insert(seconds);
         *self
             .scheduler_statistics
             .batch_histogram
@@ -1009,6 +1311,17 @@ impl ModelRuntime {
         }
         self.commit_batch(requests, selected, output)?;
         self.scheduler_statistics.batch_commit_s += commit_at.elapsed().as_secs_f64();
+        let seconds = inputs_at.elapsed().as_secs_f64();
+        let capture_s = self.execution.batch_statistics.get().capture_s - capture_before;
+        self.iteration_costs
+            .entry(key)
+            .or_default()
+            .observe((seconds - capture_s).max(0.000001));
+        let rows: usize = selected.iter().map(|(_, n)| n).sum();
+        for &(i, chunk) in selected {
+            requests[i].credit_s -= seconds * chunk as f64 / rows as f64;
+            requests[i].last_prefill = Instant::now();
+        }
         #[cfg(test)]
         profile::mark("commit");
         Ok(())

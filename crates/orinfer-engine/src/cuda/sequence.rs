@@ -891,11 +891,30 @@ impl Executor {
         key: Vec<(usize, usize)>,
         operations: &[Invocation],
         decode: bool,
+        allow_capture: bool,
     ) -> Result<()> {
         let dynamic = operations.iter().any(|op| op.launch.is_some());
-        let graph_enabled = (self.cuda_graph == crate::execution::CudaGraphMode::Full
+        let configured = (self.cuda_graph == crate::execution::CudaGraphMode::Full
             || (decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly))
             && operations.len() <= BATCH_GRAPH_NODES;
+        // A one-off membership executes directly. Capture only after a repeat,
+        // and only when the remaining output budget can amortize the capture.
+        // Existing graphs remain reusable even on the final token.
+        let graph_enabled = configured
+            && (self.batch_graphs.borrow().contains_key(&key) || {
+                let mut trials = self.batch_graph_trials.borrow_mut();
+                if trials.len() >= 32 && !trials.contains_key(&key) {
+                    trials.clear();
+                }
+                let count = trials.entry(key.clone()).or_default();
+                *count += 1;
+                allow_capture && *count >= 2
+            });
+        if configured && !graph_enabled {
+            let mut statistics = self.batch_statistics.get();
+            statistics.graph_capture_deferrals += 1;
+            self.batch_statistics.set(statistics);
+        }
         if graph_enabled {
             let tick = self.batch_graph_clock.get().wrapping_add(1);
             self.batch_graph_clock.set(tick);

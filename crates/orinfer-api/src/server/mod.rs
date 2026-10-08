@@ -109,6 +109,11 @@ impl Settings {
                     settings.scheduler.max_batch_tokens =
                         pair[1].parse().map_err(|_| "Invalid batch token limit")?
                 }
+                "--target-tpot-ms" => {
+                    settings.scheduler.target_tpot_ms = pair[1]
+                        .parse()
+                        .map_err(|_| "Invalid decode latency target")?;
+                }
                 "--prefill-budget-ms" => {
                     settings.scheduler.prefill_budget_ms =
                         pair[1].parse().map_err(|_| "Invalid prefill time budget")?
@@ -228,6 +233,8 @@ mod settings_tests {
             "64".into(),
             "--prefill-budget-ms".into(),
             "150".into(),
+            "--target-tpot-ms".into(),
+            "350".into(),
             "--memory-reserve-mib".into(),
             "2048".into(),
         ])
@@ -235,12 +242,15 @@ mod settings_tests {
         assert_eq!(settings.scheduler.max_active, 8);
         assert_eq!(settings.scheduler.max_batch_tokens, 64);
         assert_eq!(settings.scheduler.prefill_budget_ms, 150.);
+        assert_eq!(settings.scheduler.target_tpot_ms, 350.);
         assert_eq!(settings.scheduler.memory_reserve_bytes, 2 << 30);
         for (name, value) in [
             ("--max-active-requests", "0"),
             ("--max-active-requests", "129"),
             ("--max-batch-tokens", "0"),
             ("--prefill-budget-ms", "NaN"),
+            ("--target-tpot-ms", "NaN"),
+            ("--target-tpot-ms", "0"),
             ("--prefill-budget-ms", "-1"),
         ] {
             assert!(Settings::parse(&[directory.clone(), name.into(), value.into()]).is_err());
@@ -291,6 +301,7 @@ struct Job {
     id: String,
     created: u64,
     queued: Instant,
+    hint: Option<orinfer_engine::scheduler::RequestHint>,
 }
 enum ModelEvent {
     Chunk(Value),
@@ -680,6 +691,7 @@ async fn completions(
         id: format!("chatcmpl-{created}-{}-{serial}", std::process::id()),
         created,
         queued: Instant::now(),
+        hint: None,
     };
     if let Err(e) = state.jobs.try_send(job) {
         return match e {

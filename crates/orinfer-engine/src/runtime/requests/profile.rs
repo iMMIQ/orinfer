@@ -159,6 +159,7 @@ fn capture_prefill_ffn_inputs() {
                         views: BTreeMap::new(),
                     }],
                     false,
+                    false,
                 )
                 .unwrap();
         }
@@ -261,6 +262,7 @@ fn capture_prefill_attention_inputs() {
                     launch: None,
                     views: BTreeMap::new(),
                 }],
+                false,
                 false,
             )
             .unwrap();
@@ -402,7 +404,7 @@ fn capture_decode_projections() {
                     }
                     model.execution.execute_batch(vec![], &[Invocation {
                         operation: operation.clone(), sequence: None, launch: None, views: BTreeMap::new(),
-                    }], false)?;
+                    }], false, false)?;
                 }
                 model.execution.sync()?;
                 samples += 1;

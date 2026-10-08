@@ -58,3 +58,5 @@ ORINFER_BATCH_FIXTURE=/absolute/path/to/flash-fixture.json \
 ```
 
 该检查关闭 prefix cache，对照同权重、相同冷 prefill 和 teacher-forced 历史的单序列执行，验证 batch 迁移的算术与隔离；不替代原始 BF16/FP8 量化质量验收。性能与缓存命中的功能验收另用真实 Chat/SSE 的 `concurrency.py`、`acceptance.py` 测量。
+
+固定到达时间的混合请求验收使用 `python -m tools.bench.scheduling --requests TRACE.json --output RESULT.json`。输入为 `{"requests":[{"id":"short-1","at_s":0.1,"request":{"model":"MODEL_ID","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}}]}`，最多 128 条；同一时刻可提交多条请求。到达时间不依赖前一请求是否完成，报告客户端到达误差、TTFT、整请求耗时和最大流式 chunk 间隔的 P50/P95/P99，以及失败数、有效输出吞吐、成功请求的 prefix 请求/token 命中率和调度统计。chunk 间隔不能当成 token ITL。比较调度版本时使用相同 trace、模型包、缓存/MTP/Graph 配置，分别测试冷缓存与预热后的缓存。

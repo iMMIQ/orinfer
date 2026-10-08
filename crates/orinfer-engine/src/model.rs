@@ -189,6 +189,38 @@ impl Model {
     ) -> Result<crate::scheduler::Waiting> {
         self.0.waiting_cost(input, images)
     }
+    pub fn request_hint(
+        &self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+    ) -> Result<crate::scheduler::RequestHint> {
+        self.0.request_hint(input, images)
+    }
+    pub fn estimated_hint_cost(
+        &self,
+        hint: &crate::scheduler::RequestHint,
+    ) -> Result<crate::scheduler::Waiting> {
+        self.0.hint_cost(hint)
+    }
+    pub fn share_prefill_checkpoint(
+        &self,
+        request: &mut RequestState,
+        hint: &crate::scheduler::RequestHint,
+    ) -> Result<bool> {
+        self.0.share_prefill_checkpoint(request, hint)
+    }
+    pub fn prefix_cache_enabled(&self) -> bool {
+        self.0.prefix_cache_limit > 0
+    }
+    pub fn decode_admission_allowed(
+        &self,
+        active: &[&RequestState],
+        prompt_tokens: usize,
+        options: &crate::scheduler::Options,
+    ) -> bool {
+        self.0
+            .decode_admission_allowed(active, prompt_tokens, options)
+    }
     pub fn can_admit(
         &mut self,
         input: &GenerationInput,

@@ -120,7 +120,7 @@ pi --provider orinfer --model qwen-flash-next --thinking low
 
 prefill 尾部即使复用 decode 计划，在 `decode_only` 模式下也不使用 Graph。地址及 workspace 变化会使相关 Graph 失效或重新捕获。
 
-Graph 在程序首次执行时按需捕获，加载时不预先捕获未使用的程序。batch Graph 缓存常见的 2 的幂次批次，同时限制条数和总操作节点数；过渡批次及超出节点预算的计划直接提交；内存准入紧张时先淘汰空闲 Graph，再回收空闲请求状态。首次执行的捕获耗时计入请求预热。
+单请求 Graph 在程序首次执行时按需捕获，加载时不预先捕获未使用的程序。batch Graph 在成员组合重复出现后捕获，缓存常见的 2 的幂次批次，同时限制条数和总操作节点数；过渡批次及超出节点预算的计划直接提交；内存准入紧张时先淘汰空闲 Graph，再回收空闲请求状态。首次执行的捕获耗时计入请求预热。
 
 短请求结束后，每个 KV 缓冲区最多保留一个 CUDA 分配粒度的页，清零后供同一槽位复用；较大映射释放，内存紧张时空闲页也释放。准入只计入需要新增的 KV 页，空闲槽位的页不会抵扣其他活跃请求的未来预算。
 
@@ -154,13 +154,17 @@ KV 区间不可变并按引用共享，持续状态单独保存；恢复仍执�
 
 单请求冷 prefill 使用大块计划；兼容的多个短请求可联合执行。与 decode 混合时，按预测耗时选择小块 prefill。常见 batch 可使用固定形状 kernel，其余 2–128 行可由支持动态行数的 AOT 包执行，线上不编译。请求按迭代加入和结束；不为凑 batch 额外等待。
 
-Flash Next 的 batch 包共享投影、MoE 路由、专家和输出头计算，GDN、卷积、PLE、QSA/KV/index/pending 与 MTP 状态按请求隔离。提供 2/4/8/16/32/64/128 专用档；附加动态回退包后，其他数量复用邻近容量的 AOT 算子，按真实行数执行。未附加动态回退的包仍补零到下一档。冷 prefill 保留单请求大块路径；有 decoder 等待时，按 `--prefill-budget-ms` 和完整分块实测耗时选择真实小块，与 decode 交替推进。该包不合并不同请求的 prompt chunk。预算是预测软目标，冷启动、长上下文和 checkpoint 可能超出；至少推进一个 token 以避免饥饿。预算控制文本主干分块，视觉编码器仍独立执行。调度统计提供 `prefill_chunk_histogram`、`bounded_prefill_iterations` 和 `max_bounded_prefill_s`；`batch_execution` 中的 `dynamic_graph_captures`、`dynamic_direct_iterations` 与 `graph_hits` 可用于核对动态回退和重放。构建入口见[Flash 模型工具](../tools/model/flash_next/README.md)。
+Flash Next 的 batch 包共享投影、MoE 路由、专家和输出头计算，GDN、卷积、PLE、QSA/KV/index/pending 与 MTP 状态按请求隔离。提供 2/4/8/16/32/64/128 专用档；附加动态回退包后，其他数量复用邻近容量的 AOT 算子，按真实行数执行。未附加动态回退的包仍补零到下一档。冷 prefill 保留单请求大块路径；有 decoder 等待时，根据 `--target-tpot-ms` 的剩余时间，预留下一轮 decode 的预计耗时，再在 `--prefill-budget-ms` 上限内选择真实 prefill 小块。该包不合并不同请求的 prompt chunk；两轮 decode 之间的独立 prefill 耗时跨迭代累计；每次 decode 后允许一个受预算限制的块，额外 prefill 还受预计 decode 耗时约束。预算是预测软目标，冷启动、长上下文和 checkpoint 可能超出；预算不足时允许最小有效块（最多 16 tokens），避免退化为反复读取权重的逐 token prefill，尾部仍按真实长度执行。预算控制文本主干分块，视觉编码器仍独立执行。调度统计提供 `prefill_chunk_histogram`、`bounded_prefill_iterations` 和 `max_bounded_prefill_s`；`batch_execution` 中的 `dynamic_graph_captures`、`dynamic_direct_iterations` 与 `graph_hits` 可用于核对动态回退和重放。构建入口见[Flash 模型工具](../tools/model/flash_next/README.md)。
 
 包含私有地址表的 Flash 包在每层用一套 GDN/QSA kernel 并行处理全部请求，包含临时缓冲区的隔离和批量卷积历史提交。请求地址在 Graph 重放前更新，补零行的地址为空；单请求仍走 M1 程序。
 
 请求的 KV 和 MTP hidden ring 按总 token 预算分配，长请求仍可使用完整容量。槽位复用时收缩过大的私有分配；显存准入受阻时保留一个空闲槽位并回收其余空闲槽位的普通缓冲区，下次准入前重新分配。实际活跃数取决于请求预算和可用显存，超过准入容量的请求排队。
 
-默认最多 32 个活跃请求、128 个待处理请求，队列满时返回 429。活跃数还受每请求上下文/输出预算、workspace 和可用内存约束。准入检查 CUDA 可用内存和 Linux `MemAvailable`，保留系统余量；不足时先收缩 prefix cache，再排队。冷请求可能延后准入以减少现有 decoder 的停顿，缓存命中请求仍可准入；统计见 `/health`。
+默认最多 32 个活跃请求、128 个待处理请求，队列满时返回 429。活跃数还受每请求上下文/输出预算、workspace 和可用内存约束。准入检查 CUDA 可用内存和 Linux `MemAvailable`，保留系统余量；不足时先收缩 prefix cache，再排队。等待队列按初始化、图片编码、有效缓存恢复和剩余 prefill 成本排序，等待时间平滑提升优先级，30 秒后优先处理最老请求。图片身份在队列描述中只计算一次，缓存匹配随 checkpoint 更新。大于每轮 token 预算的冷 prefill 通常最多提前准入两个，短请求可成批准入；可有效复用的共同 prefix 由一个请求先计算，其余暂留 CPU 队列。等待 30 秒仍因内存不足无法准入的请求会阻止新增工作，直到已有请求结束、腾出空间；取消或超时会解除此保护。统计见 `/health`。
+
+prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少而获得更多服务。有 decoder 时根据距上次提交 token 的时间决定下一轮工作；至少定期推进一个 prefill token，目标不可满足时计入 `prefill_progress_overrides`。`--target-tpot-ms` 是软目标，不限制客户端输出预算，不保证视觉编码、缓存保存或冷启动期间的最大流式间隔。`max_decode_gap_s` 和 `decode_budget_overruns` 记录引擎提交 token 的间隔，HTTP chunk 间隔需另行测量。
+
+实际活跃数还结合已测量的相邻 batch 耗时与吞吐决定，未知档位允许探索。Graph 首次遇到新 batch 成员组合时直接执行，重复出现且仍有足够输出预算时再捕获；已有图可用于最后几步。MTP 在算子包和 CLI 草稿上限内比较真实轮次耗时与有效提交量，选择验证长度；这是请求级在线探索，不能保证短请求已经完成调优。
 
 模型包决定实际上下文容量，上限可配置为 262144 tokens。长提示分块计算，首次 dense attention 的复杂度不变。INT8 group-64 KV 包含 FP16 scale，CUDA VMM 按已执行位置映射物理页，同时保持 Graph 地址稳定；prefill 的单层 FP16 临时 KV workspace 可共享并按需增长。持续 GDN 状态保持 FP32。上下文扩展、KV 优化和验证见[模型构建](../tools/model/README.md)。
 
@@ -172,7 +176,8 @@ Flash Next 的 batch 包共享投影、MoE 路由、专家和输出头计算，G
 | `--prefix-cache-mib` | `12288` | GPU 缓存字节预算，0 关闭 |
 | `--max-active-requests` | `32` | 活跃请求上限，1–128 |
 | `--max-batch-tokens` | `128` | 每轮 target 计算 token 预算，1–128 |
-| `--prefill-budget-ms` | `200` | 混合块的预测耗时目标，非严格延迟上限 |
+| `--prefill-budget-ms` | `200` | 混合块的预测耗时上限，非严格延迟上限 |
+| `--target-tpot-ms` | `400` | 引擎提交 token 的软间隔目标 |
 | `--memory-reserve-mib` | `1024` | 系统余量以外的准入保留内存 |
 | `--preprocess-workers` | `2` | 同时执行图片/模板/tokenizer CPU 任务数 |
 | `--preprocess-memory-mib` | `2048` | 预处理和排队图片张量预算 |

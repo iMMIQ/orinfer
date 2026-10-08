@@ -25,6 +25,9 @@ pub(super) struct AdmissionStatistics {
     max_round_s: f64,
     histogram: std::collections::BTreeMap<usize, usize>,
     cold_deferrals: usize,
+    prefix_waits: usize,
+    memory_drain_rounds: usize,
+    deadline_yields: usize,
 }
 
 type Decoder<'a> = tokenizers::tokenizer::DecodeStream<
@@ -392,7 +395,7 @@ pub(super) fn worker(
     let mut waiting: Vec<Job> = vec![];
     let mut active: Vec<Active<'_>> = vec![];
     let mut completed: Vec<Mailbox> = vec![];
-    let mut admission_costs = scheduler::AdmissionCosts::default();
+    let mut memory_guard: Option<String> = None;
     loop {
         if shutdown.load(Ordering::Relaxed) || !lifecycle.is_ready() {
             break;
@@ -431,26 +434,47 @@ pub(super) fn worker(
         }
         let admission = Instant::now();
         let has_decoders = active.iter().any(|a| !a.request.is_prefilling());
-        let has_prefills = active.iter().any(|a| a.request.is_prefilling());
-        let decoder_count = active.iter().filter(|a| !a.request.is_prefilling()).count();
-        let remaining_decode_tokens: usize = active
-            .iter()
-            .filter(|a| !a.request.is_prefilling())
-            .map(|a| a.mailbox.job.prepared.max_tokens.saturating_sub(a.count))
-            .sum();
+        if memory_guard
+            .as_ref()
+            .is_some_and(|id| !waiting.iter().any(|job| &job.id == id))
+        {
+            memory_guard = None;
+        }
+        let mut prefix_waits = 0;
+        let mut deadline_yields = 0;
         let mut admitted_count = 0;
         let mut cached_count = 0;
         let mut cold_deferrals = 0;
         while lifecycle.is_ready() && active.len() < options.max_active && !waiting.is_empty() {
-            let costs: Vec<_> = waiting
+            let slack = active
                 .iter()
+                .filter_map(|a| a.request.decode_slack_s(options.target_tpot_ms))
+                .fold(f64::INFINITY, f64::min);
+            if has_decoders
+                && (slack <= 0.
+                    || admission.elapsed().as_secs_f64()
+                        >= (options.target_tpot_ms / 1000. * 0.25).min(0.1))
+            {
+                deadline_yields += 1;
+                break;
+            }
+            let costs: Vec<_> = waiting
+                .iter_mut()
                 .map(|job| {
-                    let mut cost = model
-                        .estimated_request_cost(&job.prepared.input, &job.prepared.images)
+                    if job.hint.is_none() {
+                        job.hint = model
+                            .request_hint(&job.prepared.input, &job.prepared.images)
+                            .ok();
+                    }
+                    let mut cost = job
+                        .hint
+                        .as_ref()
+                        .and_then(|hint| model.estimated_hint_cost(hint).ok())
                         .unwrap_or(scheduler::Waiting {
                             age_s: 0.,
                             remaining_s: f64::MAX,
                             restore_s: 0.,
+                            startup_s: 0.,
                             remaining_tokens: 0,
                         });
                     cost.age_s = job.queued.elapsed().as_secs_f64();
@@ -459,21 +483,63 @@ pub(super) fn worker(
                 .collect();
             let mut admitted = false;
             let mut cached_text = false;
-            let mut untried: Vec<_> = (0..waiting.len()).collect();
+            let mut untried: Vec<_> = (0..waiting.len())
+                .filter(|&i| memory_guard.as_ref().is_none_or(|id| id == &waiting[i].id))
+                .collect();
             while !untried.is_empty() {
                 let relative = scheduler::select_waiting(
                     &untried.iter().map(|&i| costs[i]).collect::<Vec<_>>(),
                 )
                 .expect("nonempty candidates");
                 let i = untried.remove(relative);
-                if admission_costs.defer_cold(
-                    costs[i],
-                    decoder_count,
-                    remaining_decode_tokens,
-                    has_prefills,
-                ) {
-                    cold_deferrals += 1;
-                    continue;
+                if costs[i].age_s < 30. && costs[i].remaining_tokens > 0 {
+                    // Large cold prompts need bounded residency. Small prompts
+                    // must still form a cohort to amortize a model weight pass.
+                    if costs[i].remaining_tokens > options.max_batch_tokens
+                        && active
+                            .iter()
+                            .filter(|a| a.request.is_prefilling())
+                            .filter(|a| {
+                                a.request.remaining_prefill_tokens() > options.max_batch_tokens
+                            })
+                            .count()
+                            >= 2
+                    {
+                        cold_deferrals += 1;
+                        continue;
+                    }
+                    if model.prefix_cache_enabled()
+                        && let Some(hint) = &waiting[i].hint
+                    {
+                        let mut shared = false;
+                        for a in &mut active {
+                            if model
+                                .share_prefill_checkpoint(&mut a.request, hint)
+                                .unwrap_or(false)
+                            {
+                                shared = true;
+                                break;
+                            }
+                        }
+                        if shared {
+                            prefix_waits += 1;
+                            continue;
+                        }
+                    }
+                }
+                if has_decoders && costs[i].age_s < 30. {
+                    if costs[i].startup_s + costs[i].restore_s > slack {
+                        deadline_yields += 1;
+                        continue;
+                    }
+                    if !model.decode_admission_allowed(
+                        &active.iter().map(|a| &a.request).collect::<Vec<_>>(),
+                        waiting[i].prepared.input.len(),
+                        &options,
+                    ) {
+                        cold_deferrals += 1;
+                        continue;
+                    }
                 }
                 let job = &waiting[i];
                 let input = GenerationInput {
@@ -486,6 +552,9 @@ pub(super) fn worker(
                 match model.can_admit(&input, &options) {
                     Ok(true) => {
                         let mut job = waiting.remove(i);
+                        if memory_guard.as_ref() == Some(&job.id) {
+                            memory_guard = None;
+                        }
                         let text_only = input.images.is_empty();
                         let prompt_tokens = input.input_tokens.len();
                         match model.start_request(input, || {
@@ -531,7 +600,12 @@ pub(super) fn worker(
                         admitted = true;
                         break;
                     }
-                    Ok(false) => {}
+                    Ok(false) => {
+                        if costs[i].age_s >= 30. {
+                            memory_guard = Some(waiting[i].id.clone());
+                            break;
+                        }
+                    }
                 }
             }
             if admitted {
@@ -570,6 +644,11 @@ pub(super) fn worker(
         {
             statistics.cold_deferrals += cold_deferrals;
         }
+        if let Ok(mut stats) = activity.admission.lock() {
+            stats.prefix_waits += prefix_waits;
+            stats.deadline_yields += deadline_yields;
+            stats.memory_drain_rounds += usize::from(memory_guard.is_some());
+        }
         activity.active.store(active.len(), Ordering::Relaxed);
         activity
             .queued
@@ -578,9 +657,6 @@ pub(super) fn worker(
             break;
         }
         if !active.is_empty() {
-            let before = model.scheduler_statistics();
-            let step_at = Instant::now();
-            let decoders = active.iter().filter(|a| !a.request.is_prefilling()).count();
             let mut requests: Vec<_> = active.iter_mut().map(|a| &mut a.request).collect();
             match model.advance_requests(&mut requests, &options) {
                 Ok(outputs) => {
@@ -599,12 +675,6 @@ pub(super) fn worker(
                 }
             }
             let after = model.scheduler_statistics();
-            admission_costs.observe(
-                decoders,
-                after.decode_tokens.saturating_sub(before.decode_tokens),
-                after.prefill_tokens.saturating_sub(before.prefill_tokens),
-                step_at.elapsed().as_secs_f64(),
-            );
             if let Ok(mut statistics) = activity.statistics.lock() {
                 *statistics = after;
             }
@@ -702,6 +772,7 @@ mod tests {
             id: "test".into(),
             created: 0,
             queued: Instant::now(),
+            hint: None,
         };
         (Mailbox::new(job), receiver)
     }
