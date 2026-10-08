@@ -89,6 +89,11 @@ pub struct ValidationReport {
     pub validation_s: f64,
 }
 
+/// Read the native execution library's own version and registered capabilities.
+pub fn inspect_execution_library(path: &Path) -> Result<orinfer_model_sdk::abi::PackageInfo> {
+    crate::model_package::inspect_library(path)
+}
+
 /// Verify all container layouts and payloads without CUDA or resident weight copies.
 pub fn validate_model(path: &Path) -> Result<ValidationReport> {
     let start = Instant::now();

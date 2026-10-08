@@ -9,7 +9,7 @@ import shutil
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-from tools.model.package import model_library, validate_plan
+from tools.model.package import execution_identity, model_library, validate_plan
 from tools.model.publication import file_hash, link_or_copy, source_path, write_json
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -51,12 +51,7 @@ def publish(directory, engine=None):
         kernels=build["kernels"],
         buffer_contracts=[{k: v for k, v in b.items() if k != "data"} for b in model["buffers"]],
         toolchain=model["toolchain"],
-        execution=dict(
-            abi_version=1,
-            library=dict(file="lib/model.so", sha256=file_hash(library)),
-            package="orinfer-models",
-            version="0.1.1",
-        ),
+        execution=execution_identity(library, engine, "flash_next", "int8_quality"),
     )
     raw = (json.dumps(package, indent=2, ensure_ascii=False) + "\n").encode()
     digest = hashlib.sha256(raw).hexdigest()

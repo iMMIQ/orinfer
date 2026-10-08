@@ -57,6 +57,36 @@ def verify_library(path):
         raise ValueError("Execution library must be an aarch64 ELF shared object")
 
 
+def execution_identity(library, engine=None, architecture=None, compute_policy=None):
+    """Read identity from the selected library, never from the source tree version."""
+    verify_library(library)
+    cli = engine or Path(__file__).resolve().parents[2] / "target/release/orinfer"
+    result = subprocess.run(
+        [str(cli.resolve(strict=True)), "inspect-library", str(library.resolve(strict=True))],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    info = json.loads(result.stdout)
+    if (
+        info.get("runtime_abi") != 1
+        or info.get("target") != "sm_87"
+        or not info.get("package")
+        or not info.get("version")
+    ):
+        raise ValueError("Execution library identity or target is incompatible")
+    if (architecture is not None and architecture not in info.get("architectures", [])) or (
+        compute_policy is not None and compute_policy not in info.get("compute_policies", [])
+    ):
+        raise ValueError("Execution library does not support the architecture or compute policy")
+    return dict(
+        abi_version=1,
+        library=dict(file="lib/model.so", sha256=file_hash(library)),
+        package=info["package"],
+        version=info["version"],
+    )
+
+
 def verify_execution(package, directory):
     execution = package.get("execution", {})
     if (
@@ -278,12 +308,7 @@ def publish(directory, engine=None):
         },
     )
     library = model_library()
-    package["execution"] = dict(
-        abi_version=1,
-        library=dict(file="lib/model.so", sha256=file_hash(library)),
-        package="orinfer-models",
-        version="0.1.1",
-    )
+    package["execution"] = execution_identity(library, engine, "qwen3_5", "int8_quality")
     raw = (json.dumps(package, indent=2, ensure_ascii=False) + "\n").encode()
     digest = hashlib.sha256(raw).hexdigest()
     destination = cache / "packages" / digest

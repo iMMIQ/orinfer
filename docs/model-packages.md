@@ -55,11 +55,10 @@ cargo build --release --locked --offline -p orinfer-models
 cd /path/to/orinfer
 PYTHONPATH=. .venv/bin/python -m tools.model.attach_execution \
   --model /path/to/prepared-model --output /path/to/new-model \
-  --library /path/to/liborinfer_models.so \
-  --package orinfer-models --version 0.1.1
+  --library /path/to/liborinfer_models.so
 ```
 
-更新工具校验原执行库与 kernel 资产，复用权重和 cubin，替换 `.so` 后通过加载器校验计划，再原子发布。源目录不会修改。模型数据与包仅支持当前 schema 1 结构，不读取旧算子包或 schema 2。
+更新工具读取新库的实际身份与版本，校验原执行库与 kernel 资产，复用权重和 cubin，替换 `.so` 后通过加载器校验计划，再原子发布。源目录不会修改。模型数据与包仅支持当前 schema 1 结构，不读取旧算子包或 schema 2。
 
 新准备的 Qwen 模型通过 `ORINFER_MODEL_LIBRARY=/path/to/library.so` 指定原生执行库；默认查找本项目 `target/release/liborinfer_models.so`。发布和安装工具：
 

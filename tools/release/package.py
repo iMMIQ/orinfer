@@ -3,6 +3,7 @@
 import argparse
 import gzip
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 # Support direct script invocation before loading project modules.
 sys.path.insert(0, str(ROOT))
-from tools.model.package import install  # noqa: E402
+from tools.model.package import execution_identity, install  # noqa: E402
 from tools.model.publication import file_hash  # noqa: E402
 
 
@@ -66,6 +67,47 @@ def notices(metadata):
     return "".join(text)
 
 
+def execution_assets(archives, cache, binary, tag):
+    """Validate each package independently and name assets from their actual contract."""
+    assets = []
+    names = set()
+    for archive_path in archives:
+        archive_path = archive_path.resolve(strict=True)
+        digest = install(archive_path, cache)
+        root = cache / digest
+        package = json.loads((root / "package.json").read_text())
+        identity = execution_identity(
+            root / package["execution"]["library"]["file"],
+            binary,
+            package["architecture"],
+            package["compute_policy"],
+        )
+        if identity != package["execution"]:
+            raise ValueError("Native execution identity differs from package manifest")
+        fields = [package[k] for k in ("architecture", "compute_policy", "target")]
+        if any(not isinstance(f, str) or not re.fullmatch(r"[a-z0-9_]+", f) for f in fields):
+            raise ValueError("Unsafe execution package asset identity")
+        architecture, policy, target = fields
+        name = f"orinfer-{tag}-{architecture}-{policy.replace('_', '-')}-{target.replace('_', '')}-execution.tar.gz"
+        if name in names:
+            raise ValueError("Duplicate architecture, compute policy and target in release")
+        names.add(name)
+        assets.append(
+            dict(
+                source=archive_path,
+                metadata=dict(
+                    file=name,
+                    digest=digest,
+                    architecture=architecture,
+                    compute_policy=policy,
+                    target=target,
+                    execution=identity,
+                ),
+            )
+        )
+    return assets
+
+
 def build(args):
     revision = command("git", "rev-parse", "HEAD")
     if command("git", "status", "--porcelain", "--untracked-files=normal"):
@@ -92,36 +134,18 @@ def build(args):
         raise ValueError("Binary version mismatch")
     if command("git", "rev-parse", "HEAD") != revision or command("git", "status", "--porcelain"):
         raise ValueError("Source changed during build")
-    operators = args.operators.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="orinfer-release-") as temp:
-        package_id = install(operators, Path(temp) / "operator-cache")
+        packages = execution_assets(args.operators, Path(temp) / "operator-cache", binary, tag)
         bundle = Path(temp) / f"orinfer-{tag}-linux-aarch64"
         (bundle / "bin").mkdir(parents=True)
         shutil.copy2(binary, bundle / "bin/orinfer")
         for name in ("README.md", "LICENSE", "COPYING", "COPYING.LESSER", "THIRD_PARTY_NOTICES.md"):
             if (ROOT / name).exists():
                 shutil.copyfile(ROOT / name, bundle / name)
-        for name in (
-            "tools/model/prepare.py",
-            "tools/model/package.py",
-            "tools/model/publication.py",
-            "configs/architecture-contract.json",
-            "tools/build/cpu-requirements.txt",
-        ):
-            (bundle / name).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(ROOT / name, bundle / name)
-        for name in (
-            "docs/serving.md",
-            "kernels/README.md",
-            "examples/opencode.json",
-            "examples/pi-models.json",
-            "tools/build/README.md",
-            "tools/model/README.md",
-            "tools/api/README.md",
-            "tools/vision/README.md",
-            "tools/bench/README.md",
-            "tools/eval/README.md",
-        ):
+        # Ship complete offline tools and their imports; only tracked files are included.
+        for name in command(
+            "git", "ls-files", "docs", "examples", "tools", "kernels", "configs"
+        ).splitlines():
             (bundle / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, bundle / name)
         source = bundle / "source.tar.gz"
@@ -139,7 +163,7 @@ def build(args):
                 dict(
                     tag=tag,
                     revision=revision,
-                    execution_package=package_id,
+                    execution_packages=[p["metadata"] for p in packages],
                     binary_sha256=file_hash(binary),
                 ),
                 indent=2,
@@ -148,8 +172,8 @@ def build(args):
         )
         epoch = int(command("git", "show", "-s", "--format=%ct", revision))
         archive(bundle, output / f"{bundle.name}.tar.gz", epoch)
-    operator_name = f"orinfer-{tag}-qwen3_5-27b-int8-quality-sm87-operators.tar.gz"
-    shutil.copyfile(operators, output / operator_name)
+    for package in packages:
+        shutil.copyfile(package["source"], output / package["metadata"]["file"])
     assets = sorted(output.glob("*.tar.gz"))
     (output / "SHA256SUMS").write_text(
         "".join(f"{file_hash(path)}  {path.name}\n" for path in assets)
@@ -195,7 +219,13 @@ def build(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--operators", type=Path, required=True)
+    parser.add_argument(
+        "--operators",
+        type=Path,
+        action="append",
+        required=True,
+        help="Native execution package archive; repeat for each architecture/policy",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--notes", type=Path)
     parser.add_argument("--publish", action="store_true")

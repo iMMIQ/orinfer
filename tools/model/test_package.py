@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tools.model.package import archive, install, split
+from tools.model.package import archive, execution_identity, install, split
 
 
 class PackageTests(unittest.TestCase):
@@ -25,6 +25,17 @@ class PackageTests(unittest.TestCase):
         env = patch.dict(os.environ, ORINFER_MODEL_LIBRARY=str(self.library))
         env.start()
         self.addCleanup(env.stop)
+        identity = patch(
+            "tools.model.package.execution_identity",
+            return_value=dict(
+                abi_version=1,
+                package="test-model",
+                version="1",
+                library=dict(file="lib/model.so", sha256=hashlib.sha256(header).hexdigest()),
+            ),
+        )
+        identity.start()
+        self.addCleanup(identity.stop)
         self.model = self.root / "source"
         (self.model / "cache/kernels").mkdir(parents=True)
         (self.model / "cache/weights").mkdir()
@@ -195,3 +206,25 @@ class PackageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NativeIdentityTests(unittest.TestCase):
+    def test_library_version_is_read_from_abi_instead_of_workspace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            library = root / "model.so"
+            header = bytearray(20)
+            header[:6] = b"\x7fELF\x02\x01"
+            header[16:20] = bytes((3, 0, 183, 0))
+            library.write_bytes(header)
+            info = dict(package="external-model", version="3.7.9", target="sm_87", runtime_abi=1)
+            with patch("tools.model.package.subprocess.run") as run:
+                run.return_value.stdout = json.dumps(info)
+                identity = execution_identity(library, Path("/bin/true"))
+                self.assertEqual(identity["version"], "3.7.9")
+                self.assertEqual(identity["package"], "external-model")
+                self.assertEqual(identity["library"]["sha256"], hashlib.sha256(header).hexdigest())
+                for key, value in (("target", "sm_90"), ("runtime_abi", 2), ("version", "")):
+                    run.return_value.stdout = json.dumps(dict(info, **{key: value}))
+                    with self.assertRaisesRegex(ValueError, "incompatible"):
+                        execution_identity(library, Path("/bin/true"))

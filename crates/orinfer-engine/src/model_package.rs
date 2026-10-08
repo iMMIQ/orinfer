@@ -21,6 +21,18 @@ pub struct ExecutionLibrary {
     pub version: String,
 }
 
+/// Inspect an explicitly selected native library without creating a model or CUDA context.
+pub(crate) fn inspect_library(path: &Path) -> Result<abi::PackageInfo> {
+    let image = std::fs::read(path).map_err(|e| e.to_string())?;
+    ModelPackage::open(path, &image)?.describe()
+}
+
+#[repr(C)]
+struct Header {
+    version: u32,
+    size: usize,
+}
+
 type BindingCache = std::cell::RefCell<
     std::collections::VecDeque<(Vec<(usize, usize)>, std::rc::Rc<abi::StateBindings>)>,
 >;
@@ -34,6 +46,52 @@ pub(crate) struct ModelPackage {
     bindings: BindingCache,
 }
 impl ModelPackage {
+    fn open(path: &Path, image: &[u8]) -> Result<Self> {
+        if image.len() < 20
+            || &image[..4] != b"\x7fELF"
+            || image[4] != 2
+            || image[5] != 1
+            || u16::from_le_bytes([image[16], image[17]]) != 3
+            || u16::from_le_bytes([image[18], image[19]]) != 183
+        {
+            return Err("Model library must be an aarch64 ELF shared object".into());
+        }
+        // SAFETY: this explicitly selected native library implements the documented
+        // C ABI. The model loader verifies its hash before calling open.
+        let library = unsafe { Library::new(path) }.map_err(|e| format!("Model library: {e}"))?;
+        // SAFETY: symbol is the required versioned C entry point, not a Rust ABI.
+        let entry =
+            unsafe { library.get::<unsafe extern "C" fn(u32) -> *const abi::Api>(abi::ENTRYPOINT) }
+                .map_err(|e| format!("Model entry point: {e}"))?;
+        // SAFETY: the package retains its static function table for the library lifetime.
+        let api = unsafe { entry(abi::ABI_VERSION) };
+        if api.is_null() {
+            return Err("Model library rejects engine ABI".into());
+        }
+        // SAFETY: every ABI entry returns at least this C prefix; larger tables
+        // are read only after the declared size is checked.
+        let header = unsafe { &*api.cast::<Header>() };
+        if header.version != abi::ABI_VERSION || header.size != std::mem::size_of::<abi::Api>() {
+            return Err("Incompatible model library function table".into());
+        }
+        Ok(Self {
+            handle: ptr::null_mut(),
+            api,
+            input_api: None,
+            _library: library,
+            bindings: Default::default(),
+        })
+    }
+    fn describe(&self) -> Result<abi::PackageInfo> {
+        let mut description = OwnedBytes::default();
+        // SAFETY: self retains the checked table and a live writable output slot.
+        let status = unsafe { (self.table().describe)(&mut description) };
+        let description = self.consume_bytes(description)?;
+        if status != 0 {
+            return Err("Model package cannot describe capabilities".into());
+        }
+        serde_json::from_slice(&description).map_err(|e| e.to_string())
+    }
     pub(crate) fn create(
         base: &Path,
         spec: &ExecutionLibrary,
@@ -46,46 +104,16 @@ impl ModelPackage {
             return Err("Incompatible model package ABI or identity".into());
         }
         let image = read_identity(base, &spec.library)?;
-        if image.len() < 20
-            || &image[..4] != b"\x7fELF"
-            || image[4] != 2
-            || image[5] != 1
-            || u16::from_le_bytes([image[16], image[17]]) != 3
-            || u16::from_le_bytes([image[18], image[19]]) != 183
-        {
-            return Err("Model library must be an aarch64 ELF shared object".into());
-        }
         let path = resolve_file(base, &spec.library.file)?;
-        // SAFETY: this explicitly selected, hash-verified package contains native
-        // code; its entry point uses the documented versioned C ABI.
-        let library = unsafe { Library::new(path) }.map_err(|e| format!("Model library: {e}"))?;
-        // SAFETY: symbol is the required versioned C entry point, not a Rust ABI.
-        let entry =
-            unsafe { library.get::<unsafe extern "C" fn(u32) -> *const abi::Api>(abi::ENTRYPOINT) }
-                .map_err(|e| format!("Model entry point: {e}"))?;
-        // SAFETY: the package retains its static function table for the library lifetime.
-        let api = unsafe { entry(abi::ABI_VERSION) };
-        if api.is_null() {
-            return Err("Model library rejects engine ABI".into());
-        }
-        // SAFETY: ABI v1 guarantees the version/size prefix and this checked table.
-        #[repr(C)]
-        struct Header {
-            version: u32,
-            size: usize,
-        }
-        // SAFETY: every ABI entry returns at least this C prefix; larger tables
-        // are read only after the declared size is checked.
-        let header = unsafe { &*api.cast::<Header>() };
-        if header.version != abi::ABI_VERSION || header.size != std::mem::size_of::<abi::Api>() {
-            return Err("Incompatible model library function table".into());
-        }
+        let mut model = Self::open(&path, &image)?;
         let input_api = if request.metadata.input_assets.is_some() {
             // SAFETY: hash-verified native library exports the documented C extension.
             let entry = unsafe {
-                library.get::<unsafe extern "C" fn(u32) -> *const abi::inputs::Api>(
-                    abi::inputs::ENTRYPOINT,
-                )
+                model
+                    ._library
+                    .get::<unsafe extern "C" fn(u32) -> *const abi::inputs::Api>(
+                        abi::inputs::ENTRYPOINT,
+                    )
             }
             .map_err(|e| format!("Model input adapter: {e}"))?;
             // SAFETY: the extension returns a static table retained by the library.
@@ -103,22 +131,8 @@ impl ModelPackage {
             None
         };
         let input = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
-        let mut model = Self {
-            handle: ptr::null_mut(),
-            api,
-            input_api,
-            _library: library,
-            bindings: Default::default(),
-        };
-        let mut description = OwnedBytes::default();
-        // SAFETY: model retains the checked function table and writable output.
-        let status = unsafe { (model.table().describe)(&mut description) };
-        let description = model.consume_bytes(description)?;
-        if status != 0 {
-            return Err("Model package cannot describe capabilities".into());
-        }
-        let description: abi::PackageInfo =
-            serde_json::from_slice(&description).map_err(|e| e.to_string())?;
+        model.input_api = input_api;
+        let description = model.describe()?;
         if description.package != spec.package
             || description.version != spec.version
             || description.target != "sm_87"
@@ -411,14 +425,16 @@ fn string(value: Bytes) -> Result<String> {
 }
 impl Drop for ModelPackage {
     fn drop(&mut self) {
-        // SAFETY: the creating library remains mapped and destroys only its own handle.
-        unsafe {
-            (self.table().destroy)(self.handle);
+        if !self.handle.is_null() {
+            // SAFETY: the creating library remains mapped and destroys only its own handle.
+            unsafe {
+                (self.table().destroy)(self.handle);
+            }
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
     fn fixture() -> (std::path::PathBuf, ExecutionLibrary, CreateRequest) {
@@ -475,6 +491,9 @@ mod tests {
     #[test]
     fn independent_c_package_loads_unknown_family_and_preserves_binary_batch_contract() {
         let (root, spec, request) = fixture();
+        let description = inspect_library(&root.join("model.so")).unwrap();
+        assert_eq!(description.package, spec.package);
+        assert_eq!(description.version, spec.version);
         let (model, plan) = ModelPackage::create(&root, &spec, request).unwrap();
         assert!(plan.decode_programs.contains("decode"));
         let segments = [BatchSegment { slot: 7, tokens: 3 }];
@@ -508,5 +527,20 @@ mod tests {
             assert!(ModelPackage::create(&root, &spec, request).is_err());
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    #[test]
+    fn non_aarch64_execution_library_is_rejected_before_loading() {
+        let mut image = [0u8; 20];
+        image[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        image[16..18].copy_from_slice(&3u16.to_le_bytes());
+        image[18..20].copy_from_slice(&62u16.to_le_bytes());
+        let error = super::ModelPackage::open(std::path::Path::new("unused.so"), &image)
+            .err()
+            .unwrap();
+        assert!(error.contains("aarch64 ELF shared object"));
     }
 }

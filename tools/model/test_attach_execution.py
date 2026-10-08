@@ -24,6 +24,17 @@ class ExecutionReplacementTests(unittest.TestCase):
         header[:6] = b"\x7fELF\x02\x01"
         header[16:20] = bytes((3, 0, 183, 0))
         self.library.write_bytes(header)
+        identity = patch(
+            "tools.model.attach_execution.execution_identity",
+            return_value=dict(
+                abi_version=1,
+                package="test-model",
+                version="1",
+                library=dict(file="lib/model.so", sha256=hashlib.sha256(header).hexdigest()),
+            ),
+        )
+        identity.start()
+        self.addCleanup(identity.stop)
         raw = json.dumps(
             dict(
                 schema_version=1,
@@ -81,6 +92,12 @@ class ExecutionReplacementTests(unittest.TestCase):
         self.assertFalse(output.exists())
         self.assertFalse(list(self.root.glob(".failed-*")))
         self.assertTrue((self.package / "package.json").exists())
+
+    def test_identity_assertions_reject_a_mismatched_library_version(self):
+        output = self.root / "mismatched"
+        with self.assertRaisesRegex(ValueError, "differs from the native library"):
+            attach(self.source, output, self.library, Path("/bin/true"), "test-model", "old")
+        self.assertFalse(output.exists())
 
     def test_nested_output_is_rejected_without_changing_source(self):
         for output in (self.source, self.source / "nested"):

@@ -28,6 +28,8 @@ enum Command {
     ValidateArtifact { manifest: PathBuf },
     /// Execute an SM87 AOT fixture and validate graph replay.
     RunArtifact { manifest: PathBuf },
+    /// Inspect a native execution library identity and capabilities without CUDA.
+    InspectLibrary { library: PathBuf },
     /// Inspect the native model package plan without CUDA.
     PlanModel { model_dir: PathBuf },
     /// Verify model, execution package and tensor hashes without CUDA.
@@ -152,6 +154,9 @@ fn execute(command: Command) -> Result<(), String> {
         }
         Command::RunArtifact { manifest } => {
             print_json(orinfer_engine::artifact::run_artifact(&manifest)?)
+        }
+        Command::InspectLibrary { library } => {
+            print_json(orinfer_engine::model::inspect_execution_library(&library)?)
         }
         Command::PlanModel { model_dir } => {
             print_json(orinfer_engine::model::inspect_plan(&model_dir)?)

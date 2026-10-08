@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import shutil
 
-from tools.model.package import verify_execution, verify_library
+from tools.model.package import execution_identity, verify_execution, verify_library
 from tools.model.publication import (
     atomic_model,
     clone_cpu_assets,
@@ -22,15 +22,18 @@ from tools.model.publication import (
 )
 
 
-def attach(source, output, library, engine, package_name, version):
+def attach(source, output, library, engine, package_name=None, version=None):
     source = source.resolve(strict=True)
     output = output.resolve()
     if output.is_relative_to(source):
         raise ValueError("Destination must be outside the immutable source model")
     library = library.resolve(strict=True)
     verify_library(library)
-    if not package_name or not version:
-        raise ValueError("Execution package identity and version are required")
+    identity = execution_identity(library, engine)
+    if (package_name is not None and package_name != identity["package"]) or (
+        version is not None and version != identity["version"]
+    ):
+        raise ValueError("Requested execution identity differs from the native library")
     descriptor = json.loads((source / "cache/model.json").read_text())
     if descriptor.get("schema_version") != 1:
         raise ValueError("Expected model data schema 1")
@@ -76,12 +79,7 @@ def attach(source, output, library, engine, package_name, version):
         # A previous package may have been hardlinked: never overwrite its inode.
         target_library.unlink(missing_ok=True)
         shutil.copyfile(library, target_library)
-        package["execution"] = dict(
-            abi_version=1,
-            library=dict(file="lib/model.so", sha256=file_hash(library)),
-            package=package_name,
-            version=version,
-        )
+        package["execution"] = identity
         raw = (json.dumps(package, indent=2, ensure_ascii=False) + "\n").encode()
         (target / "package.json").unlink()
         (target / "package.json").write_bytes(raw)
@@ -98,8 +96,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--engine", type=Path, default=Path("target/release/orinfer"))
-    parser.add_argument("--package", required=True)
-    parser.add_argument("--version", required=True)
+    parser.add_argument("--package", help="Optional identity assertion")
+    parser.add_argument("--version", help="Optional version assertion")
     args = parser.parse_args()
     print(attach(args.model, args.output, args.library, args.engine, args.package, args.version))
 
