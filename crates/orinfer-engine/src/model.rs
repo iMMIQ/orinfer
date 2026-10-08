@@ -38,6 +38,10 @@ pub struct Report {
     pub model: String,
     pub device: crate::cuda::DeviceInfo,
     pub load_to_ready_s: f64,
+    pub verify_weights: bool,
+    pub load_workers: usize,
+    pub preloaded_modules: usize,
+    pub registered_modules: usize,
     pub weight_io_hash_s: f64,
     pub weight_upload_s: f64,
     pub module_load_bind_s: f64,
@@ -97,9 +101,9 @@ pub fn inspect_execution_library(path: &Path) -> Result<orinfer_model_sdk::abi::
 /// Verify all container layouts and payloads without CUDA or resident weight copies.
 pub fn validate_model(path: &Path) -> Result<ValidationReport> {
     let start = Instant::now();
-    let prepared = crate::loader::load(path)?;
+    let prepared = crate::loader::load(path, true)?;
     let manifest = &prepared.plan;
-    let mut weights = crate::weights::Weights::open(&prepared.weights_root)?;
+    let mut weights = crate::weights::Weights::open(&prepared.weights_root, true)?;
     let mut tensor_count = 0;
     for buffer in &manifest.buffers {
         if buffer.data.is_some() {
@@ -139,7 +143,7 @@ pub struct PlanReport {
     pub manifest: Manifest,
 }
 pub fn inspect_plan(path: &Path) -> Result<PlanReport> {
-    let prepared = crate::loader::load(path)?;
+    let prepared = crate::loader::load(path, false)?;
     let mut allocation_bytes = BTreeMap::new();
     for buffer in &prepared.plan.buffers {
         let key = match prepared.scopes[&buffer.name] {
@@ -322,7 +326,7 @@ pub fn media_layout(
     images: &[crate::vision::ImageInput],
     capacity: usize,
 ) -> Result<(Vec<i32>, Vec<u32>)> {
-    let prepared = crate::loader::load(path)?;
+    let prepared = crate::loader::load(path, false)?;
     let vision = prepared
         .plan
         .vision

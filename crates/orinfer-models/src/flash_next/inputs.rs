@@ -2,6 +2,8 @@
 //! immutable decoded rows are shared, never mutable n-gram state.
 use crate::artifact::Result;
 use half::f16;
+use memmap2::MmapOptions;
+use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -127,8 +129,47 @@ fn digest(file: &mut File) -> Result<String> {
     }
     Ok(hex::encode(hash.finalize()))
 }
+
+fn validate_rows(file: &mut File, part: &Part, width: usize, verify_weights: bool) -> Result<()> {
+    if part.sha256.len() != 64 || !part.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Invalid CPU row shard hash".into());
+    }
+    // SAFETY: Prepared assets remain immutable while open. Only the container
+    // header is accessed here; the mapping is dropped before row lookup begins.
+    let mapping = unsafe { MmapOptions::new().map(&*file) }.map_err(|e| e.to_string())?;
+    let (header, metadata) = SafeTensors::read_metadata(&mapping).map_err(|e| e.to_string())?;
+    let start = 8 + header;
+    let tensors = metadata.tensors();
+    let contains = |offset: u64, dtype: Dtype, shape: &[usize]| {
+        tensors.values().any(|info| {
+            (start + info.data_offsets.0) as u64 == offset
+                && info.dtype == dtype
+                && info.shape == shape
+        })
+    };
+    let rows_match = if part.book.is_some() {
+        contains(part.offset, Dtype::U8, &[part.rows, 2 + width / 4])
+    } else {
+        contains(part.offset, Dtype::I8, &[part.rows, width])
+            && part
+                .scale_offset
+                .is_some_and(|offset| contains(offset, Dtype::F16, &[part.rows]))
+    };
+    if !rows_match {
+        return Err("CPU row safetensors dtype, shape or offset mismatch".into());
+    }
+    drop(mapping);
+    if verify_weights && digest(file)? != part.sha256 {
+        return Err("CPU row shard hash mismatch".into());
+    }
+    Ok(())
+}
 impl Inputs {
-    pub(super) fn open(root: &str, identity: &crate::artifact::FileIdentity) -> Result<Self> {
+    pub(super) fn open(
+        root: &str,
+        identity: &crate::artifact::FileIdentity,
+        verify_weights: bool,
+    ) -> Result<Self> {
         let root = Path::new(root).canonicalize().map_err(|e| e.to_string())?;
         let raw = std::fs::read(path(&root, &identity.file)?).map_err(|e| e.to_string())?;
         if hex::encode(Sha256::digest(&raw)) != identity.sha256 {
@@ -195,9 +236,7 @@ impl Inputs {
                     return Err("Invalid or discontinuous CPU row slices".into());
                 }
                 let mut file = File::open(path(&root, &part.file)?).map_err(|e| e.to_string())?;
-                if digest(&mut file)? != part.sha256 {
-                    return Err("CPU row shard hash mismatch".into());
-                }
+                validate_rows(&mut file, part, width, verify_weights)?;
                 let bytes = (part.rows as u64)
                     .checked_mul(if part.book.is_some() {
                         (2 + width / 4) as u64
@@ -465,6 +504,102 @@ fn decode(packet: &[u8], table: &Table) -> Result<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use safetensors::tensor::TensorView;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Rows(PathBuf);
+    impl Rows {
+        fn new(encoded: bool) -> (Self, Part, usize) {
+            let path = std::env::temp_dir().join(format!(
+                "orin-cpu-rows-{}-{}.safetensors",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let width = if encoded { 160 } else { 2560 };
+            let columns = if encoded { 2 + width / 4 } else { width };
+            let data = vec![0u8; 2 * columns];
+            let scales = [0u8; 4];
+            let dtype = if encoded { Dtype::U8 } else { Dtype::I8 };
+            let mut tensors = vec![(
+                "rows",
+                TensorView::new(dtype, vec![2, columns], &data).unwrap(),
+            )];
+            if !encoded {
+                tensors.push((
+                    "scale",
+                    TensorView::new(Dtype::F16, vec![2], &scales).unwrap(),
+                ));
+            }
+            let bytes = safetensors::serialize(tensors, None).unwrap();
+            let (header, metadata) = SafeTensors::read_metadata(&bytes).unwrap();
+            let offset = |name| (8 + header + metadata.info(name).unwrap().data_offsets.0) as u64;
+            let part = Part {
+                file: path.file_name().unwrap().to_str().unwrap().into(),
+                sha256: hex::encode(Sha256::digest(&bytes)),
+                offset: offset("rows"),
+                first: 0,
+                rows: 2,
+                book: encoded.then_some(0),
+                scale_offset: (!encoded).then(|| offset("scale")),
+            };
+            std::fs::write(&path, bytes).unwrap();
+            (Self(path), part, width)
+        }
+        fn validate(&self, part: &Part, width: usize, verify: bool) -> Result<()> {
+            validate_rows(&mut File::open(&self.0).unwrap(), part, width, verify)
+        }
+    }
+    impl Drop for Rows {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn cpu_rows_verify_content_only_when_requested() {
+        for encoded in [false, true] {
+            let (file, part, width) = Rows::new(encoded);
+            file.validate(&part, width, false).unwrap();
+            file.validate(&part, width, true).unwrap();
+            let mut bytes = std::fs::read(&file.0).unwrap();
+            bytes[part.offset as usize] ^= 1;
+            std::fs::write(&file.0, bytes).unwrap();
+            file.validate(&part, width, false).unwrap();
+            assert!(file.validate(&part, width, true).is_err());
+        }
+    }
+
+    #[test]
+    fn cpu_rows_reject_invalid_structure_in_both_modes() {
+        for encoded in [false, true] {
+            let (file, mut part, width) = Rows::new(encoded);
+            for verify in [false, true] {
+                assert!(file.validate(&part, width + 8, verify).is_err());
+                part.rows = 1;
+                assert!(file.validate(&part, width, verify).is_err());
+                part.rows = 2;
+                part.offset += 1;
+                assert!(file.validate(&part, width, verify).is_err());
+                part.offset -= 1;
+                if let Some(offset) = part.scale_offset {
+                    part.scale_offset = Some(offset + 1);
+                    assert!(file.validate(&part, width, verify).is_err());
+                    part.scale_offset = Some(offset);
+                }
+                part.book = if encoded { None } else { Some(0) };
+                assert!(file.validate(&part, width, verify).is_err());
+                part.book = encoded.then_some(0);
+            }
+            let mut bytes = std::fs::read(&file.0).unwrap();
+            bytes.pop();
+            std::fs::write(&file.0, bytes).unwrap();
+            for verify in [false, true] {
+                assert!(file.validate(&part, width, verify).is_err());
+            }
+        }
+    }
+
     #[test]
     #[ignore = "Requires prepared Flash CPU row assets and frozen Python input rows"]
     fn reference_rows_match_with_eos_and_request_history() {
@@ -477,6 +612,7 @@ mod tests {
                 file: "cache/cpu/inputs.json".into(),
                 sha256: hex::encode(Sha256::digest(&raw)),
             },
+            true,
         )
         .unwrap();
         let golden: serde_json::Value =

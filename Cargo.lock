@@ -1662,6 +1662,7 @@ dependencies = [
  "cudarc",
  "half",
  "hex",
+ "libc",
  "libloading",
  "memmap2",
  "orinfer-model-sdk",
@@ -1685,7 +1686,9 @@ version = "0.1.2"
 dependencies = [
  "half",
  "hex",
+ "memmap2",
  "orinfer-model-sdk",
+ "safetensors",
  "serde",
  "serde_json",
  "sha2",

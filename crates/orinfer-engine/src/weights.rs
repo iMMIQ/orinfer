@@ -16,7 +16,15 @@ struct Index {
     weight_map: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct TensorSource {
+    pub path: PathBuf,
+    pub offset: usize,
+    pub bytes: usize,
+}
+
 struct Shard {
+    path: PathBuf,
     mapping: Mmap,
     metadata: Metadata,
     data_start: usize,
@@ -26,10 +34,11 @@ pub(crate) struct Weights {
     base: PathBuf,
     index: Index,
     shards: BTreeMap<String, Shard>,
+    verify_payloads: bool,
 }
 
 impl Weights {
-    pub(crate) fn open(base: &Path) -> Result<Self> {
+    pub(crate) fn open(base: &Path, verify_payloads: bool) -> Result<Self> {
         let cache = base.canonicalize().map_err(|e| e.to_string())?;
         let base = cache
             .join("weights")
@@ -47,10 +56,12 @@ impl Weights {
             base,
             index,
             shards: BTreeMap::new(),
+            verify_payloads,
         })
     }
 
-    pub(crate) fn read<'a>(&'a mut self, buffer: &Buffer<TensorIdentity>) -> Result<&'a [u8]> {
+    /// Validate the standard container and binding without faulting tensor payload pages.
+    pub(crate) fn source(&mut self, buffer: &Buffer<TensorIdentity>) -> Result<TensorSource> {
         let id = buffer
             .data
             .as_ref()
@@ -62,7 +73,7 @@ impl Weights {
             .ok_or_else(|| format!("{}: absent from weight_map", id.tensor))?;
         if !self.shards.contains_key(file) {
             let path = resolve_file(&self.base, file)?;
-            let input = File::open(path).map_err(|e| format!("{file}: {e}"))?;
+            let input = File::open(&path).map_err(|e| format!("{file}: {e}"))?;
             // SAFETY: Prepared cache files are immutable while the model loads.
             // The read-only mapping owns its lifetime; tensor views never outlive it.
             let mapping =
@@ -72,6 +83,7 @@ impl Weights {
             self.shards.insert(
                 file.clone(),
                 Shard {
+                    path,
                     mapping,
                     metadata,
                     data_start: 8 + header,
@@ -111,12 +123,26 @@ impl Weights {
         }
         // The standard parser has validated all offsets, extents and shape products.
         let (begin, end) = info.data_offsets;
-        let data = &shard.mapping[shard.data_start + begin..shard.data_start + end];
-        if data.len() != buffer.bytes()? || sha256(data) != id.sha256 {
-            return Err(format!(
-                "{}: tensor byte length or sha256 mismatch",
-                buffer.name
-            ));
+        if end - begin != buffer.bytes()? {
+            return Err(format!("{}: tensor byte length mismatch", buffer.name));
+        }
+        Ok(TensorSource {
+            path: shard.path.clone(),
+            offset: shard.data_start + begin,
+            bytes: end - begin,
+        })
+    }
+
+    pub(crate) fn read<'a>(&'a mut self, buffer: &Buffer<TensorIdentity>) -> Result<&'a [u8]> {
+        let source = self.source(buffer)?;
+        let id = buffer
+            .data
+            .as_ref()
+            .ok_or("Buffer has no tensor identity")?;
+        let shard = &self.shards[&self.index.weight_map[&id.tensor]];
+        let data = &shard.mapping[source.offset..source.offset + source.bytes];
+        if self.verify_payloads && sha256(data) != id.sha256 {
+            return Err(format!("{}: tensor sha256 mismatch", buffer.name));
         }
         Ok(data)
     }
@@ -192,7 +218,7 @@ mod tests {
         ] {
             let fixture = Fixture::new();
             fixture.write(&data, dtype, vec![2]);
-            let mut weights = Weights::open(&fixture.0).unwrap();
+            let mut weights = Weights::open(&fixture.0, true).unwrap();
             let spec = buffer(&data, name, &[2]);
             assert_eq!(weights.read(&spec).unwrap(), data);
             assert_eq!(weights.read(&spec).unwrap(), data);
@@ -205,7 +231,7 @@ mod tests {
         let fixture = Fixture::new();
         let data = [0u8; 8];
         fixture.write(&data, safetensors::Dtype::I32, vec![2]);
-        let mut weights = Weights::open(&fixture.0).unwrap();
+        let mut weights = Weights::open(&fixture.0, true).unwrap();
         let mut spec = buffer(&data, "i32", &[2]);
         spec.shape = vec![1, 2];
         assert!(weights.read(&spec).is_err());
@@ -223,15 +249,59 @@ mod tests {
     }
 
     #[test]
+    fn structural_mode_skips_only_payload_hash() {
+        let fixture = Fixture::new();
+        let data = [0u8; 8];
+        let mut spec = buffer(&data, "i32", &[2]);
+        fixture.write(&[1u8; 8], safetensors::Dtype::I32, vec![2]);
+        assert_eq!(
+            Weights::open(&fixture.0, false)
+                .unwrap()
+                .read(&spec)
+                .unwrap(),
+            [1u8; 8]
+        );
+        assert!(
+            Weights::open(&fixture.0, true)
+                .unwrap()
+                .read(&spec)
+                .is_err()
+        );
+        let mut weights = Weights::open(&fixture.0, false).unwrap();
+        spec.shape = vec![1, 2];
+        assert!(weights.read(&spec).is_err());
+        spec.shape = vec![2];
+        spec.dtype = Dtype::F32;
+        assert!(weights.read(&spec).is_err());
+        spec.dtype = Dtype::I32;
+        spec.layout = "other_u4".into();
+        assert!(weights.read(&spec).is_err());
+    }
+
+    #[test]
     fn rejects_escaping_index_and_truncated_container() {
         let fixture = Fixture::new();
         fixture.write(&[0u8; 8], safetensors::Dtype::I32, vec![2]);
         let spec = buffer(&[0u8; 8], "i32", &[2]);
-        fixture.index("../weights/shard.safetensors");
-        assert!(Weights::open(&fixture.0).unwrap().read(&spec).is_err());
+        for verify in [false, true] {
+            fixture.index("../weights/shard.safetensors");
+            assert!(
+                Weights::open(&fixture.0, verify)
+                    .unwrap()
+                    .read(&spec)
+                    .is_err()
+            );
+        }
         fixture.index("shard.safetensors");
         fs::write(fixture.0.join("weights/shard.safetensors"), [0u8; 8]).unwrap();
-        assert!(Weights::open(&fixture.0).unwrap().read(&spec).is_err());
+        for verify in [false, true] {
+            assert!(
+                Weights::open(&fixture.0, verify)
+                    .unwrap()
+                    .read(&spec)
+                    .is_err()
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -246,7 +316,7 @@ mod tests {
         .unwrap();
         fixture.index("link.safetensors");
         assert!(
-            Weights::open(&fixture.0)
+            Weights::open(&fixture.0, true)
                 .unwrap()
                 .read(&buffer(&[0u8; 8], "i32", &[2]))
                 .is_err()

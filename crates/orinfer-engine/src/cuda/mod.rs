@@ -10,9 +10,11 @@ use std::{
     ptr,
     time::Instant,
 };
+mod kernels;
 mod sequence;
 pub(crate) mod snapshot;
 mod virtual_memory;
+mod weight_upload;
 pub(crate) use cudarc::driver::sys;
 pub(crate) type Handle = sys::CUgraphExec;
 
@@ -52,6 +54,9 @@ impl Driver {
             b"cuMemRelease\0".as_slice(),
             b"cuMemFree_v2\0".as_slice(),
             b"cuMemcpyHtoD_v2\0".as_slice(),
+            b"cuMemcpyHtoDAsync_v2\0".as_slice(),
+            b"cuMemHostAlloc\0".as_slice(),
+            b"cuMemFreeHost\0".as_slice(),
             b"cuMemcpyDtoDAsync_v2\0".as_slice(),
             b"cuMemcpyDtoH_v2\0".as_slice(),
             b"cuMemsetD8Async\0".as_slice(),
@@ -125,7 +130,7 @@ pub(crate) struct Session {
     pub(crate) stream: sys::CUstream,
     pub(crate) buffers: Vec<u64>,
     pub(crate) virtual_buffers: std::cell::RefCell<virtual_memory::Reservations>,
-    pub(crate) modules: Vec<sys::CUmodule>,
+    pub(crate) modules: std::cell::RefCell<Vec<sys::CUmodule>>,
     pub(crate) events: Vec<sys::CUevent>,
     pub(crate) graph: sys::CUgraph,
     pub(crate) exec: Handle,
@@ -142,7 +147,7 @@ impl Session {
             stream: ptr::null_mut(),
             buffers: vec![],
             virtual_buffers: Default::default(),
-            modules: vec![],
+            modules: Default::default(),
             events: vec![],
             graph: ptr::null_mut(),
             exec: ptr::null_mut(),
@@ -207,7 +212,7 @@ impl Session {
             for buffer in self.buffers.drain(..) {
                 record(sys::cuMemFree_v2(buffer), "free buffer");
             }
-            for module in self.modules.drain(..) {
+            for module in self.modules.get_mut().drain(..) {
                 record(sys::cuModuleUnload(module), "unload module");
             }
             if !self.stream.is_null() {
@@ -443,7 +448,7 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
                 sys::cuModuleLoadData(&mut module, image.as_ptr().cast()),
                 &format!("load {}", k.name),
             )?;
-            s.modules.push(module);
+            s.modules.borrow_mut().push(module);
             let symbol = CString::new(k.symbol.as_str()).map_err(|e| e.to_string())?;
             let mut function = ptr::null_mut();
             check(

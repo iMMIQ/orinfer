@@ -22,6 +22,7 @@ mod reference_generation;
 pub(crate) mod requests;
 pub(crate) mod scoring;
 mod speculation;
+mod startup;
 mod vision;
 
 pub(crate) struct ModelRuntime {
@@ -61,7 +62,7 @@ impl ModelRuntime {
     }
     pub(crate) fn load_with_options(path: &std::path::Path, options: LoadOptions) -> Result<Self> {
         let started = Instant::now();
-        let mut prepared = crate::loader::load(path)?;
+        let mut prepared = crate::loader::load(path, options.verify_weights)?;
         let request_hidden_ring = prepared
             .plan
             .mtp
@@ -71,16 +72,13 @@ impl ModelRuntime {
         prepared
             .decode_programs
             .retain(|name| prepared.plan.programs.contains_key(name));
-        let (execution, mut stats) = Executor::load(
-            &prepared.plan,
-            &prepared.weights_root,
-            &prepared.kernel_root,
-            prepared.fingerprint,
-            &prepared.scopes,
-            &prepared.decode_programs,
-            options,
-        )?;
+        let preload = startup::kernels(&prepared.plan, &prepared.execution_model)?;
+        let (execution, mut stats) = Executor::load(&prepared, options, &preload)?;
         stats.load_to_ready_s = started.elapsed().as_secs_f64();
+        eprintln!(
+            "MODEL READY after {:.3}s; verify_weights={}",
+            stats.load_to_ready_s, options.verify_weights
+        );
         let shapes = if prepared.plan.prefill_plans.is_empty() {
             vec![prepared.plan.chunk_tokens]
         } else {

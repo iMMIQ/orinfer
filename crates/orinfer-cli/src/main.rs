@@ -1,6 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 use orinfer_api::{PreprocessingLimits, ServerConfig};
-use orinfer_engine::execution::{CudaGraphMode, LoadOptions, parse_cache_mib, parse_mtp_drafts};
+use orinfer_engine::execution::{
+    CudaGraphMode, LoadOptions, parse_cache_mib, parse_load_workers, parse_mtp_drafts,
+};
 use std::{path::PathBuf, process::ExitCode};
 
 #[derive(Clone, Debug)]
@@ -42,17 +44,23 @@ enum Command {
     Serve(ServeArgs),
 }
 #[derive(Args)]
-struct GraphArgs {
+struct LoadArgs {
     /// CUDA graph capture: decode_only, full or off.
     #[arg(long, value_name = "MODE", default_value_t = CudaGraphMode::default())]
     cuda_graph: CudaGraphMode,
+    /// Hash loaded GPU weights and CPU row tables at startup (slower).
+    #[arg(long)]
+    verify_weights: bool,
+    /// Parallel weight readers; default selects a bounded number of CPU cores.
+    #[arg(long, value_name = "N", value_parser = parse_load_workers)]
+    load_workers: Option<usize>,
 }
 #[derive(Args)]
 struct ModelArgs {
     model_dir: PathBuf,
     requests: PathBuf,
     #[command(flatten)]
-    graph: GraphArgs,
+    load: LoadArgs,
 }
 #[derive(Args)]
 struct ServeArgs {
@@ -65,7 +73,7 @@ struct ServeArgs {
     #[arg(long, default_value_os_t = ServerConfig::default().gpu_lock)]
     gpu_lock: PathBuf,
     #[command(flatten)]
-    graph: GraphArgs,
+    load: LoadArgs,
     /// auto uses the package default; 0 disables MTP; 1..7 sets draft count.
     #[arg(long, value_name = "N", default_value = "auto")]
     mtp_drafts: MtpDrafts,
@@ -103,7 +111,9 @@ impl From<ServeArgs> for ServerConfig {
             model: args.model,
             listen: args.listen,
             gpu_lock: args.gpu_lock,
-            cuda_graph: args.graph.cuda_graph,
+            cuda_graph: args.load.cuda_graph,
+            verify_weights: args.load.verify_weights,
+            load_workers: args.load.load_workers,
             mtp_drafts: args.mtp_drafts.0,
             prefix_cache_bytes: args.prefix_cache_bytes,
             scheduler: orinfer_engine::scheduler::Options {
@@ -168,7 +178,9 @@ fn execute(command: Command) -> Result<(), String> {
             &args.model_dir,
             &args.requests,
             LoadOptions {
-                cuda_graph: args.graph.cuda_graph,
+                cuda_graph: args.load.cuda_graph,
+                verify_weights: args.load.verify_weights,
+                load_workers: args.load.load_workers,
                 ..Default::default()
             },
         )?),
@@ -176,7 +188,9 @@ fn execute(command: Command) -> Result<(), String> {
             &args.model_dir,
             &args.requests,
             LoadOptions {
-                cuda_graph: args.graph.cuda_graph,
+                cuda_graph: args.load.cuda_graph,
+                verify_weights: args.load.verify_weights,
+                load_workers: args.load.load_workers,
                 ..Default::default()
             },
         )?),
@@ -211,7 +225,10 @@ mod tests {
         assert_eq!(config.prefix_cache_bytes, 12usize << 30);
         assert_eq!(config.scheduler.max_active, 32);
         assert_eq!(config.mtp_drafts, None);
+        assert!(!config.verify_weights);
+        assert_eq!(config.load_workers, None);
         let config = serve(&[
+            "--verify-weights",
             "--mtp-drafts=7",
             "--cuda-graph",
             "off",
@@ -232,6 +249,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.cuda_graph, CudaGraphMode::Off);
         assert_eq!(config.mtp_drafts, Some(7));
+        assert!(config.verify_weights);
         assert_eq!(config.prefix_cache_bytes, 0);
         assert_eq!(config.scheduler.memory_reserve_bytes, 2usize << 30);
     }
@@ -247,6 +265,7 @@ mod tests {
         for options in [
             &["--cuda-graph"][..],
             &["--cuda-graph", "on"],
+            &["--verify-weights=false"],
             &["--mtp-drafts", "8"],
             &["--unknown", "off"],
             &["--prefix-cache-mib", "1.5"],
@@ -271,12 +290,30 @@ mod tests {
             "model",
             "requests.json",
             "--cuda-graph=full",
+            "--verify-weights",
         ])
         .unwrap();
         let Some(Command::RunModel(args)) = cli.command else {
             unreachable!()
         };
-        assert_eq!(args.graph.cuda_graph, CudaGraphMode::Full);
+        assert_eq!(args.load.cuda_graph, CudaGraphMode::Full);
+        assert!(args.load.verify_weights);
+        assert_eq!(
+            serve(&["--load-workers", "12"]).unwrap().load_workers,
+            Some(12)
+        );
+        assert!(serve(&["--load-workers", "0"]).is_err());
+        assert!(serve(&["--load-workers", "33"]).is_err());
+        for verify in [false, true] {
+            let mut argv = vec!["orinfer", "score-model", "model", "requests.json"];
+            if verify {
+                argv.push("--verify-weights");
+            }
+            let Some(Command::ScoreModel(args)) = Cli::try_parse_from(argv).unwrap().command else {
+                unreachable!()
+            };
+            assert_eq!(args.load.verify_weights, verify);
+        }
         assert!(Cli::try_parse_from(["orinfer", "run-model", "model"]).is_err());
         assert!(Cli::try_parse_from(["orinfer", "plan-model", "model", "extra"]).is_err());
     }

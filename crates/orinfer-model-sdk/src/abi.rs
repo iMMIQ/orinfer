@@ -36,6 +36,9 @@ pub struct PackageInfo {
 pub struct CreateRequest {
     #[serde(default)]
     pub model_root: String,
+    /// Full CPU weight-table verification; structural checks are always required.
+    #[serde(default)]
+    pub verify_weights: bool,
     pub config: serde_json::Value,
     pub architecture: String,
     pub compute_policy: String,

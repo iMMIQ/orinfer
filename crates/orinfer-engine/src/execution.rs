@@ -39,10 +39,22 @@ impl FromStr for CudaGraphMode {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadOptions {
     pub cuda_graph: CudaGraphMode,
+    /// Hash loaded weight payloads and CPU row tables in addition to structural checks.
+    pub verify_weights: bool,
+    /// None selects a bounded number of available CPU cores for weight I/O.
+    pub load_workers: Option<usize>,
     /// Maximum extra resident prefix snapshots. Zero disables reuse.
     pub prefix_cache_bytes: usize,
     /// None keeps the package default; zero disables speculative execution.
     pub mtp_drafts: Option<usize>,
+}
+
+pub fn parse_load_workers(value: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=32).contains(n))
+        .ok_or_else(|| "Weight load workers must be within 1..32".into())
 }
 
 pub fn parse_mtp_drafts(value: &str) -> Result<Option<usize>> {
@@ -58,6 +70,16 @@ pub fn parse_mtp_drafts(value: &str) -> Result<Option<usize>> {
 }
 
 impl LoadOptions {
+    pub(crate) fn weight_workers(self) -> Result<usize> {
+        match self.load_workers {
+            Some(n) if (1..=32).contains(&n) => Ok(n),
+            Some(_) => Err("Weight load workers must be within 1..32".into()),
+            None => Ok(std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(4)),
+        }
+    }
+
     pub(crate) fn configure_mtp(self, manifest: &mut crate::model::Manifest) -> Result<()> {
         let Some(drafts) = self.mtp_drafts else {
             return Ok(());
@@ -213,6 +235,29 @@ mod tests {
         for invalid in ["", "-1", "8", "1.5", "AUTO", "18446744073709551615"] {
             assert!(parse_mtp_drafts(invalid).is_err());
         }
+        for workers in [1, 4, 12, 32] {
+            assert_eq!(parse_load_workers(&workers.to_string()).unwrap(), workers);
+            assert_eq!(
+                LoadOptions {
+                    load_workers: Some(workers),
+                    ..Default::default()
+                }
+                .weight_workers()
+                .unwrap(),
+                workers
+            );
+        }
+        for invalid in ["0", "33", "-1", "", "auto", "1.5"] {
+            assert!(parse_load_workers(invalid).is_err());
+        }
+        assert!(
+            LoadOptions {
+                load_workers: Some(0),
+                ..Default::default()
+            }
+            .weight_workers()
+            .is_err()
+        );
         assert_eq!(parse_cache_mib("0").unwrap(), 0);
         assert_eq!(parse_cache_mib("12288").unwrap(), 12usize << 30);
         for invalid in ["-1", "1.5", "", "18446744073709551615"] {

@@ -43,6 +43,7 @@ struct Service {
     model: Arc<str>,
     context: usize,
     mtp_drafts: usize,
+    verify_weights: bool,
     vision: Option<orinfer_engine::vision::VisionSpec>,
     api_key: Option<Arc<str>>,
     ids: Arc<AtomicU64>,
@@ -101,6 +102,8 @@ async fn serve(settings: Settings) -> Result<()> {
     let worker_model = Arc::clone(&model_id);
     let worker_shutdown = Arc::clone(&shutdown);
     let scheduler = settings.scheduler;
+    let verify_weights = settings.verify_weights;
+    let load_workers = settings.load_workers;
     let activity = Arc::new(continuous::Activity::default());
     let lifecycle = Arc::clone(&activity.lifecycle);
     let worker_activity = Arc::clone(&activity);
@@ -136,6 +139,8 @@ async fn serve(settings: Settings) -> Result<()> {
                         &settings.model_dir,
                         LoadOptions {
                             cuda_graph: settings.cuda_graph,
+                            verify_weights,
+                            load_workers,
                             prefix_cache_bytes: settings.prefix_cache_bytes,
                             mtp_drafts: settings.mtp_drafts,
                         },
@@ -190,6 +195,7 @@ continuous::worker(
         model: model_id,
         context,
         mtp_drafts,
+        verify_weights,
         vision,
         api_key: std::env::var("ORINFER_API_KEY")
             .ok()
@@ -346,6 +352,7 @@ async fn health(State(state): State<Service>) -> Response {
     (if state.activity.lifecycle.is_ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(
         json!({"status":state.activity.lifecycle.name(),"failure":state.activity.lifecycle.failure(),"model":state.model.as_ref(),"max_context":state.context,
         "frontend_assets":state.codec.asset_hashes,
+        "verify_weights":state.verify_weights,
         "chat_capabilities":{"streaming":true,"default_stream":false,"max_choices":1,
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
             "tools":{"function":true,"strict":true,"required":true,"incremental_arguments":true},

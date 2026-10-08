@@ -19,3 +19,5 @@ serde_json.workspace = true
 half.workspace = true
 sha2.workspace = true
 hex.workspace = true
+memmap2 = "=0.9.11"
+safetensors = "=0.8.0"

@@ -10,6 +10,10 @@
 
 服务加载一次模型，由单个 GPU worker 执行请求。CPU 使用模型目录中的 `tokenizer.json`、`chat_template.jinja` 和 `generation_config.json` 渲染模板及分词；线上不运行 Python、量化或 kernel JIT。
 
+权重加载采用并行读取和有界的 pinned 缓冲区，并与异步 GPU 上传重叠。`--load-workers N` 可设置 1–32 个读取线程；默认按可用 CPU 核心选择，最多 4 个。暂存内存最多 256 MiB，加载结束后释放。开启 `--verify-weights` 时使用完整校验路径，启动较慢。
+
+执行包中的全部 kernel 资产仍校验 hash；普通文本、配置的 MTP、视觉及小 batch 计划预加载 CUDA 模块，其余计划在首次使用时加载，并在 CUDA Graph 捕获前完成绑定。未预加载的形状可能有额外的首次执行开销。
+
 模型准备时封存上述前端文件的 SHA256。需要有意修改时，先确认它们与 checkpoint 的 token 映射和语义一致，再执行 `python3 tools/model/package.py pin-assets MODEL_DIR` 重新封存；此命令不改权重。模型文件在加载期间必须保持不变。
 
 先查共享执行包缓存中的 `<digest>`，缺失时再查模型内的 `cache/packages/<digest>`。`ORINFER_EXECUTION_CACHE` 可覆盖共享缓存位置；默认目录是 `$XDG_CACHE_HOME/orinfer/packages`，未设置 XDG 时为 `~/.cache/orinfer/packages`。存在但损坏的包会报错。专用 safetensors 布局沿用 `orin.layout.<tensor>` 标识，执行包 digest 固定原生执行逻辑与 kernel。
@@ -173,6 +177,7 @@ prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少
 | `--listen` | `0.0.0.0:8088` | HTTP 监听地址 |
 | `--model` | `qwen3.8-27b` | API 模型 ID |
 | `--cuda-graph` | `decode_only` | Graph 模式 |
+| `--verify-weights` | 关闭 | 启动时完整校验已加载权重和 CPU 表内容 |
 | `--prefix-cache-mib` | `12288` | GPU 缓存字节预算，0 关闭 |
 | `--max-active-requests` | `32` | 活跃请求上限，1–128 |
 | `--max-batch-tokens` | `128` | 每轮 target 计算 token 预算，1–128 |
@@ -187,6 +192,8 @@ prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少
 | `--gpu-lock` | `artifacts/gpu-experiment.lock` | GPU worker 使用的共享锁 |
 
 `/health` 显示 starting/ready/draining/failed，并提供调度、准入、缓存恢复和 Graph 统计。GPU worker 故障时返回 503；CUDA 或内部状态故障后需要重启服务。统计和真实 API 性能测量见[性能工具](../tools/bench/README.md)。
+
+启动默认校验配置、执行库、kernel 身份，以及权重和 CPU 表的 safetensors 结构、dtype、shape、布局和偏移边界，跳过大体积权重的 SHA256 扫描。`serve`、`run-model` 和 `score-model` 添加 `--verify-weights` 可校验加载的权重内容；`validate-model` 始终完整校验模型权重。默认模式无法发现仅修改数值、但不改变结构的损坏。
 
 ## 诊断 CLI
 

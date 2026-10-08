@@ -5,7 +5,7 @@ pub(super) type BatchGraphCache = BTreeMap<Vec<(usize, usize)>, (Handle, u64, us
 
 pub(super) struct DirectKernel {
     pub(super) spec: Kernel,
-    pub(super) function: sys::CUfunction,
+    pub(super) function: Option<sys::CUfunction>,
     pub(super) values: Vec<Value>,
 }
 
@@ -23,6 +23,7 @@ pub(crate) struct Executor {
     pub(crate) sizes: BTreeMap<String, usize>,
     pub(crate) graphs: RefCell<BTreeMap<String, Handle>>,
     pub(super) direct: Option<DirectPrograms>,
+    pub(super) kernels: RefCell<super::kernels::Catalog>,
     pub(super) cuda_graph: CudaGraphMode,
     growth: BTreeMap<String, crate::model::KvGrowth>,
     pub(crate) peak_kv_bytes: std::cell::Cell<usize>,
@@ -57,6 +58,10 @@ pub(crate) struct LoadStats {
     pub(crate) manifest_sha256: String,
     pub(crate) device: DeviceInfo,
     pub(crate) load_to_ready_s: f64,
+    pub(crate) verify_weights: bool,
+    pub(crate) load_workers: usize,
+    pub(crate) preloaded_modules: usize,
+    pub(crate) registered_modules: usize,
     pub(crate) weight_io_hash_s: f64,
     pub(crate) weight_upload_s: f64,
     pub(crate) module_load_bind_s: f64,
@@ -68,15 +73,18 @@ pub(crate) struct LoadStats {
 }
 impl Executor {
     pub(crate) fn load(
-        manifest: &crate::model::Manifest,
-        base: &std::path::Path,
-        kernel_base: &std::path::Path,
-        fingerprint: String,
-        scopes: &BTreeMap<String, crate::loader::BufferScope>,
-        decode_programs: &std::collections::BTreeSet<String>,
+        prepared: &crate::loader::PreparedModel,
         options: LoadOptions,
+        preload: &std::collections::BTreeSet<String>,
     ) -> Result<(Self, LoadStats)> {
+        let manifest = &prepared.plan;
+        let base = &prepared.weights_root;
+        let kernel_base = &prepared.kernel_root;
+        let scopes = &prepared.scopes;
+        let decode_programs = &prepared.decode_programs;
+        let fingerprint = prepared.fingerprint.clone();
         let cuda_graph = options.cuda_graph;
+        let load_workers = options.weight_workers()?;
         if decode_programs
             .iter()
             .any(|name| !manifest.programs.contains_key(name))
@@ -192,12 +200,23 @@ impl Executor {
                 sys::cuMemGetInfo_v2(&mut free, &mut memtotal),
                 "available memory",
             )?;
+            if buffer_bytes > memtotal {
+                return Err(format!(
+                    "Model needs {buffer_bytes} bytes, device total {memtotal}"
+                ));
+            }
+            // On Tegra the instantaneous free estimate excludes memory the OS
+            // can reclaim (CUDA for Tegra, memory management). Let checked
+            // allocations decide availability; Session rolls back on failure.
             if buffer_bytes > free {
-                return Err(format!("Model needs {buffer_bytes} bytes, free {free}"));
+                eprintln!(
+                    "Model needs {buffer_bytes} bytes, CUDA free estimate {free}; checking allocations"
+                );
             }
         }
         let (mut weight_io_hash_s, mut weight_upload_s) = (0.0, 0.0);
-        let mut weights = crate::weights::Weights::open(base)?;
+        let mut weights = crate::weights::Weights::open(base, options.verify_weights)?;
+        let mut uploads = Vec::new();
         for b in &manifest.buffers {
             if b.data.is_some()
                 && b.access == crate::artifact::Access::Read
@@ -246,21 +265,26 @@ impl Executor {
             arena.bytes += bytes;
             if b.data.is_some() {
                 let t = Instant::now();
-                let raw = weights.read(b)?;
-                weight_io_hash_s += t.elapsed().as_secs_f64();
-                if raw.len() != bytes {
-                    return Err(format!("{} weight byte length mismatch", b.name));
+                if options.verify_weights {
+                    let raw = weights.read(b)?;
+                    weight_io_hash_s += t.elapsed().as_secs_f64();
+                    let t = Instant::now();
+                    // SAFETY: Validated immutable host/device extents; the
+                    // synchronous full-verification upload keeps raw alive.
+                    unsafe {
+                        check(
+                            sys::cuMemcpyHtoD_v2(address, raw.as_ptr().cast(), bytes),
+                            "verified weight upload",
+                        )?;
+                    }
+                    weight_upload_s += t.elapsed().as_secs_f64();
+                } else {
+                    uploads.push(super::weight_upload::Upload {
+                        source: weights.source(b)?,
+                        destination: address,
+                    });
+                    weight_io_hash_s += t.elapsed().as_secs_f64();
                 }
-                let t = Instant::now();
-                // SAFETY: Both ranges are valid for bytes and raw lives until the
-                // synchronous transfer finishes. No online Python is involved.
-                unsafe {
-                    check(
-                        sys::cuMemcpyHtoD_v2(address, raw.as_ptr().cast(), bytes),
-                        &format!("upload {}", b.name),
-                    )?;
-                }
-                weight_upload_s += t.elapsed().as_secs_f64();
             } else if stride.is_none() {
                 // SAFETY: Whole allocation is owned and not in use yet.
                 unsafe {
@@ -272,123 +296,18 @@ impl Executor {
             }
         }
         drop(weights);
+        let t = Instant::now();
+        super::weight_upload::upload(&s, uploads, load_workers)?;
+        weight_upload_s += t.elapsed().as_secs_f64();
         let module_started = Instant::now();
-        let mut modules = BTreeMap::<String, sys::CUmodule>::new();
-        let mut functions = BTreeMap::<(String, String), sys::CUfunction>::new();
+        let mut catalog = super::kernels::Catalog::new(&s, kernel_base, &manifest.kernels)?;
         let mut launches = BTreeMap::new();
         for k in &manifest.kernels {
-            let module = if let Some(m) = modules.get(&k.module.file) {
-                *m
+            let function = if preload.contains(&k.name) {
+                Some(catalog.resolve(&s, k)?)
             } else {
-                let image = crate::artifact::read_identity(kernel_base, &k.module)?;
-                crate::artifact::read_identity(kernel_base, &k.source)?;
-                crate::artifact::read_identity(kernel_base, &k.host_abi)?;
-                if !image.starts_with(b"\x7fELF") {
-                    return Err("Expected cubin ELF".into());
-                }
-                let mut module = ptr::null_mut();
-                // SAFETY: image contains a hash-verified cubin for the checked SM.
-                // Driver copies module data; session owns the resulting handle.
-                unsafe {
-                    check(
-                        sys::cuModuleLoadData(&mut module, image.as_ptr().cast()),
-                        &format!("load {}", k.name),
-                    )?;
-                }
-                s.modules.push(module);
-                modules.insert(k.module.file.clone(), module);
-                module
+                None
             };
-            let key = (k.module.file.clone(), k.symbol.clone());
-            let function = if let Some(f) = functions.get(&key) {
-                *f
-            } else {
-                let mut function = ptr::null_mut();
-                let symbol = CString::new(k.symbol.as_str()).map_err(|e| e.to_string())?;
-                // SAFETY: Module remains live and symbol is a terminated C string.
-                unsafe {
-                    check(
-                        sys::cuModuleGetFunction(&mut function, module, symbol.as_ptr()),
-                        "model function",
-                    )?;
-                }
-                functions.insert(key, function);
-                function
-            };
-            // SAFETY: Actual function/device bounds are checked before each launch
-            // binding. Opt-in shared memory is set on the same live function.
-            unsafe {
-                let (mut threads, mut static_shared, mut max_shared, mut default_shared) =
-                    (0, 0, 0, 0);
-                check(
-                    sys::cuFuncGetAttribute(
-                        &mut threads,
-                        sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-                        function,
-                    ),
-                    "function threads",
-                )?;
-                check(
-                    sys::cuFuncGetAttribute(
-                        &mut static_shared,
-                        sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
-                        function,
-                    ),
-                    "static shared memory",
-                )?;
-                check(
-                    sys::cuDeviceGetAttribute(&mut max_shared, sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, s.device),
-                    "shared memory limit",
-                )?;
-                check(
-                    sys::cuDeviceGetAttribute(
-                        &mut default_shared,
-                        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
-                        s.device,
-                    ),
-                    "default shared memory",
-                )?;
-                let shared = u64::from(k.shared_memory_bytes) + static_shared as u64;
-                if k.block.iter().product::<u32>() > threads as u32 || shared > max_shared as u64 {
-                    return Err(format!("{} resource limit", k.name));
-                }
-                for axis in 0..3 {
-                    let (mut block, mut grid) = (0, 0);
-                    check(
-                        sys::cuDeviceGetAttribute(
-                            &mut block,
-                            [
-                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X,
-                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y,
-                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z,
-                            ][axis],
-                            s.device,
-                        ),
-                        "block limit",
-                    )?;
-                    check(
-                        sys::cuDeviceGetAttribute(
-                            &mut grid,
-                            [
-                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X,
-                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y,
-                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z,
-                            ][axis],
-                            s.device,
-                        ),
-                        "grid limit",
-                    )?;
-                    if k.block[axis] > block as u32 || k.grid[axis] > grid as u32 {
-                        return Err("Grid/block limit".into());
-                    }
-                }
-                if shared > default_shared as u64 {
-                    check(
-                        sys::cuFuncSetAttribute(function, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k.shared_memory_bytes as i32),
-                        "opt-in shared memory",
-                    )?;
-                }
-            }
             let values = k
                 .args
                 .iter()
@@ -406,13 +325,15 @@ impl Executor {
                 .collect();
             launches.insert(
                 k.name.clone(),
-                Launch {
-                    spec: k,
+                DirectKernel {
+                    spec: k.clone(),
                     function,
                     values,
                 },
             );
         }
+        let preloaded_modules = catalog.loaded_modules();
+        let registered_modules = catalog.registered_modules();
         let module_load_bind_s = module_started.elapsed().as_secs_f64();
         // SAFETY: Flush all default-stream uploads and workspace initialization
         // before capture on a nonblocking stream. No allocation occurs in graphs.
@@ -425,27 +346,13 @@ impl Executor {
         let graphs = BTreeMap::new();
         let graph_capture_s = 0.0;
         let direct = Some(DirectPrograms {
-            kernels: RefCell::new(
-                launches
-                    .into_iter()
-                    .map(|(name, launch)| {
-                        (
-                            name,
-                            DirectKernel {
-                                spec: launch.spec.clone(),
-                                function: launch.function,
-                                values: launch.values,
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
+            kernels: RefCell::new(launches),
             programs: manifest.programs.clone(),
         });
         let load_to_ready_s = started.elapsed().as_secs_f64();
         let captured_programs: Vec<String> = graphs.keys().cloned().collect();
         eprintln!(
-            "MODEL READY after {load_to_ready_s:.3}s; {buffer_bytes} resident buffer bytes, {capacity_bytes} capacity bytes; cuda_graph={cuda_graph}, {} captured programs",
+            "GPU LOAD complete after {load_to_ready_s:.3}s; {buffer_bytes} resident buffer bytes, {capacity_bytes} capacity bytes; cuda_graph={cuda_graph}, {} captured programs",
             captured_programs.len()
         );
         let device = DeviceInfo {
@@ -463,6 +370,7 @@ impl Executor {
             sizes,
             graphs: RefCell::new(graphs),
             direct,
+            kernels: RefCell::new(catalog),
             cuda_graph,
             growth: manifest
                 .kv_cache
@@ -495,6 +403,10 @@ impl Executor {
             manifest_sha256: fingerprint,
             device,
             load_to_ready_s,
+            verify_weights: options.verify_weights,
+            load_workers,
+            preloaded_modules,
+            registered_modules,
             weight_io_hash_s,
             weight_upload_s,
             module_load_bind_s,
@@ -634,6 +546,7 @@ impl Executor {
     /// Submit the same registered program without adding synchronization points.
     pub(crate) fn submit_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
         self.ensure_kv(name)?;
+        self.ensure_program_kernels(name)?;
         if self.cuda_graph.uses_graph(phase) {
             let graph = self.program_graph(name)?;
             // SAFETY: Graphs and their stable addresses live in this thread's session.
@@ -673,7 +586,9 @@ impl Executor {
                         }
                         launch_kernel(
                             &kernel.spec,
-                            kernel.function,
+                            kernel
+                                .function
+                                .ok_or("Kernel was not resolved before submission")?,
                             &mut kernel.values,
                             &self.session.driver,
                             self.session.stream,
@@ -719,6 +634,48 @@ impl Executor {
         }
         Err(format!("Missing direct execution bindings for {name}"))
     }
+    pub(super) fn ensure_kernel(&self, name: &str) -> Result<()> {
+        let direct = self.direct.as_ref().ok_or("Missing direct bindings")?;
+        let mut bindings = direct.kernels.borrow_mut();
+        let kernel = bindings
+            .get_mut(name)
+            .ok_or_else(|| format!("Unknown kernel {name}"))?;
+        if kernel.function.is_none() {
+            kernel.function = Some(
+                self.kernels
+                    .borrow_mut()
+                    .resolve(&self.session, &kernel.spec)?,
+            );
+        }
+        Ok(())
+    }
+    pub(super) fn ensure_program_kernels(&self, name: &str) -> Result<()> {
+        let operations = self
+            .direct
+            .as_ref()
+            .ok_or("Missing direct bindings")?
+            .programs
+            .get(name)
+            .ok_or_else(|| format!("Unknown program {name}"))?;
+        for operation in operations {
+            if let crate::model::Operation::Kernel { name } = operation {
+                self.ensure_kernel(name)?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn ensure_invocation_kernels(
+        &self,
+        operations: &[crate::execution::Invocation],
+    ) -> Result<()> {
+        for invocation in operations {
+            if let crate::model::Operation::Kernel { name } = &invocation.operation {
+                self.ensure_kernel(name)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn ensure_kv(&self, program: &str) -> Result<()> {
         let Some(growth) = self.growth.get(program) else {
             return Ok(());

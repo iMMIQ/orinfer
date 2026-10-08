@@ -719,13 +719,15 @@ impl Executor {
                         }
                         values[index] = Value::I32(value);
                     }
+                    self.kernels.borrow().validate_launch(&dynamic_spec)?;
                     &dynamic_spec
                 } else {
                     &k.spec
                 };
                 super::launch_kernel(
                     spec,
-                    k.function,
+                    k.function
+                        .ok_or("Batch kernel was not resolved before submission")?,
                     &mut values,
                     &self.session.driver,
                     self.session.stream,
@@ -789,6 +791,7 @@ impl Executor {
         Ok(())
     }
     fn capture(&self, operations: &[Invocation]) -> Result<Handle> {
+        self.ensure_invocation_kernels(operations)?;
         // SAFETY: All bindings and backing allocations outlive graph execution;
         // capture records work, and the worker is the stream's sole submitter.
         unsafe {
@@ -879,6 +882,7 @@ impl Executor {
         decode: bool,
         allow_capture: bool,
     ) -> Result<()> {
+        self.ensure_invocation_kernels(operations)?;
         let dynamic = operations.iter().any(|op| op.launch.is_some());
         let configured = (self.cuda_graph == crate::execution::CudaGraphMode::Full
             || (decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly))
@@ -1044,6 +1048,7 @@ impl Executor {
         position: Option<(&str, u32)>,
     ) -> Result<Vec<Vec<f32>>> {
         self.sync()?;
+        self.ensure_invocation_kernels(operations)?;
         let events = self.profile_events(operations.len() + 1)?;
         // SAFETY: Sole stream owner; external event nodes retain timestamps in replay.
         unsafe {

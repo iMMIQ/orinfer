@@ -119,6 +119,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             .input_assets
             .as_ref()
             .ok_or("Missing CPU input assets")?,
+        request.verify_weights,
     )?;
     let metadata = request.metadata;
     let mut decode_programs = std::collections::BTreeSet::from(["decode".into()]);

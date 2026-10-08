@@ -47,7 +47,7 @@ pub(crate) struct PreparedModel {
     pub execution_model: crate::model_package::ModelPackage,
 }
 
-pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
+pub(crate) fn load(path: &Path, verify_weights: bool) -> Result<PreparedModel> {
     let descriptor = crate::model::resolve_manifest(path)?;
     let weights_root = descriptor
         .parent()
@@ -102,6 +102,7 @@ pub(crate) fn load(path: &Path) -> Result<PreparedModel> {
         &package.execution,
         orinfer_model_sdk::abi::CreateRequest {
             model_root: root.display().to_string(),
+            verify_weights,
             config,
             architecture: model.architecture.clone(),
             compute_policy: model.compute_policy.clone(),
@@ -226,7 +227,7 @@ mod tests {
             serde_json::to_vec(&descriptor).unwrap(),
         )
         .unwrap();
-        let error = load(&root).err().unwrap();
+        let error = load(&root, false).err().unwrap();
         fs::remove_dir_all(root).unwrap();
         assert!(error.contains("without embedded kernels or programs"));
     }

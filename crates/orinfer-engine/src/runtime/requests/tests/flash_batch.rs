@@ -16,6 +16,8 @@ fn validate_flash_decode_batches() {
             // changes prompt chunk boundaries and tests a different path.
             prefix_cache_bytes: 0,
             mtp_drafts: fixture.mtp_drafts,
+
+            ..Default::default()
         },
     )
     .unwrap();
@@ -128,6 +130,8 @@ fn validate_flash_decode_batches() {
                 cuda_graph: fixture.cuda_graph.parse().unwrap(),
                 prefix_cache_bytes: 0,
                 mtp_drafts: Some(0),
+
+                ..Default::default()
             },
         )
         .unwrap()
@@ -339,6 +343,8 @@ fn validate_flash_bounded_prefill() {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
+
+            ..Default::default()
         },
     )
     .unwrap();
@@ -460,6 +466,8 @@ fn validate_flash_prefix_cache() {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 2 << 30,
             mtp_drafts: Some(0),
+
+            ..Default::default()
         },
     )
     .unwrap();

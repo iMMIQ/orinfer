@@ -9,6 +9,8 @@ pub struct ServerConfig {
     pub listen: String,
     pub gpu_lock: PathBuf,
     pub cuda_graph: CudaGraphMode,
+    pub verify_weights: bool,
+    pub load_workers: Option<usize>,
     pub mtp_drafts: Option<usize>,
     pub prefix_cache_bytes: usize,
     pub scheduler: scheduler::Options,
@@ -22,6 +24,8 @@ impl Default for ServerConfig {
             listen: "0.0.0.0:8088".into(),
             gpu_lock: "artifacts/gpu-experiment.lock".into(),
             cuda_graph: CudaGraphMode::default(),
+            verify_weights: false,
+            load_workers: None,
             mtp_drafts: None,
             prefix_cache_bytes: 12usize << 30,
             scheduler: Default::default(),
@@ -33,6 +37,9 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<(), String> {
         if !self.model_dir.is_dir() {
             return Err("MODEL_DIR must be a prepared model directory".into());
+        }
+        if self.load_workers.is_some_and(|n| !(1..=32).contains(&n)) {
+            return Err("Weight load workers must be within 1..32".into());
         }
         if self.model.is_empty() {
             return Err("Model ID cannot be empty".into());

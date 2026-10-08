@@ -479,6 +479,7 @@ mod tests {
             spec,
             CreateRequest {
                 model_root: String::new(),
+                verify_weights: false,
                 config: serde_json::json!({"model_type":"test_family"}),
                 architecture: "test_family".into(),
                 compute_policy: "test_policy".into(),

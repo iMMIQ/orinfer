@@ -891,6 +891,8 @@ fn validate_flash_mtp() {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 0,
             mtp_drafts: Some(7),
+
+            ..Default::default()
         },
     )
     .unwrap();

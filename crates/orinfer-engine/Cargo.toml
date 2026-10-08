@@ -18,6 +18,7 @@ sha2.workspace = true
 hex.workspace = true
 
 half.workspace = true
+libc = "=0.2.190"
 memmap2 = "=0.9.11"
 safetensors = "=0.8.0"
 
