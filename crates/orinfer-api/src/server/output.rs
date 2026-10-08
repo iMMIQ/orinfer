@@ -1,9 +1,54 @@
 //! Incremental Qwen XML tool/reasoning parsing into Chat Completions deltas.
 use serde_json::{Map, Value, json};
+use std::{collections::BTreeMap, sync::OnceLock};
+
+#[derive(Default)]
+struct Schemas {
+    compiled: OnceLock<Result<BTreeMap<String, jsonschema::ValidatorMap>>>,
+}
+impl Schemas {
+    fn get(
+        &self,
+        tools: &[Value],
+        name: &str,
+        pointer: &str,
+    ) -> Result<Option<&jsonschema::Validator>> {
+        let compiled = self.compiled.get_or_init(|| {
+            tools
+                .iter()
+                .map(|tool| {
+                    let name = tool["function"]["name"]
+                        .as_str()
+                        .ok_or("Tool name missing")?;
+                    let schema = &tool["function"]["parameters"];
+                    let schema = if schema.is_null() {
+                        &Value::Bool(true)
+                    } else {
+                        schema
+                    };
+                    let compiled = jsonschema::options()
+                        .offline()
+                        .build_map(schema)
+                        .map_err(|e| e.to_string())?;
+                    Ok((name.to_owned(), compiled))
+                })
+                .collect()
+        });
+        let compiled = compiled.as_ref().map_err(Clone::clone)?;
+        Ok(compiled.get(name).and_then(|map| map.get(pointer)))
+    }
+    fn validate(&self, tools: &[Value], name: &str, arguments: &Value) -> Result<()> {
+        self.get(tools, name, "#")?
+            .ok_or("Missing tool schema")?
+            .validate(arguments)
+            .map_err(|e| e.to_string())
+    }
+}
 
 type Result<T> = std::result::Result<T, String>;
 
 pub struct Output {
+    schemas: Schemas,
     pending: String,
     reasoning: bool,
     in_tool: bool,
@@ -25,6 +70,7 @@ pub struct Output {
 impl Output {
     pub fn new(thinking: bool, tools: Vec<Value>, stops: Vec<String>, id: &str) -> Self {
         Self {
+            schemas: Schemas::default(),
             pending: String::new(),
             reasoning: thinking,
             in_tool: false,
@@ -83,7 +129,9 @@ impl Output {
                     self.stopped = true;
                     break;
                 }
-                if let Some((name, arguments)) = partial_call(&self.pending, &self.tools)? {
+                if let Some((name, arguments)) =
+                    partial_call(&self.pending, &self.tools, &self.schemas)?
+                {
                     self.stream_call(&name, &arguments, &mut deltas)?;
                 }
                 if let Some(end) = end {
@@ -92,6 +140,7 @@ impl Output {
                         &self.tools,
                         &format!("call_{}_{}", self.call_prefix, self.calls.len()),
                         self.constrained_tools,
+                        &self.schemas,
                     )?;
                     self.stream_call(
                         call["function"]["name"].as_str().unwrap(),
@@ -306,18 +355,26 @@ fn json_fields(body: &str) -> Option<(Option<String>, Option<&str>)> {
     }
     Some((name, arguments))
 }
-fn parameter_value(value: &str, schema: &Value) -> Result<Value> {
+fn parameter_value(
+    value: &str,
+    schema: &Value,
+    validator: Option<&jsonschema::Validator>,
+) -> Result<Value> {
     let parsed = if schema["type"] == "string" {
         json!(value)
     } else {
         match serde_json::from_str::<Value>(value) {
-            Ok(v) if validate_schema(&v, schema).is_ok() => v,
+            Ok(v) if validator.is_none_or(|validator| validator.is_valid(&v)) => v,
             _ => json!(value),
         }
     };
     Ok(parsed)
 }
-fn partial_call(body: &str, tools: &[Value]) -> Result<Option<(String, String)>> {
+fn partial_call(
+    body: &str,
+    tools: &[Value],
+    schemas: &Schemas,
+) -> Result<Option<(String, String)>> {
     let body = body.trim_start();
     if body.starts_with('{') {
         if let Some((Some(name), arguments)) = json_fields(body) {
@@ -365,7 +422,10 @@ fn partial_call(body: &str, tools: &[Value]) -> Result<Option<(String, String)>>
         arguments.push_str(&serde_json::to_string(key).unwrap());
         arguments.push(':');
         if let Some(end) = complete {
-            arguments.push_str(&parameter_value(value, schema)?.to_string());
+            let pointer = format!("#/properties/{}", key.replace('~', "~0").replace('/', "~1"));
+            arguments.push_str(
+                &parameter_value(value, schema, schemas.get(tools, name, &pointer)?)?.to_string(),
+            );
             // Complete offsets refer to the original parameter suffix.
             rest = rest_value.split_once('>').unwrap().1[end + "</parameter>".len()..].trim_start();
             count += 1;
@@ -380,7 +440,13 @@ fn partial_call(body: &str, tools: &[Value]) -> Result<Option<(String, String)>>
     }
     Ok(Some((name.into(), arguments)))
 }
-fn parse_call(body: &str, tools: &[Value], id: &str, constrained: bool) -> Result<Value> {
+fn parse_call(
+    body: &str,
+    tools: &[Value],
+    id: &str,
+    constrained: bool,
+    schemas: &Schemas,
+) -> Result<Value> {
     let body = body.trim();
     if body.starts_with('{') {
         let raw = body;
@@ -390,11 +456,11 @@ fn parse_call(body: &str, tools: &[Value], id: &str, constrained: bool) -> Resul
         if constrained {
             let arguments: Value = serde_json::from_str(raw_arguments)
                 .map_err(|e| format!("Invalid JSON tool arguments: {e}"))?;
-            let tool = tools
+            tools
                 .iter()
                 .find(|t| t["function"]["name"] == name)
                 .ok_or("Undeclared tool")?;
-            validate_schema(&arguments, &tool["function"]["parameters"])?;
+            schemas.validate(tools, &name, &arguments)?;
         }
         return Ok(
             json!({"id":id,"type":"function","function":{"name":name,"arguments":raw_arguments}}),
@@ -429,7 +495,8 @@ fn parse_call(body: &str, tools: &[Value], id: &str, constrained: bool) -> Resul
             return Err("Empty or duplicate tool parameter".into());
         }
         let parameter_schema = &schema["properties"][key];
-        let parsed = parameter_value(value, parameter_schema)
+        let pointer = format!("#/properties/{}", key.replace('~', "~0").replace('/', "~1"));
+        let parsed = parameter_value(value, parameter_schema, schemas.get(tools, name, &pointer)?)
             .map_err(|e| format!("Parameter {key}: {e}"))?;
         arguments.insert(key.to_owned(), parsed);
         rest = tail.trim_start();
@@ -439,93 +506,76 @@ fn parse_call(body: &str, tools: &[Value], id: &str, constrained: bool) -> Resul
     }
     let arguments = Value::Object(arguments);
     if constrained {
-        validate_schema(&arguments, schema)?;
+        schemas.validate(tools, name, &arguments)?;
     }
     Ok(
         json!({"id":id, "type":"function", "function":{"name":name,"arguments":serde_json::to_string(&arguments).map_err(|e| e.to_string())?}}),
     )
 }
-// Structural checks catch malformed calls. This is not a constrained decoder or
-// a complete JSON Schema implementation; clients still validate tool arguments.
-fn validate_schema(value: &Value, schema: &Value) -> Result<()> {
-    if schema == &Value::Bool(false) {
-        return Err("Forbidden by schema".into());
-    }
-    for keyword in ["anyOf", "oneOf"] {
-        if let Some(choices) = schema[keyword].as_array() {
-            let valid = choices
-                .iter()
-                .filter(|s| validate_schema(value, s).is_ok())
-                .count();
-            if valid == 0 || (keyword == "oneOf" && valid != 1) {
-                return Err(format!("Does not match {keyword}"));
-            }
-        }
-    }
-    if let Some(choices) = schema["allOf"].as_array() {
-        for s in choices {
-            validate_schema(value, s)?;
-        }
-    }
-    if let Some(types) = schema.get("type") {
-        let matches = |name: &str| match name {
-            "string" => value.is_string(),
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "number" => value.is_number(),
-            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-            "boolean" => value.is_boolean(),
-            "null" => value.is_null(),
-            _ => false,
-        };
-        let valid = types.as_str().is_some_and(matches)
-            || types
-                .as_array()
-                .is_some_and(|a| a.iter().any(|t| t.as_str().is_some_and(matches)));
-        if !valid {
-            return Err("Incorrect parameter type".into());
-        }
-    }
-    if schema["enum"]
-        .as_array()
-        .is_some_and(|a| !a.contains(value))
-    {
-        return Err("Value outside enum".into());
-    }
-    if schema.get("const").is_some_and(|c| c != value) {
-        return Err("Incorrect const".into());
-    }
-    if let Some(object) = value.as_object() {
-        if let Some(required) = schema["required"].as_array() {
-            for key in required {
-                if !key.as_str().is_some_and(|s| object.contains_key(s)) {
-                    return Err("Required parameter missing".into());
-                }
-            }
-        }
-        for (key, value) in object {
-            if let Some(property) = schema["properties"].get(key) {
-                validate_schema(value, property)?;
-            } else if schema["additionalProperties"] == false {
-                return Err("Unexpected parameter".into());
-            } else if schema["additionalProperties"].is_object() {
-                validate_schema(value, &schema["additionalProperties"])?;
-            }
-        }
-    }
-    if let Some(items) = value.as_array()
-        && let Some(schema) = schema.get("items")
-    {
-        for v in items {
-            validate_schema(v, schema)?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn strict_calls_validate_ranges_patterns_array_limits_and_local_references() {
+        let tools = vec![
+            json!({"type":"function","function":{"name":"check","parameters":{
+                "type":"object", "$defs":{"count":{"type":"integer","minimum":0,"maximum":10}},
+                "properties":{"count":{"$ref":"#/$defs/count"},"label":{"type":"string","pattern":"^[a-z]+$","minLength":2,"maxLength":4},"items":{"type":"array","items":{"type":"boolean"},"minItems":1,"maxItems":2}},
+                "required":["count","label","items"], "additionalProperties":false
+            }}}),
+        ];
+        let schemas = Schemas::default();
+        let valid = json!({"count":3,"label":"good","items":[true]});
+        schemas.validate(&tools, "check", &valid).unwrap();
+        for (key, invalid) in [
+            ("count", json!(-1)),
+            ("count", json!(11)),
+            ("label", json!("BAD")),
+            ("label", json!("x")),
+            ("label", json!("abcde")),
+            ("items", json!([])),
+            ("items", json!([true, false, true])),
+        ] {
+            let mut value = valid.clone();
+            value[key] = invalid;
+            let body = json!({"name":"check","arguments":value}).to_string();
+            assert!(parse_call(&body, &tools, "x", true, &schemas).is_err());
+            assert!(parse_call(&body, &tools, "x", false, &schemas).is_ok());
+        }
+        let xml = "<tool_call><function=check><parameter=count>3</parameter><parameter=label>good</parameter><parameter=items>[true]</parameter></function></tool_call>";
+        for at in (0..=xml.len()).filter(|&at| xml.is_char_boundary(at)) {
+            let mut output = Output::new(false, tools.clone(), vec![], "x");
+            output.constrained_tools(true);
+            output.push(&xml[..at], false).unwrap();
+            output.push(&xml[at..], true).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(
+                    output.calls[0]["function"]["arguments"].as_str().unwrap()
+                )
+                .unwrap(),
+                valid
+            );
+        }
+    }
+    #[test]
+    fn property_validation_keeps_root_references_and_escaped_names() {
+        let tools = vec![
+            json!({"type":"function","function":{"name":"check","parameters":{
+                "type":"object","$defs":{"int":{"type":"integer"}},
+                "properties":{"key/~":{"$ref":"#/$defs/int"}}, "required":["key/~"]
+            }}}),
+        ];
+        let schemas = Schemas::default();
+        let body = "<function=check><parameter=key/~>7</parameter></function>";
+        let call = parse_call(body, &tools, "x", true, &schemas).unwrap();
+        assert_eq!(call["function"]["arguments"], "{\"key/~\":7}");
+        assert!(
+            schemas
+                .get(&tools, "check", "#/properties/key~1~0")
+                .unwrap()
+                .is_some()
+        );
+    }
     #[test]
     fn json_and_xml_arguments_stream_before_completion_and_preserve_fragments() {
         let bodies = [
@@ -649,9 +699,9 @@ mod tests {
             r#"{"name":"read","arguments":{"limit":"bad"}}"#,
             r#"{"name":"read","arguments":[]}"#,
         ] {
-            let call = parse_call(body, &tools(), "call_x_0", false).unwrap();
+            let call = parse_call(body, &tools(), "call_x_0", false, &Schemas::default()).unwrap();
             assert!(call["function"]["arguments"].is_string());
-            assert!(parse_call(body, &tools(), "x", true).is_err());
+            assert!(parse_call(body, &tools(), "x", true, &Schemas::default()).is_err());
             let raw = format!("<tool_call>{body}</tool_call>");
             for at in (0..=raw.len()).filter(|&i| raw.is_char_boundary(i)) {
                 let mut parser = Output::new(false, tools(), vec![], "x");

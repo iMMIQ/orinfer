@@ -1,26 +1,8 @@
 //! CUDA VMM ownership: graph pointers stay fixed while physical slabs grow.
-use super::{Driver, Result, Session, check};
+use super::{Driver, Result, Session, check, sys};
 use std::collections::BTreeMap;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct Location {
-    kind: i32,
-    id: i32,
-}
-#[repr(C)]
-pub(crate) struct AllocationProp {
-    kind: i32,
-    handles: i32,
-    location: Location,
-    windows: *mut std::ffi::c_void,
-    flags: [u8; 8],
-}
-#[repr(C)]
-pub(crate) struct AccessDesc {
-    location: Location,
-    flags: i32,
-}
+use sys::{CUmemAccessDesc as AccessDesc, CUmemAllocationProp as AllocationProp};
 
 pub(crate) struct Reservation {
     pub address: u64,
@@ -39,12 +21,16 @@ impl Reservation {
         // SAFETY: repr(C) properties match CUDA 12.6 cuda.h; pointers are live.
         unsafe {
             check(
-                (s.driver.vmm_granularity)(&mut granularity, &prop, 0),
+                sys::cuMemGetAllocationGranularity(
+                    &mut granularity,
+                    &prop,
+                    sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+                ),
                 "VMM granularity",
             )?;
             let bytes = round_up(bytes, granularity)?;
             check(
-                (s.driver.vmm_reserve)(&mut address, bytes, granularity, 0, 0),
+                sys::cuMemAddressReserve(&mut address, bytes, granularity, 0, 0),
                 "reserve KV address space",
             )?;
             Ok(Self {
@@ -88,14 +74,14 @@ impl Reservation {
         let prop = properties(s.device);
         let access = AccessDesc {
             location: prop.location,
-            flags: 3,
+            flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
         };
         let mut handle = 0;
         // SAFETY: Session owns the context/stream; each successful create is
         // immediately recorded before any fallible map/access/initialization.
         unsafe {
             check(
-                (s.driver.vmm_create)(&mut handle, bytes, &prop, 0),
+                sys::cuMemCreate(&mut handle, bytes, &prop, 0),
                 "create KV physical slab",
             )?;
         }
@@ -108,17 +94,14 @@ impl Reservation {
         let result = (|| {
             // SAFETY: Reserved VA extent and live physical allocation do not overlap prior slabs.
             unsafe {
-                check(
-                    (s.driver.vmm_map)(address, bytes, 0, handle, 0),
-                    "map KV slab",
-                )?;
+                check(sys::cuMemMap(address, bytes, 0, handle, 0), "map KV slab")?;
                 slab.mapped = true;
                 check(
-                    (s.driver.vmm_access)(address, bytes, &access, 1),
+                    sys::cuMemSetAccess(address, bytes, &access, 1),
                     "enable KV slab access",
                 )?;
                 check(
-                    (s.driver.memset)(address, 0, bytes, s.stream),
+                    sys::cuMemsetD8Async(address, 0, bytes, s.stream),
                     "initialize KV slab",
                 )?;
             }
@@ -165,18 +148,18 @@ struct Slab {
     handle: u64,
     mapped: bool,
 }
-fn unsafe_unmap(driver: &Driver, address: u64, slab: &Slab) -> Result<()> {
+fn unsafe_unmap(_driver: &Driver, address: u64, slab: &Slab) -> Result<()> {
     // SAFETY: The caller owns this mapped extent and synchronized its stream.
     unsafe {
         check(
-            (driver.vmm_unmap)(address + slab.offset as u64, slab.bytes),
+            sys::cuMemUnmap(address + slab.offset as u64, slab.bytes),
             "unmap KV slab",
         )
     }
 }
-fn unsafe_release(driver: &Driver, handle: u64) -> Result<()> {
+fn unsafe_release(_driver: &Driver, handle: u64) -> Result<()> {
     // SAFETY: The caller owns the live allocation handle, now unmapped.
-    unsafe { check((driver.vmm_release)(handle), "release KV slab") }
+    unsafe { check(sys::cuMemRelease(handle), "release KV slab") }
 }
 fn release_owned(
     slabs: &mut Vec<Slab>,
@@ -206,14 +189,19 @@ fn release_owned(
 }
 fn properties(device: i32) -> AllocationProp {
     AllocationProp {
-        kind: 1,
-        handles: 0,
-        location: Location {
-            kind: 1,
+        type_: sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED,
+        requestedHandleTypes: sys::CUmemAllocationHandleType(0),
+        location: sys::CUmemLocation {
+            type_: sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
             id: device,
         },
-        windows: std::ptr::null_mut(),
-        flags: [0; 8],
+        win32HandleMetaData: std::ptr::null_mut(),
+        allocFlags: sys::CUmemAllocationProp_st__bindgen_ty_1 {
+            compressionType: 0,
+            gpuDirectRDMACapable: 0,
+            usage: 0,
+            reserved: [0; 4],
+        },
     }
 }
 fn round_up(bytes: usize, granularity: usize) -> Result<usize> {
@@ -269,18 +257,22 @@ mod tests {
     #[test]
     #[ignore = "Requires exclusive GPU experiment lock"]
     fn vmm_graph_growth_reset_and_last_token() {
-        use super::super::{Handle, Session};
+        use super::super::Session;
         let mut s = Session::new(Driver::load().unwrap());
         // SAFETY: Test owns a primary-context reference, stream and graph handles.
         unsafe {
-            check((s.driver.init)(0), "init").unwrap();
-            check((s.driver.device)(&mut s.device, 0), "device").unwrap();
-            check((s.driver.current)(&mut s.previous), "previous").unwrap();
-            let mut context: Handle = std::ptr::null_mut();
-            check((s.driver.retain)(&mut context, s.device), "retain").unwrap();
+            check(sys::cuInit(0), "init").unwrap();
+            check(sys::cuDeviceGet(&mut s.device, 0), "device").unwrap();
+            check(sys::cuCtxGetCurrent(&mut s.previous), "previous").unwrap();
+            let mut context: sys::CUcontext = std::ptr::null_mut();
+            check(
+                sys::cuDevicePrimaryCtxRetain(&mut context, s.device),
+                "retain",
+            )
+            .unwrap();
             s.retained = true;
-            check((s.driver.set_current)(context), "current").unwrap();
-            check((s.driver.stream_create)(&mut s.stream, 1), "stream").unwrap();
+            check(sys::cuCtxSetCurrent(context), "current").unwrap();
+            check(sys::cuStreamCreate(&mut s.stream, 1), "stream").unwrap();
         }
         let mut r = Reservation::reserve(&s, 262144 * 2048, 2048).unwrap();
         let address = r.address;
@@ -289,18 +281,29 @@ mod tests {
         // SAFETY: Capture a write into a mapped buffer; subsequent mappings keep
         // the graph address stable. Every map/unmap follows stream completion.
         unsafe {
-            check((s.driver.stream_sync)(s.stream), "init sync").unwrap();
-            check((s.driver.capture_begin)(s.stream, 0), "capture").unwrap();
-            s.capturing = true;
-            check((s.driver.memset)(address, 37, 4, s.stream), "record write").unwrap();
+            check(sys::cuStreamSynchronize(s.stream), "init sync").unwrap();
             check(
-                (s.driver.capture_end)(s.stream, &mut s.graph),
+                sys::cuStreamBeginCapture_v2(
+                    s.stream,
+                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+                ),
+                "capture",
+            )
+            .unwrap();
+            s.capturing = true;
+            check(
+                sys::cuMemsetD8Async(address, 37, 4, s.stream),
+                "record write",
+            )
+            .unwrap();
+            check(
+                sys::cuStreamEndCapture(s.stream, &mut s.graph),
                 "capture end",
             )
             .unwrap();
             s.capturing = false;
             check(
-                (s.driver.graph_instantiate)(&mut s.exec, s.graph, 0),
+                sys::cuGraphInstantiateWithFlags(&mut s.exec, s.graph, 0),
                 "instantiate",
             )
             .unwrap();
@@ -313,17 +316,21 @@ mod tests {
             let mut value = [0u8; 4];
             // SAFETY: First and last writes are within mapped extents.
             unsafe {
-                check((s.driver.memset)(last, 71, 4, s.stream), "last token write").unwrap();
-                check((s.driver.graph_launch)(s.exec, s.stream), "graph replay").unwrap();
-                check((s.driver.stream_sync)(s.stream), "sync").unwrap();
                 check(
-                    (s.driver.download)(value.as_mut_ptr().cast(), last, 4),
+                    sys::cuMemsetD8Async(last, 71, 4, s.stream),
+                    "last token write",
+                )
+                .unwrap();
+                check(sys::cuGraphLaunch(s.exec, s.stream), "graph replay").unwrap();
+                check(sys::cuStreamSynchronize(s.stream), "sync").unwrap();
+                check(
+                    sys::cuMemcpyDtoH_v2(value.as_mut_ptr().cast(), last, 4),
                     "last token read",
                 )
                 .unwrap();
                 assert_eq!(value, [71; 4]);
                 check(
-                    (s.driver.download)(value.as_mut_ptr().cast(), address, 4),
+                    sys::cuMemcpyDtoH_v2(value.as_mut_ptr().cast(), address, 4),
                     "graph read",
                 )
                 .unwrap();
@@ -336,17 +343,17 @@ mod tests {
         let mut value = [1u8; 4];
         // SAFETY: Fresh physical storage is zeroed, graph still uses the same VA.
         unsafe {
-            check((s.driver.stream_sync)(s.stream), "reset sync").unwrap();
+            check(sys::cuStreamSynchronize(s.stream), "reset sync").unwrap();
             check(
-                (s.driver.download)(value.as_mut_ptr().cast(), address, 4),
+                sys::cuMemcpyDtoH_v2(value.as_mut_ptr().cast(), address, 4),
                 "reset read",
             )
             .unwrap();
             assert_eq!(value, [0; 4]);
-            check((s.driver.graph_launch)(s.exec, s.stream), "reset replay").unwrap();
-            check((s.driver.stream_sync)(s.stream), "reset replay sync").unwrap();
+            check(sys::cuGraphLaunch(s.exec, s.stream), "reset replay").unwrap();
+            check(sys::cuStreamSynchronize(s.stream), "reset replay sync").unwrap();
             check(
-                (s.driver.download)(value.as_mut_ptr().cast(), address, 4),
+                sys::cuMemcpyDtoH_v2(value.as_mut_ptr().cast(), address, 4),
                 "replay read",
             )
             .unwrap();

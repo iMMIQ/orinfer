@@ -11,6 +11,8 @@ axum = "=0.8.9"
 futures-util = "=0.3.34"
 libc = "=0.2.190"
 minijinja = { version = "=2.24.0", features = ["json"] }
+minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
+jsonschema = { version = "=0.58.6", default-features = false }
 orinfer-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true

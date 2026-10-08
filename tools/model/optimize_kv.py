@@ -10,11 +10,13 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import struct
 import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.model.publication import atomic_model, clone_model, commit_package, load_model
+from safetensors import safe_open
 
 
 def transform(wrapper, package):
@@ -85,17 +87,10 @@ def optimize(source, destination, engine, storage="fp16", output=None):
     original = json.loads(completed.stdout)["manifest"]
     # Read just the safetensors header and Pages payload, without loading weights.
     index = json.loads((source / "cache/weights/model.safetensors.index.json").read_text())
-    import struct
-
     page_buffer = next(b for b in original["buffers"] if b["name"] == "Pages")
     shard = source / "cache/weights" / index["weight_map"][page_buffer["data"]["tensor"]]
-    with shard.open("rb") as stream:
-        length = struct.unpack("<Q", stream.read(8))[0]
-        header = json.loads(stream.read(length))
-        tensor = header[page_buffer["data"]["tensor"]]
-        start, stop = tensor["data_offsets"]
-        stream.seek(8 + length + start)
-        pages = stream.read(stop - start)
+    with safe_open(shard, framework="np") as reader:
+        pages = reader.get_tensor(page_buffer["data"]["tensor"]).tobytes()
     expected = struct.pack(
         "<" + "i" * (original["max_context"] // 128), *range(original["max_context"] // 128)
     )

@@ -1,4 +1,5 @@
 use super::*;
+use crate::cuda::sys;
 
 impl ModelRuntime {
     pub(super) fn benchmark(
@@ -26,7 +27,7 @@ impl ModelRuntime {
             .iter()
             .find(|b| b.name == manifest.logits)
             .ok_or("Logits missing")?;
-        let dump_logits = |session: &Session,
+        let dump_logits = |_session: &Session,
                            q: &crate::model::Request,
                            step: usize,
                            files: &mut Vec<String>|
@@ -39,7 +40,7 @@ impl ModelRuntime {
             // allocation cover the complete logits tensor.
             unsafe {
                 check(
-                    (session.driver.download)(
+                    sys::cuMemcpyDtoH_v2(
                         raw.as_mut_ptr().cast(),
                         pointers[&manifest.logits],
                         raw.len(),
@@ -66,13 +67,13 @@ impl ModelRuntime {
             files.push(path.display().to_string());
             Ok(())
         };
-        let read_i32 = |session: &Session, name: &str| -> Result<i32> {
+        let read_i32 = |_session: &Session, name: &str| -> Result<i32> {
             let mut value = 0i32;
             // SAFETY: Control allocations and stack destination are >=4 bytes.
             // Every caller has synchronized the producing stream.
             unsafe {
                 check(
-                    (session.driver.download)((&mut value as *mut i32).cast(), pointers[name], 4),
+                    sys::cuMemcpyDtoH_v2((&mut value as *mut i32).cast(), pointers[name], 4),
                     "download control",
                 )?;
             }
@@ -103,7 +104,10 @@ impl ModelRuntime {
                 // SAFETY: Input IDs fit this allocation and were range checked.
                 // Previous graph is complete before overwriting its input buffer.
                 unsafe {
-                    check((s.driver.stream_sync)(s.stream), "prefill input dependency")?;
+                    check(
+                        sys::cuStreamSynchronize(s.stream),
+                        "prefill input dependency",
+                    )?;
                     if q.input_tokens.len() > 8192
                         && chunk_index > 0
                         && chunk_index.is_multiple_of(8)
@@ -117,14 +121,14 @@ impl ModelRuntime {
                         );
                     }
                     check(
-                        (s.driver.upload)(
+                        sys::cuMemcpyHtoD_v2(
                             pointers[&manifest.input],
                             chunk.as_ptr().cast(),
                             chunk.len() * 4,
                         ),
                         "prefill token upload",
                     )?;
-                    check((s.driver.context_sync)(), "prefill upload dependency")?;
+                    check(sys::cuCtxSynchronize(), "prefill upload dependency")?;
                 }
                 self.model_package.prepare_inputs(
                     "target",
@@ -137,7 +141,7 @@ impl ModelRuntime {
             }
             // SAFETY: Synchronize before head timing and output download.
             unsafe {
-                check((s.driver.stream_sync)(s.stream), "prefill complete")?;
+                check(sys::cuStreamSynchronize(s.stream), "prefill complete")?;
             }
             let prefill_s = request_start.elapsed().as_secs_f64();
             let head_start = Instant::now();
@@ -145,7 +149,7 @@ impl ModelRuntime {
                 .submit_program(head_program, ExecutionPhase::Prefill)?;
             // SAFETY: Head consumes last prefill graph's buffers on the same stream.
             unsafe {
-                check((s.driver.stream_sync)(s.stream), "head complete")?;
+                check(sys::cuStreamSynchronize(s.stream), "head complete")?;
             }
             if read_i32(s, &manifest.status)? != 0 {
                 return Err("Token selection status failure".into());
@@ -166,14 +170,14 @@ impl ModelRuntime {
                     // destination; explicit synchronization separates upload/replay.
                     unsafe {
                         check(
-                            (s.driver.upload)(
+                            sys::cuMemcpyHtoD_v2(
                                 pointers[&manifest.token],
                                 (id as *const u32).cast(),
                                 4,
                             ),
                             "teacher-force token",
                         )?;
-                        check((s.driver.context_sync)(), "teacher-force dependency")?;
+                        check(sys::cuCtxSynchronize(), "teacher-force dependency")?;
                     }
                 }
                 let input = q
@@ -194,7 +198,7 @@ impl ModelRuntime {
                 history.push(input);
                 // SAFETY: This session owns the live stream and all queued work.
                 unsafe {
-                    check((s.driver.stream_sync)(s.stream), "decode complete")?;
+                    check(sys::cuStreamSynchronize(s.stream), "decode complete")?;
                 }
                 if read_i32(s, &manifest.status)? != 0 {
                     return Err("Decode token status failure".into());

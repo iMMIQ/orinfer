@@ -1,6 +1,6 @@
 //! Shared immutable KV extents plus private endpoint state. Restore keeps graph VAs.
 use super::executor::Executor;
-use super::{Result, check};
+use super::{Result, check, sys};
 use std::{
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
@@ -151,14 +151,14 @@ impl Executor {
         // before any fallible copy; its destructor also handles error paths.
         unsafe {
             check(
-                (self.session.driver.memory_info)(&mut free, &mut total),
+                sys::cuMemGetInfo_v2(&mut free, &mut total),
                 "snapshot memory",
             )?;
             if bytes > free.saturating_sub(64 * 1024 * 1024) {
                 return Ok(None);
             }
-            let status = (self.session.driver.alloc)(&mut address, bytes);
-            if status == 2 {
+            let status = sys::cuMemAlloc_v2(&mut address, bytes);
+            if status == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
                 return Ok(None);
             }
             check(status, "allocate prefix snapshot")?;
@@ -173,7 +173,7 @@ impl Executor {
                 // orders all writes before the immutable snapshot is published.
                 unsafe {
                     check(
-                        (self.session.driver.copy)(
+                        sys::cuMemcpyDtoDAsync_v2(
                             address + source as u64,
                             self.pointers[&name] + range.offset as u64,
                             range.bytes,
@@ -219,7 +219,7 @@ impl Executor {
             // at capture, and graph-bound destinations retain their original VAs.
             unsafe {
                 check(
-                    (self.session.driver.copy)(
+                    sys::cuMemcpyDtoDAsync_v2(
                         self.pointers[&p.name] + p.range.offset as u64,
                         p.allocation.address + p.source as u64,
                         p.range.bytes,
@@ -259,10 +259,7 @@ impl Executor {
                 .ok_or("Unowned snapshot allocation")?;
             // SAFETY: Stream completed and registry is the only remaining owner.
             unsafe {
-                check(
-                    (self.session.driver.free)(a.address),
-                    "release prefix allocation",
-                )?;
+                check(sys::cuMemFree_v2(a.address), "release prefix allocation")?;
             }
             self.session.buffers.swap_remove(index);
             self.snapshot_allocations.swap_remove(i);

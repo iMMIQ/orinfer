@@ -1,5 +1,7 @@
 //! Generation orchestration, independent of API transport and CUDA graph binding.
 use crate::cuda::executor::{Executor, LoadStats};
+#[cfg(test)]
+use crate::cuda::sys;
 use crate::execution::{ExecutionPhase, LoadOptions};
 use crate::{
     artifact::Result,
@@ -228,7 +230,7 @@ mod tests {
             // allocation covers the complete validated logits buffer.
             unsafe {
                 check(
-                    (model.execution.session.driver.download)(
+                    sys::cuMemcpyDtoH_v2(
                         raw.as_mut_ptr().cast(),
                         model.execution.pointers[&model.manifest.logits],
                         raw.len(),

@@ -231,7 +231,12 @@ pub fn validate_schema(schema: &Value, param: &str) -> Result<()> {
     if schema.to_string().len() > 128 * 1024 {
         return Err(format!("{param}: Schema exceeds 128 KiB"));
     }
-    check_schema(schema, 0).map_err(|e| format!("{param}: {e}"))
+    check_schema(schema, 0).map_err(|e| format!("{param}: {e}"))?;
+    jsonschema::options()
+        .offline()
+        .build(schema)
+        .map_err(|e| format!("{param}: {e}"))?;
+    Ok(())
 }
 
 pub fn recipe(

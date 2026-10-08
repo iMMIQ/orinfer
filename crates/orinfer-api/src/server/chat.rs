@@ -173,50 +173,10 @@ impl ChatCodec {
             return Err("EOS outside tokenizer vocabulary".into());
         }
         let mut environment = Environment::new();
-        // The checkpoint uses Python's startswith/endswith methods on strings.
-        environment.set_unknown_method_callback(|_, value, method, args| {
-            if let (Some(text), [arg]) = (value.as_str(), args)
-                && let Some(arg) = arg.as_str()
-            {
-                match method {
-                    "startswith" => return Ok(minijinja::Value::from(text.starts_with(arg))),
-                    "endswith" => return Ok(minijinja::Value::from(text.ends_with(arg))),
-                    _ => {}
-                }
-            }
-            Err(minijinja::Error::new(
-                minijinja::ErrorKind::UnknownMethod,
-                "Unsupported template method",
-            ))
-        });
-        // Match Transformers' Unicode-preserving JSON filter and separators.
-        environment.add_filter(
-            "tojson",
-            |value: minijinja::Value| -> std::result::Result<minijinja::Value, minijinja::Error> {
-                let mut value = serde_json::to_value(&value).map_err(|e| {
-                    minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
-                })?;
-                canonical(&mut value);
-                let raw = serde_json::to_string(&value).unwrap();
-                let mut spaced = String::new();
-                let (mut quoted, mut escaped) = (false, false);
-                for c in raw.chars() {
-                    spaced.push(c);
-                    if escaped {
-                        escaped = false;
-                        continue;
-                    }
-                    if quoted && c == '\\' {
-                        escaped = true;
-                    } else if c == '"' {
-                        quoted = !quoted;
-                    } else if !quoted && (c == ',' || c == ':') {
-                        spaced.push(' ');
-                    }
-                }
-                Ok(minijinja::Value::from_safe_string(spaced))
-            },
-        );
+        environment
+            .set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        // Transformers uses Unicode-preserving JSON with Python separators, not HTML escaping.
+        environment.add_filter("tojson", template_json);
         environment.add_function(
             "raise_exception",
             |message: String| -> std::result::Result<String, minijinja::Error> {
@@ -429,6 +389,12 @@ impl ChatCodec {
                     "tools[{index}].function.parameters: Expected JSON schema object"
                 ));
             }
+            if !function["parameters"].is_null() {
+                super::grammar::validate_schema(
+                    &function["parameters"],
+                    &format!("tools[{index}].function.parameters"),
+                )?;
+            }
             if function
                 .get("strict")
                 .is_some_and(|s| !s.is_null() && !s.is_boolean())
@@ -622,6 +588,52 @@ impl ChatCodec {
         })
     }
 }
+struct PythonJsonFormatter;
+impl serde_json::ser::Formatter for PythonJsonFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if !first {
+            writer.write_all(b", ")?;
+        }
+        Ok(())
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if !first {
+            writer.write_all(b", ")?;
+        }
+        Ok(())
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
+}
+fn template_json(
+    value: minijinja::Value,
+) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    let serialize = || -> std::result::Result<String, serde_json::Error> {
+        let mut value = serde_json::to_value(&value)?;
+        canonical(&mut value);
+        let mut bytes = Vec::new();
+        let mut serializer =
+            serde_json::Serializer::with_formatter(&mut bytes, PythonJsonFormatter);
+        serde::Serialize::serialize(&value, &mut serializer)?;
+        // serde_json always writes UTF-8, including unescaped Unicode.
+        Ok(String::from_utf8(bytes).expect("JSON serializer produces UTF-8"))
+    };
+    serialize()
+        .map(minijinja::Value::from_safe_string)
+        .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
+}
 fn canonical(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -755,6 +767,22 @@ fn normalize_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn template_json_matches_python_separators_unicode_and_string_escaping() {
+        let value = json!({"z":["世界", "a,b:c", "\"\\", "<>&'"],"a":{"b":true},"empty":[]});
+        let result = template_json(minijinja::Value::from_serialize(&value)).unwrap();
+        assert_eq!(
+            result.as_str().unwrap(),
+            r#"{"a": {"b": true}, "empty": [], "z": ["世界", "a,b:c", "\"\\", "<>&'"]}"#
+        );
+    }
+    #[test]
+    fn template_python_methods_support_real_python_argument_shapes() {
+        let mut environment = Environment::new();
+        environment
+            .set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        assert_eq!(environment.render_str("{{ 'ABC'.lower() }} {{ 'abcdef'.startswith(['xy', 'ab']) }} {{ 'abc'.endswith('bc') }} {{ ' a '.strip() }}", minijinja::context!()).unwrap(), "abc True True a");
+    }
     #[test]
     fn nullable_optional_fields_and_signed_seed_match_the_wire_contract() {
         let request: ChatRequest=serde_json::from_value(json!({"model":"test","messages":[],"tools":null,"stream":null,"seed":-1,"store":false,"metadata":{"case":"test"},"logprobs":true,"top_logprobs":3,"logit_bias":{"42":-100}})).unwrap();

@@ -1,6 +1,6 @@
 //! Request arenas share immutable weights and workspace. Switching an arena
 //! changes host bindings, never copies recurrent state or KV payloads.
-use super::{Argument, Handle, Result, Value, check, executor::Executor, ptr};
+use super::{Argument, Handle, Result, Value, check, executor::Executor, ptr, sys};
 use crate::{execution::Invocation, model::Operation};
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -82,7 +82,7 @@ impl Executor {
         // SAFETY: The worker owns the current context and both output scalars.
         unsafe {
             check(
-                (self.session.driver.memory_info)(&mut free, &mut total),
+                sys::cuMemGetInfo_v2(&mut free, &mut total),
                 "sequence free memory",
             )?;
         }
@@ -222,7 +222,7 @@ impl Executor {
                         // graphs; retired ownership remains registered on failure.
                         unsafe {
                             check(
-                                (self.session.driver.vmm_address_free)(old.address, old.bytes),
+                                sys::cuMemAddressFree(old.address, old.bytes),
                                 "free idle KV reservation",
                             )?;
                         }
@@ -234,17 +234,17 @@ impl Executor {
                     // allocation. Transfer new ownership before initialization.
                     unsafe {
                         check(
-                            (self.session.driver.alloc)(&mut address, bytes),
+                            sys::cuMemAlloc_v2(&mut address, bytes),
                             "grow request metadata",
                         )?;
                         self.session.buffers.push(address);
                         check(
-                            (self.session.driver.memset)(address, 0, bytes, self.session.stream),
+                            sys::cuMemsetD8Async(address, 0, bytes, self.session.stream),
                             "initialize request metadata",
                         )?;
                         let old = self.sequences[slot].addresses[&name];
                         if old != 0 {
-                            check((self.session.driver.free)(old), "free idle metadata")?;
+                            check(sys::cuMemFree_v2(old), "free idle metadata")?;
                             self.session.buffers.retain(|&p| p != old);
                         }
                     }
@@ -275,13 +275,13 @@ impl Executor {
                     // initialization or any subsequent fallible operation.
                     unsafe {
                         check(
-                            (self.session.driver.alloc)(&mut address, bytes),
+                            sys::cuMemAlloc_v2(&mut address, bytes),
                             "allocate request state",
                         )?;
                         self.session.buffers.push(address);
                         allocated.push(address);
                         check(
-                            (self.session.driver.memset)(address, 0, bytes, self.session.stream),
+                            sys::cuMemsetD8Async(address, 0, bytes, self.session.stream),
                             "initialize request state",
                         )?;
                     }
@@ -312,16 +312,13 @@ impl Executor {
                 for key in failed {
                     let r = &self.session.virtual_buffers.get_mut()[&key];
                     check(
-                        (self.session.driver.vmm_address_free)(r.address, r.bytes),
+                        sys::cuMemAddressFree(r.address, r.bytes),
                         "rollback request reservation",
                     )?;
                     self.session.virtual_buffers.get_mut().remove(&key);
                 }
                 for address in allocated {
-                    check(
-                        (self.session.driver.free)(address),
-                        "rollback request state",
-                    )?;
+                    check(sys::cuMemFree_v2(address), "rollback request state")?;
                     self.session.buffers.retain(|&p| p != address);
                 }
             }
@@ -390,15 +387,9 @@ impl Executor {
                 let (graph, exec) = owned[index];
                 // SAFETY: Idle stream, graphs removed from every execution map.
                 unsafe {
-                    check(
-                        (self.session.driver.graph_exec_destroy)(exec),
-                        "invalidate metadata graph",
-                    )?;
+                    check(sys::cuGraphExecDestroy(exec), "invalidate metadata graph")?;
                     owned[index].1 = std::ptr::null_mut();
-                    check(
-                        (self.session.driver.graph_destroy)(graph),
-                        "invalidate metadata capture",
-                    )?;
+                    check(sys::cuGraphDestroy(graph), "invalidate metadata capture")?;
                 }
                 owned.remove(index);
             } else {
@@ -628,10 +619,7 @@ impl Executor {
                 // SAFETY: Unleased arena, synchronized stream, invalidated
                 // graphs. Ownership is removed immediately after successful free.
                 unsafe {
-                    check(
-                        (self.session.driver.free)(address),
-                        "reclaim idle request state",
-                    )?;
+                    check(sys::cuMemFree_v2(address), "reclaim idle request state")?;
                 }
                 self.session.buffers.retain(|&p| p != address);
                 self.sequences[slot].addresses.insert(name.clone(), 0);
@@ -754,7 +742,7 @@ impl Executor {
                 // ranges, and are ordered with their producers on this stream.
                 unsafe {
                     check(
-                        (self.session.driver.copy)(
+                        sys::cuMemcpyDtoDAsync_v2(
                             address(destination)?,
                             address(source)?,
                             *bytes,
@@ -769,12 +757,7 @@ impl Executor {
                 // SAFETY: Checked writable range, ordered on the owner stream.
                 unsafe {
                     check(
-                        (self.session.driver.memset)(
-                            address(destination)?,
-                            0,
-                            *bytes,
-                            self.session.stream,
-                        ),
+                        sys::cuMemsetD8Async(address(destination)?, 0, *bytes, self.session.stream),
                         "batch zero",
                     )
                 }
@@ -810,7 +793,10 @@ impl Executor {
         // capture records work, and the worker is the stream's sole submitter.
         unsafe {
             check(
-                (self.session.driver.capture_begin)(self.session.stream, 0),
+                sys::cuStreamBeginCapture_v2(
+                    self.session.stream,
+                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+                ),
                 "begin request capture",
             )?;
         }
@@ -819,7 +805,7 @@ impl Executor {
         // SAFETY: Always end capture, including a failed recorded operation.
         let end = unsafe {
             check(
-                (self.session.driver.capture_end)(self.session.stream, &mut graph),
+                sys::cuStreamEndCapture(self.session.stream, &mut graph),
                 "end request capture",
             )
         };
@@ -827,7 +813,7 @@ impl Executor {
             if !graph.is_null() {
                 // SAFETY: This local failed capture is not owned elsewhere.
                 unsafe {
-                    (self.session.driver.graph_destroy)(graph);
+                    sys::cuGraphDestroy(graph);
                 }
             }
             return Err(error);
@@ -836,10 +822,10 @@ impl Executor {
         // SAFETY: Graph is locally owned until transferred into Session.
         unsafe {
             if let Err(error) = check(
-                (self.session.driver.graph_instantiate)(&mut exec, graph, 0),
+                sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0),
                 "instantiate request graph",
             ) {
-                (self.session.driver.graph_destroy)(graph);
+                sys::cuGraphDestroy(graph);
                 return Err(error);
             }
         }
@@ -966,7 +952,7 @@ impl Executor {
             // SAFETY: Captured pointers refer to stable, retained request arenas.
             unsafe {
                 check(
-                    (self.session.driver.graph_launch)(graph, self.session.stream),
+                    sys::cuGraphLaunch(graph, self.session.stream),
                     "batch graph",
                 )?;
             }
@@ -991,16 +977,13 @@ impl Executor {
 
 #[cfg(test)]
 impl Executor {
-    fn profile_events(&mut self, count: usize) -> Result<Vec<Handle>> {
+    fn profile_events(&mut self, count: usize) -> Result<Vec<sys::CUevent>> {
         let mut events = Vec::with_capacity(count);
         for _ in 0..count {
             let mut event = ptr::null_mut();
             // SAFETY: Live context; transfer ownership before any further error.
             unsafe {
-                check(
-                    (self.session.driver.event_create)(&mut event, 0),
-                    "profile event",
-                )?;
+                check(sys::cuEventCreate(&mut event, 0), "profile event")?;
             }
             self.session.events.push(event);
             events.push(event);
@@ -1028,23 +1011,20 @@ impl Executor {
             // SAFETY: Stable graph bindings, owned events and worker stream.
             unsafe {
                 check(
-                    (self.session.driver.event_record)(events[0], self.session.stream),
+                    sys::cuEventRecord(events[0], self.session.stream),
                     "profile start",
                 )?;
                 check(
-                    (self.session.driver.graph_launch)(graph, self.session.stream),
+                    sys::cuGraphLaunch(graph, self.session.stream),
                     "profile replay",
                 )?;
                 check(
-                    (self.session.driver.event_record)(events[1], self.session.stream),
+                    sys::cuEventRecord(events[1], self.session.stream),
                     "profile end",
                 )?;
+                check(sys::cuEventSynchronize(events[1]), "profile completion")?;
                 check(
-                    (self.session.driver.event_sync)(events[1]),
-                    "profile completion",
-                )?;
-                check(
-                    (self.session.driver.event_elapsed)(&mut ms, events[0], events[1]),
+                    sys::cuEventElapsedTime(&mut ms, events[0], events[1]),
                     "profile elapsed",
                 )?;
             }
@@ -1065,20 +1045,13 @@ impl Executor {
     ) -> Result<Vec<Vec<f32>>> {
         self.sync()?;
         let events = self.profile_events(operations.len() + 1)?;
-        type Record = unsafe extern "C" fn(Handle, Handle, u32) -> i32;
-        // SAFETY: Driver library outlives the symbol; signature is CUDA 12.6 ABI.
-        let record = unsafe {
-            *self
-                .session
-                .driver
-                ._library
-                .get::<Record>(b"cuEventRecordWithFlags\0")
-                .map_err(|e| e.to_string())?
-        };
         // SAFETY: Sole stream owner; external event nodes retain timestamps in replay.
         unsafe {
             check(
-                (self.session.driver.capture_begin)(self.session.stream, 0),
+                sys::cuStreamBeginCapture_v2(
+                    self.session.stream,
+                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+                ),
                 "profile capture",
             )?;
         }
@@ -1087,7 +1060,7 @@ impl Executor {
                 // SAFETY: Owned event, during capture; CU_EVENT_RECORD_EXTERNAL=1.
                 unsafe {
                     check(
-                        record(events[i], self.session.stream, 1),
+                        sys::cuEventRecordWithFlags(events[i], self.session.stream, 1),
                         "profile boundary",
                     )?;
                 }
@@ -1096,7 +1069,7 @@ impl Executor {
             // SAFETY: Last event records completion of all captured operations.
             unsafe {
                 check(
-                    record(*events.last().unwrap(), self.session.stream, 1),
+                    sys::cuEventRecordWithFlags(*events.last().unwrap(), self.session.stream, 1),
                     "profile last boundary",
                 )?;
             }
@@ -1106,7 +1079,7 @@ impl Executor {
         // SAFETY: Always terminate capture after either success or failure.
         let end = unsafe {
             check(
-                (self.session.driver.capture_end)(self.session.stream, &mut graph),
+                sys::cuStreamEndCapture(self.session.stream, &mut graph),
                 "profile capture end",
             )
         };
@@ -1114,7 +1087,7 @@ impl Executor {
             if !graph.is_null() {
                 // SAFETY: Failed graph has no other owner.
                 unsafe {
-                    (self.session.driver.graph_destroy)(graph);
+                    sys::cuGraphDestroy(graph);
                 }
             }
             return Err(error);
@@ -1123,10 +1096,10 @@ impl Executor {
         // SAFETY: Locally owned graph transferred to session on success.
         unsafe {
             if let Err(error) = check(
-                (self.session.driver.graph_instantiate)(&mut exec, graph, 0),
+                sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0),
                 "profile instantiate",
             ) {
-                (self.session.driver.graph_destroy)(graph);
+                sys::cuGraphDestroy(graph);
                 return Err(error);
             }
         }
@@ -1139,7 +1112,7 @@ impl Executor {
             // SAFETY: All request buffers are retained; bounded extra steps fit reservations.
             unsafe {
                 check(
-                    (self.session.driver.graph_launch)(exec, self.session.stream),
+                    sys::cuGraphLaunch(exec, self.session.stream),
                     "profile operation replay",
                 )?;
             }
@@ -1153,7 +1126,7 @@ impl Executor {
                 // SAFETY: Events completed on the same stream in replay order.
                 unsafe {
                     check(
-                        (self.session.driver.event_elapsed)(&mut ms, pair[0], pair[1]),
+                        sys::cuEventElapsedTime(&mut ms, pair[0], pair[1]),
                         "profile operation elapsed",
                     )?;
                 }

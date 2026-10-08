@@ -5,7 +5,7 @@ pub(super) type BatchGraphCache = BTreeMap<Vec<(usize, usize)>, (Handle, u64, us
 
 pub(super) struct DirectKernel {
     pub(super) spec: Kernel,
-    pub(super) function: Handle,
+    pub(super) function: sys::CUfunction,
     pub(super) values: Vec<Value>,
 }
 
@@ -148,28 +148,48 @@ impl Executor {
         // The synchronous upload borrows live host storage until the driver returns.
         // Async memset touches separate session-owned allocations on our stream.
         unsafe {
-            check((s.driver.init)(0), "cuInit model")?;
-            check((s.driver.device)(&mut s.device, 0), "model device")?;
-            check((s.driver.attribute)(&mut major, 75, s.device), "SM major")?;
-            check((s.driver.attribute)(&mut minor, 76, s.device), "SM minor")?;
+            check(sys::cuInit(0), "cuInit model")?;
+            check(sys::cuDeviceGet(&mut s.device, 0), "model device")?;
+            check(
+                sys::cuDeviceGetAttribute(
+                    &mut major,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    s.device,
+                ),
+                "SM major",
+            )?;
+            check(
+                sys::cuDeviceGetAttribute(
+                    &mut minor,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    s.device,
+                ),
+                "SM minor",
+            )?;
             if [major, minor] != [8, 7] {
                 return Err("Model requires SM87".into());
             }
-            check((s.driver.version)(&mut version), "driver version")?;
+            check(sys::cuDriverGetVersion(&mut version), "driver version")?;
             check(
-                (s.driver.name)(name.as_mut_ptr().cast(), 256, s.device),
+                sys::cuDeviceGetName(name.as_mut_ptr().cast(), 256, s.device),
                 "device name",
             )?;
-            check((s.driver.total)(&mut total, s.device), "total memory")?;
-            check((s.driver.current)(&mut s.previous), "previous context")?;
+            check(
+                sys::cuDeviceTotalMem_v2(&mut total, s.device),
+                "total memory",
+            )?;
+            check(sys::cuCtxGetCurrent(&mut s.previous), "previous context")?;
             let mut context = ptr::null_mut();
-            check((s.driver.retain)(&mut context, s.device), "retain context")?;
+            check(
+                sys::cuDevicePrimaryCtxRetain(&mut context, s.device),
+                "retain context",
+            )?;
             s.retained = true;
-            check((s.driver.set_current)(context), "current context")?;
-            check((s.driver.stream_create)(&mut s.stream, 1), "model stream")?;
+            check(sys::cuCtxSetCurrent(context), "current context")?;
+            check(sys::cuStreamCreate(&mut s.stream, 1), "model stream")?;
             let (mut free, mut memtotal) = (0usize, 0usize);
             check(
-                (s.driver.memory_info)(&mut free, &mut memtotal),
+                sys::cuMemGetInfo_v2(&mut free, &mut memtotal),
                 "available memory",
             )?;
             if buffer_bytes > free {
@@ -206,7 +226,7 @@ impl Executor {
                 // SAFETY: Validated extent, immediately transferred to Session.
                 unsafe {
                     check(
-                        (s.driver.alloc)(&mut address, bytes),
+                        sys::cuMemAlloc_v2(&mut address, bytes),
                         &format!("allocate {}", b.name),
                     )?;
                 }
@@ -236,7 +256,7 @@ impl Executor {
                 // synchronous transfer finishes. No online Python is involved.
                 unsafe {
                     check(
-                        (s.driver.upload)(address, raw.as_ptr().cast(), bytes),
+                        sys::cuMemcpyHtoD_v2(address, raw.as_ptr().cast(), bytes),
                         &format!("upload {}", b.name),
                     )?;
                 }
@@ -245,7 +265,7 @@ impl Executor {
                 // SAFETY: Whole allocation is owned and not in use yet.
                 unsafe {
                     check(
-                        (s.driver.memset)(address, 0, bytes, s.stream),
+                        sys::cuMemsetD8Async(address, 0, bytes, s.stream),
                         "initialize workspace",
                     )?;
                 }
@@ -253,8 +273,8 @@ impl Executor {
         }
         drop(weights);
         let module_started = Instant::now();
-        let mut modules = BTreeMap::<String, Handle>::new();
-        let mut functions = BTreeMap::<(String, String), Handle>::new();
+        let mut modules = BTreeMap::<String, sys::CUmodule>::new();
+        let mut functions = BTreeMap::<(String, String), sys::CUfunction>::new();
         let mut launches = BTreeMap::new();
         for k in &manifest.kernels {
             let module = if let Some(m) = modules.get(&k.module.file) {
@@ -271,7 +291,7 @@ impl Executor {
                 // Driver copies module data; session owns the resulting handle.
                 unsafe {
                     check(
-                        (s.driver.module_load)(&mut module, image.as_ptr().cast()),
+                        sys::cuModuleLoadData(&mut module, image.as_ptr().cast()),
                         &format!("load {}", k.name),
                     )?;
                 }
@@ -288,7 +308,7 @@ impl Executor {
                 // SAFETY: Module remains live and symbol is a terminated C string.
                 unsafe {
                     check(
-                        (s.driver.function)(&mut function, module, symbol.as_ptr()),
+                        sys::cuModuleGetFunction(&mut function, module, symbol.as_ptr()),
                         "model function",
                     )?;
                 }
@@ -301,19 +321,31 @@ impl Executor {
                 let (mut threads, mut static_shared, mut max_shared, mut default_shared) =
                     (0, 0, 0, 0);
                 check(
-                    (s.driver.function_get)(&mut threads, 0, function),
+                    sys::cuFuncGetAttribute(
+                        &mut threads,
+                        sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                        function,
+                    ),
                     "function threads",
                 )?;
                 check(
-                    (s.driver.function_get)(&mut static_shared, 1, function),
+                    sys::cuFuncGetAttribute(
+                        &mut static_shared,
+                        sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                        function,
+                    ),
                     "static shared memory",
                 )?;
                 check(
-                    (s.driver.attribute)(&mut max_shared, 97, s.device),
+                    sys::cuDeviceGetAttribute(&mut max_shared, sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, s.device),
                     "shared memory limit",
                 )?;
                 check(
-                    (s.driver.attribute)(&mut default_shared, 8, s.device),
+                    sys::cuDeviceGetAttribute(
+                        &mut default_shared,
+                        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+                        s.device,
+                    ),
                     "default shared memory",
                 )?;
                 let shared = u64::from(k.shared_memory_bytes) + static_shared as u64;
@@ -323,11 +355,27 @@ impl Executor {
                 for axis in 0..3 {
                     let (mut block, mut grid) = (0, 0);
                     check(
-                        (s.driver.attribute)(&mut block, 2 + axis as i32, s.device),
+                        sys::cuDeviceGetAttribute(
+                            &mut block,
+                            [
+                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X,
+                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y,
+                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z,
+                            ][axis],
+                            s.device,
+                        ),
                         "block limit",
                     )?;
                     check(
-                        (s.driver.attribute)(&mut grid, 5 + axis as i32, s.device),
+                        sys::cuDeviceGetAttribute(
+                            &mut grid,
+                            [
+                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X,
+                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y,
+                                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z,
+                            ][axis],
+                            s.device,
+                        ),
                         "grid limit",
                     )?;
                     if k.block[axis] > block as u32 || k.grid[axis] > grid as u32 {
@@ -336,7 +384,7 @@ impl Executor {
                 }
                 if shared > default_shared as u64 {
                     check(
-                        (s.driver.function_set)(function, 8, k.shared_memory_bytes as i32),
+                        sys::cuFuncSetAttribute(function, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k.shared_memory_bytes as i32),
                         "opt-in shared memory",
                     )?;
                 }
@@ -369,7 +417,7 @@ impl Executor {
         // SAFETY: Flush all default-stream uploads and workspace initialization
         // before capture on a nonblocking stream. No allocation occurs in graphs.
         unsafe {
-            check((s.driver.context_sync)(), "model uploads complete")?;
+            check(sys::cuCtxSynchronize(), "model uploads complete")?;
         }
         // Request limits can replace initial private buffers on the first lease.
         // Capture only when a program is submitted with its final arena bindings;
@@ -471,7 +519,7 @@ impl Executor {
         // SAFETY: This thread owns the live stream and all graph allocations.
         unsafe {
             check(
-                (self.session.driver.stream_sync)(self.session.stream),
+                sys::cuStreamSynchronize(self.session.stream),
                 "model synchronize",
             )
         }
@@ -492,7 +540,7 @@ impl Executor {
                     // SAFETY: Completed stream, owned mapping and full mapped range.
                     unsafe {
                         check(
-                            (self.session.driver.memset)(
+                            sys::cuMemsetD8Async(
                                 buffer.address,
                                 0,
                                 buffer.mapped,
@@ -518,7 +566,7 @@ impl Executor {
             // allocations. The next request cannot run until this stream completes.
             unsafe {
                 check(
-                    (self.session.driver.memset)(address, 0, self.sizes[name], self.session.stream),
+                    sys::cuMemsetD8Async(address, 0, self.sizes[name], self.session.stream),
                     "reset sequence",
                 )?;
             }
@@ -543,7 +591,7 @@ impl Executor {
         // SAFETY: Both ranges cover bytes and the producing stream has completed.
         unsafe {
             check(
-                (self.session.driver.download)(raw.as_mut_ptr().cast(), self.pointers[name], bytes),
+                sys::cuMemcpyDtoH_v2(raw.as_mut_ptr().cast(), self.pointers[name], bytes),
                 "download tensor",
             )?;
         }
@@ -567,7 +615,7 @@ impl Executor {
         // executor and the transfer is ordered with graph work on the same stream.
         unsafe {
             check(
-                (self.session.driver.copy)(
+                sys::cuMemcpyDtoDAsync_v2(
                     self.pointers[destination] + offset as u64,
                     self.pointers[source],
                     bytes,
@@ -591,7 +639,7 @@ impl Executor {
             // SAFETY: Graphs and their stable addresses live in this thread's session.
             unsafe {
                 check(
-                    (self.session.driver.graph_launch)(graph, self.session.stream),
+                    sys::cuGraphLaunch(graph, self.session.stream),
                     "model graph",
                 )?;
             }
@@ -640,7 +688,7 @@ impl Executor {
                         // allocations are used by the captured program above.
                         unsafe {
                             check(
-                                (self.session.driver.copy)(
+                                sys::cuMemcpyDtoDAsync_v2(
                                     self.pointers[destination],
                                     self.pointers[source],
                                     *bytes,
@@ -655,7 +703,7 @@ impl Executor {
                         // its producers and consumers, with no extra sync.
                         unsafe {
                             check(
-                                (self.session.driver.memset)(
+                                sys::cuMemsetD8Async(
                                     self.pointers[destination],
                                     0,
                                     *bytes,
@@ -699,7 +747,7 @@ impl Executor {
         // SAFETY: Live context; driver writes two scalar extents.
         unsafe {
             check(
-                (self.session.driver.memory_info)(&mut free, &mut total),
+                sys::cuMemGetInfo_v2(&mut free, &mut total),
                 "KV available memory",
             )?;
         }
@@ -732,17 +780,10 @@ impl Executor {
         // SAFETY: Synchronous copy borrows live IDs; validated allocation covers it.
         unsafe {
             check(
-                (self.session.driver.upload)(
-                    self.pointers[name],
-                    ids.as_ptr().cast(),
-                    ids.len() * 4,
-                ),
+                sys::cuMemcpyHtoD_v2(self.pointers[name], ids.as_ptr().cast(), ids.len() * 4),
                 "model IDs",
             )?;
-            check(
-                (self.session.driver.context_sync)(),
-                "model upload dependency",
-            )
+            check(sys::cuCtxSynchronize(), "model upload dependency")
         }
     }
     pub(crate) fn read_control(&self, name: &str) -> Result<i32> {
@@ -750,11 +791,7 @@ impl Executor {
         // SAFETY: Producer is synchronized, the control and destination cover 4 bytes.
         unsafe {
             check(
-                (self.session.driver.download)(
-                    (&mut value as *mut i32).cast(),
-                    self.pointers[name],
-                    4,
-                ),
+                sys::cuMemcpyDtoH_v2((&mut value as *mut i32).cast(), self.pointers[name], 4),
                 "model control",
             )?;
         }
@@ -769,17 +806,10 @@ impl Executor {
         // SAFETY: The synchronized destination is live and covers the borrowed bytes.
         unsafe {
             check(
-                (self.session.driver.upload)(
-                    self.pointers[name],
-                    bytes.as_ptr().cast(),
-                    bytes.len(),
-                ),
+                sys::cuMemcpyHtoD_v2(self.pointers[name], bytes.as_ptr().cast(), bytes.len()),
                 "image upload",
             )?;
-            check(
-                (self.session.driver.context_sync)(),
-                "image upload dependency",
-            )
+            check(sys::cuCtxSynchronize(), "image upload dependency")
         }
     }
     pub(crate) fn read_controls(&self, name: &str, count: usize) -> Result<Vec<u32>> {
@@ -791,11 +821,7 @@ impl Executor {
         // SAFETY: Producer is synchronized; both extents are checked above.
         unsafe {
             check(
-                (self.session.driver.download)(
-                    values.as_mut_ptr().cast(),
-                    self.pointers[name],
-                    bytes,
-                ),
+                sys::cuMemcpyDtoH_v2(values.as_mut_ptr().cast(), self.pointers[name], bytes),
                 "MTP controls",
             )?;
         }

@@ -1,132 +1,136 @@
-use orinfer_engine::execution::LoadOptions;
-use std::process::ExitCode;
+use clap::{Args, Parser, Subcommand};
+use orinfer_api::{PreprocessingLimits, ServerConfig};
+use orinfer_engine::execution::{CudaGraphMode, LoadOptions, parse_cache_mib, parse_mtp_drafts};
+use std::{path::PathBuf, process::ExitCode};
 
-fn model_options(args: &[String]) -> Result<LoadOptions, String> {
-    if args.len() < 2 {
-        return Err(
-            "Usage: orinfer <run-model | score-model> MODEL_DIR REQUESTS.json [--cuda-graph decode_only|full|off]"
-                .into(),
-        );
+#[derive(Clone, Debug)]
+struct MtpDrafts(Option<usize>);
+impl std::str::FromStr for MtpDrafts {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, String> {
+        parse_mtp_drafts(value).map(Self)
     }
-    let mut options = LoadOptions::default();
-    for pair in args[2..].chunks(2) {
-        if pair.len() != 2 {
-            return Err("Model option needs a value".into());
-        }
-        match pair[0].as_str() {
-            "--cuda-graph" => options.cuda_graph = pair[1].parse()?,
-            _ => return Err(format!("Unknown model option {}", pair[0])),
-        }
-    }
-    Ok(options)
 }
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|c| c == "serve") {
-        return match orinfer_api::run(&args[1..]) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("serve: {error}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-    if args
-        .first()
-        .is_some_and(|c| c == "validate-model" || c == "plan-model")
-    {
-        if args.len() != 2 {
-            eprintln!("Usage: orinfer <validate-model | plan-model> MODEL_DIR");
-            return ExitCode::from(2);
+#[derive(Parser)]
+#[command(name = "orinfer", version, about = "LLM inference on Jetson AGX Orin")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+#[derive(Subcommand)]
+enum Command {
+    /// Show target and implementation status (default command).
+    Info,
+    /// Print the benchmark specification as JSON.
+    Plan,
+    /// Check AOT fixture and file hashes without CUDA.
+    ValidateArtifact { manifest: PathBuf },
+    /// Execute an SM87 AOT fixture and validate graph replay.
+    RunArtifact { manifest: PathBuf },
+    /// Inspect the native model package plan without CUDA.
+    PlanModel { model_dir: PathBuf },
+    /// Verify model, execution package and tensor hashes without CUDA.
+    ValidateModel { model_dir: PathBuf },
+    /// Run requests through the native model package.
+    RunModel(ModelArgs),
+    /// Score frozen token histories through real prefill/decode kernels.
+    ScoreModel(ModelArgs),
+    /// Serve the OpenAI Chat Completions API.
+    Serve(ServeArgs),
+}
+#[derive(Args)]
+struct GraphArgs {
+    /// CUDA graph capture: decode_only, full or off.
+    #[arg(long, value_name = "MODE", default_value_t = CudaGraphMode::default())]
+    cuda_graph: CudaGraphMode,
+}
+#[derive(Args)]
+struct ModelArgs {
+    model_dir: PathBuf,
+    requests: PathBuf,
+    #[command(flatten)]
+    graph: GraphArgs,
+}
+#[derive(Args)]
+struct ServeArgs {
+    /// Prepared model directory including tokenizer and execution package.
+    model_dir: PathBuf,
+    #[arg(long, default_value_t = ServerConfig::default().listen)]
+    listen: String,
+    #[arg(long, default_value_t = ServerConfig::default().model)]
+    model: String,
+    #[arg(long, default_value_os_t = ServerConfig::default().gpu_lock)]
+    gpu_lock: PathBuf,
+    #[command(flatten)]
+    graph: GraphArgs,
+    /// auto uses the package default; 0 disables MTP; 1..7 sets draft count.
+    #[arg(long, value_name = "N", default_value = "auto")]
+    mtp_drafts: MtpDrafts,
+    /// Snapshot cache budget in MiB; 0 disables reuse.
+    #[arg(long = "prefix-cache-mib", value_name = "MIB", default_value_t = ServerConfig::default().prefix_cache_bytes >> 20, value_parser = parse_cache_mib)]
+    prefix_cache_bytes: usize,
+    #[arg(long, default_value_t = ServerConfig::default().scheduler.max_active)]
+    max_active_requests: usize,
+    #[arg(long, default_value_t = ServerConfig::default().scheduler.max_batch_tokens)]
+    max_batch_tokens: usize,
+    /// Predicted mixed prefill budget per iteration in milliseconds.
+    #[arg(long, default_value_t = ServerConfig::default().scheduler.prefill_budget_ms)]
+    prefill_budget_ms: f64,
+    /// Soft target for decode token intervals in milliseconds.
+    #[arg(long, default_value_t = ServerConfig::default().scheduler.target_tpot_ms)]
+    target_tpot_ms: f64,
+    #[arg(long = "memory-reserve-mib", value_name = "MIB", default_value_t = ServerConfig::default().scheduler.memory_reserve_bytes >> 20, value_parser = parse_cache_mib)]
+    memory_reserve_bytes: usize,
+    #[arg(long, default_value_t = PreprocessingLimits::default().preprocess_workers)]
+    preprocess_workers: usize,
+    #[arg(long, default_value_t = PreprocessingLimits::default().memory_mib)]
+    preprocess_memory_mib: usize,
+    /// Queue deadline in milliseconds; 0 means unlimited.
+    #[arg(long, default_value_t = PreprocessingLimits::default().queue_ms)]
+    queue_timeout_ms: u64,
+    #[arg(long, default_value_t = PreprocessingLimits::default().output_ms)]
+    output_timeout_ms: u64,
+    #[arg(long, default_value_t = PreprocessingLimits::default().drain_ms)]
+    drain_timeout_ms: u64,
+}
+impl From<ServeArgs> for ServerConfig {
+    fn from(args: ServeArgs) -> Self {
+        Self {
+            model_dir: args.model_dir,
+            model: args.model,
+            listen: args.listen,
+            gpu_lock: args.gpu_lock,
+            cuda_graph: args.graph.cuda_graph,
+            mtp_drafts: args.mtp_drafts.0,
+            prefix_cache_bytes: args.prefix_cache_bytes,
+            scheduler: orinfer_engine::scheduler::Options {
+                max_active: args.max_active_requests,
+                max_batch_tokens: args.max_batch_tokens,
+                prefill_budget_ms: args.prefill_budget_ms,
+                target_tpot_ms: args.target_tpot_ms,
+                memory_reserve_bytes: args.memory_reserve_bytes,
+            },
+            limits: PreprocessingLimits {
+                preprocess_workers: args.preprocess_workers,
+                memory_mib: args.preprocess_memory_mib,
+                queue_ms: args.queue_timeout_ms,
+                output_ms: args.output_timeout_ms,
+                drain_ms: args.drain_timeout_ms,
+            },
         }
-        let path = std::path::Path::new(&args[1]);
-        let result = if args[0] == "plan-model" {
-            orinfer_engine::model::inspect_plan(path)
-                .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
-        } else {
-            orinfer_engine::model::validate_model(path)
-                .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
-        };
-        return match result {
-            Ok(json) => {
-                println!("{json}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{}: {error}", args[0]);
-                ExitCode::FAILURE
-            }
-        };
     }
-    if args
-        .first()
-        .is_some_and(|c| c == "run-model" || c == "score-model")
-    {
-        let options = match model_options(&args[1..]) {
-            Ok(options) => options,
-            Err(error) => {
-                eprintln!("{error}");
-                return ExitCode::from(2);
-            }
-        };
-        let result = if args[0] == "score-model" {
-            orinfer_engine::model::score_with_options(
-                std::path::Path::new(&args[1]),
-                std::path::Path::new(&args[2]),
-                options,
-            )
-            .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
-        } else {
-            orinfer_engine::model::run_with_options(
-                std::path::Path::new(&args[1]),
-                std::path::Path::new(&args[2]),
-                options,
-            )
-            .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
-        };
-        return match result {
-            Ok(json) => {
-                println!("{json}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{}: {error}", args[0]);
-                ExitCode::FAILURE
-            }
-        };
-    }
-    if let Some(command @ ("validate-artifact" | "run-artifact")) = args.first().map(String::as_str)
-    {
-        if args.len() != 2 {
-            eprintln!("Usage: orinfer {command} MANIFEST.json");
-            return ExitCode::from(2);
-        }
-        let path = std::path::Path::new(&args[1]);
-        let result = if command == "validate-artifact" {
-            orinfer_engine::artifact::validate_artifact(path)
-                .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
-        } else {
-            orinfer_engine::artifact::run_artifact(path)
-                .and_then(|r| serde_json::to_string_pretty(&r).map_err(|e| e.to_string()))
-        };
-        return match result {
-            Ok(json) => {
-                println!("{json}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{command}: {error}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-    if args.len() > 1 {
-        eprintln!("Usage: orinfer [info | plan | --version | --help]");
-        return ExitCode::from(2);
-    }
-    match args.first().map(String::as_str).unwrap_or("info") {
-        "info" => {
+}
+fn print_json(value: impl serde::Serialize) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
+fn execute(command: Command) -> Result<(), String> {
+    match command {
+        Command::Info => {
             println!("Orinfer {}", env!("CARGO_PKG_VERSION"));
             println!(
                 "Target: {} / {} / {}",
@@ -136,51 +140,139 @@ fn main() -> ExitCode {
             );
             println!("Model: {}", orinfer_engine::FIRST_MODEL);
             println!("Status: {}", orinfer_engine::STATUS);
+            Ok(())
         }
-        "plan" => println!("{}", orinfer_engine::BENCHMARK_PLAN),
-        "--version" | "-V" => println!("orinfer {}", env!("CARGO_PKG_VERSION")),
-        "--help" | "-h" => println!(
-            "Usage: orinfer [info | plan | --version | --help]\n       orinfer <validate-artifact | run-artifact> MANIFEST.json\n       orinfer <run-model | score-model> MODEL_DIR REQUESTS.json [--cuda-graph MODE]\n       orinfer serve MODEL_DIR [--listen HOST:PORT] [--model MODEL_ID] [--cuda-graph MODE] [--mtp-drafts N]\n\n--cuda-graph MODE     decode_only (default), full or off\n--mtp-drafts N        Server: auto (package default), 0 disables MTP, 1..7 drafts\n--listen HOST:PORT    Default: 0.0.0.0:8088\n--prefix-cache-mib N  Server snapshot budget: 12288 MiB; 0 disables reuse\n--max-active-requests N  Active request limit: 32 (1..128)\n--max-batch-tokens N     Iteration token budget: 128 (1..128)\n--prefill-budget-ms N    Mixed prefill predicted budget: 200 ms\n--target-tpot-ms N       Soft decode token interval target: 400 ms\n--memory-reserve-mib N   Admission memory reserve: 1024 MiB\n--preprocess-workers N  Blocking CPU preprocessing limit: 2\n--preprocess-memory-mib N  Preprocessing/queued image memory budget: 2048 MiB\n--queue-timeout-ms N    Queue wait deadline: 0 (unlimited)\n--output-timeout-ms N   Stalled output deadline: 60000 ms\n--drain-timeout-ms N    SIGINT/SIGTERM HTTP drain deadline: 30000 ms\n\ninfo    Show target and implementation status\nplan    Print the benchmark specification as JSON\nvalidate-artifact    Check AOT fixture and file hashes without CUDA\nrun-artifact         Execute an SM87 AOT projection fixture and validate replay\nplan-model           Inspect the native model package plan without CUDA\nvalidate-model       Verify model, execution package and tensor hashes without CUDA\nrun-model            Load custom model data and native package plans with private state\nscore-model          Score frozen token histories through real prefill/decode kernels"
-        ),
-        other => {
-            eprintln!(
-                "Unknown command: {other}\nUsage: orinfer [info | plan | --version | --help]"
-            );
-            return ExitCode::from(2);
+        Command::Plan => {
+            println!("{}", orinfer_engine::BENCHMARK_PLAN);
+            Ok(())
+        }
+        Command::Serve(args) => orinfer_api::run(args.into()),
+        Command::ValidateArtifact { manifest } => {
+            print_json(orinfer_engine::artifact::validate_artifact(&manifest)?)
+        }
+        Command::RunArtifact { manifest } => {
+            print_json(orinfer_engine::artifact::run_artifact(&manifest)?)
+        }
+        Command::PlanModel { model_dir } => {
+            print_json(orinfer_engine::model::inspect_plan(&model_dir)?)
+        }
+        Command::ValidateModel { model_dir } => {
+            print_json(orinfer_engine::model::validate_model(&model_dir)?)
+        }
+        Command::RunModel(args) => print_json(orinfer_engine::model::run_with_options(
+            &args.model_dir,
+            &args.requests,
+            LoadOptions {
+                cuda_graph: args.graph.cuda_graph,
+                ..Default::default()
+            },
+        )?),
+        Command::ScoreModel(args) => print_json(orinfer_engine::model::score_with_options(
+            &args.model_dir,
+            &args.requests,
+            LoadOptions {
+                cuda_graph: args.graph.cuda_graph,
+                ..Default::default()
+            },
+        )?),
+    }
+}
+fn main() -> ExitCode {
+    match execute(Cli::parse().command.unwrap_or(Command::Info)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
         }
     }
-    ExitCode::SUCCESS
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orinfer_engine::execution::CudaGraphMode;
-
+    fn serve(options: &[&str]) -> Result<ServerConfig, clap::Error> {
+        let mut args = vec!["orinfer", "serve", "/tmp"];
+        args.extend_from_slice(options);
+        let Some(Command::Serve(args)) = Cli::try_parse_from(args)?.command else {
+            unreachable!()
+        };
+        Ok(args.into())
+    }
     #[test]
-    fn run_model_graph_modes_are_validated_before_loading() {
-        let required = vec!["model-dir".into(), "requests.json".into()];
-        assert_eq!(
-            model_options(&required).unwrap().cuda_graph,
-            CudaGraphMode::DecodeOnly
-        );
-        assert!(model_options(&[]).is_err());
-        assert!(model_options(&required[..1]).is_err());
-        for mode in ["decode_only", "full", "off"] {
-            let args = [required.clone(), vec!["--cuda-graph".into(), mode.into()]].concat();
-            assert_eq!(model_options(&args).unwrap().cuda_graph.to_string(), mode);
+    fn defaults_and_server_options_are_preserved() {
+        let config = serve(&[]).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.listen, "0.0.0.0:8088");
+        assert_eq!(config.cuda_graph, CudaGraphMode::DecodeOnly);
+        assert_eq!(config.prefix_cache_bytes, 12usize << 30);
+        assert_eq!(config.scheduler.max_active, 32);
+        assert_eq!(config.mtp_drafts, None);
+        let config = serve(&[
+            "--mtp-drafts=7",
+            "--cuda-graph",
+            "off",
+            "--max-active-requests",
+            "8",
+            "--max-batch-tokens",
+            "64",
+            "--prefill-budget-ms",
+            "150",
+            "--target-tpot-ms",
+            "350",
+            "--memory-reserve-mib",
+            "2048",
+            "--prefix-cache-mib",
+            "0",
+        ])
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.cuda_graph, CudaGraphMode::Off);
+        assert_eq!(config.mtp_drafts, Some(7));
+        assert_eq!(config.prefix_cache_bytes, 0);
+        assert_eq!(config.scheduler.memory_reserve_bytes, 2usize << 30);
+    }
+    #[test]
+    fn syntax_help_and_limits_are_checked_before_loading() {
+        for args in [
+            vec!["orinfer", "--help"],
+            vec!["orinfer", "--version"],
+            vec!["orinfer", "serve", "--help"],
+        ] {
+            assert_eq!(Cli::try_parse_from(args).err().unwrap().exit_code(), 0);
         }
         for options in [
-            vec!["--cuda-graph"],
-            vec!["--cuda-graph", "on"],
-            vec!["--unknown", "off"],
+            &["--cuda-graph"][..],
+            &["--cuda-graph", "on"],
+            &["--mtp-drafts", "8"],
+            &["--unknown", "off"],
+            &["--prefix-cache-mib", "1.5"],
+            &["--listen", "a", "--listen", "b"],
         ] {
-            let args = [
-                required.clone(),
-                options.into_iter().map(String::from).collect(),
-            ]
-            .concat();
-            assert!(model_options(&args).is_err());
+            assert!(serve(options).is_err());
         }
+        for (name, value) in [
+            ("--max-active-requests", "129"),
+            ("--max-batch-tokens", "0"),
+            ("--target-tpot-ms", "NaN"),
+            ("--output-timeout-ms", "0"),
+        ] {
+            assert!(serve(&[name, value]).unwrap().validate().is_err());
+        }
+    }
+    #[test]
+    fn model_subcommands_support_equals_and_reject_extra_positionals() {
+        let cli = Cli::try_parse_from([
+            "orinfer",
+            "run-model",
+            "model",
+            "requests.json",
+            "--cuda-graph=full",
+        ])
+        .unwrap();
+        let Some(Command::RunModel(args)) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(args.graph.cuda_graph, CudaGraphMode::Full);
+        assert!(Cli::try_parse_from(["orinfer", "run-model", "model"]).is_err());
+        assert!(Cli::try_parse_from(["orinfer", "plan-model", "model", "extra"]).is_err());
     }
 }

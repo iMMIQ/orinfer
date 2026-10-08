@@ -51,7 +51,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 | `--max-batch-tokens` | `128` | 每轮计算 token 预算 |
 | `--prefill-budget-ms` | `200` | 混合 prefill 的预测耗时目标 |
 
-实际并发和上下文容量受执行包及可用内存限制。环境变量统一使用 `ORINFER_*`；共享模型包默认安装到 `~/.cache/orinfer/packages`，可用 `ORINFER_EXECUTION_CACHE` 指定位置。完整配置见[服务使用指南](docs/serving.md)和 `orinfer --help`。
+实际并发和上下文容量受执行包及可用内存限制。环境变量统一使用 `ORINFER_*`；共享模型包默认安装到 `~/.cache/orinfer/packages`，可用 `ORINFER_EXECUTION_CACHE` 指定位置。完整配置见[服务使用指南](docs/serving.md)和 `orinfer serve --help`。
 
 ## 性能与范围
 

@@ -1,5 +1,6 @@
 //! Real autoregressive MTP acceptance, state recovery and committed-token timing.
 use super::*;
+use crate::cuda::sys;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -223,7 +224,7 @@ fn complete_prefix_state(model: &ModelRuntime, position: usize) -> BTreeMap<Stri
                 // have completed, and the bounded host allocation covers count bytes.
                 unsafe {
                     check(
-                        (model.execution.session.driver.download)(
+                        sys::cuMemcpyDtoH_v2(
                             raw.as_mut_ptr().cast(),
                             model.execution.pointers[&name] + (range.offset + offset) as u64,
                             count,
@@ -529,7 +530,7 @@ fn download(model: &ModelRuntime, name: &str, bytes: usize) -> Vec<u8> {
     // SAFETY: The completed graph owns the source; both extents are checked.
     unsafe {
         check(
-            (model.execution.session.driver.download)(
+            sys::cuMemcpyDtoH_v2(
                 raw.as_mut_ptr().cast(),
                 model.execution.pointers[name],
                 bytes,
@@ -574,11 +575,7 @@ fn snapshot(model: &ModelRuntime, position: usize) -> BTreeMap<String, String> {
                 // SAFETY: Both ranges are checked and the graph has completed.
                 unsafe {
                     check(
-                        (model.execution.session.driver.download)(
-                            scratch.as_mut_ptr().cast(),
-                            pointer,
-                            count,
-                        ),
+                        sys::cuMemcpyDtoH_v2(scratch.as_mut_ptr().cast(), pointer, count),
                         "MTP state hash download",
                     )
                     .unwrap();

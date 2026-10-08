@@ -19,7 +19,7 @@ import struct
 import numpy as np
 from safetensors import safe_open
 
-from tools.model.safetensors_source import Source, relative_name, validate_header
+from tools.model.safetensors_source import Source, local_header, relative_name
 from tools.quantization.flash_next import atomic_json, digest
 from tools.quantization.flash_next_aux import policy
 from tools.quantization.e8p import basis
@@ -36,22 +36,7 @@ FRONTEND = (
 
 
 def header(path):
-    with Path(path).open("rb") as f:
-        prefix = f.read(8)
-        if len(prefix) != 8:
-            raise ValueError("Truncated safetensors prefix")
-        (size,) = struct.unpack("<Q", prefix)
-        if not 2 <= size <= 64 * 1024**2:
-            raise ValueError("Invalid safetensors header size")
-        raw = f.read(size)
-        if len(raw) != size:
-            raise ValueError("Truncated safetensors header")
-    data = json.loads(raw)
-    validate_header(data)
-    end = max((t["data_offsets"][1] for k, t in data.items() if k != "__metadata__"), default=0)
-    if Path(path).stat().st_size != 8 + size + end:
-        raise ValueError("Safetensors payload size mismatch")
-    return 8 + size, data
+    return local_header(path)
 
 
 def payload_hash(path):

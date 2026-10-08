@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from safetensors.numpy import save_file
@@ -10,6 +11,40 @@ from tools.model.safetensors_source import Source, validate_header
 
 
 class OriginalSourceTests(unittest.TestCase):
+    def test_remote_header_uses_two_bounded_ranges_and_reuses_metadata_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            save_file({"x": np.arange(32, dtype=np.int8)}, str(root / "weights.safetensors"))
+            raw = (root / "weights.safetensors").read_bytes()
+            index = root / "index.json"
+            index.write_text(json.dumps({"weight_map": {"x": "weights.safetensors"}}))
+            source = Source(index, repo="Qwen/model", revision="0" * 40, cache=root / "headers")
+            with patch.object(
+                source, "read", side_effect=lambda _, offset, count: raw[offset : offset + count]
+            ) as read:
+                begin, header = source.header("weights.safetensors")
+                self.assertEqual(read.call_count, 2)
+                self.assertEqual(begin + header["x"]["data_offsets"][1], len(raw))
+                self.assertEqual(source.header("weights.safetensors"), (begin, header))
+                self.assertEqual(read.call_count, 2)
+            cached = Source(index, repo="Qwen/model", revision="0" * 40, cache=root / "headers")
+            with patch.object(
+                cached, "read", side_effect=AssertionError("Metadata cache should avoid HTTP")
+            ):
+                self.assertEqual(cached.header("weights.safetensors"), (begin, header))
+
+    def test_local_official_reader_rejects_truncated_payload_before_row_access(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            save_file({"x": np.arange(32, dtype=np.int8)}, str(root / "weights.safetensors"))
+            shard = root / "weights.safetensors"
+            shard.write_bytes(shard.read_bytes()[:-1])
+            index = root / "index.json"
+            index.write_text(json.dumps({"weight_map": {"x": shard.name}}))
+            source = Source(index, directory=root)
+            with self.assertRaisesRegex(ValueError, "Invalid safetensors file"):
+                source.tensor("x")
+
     def test_local_reads_exact_expert_and_rejects_truncation(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

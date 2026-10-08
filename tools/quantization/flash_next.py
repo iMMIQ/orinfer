@@ -11,14 +11,13 @@ import json
 import os
 from pathlib import Path
 import re
-import struct
 import time
 
 import numpy as np
 from safetensors import safe_open
 from safetensors.numpy import save_file
 
-from tools.model.safetensors_source import Source
+from tools.model.safetensors_source import Source, local_header
 
 
 def atomic_json(path, value):
@@ -44,12 +43,10 @@ def equivalent(left, right):
     """Ignore metadata key ordering while comparing exact tensor bytes."""
 
     def identity(path):
+        begin, header = local_header(path)
         h = hashlib.sha256()
         with open(path, "rb") as f:
-            (size,) = struct.unpack("<Q", f.read(8))
-            if size > 64 * 1024**2:
-                raise ValueError("Invalid quantized shard header")
-            header = json.loads(f.read(size))
+            f.seek(begin)
             for raw in iter(lambda: f.read(4 * 1024**2), b""):
                 h.update(raw)
         return header, h.hexdigest()

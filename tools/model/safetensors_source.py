@@ -10,6 +10,8 @@ import time
 import urllib.parse
 import urllib.request
 
+from safetensors import safe_open
+
 
 SIZES = {
     "BF16": 2,
@@ -57,6 +59,42 @@ def validate_header(header):
         if start != end:
             raise ValueError("Overlapping or gapped source tensor payload")
         end = stop
+
+
+def read_header(read, *, file_size=None):
+    """Read bounded metadata; remote readers do not need a full model download."""
+    prefix = read(0, 8)
+    if len(prefix) != 8:
+        raise ValueError("Truncated safetensors prefix")
+    (size,) = struct.unpack("<Q", prefix)
+    if not 2 <= size <= 64 * 1024**2:
+        raise ValueError("Invalid safetensors header size")
+    raw = read(8, size)
+    if len(raw) != size:
+        raise ValueError("Truncated safetensors header")
+    header = json.loads(raw)
+    validate_header(header)
+    end = max((t["data_offsets"][1] for k, t in header.items() if k != "__metadata__"), default=0)
+    if file_size is not None and file_size != 8 + size + end:
+        raise ValueError("Safetensors payload size mismatch")
+    return 8 + size, header
+
+
+def local_header(path):
+    """Use the official reader for local validation, without materializing tensors."""
+    path = Path(path)
+    try:
+        with safe_open(path, framework="np"):
+            pass
+    except Exception as error:
+        raise ValueError(f"Invalid safetensors file: {error}") from error
+    with path.open("rb") as stream:
+
+        def read(offset, count):
+            stream.seek(offset)
+            return stream.read(count)
+
+        return read_header(read, file_size=path.stat().st_size)
 
 
 class Source:
@@ -120,6 +158,10 @@ class Source:
     def header(self, filename):
         if filename in self.headers:
             return self.headers[filename]
+        relative_name(filename)
+        if self.directory is not None:
+            self.headers[filename] = local_header(self.directory / filename)
+            return self.headers[filename]
         key = hashlib.sha256(
             json.dumps([self.repo, self.revision, str(self.directory), filename]).encode()
         ).hexdigest()
@@ -128,11 +170,7 @@ class Source:
             item = json.loads(cached.read_text())
             begin, header = item["begin"], item["header"]
         else:
-            (size,) = struct.unpack("<Q", self.read(filename, 0, 8))
-            if not 2 <= size <= 64 * 1024**2:
-                raise ValueError("Invalid safetensors header length")
-            raw = self.read(filename, 8, size)
-            begin, header = 8 + size, json.loads(raw)
+            begin, header = read_header(lambda offset, count: self.read(filename, offset, count))
             if cached:
                 cached.parent.mkdir(parents=True, exist_ok=True)
                 temporary = cached.with_suffix(".tmp")

@@ -6,154 +6,86 @@ use libloading::Library;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
-    ffi::{CString, c_char, c_void},
+    ffi::{CString, c_void},
     ptr,
     time::Instant,
 };
 mod sequence;
 pub(crate) mod snapshot;
 mod virtual_memory;
-pub(crate) type Handle = *mut c_void;
+pub(crate) use cudarc::driver::sys;
+pub(crate) type Handle = sys::CUgraphExec;
 
 pub(crate) struct Driver {
-    pub(crate) _library: Library,
-    pub(crate) init: unsafe extern "C" fn(u32) -> i32,
-    pub(crate) version: unsafe extern "C" fn(*mut i32) -> i32,
-    pub(crate) device: unsafe extern "C" fn(*mut i32, i32) -> i32,
-    pub(crate) name: unsafe extern "C" fn(*mut c_char, i32, i32) -> i32,
-    pub(crate) attribute: unsafe extern "C" fn(*mut i32, i32, i32) -> i32,
-    pub(crate) total: unsafe extern "C" fn(*mut usize, i32) -> i32,
-    pub(crate) current: unsafe extern "C" fn(*mut Handle) -> i32,
-    pub(crate) retain: unsafe extern "C" fn(*mut Handle, i32) -> i32,
-    pub(crate) release: unsafe extern "C" fn(i32) -> i32,
-    pub(crate) set_current: unsafe extern "C" fn(Handle) -> i32,
-    pub(crate) context_sync: unsafe extern "C" fn() -> i32,
-    pub(crate) stream_create: unsafe extern "C" fn(*mut Handle, u32) -> i32,
-    pub(crate) stream_sync: unsafe extern "C" fn(Handle) -> i32,
-    pub(crate) stream_destroy: unsafe extern "C" fn(Handle) -> i32,
-    pub(crate) memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> i32,
-    pub(crate) alloc: unsafe extern "C" fn(*mut u64, usize) -> i32,
-    pub(crate) vmm_reserve: unsafe extern "C" fn(*mut u64, usize, usize, u64, u64) -> i32,
-    pub(crate) vmm_address_free: unsafe extern "C" fn(u64, usize) -> i32,
-    pub(crate) vmm_granularity:
-        unsafe extern "C" fn(*mut usize, *const virtual_memory::AllocationProp, i32) -> i32,
-    pub(crate) vmm_create:
-        unsafe extern "C" fn(*mut u64, usize, *const virtual_memory::AllocationProp, u64) -> i32,
-    pub(crate) vmm_map: unsafe extern "C" fn(u64, usize, usize, u64, u64) -> i32,
-    pub(crate) vmm_access:
-        unsafe extern "C" fn(u64, usize, *const virtual_memory::AccessDesc, usize) -> i32,
-    pub(crate) vmm_unmap: unsafe extern "C" fn(u64, usize) -> i32,
-    pub(crate) vmm_release: unsafe extern "C" fn(u64) -> i32,
-    pub(crate) free: unsafe extern "C" fn(u64) -> i32,
-    pub(crate) upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
-    pub(crate) copy: unsafe extern "C" fn(u64, u64, usize, Handle) -> i32,
-    pub(crate) download: unsafe extern "C" fn(*mut c_void, u64, usize) -> i32,
-    pub(crate) memset: unsafe extern "C" fn(u64, u8, usize, Handle) -> i32,
-    pub(crate) module_load: unsafe extern "C" fn(*mut Handle, *const c_void) -> i32,
-    pub(crate) module_unload: unsafe extern "C" fn(Handle) -> i32,
-    pub(crate) function: unsafe extern "C" fn(*mut Handle, Handle, *const c_char) -> i32,
-    pub(crate) function_get: unsafe extern "C" fn(*mut i32, i32, Handle) -> i32,
-    pub(crate) function_set: unsafe extern "C" fn(Handle, i32, i32) -> i32,
-    pub(crate) launch: unsafe extern "C" fn(
-        Handle,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        Handle,
-        *mut *mut c_void,
-        *mut *mut c_void,
-    ) -> i32,
-    pub(crate) capture_begin: unsafe extern "C" fn(Handle, i32) -> i32,
-    pub(crate) capture_end: unsafe extern "C" fn(Handle, *mut Handle) -> i32,
-    pub(crate) graph_instantiate: unsafe extern "C" fn(*mut Handle, Handle, u64) -> i32,
-    pub(crate) graph_launch: unsafe extern "C" fn(Handle, Handle) -> i32,
-    pub(crate) graph_destroy: unsafe extern "C" fn(Handle) -> i32,
-    pub(crate) graph_exec_destroy: unsafe extern "C" fn(Handle) -> i32,
-    pub(crate) event_create: unsafe extern "C" fn(*mut Handle, u32) -> i32,
-    pub(crate) event_record: unsafe extern "C" fn(Handle, Handle) -> i32,
-    pub(crate) event_sync: unsafe extern "C" fn(Handle) -> i32,
-    pub(crate) event_elapsed: unsafe extern "C" fn(*mut f32, Handle, Handle) -> i32,
-    pub(crate) event_destroy: unsafe extern "C" fn(Handle) -> i32,
+    _library: Library,
 }
-
 impl Driver {
     pub(crate) fn load() -> Result<Self> {
-        // SAFETY: This process loads the installed CUDA driver, whose exported C
-        // signatures below are checked against the local CUDA 12.6 cuda.h. The
-        // Library is retained for longer than every copied function pointer.
+        // SAFETY: Loading the installed CUDA driver; retaining it for the session.
         let library = unsafe { Library::new("libcuda.so.1") }.map_err(|e| e.to_string())?;
-        macro_rules! symbol {
-            ($name:literal) => {{
-                // SAFETY: Each inferred field type matches this named CUDA C symbol;
-                // its library remains owned by Driver until session cleanup completes.
-                unsafe {
-                    *library
-                        .get(concat!($name, "\0").as_bytes())
-                        .map_err(|e| e.to_string())?
-                }
-            }};
+        // Preflight prevents cudarc's lazy symbol loader from panicking during execution.
+        // Signatures and CUDA types come entirely from its generated CUDA 12.6 bindings.
+        for name in [
+            b"cuInit\0".as_slice(),
+            b"cuDriverGetVersion\0".as_slice(),
+            b"cuDeviceGet\0".as_slice(),
+            b"cuDeviceGetName\0".as_slice(),
+            b"cuDeviceGetAttribute\0".as_slice(),
+            b"cuDeviceTotalMem_v2\0".as_slice(),
+            b"cuCtxGetCurrent\0".as_slice(),
+            b"cuDevicePrimaryCtxRetain\0".as_slice(),
+            b"cuDevicePrimaryCtxRelease_v2\0".as_slice(),
+            b"cuCtxSetCurrent\0".as_slice(),
+            b"cuCtxSynchronize\0".as_slice(),
+            b"cuStreamCreate\0".as_slice(),
+            b"cuStreamSynchronize\0".as_slice(),
+            b"cuStreamDestroy_v2\0".as_slice(),
+            b"cuMemGetInfo_v2\0".as_slice(),
+            b"cuMemAlloc_v2\0".as_slice(),
+            b"cuMemAddressReserve\0".as_slice(),
+            b"cuMemAddressFree\0".as_slice(),
+            b"cuMemGetAllocationGranularity\0".as_slice(),
+            b"cuMemCreate\0".as_slice(),
+            b"cuMemMap\0".as_slice(),
+            b"cuMemSetAccess\0".as_slice(),
+            b"cuMemUnmap\0".as_slice(),
+            b"cuMemRelease\0".as_slice(),
+            b"cuMemFree_v2\0".as_slice(),
+            b"cuMemcpyHtoD_v2\0".as_slice(),
+            b"cuMemcpyDtoDAsync_v2\0".as_slice(),
+            b"cuMemcpyDtoH_v2\0".as_slice(),
+            b"cuMemsetD8Async\0".as_slice(),
+            b"cuModuleLoadData\0".as_slice(),
+            b"cuModuleUnload\0".as_slice(),
+            b"cuModuleGetFunction\0".as_slice(),
+            b"cuFuncGetAttribute\0".as_slice(),
+            b"cuFuncSetAttribute\0".as_slice(),
+            b"cuLaunchKernel\0".as_slice(),
+            b"cuStreamBeginCapture_v2\0".as_slice(),
+            b"cuStreamEndCapture\0".as_slice(),
+            b"cuGraphInstantiateWithFlags\0".as_slice(),
+            b"cuGraphLaunch\0".as_slice(),
+            b"cuGraphDestroy\0".as_slice(),
+            b"cuGraphExecDestroy\0".as_slice(),
+            b"cuEventCreate\0".as_slice(),
+            b"cuEventRecord\0".as_slice(),
+            b"cuEventSynchronize\0".as_slice(),
+            b"cuEventElapsedTime\0".as_slice(),
+            b"cuEventDestroy_v2\0".as_slice(),
+            b"cuEventRecordWithFlags\0".as_slice(),
+        ] {
+            // SAFETY: Inspect the symbol address without calling it or dereferencing it.
+            unsafe { library.get::<*const c_void>(name) }.map_err(|e| e.to_string())?;
         }
-        Ok(Self {
-            init: symbol!("cuInit"),
-            version: symbol!("cuDriverGetVersion"),
-            device: symbol!("cuDeviceGet"),
-            name: symbol!("cuDeviceGetName"),
-            attribute: symbol!("cuDeviceGetAttribute"),
-            total: symbol!("cuDeviceTotalMem_v2"),
-            current: symbol!("cuCtxGetCurrent"),
-            retain: symbol!("cuDevicePrimaryCtxRetain"),
-            release: symbol!("cuDevicePrimaryCtxRelease_v2"),
-            set_current: symbol!("cuCtxSetCurrent"),
-            context_sync: symbol!("cuCtxSynchronize"),
-            stream_create: symbol!("cuStreamCreate"),
-            stream_sync: symbol!("cuStreamSynchronize"),
-            stream_destroy: symbol!("cuStreamDestroy_v2"),
-            memory_info: symbol!("cuMemGetInfo_v2"),
-            alloc: symbol!("cuMemAlloc_v2"),
-            vmm_reserve: symbol!("cuMemAddressReserve"),
-            vmm_address_free: symbol!("cuMemAddressFree"),
-            vmm_granularity: symbol!("cuMemGetAllocationGranularity"),
-            vmm_create: symbol!("cuMemCreate"),
-            vmm_map: symbol!("cuMemMap"),
-            vmm_access: symbol!("cuMemSetAccess"),
-            vmm_unmap: symbol!("cuMemUnmap"),
-            vmm_release: symbol!("cuMemRelease"),
-            free: symbol!("cuMemFree_v2"),
-            upload: symbol!("cuMemcpyHtoD_v2"),
-            copy: symbol!("cuMemcpyDtoDAsync_v2"),
-            download: symbol!("cuMemcpyDtoH_v2"),
-            memset: symbol!("cuMemsetD8Async"),
-            module_load: symbol!("cuModuleLoadData"),
-            module_unload: symbol!("cuModuleUnload"),
-            function: symbol!("cuModuleGetFunction"),
-            function_get: symbol!("cuFuncGetAttribute"),
-            function_set: symbol!("cuFuncSetAttribute"),
-            launch: symbol!("cuLaunchKernel"),
-            capture_begin: symbol!("cuStreamBeginCapture_v2"),
-            capture_end: symbol!("cuStreamEndCapture"),
-            graph_instantiate: symbol!("cuGraphInstantiateWithFlags"),
-            graph_launch: symbol!("cuGraphLaunch"),
-            graph_destroy: symbol!("cuGraphDestroy"),
-            graph_exec_destroy: symbol!("cuGraphExecDestroy"),
-            event_create: symbol!("cuEventCreate"),
-            event_record: symbol!("cuEventRecord"),
-            event_sync: symbol!("cuEventSynchronize"),
-            event_elapsed: symbol!("cuEventElapsedTime"),
-            event_destroy: symbol!("cuEventDestroy_v2"),
-            _library: library,
-        })
+        Ok(Self { _library: library })
     }
 }
-pub(crate) fn check(code: i32, operation: &str) -> Result<()> {
-    if code == 0 {
+pub(crate) fn check(code: sys::CUresult, operation: &str) -> Result<()> {
+    if code == sys::CUresult::CUDA_SUCCESS {
         Ok(())
     } else {
-        crate::error::record_cuda(code);
-        Err(format!("{operation}: CUDA error {code}"))
+        crate::error::record_cuda(code as i32);
+        Err(format!("{operation}: CUDA error {}", code as i32))
     }
 }
 
@@ -188,16 +120,16 @@ pub struct RunReport {
 pub(crate) struct Session {
     pub(crate) driver: Driver,
     pub(crate) device: i32,
-    pub(crate) previous: Handle,
+    pub(crate) previous: sys::CUcontext,
     pub(crate) retained: bool,
-    pub(crate) stream: Handle,
+    pub(crate) stream: sys::CUstream,
     pub(crate) buffers: Vec<u64>,
     pub(crate) virtual_buffers: std::cell::RefCell<virtual_memory::Reservations>,
-    pub(crate) modules: Vec<Handle>,
-    pub(crate) events: Vec<Handle>,
-    pub(crate) graph: Handle,
+    pub(crate) modules: Vec<sys::CUmodule>,
+    pub(crate) events: Vec<sys::CUevent>,
+    pub(crate) graph: sys::CUgraph,
     pub(crate) exec: Handle,
-    pub(crate) graphs: std::cell::RefCell<Vec<(Handle, Handle)>>,
+    pub(crate) graphs: std::cell::RefCell<Vec<(sys::CUgraph, Handle)>>,
     pub(crate) capturing: bool,
 }
 impl Session {
@@ -232,39 +164,33 @@ impl Session {
         unsafe {
             if self.capturing {
                 record(
-                    (self.driver.capture_end)(self.stream, &mut self.graph),
+                    sys::cuStreamEndCapture(self.stream, &mut self.graph),
                     "cleanup end capture",
                 );
                 self.capturing = false;
             }
             if !self.stream.is_null() {
                 record(
-                    (self.driver.stream_sync)(self.stream),
+                    sys::cuStreamSynchronize(self.stream),
                     "cleanup stream synchronize",
                 );
             }
             if !self.exec.is_null() {
-                record(
-                    (self.driver.graph_exec_destroy)(self.exec),
-                    "destroy graph exec",
-                );
+                record(sys::cuGraphExecDestroy(self.exec), "destroy graph exec");
                 self.exec = ptr::null_mut();
             }
             if !self.graph.is_null() {
-                record((self.driver.graph_destroy)(self.graph), "destroy graph");
+                record(sys::cuGraphDestroy(self.graph), "destroy graph");
                 self.graph = ptr::null_mut();
             }
             for (graph, exec) in self.graphs.get_mut().drain(..) {
                 if !exec.is_null() {
-                    record(
-                        (self.driver.graph_exec_destroy)(exec),
-                        "destroy model graph exec",
-                    );
+                    record(sys::cuGraphExecDestroy(exec), "destroy model graph exec");
                 }
-                record((self.driver.graph_destroy)(graph), "destroy model graph");
+                record(sys::cuGraphDestroy(graph), "destroy model graph");
             }
             for event in self.events.drain(..) {
-                record((self.driver.event_destroy)(event), "destroy event");
+                record(sys::cuEventDestroy_v2(event), "destroy event");
             }
             for (_, mut buffer) in std::mem::take(self.virtual_buffers.get_mut()) {
                 if let Err(e) = buffer.release_slabs(&self.driver) {
@@ -274,30 +200,27 @@ impl Session {
                     continue;
                 }
                 record(
-                    (self.driver.vmm_address_free)(buffer.address, buffer.bytes),
+                    sys::cuMemAddressFree(buffer.address, buffer.bytes),
                     "free KV address reservation",
                 );
             }
             for buffer in self.buffers.drain(..) {
-                record((self.driver.free)(buffer), "free buffer");
+                record(sys::cuMemFree_v2(buffer), "free buffer");
             }
             for module in self.modules.drain(..) {
-                record((self.driver.module_unload)(module), "unload module");
+                record(sys::cuModuleUnload(module), "unload module");
             }
             if !self.stream.is_null() {
-                record((self.driver.stream_destroy)(self.stream), "destroy stream");
+                record(sys::cuStreamDestroy_v2(self.stream), "destroy stream");
                 self.stream = ptr::null_mut();
             }
             if self.retained {
                 record(
-                    (self.driver.release)(self.device),
+                    sys::cuDevicePrimaryCtxRelease_v2(self.device),
                     "release primary context",
                 );
                 self.retained = false;
-                record(
-                    (self.driver.set_current)(self.previous),
-                    "restore prior context",
-                );
+                record(sys::cuCtxSetCurrent(self.previous), "restore prior context");
             }
         }
         if errors.is_empty() {
@@ -337,21 +260,21 @@ impl Value {
 }
 pub(crate) struct Launch<'a> {
     spec: &'a Kernel,
-    function: Handle,
+    function: sys::CUfunction,
     values: Vec<Value>,
 }
 impl Launch<'_> {
-    fn execute(&mut self, driver: &Driver, stream: Handle) -> Result<()> {
+    fn execute(&mut self, driver: &Driver, stream: sys::CUstream) -> Result<()> {
         launch_kernel(self.spec, self.function, &mut self.values, driver, stream)
     }
 }
 
 fn launch_kernel(
     k: &Kernel,
-    function: Handle,
+    function: sys::CUfunction,
     values: &mut [Value],
-    driver: &Driver,
-    stream: Handle,
+    _driver: &Driver,
+    stream: sys::CUstream,
 ) -> Result<()> {
     let mut args: Vec<*mut c_void> = values.iter_mut().map(Value::address).collect();
     // SAFETY: Values remain at stable Vec addresses until cuLaunchKernel has
@@ -360,7 +283,7 @@ fn launch_kernel(
     // The module and explicit stream outlive all queued/captured work.
     unsafe {
         check(
-            (driver.launch)(
+            sys::cuLaunchKernel(
                 function,
                 k.grid[0],
                 k.grid[1],
@@ -402,21 +325,7 @@ pub(crate) fn floats(raw: &[u8], dtype: Dtype) -> Vec<f32> {
     }
 }
 fn half_to_float(bits: u16) -> f32 {
-    let sign = (u32::from(bits & 0x8000)) << 16;
-    let exp = (bits >> 10) & 31;
-    let mant = u32::from(bits & 1023);
-    if exp == 0 {
-        let value = (mant as f32) * 2f32.powi(-24);
-        if sign == 0 { value } else { -value }
-    } else {
-        f32::from_bits(
-            sign | if exp == 31 {
-                0x7f800000 | (mant << 13)
-            } else {
-                ((u32::from(exp) + 112) << 23) | (mant << 13)
-            },
-        )
-    }
+    half::f16::from_bits(bits).to_f32()
 }
 fn errors(output: &[f32], reference: &[f32]) -> Result<(f64, f64)> {
     let (mut sum, mut norm, mut maximum) = (0f64, 0f64, 0f64);
@@ -444,37 +353,54 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
     // immediately in Session for cleanup on every early return. The session is
     // thread-affine and the primary context remains current for its entire life.
     unsafe {
-        check((s.driver.init)(0), "cuInit")?;
-        check((s.driver.device)(&mut s.device, 0), "cuDeviceGet")?;
-        check((s.driver.attribute)(&mut major, 75, s.device), "SM major")?;
-        check((s.driver.attribute)(&mut minor, 76, s.device), "SM minor")?;
+        check(sys::cuInit(0), "cuInit")?;
+        check(sys::cuDeviceGet(&mut s.device, 0), "cuDeviceGet")?;
+        check(
+            sys::cuDeviceGetAttribute(
+                &mut major,
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                s.device,
+            ),
+            "SM major",
+        )?;
+        check(
+            sys::cuDeviceGetAttribute(
+                &mut minor,
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                s.device,
+            ),
+            "SM minor",
+        )?;
         if [major, minor] != [8, 7] {
             return Err(format!("Expected SM87, got {major}.{minor}"));
         }
-        check((s.driver.version)(&mut version), "driver version")?;
+        check(sys::cuDriverGetVersion(&mut version), "driver version")?;
         check(
-            (s.driver.name)(name.as_mut_ptr().cast(), 256, s.device),
+            sys::cuDeviceGetName(name.as_mut_ptr().cast(), 256, s.device),
             "device name",
         )?;
         check(
-            (s.driver.total)(&mut total, s.device),
+            sys::cuDeviceTotalMem_v2(&mut total, s.device),
             "total device memory",
         )?;
-        check((s.driver.current)(&mut s.previous), "get previous context")?;
+        check(
+            sys::cuCtxGetCurrent(&mut s.previous),
+            "get previous context",
+        )?;
         let mut context = ptr::null_mut();
         check(
-            (s.driver.retain)(&mut context, s.device),
+            sys::cuDevicePrimaryCtxRetain(&mut context, s.device),
             "retain primary context",
         )?;
         s.retained = true;
-        check((s.driver.set_current)(context), "set current context")?;
+        check(sys::cuCtxSetCurrent(context), "set current context")?;
         check(
-            (s.driver.stream_create)(&mut s.stream, 1),
+            sys::cuStreamCreate(&mut s.stream, 1),
             "create nonblocking stream",
         )?;
         let (mut free, mut available_total) = (0usize, 0usize);
         check(
-            (s.driver.memory_info)(&mut free, &mut available_total),
+            sys::cuMemGetInfo_v2(&mut free, &mut available_total),
             "free device memory",
         )?;
         if x.buffer_bytes > free {
@@ -487,7 +413,7 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
             let bytes = b.bytes()?;
             let mut address = 0;
             check(
-                (s.driver.alloc)(&mut address, bytes),
+                sys::cuMemAlloc_v2(&mut address, bytes),
                 &format!("allocate {}", b.name),
             )?;
             s.buffers.push(address);
@@ -496,12 +422,12 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
             }
             if let Some(id) = &b.data {
                 check(
-                    (s.driver.upload)(address, x.files[&id.file].as_ptr().cast(), bytes),
+                    sys::cuMemcpyHtoD_v2(address, x.files[&id.file].as_ptr().cast(), bytes),
                     &format!("upload {}", b.name),
                 )?
             } else {
                 check(
-                    (s.driver.memset)(address, 0, bytes, s.stream),
+                    sys::cuMemsetD8Async(address, 0, bytes, s.stream),
                     &format!("initialize {}", b.name),
                 )?
             }
@@ -514,27 +440,39 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
                 return Err("Fixture runner requires a cubin ELF module".into());
             }
             check(
-                (s.driver.module_load)(&mut module, image.as_ptr().cast()),
+                sys::cuModuleLoadData(&mut module, image.as_ptr().cast()),
                 &format!("load {}", k.name),
             )?;
             s.modules.push(module);
             let symbol = CString::new(k.symbol.as_str()).map_err(|e| e.to_string())?;
             let mut function = ptr::null_mut();
             check(
-                (s.driver.function)(&mut function, module, symbol.as_ptr()),
+                sys::cuModuleGetFunction(&mut function, module, symbol.as_ptr()),
                 &format!("find {}", k.symbol),
             )?;
             let (mut maxthreads, mut staticsmem, mut maxshared) = (0, 0, 0);
             check(
-                (s.driver.function_get)(&mut maxthreads, 0, function),
+                sys::cuFuncGetAttribute(
+                    &mut maxthreads,
+                    sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                    function,
+                ),
                 "function max threads",
             )?;
             check(
-                (s.driver.function_get)(&mut staticsmem, 1, function),
+                sys::cuFuncGetAttribute(
+                    &mut staticsmem,
+                    sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                    function,
+                ),
                 "function static shared memory",
             )?;
             check(
-                (s.driver.attribute)(&mut maxshared, 97, s.device),
+                sys::cuDeviceGetAttribute(
+                    &mut maxshared,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                    s.device,
+                ),
                 "device shared memory limit",
             )?;
             if k.block.iter().product::<u32>() > maxthreads as u32
@@ -548,11 +486,27 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
             for axis in 0..3 {
                 let (mut maxblock, mut maxgrid) = (0, 0);
                 check(
-                    (s.driver.attribute)(&mut maxblock, 2 + axis as i32, s.device),
+                    sys::cuDeviceGetAttribute(
+                        &mut maxblock,
+                        [
+                            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X,
+                            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y,
+                            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z,
+                        ][axis],
+                        s.device,
+                    ),
                     "block dimension limit",
                 )?;
                 check(
-                    (s.driver.attribute)(&mut maxgrid, 5 + axis as i32, s.device),
+                    sys::cuDeviceGetAttribute(
+                        &mut maxgrid,
+                        [
+                            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X,
+                            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y,
+                            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z,
+                        ][axis],
+                        s.device,
+                    ),
                     "grid dimension limit",
                 )?;
                 if k.block[axis] > maxblock as u32 || k.grid[axis] > maxgrid as u32 {
@@ -561,12 +515,20 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
             }
             let mut default_shared = 0;
             check(
-                (s.driver.attribute)(&mut default_shared, 8, s.device),
+                sys::cuDeviceGetAttribute(
+                    &mut default_shared,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+                    s.device,
+                ),
                 "default shared memory limit",
             )?;
             if u64::from(k.shared_memory_bytes) + staticsmem as u64 > default_shared as u64 {
                 check(
-                    (s.driver.function_set)(function, 8, k.shared_memory_bytes as i32),
+                    sys::cuFuncSetAttribute(
+                        function,
+                        sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        k.shared_memory_bytes as i32,
+                    ),
                     "opt-in dynamic shared memory",
                 )?
             }
@@ -596,7 +558,7 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
     // transfers before consuming them on the nonblocking execution stream.
     // SAFETY: The session owns the current context and all uploaded allocations.
     unsafe {
-        check((s.driver.context_sync)(), "finish loader transfers")?;
+        check(sys::cuCtxSynchronize(), "finish loader transfers")?;
     }
     let load_s = started.elapsed().as_secs_f64();
     let first = Instant::now();
@@ -607,7 +569,10 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
     // below run only after explicit stream synchronization. Capture records the
     // immutable allocations/ABI values; input changes alter data, never addresses.
     unsafe {
-        check((s.driver.stream_sync)(s.stream), "first launch synchronize")?;
+        check(
+            sys::cuStreamSynchronize(s.stream),
+            "first launch synchronize",
+        )?;
         let first_launch_wall_s = first.elapsed().as_secs_f64();
         let output_spec = x
             .manifest
@@ -618,7 +583,7 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
         let output = device_buffers[&output_spec.name];
         let mut expected = vec![0u8; output_spec.bytes()?];
         check(
-            (s.driver.download)(expected.as_mut_ptr().cast(), output, expected.len()),
+            sys::cuMemcpyDtoH_v2(expected.as_mut_ptr().cast(), output, expected.len()),
             "download first output",
         )?;
         let reference = floats(&x.files[&x.manifest.validation.reference.file], Dtype::F32);
@@ -632,33 +597,36 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
         }
         let capture = Instant::now();
         check(
-            (s.driver.capture_begin)(s.stream, 1),
+            sys::cuStreamBeginCapture_v2(
+                s.stream,
+                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            ),
             "begin thread-local capture",
         )?;
         s.capturing = true;
         for l in &mut launches {
             l.execute(&s.driver, s.stream)?;
         }
-        let code = (s.driver.capture_end)(s.stream, &mut s.graph);
+        let code = sys::cuStreamEndCapture(s.stream, &mut s.graph);
         s.capturing = false;
         check(code, "end capture")?;
         check(
-            (s.driver.graph_instantiate)(&mut s.exec, s.graph, 0),
+            sys::cuGraphInstantiateWithFlags(&mut s.exec, s.graph, 0),
             "instantiate graph",
         )?;
         let graph_capture_s = capture.elapsed().as_secs_f64();
         let mut observed = vec![0u8; expected.len()];
         check(
-            (s.driver.memset)(output, 255, expected.len(), s.stream),
+            sys::cuMemsetD8Async(output, 255, expected.len(), s.stream),
             "poison output",
         )?;
         check(
-            (s.driver.graph_launch)(s.exec, s.stream),
+            sys::cuGraphLaunch(s.exec, s.stream),
             "replay poisoned output",
         )?;
-        check((s.driver.stream_sync)(s.stream), "replay synchronize")?;
+        check(sys::cuStreamSynchronize(s.stream), "replay synchronize")?;
         check(
-            (s.driver.download)(observed.as_mut_ptr().cast(), output, observed.len()),
+            sys::cuMemcpyDtoH_v2(observed.as_mut_ptr().cast(), output, observed.len()),
             "download replay",
         )?;
         if expected != observed {
@@ -672,23 +640,20 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
             .unwrap();
         let input = device_buffers[&input_spec.name];
         check(
-            (s.driver.memset)(input, 0, input_spec.bytes()?, s.stream),
+            sys::cuMemsetD8Async(input, 0, input_spec.bytes()?, s.stream),
             "change actual input to zero",
         )?;
         check(
-            (s.driver.memset)(output, 255, observed.len(), s.stream),
+            sys::cuMemsetD8Async(output, 255, observed.len(), s.stream),
             "poison changed-input output",
         )?;
+        check(sys::cuGraphLaunch(s.exec, s.stream), "replay changed input")?;
         check(
-            (s.driver.graph_launch)(s.exec, s.stream),
-            "replay changed input",
-        )?;
-        check(
-            (s.driver.stream_sync)(s.stream),
+            sys::cuStreamSynchronize(s.stream),
             "changed-input synchronize",
         )?;
         check(
-            (s.driver.download)(observed.as_mut_ptr().cast(), output, observed.len()),
+            sys::cuMemcpyDtoH_v2(observed.as_mut_ptr().cast(), output, observed.len()),
             "download changed-input output",
         )?;
         if floats(&observed, output_spec.dtype)
@@ -699,48 +664,42 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
         }
         let original = &x.files[&input_spec.data.as_ref().unwrap().file];
         check(
-            (s.driver.upload)(input, original.as_ptr().cast(), original.len()),
+            sys::cuMemcpyHtoD_v2(input, original.as_ptr().cast(), original.len()),
             "restore actual input",
         )?;
-        check((s.driver.context_sync)(), "finish restored input transfer")?;
+        check(sys::cuCtxSynchronize(), "finish restored input transfer")?;
         check(
-            (s.driver.memset)(output, 255, observed.len(), s.stream),
+            sys::cuMemsetD8Async(output, 255, observed.len(), s.stream),
             "poison restored output",
         )?;
         check(
-            (s.driver.graph_launch)(s.exec, s.stream),
+            sys::cuGraphLaunch(s.exec, s.stream),
             "replay restored input",
         )?;
-        check((s.driver.stream_sync)(s.stream), "restore synchronize")?;
+        check(sys::cuStreamSynchronize(s.stream), "restore synchronize")?;
         check(
-            (s.driver.download)(observed.as_mut_ptr().cast(), output, observed.len()),
+            sys::cuMemcpyDtoH_v2(observed.as_mut_ptr().cast(), output, observed.len()),
             "download restored output",
         )?;
         if observed != expected {
             return Err("Restored-input graph differs from first output".into());
         }
         let (mut begin, mut end) = (ptr::null_mut(), ptr::null_mut());
-        check((s.driver.event_create)(&mut begin, 0), "create begin event")?;
+        check(sys::cuEventCreate(&mut begin, 0), "create begin event")?;
         s.events.push(begin);
-        check((s.driver.event_create)(&mut end, 0), "create end event")?;
+        check(sys::cuEventCreate(&mut end, 0), "create end event")?;
         s.events.push(end);
         let mut times = vec![];
         for _ in 0..3 {
-            check(
-                (s.driver.event_record)(begin, s.stream),
-                "record begin event",
-            )?;
+            check(sys::cuEventRecord(begin, s.stream), "record begin event")?;
             for _ in 0..x.manifest.validation.repetitions {
-                check(
-                    (s.driver.graph_launch)(s.exec, s.stream),
-                    "timed graph replay",
-                )?
+                check(sys::cuGraphLaunch(s.exec, s.stream), "timed graph replay")?
             }
-            check((s.driver.event_record)(end, s.stream), "record end event")?;
-            check((s.driver.event_sync)(end), "synchronize end event")?;
+            check(sys::cuEventRecord(end, s.stream), "record end event")?;
+            check(sys::cuEventSynchronize(end), "synchronize end event")?;
             let mut ms = 0f32;
             check(
-                (s.driver.event_elapsed)(&mut ms, begin, end),
+                sys::cuEventElapsedTime(&mut ms, begin, end),
                 "elapsed events",
             )?;
             times.push(ms / x.manifest.validation.repetitions as f32);
