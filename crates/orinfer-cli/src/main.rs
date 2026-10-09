@@ -54,6 +54,9 @@ struct LoadArgs {
     /// Parallel weight readers; default selects a bounded number of CPU cores.
     #[arg(long, value_name = "N", value_parser = parse_load_workers)]
     load_workers: Option<usize>,
+    /// Opt in to copied greedy drafts from this request's token history.
+    #[arg(long)]
+    prompt_lookup: bool,
 }
 #[derive(Args)]
 struct ModelArgs {
@@ -119,6 +122,7 @@ impl From<ServeArgs> for ServerConfig {
             verify_weights: args.load.verify_weights,
             load_workers: args.load.load_workers,
             mtp_drafts: args.mtp_drafts.0,
+            prompt_lookup: args.load.prompt_lookup,
             prefix_cache_bytes: args.prefix_cache_bytes,
             scheduler: orinfer_engine::scheduler::Options {
                 max_active: args.max_active_requests,
@@ -188,6 +192,7 @@ fn execute(command: Command) -> Result<(), String> {
             &args.requests,
             LoadOptions {
                 cuda_graph: args.load.cuda_graph,
+                prompt_lookup: args.load.prompt_lookup,
                 verify_weights: args.load.verify_weights,
                 load_workers: args.load.load_workers,
                 ..Default::default()
@@ -198,6 +203,7 @@ fn execute(command: Command) -> Result<(), String> {
             &args.requests,
             LoadOptions {
                 cuda_graph: args.load.cuda_graph,
+                prompt_lookup: args.load.prompt_lookup,
                 verify_weights: args.load.verify_weights,
                 load_workers: args.load.load_workers,
                 ..Default::default()
@@ -234,11 +240,13 @@ mod tests {
         assert_eq!(config.prefix_cache_bytes, 12usize << 30);
         assert_eq!(config.scheduler.max_active, 32);
         assert_eq!(config.mtp_drafts, None);
+        assert!(!config.prompt_lookup);
         assert!(!config.verify_weights);
         assert_eq!(config.load_workers, None);
         assert!(config.default_request_params.is_empty());
         let config = serve(&[
             "--verify-weights",
+            "--prompt-lookup",
             "--mtp-drafts=7",
             "--cuda-graph",
             "off",
@@ -259,6 +267,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.cuda_graph, CudaGraphMode::Off);
         assert_eq!(config.mtp_drafts, Some(7));
+        assert!(config.prompt_lookup);
         assert!(config.verify_weights);
         assert_eq!(config.prefix_cache_bytes, 0);
         assert_eq!(config.scheduler.memory_reserve_bytes, 2usize << 30);

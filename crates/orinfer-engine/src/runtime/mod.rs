@@ -45,6 +45,7 @@ pub(crate) struct ModelRuntime {
     iteration_costs:
         std::collections::BTreeMap<(usize, usize, usize, usize), crate::scheduler::Estimate>,
     mtp_seconds_per_token: f64,
+    prompt_lookup: bool,
     startup_costs: std::collections::BTreeMap<(usize, usize, bool), crate::scheduler::Estimate>,
     model_package: crate::model_package::ModelPackage,
     request_hidden_ring: Option<String>,
@@ -111,6 +112,7 @@ impl ModelRuntime {
             unmerged_prefill_s: 0.,
             iteration_costs: Default::default(),
             mtp_seconds_per_token: 0.055,
+            prompt_lookup: options.prompt_lookup,
             startup_costs: Default::default(),
             model_package: prepared.execution_model,
             request_hidden_ring,

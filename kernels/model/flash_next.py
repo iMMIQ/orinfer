@@ -21,12 +21,15 @@ def dense_projection(
     weight_dtype: str = "float16",
     output_dtype: str = "float16",
     dynamic_rows: bool = False,
+    block_n: int = 64,
 ):
     """FP16 input, FP16/BF16 weights, FP32 accumulation; optional F32 output."""
     if any(type(v) is not int or v <= 0 for v in (M, N, K)) or K % 64:
         raise ValueError("Invalid dense projection dimensions")
     if weight_dtype not in ("float16", "bfloat16") or output_dtype not in ("float16", "float32"):
         raise ValueError("Invalid dense projection dtype")
+    if type(block_n) is not int or block_n not in (32, 64):
+        raise ValueError("Invalid dense projection output tile")
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
@@ -35,17 +38,17 @@ def dense_projection(
         Weight: T.Tensor((N, K), weight_dtype),
         Output: T.Tensor((M, N), output_dtype),
     ):
-        with T.Kernel(T.ceildiv(M, 16), T.ceildiv(N, 64), threads=128) as (by, bx):
+        with T.Kernel(T.ceildiv(M, 16), T.ceildiv(N, block_n), threads=128) as (by, bx):
             a = T.alloc_shared((16, 64), weight_dtype)
-            w = T.alloc_shared((64, 64), weight_dtype)
-            acc = T.alloc_fragment((16, 64), T.float32)
+            w = T.alloc_shared((block_n, 64), weight_dtype)
+            acc = T.alloc_fragment((16, block_n), T.float32)
             T.clear(acc)
             for kg in T.Pipelined(K // 64, num_stages=2):
                 for i, j in T.Parallel(16, 64, coalesced_width=T.int32(1)):
                     a[i, j] = T.if_then_else(by * 16 + i < M, A[by * 16 + i, kg * 64 + j], 0.0)
-                T.copy(Weight[bx * 64, kg * 64], w)
+                T.copy(Weight[bx * block_n, kg * 64], w)
                 T.gemm(a, w, acc, transpose_B=True)
-            T.copy(acc, Output[by * 16, bx * 64])
+            T.copy(acc, Output[by * 16, bx * block_n])
 
     return main
 

@@ -5,6 +5,7 @@ use crate::{architecture::BatchSegment, prefix::Media, scheduler};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 mod profile;
+mod prompt_lookup;
 mod speculation;
 #[cfg(test)]
 mod tests;
@@ -42,7 +43,9 @@ pub struct RequestState {
     last_prefill: Instant,
     credit_s: f64,
     speculation_costs: BTreeMap<usize, speculation::Profile>,
+    lookup_costs: BTreeMap<usize, speculation::Profile>,
     speculation_probe_token: usize,
+    prompt_lookup: prompt_lookup::PromptLookup,
     mtp_blocked: bool,
     decoder: crate::sampling::Decoder,
 }
@@ -589,7 +592,9 @@ impl ModelRuntime {
                 last_prefill: Instant::now(),
                 credit_s: 0.,
                 speculation_costs: Default::default(),
+                lookup_costs: Default::default(),
                 speculation_probe_token: 0,
+                prompt_lookup: Default::default(),
                 mtp_blocked: false,
                 decoder: Default::default(),
             })
@@ -929,6 +934,7 @@ impl ModelRuntime {
                     requests[i].speculation_probe_token = requests[i].generated;
                 }
                 let began = Instant::now();
+                let lookup_rounds = requests[i].mtp.lookup_rounds;
                 let result = self.with_request(requests[i], |model, req| {
                     model.speculative_request_step(req, rows)
                 });
@@ -940,7 +946,16 @@ impl ModelRuntime {
                 let seconds = began.elapsed().as_secs_f64();
                 let per_token = seconds / tokens.len().max(1) as f64;
                 let progress = requests[i].generated;
-                let cost = requests[i].speculation_costs.entry(rows).or_default();
+                // Copies and model drafts have different costs and acceptance.
+                // A successful copy must not make a later model draft look
+                // artificially profitable at the same verification width.
+                let request = &mut requests[i];
+                let costs = if request.mtp.lookup_rounds != lookup_rounds {
+                    &mut request.lookup_costs
+                } else {
+                    &mut request.speculation_costs
+                };
+                let cost = costs.entry(rows).or_default();
                 cost.observe(seconds, tokens.len(), progress);
                 self.mtp_seconds_per_token = self.mtp_seconds_per_token * 0.8 + per_token * 0.2;
                 self.scheduler_statistics.speculative_iterations += 1;
@@ -1056,16 +1071,41 @@ impl ModelRuntime {
                 .filter(|&&j| j != i)
                 .filter_map(|&j| requests[j].decode_slack_s(options.target_tpot_ms))
                 .fold(f64::INFINITY, f64::min);
-            let candidate = speculation::select_profile(
-                &plans,
-                &req.speculation_costs,
-                req.generated,
-                req.speculation_probe_token,
-                slack,
-                self.mtp_seconds_per_token,
-            );
+            // A long matching suffix predicts a different proposal source
+            // from the model draft whose earlier timings ranked these rows.
+            // Try the widest eligible copy, still bounded by peer deadlines.
+            let lookup_rows = (self.prompt_lookup
+                && req.sampling.is_greedy()
+                && req.sampling.top_logprobs.is_none())
+            .then(|| {
+                plans
+                    .iter()
+                    .copied()
+                    .filter(|&n| {
+                        req.prompt_lookup.available(&req.history, n - 1)
+                            && req
+                                .lookup_costs
+                                .get(&n)
+                                .or_else(|| req.speculation_costs.get(&n))
+                                .map_or(self.mtp_seconds_per_token * n as f64, |p| p.upper())
+                                <= slack
+                    })
+                    .max()
+            })
+            .flatten();
+            let candidate = lookup_rows.map(|n| (n, false)).or_else(|| {
+                speculation::select_profile(
+                    &plans,
+                    &req.speculation_costs,
+                    req.generated,
+                    req.speculation_probe_token,
+                    slack,
+                    self.mtp_seconds_per_token,
+                )
+            });
             if let Some((rows, exploring)) = candidate {
-                let worthwhile = exploring
+                let worthwhile = lookup_rows.is_some()
+                    || exploring
                     || req.speculation_costs[&rows].score().unwrap()
                         < self.predict_iteration(requests, &target) / decode.len() as f64;
                 if worthwhile {

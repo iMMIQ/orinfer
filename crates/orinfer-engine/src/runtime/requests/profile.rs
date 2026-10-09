@@ -19,6 +19,125 @@ fn median(values: &[f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
 }
+
+#[test]
+#[ignore = "Requires real model and exclusive GPU experiment lock"]
+fn profile_speculative_verification() {
+    let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
+    assert!(!output.exists());
+    let sources: Vec<GenerationInput> = serde_json::from_value(fixture["cases"].clone()).unwrap();
+    let widths: Vec<usize> = serde_json::from_value(fixture["widths"].clone()).unwrap();
+    let mut model = ModelRuntime::load_with_options(
+        std::path::Path::new(fixture["model"].as_str().unwrap()),
+        LoadOptions {
+            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            prefix_cache_bytes: 0,
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    let mut rows = vec![];
+    for source in sources {
+        for &width in &widths {
+            let mut tokens = vec![];
+            model
+                .generate(
+                    &source.input_tokens,
+                    None,
+                    width + 1,
+                    &source.sampling,
+                    || false,
+                    |t| {
+                        tokens.push(t);
+                        true
+                    },
+                )
+                .unwrap();
+            assert!(tokens.len() >= width);
+            let mut request = model
+                .start_request(
+                    GenerationInput {
+                        input_tokens: source.input_tokens.clone(),
+                        images: vec![],
+                        max_new_tokens: width + 16,
+                        sampling: source.sampling.clone(),
+                        prefix_hints: vec![],
+                    },
+                    &|| false,
+                )
+                .unwrap();
+            while request.prefilling {
+                model
+                    .advance_requests(&mut [&mut request], &scheduler::Options::default())
+                    .unwrap();
+            }
+            let spec = model.manifest.mtp.clone().unwrap();
+            let verify = spec
+                .verification_plans
+                .iter()
+                .find(|p| p.tokens == width)
+                .unwrap();
+            let position = source.input_tokens.len() as u32;
+            model
+                .upload_ids(&model.manifest.input, &tokens[..width])
+                .unwrap();
+            model
+                .prepare_inputs(&tokens[..width], &source.input_tokens)
+                .unwrap();
+            model.upload_segment_controls(width).unwrap();
+            // Materialize demand-mapped KV/workspace before capturing the
+            // instrumented graph. Timing replays advance recurrent state and
+            // are diagnostic only; they do not establish output quality.
+            model
+                .launch_program(&verify.program, ExecutionPhase::Decode)
+                .unwrap();
+            let plan: Vec<_> = model.manifest.programs[&verify.program]
+                .iter()
+                .cloned()
+                .map(|operation| Invocation {
+                    operation,
+                    sequence: None,
+                    launch: None,
+                    views: BTreeMap::new(),
+                })
+                .collect();
+            let trials = model
+                .execution
+                .profile_graph_operations_at_position(
+                    &plan,
+                    Some((&model.manifest.position, position)),
+                )
+                .unwrap();
+            let operations: Vec<_> = plan
+                .iter()
+                .enumerate()
+                .map(|(index, op)| {
+                    let name = match &op.operation {
+                        crate::model::Operation::Kernel { name } => name.clone(),
+                        _ => category(&model, op),
+                    };
+                    let ms = median(
+                        &trials
+                            .iter()
+                            .map(|t| f64::from(t[index]))
+                            .collect::<Vec<_>>(),
+                    );
+                    json!({"name":name,"median_ms":ms})
+                })
+                .collect();
+            rows.push(json!({"prompt_tokens":source.input_tokens.len(),"verification_tokens":width,
+                "program":verify.program,"operations":operations,
+                "instrumented_gpu_median_ms":median(&trials.iter().map(|t|t.iter().map(|x|f64::from(*x)).sum()).collect::<Vec<_>>())}));
+            std::fs::write(&output,serde_json::to_vec_pretty(&json!({"rows":rows,
+                "scope":"Real model, teacher-forced target tokens; instrumented verification graph at fixed position. Recurrent state advances between replays. Diagnostic only, excludes draft/commit/refresh and is not end-to-end TPS or quality acceptance."})).unwrap()).unwrap();
+            model.finish_request(&mut request, false).unwrap();
+        }
+    }
+}
 fn category(model: &ModelRuntime, op: &Invocation) -> String {
     match &op.operation {
         crate::model::Operation::Kernel { name } => {

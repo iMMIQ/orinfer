@@ -47,6 +47,8 @@ pub struct LoadOptions {
     pub prefix_cache_bytes: usize,
     /// None keeps the package default; zero disables speculative execution.
     pub mtp_drafts: Option<usize>,
+    /// Opt in to request-local copied proposals for greedy speculation.
+    pub prompt_lookup: bool,
 }
 
 pub fn parse_load_workers(value: &str) -> Result<usize> {
@@ -228,6 +230,7 @@ mod tests {
         }
         assert_eq!(LoadOptions::default().cuda_graph, CudaGraphMode::DecodeOnly);
         assert_eq!(LoadOptions::default().mtp_drafts, None);
+        assert!(!LoadOptions::default().prompt_lookup);
         assert_eq!(parse_mtp_drafts("auto").unwrap(), None);
         for n in 0..=7 {
             assert_eq!(parse_mtp_drafts(&n.to_string()).unwrap(), Some(n));

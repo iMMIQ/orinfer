@@ -4,6 +4,15 @@
 
 执行器固定使用已采用的 SM87 路径：专家 E8P＋block128 旋转、普通投影 W8、关键系数 BF16/FP32、group-64 INT8 KV、FP32 GDN 状态。prefill 按长度选择专家 tile；MTP 支持 1..7 个草稿和完整接受前缀提交。架构与编码约束位于 [`architecture-contract.json`](../../../configs/architecture-contract.json)，加载前拒绝不匹配的配置。
 
+小批次验证使用精确的 E8P 短码表和字节置换；router 按小批次选择输出 tile。已有原生模型可用 `tools/model/flash_next/optimize_decode.py` 重建这些算子，权重逐字节保留，新执行包仍合并为 safetensors 资产容器：
+
+```bash
+ORINFER_CHECKPOINT_DIR=/path/to/native-model \
+  ORINFER_EXECUTION_CACHE=/path/to/orinfer/packages \
+  bash tools/operators/run.sh tools/model/flash_next/optimize_decode.py artifacts/flash-decode-build \
+  --model /path/to/native-model --model-output artifacts/models/flash-decode
+```
+
 ## 权重准备
 
 CPU 工具使用 `make python-env` 创建的 uv 环境，GPU 转换与验证使用固定编译镜像及 GPU 锁。固定原始 checkpoint revision，流式读取 BF16，不需要保存完整原始模型：
@@ -49,6 +58,8 @@ bash tools/operators/run.sh tools/model/flash_next/prepare_mtp.py artifacts/flas
 PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models/flash-serving-mtp
 # serve 使用上面的相同参数，改为 flash-serving-mtp 目录；包含 MTP 的包自动启用。
 ```
+
+代码修改或重复模板可额外指定 `--prompt-lookup`，从本请求历史中提取待验证续写；默认关闭，普通生成可能因较差候选而变慢。它仅适用于无惩罚 greedy 且未请求 logprobs 的请求，上限仍由 `--mtp-drafts` 控制。
 
 验证阶段保存 GDN 的 FP32 紧凑更新、卷积/PLE 历史和每个 QSA pending 前缀；全部接受和部分接受均执行提交。Draft 分支会恢复其原始 pending 块，再以 target HC 重算已提交位置。随机采样使用 p/q 接受和残差分布修正。
 

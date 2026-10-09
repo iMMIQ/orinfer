@@ -96,6 +96,9 @@ pub struct Statistics {
     pub sampling_s: f64,
     pub restore_s: f64,
     pub refresh_s: f64,
+    pub lookup_rounds: usize,
+    pub lookup_proposed_tokens: usize,
+    pub lookup_accepted_draft_tokens: usize,
 }
 
 #[cfg(test)]

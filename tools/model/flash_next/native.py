@@ -60,6 +60,7 @@ from kernels.operators.op30_activation_quantization import (
     launch as launch_quant,
 )
 from tools.model.flash_next.checkpoint import Checkpoint
+from tools.model.flash_next.kernel_policy import expert_tile_config, router_tile
 from tools.model.flash_next.chunks import chunks
 from tools.model.flash_next.speculation import DEFAULT_DRAFTS
 from tools.model.flash_next.lookup import RowCache
@@ -472,9 +473,12 @@ class Model:
                 else:
                     wd = str(weight.dtype).split(".")[-1]
                     od = str(out.dtype).split(".")[-1]
+                    # Give all 16 SMs work on the small BF16 router, preserving
+                    # the K traversal and accumulation/rounding semantics.
+                    bn = router_tile(rows, n, width, e, h)
                     call(
-                        f"dense-{rows}-{n}-{width}-{wd}-{od}",
-                        lambda: fn.dense_projection(rows, n, width, wd, od),
+                        f"dense-{rows}-{n}-{width}-{wd}-{od}-{bn}",
+                        lambda: fn.dense_projection(rows, n, width, wd, od, block_n=bn),
                         a,
                         weight,
                         out,
@@ -637,8 +641,9 @@ class Model:
         )
         # Larger row tiles amortize expert decoding on long prompts; short
         # requests need the smaller tile to bound padding and register costs.
-        expert_bm = 64 if m >= 1024 else 32 if m >= 256 else 16
-        byte_permute = expert_bm == 64
+        expert_config = expert_tile_config(m)
+        expert_bm = expert_config["block_m"]
+        byte_permute = expert_config["byte_permute"]
         tiles = (assignments + expert_bm - 1) // expert_bm + min(e, assignments)
         # An auto BM64 arena must also accommodate smaller BM32 tails.
         # The route tile count is not monotonic in request length.
@@ -1007,10 +1012,10 @@ class Model:
             call(f"router-{m}", lambda: router_topk(m, e, k), logits, ids, prob)
             # Shortbook/BM32 preserves decoded INT8 values and improves real
             # prefill weight reuse; small verification keeps its BM16 plan.
-            shortbook = m in (4, 8) or m >= 256
+            shortbook = expert_config["shortbook"]
             book_key = "short_table" if shortbook else "table"
-            expert_bn = 128 if shortbook else 64
-            expert_stages = 1 if shortbook and expert_bm <= 32 else 2
+            expert_bn = expert_config["block_n"]
+            expert_stages = expert_config["num_stages"]
             if m >= 256:
                 call(
                     f"histogram-local-{m}",

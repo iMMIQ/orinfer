@@ -27,7 +27,7 @@ group_args=()
 for group_id in $(id -G); do group_args+=(--group-add "$group_id"); done
 reference_env=()
 declare -A mounted_inputs=()
-for variable in ORINFER_CHECKPOINT_DIR ORINFER_REFERENCE_CHECKPOINT ORINFER_REFERENCE_SOURCE ORINFER_REFERENCE_ACTIVATIONS; do
+for variable in ORINFER_CHECKPOINT_DIR ORINFER_REFERENCE_CHECKPOINT ORINFER_REFERENCE_SOURCE ORINFER_REFERENCE_ACTIVATIONS ORINFER_EXECUTION_CACHE; do
     if [[ -n "${!variable:-}" ]]; then
         input_path="$(realpath -- "${!variable}")"
         if [[ -z "${mounted_inputs[$input_path]+present}" ]]; then

@@ -10,6 +10,9 @@ pub(super) struct Profile {
     last_progress: usize,
 }
 impl Profile {
+    pub fn upper(&self) -> f64 {
+        self.time.upper()
+    }
     pub fn observe(&mut self, seconds: f64, tokens: usize, progress: usize) {
         if self.trials == 1 {
             // The first use may capture a graph or load a lazy CUDA module.
@@ -151,102 +154,115 @@ impl ModelRuntime {
             return Ok(out);
         };
         let vocab = self.manifest.vocab;
-        if let Some(save) = &spec.draft_snapshot_program {
-            self.launch_program(save, ExecutionPhase::Decode)?;
-        }
         let at = Instant::now();
         let mut drafts = Vec::with_capacity(plan.tokens - 1);
         let mut proposals = Vec::with_capacity(plan.tokens - 1);
-        let mut draft_history = req.history.clone();
         let host_sampling = !req.sampling.is_greedy() || req.sampling.top_logprobs.is_some();
-        let mut draft_decoder = req.decoder.fork();
-        let draft_options = crate::sampling::Options {
-            top_logprobs: None,
-            ..req.sampling.clone()
-        };
-        for i in 0..plan.tokens - 1 {
-            if i != 0 {
-                self.prepare_program_inputs(
-                    &spec.draft_program,
-                    &[*drafts.last().ok_or("Missing draft input")?],
-                    &[],
-                )?;
-                self.launch_program(&spec.draft_program, ExecutionPhase::Decode)?;
-            }
-            let selected = self.read_control(&spec.token)?;
-            if self.read_control(&spec.status)? != 0 || selected < 0 || selected as usize >= vocab {
-                return Err("Invalid request draft token".into());
-            }
-            let token = if !host_sampling {
-                let token = match draft_decoder
-                    .greedy_candidate(selected as u32, vocab)
-                    .inspect_err(|error| {
-                        if draft_decoder.failure().is_some() {
-                            req.decoder.fail(error.clone());
-                        }
-                    })? {
-                    Some(token) => token,
-                    None => {
-                        let raw = self
-                            .execution
-                            .download_bytes(&spec.draft_logits, vocab * 4)?;
-                        draft_decoder
-                            .law(
-                                &floats(&raw, crate::artifact::Dtype::F32),
-                                &draft_history,
-                                &draft_options,
-                            )
-                            .inspect_err(|error| {
-                                if draft_decoder.failure().is_some() {
-                                    req.decoder.fail(error.clone());
-                                }
-                            })?
-                            .distribution
-                            .draw(0.0)?
-                    }
-                };
-                if token != selected as u32 {
-                    self.upload_ids(&spec.token, &[token])?;
-                }
-                draft_decoder.consume(token).inspect_err(|error| {
-                    req.decoder.fail(error.clone());
-                })?;
-                token
-            } else {
-                let raw = self
-                    .execution
-                    .download_bytes(&spec.draft_logits, vocab * 4)?;
-                let law = draft_decoder
-                    .law(
-                        &floats(&raw, crate::artifact::Dtype::F32),
-                        &draft_history,
-                        &draft_options,
-                    )
-                    .inspect_err(|error| {
-                        if draft_decoder.failure().is_some() {
-                            req.decoder.fail(error.clone());
-                        }
-                    })?;
-                let distribution = law.distribution;
-                let token = distribution.draw(crate::sampling::counter_uniform(
-                    req.sampling.seed,
-                    crate::mtp::DRAFT_STREAM,
-                    (req.generated + i) as u64,
-                ))?;
-                proposals.push(crate::mtp::Proposal {
-                    token,
-                    distribution,
-                });
-                self.upload_ids(&spec.token, &[token])?;
-                draft_decoder.consume(token).inspect_err(|error| {
-                    req.decoder.fail(error.clone());
-                })?;
-                token
+        let lookup = (self.prompt_lookup && !host_sampling)
+            .then(|| req.prompt_lookup.propose(&req.history, plan.tokens - 1))
+            .flatten();
+        let is_lookup = lookup.is_some();
+        if !is_lookup && let Some(save) = &spec.draft_snapshot_program {
+            self.launch_program(save, ExecutionPhase::Decode)?;
+        }
+        if let Some(tokens) = lookup {
+            drafts = tokens;
+            req.mtp.lookup_rounds += 1;
+            req.mtp.lookup_proposed_tokens += drafts.len();
+        } else {
+            let mut draft_history = req.history.clone();
+            let mut draft_decoder = req.decoder.fork();
+            let draft_options = crate::sampling::Options {
+                top_logprobs: None,
+                ..req.sampling.clone()
             };
-            drafts.push(token);
-            draft_history.push(token);
-            if draft_decoder.finished() {
-                break;
+            for i in 0..plan.tokens - 1 {
+                if i != 0 {
+                    self.prepare_program_inputs(
+                        &spec.draft_program,
+                        &[*drafts.last().ok_or("Missing draft input")?],
+                        &[],
+                    )?;
+                    self.launch_program(&spec.draft_program, ExecutionPhase::Decode)?;
+                }
+                let selected = self.read_control(&spec.token)?;
+                if self.read_control(&spec.status)? != 0
+                    || selected < 0
+                    || selected as usize >= vocab
+                {
+                    return Err("Invalid request draft token".into());
+                }
+                let token = if !host_sampling {
+                    let token = match draft_decoder
+                        .greedy_candidate(selected as u32, vocab)
+                        .inspect_err(|error| {
+                            if draft_decoder.failure().is_some() {
+                                req.decoder.fail(error.clone());
+                            }
+                        })? {
+                        Some(token) => token,
+                        None => {
+                            let raw = self
+                                .execution
+                                .download_bytes(&spec.draft_logits, vocab * 4)?;
+                            draft_decoder
+                                .law(
+                                    &floats(&raw, crate::artifact::Dtype::F32),
+                                    &draft_history,
+                                    &draft_options,
+                                )
+                                .inspect_err(|error| {
+                                    if draft_decoder.failure().is_some() {
+                                        req.decoder.fail(error.clone());
+                                    }
+                                })?
+                                .distribution
+                                .draw(0.0)?
+                        }
+                    };
+                    if token != selected as u32 {
+                        self.upload_ids(&spec.token, &[token])?;
+                    }
+                    draft_decoder.consume(token).inspect_err(|error| {
+                        req.decoder.fail(error.clone());
+                    })?;
+                    token
+                } else {
+                    let raw = self
+                        .execution
+                        .download_bytes(&spec.draft_logits, vocab * 4)?;
+                    let law = draft_decoder
+                        .law(
+                            &floats(&raw, crate::artifact::Dtype::F32),
+                            &draft_history,
+                            &draft_options,
+                        )
+                        .inspect_err(|error| {
+                            if draft_decoder.failure().is_some() {
+                                req.decoder.fail(error.clone());
+                            }
+                        })?;
+                    let distribution = law.distribution;
+                    let token = distribution.draw(crate::sampling::counter_uniform(
+                        req.sampling.seed,
+                        crate::mtp::DRAFT_STREAM,
+                        (req.generated + i) as u64,
+                    ))?;
+                    proposals.push(crate::mtp::Proposal {
+                        token,
+                        distribution,
+                    });
+                    self.upload_ids(&spec.token, &[token])?;
+                    draft_decoder.consume(token).inspect_err(|error| {
+                        req.decoder.fail(error.clone());
+                    })?;
+                    token
+                };
+                drafts.push(token);
+                draft_history.push(token);
+                if draft_decoder.finished() {
+                    break;
+                }
             }
         }
         // Fixed verification profiles may contain unused rows after EOS. They
@@ -324,7 +340,7 @@ impl ModelRuntime {
             return Err("Invalid speculative commit length".into());
         }
         req.mtp.sampling_s += at.elapsed().as_secs_f64();
-        req.mtp.accepted_draft_tokens += if host_sampling {
+        let accepted = if host_sampling {
             committed
                 .iter()
                 .zip(&proposals)
@@ -337,6 +353,12 @@ impl ModelRuntime {
                 .take_while(|(token, draft)| token == draft)
                 .count()
         };
+        req.mtp.accepted_draft_tokens += accepted;
+        if is_lookup {
+            req.mtp.lookup_accepted_draft_tokens += accepted;
+            req.prompt_lookup
+                .observe(accepted, drafts.len(), req.history.len() + committed.len());
+        }
         let at = Instant::now();
         if spec.commit_always || committed.len() < plan.tokens {
             self.upload_ids(&spec.accepted_inputs, &[committed.len() as u32])?;
@@ -351,7 +373,7 @@ impl ModelRuntime {
         req.history.extend_from_slice(&committed);
         req.generated += committed.len();
         let at = Instant::now();
-        if let Some(restore) = &spec.draft_restore_program {
+        if !is_lookup && let Some(restore) = &spec.draft_restore_program {
             self.launch_program(restore, ExecutionPhase::Decode)?;
         }
         self.upload_ids(&spec.position, &[position as u32])?;

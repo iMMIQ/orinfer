@@ -44,6 +44,7 @@ struct Service {
     model: Arc<str>,
     context: usize,
     mtp_drafts: usize,
+    prompt_lookup: bool,
     verify_weights: bool,
     vision: Option<orinfer_engine::vision::VisionSpec>,
     api_key: Option<Arc<str>>,
@@ -121,6 +122,7 @@ async fn serve(settings: Settings) -> Result<()> {
     let scheduler = settings.scheduler;
     let verify_weights = settings.verify_weights;
     let load_workers = settings.load_workers;
+    let prompt_lookup = settings.prompt_lookup;
     let activity = Arc::new(continuous::Activity::default());
     let lifecycle = Arc::clone(&activity.lifecycle);
     let worker_activity = Arc::clone(&activity);
@@ -160,6 +162,7 @@ async fn serve(settings: Settings) -> Result<()> {
                             load_workers,
                             prefix_cache_bytes: settings.prefix_cache_bytes,
                             mtp_drafts: settings.mtp_drafts,
+                            prompt_lookup: settings.prompt_lookup,
                         },
                     )?;
                     if &worker_codec.asset_hashes != model.frontend_assets() {
@@ -212,6 +215,7 @@ continuous::worker(
         model: model_id,
         context,
         mtp_drafts,
+        prompt_lookup,
         verify_weights,
         vision,
         api_key: std::env::var("ORINFER_API_KEY")
@@ -379,6 +383,7 @@ async fn health(State(state): State<Service>) -> Response {
             "images":state.vision.is_some(),"video":false,"audio":false,"default_max_completion_tokens":state.default_request_params.get("max_completion_tokens").and_then(Value::as_u64).or_else(|| state.default_request_params.get("max_tokens").and_then(Value::as_u64)).unwrap_or(8192),
             "thinking_token_budget":true,"prompt_cache":{"key":true,"retention":["in-memory","24h"],"persistent":false,"ttl_guaranteed":false}},
         "mtp":{"enabled":state.mtp_drafts>0,"max_drafts":state.mtp_drafts},
+        "prompt_lookup":{"enabled":state.prompt_lookup && state.mtp_drafts>0},
         "continuous_batching":true,"scheduler":state.scheduler,
         "scheduler_statistics":state.activity.statistics.lock().ok().map(|s| s.clone()),
         "admission_statistics":state.activity.admission.lock().ok().map(|s| s.clone()),
