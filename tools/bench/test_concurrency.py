@@ -55,6 +55,8 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(len(observed), 1)
         self.assertEqual(row["usage"]["completion_tokens"], 9)
         self.assertGreater(row["started_monotonic_s"], 0)
+        self.assertEqual(row["first_content_s"], observed[0])
+        self.assertIsNone(row["first_reasoning_s"])
 
 
 if __name__ == "__main__":

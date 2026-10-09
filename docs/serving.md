@@ -45,7 +45,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 默认关闭 thinking；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 开启后，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
-`thinking_token_budget` 限制本轮初始思考段的 token 数，支持 0；到达上限时解码强制选择 `</think>`，随后继续回答或调用工具。结束标记计入 completion，不计入 reasoning。预算自动缩小到总输出上限减 2，为结束标记和至少一个回答 token 留空间；开启 thinking 且指定此参数时，总输出预算至少为 2。关闭 thinking 时不应用此预算。限制是请求私有状态，MTP 的草稿和 target 共同遵守；无正文约束时结束思考后恢复普通 GPU 采样。思考期间使用 CPU 约束采样，会增加开销。effort 控制模型倾向，不能替代这个硬上限。
+`thinking_token_budget` 限制本轮初始思考段的 token 数，支持 0；到达上限时解码强制选择 `</think>`，随后继续回答或调用工具。结束标记计入 completion，不计入 reasoning。预算自动缩小到总输出上限减 2，为结束标记和至少一个回答 token 留空间；开启 thinking 且指定此参数时，总输出预算至少为 2。关闭 thinking 时不应用此预算。限制是请求私有状态，MTP 的草稿和 target 共同遵守。无惩罚、无概率报告的 greedy 请求在 GPU argmax 满足约束时直接复用结果；预算耗尽的单一结束标记也无需下载 logits。其他约束选择保留 CPU 回退，随机采样保持相同目标分布。effort 控制模型倾向，不能替代这个硬上限。
 
 默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 指定，二者不能同时传入。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限为 32 MiB。
 
@@ -151,15 +151,15 @@ Flash Next 的主模型支持 2048／4096 token 大分块，MTP 预热保持 512
 
 `--mtp-drafts 0` 移除草稿和验证执行计划，加载时跳过它们独占的权重；主模型、视觉及 batch 所需的目标状态捕获仍保留。模型文件不变，重新启用 MTP 时正常加载草稿权重。
 
-拒绝时恢复私有 GDN、卷积、位置和有效 KV 状态。固定 seed 可复现同模式结果；随机 MTP 与普通 decode 不要求同 seed 下逐 token 相同。输出尾部不足一个验证块时执行普通 decode。
+拒绝时恢复私有 GDN、卷积、位置和有效 KV 状态。固定 seed 控制采样随机流；自适应验证长度受实测耗时影响，不保证随机输出逐 token 复现。随机 MTP 与普通 decode 保持相同目标分布，不要求同 seed 下逐 token 相同。输出尾部不足一个验证块时执行普通 decode。
 
-单请求使用 MTP；2–4 个 decoder 按实测每提交 token 成本选择 MTP 或 target batch，更大并发和混合 prefill 使用 target batch。收益取决于接受率及采样开销。构建方法见[模型工具](../tools/model/README.md)。
+单请求使用 MTP；2–4 个 decoder 按实测每提交 token 成本选择 MTP 或 target batch，更大并发和混合 prefill 使用 target batch。草稿长度在 CLI 上限内按请求选择，各档先采集预热和稳定执行样本，首次执行耗时不进入稳定估计；每 64 个已提交 token 复测一个旧档位（普通 decode 也计入间隔），以适应 thinking 与代码段的接受率变化。所有探索仍受其他请求的 decode 时间预算约束。收益取决于接受率及采样开销。构建方法见[模型工具](../tools/model/README.md)。
 
 ### Prefix cache
 
 `--prefix-cache-mib` 默认 12288，单位 MiB，0 关闭复用；按需分配，不在加载时预占。缓存保存完整 KV、FP32 GDN、卷积、位置及 MTP 检查点。Rust radix tree 按 token 和图片身份匹配，并结合实际 prefill/恢复成本选择可用端点。
 
-KV 区间不可变并按引用共享，持续状态单独保存；恢复仍执行 GPU 复制到 Graph 绑定地址。短前缀妨碍大块执行时可能跳过。保存最终提示、周期及按成本准入的分叉检查点；生成结束也可保存已计算的输出前缀。模型重载后缓存清空。
+KV 区间不可变并按引用共享，持续状态单独保存；恢复仍执行 GPU 复制到 Graph 绑定地址。短前缀妨碍大块执行时可能跳过。保存最终提示、周期及按成本准入的分叉检查点；生成结束也可保存已计算的输出前缀。保存输出前缀时保留它所属的最长可复用提示；预算不足则跳过这次输出快照。正常内存回收仍可驱逐提示。模型重载后缓存清空。
 
 命中免除对应文本主干计算，视觉编码、剩余提示和生成继续执行。`usage.prompt_tokens_details.cached_tokens` 报告实际恢复长度，SSE 需请求 usage。缓存不是 paged attention 或零复制映射，不保证接近满上下文时命中完整提示；内存不足会驱逐或跳过保存。
 

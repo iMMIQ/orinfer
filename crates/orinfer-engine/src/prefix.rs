@@ -265,6 +265,11 @@ impl<T: Resident> Cache<T> {
     /// SegLen-style utility: saved replay distance per reclaimable byte,
     /// discounted by age. Tombstoned parents are skipped when computing distance.
     pub fn evict_one(&mut self) -> Option<T> {
+        self.evict_one_except(None)
+    }
+    /// A generated endpoint must not evict the prompt that makes repeating
+    /// that request useful. General memory admission may still evict any entry.
+    pub fn evict_one_except(&mut self, protected: Option<u64>) -> Option<T> {
         let mut references: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
         for e in self.entries.values() {
             let mut own = BTreeMap::new();
@@ -277,6 +282,7 @@ impl<T: Resident> Cache<T> {
         let victim = self
             .entries
             .iter()
+            .filter(|(id, _)| Some(**id) != protected)
             .min_by(|(_, a), (_, b)| {
                 let utility = |e: &Entry<T>| {
                     let parent = self.ancestor_depth(e);
@@ -319,6 +325,18 @@ impl<T: Resident> Cache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn decoded_insertion_preserves_its_prompt_but_admission_can_reclaim_it() {
+        let mut cache = Cache::new(100);
+        let prompt = cache.insert(entry(&[1, 2], &[(1, 10)], true));
+        cache.insert(entry(&[1, 2, 3, 4, 5], &[(2, 10)], false));
+        assert!(cache.evict_one_except(Some(prompt)).is_some());
+        assert_eq!(cache.find(&[1, 2], &Media::default()), Some(prompt));
+        assert!(cache.evict_one_except(Some(prompt)).is_none());
+        assert_eq!(cache.bytes, 10);
+        assert!(cache.evict_one().is_some());
+        assert_eq!(cache.bytes, 0);
+    }
     #[derive(Clone)]
     struct Blocks(Vec<(u64, usize)>);
     impl Resident for Blocks {

@@ -10,6 +10,15 @@
 
 `validate_plan.py`校验benchmark与快速评测配置，属于CPU检查，不产生性能测量。
 
+`code_generation.py` 用相同 Chat 请求测量 thinking、MTP 和 prefix cache 的组合，输入采用下方 `concurrency.py` 的 cases 格式：
+
+```bash
+python3 -m tools.bench.code_generation --requests code-requests.json \
+  --repetitions 3 --output artifacts/code-generation.json
+```
+
+每个 case 先执行一次预热，再重复请求；输出保留全部正文、思考文本、usage、首 token、首正文时间、实际缓存 token 命中率和 scheduler 差值。吞吐按已提交的 completion tokens 除以完整 HTTP 耗时计算，包含 thinking、prefill 和传输，不将 MTP 草稿或 SSE chunk 当作 token。报告单独列出空正文及预算截断，不能用提前结束的响应替代完整代码性能或质量验收。测冷请求需先重启自己的服务或使用新前缀；服务配置和输入保持一致，测量期间应独占接口。
+
 `concurrency.py`以真实SSE请求测量1..128并发，输入为`{ "cases": [{ "id": "case", "request": { ...Chat API body... } }] }`：
 
 ```bash

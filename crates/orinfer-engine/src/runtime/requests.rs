@@ -41,7 +41,8 @@ pub struct RequestState {
     last_output: Instant,
     last_prefill: Instant,
     credit_s: f64,
-    speculation_costs: BTreeMap<usize, (scheduler::Estimate, f64)>,
+    speculation_costs: BTreeMap<usize, speculation::Profile>,
+    speculation_probe_token: usize,
     mtp_blocked: bool,
     decoder: crate::sampling::Decoder,
 }
@@ -113,7 +114,7 @@ pub struct StepOutput {
 }
 
 enum Work {
-    Speculative(usize, usize),
+    Speculative(usize, usize, bool),
     Prefill(usize, Option<f64>),
     Batch(Vec<(usize, usize)>),
     Idle,
@@ -588,6 +589,7 @@ impl ModelRuntime {
                 last_prefill: Instant::now(),
                 credit_s: 0.,
                 speculation_costs: Default::default(),
+                speculation_probe_token: 0,
                 mtp_blocked: false,
                 decoder: Default::default(),
             })
@@ -921,8 +923,11 @@ impl ModelRuntime {
             self.unmerged_prefill_s = 0.;
         }
         match self.select_work(requests, options, &initialized)? {
-            Work::Speculative(i, rows) => {
+            Work::Speculative(i, rows, exploring) => {
                 self.unmerged_prefill_s = 0.;
+                if exploring {
+                    requests[i].speculation_probe_token = requests[i].generated;
+                }
                 let began = Instant::now();
                 let result = self.with_request(requests[i], |model, req| {
                     model.speculative_request_step(req, rows)
@@ -934,13 +939,9 @@ impl ModelRuntime {
                 };
                 let seconds = began.elapsed().as_secs_f64();
                 let per_token = seconds / tokens.len().max(1) as f64;
+                let progress = requests[i].generated;
                 let cost = requests[i].speculation_costs.entry(rows).or_default();
-                cost.0.observe(seconds);
-                cost.1 = if cost.0.samples == 1 {
-                    tokens.len() as f64
-                } else {
-                    cost.1 * 0.8 + tokens.len() as f64 * 0.2
-                };
+                cost.observe(seconds, tokens.len(), progress);
                 self.mtp_seconds_per_token = self.mtp_seconds_per_token * 0.8 + per_token * 0.2;
                 self.scheduler_statistics.speculative_iterations += 1;
                 self.scheduler_statistics.decode_tokens += tokens.len();
@@ -1055,41 +1056,20 @@ impl ModelRuntime {
                 .filter(|&&j| j != i)
                 .filter_map(|&j| requests[j].decode_slack_s(options.target_tpot_ms))
                 .fold(f64::INFINITY, f64::min);
-            let candidate = plans
-                .iter()
-                .copied()
-                .filter(|n| {
-                    req.speculation_costs
-                        .get(n)
-                        .map_or(self.mtp_seconds_per_token * *n as f64, |(time, _)| {
-                            time.upper()
-                        })
-                        <= slack
-                })
-                .min_by(|a, b| {
-                    let score = |n: &usize| {
-                        req.speculation_costs
-                            .get(n)
-                            .map(|(time, tokens)| time.mean / tokens.max(1.))
-                    };
-                    match (score(a), score(b)) {
-                        (None, None) => b.cmp(a),
-                        (None, Some(_)) => std::cmp::Ordering::Less,
-                        (Some(_), None) => std::cmp::Ordering::Greater,
-                        (Some(a), Some(b)) => a.total_cmp(&b),
-                    }
-                });
-            if let Some(rows) = candidate {
-                let worthwhile = req
-                    .speculation_costs
-                    .get(&rows)
-                    .is_none_or(|(time, tokens)| {
-                        time.samples < 2
-                            || time.mean / tokens.max(1.)
-                                < self.predict_iteration(requests, &target) / decode.len() as f64
-                    });
+            let candidate = speculation::select_profile(
+                &plans,
+                &req.speculation_costs,
+                req.generated,
+                req.speculation_probe_token,
+                slack,
+                self.mtp_seconds_per_token,
+            );
+            if let Some((rows, exploring)) = candidate {
+                let worthwhile = exploring
+                    || req.speculation_costs[&rows].score().unwrap()
+                        < self.predict_iteration(requests, &target) / decode.len() as f64;
                 if worthwhile {
-                    return Ok(Work::Speculative(i, rows));
+                    return Ok(Work::Speculative(i, rows, exploring));
                 }
             }
         }
@@ -1443,6 +1423,16 @@ impl ModelRuntime {
         }
         if self.read_control(&self.manifest.status)? != 0 {
             return Err("Model token status failure".into());
+        }
+        if req.sampling.is_greedy() && req.sampling.top_logprobs.is_none() {
+            let selected = self.read_control(&self.manifest.token)? as u32;
+            if let Some(token) = req
+                .decoder
+                .greedy_candidate(selected, self.manifest.vocab)?
+            {
+                req.decoder.consume(token)?;
+                return Ok(token);
+            }
         }
         let spec = self
             .manifest

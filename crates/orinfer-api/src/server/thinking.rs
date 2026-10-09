@@ -173,4 +173,23 @@ mod tests {
         budget.consume(2).unwrap();
         assert_ne!(budget.mask().unwrap()[0] & 2, 0);
     }
+    #[test]
+    fn greedy_gpu_candidates_cross_the_cap_on_private_draft_state() {
+        let tokens = Arc::new(vec![b"a".to_vec(), b"eos".to_vec(), b"</think>".to_vec()]);
+        let mut target = Decoder::default();
+        target.set_constraint(Box::new(Budget::new(None, 1, 2, tokens, vec![1])));
+        let mut draft = target.fork();
+        assert_eq!(draft.greedy_candidate(0, 3).unwrap(), Some(0));
+        draft.consume(0).unwrap();
+        assert_eq!(draft.greedy_candidate(0, 3).unwrap(), Some(2));
+        draft.consume(2).unwrap();
+        assert!(!draft.constrained());
+        assert!(target.constrained());
+        assert_eq!(target.greedy_candidate(1, 3).unwrap(), None);
+        assert_eq!(target.greedy_candidate(0, 3).unwrap(), Some(0));
+        target.consume(0).unwrap();
+        assert_eq!(target.greedy_candidate(1, 3).unwrap(), Some(2));
+        target.consume(2).unwrap();
+        assert_eq!(target.greedy_candidate(1, 3).unwrap(), Some(1));
+    }
 }

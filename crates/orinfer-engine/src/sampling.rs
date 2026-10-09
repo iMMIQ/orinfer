@@ -87,10 +87,11 @@ impl Options {
     }
 }
 /// Normalized target or draft law after applying the same history processors.
-/// Dense probabilities support exact p/q acceptance and residual sampling.
+/// Small truncated laws store only their support; large laws retain dense lookup.
 #[derive(Clone, Debug)]
 pub struct Distribution {
-    probabilities: Vec<f64>,
+    probabilities: Option<Vec<f64>>,
+    vocab: usize,
     ordered: Vec<(u32, f64)>,
 }
 impl Distribution {
@@ -110,10 +111,19 @@ impl Distribution {
         {
             return Err("Invalid sampling logits".into());
         }
-        let mut counts = vec![0usize; logits.len()];
-        for &id in history {
-            if let Some(n) = counts.get_mut(id as usize) {
-                *n += 1;
+        let mut counts = if options.repetition_penalty != 1.0
+            || options.presence_penalty != 0.0
+            || options.frequency_penalty != 0.0
+        {
+            vec![0usize; logits.len()]
+        } else {
+            vec![]
+        };
+        if !counts.is_empty() {
+            for &id in history {
+                if let Some(n) = counts.get_mut(id as usize) {
+                    *n += 1;
+                }
             }
         }
         let mut scores: Vec<(u32, f64)> = logits
@@ -121,7 +131,8 @@ impl Distribution {
             .enumerate()
             .map(|(i, &value)| {
                 let mut score = f64::from(value);
-                if counts[i] > 0 {
+                let count = counts.get(i).copied().unwrap_or(0);
+                if count > 0 {
                     score = if score < 0.0 {
                         score * options.repetition_penalty
                     } else {
@@ -129,7 +140,7 @@ impl Distribution {
                     };
                     score -= options.presence_penalty;
                 }
-                score -= options.frequency_penalty * counts[i] as f64;
+                score -= options.frequency_penalty * count as f64;
                 score += options.logit_bias.get(&(i as u32)).copied().unwrap_or(0.0);
                 (i as u32, score)
             })
@@ -179,20 +190,39 @@ impl Distribution {
                 *mass /= total;
             }
         }
-        let mut probabilities = vec![0.0; logits.len()];
-        for &(id, mass) in &scores {
-            probabilities[id as usize] = mass;
-        }
+        let probabilities = (scores.len() > 128).then(|| {
+            let mut dense = vec![0.0; logits.len()];
+            for &(id, mass) in &scores {
+                dense[id as usize] = mass;
+            }
+            dense
+        });
         Ok(Self {
             probabilities,
+            vocab: logits.len(),
             ordered: scores,
         })
     }
     pub fn probability(&self, token: u32) -> f64 {
-        self.probabilities
-            .get(token as usize)
-            .copied()
-            .unwrap_or(0.0)
+        if let Some(dense) = &self.probabilities {
+            dense.get(token as usize).copied().unwrap_or(0.0)
+        } else {
+            self.ordered
+                .iter()
+                .find(|(id, _)| *id == token)
+                .map_or(0.0, |(_, mass)| *mass)
+        }
+    }
+    fn dense_probabilities(&self) -> std::borrow::Cow<'_, [f64]> {
+        if let Some(values) = &self.probabilities {
+            std::borrow::Cow::Borrowed(values)
+        } else {
+            let mut values = vec![0.0; self.vocab];
+            for &(id, p) in &self.ordered {
+                values[id as usize] = p;
+            }
+            std::borrow::Cow::Owned(values)
+        }
     }
     pub fn draw(&self, uniform: f64) -> Result<u32, String> {
         if !uniform.is_finite() || !(0.0..1.0).contains(&uniform) {
@@ -217,13 +247,34 @@ impl Distribution {
     }
     /// On a rejected proposal the correction law is proportional to (p-q)+.
     pub fn residual(&self, draft: &Self) -> Result<Self, String> {
-        if self.probabilities.len() != draft.probabilities.len() {
+        if self.vocab != draft.vocab {
             return Err("Target/draft vocabulary differs".into());
         }
+        if self.probabilities.is_none() && draft.probabilities.is_none() {
+            let mut ordered: Vec<_> = self
+                .ordered
+                .iter()
+                .map(|&(id, p)| (id, (p - draft.probability(id)).max(0.0)))
+                .filter(|(_, p)| *p > 0.0)
+                .collect();
+            ordered.sort_unstable_by_key(|&(id, _)| id);
+            let total: f64 = ordered.iter().map(|(_, p)| p).sum();
+            if !total.is_finite() || total <= 0.0 {
+                return Err("Rejected proposal has no residual mass".into());
+            }
+            for (_, p) in &mut ordered {
+                *p /= total;
+            }
+            return Ok(Self {
+                probabilities: None,
+                vocab: self.vocab,
+                ordered,
+            });
+        }
         let mut probabilities: Vec<f64> = self
-            .probabilities
+            .dense_probabilities()
             .iter()
-            .zip(&draft.probabilities)
+            .zip(draft.dense_probabilities().iter())
             .map(|(p, q)| (p - q).max(0.0))
             .collect();
         let total: f64 = probabilities.iter().sum();
@@ -240,7 +291,8 @@ impl Distribution {
             .map(|(id, &p)| (id as u32, p))
             .collect();
         Ok(Self {
-            probabilities,
+            probabilities: Some(probabilities),
+            vocab: self.vocab,
             ordered,
         })
     }
@@ -305,6 +357,41 @@ fn greedy(logits: &[f32], history: &[u32], options: &Options) -> Result<u32, Str
 mod sampling_tests {
     use super::*;
     #[test]
+    fn sparse_top_k_and_residual_match_dense_probabilities_and_draws() {
+        let logits: Vec<_> = (0..257)
+            .map(|i| ((i * 17 % 101) as f32 - 50.0) / 7.0)
+            .collect();
+        let draft_logits: Vec<_> = logits.iter().rev().copied().collect();
+        for k in [1, 20, 128, 200, 0] {
+            let options = Options {
+                top_k: k,
+                top_p: 0.95,
+                ..Default::default()
+            };
+            let target = Distribution::from_logits(&logits, &[], &options).unwrap();
+            let draft = Distribution::from_logits(&draft_logits, &[], &options).unwrap();
+            if (1..=128).contains(&k) {
+                assert!(target.probabilities.is_none());
+            }
+            let dense = |law: &Distribution| Distribution {
+                probabilities: Some(law.dense_probabilities().into_owned()),
+                vocab: law.vocab,
+                ordered: law.ordered.clone(),
+            };
+            let a = target.residual(&draft).unwrap();
+            let b = dense(&target).residual(&dense(&draft)).unwrap();
+            assert_eq!(a.ordered, b.ordered);
+            for id in 0..257 {
+                assert_eq!(a.probability(id), b.probability(id));
+            }
+            for step in 0..100 {
+                let u = counter_uniform(EVALUATION_SEED, 0, step);
+                assert_eq!(a.draw(u), b.draw(u));
+            }
+            assert!(target.residual(&target).is_err());
+        }
+    }
+    #[test]
     fn greedy_matches_distribution_processors_and_total_order() {
         for repeat in [0.5, 1.0, 1.05, 2.0, f64::MAX] {
             for presence in [-2.0, 0.0, 2.0] {
@@ -330,7 +417,8 @@ mod sampling_tests {
     #[test]
     fn rounded_mass_does_not_select_an_underflowed_token() {
         let law = Distribution {
-            probabilities: vec![1.0 - 1e-12, 0.0],
+            probabilities: Some(vec![1.0 - 1e-12, 0.0]),
+            vocab: 2,
             ordered: vec![(0, 1.0 - 1e-12), (1, 0.0)],
         };
         assert_eq!(law.draw(1.0 - f64::EPSILON).unwrap(), 0);

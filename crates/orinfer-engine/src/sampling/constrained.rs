@@ -60,6 +60,52 @@ impl Decoder {
     pub fn take_records(&mut self) -> Vec<TokenLogprob> {
         std::mem::take(&mut self.records)
     }
+    /// Reuse a validated GPU argmax when it is allowed, or select a singleton
+    /// mask without downloading logits. The caller must use unprocessed greedy
+    /// sampling without probability reporting and validate finite GPU logits.
+    pub fn greedy_candidate(&mut self, selected: u32, vocab: usize) -> Result<Option<u32>> {
+        if selected as usize >= vocab {
+            return Err("Selected token outside vocabulary".into());
+        }
+        if !self.constrained() {
+            return Ok(Some(selected));
+        }
+        let result = (|| {
+            let mask = self
+                .constraint
+                .as_mut()
+                .expect("Active constraint")
+                .mask()?;
+            if mask
+                .get(selected as usize / 32)
+                .is_some_and(|bits| bits & (1 << (selected % 32)) != 0)
+            {
+                return Ok(Some(selected));
+            }
+            let mut only = None;
+            for (word, &bits) in mask.iter().take(vocab.div_ceil(32)).enumerate() {
+                let valid = (vocab - word * 32).min(32);
+                let bits = if valid == 32 {
+                    bits
+                } else {
+                    bits & ((1u32 << valid) - 1)
+                };
+                if bits == 0 {
+                    continue;
+                }
+                if only.is_some() || bits.count_ones() > 1 {
+                    return Ok(None);
+                }
+                only = Some((word * 32 + bits.trailing_zeros() as usize) as u32);
+            }
+            only.map(Some)
+                .ok_or_else(|| "Grammar permits no tokens".to_owned())
+        })();
+        if let Err(error) = &result {
+            self.fail(error.clone());
+        }
+        result
+    }
     pub fn law(&mut self, logits: &[f32], history: &[u32], options: &Options) -> Result<Law> {
         let mask = match self.constraint.as_mut().map(|c| c.mask()).transpose() {
             Ok(mask) => mask,
@@ -190,6 +236,43 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gpu_greedy_respects_masks_singletons_and_vocabulary_tail() {
+        #[derive(Clone)]
+        struct Fixed(Vec<u32>);
+        impl Constraint for Fixed {
+            fn fork(&self) -> Box<dyn Constraint> {
+                Box::new(self.clone())
+            }
+            fn mask(&mut self) -> Result<Vec<u32>> {
+                Ok(self.0.clone())
+            }
+            fn consume(&mut self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            fn finished(&self) -> bool {
+                false
+            }
+        }
+        for (mask, selected, expected) in [
+            (vec![3], 0, Some(0)),
+            (vec![3], 2, None),
+            (vec![2], 0, Some(1)),
+            (vec![0, u32::MAX], 0, Some(32)),
+        ] {
+            let mut decoder = Decoder::default();
+            decoder.set_constraint(Box::new(Fixed(mask)));
+            assert_eq!(decoder.greedy_candidate(selected, 33).unwrap(), expected);
+        }
+        let mut decoder = Decoder::default();
+        decoder.set_constraint(Box::new(Fixed(vec![0])));
+        assert!(decoder.greedy_candidate(0, 3).is_err());
+        assert!(decoder.finished() && decoder.failure().is_some());
+        let mut decoder = Decoder::default();
+        assert_eq!(decoder.greedy_candidate(1, 3).unwrap(), Some(1));
+        assert!(decoder.greedy_candidate(3, 3).is_err());
+        assert!(decoder.failure().is_none());
+    }
     #[derive(Clone)]
     struct Alternating(usize);
     impl Constraint for Alternating {

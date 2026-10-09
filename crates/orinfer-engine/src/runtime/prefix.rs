@@ -258,8 +258,20 @@ impl ModelRuntime {
             let plan = self
                 .execution
                 .plan_snapshot(ranges, &kv_names, &context.kv)?;
+            let protected = (!logits_valid)
+                .then(|| {
+                    self.prefix_cache
+                        .match_prefix_by(input, media, |e| {
+                            e.logits_valid.then_some(-(e.tokens.len() as f64))
+                        })
+                        .checkpoint
+                })
+                .flatten();
             let mut retained = BTreeMap::new();
             plan.allocations(&mut retained);
+            if let Some(entry) = protected.and_then(|id| self.prefix_cache.entries.get(&id)) {
+                entry.snapshot.allocations(&mut retained);
+            }
             if retained.values().sum::<usize>() + plan.new_bytes > self.prefix_cache.budget {
                 context.statistics.store_s += at.elapsed().as_secs_f64();
                 self.update_prefix_usage(context);
@@ -272,7 +284,7 @@ impl ModelRuntime {
             {
                 let old = self
                     .prefix_cache
-                    .evict_one()
+                    .evict_one_except(protected)
                     .ok_or("Prefix budget planning failure")?;
                 context.statistics.evictions += 1;
                 self.execution.release_snapshot(old)?;
@@ -281,7 +293,7 @@ impl ModelRuntime {
                 if let Some(s) = self.execution.snapshot(&plan)? {
                     break Some(s);
                 }
-                let Some(old) = self.prefix_cache.evict_one() else {
+                let Some(old) = self.prefix_cache.evict_one_except(protected) else {
                     break None;
                 };
                 context.statistics.evictions += 1;
@@ -296,7 +308,7 @@ impl ModelRuntime {
                     {
                         let old = self
                             .prefix_cache
-                            .evict_one()
+                            .evict_one_except(protected)
                             .ok_or("Prefix budget accounting failure")?;
                         context.statistics.evictions += 1;
                         self.execution.release_snapshot(old)?;

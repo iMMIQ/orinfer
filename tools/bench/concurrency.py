@@ -45,6 +45,7 @@ def request(base_url, body, barrier=None, *, on_content=None, collect_arrivals=F
     start = time.perf_counter()
     usage, finish, done = None, None, False
     arrivals, content, reasoning = [], [], []
+    first_content, first_reasoning = None, None
     with urllib.request.urlopen(req, timeout=1800) as response:
         for event in events(response):
             at = time.perf_counter() - start
@@ -57,6 +58,10 @@ def request(base_url, body, barrier=None, *, on_content=None, collect_arrivals=F
             usage = value.get("usage") or usage
             for choice in value.get("choices", []):
                 delta = choice.get("delta", {})
+                if delta.get("content") and first_content is None:
+                    first_content = at
+                if delta.get("reasoning_content") and first_reasoning is None:
+                    first_reasoning = at
                 if (
                     delta.get("content")
                     or delta.get("reasoning_content")
@@ -82,7 +87,12 @@ def request(base_url, body, barrier=None, *, on_content=None, collect_arrivals=F
         chunk_gap_max_s=max(gaps) if gaps else None,
     )
     if collect_arrivals:
-        result.update(started_monotonic_s=start, arrivals_s=arrivals)
+        result.update(
+            started_monotonic_s=start,
+            arrivals_s=arrivals,
+            first_content_s=first_content,
+            first_reasoning_s=first_reasoning,
+        )
     return result
 
 
