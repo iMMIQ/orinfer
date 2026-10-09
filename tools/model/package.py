@@ -20,7 +20,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.model.publication import file_hash, source_path, write_json
+from tools.model.publication import AssetReader, file_hash, source_path, write_json
 
 
 CONTRACT = json.loads(
@@ -273,7 +273,7 @@ def publish(directory, engine=None):
     for kernel in original.values():
         for field in ("module", "source", "host_abi"):
             asset = kernel[field]
-            key = (asset["file"], asset["sha256"])
+            key = (asset["file"], asset.get("tensor"), asset["sha256"])
             if key not in checked:
                 if file_hash(source_path(cache.resolve(), asset["file"])) != asset["sha256"]:
                     raise ValueError("Source operator asset sha256 mismatch")
@@ -408,13 +408,13 @@ def install(archive_path, cache):
         manifest = json.loads((package / "package.json").read_text())
         verify_execution(manifest, package)
         checked = set()
+        reader = AssetReader(package)
         for kernel in manifest["kernels"]:
             for field in ("module", "source", "host_abi"):
                 asset = kernel[field]
-                key = (asset["file"], asset["sha256"])
+                key = (asset["file"], asset.get("tensor"), asset["sha256"])
                 if key not in checked:
-                    if file_hash(source_path(package.resolve(), asset["file"])) != asset["sha256"]:
-                        raise ValueError("Operator asset sha256 mismatch")
+                    reader.read(asset)
                     checked.add(key)
         package.rename(cache / digest)
         return digest

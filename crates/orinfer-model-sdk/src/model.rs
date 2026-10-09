@@ -139,7 +139,7 @@ impl Manifest {
         {
             return Err("Invalid model dimensions".into());
         }
-        let mut identities = BTreeMap::<&str, &str>::new();
+        let mut identities = BTreeMap::<crate::artifact::AssetKey, &str>::new();
         let mut identity = |id: &'a crate::artifact::FileIdentity| -> Result<()> {
             if id.sha256.len() != 64
                 || !id
@@ -150,7 +150,7 @@ impl Manifest {
                 return Err("Malformed file hash".into());
             }
             if identities
-                .insert(&id.file, &id.sha256)
+                .insert(id.key(), &id.sha256)
                 .is_some_and(|old| old != id.sha256)
             {
                 return Err("Conflicting identities for one artifact file".into());

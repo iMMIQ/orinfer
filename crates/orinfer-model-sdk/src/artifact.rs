@@ -6,6 +6,17 @@ pub type Result<T> = std::result::Result<T, String>;
 pub struct FileIdentity {
     pub file: String,
     pub sha256: String,
+    /// Named U8 asset in a safetensors bundle; absent for standalone files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensor: Option<String>,
+}
+
+pub type AssetKey = (String, Option<String>);
+
+impl FileIdentity {
+    pub fn key(&self) -> AssetKey {
+        (self.file.clone(), self.tensor.clone())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]

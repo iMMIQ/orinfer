@@ -112,10 +112,11 @@ pub fn validate_model(path: &Path) -> Result<ValidationReport> {
         }
     }
     let mut seen = BTreeSet::new();
+    let mut reader = crate::artifact::AssetReader::default();
     for kernel in &manifest.kernels {
         for identity in [&kernel.module, &kernel.source, &kernel.host_abi] {
-            if seen.insert(&identity.file) {
-                crate::artifact::read_identity(&prepared.kernel_root, identity)?;
+            if seen.insert(identity.key()) {
+                reader.read(&prepared.kernel_root, identity)?;
             }
         }
     }

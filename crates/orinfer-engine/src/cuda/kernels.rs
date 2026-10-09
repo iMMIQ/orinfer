@@ -62,37 +62,38 @@ impl DeviceBounds {
 }
 
 pub(super) struct Catalog {
-    images: BTreeMap<String, Vec<u8>>,
-    modules: BTreeMap<String, sys::CUmodule>,
-    functions: BTreeMap<(String, String), Function>,
-    shared: BTreeMap<(String, String), u32>,
+    images: BTreeMap<crate::artifact::AssetKey, Vec<u8>>,
+    modules: BTreeMap<crate::artifact::AssetKey, sys::CUmodule>,
+    functions: BTreeMap<(crate::artifact::AssetKey, String), Function>,
+    shared: BTreeMap<(crate::artifact::AssetKey, String), u32>,
     bounds: DeviceBounds,
 }
 impl Catalog {
     pub(super) fn new(session: &Session, base: &Path, kernels: &[Kernel]) -> Result<Self> {
         let mut images = BTreeMap::new();
-        let mut verified = BTreeMap::<String, String>::new();
+        let mut verified = BTreeMap::<crate::artifact::AssetKey, String>::new();
         let mut shared = BTreeMap::new();
+        let mut reader = crate::artifact::AssetReader::default();
         for spec in kernels {
             // Validate ALL assets now, even when driver loading is deferred.
             for identity in [&spec.module, &spec.source, &spec.host_abi] {
-                if let Some(hash) = verified.get(&identity.file) {
+                if let Some(hash) = verified.get(&identity.key()) {
                     if hash != &identity.sha256 {
                         return Err("Conflicting kernel asset identities".into());
                     }
                     continue;
                 }
-                let image = crate::artifact::read_identity(base, identity)?;
-                if identity.file == spec.module.file {
+                let image = reader.read(base, identity)?;
+                if identity.key() == spec.module.key() {
                     if !image.starts_with(b"\x7fELF") {
                         return Err("Expected cubin ELF".into());
                     }
-                    images.insert(identity.file.clone(), image);
+                    images.insert(identity.key(), image);
                 }
-                verified.insert(identity.file.clone(), identity.sha256.clone());
+                verified.insert(identity.key(), identity.sha256.clone());
             }
             shared
-                .entry((spec.module.file.clone(), spec.symbol.clone()))
+                .entry((spec.module.key(), spec.symbol.clone()))
                 .and_modify(|value: &mut u32| *value = (*value).max(spec.shared_memory_bytes))
                 .or_insert(spec.shared_memory_bytes);
         }
@@ -111,16 +112,16 @@ impl Catalog {
         self.modules.len() + self.images.len()
     }
     pub(super) fn resolve(&mut self, session: &Session, spec: &Kernel) -> Result<sys::CUfunction> {
-        let key = (spec.module.file.clone(), spec.symbol.clone());
+        let key = (spec.module.key(), spec.symbol.clone());
         let function = if let Some(function) = self.functions.get(&key) {
             *function
         } else {
-            let module = if let Some(module) = self.modules.get(&spec.module.file) {
+            let module = if let Some(module) = self.modules.get(&spec.module.key()) {
                 *module
             } else {
                 let image = self
                     .images
-                    .get(&spec.module.file)
+                    .get(&spec.module.key())
                     .ok_or("Unverified CUDA module")?;
                 let mut module = ptr::null_mut();
                 // SAFETY: Verified SM87 ELF; the driver copies the image. Session
@@ -132,8 +133,8 @@ impl Catalog {
                     )?;
                 }
                 session.modules.borrow_mut().push(module);
-                self.modules.insert(spec.module.file.clone(), module);
-                self.images.remove(&spec.module.file);
+                self.modules.insert(spec.module.key(), module);
+                self.images.remove(&spec.module.key());
                 module
             };
             let symbol = CString::new(spec.symbol.as_str()).map_err(|e| e.to_string())?;
@@ -192,7 +193,7 @@ impl Catalog {
     pub(super) fn validate_launch(&self, spec: &Kernel) -> Result<()> {
         let function = *self
             .functions
-            .get(&(spec.module.file.clone(), spec.symbol.clone()))
+            .get(&(spec.module.key(), spec.symbol.clone()))
             .ok_or("Unresolved launch resources")?;
         self.bounds.validate(spec, function)
     }

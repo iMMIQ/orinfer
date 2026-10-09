@@ -13,11 +13,10 @@ import shutil
 
 from tools.model.package import execution_identity, verify_execution, verify_library
 from tools.model.publication import (
+    AssetReader,
     atomic_model,
     clone_cpu_assets,
-    file_hash,
     link_or_copy,
-    source_path,
     write_json,
 )
 
@@ -52,11 +51,15 @@ def attach(source, output, library, engine, package_name=None, version=None):
         raise ValueError("Source package digest mismatch")
     package = json.loads(raw)
     verify_execution(package, bundled)
+    reader = AssetReader(bundled)
+    checked = set()
     for kernel in package["kernels"]:
         for field in ("module", "source", "host_abi"):
             asset = kernel[field]
-            if file_hash(source_path(bundled, asset["file"])) != asset["sha256"]:
-                raise ValueError("Source kernel asset sha256 mismatch")
+            key = (asset["file"], asset.get("tensor"), asset["sha256"])
+            if key not in checked:
+                reader.read(asset)
+                checked.add(key)
     with atomic_model(output, engine) as staging:
         staging.mkdir()
         for path in source.iterdir():

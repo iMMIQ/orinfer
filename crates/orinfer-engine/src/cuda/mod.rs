@@ -427,7 +427,7 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
             }
             if let Some(id) = &b.data {
                 check(
-                    sys::cuMemcpyHtoD_v2(address, x.files[&id.file].as_ptr().cast(), bytes),
+                    sys::cuMemcpyHtoD_v2(address, x.files[&id.key()].as_ptr().cast(), bytes),
                     &format!("upload {}", b.name),
                 )?
             } else {
@@ -440,7 +440,7 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
         }
         for k in &x.manifest.kernels {
             let mut module = ptr::null_mut();
-            let image = &x.files[&k.module.file];
+            let image = &x.files[&k.module.key()];
             if !image.starts_with(b"\x7fELF") {
                 return Err("Fixture runner requires a cubin ELF module".into());
             }
@@ -591,7 +591,7 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
             sys::cuMemcpyDtoH_v2(expected.as_mut_ptr().cast(), output, expected.len()),
             "download first output",
         )?;
-        let reference = floats(&x.files[&x.manifest.validation.reference.file], Dtype::F32);
+        let reference = floats(&x.files[&x.manifest.validation.reference.key()], Dtype::F32);
         let (relative_l2, max_abs_error) =
             errors(&floats(&expected, output_spec.dtype), &reference)?;
         if relative_l2 > x.manifest.validation.relative_l2_tolerance {
@@ -667,7 +667,7 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
         {
             return Err("Graph did not compute zero output from changed input".into());
         }
-        let original = &x.files[&input_spec.data.as_ref().unwrap().file];
+        let original = &x.files[&input_spec.data.as_ref().unwrap().key()];
         check(
             sys::cuMemcpyHtoD_v2(input, original.as_ptr().cast(), original.len()),
             "restore actual input",

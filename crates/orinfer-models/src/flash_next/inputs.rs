@@ -170,6 +170,9 @@ impl Inputs {
         identity: &crate::artifact::FileIdentity,
         verify_weights: bool,
     ) -> Result<Self> {
+        if identity.tensor.is_some() {
+            return Err("CPU input metadata must be a standalone file".into());
+        }
         let root = Path::new(root).canonicalize().map_err(|e| e.to_string())?;
         let raw = std::fs::read(path(&root, &identity.file)?).map_err(|e| e.to_string())?;
         if hex::encode(Sha256::digest(&raw)) != identity.sha256 {
@@ -610,6 +613,7 @@ mod tests {
             &root,
             &crate::artifact::FileIdentity {
                 file: "cache/cpu/inputs.json".into(),
+                tensor: None,
                 sha256: hex::encode(Sha256::digest(&raw)),
             },
             true,

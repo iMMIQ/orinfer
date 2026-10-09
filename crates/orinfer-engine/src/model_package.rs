@@ -97,6 +97,9 @@ impl ModelPackage {
         spec: &ExecutionLibrary,
         request: CreateRequest,
     ) -> Result<(Self, CreatedPlan)> {
+        if spec.library.tensor.is_some() {
+            return Err("Native execution library must be a standalone file".into());
+        }
         if spec.abi_version != abi::ABI_VERSION
             || spec.package.is_empty()
             || spec.version.is_empty()
@@ -465,6 +468,7 @@ mod tests {
             abi_version: 1,
             library: FileIdentity {
                 file: "model.so".into(),
+                tensor: None,
                 sha256: crate::artifact::sha256(&std::fs::read(output).unwrap()),
             },
             package: "test-model".into(),

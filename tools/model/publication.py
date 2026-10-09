@@ -35,6 +35,43 @@ def file_hash(path):
     return digest.hexdigest()
 
 
+class AssetReader:
+    """Verify standalone or named U8 kernel assets, reusing bundle metadata."""
+
+    def __init__(self, base):
+        self.base = Path(base).resolve(strict=True)
+        self.headers = {}
+
+    def read(self, asset):
+        path = source_path(self.base, asset["file"])
+        name = asset.get("tensor")
+        if name is None:
+            raw = path.read_bytes()
+        else:
+            from tools.model.safetensors_source import read_header
+
+            with path.open("rb") as stream:
+                if path not in self.headers:
+
+                    def read(offset, size):
+                        stream.seek(offset)
+                        return stream.read(size)
+
+                    self.headers[path] = read_header(read, file_size=path.stat().st_size)
+                begin, header = self.headers[path]
+                info = header.get(name)
+                if not name or info is None or info.get("dtype") != "U8":
+                    raise ValueError("Missing or invalid bundled kernel asset")
+                first, end = info["data_offsets"]
+                if info["shape"] != [end - first] or first == end:
+                    raise ValueError("Bundled kernel asset must be a nonempty U8 vector")
+                stream.seek(begin + first)
+                raw = stream.read(end - first)
+        if hashlib.sha256(raw).hexdigest() != asset["sha256"]:
+            raise ValueError("Operator asset sha256 mismatch")
+        return raw
+
+
 def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 

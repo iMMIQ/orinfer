@@ -22,7 +22,9 @@ pub struct Manifest {
     pub validation: Validation,
 }
 
-pub use orinfer_model_sdk::artifact::{Access, Argument, Buffer, Dtype, FileIdentity, Kernel};
+pub use orinfer_model_sdk::artifact::{
+    Access, Argument, AssetKey, Buffer, Dtype, FileIdentity, Kernel,
+};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -122,7 +124,7 @@ impl Manifest {
 
 pub(crate) struct Loaded {
     pub manifest: Manifest,
-    pub files: BTreeMap<String, Vec<u8>>,
+    pub files: BTreeMap<AssetKey, Vec<u8>>,
     pub manifest_sha256: String,
     pub validation_s: f64,
     pub buffer_bytes: usize,
@@ -132,21 +134,54 @@ pub fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+#[derive(Default)]
+pub(crate) struct AssetReader {
+    bundles: BTreeMap<std::path::PathBuf, (memmap2::Mmap, usize, safetensors::tensor::Metadata)>,
+}
+impl AssetReader {
+    pub(crate) fn read(&mut self, base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
+        if id.sha256.len() != 64
+            || !id
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(format!("{}: malformed sha256", id.file));
+        }
+        let canonical = resolve_file(base, &id.file)?;
+        let data = if let Some(name) = &id.tensor {
+            if name.is_empty() {
+                return Err("Empty bundled asset name".into());
+            }
+            if !self.bundles.contains_key(&canonical) {
+                let file = fs::File::open(&canonical).map_err(|e| e.to_string())?;
+                // SAFETY: execution assets are immutable for the model lifetime.
+                let mapping =
+                    unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| e.to_string())?;
+                let (header, metadata) =
+                    safetensors::SafeTensors::read_metadata(&mapping).map_err(|e| e.to_string())?;
+                self.bundles
+                    .insert(canonical.clone(), (mapping, 8 + header, metadata));
+            }
+            let (mapping, start, metadata) = &self.bundles[&canonical];
+            let info = metadata.info(name).ok_or("Missing bundled asset")?;
+            let (begin, end) = info.data_offsets;
+            if info.dtype != safetensors::Dtype::U8 || info.shape != [end - begin] || begin == end {
+                return Err("Bundled asset must be a nonempty U8 vector".into());
+            }
+            mapping[start + begin..start + end].to_vec()
+        } else {
+            fs::read(canonical).map_err(|e| format!("{}: {e}", id.file))?
+        };
+        if sha256(&data) != id.sha256 {
+            return Err(format!("{}: sha256 mismatch", id.file));
+        }
+        Ok(data)
+    }
+}
+
 pub(crate) fn read_identity(base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
-    if id.sha256.len() != 64
-        || !id
-            .sha256
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return Err(format!("{}: malformed sha256", id.file));
-    }
-    let canonical = resolve_file(base, &id.file)?;
-    let data = fs::read(canonical).map_err(|e| format!("{}: {e}", id.file))?;
-    if sha256(&data) != id.sha256 {
-        return Err(format!("{}: sha256 mismatch", id.file));
-    }
-    Ok(data)
+    AssetReader::default().read(base, id)
 }
 
 pub(crate) fn resolve_file(base: &Path, file: &str) -> Result<std::path::PathBuf> {
@@ -179,14 +214,15 @@ fn load(path: &Path) -> Result<Loaded> {
         .parent()
         .unwrap()
         .to_owned();
-    let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut files: BTreeMap<AssetKey, Vec<u8>> = BTreeMap::new();
+    let mut reader = AssetReader::default();
     let mut add = |id: &FileIdentity| -> Result<()> {
-        if let Some(data) = files.get(&id.file) {
+        if let Some(data) = files.get(&id.key()) {
             if sha256(data) != id.sha256 {
                 return Err("Conflicting file identities".into());
             }
         } else {
-            files.insert(id.file.clone(), read_identity(&base, id)?);
+            files.insert(id.key(), reader.read(&base, id)?);
         }
         Ok(())
     };
@@ -203,7 +239,7 @@ fn load(path: &Path) -> Result<Loaded> {
     add(&manifest.validation.reference)?;
     for b in &manifest.buffers {
         if let Some(id) = &b.data
-            && files[&id.file].len() != b.bytes()?
+            && files[&id.key()].len() != b.bytes()?
         {
             return Err(format!("{}: data byte count mismatch", b.name));
         }
@@ -216,7 +252,7 @@ fn load(path: &Path) -> Result<Loaded> {
     let refbytes = (out.bytes()? / out.dtype.bytes())
         .checked_mul(4)
         .ok_or("Reference size overflow")?;
-    if files[&manifest.validation.reference.file].len() != refbytes {
+    if files[&manifest.validation.reference.key()].len() != refbytes {
         return Err("Reference byte count mismatch".into());
     }
     Ok(Loaded {
@@ -301,6 +337,7 @@ mod tests {
         let base = dir.canonicalize().unwrap();
         let mut id = FileIdentity {
             file: "data.bin".into(),
+            tensor: None,
             sha256: sha256(&[1, 2, 3]),
         };
         assert_eq!(read_identity(&base, &id).unwrap(), [1, 2, 3]);
@@ -308,6 +345,59 @@ mod tests {
         assert!(read_identity(&base, &id).is_err());
         id.file = "../data.bin".into();
         assert!(read_identity(&base, &id).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bundled_assets_keep_distinct_keys_and_verify_each_payload() {
+        use safetensors::tensor::TensorView;
+        let dir = std::env::temp_dir().join(format!("orin-bundle-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let raw = safetensors::serialize(
+            [
+                (
+                    "a",
+                    TensorView::new(safetensors::Dtype::U8, vec![3], &[1, 2, 3]).unwrap(),
+                ),
+                (
+                    "b",
+                    TensorView::new(safetensors::Dtype::U8, vec![2], &[4, 5]).unwrap(),
+                ),
+                (
+                    "matrix",
+                    TensorView::new(safetensors::Dtype::U8, vec![1, 2], &[6, 7]).unwrap(),
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        fs::write(dir.join("assets.safetensors"), &raw).unwrap();
+        let base = dir.canonicalize().unwrap();
+        let mut reader = AssetReader::default();
+        let mut a = FileIdentity {
+            file: "assets.safetensors".into(),
+            tensor: Some("a".into()),
+            sha256: sha256(&[1, 2, 3]),
+        };
+        let b = FileIdentity {
+            tensor: Some("b".into()),
+            sha256: sha256(&[4, 5]),
+            ..a.clone()
+        };
+        assert_ne!(a.key(), b.key());
+        assert_eq!(reader.read(&base, &a).unwrap(), [1, 2, 3]);
+        assert_eq!(reader.read(&base, &b).unwrap(), [4, 5]);
+        assert_eq!(reader.bundles.len(), 1);
+        a.sha256 = b.sha256;
+        assert!(reader.read(&base, &a).is_err());
+        a.tensor = Some("matrix".into());
+        assert!(reader.read(&base, &a).is_err());
+        a.tensor = Some("missing".into());
+        assert!(reader.read(&base, &a).is_err());
+        // Container truncation is rejected by a fresh reader before asset slicing.
+        fs::write(dir.join("truncated.safetensors"), &raw[..raw.len() - 1]).unwrap();
+        a.file = "truncated.safetensors".into();
+        assert!(AssetReader::default().read(&base, &a).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }
