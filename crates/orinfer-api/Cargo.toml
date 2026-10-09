@@ -16,6 +16,7 @@ jsonschema = { version = "=0.58.6", default-features = false }
 orinfer-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_path_to_error = "=0.1.20"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
 

@@ -18,6 +18,19 @@
 
 先查共享执行包缓存中的 `<digest>`，缺失时再查模型内的 `cache/packages/<digest>`。`ORINFER_EXECUTION_CACHE` 可覆盖共享缓存位置；默认目录是 `$XDG_CACHE_HOME/orinfer/packages`，未设置 XDG 时为 `~/.cache/orinfer/packages`。存在但损坏的包会报错。专用 safetensors 布局沿用 `orin.layout.<tensor>` 标识，执行包 digest 固定原生执行逻辑与 kernel。
 
+### 请求默认参数
+
+`--default-request-params` 接受一个 JSON 对象，为本次部署填充客户端省略的 Chat 请求字段。例如，默认开启 thinking，同时设置采样温度：
+
+```bash
+./target/release/orinfer serve /path/to/prepared-model \
+  --default-request-params '{"enable_thinking":true,"temperature":0.7}'
+```
+
+不传此选项时保留原有 API 默认值。显式请求字段优先，包括 `false`、空数组和 `null`；`null` 取消对应部署默认值，再按该字段原有空值语义处理。对象字段整体替换，不递归合并。`model` 和 `messages` 必须由客户端提供，不能配置为默认值。配置的字段类型、取值和组合在加载 GPU 模型前校验；默认值必须能组成有效请求。
+
+`enable_thinking` 与 `reasoning_effort`、`max_tokens` 与 `max_completion_tokens` 分别按组覆盖：请求传入其中一项时，不再补入同组的部署默认值。因此，即使服务默认开启 thinking，请求仍可用 `enable_thinking=false` 或 `reasoning_effort=none` 关闭。请求自身的冲突仍返回 400。显式 `stream=false/null` 不继承默认 `stream_options`，显式 `logprobs=false/null` 不继承默认 `top_logprobs`。实际请求默认参数可在 `/health.default_request_params` 查看。
+
 ## Chat API
 
 提供 `GET /health`、`GET /v1/models` 和 `POST /v1/chat/completions`。设置 `ORINFER_API_KEY` 后，`/v1` 请求需携带 `Authorization: Bearer <key>`。
@@ -176,6 +189,7 @@ prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少
 | --- | --- | --- |
 | `--listen` | `0.0.0.0:8088` | HTTP 监听地址 |
 | `--model` | `qwen3.8-27b` | API 模型 ID |
+| `--default-request-params` | `{}` | JSON 请求默认值，显式请求优先 |
 | `--cuda-graph` | `decode_only` | Graph 模式 |
 | `--verify-weights` | 关闭 | 启动时完整校验已加载权重和 CPU 表内容 |
 | `--prefix-cache-mib` | `12288` | GPU 缓存字节预算，0 关闭 |

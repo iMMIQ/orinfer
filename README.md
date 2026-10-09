@@ -45,6 +45,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 | 配置 | 默认值 | 用途 |
 | --- | --- | --- |
 | `--listen` | `0.0.0.0:8088` | 监听地址 |
+| `--default-request-params` | `{}` | JSON 请求默认值，显式请求优先 |
 | `--cuda-graph` | `decode_only` | Graph 模式 |
 | `--prefix-cache-mib` | `12288` | GPU 前缀缓存预算；0 关闭 |
 | `--max-active-requests` | `32` | 活跃请求上限，支持 1–128 |

@@ -1,5 +1,6 @@
 mod chat;
 mod continuous;
+pub(crate) mod defaults;
 mod grammar;
 mod image;
 mod lifecycle;
@@ -50,6 +51,7 @@ struct Service {
     scheduler: orinfer_engine::scheduler::Options,
     preparation: Arc<preparation::Pool>,
     limits: Limits,
+    default_request_params: Arc<serde_json::Map<String, Value>>,
     activity: Arc<continuous::Activity>,
 }
 struct Job {
@@ -94,6 +96,21 @@ pub fn run(settings: Settings) -> Result<()> {
 }
 async fn serve(settings: Settings) -> Result<()> {
     let codec = Arc::new(ChatCodec::load(&settings.model_dir)?);
+    if !settings.default_request_params.is_empty() {
+        codec
+            .prepare(
+                defaults::validation_request(&settings.default_request_params)?,
+                "defaults-validation",
+                usize::MAX,
+                None,
+                &mut preparation::Context::new(
+                    Arc::new(AtomicBool::new(false)),
+                    settings.limits.memory_mib * 1024 * 1024,
+                ),
+            )
+            .map_err(|e| format!("default_request_params: {e}"))?;
+    }
+    let default_request_params = Arc::new(settings.default_request_params);
     let (sender, receiver) = mpsc::channel(128);
     let (ready_sender, ready_receiver) = oneshot::channel();
     let model_id: Arc<str> = settings.model.into();
@@ -206,6 +223,7 @@ continuous::worker(
         activity,
         preparation: Arc::new(preparation::Pool::new(limits)),
         limits,
+        default_request_params,
     };
     let router = Router::new()
         .route("/health", get(health))
@@ -353,11 +371,12 @@ async fn health(State(state): State<Service>) -> Response {
         json!({"status":state.activity.lifecycle.name(),"failure":state.activity.lifecycle.failure(),"model":state.model.as_ref(),"max_context":state.context,
         "frontend_assets":state.codec.asset_hashes,
         "verify_weights":state.verify_weights,
-        "chat_capabilities":{"streaming":true,"default_stream":false,"max_choices":1,
+        "default_request_params":state.default_request_params.as_ref(),
+        "chat_capabilities":{"streaming":true,"default_stream":state.default_request_params.get("stream").and_then(Value::as_bool).unwrap_or(false),"max_choices":1,
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
             "tools":{"function":true,"strict":true,"required":true,"incremental_arguments":true},
             "logprobs":true,"max_top_logprobs":20,"logit_bias":true,"stored_completions":false,
-            "images":state.vision.is_some(),"video":false,"audio":false,"default_max_completion_tokens":8192,
+            "images":state.vision.is_some(),"video":false,"audio":false,"default_max_completion_tokens":state.default_request_params.get("max_completion_tokens").and_then(Value::as_u64).or_else(|| state.default_request_params.get("max_tokens").and_then(Value::as_u64)).unwrap_or(8192),
             "thinking_token_budget":true,"prompt_cache":{"key":true,"retention":["in-memory","24h"],"persistent":false,"ttl_guaranteed":false}},
         "mtp":{"enabled":state.mtp_drafts>0,"max_drafts":state.mtp_drafts},
         "continuous_batching":true,"scheduler":state.scheduler,
@@ -376,10 +395,13 @@ async fn models(State(state): State<Service>, headers: HeaderMap) -> Response {
 async fn completions(
     State(state): State<Service>,
     axum::Extension(admission): axum::Extension<preparation::Ingress>,
-    body: std::result::Result<Json<ChatRequest>, JsonRejection>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let request = match body {
-        Ok(Json(v)) => v,
+        Ok(Json(v)) => match defaults::decode(v, &state.default_request_params) {
+            Ok(request) => request,
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        },
         Err(e) => {
             return error(
                 if e.status() == StatusCode::UNPROCESSABLE_ENTITY {

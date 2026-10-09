@@ -7,6 +7,8 @@ pub struct ServerConfig {
     pub model_dir: PathBuf,
     pub model: String,
     pub listen: String,
+    /// Missing Chat request fields supplied by this deployment.
+    pub default_request_params: serde_json::Map<String, serde_json::Value>,
     pub gpu_lock: PathBuf,
     pub cuda_graph: CudaGraphMode,
     pub verify_weights: bool,
@@ -22,6 +24,7 @@ impl Default for ServerConfig {
             model_dir: PathBuf::new(),
             model: "qwen3.8-27b".into(),
             listen: "0.0.0.0:8088".into(),
+            default_request_params: Default::default(),
             gpu_lock: "artifacts/gpu-experiment.lock".into(),
             cuda_graph: CudaGraphMode::default(),
             verify_weights: false,
@@ -35,6 +38,7 @@ impl Default for ServerConfig {
 }
 impl ServerConfig {
     pub fn validate(&self) -> Result<(), String> {
+        crate::server::defaults::validation_request(&self.default_request_params)?;
         if !self.model_dir.is_dir() {
             return Err("MODEL_DIR must be a prepared model directory".into());
         }

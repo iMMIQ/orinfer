@@ -41,7 +41,7 @@ enum Command {
     /// Score frozen token histories through real prefill/decode kernels.
     ScoreModel(ModelArgs),
     /// Serve the OpenAI Chat Completions API.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
 }
 #[derive(Args)]
 struct LoadArgs {
@@ -70,6 +70,9 @@ struct ServeArgs {
     listen: String,
     #[arg(long, default_value_t = ServerConfig::default().model)]
     model: String,
+    /// JSON object of Chat request defaults; explicit request fields take priority.
+    #[arg(long, value_name = "JSON", value_parser = parse_request_defaults)]
+    default_request_params: Option<serde_json::Map<String, serde_json::Value>>,
     #[arg(long, default_value_os_t = ServerConfig::default().gpu_lock)]
     gpu_lock: PathBuf,
     #[command(flatten)]
@@ -109,6 +112,7 @@ impl From<ServeArgs> for ServerConfig {
         Self {
             model_dir: args.model_dir,
             model: args.model,
+            default_request_params: args.default_request_params.unwrap_or_default(),
             listen: args.listen,
             gpu_lock: args.gpu_lock,
             cuda_graph: args.load.cuda_graph,
@@ -132,6 +136,11 @@ impl From<ServeArgs> for ServerConfig {
             },
         }
     }
+}
+fn parse_request_defaults(
+    value: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    serde_json::from_str(value).map_err(|e| format!("Expected a JSON object: {e}"))
 }
 fn print_json(value: impl serde::Serialize) -> Result<(), String> {
     println!(
@@ -158,7 +167,7 @@ fn execute(command: Command) -> Result<(), String> {
             println!("{}", orinfer_engine::BENCHMARK_PLAN);
             Ok(())
         }
-        Command::Serve(args) => orinfer_api::run(args.into()),
+        Command::Serve(args) => orinfer_api::run((*args).into()),
         Command::ValidateArtifact { manifest } => {
             print_json(orinfer_engine::artifact::validate_artifact(&manifest)?)
         }
@@ -214,7 +223,7 @@ mod tests {
         let Some(Command::Serve(args)) = Cli::try_parse_from(args)?.command else {
             unreachable!()
         };
-        Ok(args.into())
+        Ok((*args).into())
     }
     #[test]
     fn defaults_and_server_options_are_preserved() {
@@ -227,6 +236,7 @@ mod tests {
         assert_eq!(config.mtp_drafts, None);
         assert!(!config.verify_weights);
         assert_eq!(config.load_workers, None);
+        assert!(config.default_request_params.is_empty());
         let config = serve(&[
             "--verify-weights",
             "--mtp-drafts=7",
@@ -270,6 +280,8 @@ mod tests {
             &["--unknown", "off"],
             &["--prefix-cache-mib", "1.5"],
             &["--listen", "a", "--listen", "b"],
+            &["--default-request-params", "[]"],
+            &["--default-request-params", "{broken"],
         ] {
             assert!(serve(options).is_err());
         }
@@ -280,6 +292,30 @@ mod tests {
             ("--output-timeout-ms", "0"),
         ] {
             assert!(serve(&[name, value]).unwrap().validate().is_err());
+        }
+    }
+    #[test]
+    fn deployment_defaults_are_typed_and_preserved() {
+        let config = serve(&[
+            "--default-request-params",
+            r#"{"enable_thinking":true,"temperature":0.7}"#,
+        ])
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.default_request_params["enable_thinking"], true);
+        assert_eq!(config.default_request_params["temperature"], 0.7);
+        for defaults in [
+            r#"{"enable_thinking":"true"}"#,
+            r#"{"unknown":1}"#,
+            r#"{"model":"x"}"#,
+            r#"{"messages":[]}"#,
+        ] {
+            assert!(
+                serve(&["--default-request-params", defaults])
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
         }
     }
     #[test]
