@@ -8,7 +8,12 @@ import math
 
 import tilelang.language as T
 
-from tools.operators.ascend.vector_math import div_127_fp32, div_fp32_scalar, rsqrt_fp32
+from tools.operators.ascend.vector_math import (
+    div_127_fp32,
+    div_fp32_rows,
+    div_fp32_scalar,
+    rsqrt_fp32,
+)
 
 
 def rms_norm(rows, width, eps=1e-20):
@@ -49,7 +54,9 @@ def rms_norm(rows, width, eps=1e-20):
     return main
 
 
-def quantize(rows, width, fp16_query_scale=False):
+def quantize(rows, width, fp16_query_scale=False, tile_rows=1):
+    if tile_rows != 1:
+        return _quantize_rows(rows, width, fp16_query_scale, tile_rows)
     scale_dtype = "float16" if fp16_query_scale else "float32"
 
     @T.prim_func
@@ -86,9 +93,13 @@ def quantize(rows, width, fp16_query_scale=False):
                 T.tile.fill(divisor, 127.0)
                 div_127_fp32(maximum, divisor, scale, scale_negative, scale_residual)
                 if fp16_query_scale:
+                    # The pinned emitter truncates FP32 literals. Converting
+                    # through FP16 preserves this exact subnormal minimum.
+                    T.tile.fill(half_scale, 2.0**-24)
+                    T.tile.cast(scale_negative, half_scale, "CAST_NONE", 1)
                     T.tile.cast(half_scale, scale, "CAST_RINT", 1)
                     T.tile.cast(scale, half_scale, "CAST_NONE", 1)
-                    T.tile.max(scale, scale, 2.0**-24)
+                    T.tile.max(scale, scale, scale_negative)
                 scale_high[0, 0] = T.reinterpret(
                     "float32",
                     T.bitwise_and(T.reinterpret("uint32", scale[0, 0]), T.uint32(4294963200)),
@@ -117,6 +128,89 @@ def quantize(rows, width, fp16_query_scale=False):
                     T.copy(half_scale, scales[row : row + 1])
                 else:
                     T.copy(scale, scales[row : row + 1])
+
+    return main
+
+
+def _quantize_rows(rows, width, fp16_query_scale, tile_rows):
+    if tile_rows not in (2, 4, 8, 16, 32) or width % 32 or tile_rows * width > 4096:
+        raise ValueError("A2 quantization rows require an aligned tile of at most 4096 elements")
+    scale_dtype = "float16" if fp16_query_scale else "float32"
+
+    @T.prim_func
+    def main(
+        x: T.Tensor((rows, width), "bfloat16"),
+        out: T.Tensor((rows, width), "int8"),
+        scales: T.Tensor((rows,), scale_dtype),
+    ):
+        with T.Kernel(T.ceildiv(rows, tile_rows * 2), is_npu=True) as (cid, vid):
+            xb = T.alloc_ub((tile_rows, width), "bfloat16")
+            a = T.alloc_ub((tile_rows, width), "float32")
+            absolute = T.alloc_ub((tile_rows, width), "float32")
+            maximum = T.alloc_ub((tile_rows, 1), "float32")
+            scale = T.alloc_ub((tile_rows, 1), "float32")
+            divisor = T.alloc_ub((tile_rows, 1), "float32")
+            scale_residual = T.alloc_ub((tile_rows, 1), "float32")
+            scale_negative = T.alloc_ub((tile_rows, 1), "float32")
+            scale_high = T.alloc_ub((tile_rows, 1), "float32")
+            scale_low = T.alloc_ub((tile_rows, 1), "float32")
+            half_scale = T.alloc_ub((tile_rows, 1), "float16")
+            scale_tile = T.alloc_ub((tile_rows, width), "float32")
+            high_tile = T.alloc_ub((tile_rows, width), "float32")
+            low_tile = T.alloc_ub((tile_rows, width), "float32")
+            residual = T.alloc_ub((tile_rows, width), "float32")
+            quotient_low = T.alloc_ub((tile_rows, width), "float32")
+            product = T.alloc_ub((tile_rows, width), "float32")
+            rounded = T.alloc_ub((tile_rows, width), "float16")
+            y = T.alloc_ub((tile_rows, width), "int8")
+            first = (cid * 2 + vid) * tile_rows
+            if first < rows:
+                valid = T.min(tile_rows, rows - first)
+                T.tile.fill(xb, 0.0)
+                T.copy(x[first : first + valid, :], xb[:valid, :])
+                T.tile.cast(a, xb, "CAST_NONE", tile_rows * width)
+                T.tile.abs(absolute, a)
+                T.reduce_max(absolute, maximum, dim=1)
+                T.tile.max(maximum, maximum, 1e-12)
+                T.tile.fill(divisor, 127.0)
+                div_127_fp32(maximum, divisor, scale, scale_negative, scale_residual)
+                if fp16_query_scale:
+                    T.tile.fill(half_scale, 2.0**-24)
+                    T.tile.cast(scale_negative, half_scale, "CAST_NONE", tile_rows)
+                    T.tile.cast(half_scale, scale, "CAST_RINT", tile_rows)
+                    T.tile.cast(scale, half_scale, "CAST_NONE", tile_rows)
+                    T.tile.max(scale, scale, scale_negative)
+                for h in T.serial(tile_rows):
+                    scale_high[h, 0] = T.reinterpret(
+                        "float32",
+                        T.bitwise_and(T.reinterpret("uint32", scale[h, 0]), T.uint32(4294963200)),
+                    )
+                T.tile.sub(scale_low, scale, scale_high)
+                T.tile.broadcast(scale_tile, scale)
+                T.tile.broadcast(high_tile, scale_high)
+                T.tile.broadcast(low_tile, scale_low)
+                div_fp32_rows(
+                    a,
+                    scale_tile,
+                    high_tile,
+                    low_tile,
+                    a,
+                    residual,
+                    absolute,
+                    quotient_low,
+                    product,
+                )
+                T.tile.min(a, a, 127.0)
+                T.tile.max(a, a, -127.0)
+                T.tile.round(a, a, tile_rows * width)
+                T.tile.cast(rounded, a, "CAST_RINT", tile_rows * width)
+                T.tile.cast(y, rounded, "CAST_RINT", tile_rows * width)
+                T.copy(y[:valid, :], out[first : first + valid, :])
+                if fp16_query_scale:
+                    T.tile.cast(half_scale, scale, "CAST_RINT", tile_rows)
+                    T.copy(half_scale[:valid, 0], scales[first : first + valid])
+                else:
+                    T.copy(scale[:valid, 0], scales[first : first + valid])
 
     return main
 

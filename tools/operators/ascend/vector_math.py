@@ -70,3 +70,34 @@ def div_127_fp32(numerator, divisor, destination, high, low):
     T.tile.sub(low, high, low)
     T.tile.div(low, low, divisor)
     T.tile.add(destination, destination, low)
+
+
+@T.macro
+def div_fp32_rows(
+    numerator,
+    denominator,
+    denominator_high,
+    denominator_low,
+    destination,
+    residual,
+    high,
+    low,
+    product,
+):
+    """Apply the scalar refiner to rows with broadcast split denominators."""
+    T.tile.add(residual, numerator, 0.0)
+    T.tile.div(destination, numerator, denominator)
+    T.tile.mul(high, destination, 4097.0)
+    T.tile.sub(low, high, destination)
+    T.tile.sub(high, high, low)
+    T.tile.sub(low, destination, high)
+    T.tile.mul(product, high, denominator_high)
+    T.tile.sub(residual, residual, product)
+    T.tile.mul(product, high, denominator_low)
+    T.tile.sub(residual, residual, product)
+    T.tile.mul(product, low, denominator_high)
+    T.tile.sub(residual, residual, product)
+    T.tile.mul(product, low, denominator_low)
+    T.tile.sub(residual, residual, product)
+    T.tile.div(residual, residual, denominator)
+    T.tile.add(destination, destination, residual)

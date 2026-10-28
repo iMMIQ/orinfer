@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--hc-reuse-only", action="store_true")
     parser.add_argument("--sinkhorn-only", action="store_true")
     parser.add_argument("--reuse-operand-only", action="store_true")
+    parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     args = parser.parse_args()
@@ -36,6 +37,7 @@ def main():
                 args.hc_reuse_only,
                 args.sinkhorn_only,
                 args.reuse_operand_only,
+                args.quantize_only,
             )
         )
         > 1
@@ -84,6 +86,7 @@ def main():
                 "floating.split",
                 "model_ops.convert",
                 "vector.mhc_split_sinkhorn",
+                "vector.quantize",
             ):
                 continue
             if (kind == "floating.split") != args.split_only:
@@ -91,6 +94,10 @@ def main():
             if (kind == "model_ops.convert") != args.convert_only:
                 continue
             if (kind == "vector.mhc_split_sinkhorn") != args.sinkhorn_only:
+                continue
+            if (kind == "vector.quantize") != args.quantize_only:
+                continue
+            if kind == "vector.quantize" and manifest["parameters"]["width"] > 256:
                 continue
             if kind == "model_ops.convert" and manifest["parameters"]["width"] < 16:
                 continue
@@ -104,10 +111,32 @@ def main():
                 continue
             params = dict(manifest["parameters"])
             if "_row_capacity" not in params:
+                if args.quantize_only and params.get("fp16_query_scale"):
+                    path = compile_kernel(
+                        vector.quantize(**params),
+                        kind,
+                        manifest["operands"],
+                        params,
+                        base / "cache",
+                    )
+                    replacements[step["manifest"]] = str(path.relative_to(base))
+                    print(dict(op=kind, static_rows=params["rows"], manifest=str(path)), flush=True)
                 continue
             capacity = params.pop("_row_capacity")
             grid_limit = params.pop("_grid_limit", 64)
-            if kind == "vector.mhc_split_sinkhorn":
+            row_factor = 1
+            if kind == "vector.quantize":
+                row_factor, remainder = divmod(params["rows"], capacity)
+                if remainder or row_factor < 1:
+                    raise ValueError("Quantization rows must have the packet row multiplier")
+                baseline_config = dict(tile_rows=params.get("tile_rows", 1))
+                configs = [baseline_config] + [
+                    dict(tile_rows=r)
+                    for r in (8, 16, 32)
+                    if r * params["width"] <= 4096 and r != baseline_config["tile_rows"]
+                ]
+                factory = vector.quantize
+            elif kind == "vector.mhc_split_sinkhorn":
                 configs = [dict(tile_rows=r) for r in (1, 2, 4, 8, 16, 32)]
                 factory = vector.mhc_split_sinkhorn
             elif kind in ("floating.split", "model_ops.convert"):
@@ -163,6 +192,8 @@ def main():
             def build(config):
                 parameters = dict(params, **config)
                 factory_args = dict(parameters, rows=row_count(capacity, True))
+                if row_factor != 1:
+                    factory_args["rows"] = factory_args["rows"] * row_factor
                 if kind == "moe.combine":
                     factor, tail = divmod(params["expert_rows"], capacity)
                     if tail or factor < 1:
@@ -260,6 +291,7 @@ def main():
                     "f16": torch.float16,
                     "f32": torch.float32,
                     "i32": torch.int32,
+                    "i8": torch.int8,
                 }[spec["dtype"]]
                 if spec["access"] == "write":
                     if kind == "floating.split":
@@ -269,7 +301,7 @@ def main():
                     outputs.append(len(tensors))
                 tensors.append(
                     torch.zeros(shape, dtype=dtype, device="npu")
-                    if dtype == torch.int32
+                    if dtype in (torch.int32, torch.int8)
                     else torch.randn(shape, dtype=dtype, device="npu")
                 )
             if weight is not None:
@@ -328,7 +360,11 @@ def main():
                     def check():
                         torch.npu.synchronize()
                         for slot, ref in zip(outputs, expected, strict=True):
-                            count = 3 * rows * params["width"] if kind == "floating.split" else rows
+                            count = (
+                                3 * rows * params["width"]
+                                if kind == "floating.split"
+                                else rows * row_factor
+                            )
                             actual = tensors[slot][:count]
                             if kind == "floating.partials":
                                 columns = legal[i].get("tile_n", params.get("tile_n", 32))
