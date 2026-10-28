@@ -84,6 +84,11 @@ def local(rows, base=0, experts=48, selected=6, chunk=32):
                 T.tile.sub(values, lanes, floor_f)
                 T.tile.compare(mask, values, float(selected), "LT")
                 T.tile.select(score, mask, score, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
+                # GM->UB copies zero-pad their physical destination. Explicitly
+                # exclude the final partial token chunk so padded zero IDs do
+                # not become real routes to expert zero on rank 0.
+                T.tile.compare(mask, lanes, T.cast(available * 8, "float32"), "LT")
+                T.tile.select(score, mask, score, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
                 T.tile.topk(pairs, score, width, width)
                 T.tile.gather_mask(values, pairs, "P0101")
                 T.tile.compare(mask, values, -T.infinity("float32"), "GT")

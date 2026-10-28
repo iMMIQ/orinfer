@@ -11,6 +11,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", type=int, default=7)
+    p.add_argument("--base", type=int, default=144, choices=range(0, 384, 48))
+    p.add_argument("--compile-only", action="store_true")
     args = p.parse_args()
     import torch
     import torch_npu  # noqa: F401
@@ -20,10 +22,11 @@ def main():
     from tools.operators.ascend.build import compile_kernel, operand
 
     torch.manual_seed(20261002)
-    torch.npu.set_device(args.device)
-    capacity, experts, base = 2049, 48, 144
+    if not args.compile_only:
+        torch.npu.set_device(args.device)
+    capacity, experts, base = 2049, 48, args.base
     chunks = (capacity + 31) // 32
-    device = "npu"
+    device = "cpu" if args.compile_only else "npu"
     ids = torch.empty((capacity, 8), dtype=torch.int32, device=device)
     gather = torch.empty(capacity * 6 + 8, dtype=torch.int32, device=device)
     restore = torch.empty((capacity + 1, 8), dtype=torch.int32, device=device)
@@ -69,6 +72,8 @@ def main():
             args.output / "cache",
             row_capacity=capacity,
         )
+        if args.compile_only:
+            continue
         lib = ctypes.CDLL(str(path.parent / "kernel.so"))
         libraries.append(lib)
         call = lib.orinfer_ascend_kernel_v2
@@ -82,14 +87,16 @@ def main():
         pointers = (ctypes.c_void_p * len(names))(*[tensors[n].data_ptr() for n in names])
         calls.append((call, pointers, len(names)))
 
+    if args.compile_only:
+        return
     reports = []
-    for rows in (1, 2, 17, 31, 32, 33, 127, 128, 129, 2048, 2049):
+    for rows in (1, 2, 4, 16, 17, 31, 32, 33, 127, 128, 129, 511, 2048, 2049):
         for kind in ("random", "duplicates", "empty", "invalid"):
             original = torch.randint(0, 384, (rows, 8), dtype=torch.int32)
             if kind == "duplicates":
                 original[:, :6] = base + 3
             elif kind == "empty":
-                original[:, :6] = 0
+                original[:, :6] = 48 if base == 0 else 0
             elif kind == "invalid":
                 original[0, 0] = -1
                 original[-1, 5] = 384
@@ -151,6 +158,7 @@ def main():
             reports.append(dict(rows=rows, kind=kind, latency_ms=latency["median_ms"]))
             print(reports[-1], flush=True)
     atomic_json(args.output / "validation.json", reports)
+    atomic_json(args.output / f"validation-base{base}.json", reports)
 
 
 if __name__ == "__main__":
