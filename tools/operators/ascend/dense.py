@@ -5,21 +5,31 @@ import math
 import tilelang.language as T
 
 
-def projection(rows, output, reduction, integer=False, block_k=128, tile_n=64, tile_m=16):
+def projection(
+    rows, output, reduction, integer=False, block_k=128, tile_n=64, tile_m=16, pipeline_stages=0
+):
     alignment = 32 if integer else 128
     if (isinstance(rows, int) and rows < 1) or output % 32 or reduction % alignment:
         raise ValueError("A2 projection requires positive rows and aligned N/K")
     if tile_n not in (32, 64, 128, 256):
         raise ValueError("A2 projection N tile must be 32, 64, 128 or 256")
-    if tile_m not in (16, 32, 64):
-        raise ValueError("A2 projection M tile must be 16, 32 or 64")
+    if tile_m not in (16, 32, 64, 128, 256) or (tile_m == 256 and not integer):
+        raise ValueError("A2 projection M tile must fit the INT8/BF16 L0A slot")
     block_m, block_n = tile_m, math.gcd(output, tile_n)
     vector_m = block_m // 2
     if block_n * 128 * (1 if integer else 2) > 32768:
         raise ValueError("A2 projection B tile exceeds the L0B ping-pong slot")
+    if block_m * 128 * (1 if integer else 2) > 32768 or block_m * block_n * 4 > 131072:
+        raise ValueError("A2 projection tile exceeds its L0A/L0C allocation")
     legal_k = 0 < block_k <= 512 and block_k % alignment == 0
     if not legal_k or reduction % block_k:
         raise ValueError("A2 projection K tile must be aligned, divide K and be <=512")
+    if pipeline_stages not in (0, 2, 3) or (
+        pipeline_stages and reduction // block_k < pipeline_stages
+    ):
+        raise ValueError("Projection pipeline requires enough K iterations for its stages")
+    if max(1, pipeline_stages) * block_k * (block_m + block_n) * (1 if integer else 2) > 524032:
+        raise ValueError("Projection pipeline exceeds the A2 L1 allocation")
     m_blocks = (rows + block_m - 1) // block_m
     n_blocks = output // block_n
     input_dtype = "int8" if integer else "bfloat16"
@@ -42,7 +52,7 @@ def projection(rows, output, reduction, integer=False, block_k=128, tile_n=64, t
                 w = T.alloc_L1((block_n, block_k), input_dtype)
                 c = T.alloc_L0C((block_m, block_n), accum_dtype)
                 valid_rows = T.min(block_m, rows - bm * block_m)
-                for k in T.serial(reduction // block_k):
+                for k in T.Pipelined(reduction // block_k, num_stages=pipeline_stages):
                     T.copy(
                         activation[
                             bm * block_m : bm * block_m + valid_rows,

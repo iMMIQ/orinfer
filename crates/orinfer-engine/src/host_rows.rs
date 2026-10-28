@@ -226,7 +226,7 @@ impl Int8Rows {
     pub fn row_bytes(&self) -> usize {
         self.row_bytes
     }
-    /// Packet layout is [unique row, INT8 values followed by FP32 scales].
+    /// Packet layout follows query order, with INT8 values followed by FP32 scales.
     /// All IDs and the budget are checked before modifying the destination.
     /// Rows resolve in parallel: the backing table is a random-read store,
     /// and cache-miss stalls from sequential reads would idle the device.
@@ -237,23 +237,41 @@ impl Int8Rows {
             .checked_mul(self.row_bytes)
             .filter(|&n| n <= max_bytes)
             .ok_or("Host-row staging budget exceeded")?;
+        let mut slots = HashMap::with_capacity(ids.len().min(4096));
+        let mut unique = Vec::new();
+        let mut restore = Vec::with_capacity(ids.len());
         for &row in ids {
             self.shard.local(row)?;
+            let slot = *slots.entry(row).or_insert_with(|| {
+                let slot = unique.len();
+                unique.push(row);
+                slot
+            });
+            restore.push(slot);
         }
         out.clear();
         out.resize(bytes, 0);
         let weight_bytes = self.weight.row_bytes;
-        let result: Result<()> =
-            out.par_chunks_mut(self.row_bytes)
-                .enumerate()
-                .try_for_each(|(index, packet)| {
-                    let row =
-                        usize::try_from(ids[index]).map_err(|_| "Host row offset overflow")?;
-                    let (values, scales) = packet.split_at_mut(weight_bytes);
-                    self.weight.read_row_at(row, values)?;
-                    self.scale.read_row_at(row, scales)
-                });
-        result
+        let result: Result<()> = out[..unique.len() * self.row_bytes]
+            .par_chunks_mut(self.row_bytes)
+            .enumerate()
+            .try_for_each(|(index, packet)| {
+                let row = usize::try_from(unique[index]).map_err(|_| "Host row offset overflow")?;
+                let (values, scales) = packet.split_at_mut(weight_bytes);
+                self.weight.read_row_at(row, values)?;
+                self.scale.read_row_at(row, scales)
+            });
+        result?;
+        // First-appearance slots never exceed their destination indices.
+        // Expanding backwards preserves every unread compact source row and
+        // needs no second payload allocation.
+        for (destination, &source) in restore.iter().enumerate().rev() {
+            if destination != source {
+                let begin = source * self.row_bytes;
+                out.copy_within(begin..begin + self.row_bytes, destination * self.row_bytes);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -333,6 +351,27 @@ mod tests {
         assert_eq!(packet, expected);
         assert!(rows.gather_into(&[3], &mut packet, 35).is_err());
         assert_eq!(packet, expected);
+        let all = Int8Rows::open(&w, "w", &s, "s", Shard::for_rank(4, 1, 0).unwrap()).unwrap();
+        for ids in [
+            vec![0, 0, 1, 2, 3],
+            vec![3, 3, 0, 3, 2, 1, 0, 2],
+            vec![2; 257],
+            vec![3, 2, 1, 0],
+            vec![],
+        ] {
+            all.gather_into(&ids, &mut packet, ids.len() * 36).unwrap();
+            let wanted: Vec<u8> = ids
+                .iter()
+                .flat_map(|&row| {
+                    let row = row as usize;
+                    weights[row * 32..(row + 1) * 32]
+                        .iter()
+                        .chain(&scales[row * 4..(row + 1) * 4])
+                        .copied()
+                })
+                .collect();
+            assert_eq!(packet, wanted);
+        }
         let shared = SharedInt8Rows::new(rows);
         let batches = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)

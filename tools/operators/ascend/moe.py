@@ -5,8 +5,13 @@ import math
 import tilelang.language as T
 
 
-def combine(rows, expert_rows, width, selected=6, output_dtype="bfloat16"):
-    block = math.gcd(width, 256)
+def combine(rows, expert_rows, width, selected=6, output_dtype="bfloat16", tile=256):
+    """Restore a packet; dynamic expert rows retain the producer row expression."""
+    if isinstance(expert_rows, int) and expert_rows <= 0:
+        raise ValueError("Expert row capacity must be positive")
+    if tile not in (256, 512, 1024, 1280, 2560, 5120):
+        raise ValueError("Unsupported expert combine column tile")
+    block = math.gcd(width, tile)
     blocks = width // block
     stride = (selected + 7) // 8 * 8
 

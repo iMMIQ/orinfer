@@ -169,7 +169,7 @@ python -m tools.model.deepseek_v41.prepare \
 bash tools/operators/ascend/run.sh python3 -m tools.bench.ascend_single \
   --prepare artifacts/ascend-inputs.json \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
-HCCL_OP_EXPANSION_MODE=AIV HCCL_NPU_SOCKET_PORT_RANGE=auto \
+HCCL_DETERMINISTIC=true HCCL_OP_EXPANSION_MODE=AIV HCCL_NPU_SOCKET_PORT_RANGE=auto \
   flock -w 5 artifacts/gpu-experiment.lock \
   orinfer bench-ascend --plan artifacts/ascend-model/model-prepared.json \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
@@ -191,13 +191,25 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 `tools.model.deepseek_v41.tune_auxiliary` 接受同样的 `--plan`、`--model-dir` 和 `--output`，离线选择 mHC post/pre 的列块与 FP32 分解投影的行块。后者读取计划中已准备的真实 BF16 分量，候选保持原 K 累加顺序；所有候选检查逐元素一致、尾部及改变输入后的 Graph replay。输出计划名增加 `-aux-tuned`。两种调优缓存均固定当前源码、编译器、设备、测量长度和真实权重身份，并校验被选库的内容。
 
+这两个调优入口的 `--pipeline-only` 搜索更大的行块与合法的两级／三级 L1 流水线；辅助投影同时选择 HC 方差计算的行块。候选校验 A2 的 L0A、L0B、L0C 与 L1 容量，并保留 K、FP32 归约及输出舍入边界。投影调优也可读取 `prepare` 后的物理 bank，避免在线权重变换。
+
+辅助投影的宽 N tile 连续写出完整 Cube 结果，并配套发布 `floating.reduce_partials`；归约按生产者的实际布局读取，保留每个 32 列组的八段 FP32 求和。调优检查 partial 的布局还原及配套归约的完整 Graph replay。`--combine-only` 为专家 combine 选择列块，覆盖无效路由、输出尾部及修改输入后的 replay。`--rows` 指定代价汇总长度，`--compile-only` 可提前预编译候选；最终选择仍由设备测量决定。
+
+`tools.model.deepseek_v41.tune_indexer --plan PLAN --output DIR --rows 2048` 对因果索引器联合选择 query 行块与 key 列块，输出计划名增加 `-indexer-tuned`。它复用公共候选、测量和汇总选择组件，以原逐头顺序为参考，保持 INT32 点积、FP16 权重缩放和 FP32 累加顺序；另检查短尾、上下文末端及改变输入后的 Graph replay。`--compile-only` 可通过 `run.sh --without-devices` 预编译候选，实际选择仍须设备测量。
+
 `--fast-engram` 为动态 prefill 启用批量 32 阶蝶形旋转。构建器要求 checkpoint 的旋转块恰为标准顺序、统一幅值、带行符号的 Walsh 矩阵；不匹配时构建失败。计算读取原始 FP32 系数，保留输入乘系数与输出 FP32 边界。`validate_rotation` 检查原 bank、FP64 参考误差、动态尾部和改变输入后的 Graph replay；单行 decode 保留通用旋转。
 
-`--parallel-regroup` 为 prefill 生成稳定的分块专家分组：每个 32-token 块按路由位置排序，再计算专家与块的前缀和，写回 gather 和 restore。专家、token、路由 lane 的顺序与串行扫描一致；六个有效路由之外的 padding 不参与分组。`tools.operators.ascend.validate_regroup` 验证动态尾部、重复路由、空专家、异常索引和改变输入后的 Graph replay。
+`--parallel-regroup` 为 prefill 生成稳定的分块专家分组：每个 32-token 块按路由位置排序，再计算专家与块的前缀和，写回 gather 和 restore。专家、token、路由 lane 的顺序与串行扫描一致；六个有效路由之外的 padding 及最后一个块中超出真实 token 行数的位置均不参与分组。`tools.operators.ascend.validate_regroup --base 0` 覆盖 expert 0 的短尾，默认的 `--base 144` 覆盖中间 rank；验证包含重复路由、空专家、异常索引和改变输入后的 Graph replay。
 
 实验参数 `--fp32-cube` 将 prefill 的敏感投影改为三个 BF16 分量的 Cube 乘积，保留 FP32 partial 和原有归约边界。权重分量离线准备，路由输入分量由设备生成；原始 W4 专家 bank 保持单份。该路径改变浮点累加顺序，启用前需单独比较任务质量、teacher-forced 概率和状态。默认继续使用原 FP32 投影。
 
 `--packed-attention` 为 prefill 使用 token/head 合并的 Cube tile，直接读取共享 SWA 和压缩 KV bank，以因果窗口和唯一 TopK 索引掩码选择有效项。它支持 256 对齐、至多 8448 的上下文容量，保留 FP32 softmax 和 BF16 概率。`--batched-hc` 在多行之间复用 mHC 的同源八段归约与 FP32 归一化。两者均为独立实验开关，decode 继续使用单行实现；算子验证入口分别为 `validate_prefill_attention` 和 `validate_hc`，完整模型需另外验收。
+
+`--compact-attention` 配合 `--packed-attention`，按 query 块裁剪 SWA 的 QK/PV 计算，使用至多三个 128-key tile 的概率窗口；压缩 KV 的 softmax 按块内最后位置选择有界前缀。它保留因果掩码、FP32 softmax、BF16 概率和输出 inverse RoPE。`validate_prefill_attention --compact --live-buckets` 检查该布局，包括非对齐起点和上下文边界。
+
+`--batched-rope` 在 prefill 中合并同一 token 的 head，保留原旋转算术及 BF16 边界，使用 `validate_rope` 验证。`--active-expert-rows` 要求 `--parallel-regroup`，让专家 SwiGLU／量化读取设备前缀扫描给出的实际行数，跳过未被 restore 引用的容量尾部；Graph 地址和行数 ABI 保持固定，`validate_active_quant` 检查零路由、尾部及 replay 时改变有效行数。以上开关保持实验性质，完整请求、质量及请求状态需另外验收。
+
+完整模型的重复性及固定历史概率对照使用 `HCCL_DETERMINISTIC=true`。BF16 集合归约的顺序会影响后续路由及输出，确定性配置与实际吞吐一并记录。单独同步 Graph 提交不能替代确定性归约。
 
 `ORINFER_A2_LOGITS_DIR=目录` 在普通 Graph 完成后保存各 rank 的 FP32 输出头分片，文件名携带 rank、前缀位置和本次行数，重复执行覆盖同名文件。输入计划须声明 `logits` buffer；每个固定历史使用独立目录。该诊断保持原 Graph 分段，报告标记 `logits_dump: true`，耗时包含额外读回和文件写入，供概率对照使用。
 

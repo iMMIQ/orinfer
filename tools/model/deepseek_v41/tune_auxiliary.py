@@ -16,24 +16,41 @@ def main():
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", type=int, default=7)
+    parser.add_argument("--pipeline-only", action="store_true")
+    parser.add_argument("--combine-only", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     args = parser.parse_args()
+    if args.pipeline_only and args.combine_only:
+        parser.error("Choose pipeline-only or combine-only")
     import torch
     import torch_npu  # noqa: F401
     from kernels.model.rows import row_count
     from tools.model.deepseek_v41.floating import bf16_parts
     from tools.model.deepseek_v41.tune import file_hash_bytes, npu_benchmark, read_weight
-    from tools.operators.ascend import floating, vector
+    from tools.operators.ascend import dense, floating, moe, vector
     from tools.operators.ascend.build import compile_kernel
 
     torch.set_num_threads(4)
     torch.manual_seed(20261002)
-    torch.npu.set_device(args.device)
+    if not args.compile_only:
+        torch.npu.set_device(args.device)
     args.output.mkdir(parents=True, exist_ok=True)
     model = json.loads(args.plan.read_text())
     base = args.plan.parent
     index = json.loads((args.model_dir / model["index"]["file"]).read_text())["weight_map"]
     definitions = {b["name"]: b for b in model["ranks"][0]["buffers"]}
     replacements = {}
+    reduction_steps = {}
+    reducer_manifests = set()
+    paired_reducers = {}
+    for packet in model["ranks"][0]["packets"]:
+        for step in packet["body"] + packet["head"]:
+            if step["op"] == "kernel":
+                definition = json.loads((base / step["manifest"]).read_text())
+                if definition["op"] in ("dense.fp32_reduce", "floating.reduce_partials"):
+                    reduction_steps[step["buffers"][0]] = (step["manifest"], definition)
+                    reducer_manifests.add(step["manifest"])
     seen = set()
     for packet in model["ranks"][0]["packets"]:
         for step in packet["body"] + packet["head"]:
@@ -42,23 +59,59 @@ def main():
             seen.add(step["manifest"])
             manifest = json.loads((base / step["manifest"]).read_text())
             kind = manifest["op"]
-            if kind not in ("vector.mhc_post_pre", "floating.partials"):
+            if kind not in ("vector.mhc_post_pre", "floating.partials", "moe.combine"):
+                continue
+            if args.combine_only and kind != "moe.combine":
+                continue
+            if args.pipeline_only and kind != "floating.partials":
                 continue
             params = dict(manifest["parameters"])
             if "_row_capacity" not in params:
                 continue
             capacity = params.pop("_row_capacity")
             grid_limit = params.pop("_grid_limit", 64)
-            if kind == "vector.mhc_post_pre":
+            if kind == "moe.combine":
+                configs = [dict(tile=t) for t in (256, 512, 1024, 1280, 2560, 5120)]
+                factory = moe.combine
+            elif kind == "vector.mhc_post_pre":
                 configs = [dict(tile=t) for t in (256, 512, 1024, 1280, 2560)]
                 factory = vector.mhc_post_pre
             else:
-                configs = [dict(tile_m=t) for t in (16, 32, 64)]
+                configs = [dict(tile_m=t, tile_n=32) for t in (16, 32, 64)]
                 factory = floating.partials
+                if args.pipeline_only:
+                    configs = [
+                        dict(
+                            pipeline_stages=s,
+                            variance_rows=v,
+                            tile_m=m,
+                            tile_n=n,
+                            variance_prefetch=prefetch,
+                        )
+                        for s in (0, 2, 3)
+                        for v in ((1, 8, 16) if params.get("variance") else (1,))
+                        for m in sorted({params.get("tile_m", 16), 128})
+                        for n in ((32,) if params.get("variance") else (32, 64, 128))
+                        for prefetch in (False,)
+                    ]
+                    baseline_config = dict(
+                        pipeline_stages=0,
+                        variance_rows=1,
+                        tile_m=params.get("tile_m", 16),
+                        tile_n=32,
+                        variance_prefetch=False,
+                    )
+                    configs = [baseline_config] + [c for c in configs if c != baseline_config]
 
             def build(config):
                 parameters = dict(params, **config)
-                function = factory(**dict(parameters, rows=row_count(capacity, True)))
+                factory_args = dict(parameters, rows=row_count(capacity, True))
+                if kind == "moe.combine":
+                    factor, tail = divmod(params["expert_rows"], capacity)
+                    if tail or factor < 1:
+                        raise ValueError("Expert rows must have the packet row multiplier")
+                    factory_args["expert_rows"] = factory_args["rows"] * factor
+                function = factory(**factory_args)
                 return compile_kernel(
                     function,
                     kind,
@@ -74,12 +127,13 @@ def main():
             identity = dict(
                 source=descriptor["source_sha256"],
                 compiler=descriptor["compiler"],
-                device=torch.npu.get_device_name(args.device),
+                device=None if args.compile_only else torch.npu.get_device_name(args.device),
                 parameters=params,
                 configs=configs,
-                samples=[r for r in (17, 128, 512, 2048) if r <= capacity],
+                samples=sorted({r for r in args.rows if 1 <= r <= capacity}),
                 tuner_sha256=file_hash(Path(__file__)),
                 seed=20261002,
+                reduction_source=file_hash(Path(dense.__file__)),
             )
             weight = None
             if kind == "floating.partials":
@@ -96,22 +150,40 @@ def main():
                 identity["weight_sha256"] = file_hash_bytes(weight)
 
             def valid(record):
-                path = base / record["manifest"]
-                spec = json.loads(path.read_text())
-                return (
-                    spec["source_sha256"] == descriptor["source_sha256"]
-                    and spec["compiler"] == descriptor["compiler"]
-                    and spec["library"]["sha256"] == file_hash(path.parent / "kernel.so")
-                )
+                paths_to_check = [record["manifest"]]
+                if record.get("reducer_manifest"):
+                    paths_to_check.append(record["reducer_manifest"])
+                for relative in paths_to_check:
+                    path = base / relative
+                    spec = json.loads(path.read_text())
+                    if spec["compiler"] != descriptor["compiler"] or spec["library"][
+                        "sha256"
+                    ] != file_hash(path.parent / "kernel.so"):
+                        return False
+                    if (
+                        relative == record["manifest"]
+                        and spec["source_sha256"] != descriptor["source_sha256"]
+                    ):
+                        return False
+                return True
 
+            if not identity["samples"]:
+                raise ValueError("Missing auxiliary measurement rows")
             record = record_path(args.output, identity)
-            cached = read_record(record, identity, valid)
+            cached = read_record(record, identity, valid) if not args.compile_only else None
             if cached:
                 replacements[step["manifest"]] = cached["manifest"]
+                if cached.get("reducer_manifest"):
+                    replacements[reduction_steps[step["buffers"][2]][0]] = cached[
+                        "reducer_manifest"
+                    ]
                 continue
             paths, legal, rejected = compile_candidates(configs, build, tolerate_failures=True)
             if legal[0] != configs[0]:
                 raise ValueError("Missing baseline auxiliary kernel")
+            if args.compile_only:
+                print(dict(op=kind, compiled=len(paths), rejected=rejected), flush=True)
+                continue
             libraries = [ctypes.CDLL(str(path.parent / "kernel.so")) for path in paths]
             entries = [lib.orinfer_ascend_kernel_v2 for lib in libraries]
             for entry in entries:
@@ -126,11 +198,17 @@ def main():
             outputs = []
             for spec in manifest["operands"]:
                 shape = list(spec["shape"])
-                dtype = {"bf16": torch.bfloat16, "f32": torch.float32}[spec["dtype"]]
+                dtype = {"bf16": torch.bfloat16, "f32": torch.float32, "i32": torch.int32}[
+                    spec["dtype"]
+                ]
                 if spec["access"] == "write":
                     shape[0] += 1
                     outputs.append(len(tensors))
-                tensors.append(torch.randn(shape, dtype=dtype, device="npu"))
+                tensors.append(
+                    torch.zeros(shape, dtype=dtype, device="npu")
+                    if dtype == torch.int32
+                    else torch.randn(shape, dtype=dtype, device="npu")
+                )
             if weight is not None:
                 tensors[1].copy_(weight)
             expected = [torch.empty_like(tensors[i]) for i in outputs]
@@ -142,9 +220,13 @@ def main():
             original = torch.randn(capacity, params["reduction"]) if weight is not None else None
             measurements = []
             invalid = set()
-            for rows in sorted(set(identity["samples"] + [1, 2, 31, 129, capacity])):
+            for rows in sorted(set(identity["samples"] + [1, 2, 17, 31, 129, capacity])):
                 if rows > capacity:
                     continue
+                if kind == "moe.combine":
+                    tensors[2][:rows].random_(-1, rows * 6)
+                    tensors[2][0, 0] = rows * 6
+                    tensors[2][0, 1] = -2
                 if original is not None:
                     values = (
                         torch.from_numpy(bf16_parts(original[:rows].numpy())).view(torch.bfloat16)
@@ -183,8 +265,23 @@ def main():
                     def check():
                         torch.npu.synchronize()
                         for slot, ref in zip(outputs, expected, strict=True):
+                            actual = tensors[slot][:rows]
+                            if kind == "floating.partials":
+                                columns = legal[i].get("tile_n", params.get("tile_n", 32))
+                                actual = (
+                                    actual.reshape(
+                                        rows, params["output"] // columns, 8, columns // 32, 32
+                                    )
+                                    .permute(0, 1, 3, 2, 4)
+                                    .reshape(rows, -1)
+                                )
                             torch.testing.assert_close(
-                                tensors[slot][:rows], ref[:rows], atol=0, rtol=0
+                                actual,
+                                ref[:rows].reshape(rows, -1)
+                                if kind == "floating.partials"
+                                else ref[:rows],
+                                atol=0,
+                                rtol=0,
                             )
                             assert bool((tensors[slot][rows:] == 17).all()), (
                                 "Auxiliary kernel wrote tail"
@@ -217,21 +314,140 @@ def main():
                 }
             selected = int(aggregate_winner(measurements))
             chosen = str(paths[selected].relative_to(base))
+            reducer_manifest = None
+            if kind == "floating.partials" and not params.get("variance"):
+                _, reduce_spec = reduction_steps[step["buffers"][2]]
+                columns = legal[selected].get("tile_n", 32)
+                reduce_params = dict(rows=capacity, output=params["output"], splits=8)
+                reference_path = compile_kernel(
+                    dense.fp32_reduce(row_count(capacity, True), params["output"]),
+                    "dense.fp32_reduce",
+                    reduce_spec["operands"],
+                    reduce_params,
+                    base / "cache",
+                    row_capacity=capacity,
+                    grid_limit=grid_limit,
+                )
+                reduced_path = (
+                    reference_path
+                    if columns == 32
+                    else compile_kernel(
+                        floating.reduce_partials(
+                            row_count(capacity, True), params["output"], tile_n=columns
+                        ),
+                        "floating.reduce_partials",
+                        reduce_spec["operands"],
+                        dict(reduce_params, tile_n=columns),
+                        base / "cache",
+                        row_capacity=capacity,
+                        grid_limit=grid_limit,
+                    )
+                )
+                reducer_manifest = str(reduced_path.relative_to(base))
+                reduction_libraries = [
+                    ctypes.CDLL(str(p.parent / "kernel.so")) for p in (reference_path, reduced_path)
+                ]
+                reduction_entries = [lib.orinfer_ascend_kernel_v2 for lib in reduction_libraries]
+                reduced = [
+                    torch.empty(capacity + 1, params["output"], device="npu") for _ in range(2)
+                ]
+                reduction_pointers = [
+                    (ctypes.c_void_p * 2)(source.data_ptr(), destination.data_ptr())
+                    for source, destination in zip((expected[0], tensors[2]), reduced, strict=True)
+                ]
+                for entry in reduction_entries:
+                    entry.argtypes = [
+                        ctypes.POINTER(ctypes.c_void_p),
+                        ctypes.c_uint64,
+                        ctypes.c_uint64,
+                        ctypes.c_void_p,
+                    ]
+                    entry.restype = ctypes.c_int32
+
+                def reduce_run(which):
+                    status = reduction_entries[which](
+                        reduction_pointers[which],
+                        2,
+                        rows,
+                        torch.npu.current_stream()._as_parameter_,
+                    )
+                    if status:
+                        raise RuntimeError(f"Floating reduction failed: {status}")
+
+                for rows in sorted({1, 2, 17, 31, 129, capacity}):
+                    if rows > capacity:
+                        continue
+                    if original is not None:
+                        values = (
+                            torch.from_numpy(bf16_parts(original[:rows].numpy())).view(
+                                torch.bfloat16
+                            )
+                            if params["input_parts"] == 3
+                            else original[:rows].bfloat16()[None]
+                        )
+                        tensors[0].view(-1)[: values.numel()].copy_(values.reshape(-1))
+                    for target in reduced:
+                        target.fill_(17)
+
+                    def reference_run():
+                        baseline_run()
+                        reduce_run(0)
+
+                    def selected_run():
+                        launch(selected)
+                        reduce_run(1)
+
+                    def reduction_change():
+                        tensors[0].neg_()
+                        reference_run()
+
+                    def reduction_check():
+                        torch.npu.synchronize()
+                        torch.testing.assert_close(
+                            reduced[1][:rows], reduced[0][:rows], atol=0, rtol=0
+                        )
+                        assert bool((reduced[1][rows:] == 17).all()), (
+                            "Floating reduction wrote tail"
+                        )
+
+                    reference_run()
+                    selected_run()
+                    reduction_check()
+                    measure(
+                        selected_run,
+                        budget_ms=2,
+                        max_repetitions=4,
+                        change=reduction_change,
+                        check=reduction_check,
+                        benchmark=npu_benchmark,
+                    )
+                paired_reducers[step["manifest"]] = reducer_manifest
             result = dict(
                 identity=identity,
                 measurements=measurements,
                 rejected=rejected,
                 config=legal[selected],
                 manifest=chosen,
+                reducer_manifest=reducer_manifest,
             )
             atomic_json(record, result)
             replacements[step["manifest"]] = chosen
             print(dict(op=kind, **result), flush=True)
+    if args.compile_only:
+        return
     for rank in model["ranks"]:
         for packet in rank["packets"]:
+            layouts = {}
             for step in packet["body"] + packet["head"]:
-                if step["op"] == "kernel":
-                    step["manifest"] = replacements.get(step["manifest"], step["manifest"])
+                if step["op"] != "kernel":
+                    continue
+                original_manifest = step["manifest"]
+                if original_manifest in paired_reducers:
+                    layouts[step["buffers"][2]] = paired_reducers[original_manifest]
+                if original_manifest in reducer_manifests and step["buffers"][0] in layouts:
+                    step["manifest"] = layouts[step["buffers"][0]]
+                else:
+                    step["manifest"] = replacements.get(original_manifest, original_manifest)
     atomic_json(args.plan.with_name(args.plan.stem + "-aux-tuned.json"), model)
 
 

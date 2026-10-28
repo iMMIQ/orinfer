@@ -36,7 +36,7 @@ def selected_mask(rows, length, selected=512):
     return main
 
 
-def qk(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512):
+def qk(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512, windowed=True):
     long_length = capacity // ratio
     if capacity % 256 or ratio not in (1, 2) or heads != 8 or dimension != 512:
         raise ValueError("Packed prefill QK requires C%256=0, ratio=1/2 and H8/D512")
@@ -58,9 +58,14 @@ def qk(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512):
                 b = T.alloc_L1((128, 128), "bfloat16")
                 c = T.alloc_L0C((128, 128), "float32")
                 valid = T.min(128, rows * heads - first)
-                end = positions[rows - 1] + 1
+                end = (
+                    positions[T.min(rows - 1, (first + 127) // heads)] + 1
+                    if windowed
+                    else positions[rows - 1] + 1
+                )
+                begin = positions[first // heads] - 127 if windowed else 0
                 live = T.if_then_else(key < capacity, end, capacity + end // ratio)
-                if key < live:
+                if key < live and (key >= capacity or key + 128 > begin):
                     for k in T.serial(dimension // 128):
                         T.copy(query[first : first + valid, k * 128 : (k + 1) * 128], a[:valid, :])
                         if key < capacity:
@@ -78,7 +83,18 @@ def qk(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512):
     return main
 
 
-def softmax(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512):
+def softmax(
+    rows,
+    capacity,
+    ratio=2,
+    compressed=True,
+    heads=8,
+    dimension=512,
+    compact=False,
+    live_buckets=False,
+):
+    if compact:
+        return _compact_softmax(rows, capacity, ratio, compressed, heads, dimension, live_buckets)
     long_length = capacity // ratio
     length = capacity + (long_length if compressed else 0)
     if capacity % 256 or capacity > 8448:
@@ -153,11 +169,221 @@ def softmax(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512):
     return main
 
 
-def pv(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512):
+def _compact_softmax(rows, capacity, ratio, compressed, heads, dimension, live_buckets):
+    if capacity % 256 or not 256 <= capacity <= 8448 or heads != 8 or dimension != 512:
+        raise ValueError("Compact softmax requires aligned C<=8448 and H8/D512")
     long_length = capacity // ratio
-    length = capacity + (long_length if compressed else 0)
+    score_length = capacity + (long_length if compressed else 0)
+    span = min(384, capacity)
+    probability_length = span + (long_length if compressed else 0)
+    small = min(long_length, 2048 // ratio)
+    medium = min(long_length, 4096 // ratio)
+
+    @T.macro
+    def normalize(
+        scores,
+        positions,
+        selected,
+        sink,
+        probabilities,
+        flat,
+        active_long,
+        xs,
+        xl,
+        scratch,
+        lanes,
+        ids,
+        mask,
+        p,
+        maximum,
+        other,
+        denominator,
+        sink_value,
+    ):
+        row = flat // heads
+        head = flat % heads
+        position = positions[row]
+        first_row = flat // 128 * 16
+        start = T.max(0, (positions[first_row] - 127) // 128) * 128
+        valid = T.min(span, capacity - start)
+        T.tile.fill(xs, -T.infinity("float32"))
+        T.copy(scores[flat : flat + 1, start : start + valid], xs[:, :valid])
+        T.tile.mul(xs, xs, dimension**-0.5)
+        T.tile.createvecindex(lanes, 0.0)
+        T.tile.add(lanes, lanes, T.cast(start, "float32"))
+        T.tile.compare(mask, lanes, T.cast(position + 1, "float32"), "LT")
+        T.tile.select(xs, mask, xs, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
+        T.tile.compare(mask, lanes, T.cast(position - 128, "float32"), "GT")
+        T.tile.select(xs, mask, xs, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
+        T.reduce_max(xs, maximum, dim=1)
+        if compressed:
+            T.copy(scores[flat : flat + 1, capacity : capacity + active_long], xl)
+            T.copy(selected[row : row + 1, :active_long], ids[:, :active_long])
+            T.tile.cast(scratch[:, :active_long], ids[:, :active_long], "CAST_NONE", active_long)
+            T.tile.compare(mask, scratch[:, :active_long], 0.0, "GT")
+            T.tile.mul(xl, xl, dimension**-0.5)
+            T.tile.select(
+                xl,
+                mask,
+                xl,
+                -T.infinity("float32"),
+                "VSEL_TENSOR_SCALAR_MODE",
+            )
+            T.reduce_max(xl, other, dim=1)
+            T.tile.max(maximum, maximum, other)
+        sink_value[0, 0] = sink[head]
+        T.tile.max(maximum, maximum, sink_value)
+        T.tile.sub(xs, xs, maximum[0, 0])
+        T.tile.exp(xs, xs)
+        T.reduce_sum(xs, denominator, dim=1)
+        if compressed:
+            T.tile.sub(xl, xl, maximum[0, 0])
+            T.tile.exp(xl, xl)
+            T.reduce_sum(xl, other, dim=1)
+            T.tile.add(denominator, denominator, other)
+        T.tile.sub(sink_value, sink_value, maximum)
+        T.tile.exp(sink_value, sink_value)
+        T.tile.add(denominator, denominator, sink_value)
+        T.tile.div(xs, xs, denominator[0, 0])
+        T.tile.cast(p[:, :span], xs, "CAST_RINT", span)
+        T.copy(p[:, :span], probabilities[flat : flat + 1, :span])
+        T.set_flag("MTE3", "V", 7)
+        T.wait_flag("MTE3", "V", 7)
+        if compressed:
+            T.tile.add(other, denominator, 0.0)
+            T.tile.div(xl, xl, other[0, 0])
+            T.tile.cast(p[:, :active_long], xl, "CAST_RINT", active_long)
+            T.copy(p[:, :active_long], probabilities[flat : flat + 1, span : span + active_long])
+            T.set_flag("MTE3", "V", 7)
+            T.wait_flag("MTE3", "V", 7)
+
+    @T.prim_func
+    def main(
+        scores: T.Tensor((rows * heads, score_length), "float32"),
+        positions: T.Tensor((rows,), "int32"),
+        selected: T.Tensor((rows, long_length), "int32"),
+        sink: T.Tensor((heads,), "float32"),
+        probabilities: T.Tensor((rows * heads, probability_length), "bfloat16"),
+    ):
+        with T.Kernel(T.ceildiv(rows * heads, 2), is_npu=True) as (cid, vid):
+            xs = T.alloc_ub((1, span), "float32")
+            # Distinct full buffers keep the pinned compiler on its wide
+            # reduction path; BufferRegion reductions only support <=64 lanes.
+            xl = T.alloc_ub((1, long_length), "float32")
+            xl_small = T.alloc_ub((1, small), "float32")
+            xl_medium = T.alloc_ub((1, medium), "float32")
+            scratch = T.alloc_ub((1, max(span, long_length)), "float32")
+            lanes = T.alloc_ub((1, span), "float32")
+            ids = T.alloc_ub((1, long_length), "int32")
+            mask = T.alloc_ub((max(span, long_length) // 8,), "uint8")
+            p = T.alloc_ub((1, max(span, long_length)), "bfloat16")
+            maximum = T.alloc_ub((1, 1), "float32")
+            other = T.alloc_ub((1, 1), "float32")
+            denominator = T.alloc_ub((1, 1), "float32")
+            sink_value = T.alloc_ub((1, 1), "float32")
+            flat = cid * 2 + vid
+            row = flat // heads
+            if row < rows:
+                end = positions[T.min(rows - 1, flat // 128 * 16 + 15)] + 1
+                if live_buckets and compressed and long_length > small:
+                    if end <= 2048:
+                        normalize(
+                            scores,
+                            positions,
+                            selected,
+                            sink,
+                            probabilities,
+                            flat,
+                            small,
+                            xs,
+                            xl_small,
+                            scratch,
+                            lanes,
+                            ids,
+                            mask,
+                            p,
+                            maximum,
+                            other,
+                            denominator,
+                            sink_value,
+                        )
+                    elif end <= 4096:
+                        normalize(
+                            scores,
+                            positions,
+                            selected,
+                            sink,
+                            probabilities,
+                            flat,
+                            medium,
+                            xs,
+                            xl_medium,
+                            scratch,
+                            lanes,
+                            ids,
+                            mask,
+                            p,
+                            maximum,
+                            other,
+                            denominator,
+                            sink_value,
+                        )
+                    else:
+                        normalize(
+                            scores,
+                            positions,
+                            selected,
+                            sink,
+                            probabilities,
+                            flat,
+                            long_length,
+                            xs,
+                            xl,
+                            scratch,
+                            lanes,
+                            ids,
+                            mask,
+                            p,
+                            maximum,
+                            other,
+                            denominator,
+                            sink_value,
+                        )
+                else:
+                    normalize(
+                        scores,
+                        positions,
+                        selected,
+                        sink,
+                        probabilities,
+                        flat,
+                        long_length,
+                        xs,
+                        xl,
+                        scratch,
+                        lanes,
+                        ids,
+                        mask,
+                        p,
+                        maximum,
+                        other,
+                        denominator,
+                        sink_value,
+                    )
+
+    return main
+
+
+def pv(
+    rows, capacity, ratio=2, compressed=True, heads=8, dimension=512, windowed=True, compact=False
+):
+    long_length = capacity // ratio
+    span = min(384, capacity) if compact else capacity
+    length = span + (long_length if compressed else 0)
     if capacity % 256 or heads != 8 or dimension != 512:
         raise ValueError("Packed prefill PV requires C%256=0 and H8/D512")
+    if compact and not windowed:
+        raise ValueError("Compact probabilities require the shared query-block window")
 
     @T.prim_func
     def main(
@@ -175,18 +401,30 @@ def pv(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512):
                 b = T.alloc_L1((128, 64), "bfloat16")
                 c = T.alloc_L0C((128, 64), "float32")
                 valid = T.min(128, rows * heads - first)
-                end = positions[rows - 1] + 1
-                for k in T.serial(T.ceildiv(end, 128)):
+                end = (
+                    positions[T.min(rows - 1, (first + 127) // heads)] + 1
+                    if windowed
+                    else positions[rows - 1] + 1
+                )
+                begin = T.max(0, (positions[first // heads] - 127) // 128) if windowed else 0
+                for k in T.serial(begin, T.ceildiv(end, 128)):
                     T.copy(
-                        probabilities[first : first + valid, k * 128 : (k + 1) * 128], a[:valid, :]
+                        probabilities[
+                            first : first + valid,
+                            (k - (begin if compact else 0)) * 128 : (
+                                k + 1 - (begin if compact else 0)
+                            )
+                            * 128,
+                        ],
+                        a[:valid, :],
                     )
                     T.copy(swa[k * 128 : (k + 1) * 128, column : column + 64], b)
-                    T.gemm_v0(a, b, c, init=(k == 0))
+                    T.gemm_v0(a, b, c, init=(k == begin))
                 if compressed:
                     for k in T.serial(T.ceildiv(end // ratio, 128)):
                         T.copy(
                             probabilities[
-                                first : first + valid, capacity + k * 128 : capacity + (k + 1) * 128
+                                first : first + valid, span + k * 128 : span + (k + 1) * 128
                             ],
                             a[:valid, :],
                         )

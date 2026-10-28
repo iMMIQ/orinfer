@@ -195,7 +195,9 @@ def convert(rows, width, source_dtype, destination_dtype, scale=1.0):
     return main
 
 
-def partial_rope(rows, heads, dimension, inverse=False, vector_indices=True):
+def partial_rope(rows, heads, dimension, inverse=False, vector_indices=True, batch_heads=False):
+    if batch_heads:
+        return _partial_rope_heads(rows, heads, dimension, inverse)
     rotary, half = 64, 32
     sign = -1.0 if inverse else 1.0
 
@@ -258,6 +260,76 @@ def partial_rope(rows, heads, dimension, inverse=False, vector_indices=True):
                 T.tile.cast(y, a, "CAST_RINT", rotary)
                 T.copy(source[: dimension - rotary], out[row, head, : dimension - rotary])
                 T.copy(y, out[row, head, dimension - rotary :])
+
+    return main
+
+
+def _partial_rope_heads(rows, heads, dimension, inverse):
+    rotary, half = 64, 32
+    count = heads * rotary
+    sign = -1.0 if inverse else 1.0
+
+    @T.prim_func
+    def main(
+        x: T.Tensor((rows * heads, dimension), "bfloat16"),
+        cosine: T.Tensor((rows, half), "float32"),
+        sine: T.Tensor((rows, half), "float32"),
+        out: T.Tensor((rows * heads, dimension), "bfloat16"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            source = T.alloc_ub((heads, dimension), "bfloat16")
+            xb = T.alloc_ub((heads, rotary), "bfloat16")
+            a = T.alloc_ub((heads, rotary), "float32")
+            even = T.alloc_ub((heads, half), "float32")
+            odd = T.alloc_ub((heads, half), "float32")
+            co_row = T.alloc_ub((1, half), "float32")
+            si_row = T.alloc_ub((1, half), "float32")
+            co = T.alloc_ub((heads, half), "float32")
+            si = T.alloc_ub((heads, half), "float32")
+            product = T.alloc_ub((heads, half), "float32")
+            result = T.alloc_ub((2, heads, half), "float32")
+            offsets = T.alloc_ub((count,), "uint32")
+            lane = T.alloc_ub((count,), "float32")
+            half_index = T.alloc_ub((count,), "float32")
+            floor_index = T.alloc_ub((count,), "int32")
+            parity = T.alloc_ub((count,), "float32")
+            y = T.alloc_ub((heads, rotary), "bfloat16")
+            row = cid * 2 + vid
+            first = row * heads
+            if row < rows:
+                T.copy(x[first : first + heads, :], source)
+                T.copy(source[:, dimension - rotary :], xb)
+                T.copy(cosine[row : row + 1, :], co_row)
+                T.copy(sine[row : row + 1, :], si_row)
+                T.tile.broadcast(co, co_row)
+                T.tile.broadcast(si, si_row)
+                T.tile.mul(si, si, sign)
+                T.tile.cast(a, xb, "CAST_NONE", count)
+                T.tile.gather_mask(even, a, "P0101")
+                T.tile.gather_mask(odd, a, "P1010")
+                T.tile.mul(result[0, :, :], even, co)
+                T.tile.mul(product, odd, si)
+                T.tile.sub(result[0, :, :], result[0, :, :], product)
+                T.tile.mul(result[1, :, :], odd, co)
+                T.tile.mul(product, even, si)
+                T.tile.add(result[1, :, :], result[1, :, :], product)
+                T.tile.createvecindex(lane, 0.0)
+                T.tile.mul(half_index, lane, 0.5)
+                T.tile.cast(floor_index, half_index, "CAST_FLOOR", count)
+                T.tile.cast(half_index, floor_index, "CAST_NONE", count)
+                T.tile.mul(parity, half_index, 2.0)
+                T.tile.sub(lane, lane, parity)
+                T.tile.mul(lane, lane, float(heads * half))
+                T.tile.add(lane, lane, half_index)
+                T.tile.mul(lane, lane, 4.0)
+                T.tile.cast(floor_index, lane, "CAST_RINT", count)
+                T.reinterpretcast(offsets, floor_index, "uint32_t")
+                T.tile.gather(a, result, offsets, 0)
+                T.tile.cast(y, a, "CAST_RINT", count)
+                # The pinned UB->GM copy assumes a compact UB source. Store
+                # the complete head before replacing its rotary suffix.
+                T.copy(source, out[first : first + heads, :])
+                T.copy(y, out[first : first + heads, dimension - rotary :])
 
     return main
 
@@ -427,6 +499,61 @@ def swiglu_packed_quant(rows, width, limit=10.0):
                 T.copy(scale, scales[row : row + 1])
 
     return main
+
+
+def swiglu_packed_quant_active(rows, width, limit=10.0):
+    """Apply the shared arithmetic to the routed prefix, with a GPU-owned bound.
+
+    The routing prefix scan writes its live count after the token error rows.
+    Capacity and the scalar row ABI remain fixed for ACL Graph replay.
+    """
+    from tilelang import tvm
+
+    tir = tvm.tir
+    function = swiglu_packed_quant(rows, width, limit)
+    handle = tir.Var("active_counts_handle", "handle")
+    counts = tir.decl_buffer((rows // 6 + 1,), "int32", name="active_counts")
+    active = tir.Max(0, tir.Min(rows, tir.BufferLoad(counts, [rows // 6])))
+    guarded = 0
+
+    def guard(node):
+        nonlocal guarded
+        if isinstance(node, tir.IfThenElse):
+            if not isinstance(node.condition, tir.LT):
+                raise ValueError("Unexpected packed quantization row guard")
+            guarded += 1
+            return tir.IfThenElse(
+                tir.And(node.condition, node.condition.a < active),
+                node.then_case,
+                node.else_case,
+            )
+        return None
+
+    body = tir.stmt_functor.ir_transform(function.body, None, guard, ["tir.IfThenElse"])
+    if guarded != 1:
+        raise ValueError("Packed quantization must have one shared row boundary")
+
+    def live_grid(node):
+        if not (
+            isinstance(node, tir.AttrStmt)
+            and node.attr_key == "thread_extent"
+            and node.node.thread_tag == "blockIdx.x"
+        ):
+            return None
+        wave = tir.Var("live_wave", "int32")
+        logical = node.node.var + wave * 64
+        body = tir.stmt_functor.substitute(node.body, {node.node.var: logical})
+        body = tir.For(wave, 0, tir.floordiv(active + 127, 128), tir.ForKind.SERIAL, body)
+        return tir.AttrStmt(node.node, node.attr_key, 64, body)
+
+    body = tir.stmt_functor.ir_transform(body, None, live_grid, ["tir.AttrStmt"])
+    return tir.PrimFunc(
+        list(function.params) + [handle],
+        body,
+        function.ret_type,
+        dict(function.buffer_map) | {handle: counts},
+        function.attrs,
+    )
 
 
 def add_shared(rows, width):

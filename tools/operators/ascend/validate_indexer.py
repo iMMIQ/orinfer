@@ -11,6 +11,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", type=int, default=7)
+    p.add_argument("--compile-only", action="store_true")
+    p.add_argument("--tile-rows", type=int, default=1)
+    p.add_argument("--tile-s", type=int, default=64)
+    p.add_argument("--lengths", type=int, nargs="+", default=[35, 128])
     args = p.parse_args()
     import torch
     import torch_npu  # noqa: F401
@@ -22,11 +26,14 @@ def main():
 
     torch.manual_seed(20261002)
     torch.set_num_threads(4)
-    torch.npu.set_device(args.device)
+    if not args.compile_only:
+        torch.npu.set_device(args.device)
     capacity = 129
     reports = []
-    for length in (35, 128):
-        parameters = dict(rows=capacity, length=length)
+    for length in args.lengths:
+        parameters = dict(
+            rows=capacity, length=length, tile_s=args.tile_s, tile_rows=args.tile_rows
+        )
         shapes = [
             ("query", "i8", [capacity, 32, 128], "read"),
             ("query_scale", "f16", [capacity, 32], "read"),
@@ -35,10 +42,17 @@ def main():
             ("weights", "bf16", [capacity, 32], "read"),
             ("indices", "i32", [capacity, length], "read"),
             ("out", "f32", [capacity, length], "write"),
-            ("workspace", "i32", [capacity, 32, (length + 63) // 64 * 64], "scratch"),
+            (
+                "workspace",
+                "i32",
+                [capacity, 32, (length + args.tile_s - 1) // args.tile_s * args.tile_s],
+                "scratch",
+            ),
         ]
         specs = [operand(*s) for s in shapes]
-        function = causal_logits(row_count(capacity, True), length)
+        function = causal_logits(
+            row_count(capacity, True), length, tile_s=args.tile_s, tile_rows=args.tile_rows
+        )
         path = compile_kernel(
             function,
             "indexer_cube.causal_logits",
@@ -47,6 +61,8 @@ def main():
             args.output / "cache",
             row_capacity=capacity,
         )
+        if args.compile_only:
+            continue
         ids = torch.arange(length).expand(capacity, -1)
         ids = torch.where(ids <= torch.arange(capacity)[:, None], ids, -1).int()
         inputs = [

@@ -74,6 +74,9 @@ class Strategy:
     packed_attention: bool = False
     batched_hc: bool = False
     fast_engram: bool = False
+    compact_attention: bool = False
+    batched_rope: bool = False
+    active_expert_rows: bool = False
 
 
 OPTIMIZED = Strategy(True, True, True, True, True, True)
@@ -350,19 +353,26 @@ class Builder:
         )
         return out, scales
 
-    def swiglu_packed_quant(self, packed, width, output="expert.act.quant", rows=None):
+    def swiglu_packed_quant(
+        self, packed, width, output="expert.act.quant", rows=None, active_counts=None
+    ):
         rows = self.rows if rows is None else rows
         out = self.temp(output, (rows, width), "i8")
         scales = self.temp(output + ".scale", (rows,), "f32")
         self.kernel(
             model_ops,
-            "swiglu_packed_quant",
+            "swiglu_packed_quant_active" if active_counts else "swiglu_packed_quant",
             {"rows": rows, "width": width},
             [
                 ("packed", packed, "bf16", (rows, 2 * width), "read"),
                 ("out", out, "i8", (rows, width), "write"),
                 ("scales", scales, "f32", (rows,), "write"),
-            ],
+            ]
+            + (
+                [("active_counts", active_counts, "i32", (self.rows + 1,), "read")]
+                if active_counts
+                else []
+            ),
         )
         return out, scales
 
@@ -458,7 +468,13 @@ class Builder:
         self.kernel(
             model_ops,
             "partial_rope",
-            {"rows": self.rows, "heads": heads, "dimension": dimension, "inverse": inverse},
+            {
+                "rows": self.rows,
+                "heads": heads,
+                "dimension": dimension,
+                "inverse": inverse,
+                **({"batch_heads": True} if self.dynamic and self.strategy.batched_rope else {}),
+            },
             [
                 ("x", x, "bf16", (self.rows, heads, dimension), "read"),
                 ("cosine", cosine, "f32", (self.rows, 32), "read"),
@@ -776,6 +792,8 @@ class Builder:
         rows, capacity = self.rows, self.capacity
         long_length = capacity // ratio
         length = capacity + (long_length if compressed else 0)
+        span = min(384, capacity) if self.strategy.compact_attention else capacity
+        probability_length = span + (long_length if compressed else 0)
         mask = self.temp(f"attention.packed.mask.{long_length}", (rows, long_length), "i32")
         if compressed and layer in (2, 8, 14, 20, 24, 28, 32, 36):
             self.kernel(
@@ -788,7 +806,7 @@ class Builder:
                 ],
             )
         score_bank = self.temp("attention.packed.score.bank", (rows * 8, capacity * 2), "f32")
-        probability_bank = self.temp("attention.packed.prob.bank", (rows * 8, capacity * 2))
+        probability_bank = self.temp("attention.packed.prob.bank", (rows * 8, capacity + span))
         score = self.buffer(
             self.prefix + f"attention.packed.score.{length}",
             (rows * 8, length),
@@ -796,8 +814,8 @@ class Builder:
             view={"parent": score_bank, "offset": 0},
         )
         prob = self.buffer(
-            self.prefix + f"attention.packed.prob.{length}",
-            (rows * 8, length),
+            self.prefix + f"attention.packed.prob.{probability_length}",
+            (rows * 8, probability_length),
             "bf16",
             view={"parent": probability_bank, "offset": 0},
         )
@@ -822,21 +840,23 @@ class Builder:
         self.kernel(
             attention_prefill,
             "softmax",
-            parameters,
+            dict(parameters, compact=True, live_buckets=True)
+            if self.strategy.compact_attention
+            else parameters,
             [
                 ("scores", score, "f32", (rows * 8, length), "read"),
                 ("positions", positions, "i32", (rows,), "read"),
                 ("selected", mask, "i32", (rows, long_length), "read"),
                 ("sink", sink, "f32", (8,), "read"),
-                ("probabilities", prob, "bf16", (rows * 8, length), "write"),
+                ("probabilities", prob, "bf16", (rows * 8, probability_length), "write"),
             ],
         )
         self.kernel(
             attention_prefill,
             "pv",
-            parameters,
+            dict(parameters, compact=True) if self.strategy.compact_attention else parameters,
             [
-                ("probabilities", prob, "bf16", (rows * 8, length), "read"),
+                ("probabilities", prob, "bf16", (rows * 8, probability_length), "read"),
                 ("swa", swa, "bf16", (capacity, 512), "read"),
                 ("long_kv", long_kv, "bf16", (long_length, 512), "read"),
                 ("positions", positions, "i32", (rows,), "read"),
@@ -1350,7 +1370,13 @@ class Builder:
             }
         )
         down8, down_scale = self.swiglu_packed_quant(
-            packed_output, 2304, "expert.act.quant", rows=expert_rows
+            packed_output,
+            2304,
+            "expert.act.quant",
+            rows=expert_rows,
+            active_counts=route_errors
+            if self.dynamic and self.strategy.active_expert_rows
+            else None,
         )
         self.steps.append(
             {
@@ -1697,6 +1723,7 @@ def main():
     parser.add_argument("--packed-attention", action="store_true")
     parser.add_argument("--batched-hc", action="store_true")
     parser.add_argument("--fast-engram", action="store_true")
+    parser.add_argument("--compact-attention", action="store_true")
     parser.add_argument(
         "--parallel-regroup",
         action="store_true",
@@ -1706,6 +1733,14 @@ def main():
         "--fp32-cube",
         action="store_true",
         help="Experimental three-part BF16 prefill projections with FP32 boundaries",
+    )
+    parser.add_argument(
+        "--batched-rope", action="store_true", help="Batch prefill heads in each vector RoPE row"
+    )
+    parser.add_argument(
+        "--active-expert-rows",
+        action="store_true",
+        help="Bound expert activation work by the GPU routing count",
     )
     args = parser.parse_args()
     if not 1 <= args.compile_workers <= 8:
@@ -1733,6 +1768,10 @@ def main():
         parser.error("packed-attention and batched-hc require the optimized strategy")
     if args.fast_engram and args.strategy != "optimized":
         parser.error("fast-engram requires the optimized strategy")
+    if args.active_expert_rows and not args.parallel_regroup:
+        parser.error("active-expert-rows requires parallel-regroup")
+    if args.compact_attention and not args.packed_attention:
+        parser.error("compact-attention requires packed-attention")
     torch.set_num_threads(4)
     config = json.loads((args.model_dir / "config.json").read_text())["text_config"]
     for name, value in {
@@ -1778,6 +1817,9 @@ def main():
                 packed_attention=args.packed_attention,
                 batched_hc=args.batched_hc,
                 fast_engram=args.fast_engram,
+                compact_attention=args.compact_attention,
+                batched_rope=args.batched_rope,
+                active_expert_rows=args.active_expert_rows,
             )
             if args.strategy == "optimized"
             else Strategy(),

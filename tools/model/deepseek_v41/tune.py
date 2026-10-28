@@ -24,6 +24,7 @@ def main():
     p.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--compile-workers", type=int, default=4)
+    p.add_argument("--pipeline-only", action="store_true")
     args = p.parse_args()
     if not 1 <= args.compile_workers <= 8:
         p.error("compile workers must be in 1..8")
@@ -50,8 +51,8 @@ def main():
             if manifest["op"] == "dense.projection" and "_row_capacity" in manifest["parameters"]:
                 groups[step["manifest"]] = (
                     manifest,
-                    definitions[step["buffers"][1]]["weight"],
-                    definitions[step["buffers"][3]].get("weight"),
+                    definitions[step["buffers"][1]],
+                    definitions[step["buffers"][3]],
                 )
     replacements = {}
     for old, (manifest, weight, scaling) in groups.items():
@@ -61,9 +62,20 @@ def main():
         measured = sorted({r for r in args.rows if 1 <= r <= capacity})
         if not measured:
             raise ValueError("Missing bounded prefill measurements")
-        bank = read_weight(args.model_dir, index, weight)
+        bank = read_bank(
+            base,
+            args.model_dir,
+            index,
+            weight,
+            manifest["operands"][1]["dtype"],
+            manifest["operands"][1]["shape"],
+        )
         channel = (
-            read_weight(args.model_dir, index, scaling).float().reshape(-1) if scaling else None
+            read_bank(base, args.model_dir, index, scaling, "f32", [parameters["output"]])
+            .float()
+            .reshape(-1)
+            if parameters["integer"]
+            else None
         )
         configs = [
             dict(tile_m=m, tile_n=n, block_k=k)
@@ -78,6 +90,17 @@ def main():
             tile_n=parameters.get("tile_n", 64),
             block_k=parameters.get("block_k", 128),
         )
+        if args.pipeline_only:
+            baseline = dict(pipeline_stages=0, tile_m=parameters.get("tile_m", 16))
+            configs = [
+                dict(pipeline_stages=s, tile_m=m)
+                for s in (0, 2, 3)
+                for m in sorted(
+                    {parameters.get("tile_m", 16), 128}
+                    | ({256} if parameters["integer"] else set())
+                )
+                if s == 0 or parameters["reduction"] // parameters.get("block_k", 128) >= s
+            ]
         configs = [baseline] + [c for c in configs if c != baseline]
 
         def compile_one(config):
@@ -281,6 +304,26 @@ def read_weight(root, index, weight):
     )
 
 
+def read_bank(base, root, index, definition, dtype, shape):
+    """Read a logical NT projection bank from either build or prepared plans."""
+    import math
+    import torch
+
+    if "weight" in definition:
+        value = read_weight(root, index, definition["weight"])
+    else:
+        source = definition.get("prepared_weight") or definition.get("data", {}).get("file")
+        if source is None:
+            raise ValueError("Projection bank has no offline weight source")
+        kind = {"i8": torch.int8, "bf16": torch.bfloat16, "f32": torch.float32}[dtype]
+        path = base / source
+        elements = math.prod(shape)
+        if path.stat().st_size != elements * torch.empty((), dtype=kind).element_size():
+            raise ValueError("Prepared projection bank differs from its logical tensor span")
+        value = torch.from_file(str(path), shared=False, size=elements, dtype=kind)
+    return value.reshape(shape).contiguous()
+
+
 def file_hash_bytes(tensor):
     import hashlib
 
@@ -299,6 +342,9 @@ def npu_benchmark(run, repetitions, warmup):
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         run()
+    for _ in range(2):
+        graph.replay()
+    torch.npu.synchronize()
     values = []
     for _ in range(repetitions):
         start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)

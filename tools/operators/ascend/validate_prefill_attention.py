@@ -15,6 +15,8 @@ def main():
     p.add_argument("--context", type=int, default=256)
     p.add_argument("--rows", type=int, nargs="+", default=[1, 2, 17, 31, 32, 128, 129])
     p.add_argument("--bases", type=int, nargs="+", default=[0, 64])
+    p.add_argument("--compact", action="store_true")
+    p.add_argument("--live-buckets", action="store_true")
     args = p.parse_args()
     import torch
     import torch_npu  # noqa: F401
@@ -37,6 +39,8 @@ def main():
     for compressed, ratio in ((False, 2), (True, 2), (True, 1)):
         long_length = context // ratio
         length = context + (long_length if compressed else 0)
+        span = min(384, context) if args.compact else context
+        probability_length = span + (long_length if compressed else 0)
         query = torch.randn(capacity, 8, 512).bfloat16()
         swa = (torch.randn(context, 512) * 0.2).bfloat16()
         long = (torch.randn(long_length, 512) * 0.2).bfloat16()
@@ -53,7 +57,7 @@ def main():
                 mask=torch.empty(capacity, long_length, dtype=torch.int32, device="npu"),
                 scores=torch.empty((capacity * 8, length), device="npu"),
                 probabilities=torch.empty(
-                    ((capacity + 1) * 8, length), dtype=torch.bfloat16, device="npu"
+                    ((capacity + 1) * 8, probability_length), dtype=torch.bfloat16, device="npu"
                 ),
                 output=torch.empty(((capacity + 1) * 8, 512), dtype=torch.bfloat16, device="npu"),
                 workspace=torch.empty(((capacity * 8 + 127) // 128 * 128, 512), device="npu"),
@@ -67,7 +71,7 @@ def main():
             indices=("i32", [capacity, 512]),
             mask=("i32", [capacity, long_length]),
             scores=("f32", [capacity * 8, length]),
-            probabilities=("bf16", [capacity * 8, length]),
+            probabilities=("bf16", [capacity * 8, probability_length]),
             output=("bf16", [capacity * 8, 512]),
             workspace=("f32", [(capacity * 8 + 127) // 128 * 128, 512]),
         )
@@ -88,7 +92,13 @@ def main():
             ),
             (
                 "softmax",
-                dict(capacity=context, ratio=ratio, compressed=compressed),
+                dict(
+                    capacity=context,
+                    ratio=ratio,
+                    compressed=compressed,
+                    compact=args.compact,
+                    live_buckets=args.live_buckets,
+                ),
                 [
                     ("scores", "scores", "read"),
                     ("positions", "positions", "read"),
@@ -99,7 +109,7 @@ def main():
             ),
             (
                 "pv",
-                dict(capacity=context, ratio=ratio, compressed=compressed),
+                dict(capacity=context, ratio=ratio, compressed=compressed, compact=args.compact),
                 [
                     (n, n, "write" if n == "output" else "scratch" if n == "workspace" else "read")
                     for n in ("probabilities", "swa", "long_kv", "positions", "output", "workspace")
@@ -180,11 +190,37 @@ def main():
                     scores = torch.cat((scores, sink[None, :, None].expand(rows, -1, 1)), dim=-1)
                     probs = scores.softmax(-1)[..., :-1].bfloat16()
                     expected = (probs.float().reshape(rows * 8, length) @ bank).bfloat16()
+                    wanted_probabilities = probs
+                    if args.compact:
+                        wanted_probabilities = torch.full(
+                            (rows, 8, probability_length), 17, dtype=torch.bfloat16
+                        )
+                        for row in range(rows):
+                            first = row // 16 * 16
+                            start = max(0, (int(positions[first]) - 127) // 128) * 128
+                            live = min(span, context - start)
+                            wanted_probabilities[row, :, :span] = 0
+                            wanted_probabilities[row, :, :live] = probs[
+                                row, :, start : start + live
+                            ]
+                            active_long = long_length
+                            end = int(positions[min(rows - 1, first + 15)]) + 1
+                            if args.live_buckets:
+                                if end <= 2048:
+                                    active_long = min(long_length, 2048 // ratio)
+                                elif end <= 4096:
+                                    active_long = min(long_length, 4096 // ratio)
+                            if compressed:
+                                wanted_probabilities[row, :, span : span + active_long] = probs[
+                                    row, :, context : context + active_long
+                                ]
                     actual = tensors["output"].cpu()
                     torch.testing.assert_close(actual[: rows * 8], expected, atol=0.003, rtol=0.02)
                     torch.testing.assert_close(
-                        tensors["probabilities"][: rows * 8].cpu().reshape(rows, 8, length),
-                        probs,
+                        tensors["probabilities"][: rows * 8]
+                        .cpu()
+                        .reshape(rows, 8, probability_length),
+                        wanted_probabilities,
                         atol=0.00025,
                         rtol=0.01,
                     )
