@@ -35,6 +35,9 @@ impl Default for Limits {
 pub struct Session {
     pub(super) context: Rc<Context>,
     pending: RefCell<Vec<Rc<Completion>>>,
+    // Session ownership avoids a Context -> Pinned -> Context Rc cycle.
+    // Physical idle capacity remains charged to the pinned-memory budget.
+    pinned_cache: RefCell<Vec<Rc<Pinned>>>,
 }
 pub(super) struct Context {
     pub driver: Arc<DriverLease>,
@@ -361,6 +364,7 @@ impl Session {
         Ok(Self {
             context: Rc::new(context),
             pending: RefCell::new(vec![]),
+            pinned_cache: RefCell::new(vec![]),
         })
     }
     pub fn memory_info(&self) -> Result<(usize, usize)> {
@@ -386,8 +390,15 @@ impl Session {
     pub fn allocated_bytes(&self) -> usize {
         self.context.device_bytes.get()
     }
+    /// Physical pinned storage, including idle reusable buffers.
     pub fn pinned_bytes(&self) -> usize {
         self.context.pinned_bytes.get()
+    }
+    /// Release cached idle capacity. In-flight backing stays completion-owned.
+    pub fn trim_pinned_cache(&self) {
+        self.pinned_cache
+            .borrow_mut()
+            .retain(|host| Rc::strong_count(host) != 1);
     }
     pub(super) fn require(&self, buffer: &Buffer) -> Result<()> {
         self.context.ready()?;
@@ -441,15 +452,44 @@ impl Session {
         })
     }
     fn pinned(&self, bytes: usize) -> Result<Rc<Pinned>> {
-        if bytes == 0
-            || bytes
-                > self
-                    .context
-                    .limits
-                    .pinned_bytes
-                    .saturating_sub(self.pinned_bytes())
-        {
+        if bytes == 0 || bytes > self.context.limits.pinned_bytes {
             return Err("Ascend pinned allocation exceeds session budget or is empty".into());
+        }
+        let mut cache = self.pinned_cache.borrow_mut();
+        // Completion::wait releases the retained host reference only after a
+        // hard DMA fence. A cache-only reference therefore has no DMA reader
+        // or writer, even if its completed public Ticket still exists.
+        if let Some(host) = cache
+            .iter()
+            .filter(|host| Rc::strong_count(host) == 1 && host.bytes >= bytes)
+            .min_by_key(|host| host.bytes)
+        {
+            return Ok(Rc::clone(host));
+        }
+        while bytes
+            > self
+                .context
+                .limits
+                .pinned_bytes
+                .saturating_sub(self.pinned_bytes())
+        {
+            let index = cache
+                .iter()
+                .enumerate()
+                .filter(|(_, host)| Rc::strong_count(host) == 1)
+                .max_by_key(|(_, host)| host.bytes)
+                .map(|(index, _)| index)
+                .ok_or("Ascend pinned allocation exceeds session budget or is empty")?;
+            cache.swap_remove(index);
+        }
+        // Bound host bookkeeping as well as physical bytes. In-flight entries
+        // are never evicted; excess transient allocations retain the original
+        // completion-owned lifetime rather than growing the cache.
+        const MAX_CACHED: usize = 64;
+        if cache.len() == MAX_CACHED
+            && let Some(index) = cache.iter().position(|host| Rc::strong_count(host) == 1)
+        {
+            cache.swap_remove(index);
         }
         let mut pointer = ptr::null_mut();
         check(
@@ -461,11 +501,15 @@ impl Session {
             return Err("ACL pinned allocation returned null".into());
         }
         self.context.pinned_bytes.set(self.pinned_bytes() + bytes);
-        Ok(Rc::new(Pinned {
+        let host = Rc::new(Pinned {
             context: Rc::clone(&self.context),
             pointer,
             bytes,
-        }))
+        });
+        if cache.len() < MAX_CACHED {
+            cache.push(Rc::clone(&host));
+        }
+        Ok(host)
     }
     pub fn reap(&self) -> Result<()> {
         let mut pending = self.pending.borrow_mut();
@@ -564,7 +608,7 @@ impl Session {
         let destination = buffer.range(offset, data.len())?;
         self.reap()?;
         let host = self.pinned(data.len())?;
-        // SAFETY: Newly allocated pinned memory is exclusive and spans data.len().
+        // SAFETY: The pinned lease is exclusive and spans data.len().
         unsafe {
             ptr::copy_nonoverlapping(data.as_ptr(), host.pointer.cast(), data.len());
         }
@@ -593,7 +637,7 @@ impl Session {
             },
         )
     }
-    /// Stage a bounded group of complete inputs with one pinned allocation and
+    /// Stage a bounded group of complete inputs with one pinned lease and
     /// completion. Compute-stream ordering protects earlier readers when a
     /// later layer reuses the same input buffers.
     pub(super) fn upload_inputs(&self, inputs: &[(Buffer, Vec<u8>)]) -> Result<Ticket> {

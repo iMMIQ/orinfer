@@ -317,7 +317,7 @@ fn input_batch_validates_all_spans_before_submitting_and_fences_errors() {
             .upload_inputs(&[(first.clone(), vec![2; 4]), (second.clone(), vec![3; 2])])
             .is_err()
     );
-    assert_eq!(session.pinned_bytes(), 0);
+    assert_eq!(session.pinned_bytes(), 10);
     fixture.failure(0);
     assert_eq!(session.download(&first, 0, 4).unwrap(), [2; 4]);
     assert_eq!(session.download(&second, 0, 2).unwrap(), [3; 2]);
@@ -396,10 +396,12 @@ fn ready_query_keeps_dma_backing_until_a_hard_completion_fence() {
     fixture.failure(11);
     assert!(ticket.is_ready().unwrap());
     assert_eq!(session.pinned_bytes(), 4);
+    session.trim_pinned_cache();
+    assert_eq!(session.pinned_bytes(), 4, "a query is not a hard DMA fence");
     drop(ticket);
     session.reap().unwrap();
     fixture.failure(0);
-    assert_eq!(session.pinned_bytes(), 0);
+    assert_eq!(session.pinned_bytes(), 4);
     assert_eq!(session.download(&buffer, 0, 4).unwrap(), [1, 2, 3, 4]);
     drop((buffer, session));
     fixture.assert_clean();
@@ -418,10 +420,109 @@ fn async_upload_retains_copied_host_data_and_dropped_device_handles() {
     drop(buffer);
     assert_eq!(fixture.counter(0), 1);
     ticket.wait().unwrap();
-    assert_eq!(session.pinned_bytes(), 0);
+    assert_eq!(session.pinned_bytes(), 4);
     assert_eq!(fixture.counter(0), 0);
     drop(ticket);
     drop(session);
+    fixture.assert_clean();
+}
+
+#[test]
+fn pinned_cache_preserves_pending_sources_and_reuses_completed_storage() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let first = session.allocate(4).unwrap();
+    let second = session.allocate(4).unwrap();
+    let a = session.upload(&first, 0, &[1, 2, 3, 4]).unwrap();
+    let b = session.upload(&second, 0, &[5, 6, 7, 8]).unwrap();
+    assert!(!a.is_ready().unwrap());
+    assert!(!b.is_ready().unwrap());
+    assert_eq!(
+        fixture.counter(9),
+        2,
+        "pending DMA sources must be distinct"
+    );
+    assert_eq!(session.pinned_bytes(), 8);
+    session.synchronize().unwrap();
+    assert_eq!(session.download(&first, 0, 4).unwrap(), [1, 2, 3, 4]);
+    assert_eq!(session.download(&second, 0, 4).unwrap(), [5, 6, 7, 8]);
+    let c = session.upload(&first, 0, &[9, 10, 11, 12]).unwrap();
+    c.wait().unwrap();
+    assert_eq!(session.download(&first, 0, 4).unwrap(), [9, 10, 11, 12]);
+    assert_eq!(fixture.counter(9), 2, "completed backing should be reused");
+    // Completed Tickets may outlive the cache owner without keeping pinned
+    // storage or making the next owner reuse an unfinished transfer.
+    drop(session);
+    assert_eq!(fixture.counter(1), 0);
+    assert!(a.is_ready().unwrap());
+    drop((a, b, c, first, second));
+    fixture.assert_clean();
+}
+
+#[test]
+fn pinned_cache_evicts_idle_capacity_and_preserves_inflight_budget() {
+    let mut fixture = Fixture::new();
+    let session = Session::with_driver(
+        Arc::clone(fixture.driver.as_ref().unwrap()),
+        0,
+        Limits {
+            device_bytes: 16,
+            pinned_bytes: 8,
+            timeout_ms: 100,
+        },
+    )
+    .unwrap();
+    let buffer = session.allocate(16).unwrap();
+    let small = session.upload(&buffer, 0, &[1; 4]).unwrap();
+    small.wait().unwrap();
+    let large = session.upload(&buffer, 0, &[5; 8]).unwrap();
+    large.wait().unwrap();
+    assert_eq!(session.pinned_bytes(), 8);
+    assert_eq!(fixture.counter(1), 1, "idle small buffer must be evicted");
+    assert_eq!(fixture.counter(9), 2);
+    let short = session.upload(&buffer, 0, &[8, 9, 10]).unwrap();
+    session.trim_pinned_cache();
+    assert_eq!(session.pinned_bytes(), 8);
+    assert!(session.upload(&buffer, 8, &[7; 8]).is_err());
+    assert!(session.upload(&buffer, 0, &[0; 9]).is_err());
+    assert_eq!(fixture.counter(9), 2, "failed leases must not allocate");
+    short.wait().unwrap();
+    let changed = session.upload(&buffer, 8, &[7; 8]).unwrap();
+    changed.wait().unwrap();
+    assert_eq!(
+        session.download(&buffer, 0, 8).unwrap(),
+        [8, 9, 10, 5, 5, 5, 5, 5]
+    );
+    assert_eq!(session.download(&buffer, 8, 8).unwrap(), [7; 8]);
+    assert_eq!(fixture.counter(9), 2);
+    session.trim_pinned_cache();
+    assert_eq!(session.pinned_bytes(), 0);
+    drop((small, large, short, changed, buffer, session));
+    fixture.assert_clean();
+}
+
+#[test]
+fn pinned_cache_bounds_metadata_under_many_pending_uploads() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let buffers = (0..65)
+        .map(|_| session.allocate(4).unwrap())
+        .collect::<Vec<_>>();
+    let tickets = buffers
+        .iter()
+        .enumerate()
+        .map(|(i, buffer)| session.upload(buffer, 0, &[i as u8; 4]).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(session.pinned_bytes(), 65 * 4);
+    session.synchronize().unwrap();
+    assert_eq!(session.pinned_bytes(), 64 * 4);
+    for (i, buffer) in buffers.iter().enumerate() {
+        assert_eq!(session.download(buffer, 0, 4).unwrap(), [i as u8; 4]);
+    }
+    assert_eq!(fixture.counter(9), 65);
+    session.trim_pinned_cache();
+    assert_eq!(session.pinned_bytes(), 0);
+    drop((tickets, buffers, session));
     fixture.assert_clean();
 }
 
@@ -467,6 +568,7 @@ fn failed_record_fences_queued_dma_and_failed_creation_rolls_back() {
     let buffer = session.allocate(4).unwrap();
     fixture.failure(4);
     assert!(session.upload(&buffer, 0, &[1, 2, 3, 4]).is_err());
+    session.trim_pinned_cache();
     assert_eq!(fixture.counter(1), 0);
     assert_eq!(fixture.counter(2), 0);
     fixture.failure(0);

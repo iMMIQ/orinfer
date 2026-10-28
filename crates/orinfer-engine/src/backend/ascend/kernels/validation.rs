@@ -170,6 +170,7 @@ pub fn run(device: u32, path: &Path) -> Result<Report> {
         session.synchronize()?;
     }
     session.synchronize()?;
+    session.trim_pinned_cache();
     if session.allocated_bytes() != 0 || session.pinned_bytes() != 0 {
         return Err("AOT validation retained live allocations".into());
     }

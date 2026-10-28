@@ -6,7 +6,7 @@
 typedef struct { void *dst; const void *src; size_t n; int value, kind; void *stream; void *event; } Job;
 typedef struct { void *stream; int ready, capture_supported; } Event;
 static Job jobs[1024];
-static int count, counters[9], failure, stream_creates, capturing;
+static int count, counters[10], failure, stream_creates, capturing;
 static void *current;
 static char aot_contract[4096];
 void test_kernel_contract(const char *text) {
@@ -81,7 +81,7 @@ int aclrtStreamWaitEventWithTimeout(void *s,void *p,int timeout) {
 }
 int aclrtMalloc(void **p,size_t n,int policy) { (void)policy;*p=calloc(1,n);counters[0]++;return 0; }
 int aclrtFree(void *p) { free(p);counters[0]--;return 0; }
-int aclrtMallocHost(void **p,size_t n) { *p=calloc(1,n);counters[1]++;return 0; }
+int aclrtMallocHost(void **p,size_t n) { *p=calloc(1,n);counters[1]++;counters[9]++;return 0; }
 int aclrtFreeHost(void *p) { free(p);counters[1]--;return 0; }
 int aclrtMemcpyAsync(void *dst,size_t max,const void *src,size_t n,int kind,void *stream) {
     (void)kind;if(n>max)return 7;

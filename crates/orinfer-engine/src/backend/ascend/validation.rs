@@ -79,6 +79,7 @@ pub fn run(device: u32) -> Result<Report> {
     ];
     drop(workspace);
     session.synchronize()?;
+    session.trim_pinned_cache();
     if session.allocated_bytes() != 0 || session.pinned_bytes() != 0 {
         return Err("Ascend validation left live allocations".into());
     }

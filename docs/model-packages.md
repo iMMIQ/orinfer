@@ -80,6 +80,8 @@ Ascend 探测共享进程内 ACL 初始化，读取卡数与 SoC，不分配设�
 
 原生设备资源位于 `backend/ascend/runtime.rs`：每会话独占 context、compute/transfer stream，显存与 pinned 内存受独立预算约束；异步提交持有 buffer、主机副本和原生算子资源直到事件完成。跨流等待也持有源事件。完成确认失败时隔离仍可能被 DMA 使用的存储和 context，避免提前释放；释放资源只销毁所属 context，不重置整卡。Ascend 数字错误码进入统一错误分类，执行失败会使 worker 退出而非按普通请求错误继续服务。
 
+Session 缓存最多 64 个 pinned 缓冲，按实际物理容量计入预算。完成事件经过硬等待、缓冲仅由缓存持有时才可复用；需要更大容量时回收空闲项，在途存储继续由完成事件持有。`pinned_bytes()` 包含空闲缓存，`trim_pinned_cache()` 释放空闲容量；原生验收在完成全部工作后清理缓存并检查资源归零。
+
 `backend/ascend/operators.rs` 直接调用 CANN 的 `aclnnGroupedMatmulV5`，使用 ND packed signed INT4、UINT64 channel scales、FP32 assist/token scales 及 BF16 输出，支持空专家分组。准备阶段查询 workspace 并显式启用 repeatable executor，执行阶段复用准备结果；同一 compute stream 上的串行计划可共享 workspace，分支并行需要独立存储。Graph 持有稳定地址和原生计划直至最后一次重放完成。运行时通过动态库加载 CANN，无 PyTorch/ATen 依赖。
 
 ```bash
