@@ -40,12 +40,37 @@ def selected_mask(rows, length, selected=512, explicit_sync=False, store_unroll=
     return main.with_attr("orinfer.explicit_sync", True) if explicit_sync else main
 
 
-def qk(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512, windowed=True):
+def qk(
+    rows,
+    capacity,
+    ratio=2,
+    compressed=True,
+    heads=8,
+    dimension=512,
+    windowed=True,
+    live_tiles=False,
+    key_splits=1,
+):
     long_length = capacity // ratio
     if capacity % 256 or ratio not in (1, 2) or heads != 8 or dimension != 512:
         raise ValueError("Packed prefill QK requires C%256=0, ratio=1/2 and H8/D512")
+    if key_splits not in (1, 2, 4, 8):
+        raise ValueError("QK key partitions must be 1/2/4/8")
     length = capacity + (long_length if compressed else 0)
     tiles = length // 128
+    query_tiles = T.ceildiv(rows * heads, 128)
+    grid = query_tiles * (key_splits if live_tiles else tiles)
+
+    @T.macro
+    def score_tile(query, swa, long_kv, scores, a, b, c, first, key, valid):
+        for k in T.serial(dimension // 128):
+            T.copy(query[first : first + valid, k * 128 : (k + 1) * 128], a[:valid, :])
+            if key < capacity:
+                T.copy(swa[key : key + 128, k * 128 : (k + 1) * 128], b)
+            else:
+                T.copy(long_kv[key - capacity : key - capacity + 128, k * 128 : (k + 1) * 128], b)
+            T.gemm_v0(a, b, c, transpose_B=True, init=(k == 0))
+        T.copy(c[:valid, :], scores[first : first + valid, key : key + 128])
 
     @T.prim_func
     def main(
@@ -55,34 +80,54 @@ def qk(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512, windowe
         positions: T.Tensor((rows,), "int32"),
         scores: T.Tensor((rows * heads, length), "float32"),
     ):
-        with T.Kernel(T.ceildiv(rows * heads, 128) * tiles, is_npu=True) as (cid, vid):
-            first, key = cid // tiles * 128, cid % tiles * 128
+        with T.Kernel(grid, is_npu=True) as (cid, vid):
             with T.Scope("C"):
                 a = T.alloc_L1((128, 128), "bfloat16")
                 b = T.alloc_L1((128, 128), "bfloat16")
                 c = T.alloc_L0C((128, 128), "float32")
-                valid = T.min(128, rows * heads - first)
-                end = (
-                    positions[T.min(rows - 1, (first + 127) // heads)] + 1
-                    if windowed
-                    else positions[rows - 1] + 1
-                )
-                begin = positions[first // heads] - 127 if windowed else 0
-                live = T.if_then_else(key < capacity, end, capacity + end // ratio)
-                if key < live and (key >= capacity or key + 128 > begin):
-                    for k in T.serial(dimension // 128):
-                        T.copy(query[first : first + valid, k * 128 : (k + 1) * 128], a[:valid, :])
-                        if key < capacity:
-                            T.copy(swa[key : key + 128, k * 128 : (k + 1) * 128], b)
-                        else:
-                            T.copy(
-                                long_kv[
-                                    key - capacity : key - capacity + 128, k * 128 : (k + 1) * 128
-                                ],
-                                b,
-                            )
-                        T.gemm_v0(a, b, c, transpose_B=True, init=(k == 0))
-                    T.copy(c[:valid, :], scores[first : first + valid, key : key + 128])
+                if live_tiles:
+                    logical = cid // key_splits
+                    half = T.ceildiv(query_tiles, 2)
+                    # Fold early and late query blocks together to balance the
+                    # causal prefix work across bounded physical grids.
+                    group = T.if_then_else(
+                        logical < half, logical, query_tiles - 1 - (logical - half)
+                    )
+                    first = group * 128
+                    valid = T.min(128, rows * heads - first)
+                    end = (
+                        positions[T.min(rows - 1, (first + 127) // heads)] + 1
+                        if windowed
+                        else positions[rows - 1] + 1
+                    )
+                    begin = T.max(0, (positions[first // heads] - 127) // 128) if windowed else 0
+                    swa_tiles = T.ceildiv(end, 128) - begin
+                    long_tiles = T.ceildiv(end // ratio, 128) if compressed else 0
+                    active = swa_tiles + long_tiles
+                    chunk = T.ceildiv(active, key_splits)
+                    start_tile = (cid % key_splits) * chunk
+                    for tile in T.serial(
+                        start_tile,
+                        T.max(start_tile, T.min(active, (cid % key_splits + 1) * chunk)),
+                    ):
+                        key = T.if_then_else(
+                            tile < swa_tiles,
+                            (begin + tile) * 128,
+                            capacity + (tile - swa_tiles) * 128,
+                        )
+                        score_tile(query, swa, long_kv, scores, a, b, c, first, key, valid)
+                else:
+                    first, key = cid // tiles * 128, cid % tiles * 128
+                    valid = T.min(128, rows * heads - first)
+                    end = (
+                        positions[T.min(rows - 1, (first + 127) // heads)] + 1
+                        if windowed
+                        else positions[rows - 1] + 1
+                    )
+                    begin = positions[first // heads] - 127 if windowed else 0
+                    live = T.if_then_else(key < capacity, end, capacity + end // ratio)
+                    if key < live and (key >= capacity or key + 128 > begin):
+                        score_tile(query, swa, long_kv, scores, a, b, c, first, key, valid)
 
     return main
 
