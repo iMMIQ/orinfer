@@ -77,6 +77,7 @@ class Strategy:
     compact_attention: bool = False
     batched_rope: bool = False
     active_expert_rows: bool = False
+    vector_prefix: bool = False
 
 
 OPTIMIZED = Strategy(True, True, True, True, True, True)
@@ -1236,7 +1237,7 @@ class Builder:
                 ),
                 (
                     "prefix",
-                    {},
+                    {"scan_rows": rows} if self.strategy.vector_prefix and rows > 1 else {},
                     {"counts": "read", "offsets": "write", "groups": "write", "errors": "scratch"},
                 ),
                 (
@@ -1724,6 +1725,7 @@ def main():
     parser.add_argument("--batched-hc", action="store_true")
     parser.add_argument("--fast-engram", action="store_true")
     parser.add_argument("--compact-attention", action="store_true")
+    parser.add_argument("--vector-prefix", action="store_true")
     parser.add_argument(
         "--parallel-regroup",
         action="store_true",
@@ -1770,6 +1772,8 @@ def main():
         parser.error("fast-engram requires the optimized strategy")
     if args.active_expert_rows and not args.parallel_regroup:
         parser.error("active-expert-rows requires parallel-regroup")
+    if args.vector_prefix and not args.parallel_regroup:
+        parser.error("vector-prefix requires parallel-regroup")
     if args.compact_attention and not args.packed_attention:
         parser.error("compact-attention requires packed-attention")
     torch.set_num_threads(4)
@@ -1814,6 +1818,7 @@ def main():
                 OPTIMIZED,
                 fp32_cube=args.fp32_cube,
                 parallel_regroup=args.parallel_regroup,
+                vector_prefix=args.vector_prefix,
                 packed_attention=args.packed_attention,
                 batched_hc=args.batched_hc,
                 fast_engram=args.fast_engram,

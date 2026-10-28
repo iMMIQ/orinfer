@@ -199,6 +199,8 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 `--hc-reuse-only` 比较 mHC post/pre 的原始临时缓冲和 residual 缓冲复用。原 residual 转为 FP32 后，BF16 缓冲存放各路 post 结果；四路计算完成后，FP32 缓冲承载下一次 pre 的加权结果。该实现保留 BF16 post 边界和四路 FP32 加法顺序，并允许调优 5120 列的完整隐藏行。
 
+`--sinkhorn-only` 选择每组 1/2/4/8/16/32 行的 mHC Sinkhorn 实现。批量版本按 path-major 布局承载独立的 4×4 矩阵，沿用四列行归约、四路列归约和原迭代顺序；UB 别名的跨引擎传输与向量依赖显式同步。候选逐位对照单行实现，并检查动态尾部与改变输入后的 Graph replay。`tools.operators.ascend.validate_sinkhorn --tile-rows N` 另行验证 FP64 参考及重复 Graph。
+
 `tools.model.deepseek_v41.tune_indexer --plan PLAN --output DIR --rows 2048` 对因果索引器联合选择 query 行块与 key 列块，输出计划名增加 `-indexer-tuned`。它复用公共候选、测量和汇总选择组件，以原逐头顺序为参考，保持 INT32 点积、FP16 权重缩放和 FP32 累加顺序；另检查短尾、上下文末端及改变输入后的 Graph replay。`--compile-only` 可通过 `run.sh --without-devices` 预编译候选，实际选择仍须设备测量。
 
 `tune_indexer --mask-only` 在既定行列块下比较标量与向量因果掩码，以逐位输出一致和设备测量选择实现。向量掩码保留原逐头求和顺序，支持部分 key 块及全掩蔽行。
@@ -206,6 +208,8 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 `--fast-engram` 为动态 prefill 启用批量 32 阶蝶形旋转。构建器要求 checkpoint 的旋转块恰为标准顺序、统一幅值、带行符号的 Walsh 矩阵；不匹配时构建失败。计算读取原始 FP32 系数，保留输入乘系数与输出 FP32 边界。`validate_rotation` 检查原 bank、FP64 参考误差、动态尾部和改变输入后的 Graph replay；单行 decode 保留通用旋转。
 
 `--parallel-regroup` 为 prefill 生成稳定的分块专家分组：每个 32-token 块按路由位置排序，再计算专家与块的前缀和，写回 gather 和 restore。专家、token、路由 lane 的顺序与串行扫描一致；六个有效路由之外的 padding 及最后一个块中超出真实 token 行数的位置均不参与分组。`tools.operators.ascend.validate_regroup --base 0` 覆盖 expert 0 的短尾，默认的 `--base 144` 覆盖中间 rank；验证包含重复路由、空专家、异常索引和改变输入后的 Graph replay。
+
+`--vector-prefix` 在 `--parallel-regroup` 上为动态 prefill 启用有界向量前缀和。扫描容量由 packet 的行数上限固定，计数及其中间和不超过 6×4096，FP32 表示保持整数精确性；单行 decode 保留原扫描。`validate_regroup --vector-prefix` 验证完整分组，`tools.operators.ascend.validate_prefix` 覆盖 4096 行上限、分组 padding、错误标志、未写尾部和改变输入后的 Graph replay。
 
 实验参数 `--fp32-cube` 将 prefill 的敏感投影改为三个 BF16 分量的 Cube 乘积，保留 FP32 partial 和原有归约边界。权重分量离线准备，路由输入分量由设备生成；原始 W4 专家 bank 保持单份。该路径改变浮点累加顺序，启用前需单独比较任务质量、teacher-forced 概率和状态。默认继续使用原 FP32 投影。
 

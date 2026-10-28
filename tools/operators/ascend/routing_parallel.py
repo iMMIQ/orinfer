@@ -108,7 +108,9 @@ def local(rows, base=0, experts=48, selected=6, chunk=32):
     return main
 
 
-def prefix(rows, experts=48, selected=6, chunk=32, pad_last=False):
+def prefix(rows, experts=48, selected=6, chunk=32, pad_last=False, scan_rows=0):
+    if scan_rows:
+        return _vector_prefix(rows, experts, selected, chunk, pad_last, scan_rows)
     chunks = T.ceildiv(rows, chunk)
 
     @T.prim_func
@@ -131,6 +133,97 @@ def prefix(rows, experts=48, selected=6, chunk=32, pad_last=False):
             for row in T.serial(1, rows):
                 if errors[row] != 0:
                     errors[0] = 1
+
+    return main
+
+
+def _vector_prefix(rows, experts, selected, chunk, pad_last, scan_rows):
+    """Exact bounded scan; each nonnegative routing count is at most six per token."""
+    if not 1 <= scan_rows <= 4096 or experts != 48 or selected != 6 or chunk != 32:
+        raise ValueError("Vector regroup scan requires E48/top6/chunk32 and at most 4096 rows")
+    chunks = T.ceildiv(rows, chunk)
+    width = ((experts * ((scan_rows + chunk - 1) // chunk) + 63) // 64) * 64
+    steps = (width - 1).bit_length()
+
+    @T.prim_func
+    def main(
+        counts: T.Tensor((experts * chunks,), "int32"),
+        offsets: T.Tensor((experts * chunks,), "int32"),
+        groups: T.Tensor((experts,), "int64"),
+        errors: T.Tensor((rows + 1,), "int32"),
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, vid):
+            values = T.alloc_ub((1, width), "float32")
+            shifted = T.alloc_ub((1, width), "float32")
+            lanes = T.alloc_ub((1, width), "float32")
+            work = T.alloc_ub((width,), "int32")
+            addresses = T.alloc_ub((width,), "uint32")
+            mask = T.alloc_ub((width // 8,), "uint8")
+            group_values = T.alloc_ub((experts,), "int64")
+            summary = T.alloc_ub((8,), "int32")
+            total = T.alloc_ub((8,), "int32")
+            maximum = T.alloc_ub((1, 1), "float32")
+            if vid == 0:
+                T.tile.fill(work, 0)
+                T.copy(counts[: experts * chunks], work[: experts * chunks])
+                T.tile.cast(values, work, "CAST_NONE", width)
+                # All intermediate sums are integers <= 6*4096, exactly
+                # representable in FP32. Zero padding cannot create routes.
+                for step in T.serial(steps):
+                    distance = T.shift_left(1, step)
+                    T.tile.createvecindex(lanes, 0.0)
+                    T.tile.add(lanes, lanes, -T.cast(distance, "float32"))
+                    T.tile.max(lanes, lanes, 0.0)
+                    T.tile.mul(lanes, lanes, 4.0)
+                    T.tile.cast(work, lanes, "CAST_RINT", width)
+                    T.reinterpretcast(addresses, work, "uint32_t")
+                    T.tile.gather(shifted, values, addresses, 0)
+                    T.tile.createvecindex(lanes, 0.0)
+                    T.tile.compare(mask, lanes, T.cast(distance, "float32"), "GE")
+                    T.tile.select(shifted, mask, shifted, 0.0, "VSEL_TENSOR_SCALAR_MODE")
+                    T.tile.add(values, values, shifted)
+                T.set_flag("V", "S", 6)
+                T.wait_flag("V", "S", 6)
+                total[0] = T.cast(values[0, experts * chunks - 1], "int32")
+                for expert in T.serial(experts):
+                    group_values[expert] = T.cast(values[0, (expert + 1) * chunks - 1], "int64")
+                    if expert > 0:
+                        group_values[expert] = group_values[expert] - T.cast(
+                            values[0, expert * chunks - 1], "int64"
+                        )
+                if pad_last:
+                    group_values[experts - 1] = (
+                        group_values[experts - 1] + rows * selected - total[0]
+                    )
+                T.set_flag("S", "MTE3", 6)
+                T.wait_flag("S", "MTE3", 6)
+                T.copy(group_values, groups)
+                T.copy(total[:1], errors[rows : rows + 1])
+                T.copy(counts[: experts * chunks], work[: experts * chunks])
+                T.tile.cast(lanes, work, "CAST_NONE", width)
+                T.tile.sub(values, values, lanes)
+                T.tile.cast(work, values, "CAST_RINT", width)
+                T.copy(work[: experts * chunks], offsets[: experts * chunks])
+                T.set_flag("MTE3", "V", 7)
+                T.wait_flag("MTE3", "V", 7)
+                T.tile.fill(work, 0)
+                T.copy(errors[:rows], work[:rows])
+                T.set_flag("MTE2", "S", 6)
+                T.wait_flag("MTE2", "S", 6)
+                summary[0] = work[0]
+                work[0] = 0
+                T.set_flag("S", "V", 6)
+                T.wait_flag("S", "V", 6)
+                T.tile.cast(lanes, work, "CAST_NONE", width)
+                T.tile.abs(lanes, lanes)
+                T.reduce_max(lanes, maximum, dim=1)
+                T.set_flag("V", "S", 6)
+                T.wait_flag("V", "S", 6)
+                if maximum[0, 0] != 0.0:
+                    summary[0] = 1
+                T.set_flag("S", "MTE3", 6)
+                T.wait_flag("S", "MTE3", 6)
+                T.copy(summary[:1], errors[:1])
 
     return main
 

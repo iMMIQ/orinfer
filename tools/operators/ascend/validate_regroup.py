@@ -13,6 +13,7 @@ def main():
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--base", type=int, default=144, choices=range(0, 384, 48))
     p.add_argument("--compile-only", action="store_true")
+    p.add_argument("--vector-prefix", action="store_true")
     args = p.parse_args()
     import torch
     import torch_npu  # noqa: F401
@@ -60,7 +61,11 @@ def main():
     for name, params, names in [
         ("clear", dict(experts=384), ["indices", "gather", "restore", "errors"]),
         ("local", dict(base=base, experts=experts), ["indices", "positions", "counts"]),
-        ("prefix", dict(experts=experts), ["counts", "offsets", "groups", "errors"]),
+        (
+            "prefix",
+            dict(experts=experts, scan_rows=capacity if args.vector_prefix else 0),
+            ["counts", "offsets", "groups", "errors"],
+        ),
         ("pack", dict(experts=experts), ["positions", "counts", "offsets", "gather"]),
         ("restore", dict(base=base, experts=experts), ["indices", "offsets", "restore"]),
     ]:

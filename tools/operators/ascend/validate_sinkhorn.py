@@ -11,6 +11,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", type=int, default=7)
+    p.add_argument("--tile-rows", type=int, default=1)
+    p.add_argument("--compile-only", action="store_true")
     args = p.parse_args()
     import torch
     import torch_npu  # noqa: F401
@@ -21,14 +23,12 @@ def main():
 
     torch.set_num_threads(4)
     torch.manual_seed(20261002)
-    torch.npu.set_device(args.device)
+    if not args.compile_only:
+        torch.npu.set_device(args.device)
     capacity = 2049
     inputs = [torch.randn(capacity, 32) * 4, torch.randn(8), torch.randn(32)]
-    tensors = [v.npu() for v in inputs]
-    outputs = [torch.empty(capacity + 1, w, device="npu") for w in (8, 8, 16)]
-    tensors.extend(outputs)
     path = compile_kernel(
-        mhc_split_sinkhorn(row_count(capacity, True)),
+        mhc_split_sinkhorn(row_count(capacity, True), tile_rows=args.tile_rows),
         "vector.mhc_split_sinkhorn",
         [
             operand("mixes", "f32", [capacity, 32]),
@@ -38,10 +38,15 @@ def main():
             operand("post", "f32", [capacity, 8], "write"),
             operand("combination", "f32", [capacity, 16], "write"),
         ],
-        dict(rows=capacity),
+        dict(rows=capacity, tile_rows=args.tile_rows),
         args.output / "cache",
         row_capacity=capacity,
     )
+    if args.compile_only:
+        return
+    tensors = [v.npu() for v in inputs]
+    outputs = [torch.empty(capacity + 1, w, device="npu") for w in (8, 8, 16)]
+    tensors.extend(outputs)
     lib = ctypes.CDLL(str(path.parent / "kernel.so"))
     call = lib.orinfer_ascend_kernel_v2
     call.argtypes = [

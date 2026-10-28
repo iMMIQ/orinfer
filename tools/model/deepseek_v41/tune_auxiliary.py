@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--split-only", action="store_true")
     parser.add_argument("--convert-only", action="store_true")
     parser.add_argument("--hc-reuse-only", action="store_true")
+    parser.add_argument("--sinkhorn-only", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     args = parser.parse_args()
@@ -32,6 +33,7 @@ def main():
                 args.split_only,
                 args.convert_only,
                 args.hc_reuse_only,
+                args.sinkhorn_only,
             )
         )
         > 1
@@ -79,11 +81,14 @@ def main():
                 "moe.combine",
                 "floating.split",
                 "model_ops.convert",
+                "vector.mhc_split_sinkhorn",
             ):
                 continue
             if (kind == "floating.split") != args.split_only:
                 continue
             if (kind == "model_ops.convert") != args.convert_only:
+                continue
+            if (kind == "vector.mhc_split_sinkhorn") != args.sinkhorn_only:
                 continue
             if kind == "model_ops.convert" and manifest["parameters"]["width"] < 16:
                 continue
@@ -98,7 +103,10 @@ def main():
                 continue
             capacity = params.pop("_row_capacity")
             grid_limit = params.pop("_grid_limit", 64)
-            if kind in ("floating.split", "model_ops.convert"):
+            if kind == "vector.mhc_split_sinkhorn":
+                configs = [dict(tile_rows=r) for r in (1, 2, 4, 8, 16, 32)]
+                factory = vector.mhc_split_sinkhorn
+            elif kind in ("floating.split", "model_ops.convert"):
                 configs = [dict(tile=t) for t in (256, 512, 1024, 1280, 2560, 5120)]
                 factory = floating.split if kind == "floating.split" else model_ops.convert
             elif kind == "moe.combine":
