@@ -18,7 +18,10 @@ def main():
     parser.add_argument("--rows", type=int, nargs="+", default=[128, 512, 2048])
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--mask-only", action="store_true")
+    parser.add_argument("--vector-only", action="store_true")
     args = parser.parse_args()
+    if args.mask_only and args.vector_only:
+        parser.error("Choose one indexer operator filter")
     args.output.mkdir(parents=True, exist_ok=True)
     import torch
     import torch_npu  # noqa: F401
@@ -66,6 +69,21 @@ def main():
                     vector_mask=False,
                 )
                 configs = [baseline, dict(baseline, vector_mask=True)]
+            if args.vector_only:
+                baseline = dict(
+                    direct_sum=params.get("direct_sum", False),
+                    prefetch_inputs=params.get("prefetch_inputs", False),
+                )
+                configs = [baseline] + [
+                    dict(direct_sum=direct, prefetch_inputs=prefetch)
+                    for direct, prefetch in (
+                        (False, False),
+                        (True, False),
+                        (False, True),
+                        (True, True),
+                    )
+                    if dict(direct_sum=direct, prefetch_inputs=prefetch) != baseline
+                ]
 
             def build(config):
                 parameters = dict(params, **config)

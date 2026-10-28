@@ -15,6 +15,8 @@ def main():
     p.add_argument("--tile-rows", type=int, default=1)
     p.add_argument("--tile-s", type=int, default=64)
     p.add_argument("--vector-mask", action="store_true")
+    p.add_argument("--direct-sum", action="store_true")
+    p.add_argument("--prefetch-inputs", action="store_true")
     p.add_argument("--lengths", type=int, nargs="+", default=[35, 128])
     args = p.parse_args()
     import torch
@@ -38,6 +40,8 @@ def main():
             tile_s=args.tile_s,
             tile_rows=args.tile_rows,
             vector_mask=args.vector_mask,
+            direct_sum=args.direct_sum,
+            prefetch_inputs=args.prefetch_inputs,
         )
         shapes = [
             ("query", "i8", [capacity, 32, 128], "read"),
@@ -61,6 +65,8 @@ def main():
             tile_s=args.tile_s,
             tile_rows=args.tile_rows,
             vector_mask=args.vector_mask,
+            direct_sum=args.direct_sum,
+            prefetch_inputs=args.prefetch_inputs,
         )
         path = compile_kernel(
             function,
@@ -98,6 +104,8 @@ def main():
         entry.restype = ctypes.c_int32
         pointers = (ctypes.c_void_p * len(tensors))(*[t.data_ptr() for t in tensors])
         for rows in (1, 2, 17, 127, 128, 129):
+            inputs[5] = ids.clone()
+            tensors[5].copy_(inputs[5])
 
             def run():
                 status = entry(
@@ -122,7 +130,17 @@ def main():
             tensors[0].copy_(inputs[0])
             graph.replay()
             check()
-            reports.append(dict(length=length, rows=rows, changed_input_graph=True))
+            inputs[1].mul_(0.5)
+            inputs[3].mul_(1.25)
+            inputs[4].neg_()
+            inputs[5] = torch.where(inputs[5] < 7, inputs[5], -1)
+            for slot in (1, 3, 4, 5):
+                tensors[slot].copy_(inputs[slot])
+            graph.replay()
+            check()
+            reports.append(
+                dict(length=length, rows=rows, changed_input_graph=True, changed_scales_mask=True)
+            )
             print(reports[-1], flush=True)
     atomic_json(args.output / "validation.json", reports)
 

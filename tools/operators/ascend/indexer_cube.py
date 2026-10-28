@@ -12,6 +12,8 @@ def causal_logits(
     vector_scales=True,
     tile_rows=1,
     vector_mask=False,
+    direct_sum=False,
+    prefetch_inputs=False,
 ):
     if heads != 32 or dimension != 128 or tile_s not in (32, 64, 128):
         raise ValueError("Causal index Cube requires H32/D128 and aligned key tiles")
@@ -86,15 +88,23 @@ def causal_logits(
                                     ],
                                     raw,
                                 )
+                                if prefetch_inputs:
+                                    T.copy(query_scale[row, :], qs_half)
+                                    T.copy(weights[row, :], w_bf)
+                                    T.copy(key_scale[column : column + valid], ks_half[:valid])
+                                    T.copy(indices[row, column : column + valid], ids[:valid])
                                 T.tile.cast(dots, raw, "CAST_RINT", heads * lanes)
-                                T.copy(query_scale[row, :], qs_half)
+                                if not prefetch_inputs:
+                                    T.copy(query_scale[row, :], qs_half)
                                 T.tile.cast(qs, qs_half, "CAST_NONE", heads)
-                                T.copy(weights[row, :], w_bf)
+                                if not prefetch_inputs:
+                                    T.copy(weights[row, :], w_bf)
                                 T.tile.cast(w, w_bf, "CAST_NONE", heads)
                                 T.tile.mul(w, w, factor)
                                 T.tile.cast(w_half, w, "CAST_RINT", heads)
                                 T.tile.cast(w, w_half, "CAST_NONE", heads)
-                                T.copy(key_scale[column : column + valid], ks_half[:valid])
+                                if not prefetch_inputs:
+                                    T.copy(key_scale[column : column + valid], ks_half[:valid])
                                 T.tile.cast(ks, ks_half, "CAST_NONE", lanes)
                                 T.tile.fill(total, 0.0)
                                 if vector_scales:
@@ -106,14 +116,18 @@ def causal_logits(
                                     T.tile.broadcast(expanded, w)
                                     T.tile.mul(dots, dots, expanded)
                                 for head in T.serial(heads):
-                                    T.copy(dots[head : head + 1, :], partial)
-                                    if not vector_scales:
-                                        T.tile.max(partial, partial, 0.0)
-                                        T.tile.mul(partial, partial, qs[head, 0])
-                                        T.tile.mul(partial, partial, ks)
-                                        T.tile.mul(partial, partial, w[head, 0])
-                                    T.tile.add(total, total, partial)
-                                T.copy(indices[row, column : column + valid], ids[:valid])
+                                    if direct_sum and vector_scales:
+                                        T.tile.add(total, total, dots[head : head + 1, :])
+                                    else:
+                                        T.copy(dots[head : head + 1, :], partial)
+                                        if not vector_scales:
+                                            T.tile.max(partial, partial, 0.0)
+                                            T.tile.mul(partial, partial, qs[head, 0])
+                                            T.tile.mul(partial, partial, ks)
+                                            T.tile.mul(partial, partial, w[head, 0])
+                                        T.tile.add(total, total, partial)
+                                if not prefetch_inputs:
+                                    T.copy(indices[row, column : column + valid], ids[:valid])
                                 if vector_mask:
                                     T.tile.cast(partial, ids, "CAST_NONE", lanes)
                                     T.tile.compare(mask, partial, 0.0, "GE")

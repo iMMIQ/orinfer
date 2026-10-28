@@ -207,6 +207,8 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 `tune_auxiliary --quantize-only` 为不超过 256 列的动态量化比较当前行块与 8／16／32 行候选，保持原 FP32 除法残差修正、scale 位拆分及 INT8 舍入。query 的 32 个 head 按物理行数 `32*m` 参与编译和范围检查，ABI 仍接收实际 packet 行数 `m`。FP16 scale 下限从精确的 FP16 值转换，避免固定编译器截短 FP32 常量；静态 query 量化同步重建该下限，保留逐行调度。`tools.operators.ascend.validate_quantize` 独立以 FP64 除法检查 INT8 码和 scale，覆盖 FP16／FP32 scale、零值、小值、半整数、最小次正规 scale、非对齐尾部和改输入后的 Graph replay。可先用 `--compile-only` 离线预编译候选，再进行设备检查与完整请求验收。
 
+`tune_indexer --vector-only` 保留输入计划的 query／key tile、scale 和 mask 策略，比较直接读取 UB head 切片累加及提前加载 scale、权重和索引的组合。32 个 head 保持顺序执行 FP32 加法；当前配置参与基线测量，多种行数汇总代价后选择发布候选。`validate_indexer --direct-sum --prefetch-inputs` 以独立参考检查该组合，并在同一 Graph 中改变 query、scale、权重和因果 mask。生产选择和完整请求验收沿用离线调优流程。
+
 `tools.model.deepseek_v41.tune_softmax` 为 compact、live-bucket prefill 比较原 softmax 与共享 head 的实现。`--plan`、`--output`、`--rows` 和 `--compile-only` 沿用离线调优约定；默认 `--head-tiles 4 2 1` 分别用于结束位置不超过 2048、不超过 4096 和更长的前缀桶。各桶发布独立内核并在设备上检查位置，互斥写入同一概率缓冲，保留 FP32 倒数、归约和 BF16 概率边界。测量在前缀起点 0 汇总指定长度的代价；数值检查覆盖上下文末端，并在同一 Graph 中改变分数、位置、选择 mask 和前缀桶。候选通过逐位一致和尾部检查后，按测量结果发布原实现或整组分桶实现，输出计划名增加 `-softmax-tuned`。更改执行计划后仍需完整模型请求验收。
 
 `--sinkhorn-only` 选择每组 1/2/4/8/16/32 行的 mHC Sinkhorn 实现。批量版本按 path-major 布局承载独立的 4×4 矩阵，沿用四列行归约、四路列归约和原迭代顺序；UB 别名的跨引擎传输与向量依赖显式同步。候选逐位对照单行实现，并检查动态尾部与改变输入后的 Graph replay。`tools.operators.ascend.validate_sinkhorn --tile-rows N` 另行验证 FP64 参考及重复 Graph。
