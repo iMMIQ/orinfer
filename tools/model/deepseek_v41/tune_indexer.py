@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--device", type=int, default=7)
     parser.add_argument("--rows", type=int, nargs="+", default=[128, 512, 2048])
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--mask-only", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     import torch
@@ -57,6 +58,14 @@ def main():
                 for m in (1, 2, 4, 8)
                 for n in (64, 128)
             ]
+            if args.mask_only:
+                baseline = dict(
+                    vector_scales=params.get("vector_scales", True),
+                    tile_rows=params.get("tile_rows", 1),
+                    tile_s=params.get("tile_s", 64),
+                    vector_mask=False,
+                )
+                configs = [baseline, dict(baseline, vector_mask=True)]
 
             def build(config):
                 parameters = dict(params, **config)

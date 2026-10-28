@@ -195,7 +195,13 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 辅助投影的宽 N tile 连续写出完整 Cube 结果，并配套发布 `floating.reduce_partials`；归约按生产者的实际布局读取，保留每个 32 列组的八段 FP32 求和。调优检查 partial 的布局还原及配套归约的完整 Graph replay。`--combine-only` 为专家 combine 选择列块，覆盖无效路由、输出尾部及修改输入后的 replay。`--rows` 指定代价汇总长度，`--compile-only` 可提前预编译候选；最终选择仍由设备测量决定。
 
+`tune_auxiliary --split-only` 为 FP32 激活的三分量 BF16 分解选择列块，复用相同的逐次舍入和残差计算。验证按真实行数检查紧凑的三个物理平面、未写尾部与修改输入后的 Graph replay，并逐位对照离线分解结果。`--convert-only` 为逐元素精度转换选择列块，保留 FP32 缩放与目标 dtype 的舍入。
+
+`--hc-reuse-only` 比较 mHC post/pre 的原始临时缓冲和 residual 缓冲复用。原 residual 转为 FP32 后，BF16 缓冲存放各路 post 结果；四路计算完成后，FP32 缓冲承载下一次 pre 的加权结果。该实现保留 BF16 post 边界和四路 FP32 加法顺序，并允许调优 5120 列的完整隐藏行。
+
 `tools.model.deepseek_v41.tune_indexer --plan PLAN --output DIR --rows 2048` 对因果索引器联合选择 query 行块与 key 列块，输出计划名增加 `-indexer-tuned`。它复用公共候选、测量和汇总选择组件，以原逐头顺序为参考，保持 INT32 点积、FP16 权重缩放和 FP32 累加顺序；另检查短尾、上下文末端及改变输入后的 Graph replay。`--compile-only` 可通过 `run.sh --without-devices` 预编译候选，实际选择仍须设备测量。
+
+`tune_indexer --mask-only` 在既定行列块下比较标量与向量因果掩码，以逐位输出一致和设备测量选择实现。向量掩码保留原逐头求和顺序，支持部分 key 块及全掩蔽行。
 
 `--fast-engram` 为动态 prefill 启用批量 32 阶蝶形旋转。构建器要求 checkpoint 的旋转块恰为标准顺序、统一幅值、带行符号的 Walsh 矩阵；不匹配时构建失败。计算读取原始 FP32 系数，保留输入乘系数与输出 FP32 边界。`validate_rotation` 检查原 bank、FP64 参考误差、动态尾部和改变输入后的 Graph replay；单行 decode 保留通用旋转。
 

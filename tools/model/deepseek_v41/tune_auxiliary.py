@@ -18,17 +18,31 @@ def main():
     parser.add_argument("--device", type=int, default=7)
     parser.add_argument("--pipeline-only", action="store_true")
     parser.add_argument("--combine-only", action="store_true")
+    parser.add_argument("--split-only", action="store_true")
+    parser.add_argument("--convert-only", action="store_true")
+    parser.add_argument("--hc-reuse-only", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     args = parser.parse_args()
-    if args.pipeline_only and args.combine_only:
-        parser.error("Choose pipeline-only or combine-only")
+    if (
+        sum(
+            (
+                args.pipeline_only,
+                args.combine_only,
+                args.split_only,
+                args.convert_only,
+                args.hc_reuse_only,
+            )
+        )
+        > 1
+    ):
+        parser.error("Choose one auxiliary operator filter")
     import torch
     import torch_npu  # noqa: F401
     from kernels.model.rows import row_count
     from tools.model.deepseek_v41.floating import bf16_parts
     from tools.model.deepseek_v41.tune import file_hash_bytes, npu_benchmark, read_weight
-    from tools.operators.ascend import dense, floating, moe, vector
+    from tools.operators.ascend import dense, floating, model_ops, moe, vector
     from tools.operators.ascend.build import compile_kernel
 
     torch.set_num_threads(4)
@@ -59,23 +73,44 @@ def main():
             seen.add(step["manifest"])
             manifest = json.loads((base / step["manifest"]).read_text())
             kind = manifest["op"]
-            if kind not in ("vector.mhc_post_pre", "floating.partials", "moe.combine"):
+            if kind not in (
+                "vector.mhc_post_pre",
+                "floating.partials",
+                "moe.combine",
+                "floating.split",
+                "model_ops.convert",
+            ):
+                continue
+            if (kind == "floating.split") != args.split_only:
+                continue
+            if (kind == "model_ops.convert") != args.convert_only:
+                continue
+            if kind == "model_ops.convert" and manifest["parameters"]["width"] < 16:
                 continue
             if args.combine_only and kind != "moe.combine":
                 continue
             if args.pipeline_only and kind != "floating.partials":
+                continue
+            if args.hc_reuse_only and kind != "vector.mhc_post_pre":
                 continue
             params = dict(manifest["parameters"])
             if "_row_capacity" not in params:
                 continue
             capacity = params.pop("_row_capacity")
             grid_limit = params.pop("_grid_limit", 64)
-            if kind == "moe.combine":
+            if kind in ("floating.split", "model_ops.convert"):
+                configs = [dict(tile=t) for t in (256, 512, 1024, 1280, 2560, 5120)]
+                factory = floating.split if kind == "floating.split" else model_ops.convert
+            elif kind == "moe.combine":
                 configs = [dict(tile=t) for t in (256, 512, 1024, 1280, 2560, 5120)]
                 factory = moe.combine
             elif kind == "vector.mhc_post_pre":
                 configs = [dict(tile=t) for t in (256, 512, 1024, 1280, 2560)]
                 factory = vector.mhc_post_pre
+                if args.hc_reuse_only:
+                    configs = [dict(tile=params.get("tile", 256), reuse_residual=False)] + [
+                        dict(tile=t, reuse_residual=True) for t in (1280, 2560, 5120)
+                    ]
             else:
                 configs = [dict(tile_m=t, tile_n=32) for t in (16, 32, 64)]
                 factory = floating.partials
@@ -198,11 +233,17 @@ def main():
             outputs = []
             for spec in manifest["operands"]:
                 shape = list(spec["shape"])
-                dtype = {"bf16": torch.bfloat16, "f32": torch.float32, "i32": torch.int32}[
-                    spec["dtype"]
-                ]
+                dtype = {
+                    "bf16": torch.bfloat16,
+                    "f16": torch.float16,
+                    "f32": torch.float32,
+                    "i32": torch.int32,
+                }[spec["dtype"]]
                 if spec["access"] == "write":
-                    shape[0] += 1
+                    if kind == "floating.split":
+                        shape = [3 * (capacity + 1) * params["width"]]
+                    else:
+                        shape[0] += 1
                     outputs.append(len(tensors))
                 tensors.append(
                     torch.zeros(shape, dtype=dtype, device="npu")
@@ -265,7 +306,8 @@ def main():
                     def check():
                         torch.npu.synchronize()
                         for slot, ref in zip(outputs, expected, strict=True):
-                            actual = tensors[slot][:rows]
+                            count = 3 * rows * params["width"] if kind == "floating.split" else rows
+                            actual = tensors[slot][:count]
                             if kind == "floating.partials":
                                 columns = legal[i].get("tile_n", params.get("tile_n", 32))
                                 actual = (
@@ -279,13 +321,27 @@ def main():
                                 actual,
                                 ref[:rows].reshape(rows, -1)
                                 if kind == "floating.partials"
-                                else ref[:rows],
+                                else ref[:count],
                                 atol=0,
                                 rtol=0,
                             )
-                            assert bool((tensors[slot][rows:] == 17).all()), (
+                            assert bool((tensors[slot][count:] == 17).all()), (
                                 "Auxiliary kernel wrote tail"
                             )
+                            if kind == "floating.split":
+                                reference_parts = (
+                                    torch.from_numpy(bf16_parts(tensors[0][:rows].cpu().numpy()))
+                                    .view(torch.bfloat16)
+                                    .reshape(-1)
+                                )
+                                torch.testing.assert_close(
+                                    actual.cpu(), reference_parts, atol=0, rtol=0
+                                )
+                            if kind == "model_ops.convert":
+                                converted = (
+                                    tensors[0][:rows].cpu().float() * params.get("scale", 1.0)
+                                ).to(actual.dtype)
+                                torch.testing.assert_close(actual.cpu(), converted, atol=0, rtol=0)
 
                     try:
                         run()

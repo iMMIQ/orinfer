@@ -4,7 +4,14 @@ import tilelang.language as T
 
 
 def causal_logits(
-    rows, length, heads=32, dimension=128, tile_s=64, vector_scales=True, tile_rows=1
+    rows,
+    length,
+    heads=32,
+    dimension=128,
+    tile_s=64,
+    vector_scales=True,
+    tile_rows=1,
+    vector_mask=False,
 ):
     if heads != 32 or dimension != 128 or tile_s not in (32, 64, 128):
         raise ValueError("Causal index Cube requires H32/D128 and aligned key tiles")
@@ -62,6 +69,7 @@ def causal_logits(
                 partial = T.alloc_ub((1, lanes), "float32")
                 total = T.alloc_ub((1, lanes), "float32")
                 ids = T.alloc_ub((lanes,), "int32")
+                mask = T.alloc_ub((lanes // 8,), "uint8")
                 expanded = T.alloc_ub((heads, lanes), "float32")
                 column = start + vid * lanes
                 if indices[first + valid_rows - 1, start] >= 0:
@@ -106,9 +114,20 @@ def causal_logits(
                                         T.tile.mul(partial, partial, w[head, 0])
                                     T.tile.add(total, total, partial)
                                 T.copy(indices[row, column : column + valid], ids[:valid])
-                                for lane in T.serial(lanes):
-                                    if ids[lane] < 0:
-                                        total[0, lane] = -T.infinity("float32")
+                                if vector_mask:
+                                    T.tile.cast(partial, ids, "CAST_NONE", lanes)
+                                    T.tile.compare(mask, partial, 0.0, "GE")
+                                    T.tile.select(
+                                        total,
+                                        mask,
+                                        total,
+                                        -T.infinity("float32"),
+                                        "VSEL_TENSOR_SCALAR_MODE",
+                                    )
+                                else:
+                                    for lane in T.serial(lanes):
+                                        if ids[lane] < 0:
+                                            total[0, lane] = -T.infinity("float32")
                                 T.copy(total[0, :valid], out[row, column : column + valid])
                         else:
                             if column < length:

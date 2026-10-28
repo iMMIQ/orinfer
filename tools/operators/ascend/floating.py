@@ -4,8 +4,10 @@ import math
 import tilelang.language as T
 
 
-def split(rows, width):
-    block = math.gcd(width, 256)
+def split(rows, width, tile=256):
+    if tile < 16 or tile > 8192 or tile % 16:
+        raise ValueError("FP32 decomposition tile must be 16-aligned and at most 8192")
+    block = math.gcd(width, tile)
     tiles = width // block
 
     @T.prim_func

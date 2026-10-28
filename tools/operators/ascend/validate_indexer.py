@@ -14,6 +14,7 @@ def main():
     p.add_argument("--compile-only", action="store_true")
     p.add_argument("--tile-rows", type=int, default=1)
     p.add_argument("--tile-s", type=int, default=64)
+    p.add_argument("--vector-mask", action="store_true")
     p.add_argument("--lengths", type=int, nargs="+", default=[35, 128])
     args = p.parse_args()
     import torch
@@ -32,7 +33,11 @@ def main():
     reports = []
     for length in args.lengths:
         parameters = dict(
-            rows=capacity, length=length, tile_s=args.tile_s, tile_rows=args.tile_rows
+            rows=capacity,
+            length=length,
+            tile_s=args.tile_s,
+            tile_rows=args.tile_rows,
+            vector_mask=args.vector_mask,
         )
         shapes = [
             ("query", "i8", [capacity, 32, 128], "read"),
@@ -51,7 +56,11 @@ def main():
         ]
         specs = [operand(*s) for s in shapes]
         function = causal_logits(
-            row_count(capacity, True), length, tile_s=args.tile_s, tile_rows=args.tile_rows
+            row_count(capacity, True),
+            length,
+            tile_s=args.tile_s,
+            tile_rows=args.tile_rows,
+            vector_mask=args.vector_mask,
         )
         path = compile_kernel(
             function,

@@ -445,9 +445,9 @@ def mhc_post(rows, width):
     return main
 
 
-def mhc_post_pre(rows, width, tile=256):
+def mhc_post_pre(rows, width, tile=256, reuse_residual=False):
     """Keep the post BF16 boundary, then collapse using the next pre-mix."""
-    if tile not in (256, 512, 1024, 1280, 2560):
+    if tile not in (256, 512, 1024, 1280, 2560) and not (reuse_residual and tile == 5120):
         raise ValueError("mHC post/pre tile must fit the A2 unified buffer")
     block = math.gcd(width, tile)
     blocks = width // block
@@ -464,40 +464,63 @@ def mhc_post_pre(rows, width, tile=256):
     ):
         with T.Kernel(T.ceildiv(rows, 2) * blocks, is_npu=True) as (cid, vid):
             xb = T.alloc_ub((4, block), "bfloat16")
-            lb = T.alloc_ub((block,), "bfloat16")
+            lb = T.alloc_ub((16 if reuse_residual else block,), "bfloat16")
             x = T.alloc_ub((4, block), "float32")
             l = T.alloc_ub((block,), "float32")
             p = T.alloc_ub((8,), "float32")
             c = T.alloc_ub((16,), "float32")
             temporary = T.alloc_ub((block,), "float32")
             a = T.alloc_ub((block,), "float32")
-            term = T.alloc_ub((block,), "float32")
+            term = T.alloc_ub((16 if reuse_residual else block,), "float32")
             y = T.alloc_ub((block,), "bfloat16")
             weights = T.alloc_ub((8,), "float32")
-            weighted = T.alloc_ub((4, block), "float32")
+            weighted = T.alloc_ub((1, 8) if reuse_residual else (4, block), "float32")
             row, column = cid // blocks * 2 + vid, cid % blocks * block
             if row < rows:
                 T.copy(residual[row, :, column : column + block], xb)
-                T.copy(layer[row, column : column + block], lb)
+                if reuse_residual:
+                    T.copy(layer[row, column : column + block], y)
+                else:
+                    T.copy(layer[row, column : column + block], lb)
                 T.copy(post[row, :], p)
                 T.copy(mix[row, :], weights)
                 T.copy(combination[row, :], c)
                 T.tile.cast(x, xb, "CAST_NONE", 4 * block)
-                T.tile.cast(l, lb, "CAST_NONE", block)
+                if reuse_residual:
+                    T.tile.cast(l, y, "CAST_NONE", block)
+                else:
+                    T.tile.cast(l, lb, "CAST_NONE", block)
                 for path in T.serial(4):
                     T.tile.mul(a, x[0, :], c[path])
                     for source in T.serial(1, 4):
                         T.tile.mul(temporary, x[source, :], c[source * 4 + path])
                         T.tile.add(a, a, temporary)
-                    T.tile.mul(term, l, p[path])
-                    T.tile.add(a, term, a)
-                    T.tile.cast(y, a, "CAST_RINT", block)
-                    T.copy(y, out[row, path, column : column + block])
-                    T.tile.cast(weighted[path, :], y, "CAST_NONE", block)
-                    T.tile.mul(weighted[path, :], weighted[path, :], weights[path])
-                T.tile.add(a, weighted[0, :], weighted[1, :])
-                T.tile.add(a, a, weighted[2, :])
-                T.tile.add(a, a, weighted[3, :])
+                    if reuse_residual:
+                        T.tile.mul(temporary, l, p[path])
+                        T.tile.add(a, temporary, a)
+                        # The input residual is already held in x. Reuse its
+                        # BF16 copy for the rounded post-mix, then reuse x once
+                        # all four paths have consumed the original values.
+                        T.tile.cast(xb[path, :], a, "CAST_RINT", block)
+                        T.copy(xb[path, :], out[row, path, column : column + block])
+                    else:
+                        T.tile.mul(term, l, p[path])
+                        T.tile.add(a, term, a)
+                        T.tile.cast(y, a, "CAST_RINT", block)
+                        T.copy(y, out[row, path, column : column + block])
+                        T.tile.cast(weighted[path, :], y, "CAST_NONE", block)
+                        T.tile.mul(weighted[path, :], weighted[path, :], weights[path])
+                if reuse_residual:
+                    T.tile.cast(x, xb, "CAST_NONE", 4 * block)
+                    for path in T.serial(4):
+                        T.tile.mul(x[path, :], x[path, :], weights[path])
+                    T.tile.add(a, x[0, :], x[1, :])
+                    T.tile.add(a, a, x[2, :])
+                    T.tile.add(a, a, x[3, :])
+                else:
+                    T.tile.add(a, weighted[0, :], weighted[1, :])
+                    T.tile.add(a, a, weighted[2, :])
+                    T.tile.add(a, a, weighted[3, :])
                 T.tile.cast(y, a, "CAST_RINT", block)
                 T.copy(y, collapsed[row, column : column + block])
 

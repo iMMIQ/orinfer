@@ -163,8 +163,10 @@ def norm_quant(rows, width, eps=1e-20):
     return main
 
 
-def convert(rows, width, source_dtype, destination_dtype, scale=1.0):
-    block = math.gcd(width, 256)
+def convert(rows, width, source_dtype, destination_dtype, scale=1.0, tile=256):
+    if tile < 16 or tile > 8192 or tile % 16:
+        raise ValueError("Conversion tile must be 16-aligned and at most 8192")
+    block = math.gcd(width, tile)
     blocks = width // block
 
     @T.prim_func
