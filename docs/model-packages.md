@@ -195,6 +195,8 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 这两个调优入口的 `--pipeline-only` 搜索更大的行块与合法的两级／三级 L1 流水线；辅助投影同时选择 HC 方差计算的行块。候选校验 A2 的 L0A、L0B、L0C 与 L1 容量，并保留 K、FP32 归约及输出舍入边界。投影调优也可读取 `prepare` 后的物理 bank，避免在线权重变换。
 
+整数投影的 `--wide-integer` 比较当前完整配置与 M128/N256 的流水线配置，覆盖输出列数能被 256 整除的 INT8 几何；其余投影沿用输入计划。当前行块、列块、K 块和流水级数共同构成基线，重复调优也保留已有的流水线选择。该选项与 `--pipeline-only` 互斥，选择结果仍需完整模型请求验收。
+
 辅助投影的宽 N tile 连续写出完整 Cube 结果，并配套发布 `floating.reduce_partials`；归约按生产者的实际布局读取，保留每个 32 列组的八段 FP32 求和。调优检查 partial 的布局还原及配套归约的完整 Graph replay。`--combine-only` 为专家 combine 选择列块，覆盖无效路由、输出尾部及修改输入后的 replay。`--rows` 指定代价汇总长度，`--compile-only` 可提前预编译候选；最终选择仍由设备测量决定。
 
 `tune_auxiliary --split-only` 为 FP32 激活的三分量 BF16 分解选择列块，复用相同的逐次舍入和残差计算。验证按真实行数检查紧凑的三个物理平面、未写尾部与修改输入后的 Graph replay，并逐位对照离线分解结果。`--convert-only` 为逐元素精度转换选择列块，保留 FP32 缩放与目标 dtype 的舍入。

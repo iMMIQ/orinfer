@@ -16,6 +16,40 @@ from tools.model.row_selection import aggregate_winner
 from tools.model.tuning import compile_candidates, measure, read_record, record_path
 
 
+def projection_configs(parameters, pipeline_only=False, wide_integer=False):
+    baseline = {
+        key: parameters.get(key, default)
+        for key, default in (
+            ("tile_m", 16),
+            ("tile_n", 64),
+            ("block_k", 128),
+            ("pipeline_stages", 0),
+        )
+    }
+    if wide_integer:
+        configs = [
+            dict(baseline, tile_m=128, tile_n=256, pipeline_stages=s)
+            for s in (0, 2, 3)
+            if s == 0 or parameters["reduction"] // baseline["block_k"] >= s
+        ]
+    elif pipeline_only:
+        configs = [
+            dict(baseline, pipeline_stages=s, tile_m=m)
+            for s in (0, 2, 3)
+            for m in sorted({baseline["tile_m"], 128} | ({256} if parameters["integer"] else set()))
+            if s == 0 or parameters["reduction"] // baseline["block_k"] >= s
+        ]
+    else:
+        configs = [
+            dict(baseline, tile_m=m, tile_n=n, block_k=k)
+            for m in (16, 32, 64)
+            for n in (64, 128)
+            for k in sorted({128, 256, 512, baseline["block_k"]})
+            if parameters["reduction"] % k == 0
+        ]
+    return [baseline] + [c for c in configs if c != baseline]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--plan", type=Path, required=True)
@@ -24,7 +58,13 @@ def main():
     p.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--compile-workers", type=int, default=4)
-    p.add_argument("--pipeline-only", action="store_true")
+    search = p.add_mutually_exclusive_group()
+    search.add_argument("--pipeline-only", action="store_true")
+    search.add_argument(
+        "--wide-integer",
+        action="store_true",
+        help="Compare the current INT8 schedule with M128/N256 and legal pipeline stages",
+    )
     args = p.parse_args()
     if not 1 <= args.compile_workers <= 8:
         p.error("compile workers must be in 1..8")
@@ -59,6 +99,8 @@ def main():
         parameters = dict(manifest["parameters"])
         capacity = parameters.pop("_row_capacity")
         grid_limit = parameters.pop("_grid_limit", 64)
+        if args.wide_integer and (not parameters["integer"] or parameters["output"] % 256):
+            continue
         measured = sorted({r for r in args.rows if 1 <= r <= capacity})
         if not measured:
             raise ValueError("Missing bounded prefill measurements")
@@ -77,31 +119,8 @@ def main():
             if parameters["integer"]
             else None
         )
-        configs = [
-            dict(tile_m=m, tile_n=n, block_k=k)
-            for m in (16, 32, 64)
-            for n in (64, 128)
-            for k in sorted({128, 256, 512, parameters.get("block_k", 128)})
-            if parameters["reduction"] % k == 0
-        ]
-        # Preserve the baseline candidate, including narrow and K=288 operands.
-        baseline = dict(
-            tile_m=parameters.get("tile_m", 16),
-            tile_n=parameters.get("tile_n", 64),
-            block_k=parameters.get("block_k", 128),
-        )
-        if args.pipeline_only:
-            baseline = dict(pipeline_stages=0, tile_m=parameters.get("tile_m", 16))
-            configs = [
-                dict(pipeline_stages=s, tile_m=m)
-                for s in (0, 2, 3)
-                for m in sorted(
-                    {parameters.get("tile_m", 16), 128}
-                    | ({256} if parameters["integer"] else set())
-                )
-                if s == 0 or parameters["reduction"] // parameters.get("block_k", 128) >= s
-            ]
-        configs = [baseline] + [c for c in configs if c != baseline]
+        configs = projection_configs(parameters, args.pipeline_only, args.wide_integer)
+        baseline = configs[0]
 
         def compile_one(config):
             params = dict(parameters, **config)
