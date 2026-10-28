@@ -155,8 +155,8 @@ impl Worker {
             let packet = self
                 .packet_templates
                 .iter()
-                .filter(|p| p.min_rows > 0 && (p.min_rows..=p.rows).contains(&rows))
-                .min_by_key(|p| p.rows)
+                .filter(|p| p.min_rows > 0 && (p.min_rows..=p.dispatch_max()).contains(&rows))
+                .min_by_key(|p| p.dispatch_max())
                 .cloned()
                 .ok_or_else(|| format!("No A2 packet for {rows} rows"))?;
             let base = self.package.clone();

@@ -221,6 +221,10 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 `tune_indexer --mask-only` 在既定行列块下比较标量与向量因果掩码，以逐位输出一致和设备测量选择实现。向量掩码保留原逐头求和顺序，支持部分 key 块及全掩蔽行。
 
+`tools.model.deepseek_v41.shard_indexer --plan PLAN --output PLAN_SHARDED --min-rows 512` 为 TP8 动态 prefill 计划生成交错分行的 indexer 和 TopK 路径，输出与输入位于同一资产目录。每卡打包 `rank + 8*i` 行，复用原 INT32 点积和逐头 FP32 累加，再通过固定大小的 INT32 AllGather 恢复全局选中索引；权重和请求私有状态保持原布局。局部行容量为 packet 容量的八分之一，尾部填充行的选择长度为零。较短片段复用原 packet 的物理容量和算子，以独立的 `min_rows`／`max_rows` 范围选择；加载时拒绝间断或重叠的范围。局部算子显式声明固定行数，AOT 容量和逐操作数字节数继续严格匹配。
+
+上述工具可通过 `run.sh --without-devices` 离线编译。`tools.operators.ascend.validate_sharded_indexer --baseline PLAN --plan PLAN_SHARDED --output DIR` 在设备上逐卡比较原始分数、TopK、填充行和索引重排，以独立参考抽查分数，并验证修改输入后的 Graph replay。完整请求另用 `bench-ascend` 验证分块、缓存状态、输出与 TPS。
+
 `--fast-engram` 为动态 prefill 启用批量 32 阶蝶形旋转。构建器要求 checkpoint 的旋转块恰为标准顺序、统一幅值、带行符号的 Walsh 矩阵；不匹配时构建失败。计算读取原始 FP32 系数，保留输入乘系数与输出 FP32 边界。`validate_rotation` 检查原 bank、FP64 参考误差、动态尾部和改变输入后的 Graph replay；单行 decode 保留通用旋转。
 
 `--parallel-regroup` 为 prefill 生成稳定的分块专家分组：每个 32-token 块按路由位置排序，再计算专家与块的前缀和，写回 gather 和 restore。专家、token、路由 lane 的顺序与串行扫描一致；六个有效路由之外的 padding 及最后一个块中超出真实 token 行数的位置均不参与分组。`tools.operators.ascend.validate_regroup --base 0` 覆盖 expert 0 的短尾，默认的 `--base 144` 覆盖中间 rank；验证包含重复路由、空专家、异常索引和改变输入后的 Graph replay。

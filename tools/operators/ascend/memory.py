@@ -5,6 +5,75 @@ import math
 import tilelang.language as T
 
 
+def partition_rows(rows, count, width, first, stride=8, dtype="int32", repeat_last=False):
+    """Pack interleaved rows; pad data with zero or repeat the last source row.
+
+    Repeated index rows preserve the causal indexer's monotone tile guard.
+    Padded rows have zero selection lengths and never contribute to TopK.
+    """
+    if count < 1 or width < 1 or stride < 1 or not 0 <= first < stride:
+        raise ValueError("Invalid interleaved row partition")
+    block = math.gcd(width, 256)
+    blocks = width // block
+
+    @T.prim_func
+    def main(
+        source: T.Tensor((rows, width), dtype),
+        out: T.Tensor((count, width), dtype),
+    ):
+        with T.Kernel(T.ceildiv(count, 2) * blocks, is_npu=True) as (cid, vid):
+            data = T.alloc_ub((block,), dtype)
+            zeros = T.alloc_ub((max(1, block // 2),), "int16")
+            row = (cid // blocks) * 2 + vid
+            column = (cid % blocks) * block
+            index = first + row * stride
+            if row < count:
+                if repeat_last:
+                    index = T.min(index, rows - 1)
+                    T.copy(source[index, column : column + block], data)
+                else:
+                    if dtype == "int8":
+                        T.reinterpretcast(data, zeros, "int8_t")
+                        T.tile.fill(zeros, 0)
+                    elif block < 8:
+                        for lane in T.serial(block):
+                            data[lane] = 0
+                    else:
+                        T.tile.fill(data, 0)
+                    if index < rows:
+                        T.copy(source[index, column : column + block], data)
+                T.copy(data, out[row, column : column + block])
+                # The INT8 view aliases the INT16 zero-fill buffer. Preserve
+                # its lifetime across the bounded grid's next loop iteration.
+                T.pipe_barrier("ALL")
+
+    return main
+
+
+def interleave_rows(rows, count, width, ranks=8, dtype="int32"):
+    """Restore global row order after gathering equal interleaved partitions."""
+    if min(count, width, ranks) < 1:
+        raise ValueError("Invalid interleaved gather geometry")
+    block = math.gcd(width, 256)
+    blocks = width // block
+
+    @T.prim_func
+    def main(
+        source: T.Tensor((ranks * count, width), dtype),
+        out: T.Tensor((rows, width), dtype),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2) * blocks, is_npu=True) as (cid, vid):
+            data = T.alloc_ub((block,), dtype)
+            row = cid // blocks * 2 + vid
+            column = cid % blocks * block
+            if row < rows:
+                index = row % ranks * count + row // ranks
+                T.copy(source[index, column : column + block], data)
+                T.copy(data, out[row, column : column + block])
+
+    return main
+
+
 def last_row(rows, width):
     """Copy the actual last row from a capacity-backed dynamic activation."""
     block = math.gcd(width, 256)

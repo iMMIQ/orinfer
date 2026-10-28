@@ -2,6 +2,8 @@
 mod affinity;
 mod benchmark;
 mod branches;
+#[cfg(test)]
+mod dispatch_tests;
 mod packet;
 mod weights;
 
@@ -69,6 +71,8 @@ struct Packet {
     rows: usize,
     #[serde(default)]
     min_rows: usize,
+    #[serde(default)]
+    max_rows: Option<usize>,
     coordinates: packet::Coordinates,
     body: Vec<Instruction>,
     head: Vec<Instruction>,
@@ -79,9 +83,12 @@ struct Packet {
     vocab_first: u32,
 }
 impl Packet {
+    fn dispatch_max(&self) -> usize {
+        self.max_rows.unwrap_or(self.rows)
+    }
     fn prefill_plan(&self) -> orinfer_model_sdk::model::PrefillPlan {
         orinfer_model_sdk::model::PrefillPlan {
-            chunk_tokens: self.rows,
+            chunk_tokens: self.dispatch_max(),
             min_tokens: self.min_rows,
             prefill_program: "prefill".into(),
             head_program: "head".into(),
@@ -101,10 +108,16 @@ enum Instruction {
         destination: String,
         elements: u64,
         fp32: bool,
+        #[serde(default)]
+        int32: bool,
+        #[serde(default)]
+        fixed_rows: bool,
     },
     Kernel {
         manifest: String,
         buffers: Vec<String>,
+        #[serde(default)]
+        fixed_rows: Option<usize>,
     },
     Reduce {
         source: String,
@@ -575,13 +588,12 @@ impl Worker {
             steps: BTreeMap::new(),
         };
         for packet in rank.packets {
-            let body =
-                worker.compile(&packet.body, package, snapshots, (packet.rows, packet.rows))?;
-            let head =
-                worker.compile(&packet.head, package, snapshots, (packet.rows, packet.rows))?;
+            let actual = packet.dispatch_max();
+            let body = worker.compile(&packet.body, package, snapshots, (packet.rows, actual))?;
+            let head = worker.compile(&packet.head, package, snapshots, (packet.rows, actual))?;
             if worker
                 .packets
-                .insert(packet.rows, Rc::new(Execution { packet, body, head }))
+                .insert(actual, Rc::new(Execution { packet, body, head }))
                 .is_some()
             {
                 return Err("Duplicate packet row count".into());
@@ -668,7 +680,12 @@ impl Worker {
                 }
                 continue;
             }
-            if let Instruction::Kernel { manifest, buffers } = instruction {
+            if let Instruction::Kernel {
+                manifest,
+                buffers,
+                fixed_rows,
+            } = instruction
+            {
                 let operands = buffers
                     .iter()
                     .map(|n| get(&self.buffers, n))
@@ -688,7 +705,12 @@ impl Worker {
                 let t = Instant::now();
                 pending.push(SegmentOp::Kernel(
                     if template.spec().row_capacity()?.is_some() {
-                        Kernel::bind_rows(&self.session, &template, &operands, actual)?
+                        Kernel::bind_rows(
+                            &self.session,
+                            &template,
+                            &operands,
+                            fixed_rows.unwrap_or(actual),
+                        )?
                     } else {
                         Kernel::bind(&self.session, &template, &operands)?
                     },
@@ -727,19 +749,17 @@ impl Worker {
                 destination,
                 elements,
                 fp32,
+                int32,
+                fixed_rows,
             } = instruction
             {
                 let source = get(&self.buffers, source)?;
                 let destination = get(&self.buffers, destination)?;
-                let element = if *fp32 {
-                    Element::Float32
-                } else {
-                    Element::Bfloat16
-                };
+                let element = gather_element(*fp32, *int32)?;
                 self.session.require(&source)?;
                 self.session.require(&destination)?;
-                let elements =
-                    scaled(usize::try_from(*elements).map_err(|_| "Gather size overflow")?)? as u64;
+                let count = usize::try_from(*elements).map_err(|_| "Gather size overflow")?;
+                let elements = if *fixed_rows { count } else { scaled(count)? } as u64;
                 let bytes = elements
                     .checked_mul(element.bytes())
                     .ok_or("Model gather extent overflow")?;
@@ -1034,18 +1054,16 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                 }
             }
         }
-        if rank.packets.len() != 2 || rank.packets[0].rows != 1 || rank.packets[0].min_rows != 0 {
-            return Err("Expected single-row decode and one prefill template".into());
-        }
+        validate_dispatch(&rank.packets)?;
         if rank
             .packets
             .iter()
-            .map(|p| (p.rows, p.min_rows))
+            .map(|p| (p.rows, p.min_rows, p.max_rows))
             .collect::<Vec<_>>()
             != model.ranks[0]
                 .packets
                 .iter()
-                .map(|p| (p.rows, p.min_rows))
+                .map(|p| (p.rows, p.min_rows, p.max_rows))
                 .collect::<Vec<_>>()
         {
             return Err("TP ranks have different row contracts".into());
@@ -1056,7 +1074,7 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
             if packet.rows == 0
                 || packet.rows > 4096
                 || packet.rows > model.capacity
-                || (packet.min_rows != 0 && (packet.min_rows != 2 || packet.rows < 2))
+                || packet.dispatch_max() > packet.rows
             {
                 return Err("Invalid packet row capacity".into());
             }
@@ -1078,6 +1096,7 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                 if let Instruction::Kernel {
                     manifest,
                     buffers: bindings,
+                    fixed_rows,
                 } = instruction
                 {
                     if !kernels.contains_key(manifest) {
@@ -1092,9 +1111,12 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                         kernels.insert(manifest.clone(), spec);
                     }
                     let spec = &kernels[manifest];
-                    if spec
-                        .row_capacity()?
-                        .is_some_and(|cap| packet.min_rows == 0 || cap != packet.rows)
+                    let expected = fixed_rows.unwrap_or(packet.rows);
+                    if fixed_rows.is_some_and(|rows| rows == 0 || rows > packet.rows)
+                        || spec
+                            .row_capacity()?
+                            .is_some_and(|cap| packet.min_rows == 0 || cap != expected)
+                        || (fixed_rows.is_some() && spec.row_capacity()?.is_none())
                     {
                         return Err("Packet/AOT dynamic row capacities differ".into());
                     }
@@ -1106,6 +1128,9 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                             return Err(format!("{binding}: packet/AOT byte extent differs"));
                         }
                     }
+                }
+                if let Instruction::Gather { fp32, int32, .. } = instruction {
+                    gather_element(*fp32, *int32)?;
                 }
                 if let Instruction::W4 {
                     rows,
@@ -1149,6 +1174,35 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn gather_element(fp32: bool, int32: bool) -> Result<Element> {
+    match (fp32, int32) {
+        (true, false) => Ok(Element::Float32),
+        (false, true) => Ok(Element::Int32),
+        (false, false) => Ok(Element::Bfloat16),
+        (true, true) => Err("AllGather has conflicting element types".into()),
+    }
+}
+
+fn validate_dispatch(packets: &[Packet]) -> Result<()> {
+    let Some(decode) = packets.first() else {
+        return Err("Missing A2 decode packet".into());
+    };
+    if decode.rows != 1 || decode.min_rows != 0 || decode.dispatch_max() != 1 || packets.len() < 2 {
+        return Err("Expected single-row decode followed by prefill ranges".into());
+    }
+    let mut next = 2;
+    for packet in &packets[1..] {
+        if packet.min_rows != next
+            || packet.dispatch_max() < next
+            || packet.dispatch_max() > packet.rows
+        {
+            return Err("A2 prefill ranges must be ordered, contiguous and disjoint".into());
+        }
+        next = packet.dispatch_max() + 1;
     }
     Ok(())
 }
