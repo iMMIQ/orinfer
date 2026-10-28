@@ -48,6 +48,7 @@ def partials(
     variance_rows=1,
     tile_n=32,
     variance_prefetch=False,
+    reuse_operand=False,
 ):
     if output % 32 or reduction % splits or reduction // splits % block_k:
         raise ValueError("Floating Cube requires aligned output and split reduction tiles")
@@ -61,9 +62,8 @@ def partials(
         raise ValueError("Floating output tile must divide N and retain HC lanes")
     blocks = output // tile_n
     loops = reduction // splits // block_k
-    if pipeline_stages not in (0, 2, 3) or (
-        pipeline_stages and loops * input_parts * weight_parts < pipeline_stages
-    ):
+    iterations = loops if reuse_operand else loops * input_parts * weight_parts
+    if pipeline_stages not in (0, 2, 3) or (pipeline_stages and iterations < pipeline_stages):
         raise ValueError("Floating pipeline requires enough K/part iterations for its stages")
     if max(1, pipeline_stages) * block_k * (tile_m + tile_n) * 2 > 524032:
         raise ValueError("Floating pipeline exceeds the A2 L1 allocation")
@@ -87,22 +87,62 @@ def partials(
                 b = T.alloc_L1((tile_n, block_k), "bfloat16")
                 c = T.alloc_L0C((tile_m, tile_n), "float32")
                 valid = T.min(tile_m, rows - first)
-                for step in T.Pipelined(
-                    loops * input_parts * weight_parts, num_stages=pipeline_stages
-                ):
-                    k = step // (input_parts * weight_parts)
-                    ap = step // weight_parts % input_parts
-                    wp = step % weight_parts
-                    column = (split_id * loops + k) * block_k
-                    T.copy(
-                        activation[ap, first : first + valid, column : column + block_k],
-                        a[:valid, :],
-                    )
-                    T.copy(
-                        weight[wp, tile * tile_n : (tile + 1) * tile_n, column : column + block_k],
-                        b,
-                    )
-                    T.gemm_v0(a, b, c, transpose_B=True, init=(step == 0))
+                if reuse_operand:
+                    for k in T.Pipelined(loops, num_stages=pipeline_stages):
+                        column = (split_id * loops + k) * block_k
+                        if input_parts == 1:
+                            T.copy(
+                                activation[0, first : first + valid, column : column + block_k],
+                                a[:valid, :],
+                            )
+                        else:
+                            T.copy(
+                                weight[
+                                    0,
+                                    tile * tile_n : (tile + 1) * tile_n,
+                                    column : column + block_k,
+                                ],
+                                b,
+                            )
+                        for plane in T.serial(3):
+                            if input_parts == 1:
+                                T.copy(
+                                    weight[
+                                        plane,
+                                        tile * tile_n : (tile + 1) * tile_n,
+                                        column : column + block_k,
+                                    ],
+                                    b,
+                                )
+                            else:
+                                T.copy(
+                                    activation[
+                                        plane, first : first + valid, column : column + block_k
+                                    ],
+                                    a[:valid, :],
+                                )
+                            # One linear index retains the flattened loop's
+                            # initialization condition in the pinned compiler.
+                            T.gemm_v0(a, b, c, transpose_B=True, init=(k * 3 + plane == 0))
+                else:
+                    for step in T.Pipelined(
+                        loops * input_parts * weight_parts, num_stages=pipeline_stages
+                    ):
+                        k = step // (input_parts * weight_parts)
+                        ap = step // weight_parts % input_parts
+                        wp = step % weight_parts
+                        column = (split_id * loops + k) * block_k
+                        T.copy(
+                            activation[ap, first : first + valid, column : column + block_k],
+                            a[:valid, :],
+                        )
+                        T.copy(
+                            weight[
+                                wp, tile * tile_n : (tile + 1) * tile_n, column : column + block_k
+                            ],
+                            b,
+                        )
+                        T.gemm_v0(a, b, c, transpose_B=True, init=(step == 0))
                 T.copy(
                     c[:valid, :],
                     out[

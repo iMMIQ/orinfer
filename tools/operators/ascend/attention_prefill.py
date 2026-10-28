@@ -92,7 +92,25 @@ def softmax(
     dimension=512,
     compact=False,
     live_buckets=False,
+    tile_heads=1,
+    bucket=-1,
 ):
+    if bucket != -1:
+        if (
+            not compact
+            or not live_buckets
+            or ratio not in (1, 2)
+            or bucket not in (0, 1, 2)
+            or (not compressed and bucket != 0)
+            or capacity % 256
+            or not 256 <= capacity <= 8448
+        ):
+            raise ValueError("Head tiles require compact, live prefill buckets at aligned C<=8448")
+        return _bucketed_softmax(
+            rows, capacity, ratio, compressed, heads, dimension, tile_heads, bucket
+        )
+    if tile_heads != 1:
+        raise ValueError("A multi-head softmax tile requires an explicit prefix bucket")
     if compact:
         return _compact_softmax(rows, capacity, ratio, compressed, heads, dimension, live_buckets)
     long_length = capacity // ratio
@@ -440,5 +458,145 @@ def pv(
                     T.copy(workspace[start : start + valid, column : column + 64], x[:valid, :])
                     T.tile.cast(y, x, "CAST_RINT", 64 * 64)
                     T.copy(y[:valid, :], output[start : start + valid, column : column + 64])
+
+    return main
+
+
+def _bucketed_softmax(rows, capacity, ratio, compressed, heads, dimension, tile_heads, bucket):
+    """Normalize one prefix bucket with shared masks and scalar FP32 reciprocals."""
+    if heads != 8 or dimension != 512 or tile_heads not in (1, 2, 4, 8):
+        raise ValueError("Head tiles require H8/D512 and 1, 2, 4 or 8 heads")
+    long_length = capacity // ratio
+    score_length = capacity + (long_length if compressed else 0)
+    span = min(384, capacity)
+    probability_length = span + (long_length if compressed else 0)
+    small, medium = min(long_length, 2048 // ratio), min(long_length, 4096 // ratio)
+
+    active = (small, medium, long_length)[bucket]
+    if tile_heads * max(span, active) > 8448:
+        raise ValueError("Head tile exceeds the bounded A2 softmax UB workspace")
+
+    @T.macro
+    def normalize(scores, positions, selected, sink, probabilities, flat, active_long):
+        xs = T.alloc_ub((tile_heads, span), "float32")
+        xl = T.alloc_ub((tile_heads, active_long), "float32")
+        lanes = T.alloc_ub((1, span), "float32")
+        ids = T.alloc_ub((1, active_long), "int32")
+        ids_float = T.alloc_ub((1, active_long), "float32")
+        mask = T.alloc_ub((max(span, active_long) // 8,), "uint8")
+        short_broadcast = T.alloc_ub((tile_heads, span), "float32")
+        long_broadcast = T.alloc_ub((tile_heads, active_long), "float32")
+        ps = T.alloc_ub((tile_heads, span), "bfloat16")
+        pl = T.alloc_ub((tile_heads, active_long), "bfloat16")
+        maximum = T.alloc_ub((tile_heads, 1), "float32")
+        other = T.alloc_ub((tile_heads, 1), "float32")
+        denominator = T.alloc_ub((tile_heads, 1), "float32")
+        sink_value = T.alloc_ub((tile_heads, 1), "float32")
+        inverse = T.alloc_ub((tile_heads, 1), "float32")
+        row, head = flat // heads, flat % heads
+        position = positions[row]
+        first_row = row // 16 * 16
+        start = T.max(0, (positions[first_row] - 127) // 128) * 128
+        valid = T.min(span, capacity - start)
+        T.tile.fill(xs, -T.infinity("float32"))
+        T.copy(scores[flat : flat + tile_heads, start : start + valid], xs[:, :valid])
+        T.tile.mul(xs, xs, dimension**-0.5)
+        T.tile.createvecindex(lanes, 0.0)
+        T.tile.add(lanes, lanes, T.cast(start, "float32"))
+        T.tile.compare(mask, lanes, T.cast(position + 1, "float32"), "LT")
+        for h in T.unroll(tile_heads):
+            T.tile.select(
+                xs[h : h + 1, :],
+                mask,
+                xs[h : h + 1, :],
+                -T.infinity("float32"),
+                "VSEL_TENSOR_SCALAR_MODE",
+            )
+        T.tile.compare(mask, lanes, T.cast(position - 128, "float32"), "GT")
+        for h in T.unroll(tile_heads):
+            T.tile.select(
+                xs[h : h + 1, :],
+                mask,
+                xs[h : h + 1, :],
+                -T.infinity("float32"),
+                "VSEL_TENSOR_SCALAR_MODE",
+            )
+        T.reduce_max(xs, maximum, dim=1)
+        if compressed:
+            T.copy(scores[flat : flat + tile_heads, capacity : capacity + active_long], xl)
+            T.copy(selected[row : row + 1, :active_long], ids)
+            T.tile.cast(ids_float, ids, "CAST_NONE", active_long)
+            T.tile.compare(mask, ids_float, 0.0, "GT")
+            T.tile.mul(xl, xl, dimension**-0.5)
+            for h in T.unroll(tile_heads):
+                T.tile.select(
+                    xl[h : h + 1, :],
+                    mask,
+                    xl[h : h + 1, :],
+                    -T.infinity("float32"),
+                    "VSEL_TENSOR_SCALAR_MODE",
+                )
+            T.reduce_max(xl, other, dim=1)
+            T.tile.max(maximum, maximum, other)
+        T.copy(sink[head : head + tile_heads], sink_value)
+        T.tile.max(maximum, maximum, sink_value)
+        T.tile.broadcast(short_broadcast, maximum)
+        T.tile.sub(xs, xs, short_broadcast)
+        T.tile.exp(xs, xs)
+        T.reduce_sum(xs, denominator, dim=1)
+        if compressed:
+            T.tile.broadcast(long_broadcast, maximum)
+            T.tile.sub(xl, xl, long_broadcast)
+            T.tile.exp(xl, xl)
+            T.reduce_sum(xl, other, dim=1)
+            T.tile.add(denominator, denominator, other)
+        T.tile.sub(sink_value, sink_value, maximum)
+        T.tile.exp(sink_value, sink_value)
+        T.tile.add(denominator, denominator, sink_value)
+        # Retain the original scalar FP32 reciprocal, then the same FP32 multiply.
+        for h in T.serial(tile_heads):
+            inverse[h, 0] = 1.0 / denominator[h, 0]
+        T.tile.broadcast(short_broadcast, inverse)
+        T.tile.mul(xs, xs, short_broadcast)
+        T.tile.cast(ps, xs, "CAST_RINT", tile_heads * span)
+        T.copy(ps, probabilities[flat : flat + tile_heads, :span])
+        T.set_flag("MTE3", "V", 7)
+        T.wait_flag("MTE3", "V", 7)
+        if compressed:
+            T.tile.broadcast(long_broadcast, inverse)
+            T.tile.mul(xl, xl, long_broadcast)
+            T.tile.cast(pl, xl, "CAST_RINT", tile_heads * active_long)
+            T.copy(pl, probabilities[flat : flat + tile_heads, span : span + active_long])
+            T.set_flag("MTE3", "V", 7)
+            T.wait_flag("MTE3", "V", 7)
+
+    @T.prim_func
+    def main(
+        scores: T.Tensor((rows * heads, score_length), "float32"),
+        positions: T.Tensor((rows,), "int32"),
+        selected: T.Tensor((rows, long_length), "int32"),
+        sink: T.Tensor((heads,), "float32"),
+        probabilities: T.Tensor((rows * heads, probability_length), "bfloat16"),
+    ):
+        with T.Kernel(T.ceildiv(rows * heads, tile_heads * 2), is_npu=True) as (cid, vid):
+            flat = (cid * 2 + vid) * tile_heads
+            row = flat // heads
+            if row < rows:
+                end = positions[T.min(rows - 1, row // 16 * 16 + 15)] + 1
+                if not compressed or long_length == small:
+                    if bucket == 0:
+                        normalize(scores, positions, selected, sink, probabilities, flat, active)
+                elif bucket == 0:
+                    if end <= 2048:
+                        normalize(scores, positions, selected, sink, probabilities, flat, active)
+                elif bucket == 1:
+                    if end > 2048:
+                        if end <= 4096:
+                            normalize(
+                                scores, positions, selected, sink, probabilities, flat, active
+                            )
+                else:
+                    if end > 4096:
+                        normalize(scores, positions, selected, sink, probabilities, flat, active)
 
     return main

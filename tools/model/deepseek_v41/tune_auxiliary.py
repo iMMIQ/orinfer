@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--convert-only", action="store_true")
     parser.add_argument("--hc-reuse-only", action="store_true")
     parser.add_argument("--sinkhorn-only", action="store_true")
+    parser.add_argument("--reuse-operand-only", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     args = parser.parse_args()
@@ -34,6 +35,7 @@ def main():
                 args.convert_only,
                 args.hc_reuse_only,
                 args.sinkhorn_only,
+                args.reuse_operand_only,
             )
         )
         > 1
@@ -96,6 +98,8 @@ def main():
                 continue
             if args.pipeline_only and kind != "floating.partials":
                 continue
+            if args.reuse_operand_only and kind != "floating.partials":
+                continue
             if args.hc_reuse_only and kind != "vector.mhc_post_pre":
                 continue
             params = dict(manifest["parameters"])
@@ -122,6 +126,16 @@ def main():
             else:
                 configs = [dict(tile_m=t, tile_n=32) for t in (16, 32, 64)]
                 factory = floating.partials
+                if args.reuse_operand_only:
+                    baseline_config = dict(
+                        reuse_operand=params.get("reuse_operand", False),
+                        pipeline_stages=params.get("pipeline_stages", 0),
+                    )
+                    configs = [baseline_config] + [
+                        dict(reuse_operand=True, pipeline_stages=s)
+                        for s in (0, 2, 3)
+                        if dict(reuse_operand=True, pipeline_stages=s) != baseline_config
+                    ]
                 if args.pipeline_only:
                     configs = [
                         dict(
@@ -325,11 +339,22 @@ def main():
                                     .permute(0, 1, 3, 2, 4)
                                     .reshape(rows, -1)
                                 )
+                                reference_columns = params.get("tile_n", 32)
+                                reference_value = (
+                                    ref[:rows]
+                                    .reshape(
+                                        rows,
+                                        params["output"] // reference_columns,
+                                        8,
+                                        reference_columns // 32,
+                                        32,
+                                    )
+                                    .permute(0, 1, 3, 2, 4)
+                                    .reshape(rows, -1)
+                                )
                             torch.testing.assert_close(
                                 actual,
-                                ref[:rows].reshape(rows, -1)
-                                if kind == "floating.partials"
-                                else ref[:count],
+                                reference_value if kind == "floating.partials" else ref[:count],
                                 atol=0,
                                 rtol=0,
                             )
@@ -381,13 +406,20 @@ def main():
             reducer_manifest = None
             if kind == "floating.partials" and not params.get("variance"):
                 _, reduce_spec = reduction_steps[step["buffers"][2]]
-                columns = legal[selected].get("tile_n", 32)
+                reference_columns = params.get("tile_n", 32)
+                columns = legal[selected].get("tile_n", reference_columns)
                 reduce_params = dict(rows=capacity, output=params["output"], splits=8)
                 reference_path = compile_kernel(
-                    dense.fp32_reduce(row_count(capacity, True), params["output"]),
-                    "dense.fp32_reduce",
+                    dense.fp32_reduce(row_count(capacity, True), params["output"])
+                    if reference_columns == 32
+                    else floating.reduce_partials(
+                        row_count(capacity, True), params["output"], tile_n=reference_columns
+                    ),
+                    "dense.fp32_reduce" if reference_columns == 32 else "floating.reduce_partials",
                     reduce_spec["operands"],
-                    reduce_params,
+                    reduce_params
+                    if reference_columns == 32
+                    else dict(reduce_params, tile_n=reference_columns),
                     base / "cache",
                     row_capacity=capacity,
                     grid_limit=grid_limit,
