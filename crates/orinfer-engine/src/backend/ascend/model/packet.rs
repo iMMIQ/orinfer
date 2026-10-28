@@ -7,9 +7,11 @@ use safetensors::Dtype;
 use serde::Deserialize;
 use std::{fs, path::Path, rc::Rc, time::Instant};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Coordinates {
+    #[serde(default)]
+    pub device_indices: bool,
     pub base_cos: String,
     pub base_sin: String,
     pub long_cos: String,
@@ -59,7 +61,10 @@ fn ints(values: &[i32]) -> Vec<u8> {
 }
 impl Worker {
     fn put(&self, inputs: &mut Vec<(Buffer, Vec<u8>)>, name: &str, data: &[u8]) -> Result<()> {
-        inputs.push((get(&self.buffers, name)?, data.to_vec()));
+        inputs.push((
+            get(&self.buffers, name)?.slice(0, data.len())?,
+            data.to_vec(),
+        ));
         Ok(())
     }
     fn coordinate(&self, names: &Coordinates, base: usize, rows: usize) -> Result<()> {
@@ -126,6 +131,9 @@ impl Worker {
             (1, &names.c1_indices, &names.c1_lengths),
             (2, &names.c2_indices, &names.c2_lengths),
         ] {
+            if names.device_indices {
+                continue;
+            }
             let capacity = self.capacity / ratio;
             let mut ids = vec![-1; rows * capacity];
             let mut lens = vec![0; rows];
@@ -142,6 +150,24 @@ impl Worker {
         self.session.upload_inputs(&inputs)?;
         Ok(())
     }
+    pub(super) fn prepare_rows(&mut self, rows: usize) -> Result<()> {
+        if !self.packets.contains_key(&rows) {
+            let packet = self
+                .packet_templates
+                .iter()
+                .filter(|p| p.min_rows > 0 && (p.min_rows..=p.rows).contains(&rows))
+                .min_by_key(|p| p.rows)
+                .cloned()
+                .ok_or_else(|| format!("No A2 packet for {rows} rows"))?;
+            let base = self.package.clone();
+            let body = self.compile(&packet.body, &base, self.snapshots, (packet.rows, rows))?;
+            let head = self.compile(&packet.head, &base, self.snapshots, (packet.rows, rows))?;
+            self.packets
+                .insert(rows, Rc::new(Execution { packet, body, head }));
+        }
+        Ok(())
+    }
+
     pub(super) fn forward(
         &mut self,
         history: &[u32],
@@ -154,7 +180,7 @@ impl Worker {
             .packets
             .get(&rows)
             .cloned()
-            .ok_or_else(|| format!("No A2 packet for {rows} rows"))?;
+            .ok_or("A2 packet extent must be prepared before request reset")?;
         let t = Instant::now();
         self.coordinate(&execution.packet.coordinates, history.len(), rows)?;
         let coordinate = t.elapsed().as_secs_f64();
@@ -207,6 +233,25 @@ impl Worker {
         let download = t.elapsed().as_secs_f64();
         let value = f32::from_le_bytes(raw_value.try_into().unwrap());
         let local = i32::from_le_bytes(raw_index.try_into().unwrap());
+        if let Some(directory) = std::env::var_os("ORINFER_A2_LOGITS_DIR") {
+            let name = execution
+                .packet
+                .logits
+                .as_ref()
+                .ok_or("Logit diagnostics require a packet with a declared logits buffer")?;
+            let buffer = get(&self.buffers, name)?;
+            if buffer.bytes() != 16160 * 4 {
+                return Err("Diagnostic logits must contain one FP32 vocabulary shard".into());
+            }
+            let directory = Path::new(&directory);
+            fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+            let values = self.session.download(&buffer, 0, buffer.bytes())?;
+            fs::write(
+                directory.join(format!("r{}-p{}-m{rows}.bin", self.rank, history.len())),
+                values,
+            )
+            .map_err(|e| e.to_string())?;
+        }
         if !value.is_finite() || !(0..16160).contains(&local) {
             return Err("Nonfinite/invalid native model output".into());
         }
@@ -241,7 +286,8 @@ impl Worker {
         let mut embeddings = vec![];
         for step in execution.body.iter().chain(head) {
             if let Step::Embed(destination) = step {
-                embeddings.push(vec![(destination.clone(), self.embedding(tokens)?)])
+                let data = self.embedding(tokens)?;
+                embeddings.push(vec![(destination.slice(0, data.len())?, data)])
             }
         }
         let mut embeddings = embeddings.into_iter();
@@ -493,7 +539,7 @@ impl Worker {
             Step::Embed(destination) => {
                 let values = self.embedding(tokens)?;
                 self.session
-                    .upload_inputs(&[(destination.clone(), values)])?;
+                    .upload_inputs(&[(destination.slice(0, values.len())?, values)])?;
             }
             Step::Lookup {
                 layer,
@@ -576,9 +622,12 @@ impl Worker {
             scale.extend_from_slice(&data[256..]);
         }
         Ok(vec![
-            (values.clone(), q),
-            (scales.clone(), scale),
-            (mask.clone(), valid.iter().map(|&v| u8::from(v)).collect()),
+            (values.slice(0, q.len())?, q),
+            (scales.slice(0, scale.len())?, scale),
+            (
+                mask.slice(0, valid.len())?,
+                valid.iter().map(|&v| u8::from(v)).collect(),
+            ),
         ])
     }
 }

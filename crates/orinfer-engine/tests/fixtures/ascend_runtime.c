@@ -19,6 +19,11 @@ int orinfer_ascend_kernel_v1(void *const *buffers, uint64_t size, void *stream) 
     memcpy(buffers[1], buffers[0], 4);
     return 0;
 }
+int orinfer_ascend_kernel_v2(void *const *buffers, uint64_t size, uint64_t rows, void *stream) {
+    if (!buffers || size != 2 || !stream || !rows || rows > 4) return 7;
+    memcpy(buffers[1], buffers[0], rows);
+    return 0;
+}
 static int flush(void *stream) {
     if (failure == 3) return 7;
     for (int i=0;i<count;i++) {

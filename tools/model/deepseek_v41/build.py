@@ -7,13 +7,15 @@ full coverage within the initial <=16384-position single-stream scope.
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib
 import json
 import math
 import multiprocessing
+import os
 from pathlib import Path
 import shutil
+import tempfile
 
 import numpy as np
 import torch
@@ -22,13 +24,17 @@ from tools.build.files import atomic_json, file_hash
 from tools.operators.ascend import (
     attention,
     attention_cube,
+    attention_prefill,
     compressor,
     dense,
     engram,
+    floating,
+    hc_prefill,
     indexer,
+    indexer_cube,
     memory,
 )
-from tools.operators.ascend import model_ops, moe, routing, topk, vector
+from tools.operators.ascend import model_ops, moe, routing, routing_parallel, topk, vector
 from tools.operators.ascend.build import compile_kernel, operand
 
 DTYPE = {
@@ -62,13 +68,19 @@ class Strategy:
     parallel: bool = False
     fusion: bool = False
     engram_tp: bool = False
+    prefill: bool = False
+    fp32_cube: bool = False
+    parallel_regroup: bool = False
+    packed_attention: bool = False
+    batched_hc: bool = False
+    fast_engram: bool = False
 
 
-OPTIMIZED = Strategy(True, True, True, True, True)
+OPTIMIZED = Strategy(True, True, True, True, True, True)
 
 
 class Builder:
-    def __init__(self, output, rank, capacity, kernels, strategy=None):
+    def __init__(self, output, rank, capacity, kernels, strategy=None, model_dir=None):
         self.output, self.rank, self.capacity = output, rank, capacity
         self.kernels = kernels
         self.buffers, self.by_name, self.types = [], {}, {}
@@ -76,6 +88,108 @@ class Builder:
         self.steps = []
         self.strategy = strategy or Strategy()
         self.ready_collapsed = None
+        self.dynamic = False
+        self.model_dir = model_dir
+        self.model_index = None
+
+    def float_weight(self, weight, n, k):
+        """Prepare finite FP32 weights as three BF16 residual planes offline."""
+        from safetensors import safe_open
+        from tools.model.deepseek_v41.floating import bf16_parts
+
+        source = self.by_name[weight]["weight"]
+        if source["kind"] == "matrix" and source["dtype"] == "bf16":
+            return self.matrix(
+                source["name"], "bf16", n, k, source["first_row"], source["first_column"]
+            ), 1
+        if self.model_index is None:
+            self.model_index = json.loads(
+                (self.model_dir / "quant_model_weights.safetensors.index.json").read_text()
+            )["weight_map"]
+        path = self.model_dir / self.model_index[source["name"]]
+        folder = self.output / "float-parts"
+        folder.mkdir(exist_ok=True)
+        target = folder / (weight + ".bin")
+        record = target.with_suffix(".json")
+        stat = path.stat()
+        identity = dict(
+            source=source,
+            shape=[3, n, k],
+            source_file=[stat.st_size, stat.st_mtime_ns, stat.st_ino],
+            converter=file_hash(Path(__file__).with_name("floating.py")),
+        )
+        cached = json.loads(record.read_text()) if record.exists() else None
+        if cached != identity or not target.exists() or target.stat().st_size != 3 * n * k * 2:
+            with safe_open(path, framework="pt", device="cpu") as archive:
+                if source["kind"] == "pad":
+                    raw = archive.get_tensor(source["name"]).float().reshape(-1)
+                    if raw.numel() > n * k:
+                        raise ValueError("FP32 weight padding exceeds the declared shape")
+                    values = torch.zeros(n * k)
+                    values[: raw.numel()] = raw
+                    values = values.reshape(n, k)
+                else:
+                    values = (
+                        archive.get_slice(source["name"])[
+                            source["first_row"] : source["first_row"] + n,
+                            source["first_column"] : source["first_column"] + k,
+                        ]
+                        .float()
+                        .contiguous()
+                    )
+            parts = bf16_parts(values.numpy())
+            with tempfile.NamedTemporaryFile(dir=folder, delete=False) as temporary:
+                stage = Path(temporary.name)
+                try:
+                    temporary.write(parts.astype("<u2").tobytes())
+                    temporary.flush()
+                    os.replace(stage, target)
+                finally:
+                    stage.unlink(missing_ok=True)
+            atomic_json(record, identity)
+        return self.buffer(
+            "parts." + weight,
+            (3, n, k),
+            "bf16",
+            prepared_weight=str(target.relative_to(self.output)),
+        ), 3
+
+    def floating_partials(self, x, weight, n, k, partials, *, input_dtype="bf16", variance=False):
+        bank, weight_parts = self.float_weight(weight, n, k)
+        input_parts = 1
+        if input_dtype == "f32":
+            if weight_parts != 1:
+                raise ValueError("Floating Cube requires one exact BF16 operand")
+            input_parts = 3
+            split = self.temp("fp32.parts." + partials, (3, self.rows, k))
+            self.kernel(
+                floating,
+                "split",
+                {"rows": self.rows, "width": k},
+                [
+                    ("source", x, "f32", (self.rows, k), "read"),
+                    ("out", split, "bf16", (3, self.rows, k), "write"),
+                ],
+            )
+            x = split
+        self.kernel(
+            floating,
+            "partials",
+            dict(
+                rows=self.rows,
+                output=n,
+                reduction=k,
+                input_parts=input_parts,
+                weight_parts=weight_parts,
+                block_k=math.gcd(k // 8, 256),
+                variance=variance,
+            ),
+            [
+                ("activation", x, "bf16", (input_parts, self.rows, k), "read"),
+                ("weight", bank, "bf16", (weight_parts, n, k), "read"),
+                ("out", partials, "f32", (self.rows, n // 32, 8, 32), "write"),
+            ],
+        )
 
     def buffer(self, name, shape, dtype, **source):
         size = math.prod(shape) * DTYPE[dtype][1]
@@ -134,13 +248,25 @@ class Builder:
 
     def kernel(self, module, name, arguments, tensors):
         specs = [operand(slot, dtype, shape, access) for slot, _, dtype, shape, access in tensors]
-        key = json.dumps([module.__name__, name, arguments, specs], sort_keys=True)
+        symbolic = {}
+        if self.dynamic:
+            for key in ("rows", "tokens", "expert_rows"):
+                value = arguments.get(key, 0)
+                if value and value % self.rows == 0:
+                    symbolic[key] = value // self.rows
+            if module is memory and name in ("gather_quantized_rows", "gather_rows"):
+                value = arguments.get("table_rows", 0)
+                if value == self.rows:
+                    symbolic["table_rows"] = 1
+        key = json.dumps([module.__name__, name, arguments, specs, symbolic], sort_keys=True)
         if key not in self.kernels:
             self.kernels[key] = {
                 "module": module.__name__,
                 "name": name,
                 "arguments": arguments,
                 "specs": specs,
+                "dynamic_arguments": symbolic,
+                "row_capacity": self.rows if symbolic else None,
                 "placeholder": f"@kernel{len(self.kernels)}",
             }
         for _, buffer, dtype, shape, _ in tensors:
@@ -298,16 +424,24 @@ class Builder:
         rows = self.rows if rows is None else rows
         partials = self.temp(f"fp32.partial.{output}", (rows, n // 32, 8, 32), "f32")
         out = self.temp(output, (rows, n), "f32")
-        self.kernel(
-            dense,
-            "fp32_partials",
-            {"rows": rows, "output": n, "reduction": k, "activation_dtype": DTYPE[input_dtype][0]},
-            [
-                ("activation", x, input_dtype, (rows, k), "read"),
-                ("weight", weight, "f32", (n, k), "read"),
-                ("out", partials, "f32", (rows, n // 32, 8, 32), "write"),
-            ],
-        )
+        if self.strategy.fp32_cube and self.dynamic and rows == self.rows:
+            self.floating_partials(x, weight, n, k, partials, input_dtype=input_dtype)
+        else:
+            self.kernel(
+                dense,
+                "fp32_partials",
+                {
+                    "rows": rows,
+                    "output": n,
+                    "reduction": k,
+                    "activation_dtype": DTYPE[input_dtype][0],
+                },
+                [
+                    ("activation", x, input_dtype, (rows, k), "read"),
+                    ("weight", weight, "f32", (n, k), "read"),
+                    ("out", partials, "f32", (rows, n // 32, 8, 32), "write"),
+                ],
+            )
         self.kernel(
             dense,
             "fp32_reduce",
@@ -428,19 +562,22 @@ class Builder:
         combination = self.temp("hc.combination", (rows, 16), "f32")
         if self.strategy.parallel:
             self.steps.append({"op": "fork"})
+        if self.strategy.fp32_cube and self.dynamic:
+            self.floating_partials(current, fn, 32, 20480, partials, variance=True)
+        else:
+            self.kernel(
+                vector,
+                "mhc_prenorm_partials",
+                {"rows": rows, "width": 5120, "lanes": 8 if rows == 1 else 32},
+                [
+                    ("residual", current, "bf16", (rows, 20480), "read"),
+                    ("fn", fn, "f32", (32, 20480), "read"),
+                    ("out", partials, "f32", (rows, 8, 32), "write"),
+                ],
+            )
         self.kernel(
-            vector,
-            "mhc_prenorm_partials",
-            {"rows": rows, "width": 5120, "lanes": 8 if rows == 1 else 32},
-            [
-                ("residual", current, "bf16", (rows, 20480), "read"),
-                ("fn", fn, "f32", (32, 20480), "read"),
-                ("out", partials, "f32", (rows, 8, 32), "write"),
-            ],
-        )
-        self.kernel(
-            vector,
-            "mhc_prenorm_reduce",
+            hc_prefill if self.dynamic and self.strategy.batched_hc else vector,
+            "reduce" if self.dynamic and self.strategy.batched_hc else "mhc_prenorm_reduce",
             {"rows": rows, "width": 5120},
             [
                 ("partials", partials, "f32", (rows, 8, 32), "read"),
@@ -577,8 +714,16 @@ class Builder:
         original = self.temp("engram.original", (rows, 4, 5120), "f32")
         self.kernel(
             engram,
-            "rotate_blocks",
-            {"rows": rows, "width": 5120, "block": 32},
+            "hadamard32" if self.dynamic and self.strategy.fast_engram else "rotate_blocks",
+            dict(
+                rows=rows,
+                width=5120,
+                **(
+                    {"tile_groups": 64}
+                    if self.dynamic and self.strategy.fast_engram
+                    else {"block": 32}
+                ),
+            ),
             [
                 ("hidden", hidden, "bf16", (rows, 4, 5120), "read"),
                 ("rotation", "rotation", "f32", (32, 32), "read"),
@@ -624,6 +769,82 @@ class Builder:
         swa = self.buffer(f"cache.swa.{layer}", (self.capacity, 512), "bf16")
         self.scatter(kv, slots, swa, 512, self.capacity)
         return swa
+
+    def prefill_attention(
+        self, query, swa, long_kv, selected, positions, prefix, layer, ratio, compressed
+    ):
+        rows, capacity = self.rows, self.capacity
+        long_length = capacity // ratio
+        length = capacity + (long_length if compressed else 0)
+        mask = self.temp(f"attention.packed.mask.{long_length}", (rows, long_length), "i32")
+        if compressed and layer in (2, 8, 14, 20, 24, 28, 32, 36):
+            self.kernel(
+                attention_prefill,
+                "selected_mask",
+                {"rows": rows, "length": long_length},
+                [
+                    ("indices", selected, "i32", (rows, 512), "read"),
+                    ("mask", mask, "i32", (rows, long_length), "write"),
+                ],
+            )
+        score_bank = self.temp("attention.packed.score.bank", (rows * 8, capacity * 2), "f32")
+        probability_bank = self.temp("attention.packed.prob.bank", (rows * 8, capacity * 2))
+        score = self.buffer(
+            self.prefix + f"attention.packed.score.{length}",
+            (rows * 8, length),
+            "f32",
+            view={"parent": score_bank, "offset": 0},
+        )
+        prob = self.buffer(
+            self.prefix + f"attention.packed.prob.{length}",
+            (rows * 8, length),
+            "bf16",
+            view={"parent": probability_bank, "offset": 0},
+        )
+        scratch = self.temp(
+            "attention.packed.workspace", ((rows * 8 + 127) // 128 * 128, 512), "f32"
+        )
+        output = self.temp("attention.output", (rows, 8, 512))
+        sink = self.matrix(prefix + ".attn_sink", "f32", 8, 1, first_row=self.rank * 8)
+        parameters = {"rows": rows, "capacity": capacity, "ratio": ratio, "compressed": compressed}
+        self.kernel(
+            attention_prefill,
+            "qk",
+            parameters,
+            [
+                ("query", query, "bf16", (rows * 8, 512), "read"),
+                ("swa", swa, "bf16", (capacity, 512), "read"),
+                ("long_kv", long_kv, "bf16", (long_length, 512), "read"),
+                ("positions", positions, "i32", (rows,), "read"),
+                ("scores", score, "f32", (rows * 8, length), "write"),
+            ],
+        )
+        self.kernel(
+            attention_prefill,
+            "softmax",
+            parameters,
+            [
+                ("scores", score, "f32", (rows * 8, length), "read"),
+                ("positions", positions, "i32", (rows,), "read"),
+                ("selected", mask, "i32", (rows, long_length), "read"),
+                ("sink", sink, "f32", (8,), "read"),
+                ("probabilities", prob, "bf16", (rows * 8, length), "write"),
+            ],
+        )
+        self.kernel(
+            attention_prefill,
+            "pv",
+            parameters,
+            [
+                ("probabilities", prob, "bf16", (rows * 8, length), "read"),
+                ("swa", swa, "bf16", (capacity, 512), "read"),
+                ("long_kv", long_kv, "bf16", (long_length, 512), "read"),
+                ("positions", positions, "i32", (rows,), "read"),
+                ("output", output, "bf16", (rows * 8, 512), "write"),
+                ("workspace", scratch, "f32", ((rows * 8 + 127) // 128 * 128, 512), "scratch"),
+            ],
+        )
+        return output
 
     def attention(self, x, layer, coordinates, reset):
         rows, capacity = self.rows, self.capacity
@@ -741,100 +962,137 @@ class Builder:
             scores = self.temp(
                 f"index.scores.{compressed_capacity}", (rows, compressed_capacity), "f32"
             )
-            self.kernel(
-                indexer,
-                "quantized_logits",
-                {"rows": rows, "length": compressed_capacity, "table_rows": compressed_capacity},
-                [
-                    ("query", iq8, "i8", (rows, 32, 128), "read"),
-                    ("query_scale", iqs, "f16", (rows, 32), "read"),
-                    ("keys", key_cache, "i8", (compressed_capacity, 128), "read"),
-                    ("key_scale", key_scale, "f16", (compressed_capacity,), "read"),
-                    ("weights", iw, "bf16", (rows, 32), "read"),
-                    (
-                        "indices",
-                        coordinates[f"c{ratio}_indices"],
-                        "i32",
-                        (rows, compressed_capacity),
-                        "read",
-                    ),
-                    ("out", scores, "f32", (rows, compressed_capacity), "write"),
-                ],
-            )
+            operands = [
+                ("query", iq8, "i8", (rows, 32, 128), "read"),
+                ("query_scale", iqs, "f16", (rows, 32), "read"),
+                ("keys", key_cache, "i8", (compressed_capacity, 128), "read"),
+                ("key_scale", key_scale, "f16", (compressed_capacity,), "read"),
+                ("weights", iw, "bf16", (rows, 32), "read"),
+                (
+                    "indices",
+                    coordinates[f"c{ratio}_indices"],
+                    "i32",
+                    (rows, compressed_capacity),
+                    "read",
+                ),
+                ("out", scores, "f32", (rows, compressed_capacity), "write"),
+            ]
+            if self.strategy.prefill and self.dynamic:
+                padded = (compressed_capacity + 63) // 64 * 64
+                workspace = self.temp(
+                    "index.cube.workspace", (rows, 32, (capacity + 63) // 64 * 64), "i32"
+                )
+                scratch = self.buffer(
+                    self.prefix + f"index.cube.{compressed_capacity}",
+                    (rows, 32, padded),
+                    "i32",
+                    view={"parent": workspace, "offset": 0},
+                )
+                operands.append(("workspace", scratch, "i32", (rows, 32, padded), "scratch"))
+                self.kernel(
+                    indexer_cube,
+                    "causal_logits",
+                    {"rows": rows, "length": compressed_capacity},
+                    operands,
+                )
+            else:
+                self.kernel(
+                    indexer,
+                    "quantized_logits",
+                    {
+                        "rows": rows,
+                        "length": compressed_capacity,
+                        "table_rows": compressed_capacity,
+                    },
+                    operands,
+                )
             selected, _ = self.select(scores, compressed_capacity, coordinates[f"c{ratio}_lengths"])
-        count = 640 if compressed else 128
-        gathered = self.temp(f"attention.gathered.{count}", (rows, count, 512))
-        mask = self.temp(f"attention.mask.{count}", (rows, count), "i32")
-        self.kernel(
-            model_ops,
-            "gather_attention",
-            {
-                "rows": rows,
-                "capacity": capacity,
-                "compressed_capacity": compressed_capacity,
-                "compressed": compressed,
-            },
-            [
-                ("swa", swa, "bf16", (capacity, 512), "read"),
-                ("long_kv", long_kv, "bf16", (compressed_capacity, 512), "read"),
-                ("swa_indices", coordinates["swa_indices"], "i32", (rows, 128), "read"),
-                ("long_indices", selected, "i32", (rows, 512), "read"),
-                ("out", gathered, "bf16", (rows, count, 512), "write"),
-                ("mask", mask, "i32", (rows, count), "write"),
-            ],
-        )
-        attended = self.temp("attention.output", (rows, 8, 512))
-        sink = self.matrix(prefix + ".attn_sink", "f32", 8, 1, first_row=self.rank * 8)
-        if self.strategy.cube_attention and rows == 1:
-            score = self.temp(f"attention.cube.score.{count}", (rows, 16, count), "f32")
-            prob = self.temp(f"attention.cube.prob.{count}", (rows, 16, count))
-            scratch = self.temp("attention.cube.workspace", (rows, 16, 512), "f32")
-            parameters = {"rows": rows, "heads": 8, "selected": count}
-            self.kernel(
-                attention_cube,
-                "qk",
-                parameters,
-                [
-                    ("query", query, "bf16", (rows, 8, 512), "read"),
-                    ("kv", gathered, "bf16", (rows, count, 512), "read"),
-                    ("scores", score, "f32", (rows, 16, count), "write"),
-                ],
-            )
-            self.kernel(
-                attention_cube,
-                "softmax",
-                parameters,
-                [
-                    ("scores", score, "f32", (rows, 16, count), "read"),
-                    ("indices", mask, "i32", (rows, count), "read"),
-                    ("sink", sink, "f32", (8,), "read"),
-                    ("probabilities", prob, "bf16", (rows, 16, count), "write"),
-                ],
-            )
-            self.kernel(
-                attention_cube,
-                "pv",
-                parameters,
-                [
-                    ("probabilities", prob, "bf16", (rows, 16, count), "read"),
-                    ("kv", gathered, "bf16", (rows, count, 512), "read"),
-                    ("output", attended, "bf16", (rows, 8, 512), "write"),
-                    ("workspace", scratch, "f32", (rows, 16, 512), "scratch"),
-                ],
+        if self.dynamic and self.strategy.packed_attention:
+            attended = self.prefill_attention(
+                query,
+                swa,
+                long_kv,
+                selected,
+                coordinates["slots"],
+                prefix,
+                layer,
+                ratio,
+                compressed,
             )
         else:
+            count = 640 if compressed else 128
+            gathered = self.temp(f"attention.gathered.{count}", (rows, count, 512))
+            mask = self.temp(f"attention.mask.{count}", (rows, count), "i32")
             self.kernel(
-                attention,
-                "sparse_attention",
-                {"rows": rows, "heads": 8, "selected": count},
+                model_ops,
+                "gather_attention",
+                {
+                    "rows": rows,
+                    "capacity": capacity,
+                    "compressed_capacity": compressed_capacity,
+                    "compressed": compressed,
+                },
                 [
-                    ("query", query, "bf16", (rows, 8, 512), "read"),
-                    ("gathered_kv", gathered, "bf16", (rows, count, 512), "read"),
-                    ("indices", mask, "i32", (rows, count), "read"),
-                    ("sink", sink, "f32", (8,), "read"),
-                    ("out", attended, "bf16", (rows, 8, 512), "write"),
+                    ("swa", swa, "bf16", (capacity, 512), "read"),
+                    ("long_kv", long_kv, "bf16", (compressed_capacity, 512), "read"),
+                    ("swa_indices", coordinates["swa_indices"], "i32", (rows, 128), "read"),
+                    ("long_indices", selected, "i32", (rows, 512), "read"),
+                    ("out", gathered, "bf16", (rows, count, 512), "write"),
+                    ("mask", mask, "i32", (rows, count), "write"),
                 ],
             )
+            attended = self.temp("attention.output", (rows, 8, 512))
+            sink = self.matrix(prefix + ".attn_sink", "f32", 8, 1, first_row=self.rank * 8)
+            if self.strategy.cube_attention and (rows == 1 or self.strategy.prefill):
+                score = self.temp(f"attention.cube.score.{count}", (rows, 16, count), "f32")
+                prob = self.temp(f"attention.cube.prob.{count}", (rows, 16, count))
+                scratch = self.temp("attention.cube.workspace", (rows, 16, 512), "f32")
+                parameters = {"rows": rows, "heads": 8, "selected": count}
+                self.kernel(
+                    attention_cube,
+                    "qk",
+                    parameters,
+                    [
+                        ("query", query, "bf16", (rows, 8, 512), "read"),
+                        ("kv", gathered, "bf16", (rows, count, 512), "read"),
+                        ("scores", score, "f32", (rows, 16, count), "write"),
+                    ],
+                )
+                self.kernel(
+                    attention_cube,
+                    "softmax",
+                    parameters,
+                    [
+                        ("scores", score, "f32", (rows, 16, count), "read"),
+                        ("indices", mask, "i32", (rows, count), "read"),
+                        ("sink", sink, "f32", (8,), "read"),
+                        ("probabilities", prob, "bf16", (rows, 16, count), "write"),
+                    ],
+                )
+                self.kernel(
+                    attention_cube,
+                    "pv",
+                    parameters,
+                    [
+                        ("probabilities", prob, "bf16", (rows, 16, count), "read"),
+                        ("kv", gathered, "bf16", (rows, count, 512), "read"),
+                        ("output", attended, "bf16", (rows, 8, 512), "write"),
+                        ("workspace", scratch, "f32", (rows, 16, 512), "scratch"),
+                    ],
+                )
+            else:
+                self.kernel(
+                    attention,
+                    "sparse_attention",
+                    {"rows": rows, "heads": 8, "selected": count},
+                    [
+                        ("query", query, "bf16", (rows, 8, 512), "read"),
+                        ("gathered_kv", gathered, "bf16", (rows, count, 512), "read"),
+                        ("indices", mask, "i32", (rows, count), "read"),
+                        ("sink", sink, "f32", (8,), "read"),
+                        ("out", attended, "bf16", (rows, 8, 512), "write"),
+                    ],
+                )
         attended = self.rope(attended, 8, 512, cosine, sine, "attention.inverse_rope", inverse=True)
         oa = self.projection(
             attended,
@@ -930,25 +1188,79 @@ class Builder:
         counts = self.temp(f"L{layer}.counts", (48,), "i64")
         route_errors = self.temp("route.errors", (rows + 1,), "i32")
         up_name, down_name = f"{self.prefix}L{layer}.up", f"{self.prefix}L{layer}.down"
-        self.kernel(
-            routing,
-            "regroup",
-            {
-                "rows": rows,
-                "experts": 384,
-                "local": 48,
-                "selected": 6,
-                "base": self.rank * 48,
-                "pad_last": False,
-            },
-            [
-                ("indices", indices, "i32", (rows, 8), "read"),
-                ("gather", gather, "i32", (expert_rows,), "write"),
-                ("restore", restore, "i32", (rows, 8), "write"),
-                ("counts", counts, "i64", (48,), "write"),
-                ("errors", route_errors, "i32", (rows + 1,), "write"),
-            ],
-        )
+        if self.dynamic and self.strategy.parallel_regroup:
+            chunks = (rows + 31) // 32
+            positions = self.temp("route.positions", (48, chunks, 256), "i32")
+            chunk_counts = self.temp("route.chunk_counts", (48, chunks), "i32")
+            offsets = self.temp("route.offsets", (48, chunks), "i32")
+            contracts = {
+                "indices": (indices, "i32", (rows, 8)),
+                "gather": (gather, "i32", (expert_rows,)),
+                "restore": (restore, "i32", (rows, 8)),
+                "errors": (route_errors, "i32", (rows + 1,)),
+                "positions": (positions, "i32", (48, chunks, 256)),
+                "counts": (chunk_counts, "i32", (48, chunks)),
+                "offsets": (offsets, "i32", (48, chunks)),
+                "groups": (counts, "i64", (48,)),
+            }
+            for name, parameters, accesses in (
+                (
+                    "clear",
+                    {"experts": 384},
+                    {"indices": "read", "gather": "write", "restore": "write", "errors": "write"},
+                ),
+                (
+                    "local",
+                    {"base": self.rank * 48},
+                    {"indices": "read", "positions": "write", "counts": "write"},
+                ),
+                (
+                    "prefix",
+                    {},
+                    {"counts": "read", "offsets": "write", "groups": "write", "errors": "scratch"},
+                ),
+                (
+                    "pack",
+                    {},
+                    {
+                        "positions": "read",
+                        "counts": "read",
+                        "offsets": "read",
+                        "gather": "read_write",
+                    },
+                ),
+                (
+                    "restore",
+                    {"base": self.rank * 48},
+                    {"indices": "read", "offsets": "read", "restore": "write"},
+                ),
+            ):
+                self.kernel(
+                    routing_parallel,
+                    name,
+                    {"rows": rows, **parameters},
+                    [(key, *contracts[key], access) for key, access in accesses.items()],
+                )
+        else:
+            self.kernel(
+                routing,
+                "regroup",
+                {
+                    "rows": rows,
+                    "experts": 384,
+                    "local": 48,
+                    "selected": 6,
+                    "base": self.rank * 48,
+                    "pad_last": False,
+                },
+                [
+                    ("indices", indices, "i32", (rows, 8), "read"),
+                    ("gather", gather, "i32", (expert_rows,), "write"),
+                    ("restore", restore, "i32", (rows, 8), "write"),
+                    ("counts", counts, "i64", (48,), "write"),
+                    ("errors", route_errors, "i32", (rows + 1,), "write"),
+                ],
+            )
         gathered = self.temp("expert.input", (expert_rows, 5120), "i8")
         gathered_scale = self.temp("expert.input.scale", (expert_rows,), "f32")
         error = self.temp("expert.gather.errors", (expert_rows,), "i32")
@@ -1110,8 +1422,9 @@ class Builder:
             )
         return output
 
-    def packet(self, rows):
+    def packet(self, rows, *, dynamic=False):
         self.rows, self.prefix, self.steps = rows, f"m{rows}.", []
+        self.dynamic = dynamic
         self.ready_collapsed = None
         coordinates = {}
         for name in ("base_cos", "base_sin", "long_cos", "long_sin", "source_cos", "source_sin"):
@@ -1128,6 +1441,25 @@ class Builder:
         ]:
             coordinates[name] = self.temp(name, shape, "i32")
         incoming = coordinates["premix"] = self.temp("pre.a", (rows, 8), "f32")
+        if dynamic:
+            coordinates["device_indices"] = True
+            for ratio in (1, 2):
+                self.kernel(
+                    model_ops,
+                    "causal_indices",
+                    {"rows": rows, "capacity": self.capacity, "ratio": ratio},
+                    [
+                        ("positions", coordinates["slots"], "i32", (rows,), "read"),
+                        (
+                            "indices",
+                            coordinates[f"c{ratio}_indices"],
+                            "i32",
+                            (rows, self.capacity // ratio),
+                            "write",
+                        ),
+                        ("lengths", coordinates[f"c{ratio}_lengths"], "i32", (rows,), "write"),
+                    ],
+                )
         embedding = self.temp("embedding", (rows, 5120))
         self.steps.append({"op": "embed", "destination": embedding})
         current = self.temp("residual.a", (rows, 4, 5120))
@@ -1186,12 +1518,24 @@ class Builder:
         normalized, _ = self.norm(
             collapsed, self.matrix("norm.weight", "f32", 5120, 1), 5120, "final.norm"
         )
-        last = self.buffer(
-            self.prefix + "final.last",
-            (1, 5120),
-            "bf16",
-            view={"parent": normalized, "offset": (rows - 1) * 5120 * 2},
-        )
+        if dynamic:
+            last = self.temp("final.last", (1, 5120))
+            self.kernel(
+                memory,
+                "last_row",
+                {"rows": rows, "width": 5120},
+                [
+                    ("source", normalized, "bf16", (rows, 5120), "read"),
+                    ("out", last, "bf16", (1, 5120), "write"),
+                ],
+            )
+        else:
+            last = self.buffer(
+                self.prefix + "final.last",
+                (1, 5120),
+                "bf16",
+                view={"parent": normalized, "offset": (rows - 1) * 5120 * 2},
+            )
         logits = self.fp32(
             last,
             self.matrix("head.weight", "f32", 16160, 5120, first_row=self.rank * 16160),
@@ -1204,6 +1548,8 @@ class Builder:
         indices, values = self.select(logits, 16160, length, "head.selected", rows=1)
         return {
             "rows": rows,
+            "logits": logits,
+            "min_rows": 2 if dynamic else 0,
             "coordinates": coordinates,
             "body": body,
             "head": self.steps,
@@ -1247,30 +1593,146 @@ def compile_task(task_and_output):
     torch.set_num_threads(2)
     output = Path(output)
     module = importlib.import_module(task["module"])
-    function = getattr(module, task["name"])(**task["arguments"])
+    arguments = dict(task["arguments"])
+    if task.get("dynamic_arguments"):
+        from kernels.model.rows import row_count
+
+        rows = row_count(task["row_capacity"], True)
+        for name, multiplier in task["dynamic_arguments"].items():
+            arguments[name] = rows * multiplier
+    function = getattr(module, task["name"])(**arguments)
     path = compile_kernel(
         function,
         f"{task['module'].split('.')[-1]}.{task['name']}",
         task["specs"],
         task["arguments"],
         output / "cache",
+        row_capacity=task.get("row_capacity"),
+        grid_limit=task.get("grid_limit", 64),
     )
     return task["placeholder"], str(path.relative_to(output))
 
 
+def rebuild_kernels(plan, workers, *, all_kernels=False):
+    """Recompile selected or all operators from an existing native build contract."""
+    base = plan.parent
+    model = json.loads(plan.read_text())
+    tasks = {}
+    paired = {
+        "dense.projection",
+        "attention_cube.pv",
+        "indexer_cube.causal_logits",
+        "floating.partials",
+        "floating.split",
+        "model_ops.gather_attention",
+    }
+    for rank in model["ranks"]:
+        for packet in rank["packets"]:
+            for step in packet["body"] + packet["head"]:
+                if step["op"] != "kernel" or step["manifest"] in tasks:
+                    continue
+                spec = json.loads((base / step["manifest"]).read_text())
+                if not all_kernels and (
+                    spec["op"] not in paired
+                    or (
+                        "_row_capacity" not in spec["parameters"]
+                        and spec["op"] != "model_ops.gather_attention"
+                    )
+                ):
+                    continue
+                args = dict(spec["parameters"])
+                capacity = args.pop("_row_capacity", None)
+                limit = args.pop("_grid_limit", 64)
+                module, name = spec["op"].split(".")
+                symbolic = {
+                    key: args[key] // capacity
+                    for key in ("rows", "tokens", "expert_rows")
+                    if capacity is not None and key in args and args[key] % capacity == 0
+                }
+                if (
+                    capacity is not None
+                    and module == "memory"
+                    and name in ("gather_quantized_rows", "gather_rows")
+                    and args.get("table_rows") == capacity
+                ):
+                    symbolic["table_rows"] = 1
+                tasks[step["manifest"]] = dict(
+                    module="tools.operators.ascend." + module,
+                    name=name,
+                    arguments=args,
+                    specs=spec["operands"],
+                    row_capacity=capacity,
+                    grid_limit=limit,
+                    dynamic_arguments=symbolic,
+                    placeholder=step["manifest"],
+                )
+    replacements = {}
+    with ProcessPoolExecutor(
+        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        for old, new in pool.map(compile_task, [(t, str(base)) for t in tasks.values()]):
+            replacements[old] = new
+            print(json.dumps(dict(rebuilt=len(replacements), total=len(tasks))), flush=True)
+    for rank in model["ranks"]:
+        for packet in rank["packets"]:
+            for step in packet["body"] + packet["head"]:
+                if step["op"] == "kernel":
+                    step["manifest"] = replacements.get(step["manifest"], step["manifest"])
+    output = plan.with_name(plan.stem + ("-rebuilt.json" if all_kernels else "-paired.json"))
+    atomic_json(output, model)
+    print(json.dumps(dict(model=str(output), rebuilt=len(replacements))), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--engram-metadata", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--engram-metadata", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--rebuild-paired-plan", type=Path)
+    parser.add_argument("--rebuild-plan", type=Path)
     parser.add_argument("--capacity", type=int, default=8448)
     parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--strategy", choices=("baseline", "optimized"), default="baseline")
+    parser.add_argument("--prefill-capacity", type=int, default=16)
+    parser.add_argument("--packed-attention", action="store_true")
+    parser.add_argument("--batched-hc", action="store_true")
+    parser.add_argument("--fast-engram", action="store_true")
+    parser.add_argument(
+        "--parallel-regroup",
+        action="store_true",
+        help="Use stable parallel expert regrouping for prefill",
+    )
+    parser.add_argument(
+        "--fp32-cube",
+        action="store_true",
+        help="Experimental three-part BF16 prefill projections with FP32 boundaries",
+    )
     args = parser.parse_args()
-    if not 128 <= args.capacity <= 16384 or args.capacity % 32:
-        parser.error("capacity must be divisible by 32, within 128..16384")
     if not 1 <= args.compile_workers <= 8:
         parser.error("compile workers must be in 1..8")
+    if args.rebuild_plan or args.rebuild_paired_plan:
+        rebuild_kernels(
+            args.rebuild_plan or args.rebuild_paired_plan,
+            args.compile_workers,
+            all_kernels=args.rebuild_plan is not None,
+        )
+        return
+    if args.model_dir is None or args.engram_metadata is None or args.output is None:
+        parser.error("model-dir, engram-metadata and output are required for a full build")
+    if not 128 <= args.capacity <= 16384 or args.capacity % 32:
+        parser.error("capacity must be divisible by 32, within 128..16384")
+    if not 2 <= args.prefill_capacity <= min(4096, args.capacity):
+        parser.error("prefill capacity must be in 2..min(4096, context capacity)")
+    if args.fp32_cube and args.strategy != "optimized":
+        parser.error("fp32-cube requires the optimized strategy")
+    if args.parallel_regroup and args.strategy != "optimized":
+        parser.error("parallel-regroup requires the optimized strategy")
+    if args.packed_attention and (args.capacity % 256 or args.capacity > 8448):
+        parser.error("packed-attention requires 256-aligned capacity <=8448")
+    if (args.packed_attention or args.batched_hc) and args.strategy != "optimized":
+        parser.error("packed-attention and batched-hc require the optimized strategy")
+    if args.fast_engram and args.strategy != "optimized":
+        parser.error("fast-engram requires the optimized strategy")
     torch.set_num_threads(4)
     config = json.loads((args.model_dir / "config.json").read_text())["text_config"]
     for name, value in {
@@ -1298,6 +1760,10 @@ def main():
     block = rotation[:32, :32].contiguous()
     if not torch.equal(rotation, torch.block_diag(*([block] * 160))):
         raise ValueError("Expected repeated block32 Engram rotation")
+    if args.fast_engram:
+        from tools.model.deepseek_v41.export_engram import validate_hadamard32
+
+        validate_hadamard32(block.numpy())
     kernels, ranks = {}, []
     for rank in range(8):
         builder = Builder(
@@ -1305,10 +1771,20 @@ def main():
             rank,
             args.capacity,
             kernels,
-            OPTIMIZED if args.strategy == "optimized" else Strategy(),
+            replace(
+                OPTIMIZED,
+                fp32_cube=args.fp32_cube,
+                parallel_regroup=args.parallel_regroup,
+                packed_attention=args.packed_attention,
+                batched_hc=args.batched_hc,
+                fast_engram=args.fast_engram,
+            )
+            if args.strategy == "optimized"
+            else Strategy(),
+            args.model_dir,
         )
         builder.asset("rotation", block.numpy().astype("<f4"), "f32")
-        packets = [builder.packet(rows) for rows in (1, 16)]
+        packets = [builder.packet(1), builder.packet(args.prefill_capacity, dynamic=True)]
         ranks.append({"rank": rank, "buffers": builder.buffers, "packets": packets})
         print(
             json.dumps(
@@ -1338,6 +1814,7 @@ def main():
         "rope": rope_tables(args.output, args.capacity),
     }
     tasks = list(kernels.values())
+    atomic_json(args.output / "construction.json", {"model": model, "kernels": tasks})
     manifests = {}
     with ProcessPoolExecutor(
         max_workers=args.compile_workers, mp_context=multiprocessing.get_context("spawn")

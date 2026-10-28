@@ -240,7 +240,7 @@ def swiglu_quant(rows, width, limit=10.0):
     return main
 
 
-def mhc_split_sinkhorn(rows, iterations=20, eps=1e-6):
+def mhc_split_sinkhorn(rows, iterations=20, eps=1e-6, vector_rows=True):
     """Padded row strides: 24 mixes in 32 lanes, four gates in eight lanes."""
 
     @T.prim_func
@@ -265,6 +265,9 @@ def mhc_split_sinkhorn(rows, iterations=20, eps=1e-6):
             c = T.alloc_ub((1, 8), "float32")
             row_divisor = T.alloc_ub((4, 8), "float32")
             column_divisor = T.alloc_ub((4, 8), "float32")
+            indices = T.alloc_ub((32,), "float32")
+            integer_indices = T.alloc_ub((32,), "int32")
+            offsets = T.alloc_ub((32,), "uint32")
             row = cid * 2 + vid
             if row < rows:
                 T.copy(mixes[row, :], m)
@@ -294,14 +297,28 @@ def mhc_split_sinkhorn(rows, iterations=20, eps=1e-6):
                 for i in T.serial(4):
                     for j in T.serial(4):
                         a[i, j] = m[8 + i * 4 + j]
+                if vector_rows:
+                    T.tile.createvecindex(indices, 0.0)
+                    T.tile.mul(indices, indices, 0.125)
+                    T.tile.cast(integer_indices, indices, "CAST_FLOOR", 32)
+                    T.tile.cast(indices, integer_indices, "CAST_NONE", 32)
+                    T.tile.mul(indices, indices, 4.0)
+                    T.tile.cast(integer_indices, indices, "CAST_RINT", 32)
+                    T.reinterpretcast(offsets, integer_indices, "uint32_t")
                 T.reduce_max(a, r, dim=1, real_shape=[4, 4])
-                for i in T.serial(4):
-                    T.tile.fill(row_divisor[i, :], r[i])
+                if vector_rows:
+                    T.tile.gather(row_divisor, r, offsets, 0)
+                else:
+                    for i in T.serial(4):
+                        T.tile.fill(row_divisor[i, :], r[i])
                 T.tile.sub(a, a, row_divisor)
                 T.tile.exp(a, a)
                 T.reduce_sum(a, r, dim=1, real_shape=[4, 4])
-                for i in T.serial(4):
-                    T.tile.fill(row_divisor[i, :], r[i])
+                if vector_rows:
+                    T.tile.gather(row_divisor, r, offsets, 0)
+                else:
+                    for i in T.serial(4):
+                        T.tile.fill(row_divisor[i, :], r[i])
                 T.tile.div(a, a, row_divisor)
                 T.tile.add(a, a, eps)
                 T.reduce_sum(a, c, dim=0)
@@ -311,8 +328,11 @@ def mhc_split_sinkhorn(rows, iterations=20, eps=1e-6):
                 for _ in T.serial(iterations - 1):
                     T.reduce_sum(a, r, dim=1, real_shape=[4, 4])
                     T.tile.add(r, r, eps)
-                    for i in T.serial(4):
-                        T.tile.fill(row_divisor[i, :], r[i])
+                    if vector_rows:
+                        T.tile.gather(row_divisor, r, offsets, 0)
+                    else:
+                        for i in T.serial(4):
+                            T.tile.fill(row_divisor[i, :], r[i])
                     T.tile.div(a, a, row_divisor)
                     T.reduce_sum(a, c, dim=0)
                     T.tile.add(c, c, eps)
@@ -425,9 +445,11 @@ def mhc_post(rows, width):
     return main
 
 
-def mhc_post_pre(rows, width):
+def mhc_post_pre(rows, width, tile=256):
     """Keep the post BF16 boundary, then collapse using the next pre-mix."""
-    block = math.gcd(width, 256)
+    if tile not in (256, 512, 1024, 1280, 2560):
+        raise ValueError("mHC post/pre tile must fit the A2 unified buffer")
+    block = math.gcd(width, tile)
     blocks = width // block
 
     @T.prim_func

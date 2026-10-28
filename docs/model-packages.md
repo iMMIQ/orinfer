@@ -147,7 +147,9 @@ CPU 验收读取真实表的小批量行，检查所有 token 分块边界的 ha
 
 `backend/ascend/model/` 提供 DSv4.1 Flash-1017 原始 W4A8 checkpoint 的实验性单流执行入口 `bench-ascend`。八个 Rust worker 各持有独立 ACL context，以 TP8 执行 attention、每卡 48 个专家执行 MoE，并通过 HCCL 合并结果。执行计划包含全部 40 层、Engram CPU 行查找、C2/C1 缓存、索引 TopK 与输出头。W4 grouped matmul 保留 ACLNN，其余设备计算从 TileLang AOT 库加载；连续 TileLang、W4 和 HCCL 调用共同捕获为 ACL Graph，按原执行顺序复用同一 W4 workspace。设置 `ORINFER_A2_W4_NO_CAPTURE=1` 可单独提交 W4，供诊断使用。
 
-该入口使用独立的实验计划描述，公共模型包 schema 1 和 C ABI v1 保持原样；`serve` 的 Ascend 执行器仍未注册。当前上下文容量限定为 128–16384，须为 32 的倍数；默认 8448，覆盖 8K 输入和 128 个输出。此范围内候选块覆盖完整历史。prefill 使用 16 行 packet，decode 使用单行 packet；请求间清空历史和残余压缩状态，通过因果索引隔离旧 KV。prefix 复用、并发调度及 MTP 需要后续接入。
+该入口使用独立的实验计划描述，公共模型包 schema 1 和 C ABI v1 保持原样；`serve` 的 Ascend 执行器仍未注册。当前上下文容量限定为 128–16384，须为 32 的倍数；默认 8448，覆盖 8K 输入和 128 个输出。此范围内候选块覆盖完整历史。prefill 使用容量有界的动态行模板，`--prefill-capacity` 默认 16，支持 2–4096，且不超过上下文容量。单行 decode 复用独立 AOT；prefill 根据剩余长度和共享 `PrefillPlan` 契约选择真实块长，尾块保持真实长度。请求间清空历史和残余压缩状态，通过因果索引隔离旧 KV。prefix 复用、并发调度及 MTP 需要后续接入。
+
+动态 AOT 的指针表 ABI v2 显式传递真实 token 行数；operand 描述保存容量几何，库内外同时固定容量和物理 grid 上限。专家算子保留 `6*m` 等行数倍率，各 kernel 使用同一个有界行标量。编译器将逻辑 grid 映射到有限物理块上的循环；显式 Cube/Vector 计算体拆成同一库内的两个 stream 有序阶段，阶段间通过原 workspace 传递结果。通信长度、W4 tensor 视图和输出头末行随真实块长绑定。新行数的 Graph 注册在请求 reset 之前完成；每个 Graph 保留不可变的行数、库与全部 operand。因果索引在设备上从位置生成。
 
 普通 packet 用一次完成事件保留图、W4 executor、通信组及其设备资源。坐标、embedding 和 Engram 输入通过 compute stream 有序上传，复用的输入地址在原层边界更新。Engram 行包在对应层边界准备，使 CPU 查找与此前已提交的设备计算重叠。完成查询使用 `aclrtQueryEventStatus` 的 recorded 状态，pinned 内存统一通过硬完成栅栏回收。各 rank 共用只读 Engram 行包，缓存身份包含有序行 ID，掩码保持本次请求私有。ACLNN W4A8 会原地变换激活字节，每次调用前均由上游整数投影准备新的 A8 输入；离线复用 executor 的数值检查也需重新上传原始激活。
 
@@ -173,6 +175,33 @@ HCCL_OP_EXPANSION_MODE=AIV HCCL_NPU_SOCKET_PORT_RANGE=auto \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
   --inputs artifacts/ascend-inputs.json --output-tokens 128 --repeats 3
 ```
+
+大块 prefill 在构建时增加 `--strategy optimized --prefill-capacity 2048`。整数/BF16 投影可从同一模板离线测量多个真实长度，复用公共候选构建、Graph 测量及汇总选择，只替换每种几何的一个动态 fallback；decode AOT 保留原绑定：
+
+```bash
+bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate_rows \
+  --output artifacts/ascend-row-validation
+bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
+  --plan artifacts/ascend-model/model.json \
+  --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
+  --output artifacts/ascend-model/tuning --rows 17 128 512 2048
+```
+
+调优读取真实 checkpoint 投影权重，检查候选数值、尾部和改变输入后的 Graph replay，发布同目录的 `model-tuned.json`；随后对选中的计划执行 `prepare` 和完整请求验收。调优只发生在离线工具中，完整请求 TPS 仍由 `bench-ascend` 测量。
+
+`tools.model.deepseek_v41.tune_auxiliary` 接受同样的 `--plan`、`--model-dir` 和 `--output`，离线选择 mHC post/pre 的列块与 FP32 分解投影的行块。后者读取计划中已准备的真实 BF16 分量，候选保持原 K 累加顺序；所有候选检查逐元素一致、尾部及改变输入后的 Graph replay。输出计划名增加 `-aux-tuned`。两种调优缓存均固定当前源码、编译器、设备、测量长度和真实权重身份，并校验被选库的内容。
+
+`--fast-engram` 为动态 prefill 启用批量 32 阶蝶形旋转。构建器要求 checkpoint 的旋转块恰为标准顺序、统一幅值、带行符号的 Walsh 矩阵；不匹配时构建失败。计算读取原始 FP32 系数，保留输入乘系数与输出 FP32 边界。`validate_rotation` 检查原 bank、FP64 参考误差、动态尾部和改变输入后的 Graph replay；单行 decode 保留通用旋转。
+
+`--parallel-regroup` 为 prefill 生成稳定的分块专家分组：每个 32-token 块按路由位置排序，再计算专家与块的前缀和，写回 gather 和 restore。专家、token、路由 lane 的顺序与串行扫描一致；六个有效路由之外的 padding 不参与分组。`tools.operators.ascend.validate_regroup` 验证动态尾部、重复路由、空专家、异常索引和改变输入后的 Graph replay。
+
+实验参数 `--fp32-cube` 将 prefill 的敏感投影改为三个 BF16 分量的 Cube 乘积，保留 FP32 partial 和原有归约边界。权重分量离线准备，路由输入分量由设备生成；原始 W4 专家 bank 保持单份。该路径改变浮点累加顺序，启用前需单独比较任务质量、teacher-forced 概率和状态。默认继续使用原 FP32 投影。
+
+`--packed-attention` 为 prefill 使用 token/head 合并的 Cube tile，直接读取共享 SWA 和压缩 KV bank，以因果窗口和唯一 TopK 索引掩码选择有效项。它支持 256 对齐、至多 8448 的上下文容量，保留 FP32 softmax 和 BF16 概率。`--batched-hc` 在多行之间复用 mHC 的同源八段归约与 FP32 归一化。两者均为独立实验开关，decode 继续使用单行实现；算子验证入口分别为 `validate_prefill_attention` 和 `validate_hc`，完整模型需另外验收。
+
+`ORINFER_A2_LOGITS_DIR=目录` 在普通 Graph 完成后保存各 rank 的 FP32 输出头分片，文件名携带 rank、前缀位置和本次行数，重复执行覆盖同名文件。输入计划须声明 `logits` buffer；每个固定历史使用独立目录。该诊断保持原 Graph 分段，报告标记 `logits_dump: true`，耗时包含额外读回和文件写入，供概率对照使用。
+
+`tools.model.deepseek_v41.compare_logits` 用 `--reference` 指定官方 `reference` 输出目录，`--inputs` 和按位置排序的 `--cases` 指定原 prompt 加 teacher token 的完整历史，`--logits` 指定原生分片目录，`--output` 保存 NLL、argmax 和 KL。`--baseline-logits` 可同时比较同权重基线。每个 case 使用单个 prefill packet；工具核对 prompt 和 teacher 身份、历史、分片长度及有限值。少量位置的概率对照用于诊断，任务质量与长上下文仍需单独验收。
 
 构建器引用原 checkpoint。离线 `prepare` 使用 NumPy、系统 C 编译器与 ARM NEON 8×8 转置，将 W4 bank、ND per-channel scale 和辅助 bias 写入物理布局文件。数值与尾部检查放在独立 CPU 测试，批量转换只执行 NEON 转置和顺序写盘。通过顺序 `pread` 读取单个专家，以有界 bank 缓冲写盘，避免对 ZFS 映射做逐字节转置。此转换保持原始 INT4 nibble，准备产物保留 W4，每卡在线仍只加载一份 W4；原 checkpoint 保留用于参考和其余张量。断点续转核对原文件的大小/mtime/inode、转换器身份、产物长度与完成标记；权重准备和在线加载均不扫描 payload 计算哈希。全部 bank 完成后原子发布准备计划，现有 AOT 与资产共享同一目录。加载前核对配置、tokenizer、Engram、AOT 库和绑定身份；设备分配使用大页优先策略及独立会话预算。
 

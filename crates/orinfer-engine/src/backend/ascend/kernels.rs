@@ -67,7 +67,20 @@ pub struct Spec {
     pub library: FileIdentity,
 }
 impl Spec {
+    pub fn row_capacity(&self) -> Result<Option<usize>> {
+        self.parameters
+            .get("_row_capacity")
+            .map(|v| {
+                v.as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|n| (2..=4096).contains(n))
+                    .ok_or_else(|| "Invalid AOT dynamic row capacity".into())
+            })
+            .transpose()
+    }
+
     pub fn validate(&self) -> Result<usize> {
+        self.row_capacity()?;
         self.target.validate()?;
         if self.schema_version != 1
             || self.target.backend != Backend::Ascend
@@ -108,6 +121,11 @@ impl Spec {
 }
 
 type Entry = unsafe extern "C" fn(*const Handle, u64, Handle) -> i32;
+type RowEntry = unsafe extern "C" fn(*const Handle, u64, u64, Handle) -> i32;
+enum Launch {
+    Static(Entry),
+    Rows(RowEntry),
+}
 
 /// One hash-verified AOT library with its validated manifest. Loading, hash
 /// and ABI checks happen once per unique manifest; instances only bind
@@ -116,7 +134,7 @@ pub struct Template {
     path: PathBuf,
     _library: Library,
     spec: Spec,
-    entry: Entry,
+    entry: Launch,
 }
 impl Template {
     pub fn load(session: &Session, manifest: &Path) -> Result<Rc<Self>> {
@@ -160,9 +178,19 @@ impl Template {
         }
         // SAFETY: Versioned C signature emitted by the offline compiler wrapper.
         let entry = unsafe {
-            *library
-                .get::<Entry>(b"orinfer_ascend_kernel_v1\0")
-                .map_err(|e| e.to_string())?
+            if spec.row_capacity()?.is_some() {
+                Launch::Rows(
+                    *library
+                        .get::<RowEntry>(b"orinfer_ascend_kernel_v2\0")
+                        .map_err(|e| e.to_string())?,
+                )
+            } else {
+                Launch::Static(
+                    *library
+                        .get::<Entry>(b"orinfer_ascend_kernel_v1\0")
+                        .map_err(|e| e.to_string())?,
+                )
+            }
         };
         Ok(Rc::new(Self {
             path: manifest,
@@ -174,12 +202,16 @@ impl Template {
     pub fn path(&self) -> &Path {
         &self.path
     }
+    pub fn spec(&self) -> &Spec {
+        &self.spec
+    }
 }
 struct Bound {
     context: Rc<Context>,
     template: Rc<Template>,
     buffers: Vec<Buffer>,
     pointers: Vec<Handle>,
+    rows: usize,
 }
 impl Bound {
     fn launch(&self, stream: Handle) -> Result<()> {
@@ -188,7 +220,17 @@ impl Bound {
         // Bound retains every allocation, native code and context to the fence.
         check(
             unsafe {
-                (self.template.entry)(self.pointers.as_ptr(), self.pointers.len() as u64, stream)
+                match self.template.entry {
+                    Launch::Static(entry) => {
+                        entry(self.pointers.as_ptr(), self.pointers.len() as u64, stream)
+                    }
+                    Launch::Rows(entry) => entry(
+                        self.pointers.as_ptr(),
+                        self.pointers.len() as u64,
+                        self.rows as u64,
+                        stream,
+                    ),
+                }
             },
             "launch TileLang Ascend kernel",
         )
@@ -256,7 +298,21 @@ impl Kernel {
     /// Binds an operand table to an already verified AOT template. The
     /// manifest is not re-read here; cache owners keep the template alive.
     pub fn bind(session: &Session, template: &Rc<Template>, buffers: &[Buffer]) -> Result<Self> {
+        let rows = template.spec.row_capacity()?.unwrap_or(1);
+        Self::bind_rows(session, template, buffers, rows)
+    }
+    /// Bind a real extent to one capacity-backed AOT template. Captured graphs
+    /// retain this immutable extent together with their operands and library.
+    pub fn bind_rows(
+        session: &Session,
+        template: &Rc<Template>,
+        buffers: &[Buffer],
+        rows: usize,
+    ) -> Result<Self> {
         let spec = &template.spec;
+        if rows == 0 || spec.row_capacity()?.is_some_and(|cap| rows > cap) {
+            return Err("AOT rows exceed the compiled capacity".into());
+        }
         if buffers.len() != spec.operands.len() {
             return Err("AOT operand count differs from the compiled ABI".into());
         }
@@ -279,6 +335,7 @@ impl Kernel {
                 template: Rc::clone(template),
                 buffers: buffers.to_vec(),
                 pointers: buffers.iter().map(Buffer::pointer).collect(),
+                rows,
             }),
         })
     }

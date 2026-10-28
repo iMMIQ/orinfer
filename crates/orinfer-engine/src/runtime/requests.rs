@@ -1251,10 +1251,12 @@ impl ModelRuntime {
                 .then_some(frame.tokens);
         }
         let remaining = Self::prefill_boundary(requests[i]) - requests[i].offset;
-        let shapes = std::iter::once(1).chain(self.manifest.prefill_plans.iter().filter_map(|p| {
-            let n = p.chunk_tokens.min(remaining);
-            p.accepts(n).then_some(n)
-        }));
+        let shapes = std::iter::once(1).chain(
+            self.manifest
+                .prefill_plans
+                .iter()
+                .filter_map(|p| p.chunk(remaining)),
+        );
         let fitting = shapes
             .filter(|&n| n <= remaining)
             .filter(|&n| {

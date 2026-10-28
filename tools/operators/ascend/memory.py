@@ -5,9 +5,28 @@ import math
 import tilelang.language as T
 
 
+def last_row(rows, width):
+    """Copy the actual last row from a capacity-backed dynamic activation."""
+    block = math.gcd(width, 256)
+
+    @T.prim_func
+    def main(
+        source: T.Tensor((rows, width), "bfloat16"),
+        out: T.Tensor((1, width), "bfloat16"),
+    ):
+        with T.Kernel(T.ceildiv(width // block, 2), is_npu=True) as (cid, vid):
+            value = T.alloc_ub((block,), "bfloat16")
+            column = (cid * 2 + vid) * block
+            if column < width:
+                T.copy(source[rows - 1, column : column + block], value)
+                T.copy(value, out[0, column : column + block])
+
+    return main
+
+
 def gather_quantized_rows(rows, table_rows, width):
     """Move one complete INT8 activation and its FP32 scale per owner."""
-    if width % 32 or not 0 < table_rows <= 2147483647:
+    if width % 32 or (isinstance(table_rows, int) and not 0 < table_rows <= 2147483647):
         raise ValueError("Quantized gather requires aligned width and positive table rows")
 
     @T.prim_func
@@ -64,7 +83,7 @@ def gather_columns(rows, width, ranks=8):
 
 
 def gather_rows(rows, table_rows, width, dtype="bfloat16", index_dtype="int64"):
-    if table_rows > 2147483647:
+    if isinstance(table_rows, int) and table_rows > 2147483647:
         raise ValueError("A2 row table exceeds signed 32-bit addressing")
     block = math.gcd(width, 256)
     blocks = width // block

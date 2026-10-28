@@ -244,6 +244,12 @@ pub(crate) fn is_zero(value: &usize) -> bool {
 }
 
 impl PrefillPlan {
+    /// Largest real segment accepted by this plan within the remaining input.
+    pub fn chunk(&self, remaining: usize) -> Option<usize> {
+        let tokens = remaining.min(self.chunk_tokens);
+        (tokens > 0 && self.accepts(tokens)).then_some(tokens)
+    }
+
     pub fn accepts(&self, tokens: usize) -> bool {
         tokens == self.chunk_tokens
             || (self.min_tokens > 0 && (self.min_tokens..=self.chunk_tokens).contains(&tokens))
@@ -986,6 +992,7 @@ mod branch_tests {
             variants: BTreeMap::new(),
         });
         for tokens in [1, 2, 17, 511, 512] {
+            assert_eq!(manifest.prefill_plans[0].chunk(tokens), Some(tokens));
             assert_eq!(
                 manifest.select_prefill_plan(tokens).unwrap(),
                 (tokens, "prefill", "head")
@@ -996,6 +1003,8 @@ mod branch_tests {
             (512, "prefill", "head")
         );
         assert!(manifest.select_prefill_plan(0).is_err());
+        assert_eq!(manifest.prefill_plans[0].chunk(0), None);
+        assert_eq!(manifest.prefill_plans[0].chunk(513), Some(512));
         let rows = manifest.row_execution.as_mut().unwrap();
         rows.capacity = 32768;
         rows.programs.insert("vision".into());

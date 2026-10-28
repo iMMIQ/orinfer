@@ -1,5 +1,6 @@
 use super::{Limits, Model, RootInfo, Session, SharedTables, Worker, load_spec, packet::Best};
 use crate::artifact::Result;
+use orinfer_model_sdk::model::PrefillPlan;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -19,8 +20,10 @@ struct Input {
     output_tokens: Option<usize>,
     repeats: Option<usize>,
     trace: Option<bool>,
+    prefill_chunk_tokens: Option<usize>,
 }
 enum Command {
+    Prepare(Vec<usize>),
     Reset,
     Forward {
         tokens: Vec<u32>,
@@ -39,6 +42,7 @@ pub struct Report {
     tensor_parallel: usize,
     capacity: usize,
     load_s: f64,
+    logits_dump: bool,
     requests: Vec<Request>,
     scope: &'static str,
 }
@@ -49,6 +53,7 @@ struct Request {
     input_tokens: usize,
     output_tokens: usize,
     tokens_sha256: String,
+    prefill_chunks: Vec<usize>,
     ttft_s: f64,
     prefill_tokens_per_s_from_ttft: f64,
     decode_s: f64,
@@ -76,6 +81,8 @@ pub fn run(
                 || c.tokens.iter().any(|&t| t >= 129280)
                 || c.output_tokens.unwrap_or(output_tokens) < 2
                 || c.repeats.unwrap_or(repeats) == 0
+                || c.prefill_chunk_tokens
+                    .is_some_and(|n| !(1..=4096).contains(&n))
                 || c.tokens
                     .len()
                     .checked_add(c.output_tokens.unwrap_or(output_tokens).max(16))
@@ -84,6 +91,11 @@ pub fn run(
     {
         return Err("Invalid input tokens or context capacity".into());
     }
+    let plans: Vec<_> = model.ranks[0]
+        .packets
+        .iter()
+        .map(|p| p.prefill_plan())
+        .collect();
     let ranks = std::mem::take(&mut model.ranks);
     if ranks.iter().enumerate().any(|(i, r)| r.rank != i as u32) {
         return Err("A2 ranks must be ordered 0..7".into());
@@ -138,6 +150,10 @@ pub fn run(
                 let mut history = vec![];
                 while let Ok(command) = commands.recv() {
                     let result = match command {
+                        Command::Prepare(rows) => rows
+                            .into_iter()
+                            .try_for_each(|n| worker.prepare_rows(n))
+                            .map(|_| None),
                         Command::Stop => {
                             worker.report_steps();
                             break;
@@ -181,7 +197,7 @@ pub fn run(
                 let trace = trace.filter(|_| input.trace != Some(false));
                 // Warm the same packet shapes and context extent, excluding
                 // weights, first-use registration and allocation from timing.
-                generate(&peers, input, 16, usize::MAX, trace)?;
+                generate(&peers, input, 16, usize::MAX, trace, &plans)?;
                 for repeat in 0..input.repeats.unwrap_or(repeats) {
                     let request = generate(
                         &peers,
@@ -189,6 +205,7 @@ pub fn run(
                         input.output_tokens.unwrap_or(output_tokens),
                         repeat,
                         trace,
+                        &plans,
                     )?;
                     eprintln!(
                         "{} r{} TTFT={:.4}s decode={:.3} token/s",
@@ -202,6 +219,7 @@ pub fn run(
                 tensor_parallel: 8,
                 capacity: model.capacity,
                 load_s,
+                logits_dump: std::env::var_os("ORINFER_A2_LOGITS_DIR").is_some(),
                 requests,
                 scope: "Complete 40-layer original-checkpoint native Rust/TileLang + ACLNN W4A8; single sequence, no prefix reuse or speculation; host submission and HCCL included",
             })
@@ -261,7 +279,32 @@ fn generate(
     output_tokens: usize,
     repeat: usize,
     trace: Option<&Path>,
+    plans: &[PrefillPlan],
 ) -> Result<Request> {
+    let mut chunks = vec![];
+    let mut remaining = input.tokens.len();
+    while remaining > 0 {
+        let rows = plans
+            .iter()
+            .filter_map(|p| {
+                p.chunk(remaining.min(input.prefill_chunk_tokens.unwrap_or(usize::MAX)))
+            })
+            .max()
+            .ok_or("No compatible prefill row template")?;
+        chunks.push(rows);
+        remaining -= rows;
+    }
+    let shapes = chunks
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    for peer in peers {
+        peer.send
+            .send(Command::Prepare(shapes.iter().copied().collect()))
+            .map_err(|e| e.to_string())?;
+    }
+    receive(peers)?;
+    // Shape registration/capture precedes reset: warmups may mutate C2 rings.
     for peer in peers {
         peer.send.send(Command::Reset).map_err(|e| e.to_string())?;
     }
@@ -269,12 +312,7 @@ fn generate(
     let start = Instant::now();
     let mut position = 0;
     let mut token = None;
-    while position < input.tokens.len() {
-        let rows = if input.tokens.len() - position >= 16 {
-            16
-        } else {
-            1
-        };
+    for &rows in &chunks {
         let end = position + rows;
         token = forward(
             peers,
@@ -305,5 +343,6 @@ fn generate(
         decode_tokens_per_s: (output_tokens - 1) as f64 / decode_s,
         e2e_s: start.elapsed().as_secs_f64(),
         output_token_ids: tokens,
+        prefill_chunks: chunks,
     })
 }

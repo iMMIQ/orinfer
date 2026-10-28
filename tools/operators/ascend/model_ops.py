@@ -7,6 +7,41 @@ import tilelang.language as T
 from tools.operators.ascend.vector_math import div_127_fp32, div_fp32_scalar, rsqrt_fp32
 
 
+def causal_indices(rows, capacity, ratio=1):
+    """Build the full-coverage causal index view on device from token positions."""
+    length = capacity // ratio
+    block = 128
+    tiles = (length + block - 1) // block
+
+    @T.prim_func
+    def main(
+        positions: T.Tensor((rows,), "int32"),
+        indices: T.Tensor((rows, length), "int32"),
+        lengths: T.Tensor((rows,), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(rows * tiles, 2), is_npu=True) as (cid, vid):
+            ids = T.alloc_ub((block,), "float32")
+            mask = T.alloc_ub((block // 8,), "uint8")
+            out = T.alloc_ub((block,), "int32")
+            length_value = T.alloc_ub((8,), "int32")
+            index = cid * 2 + vid
+            row, tile = index // tiles, index % tiles
+            if row < rows:
+                count = (positions[row] + 1) // ratio
+                T.tile.createvecindex(ids, T.float32(0.0))
+                T.tile.add(ids, ids, T.cast(tile * block, "float32"))
+                T.tile.compare(mask, ids, T.cast(count, "float32"), "LT")
+                T.tile.select(ids, mask, ids, -1.0, "VSEL_TENSOR_SCALAR_MODE")
+                T.tile.cast(out, ids, "CAST_RINT", block)
+                valid = T.min(block, length - tile * block)
+                T.copy(out[:valid], indices[row, tile * block : tile * block + valid])
+                if tile == 0:
+                    length_value[0] = count
+                    T.copy(length_value[:1], lengths[row : row + 1])
+
+    return main
+
+
 def norm(rows, width, eps=1e-20):
     @T.prim_func
     def main(
@@ -160,7 +195,7 @@ def convert(rows, width, source_dtype, destination_dtype, scale=1.0):
     return main
 
 
-def partial_rope(rows, heads, dimension, inverse=False):
+def partial_rope(rows, heads, dimension, inverse=False, vector_indices=True):
     rotary, half = 64, 32
     sign = -1.0 if inverse else 1.0
 
@@ -182,6 +217,9 @@ def partial_rope(rows, heads, dimension, inverse=False):
             product = T.alloc_ub((half,), "float32")
             result = T.alloc_ub((2, half), "float32")
             offsets = T.alloc_ub((rotary,), "uint32")
+            lane = T.alloc_ub((rotary,), "float32")
+            half_index = T.alloc_ub((rotary,), "float32")
+            floor_index = T.alloc_ub((rotary,), "int32")
             y = T.alloc_ub((rotary,), "bfloat16")
             index = cid * 2 + vid
             row = index // heads
@@ -201,8 +239,21 @@ def partial_rope(rows, heads, dimension, inverse=False):
                 T.tile.mul(result[1, :], odd, co)
                 T.tile.mul(product, even, si)
                 T.tile.add(result[1, :], result[1, :], product)
-                for i in T.Parallel(rotary):
-                    offsets[i] = T.cast((i % 2 * half + i // 2) * 4, "uint32")
+                if vector_indices:
+                    T.tile.createvecindex(lane, 0.0)
+                    T.tile.mul(half_index, lane, 0.5)
+                    T.tile.cast(floor_index, half_index, "CAST_FLOOR", rotary)
+                    T.tile.cast(half_index, floor_index, "CAST_NONE", rotary)
+                    T.tile.mul(a, half_index, 2.0)
+                    T.tile.sub(lane, lane, a)
+                    T.tile.mul(lane, lane, float(half))
+                    T.tile.add(lane, lane, half_index)
+                    T.tile.mul(lane, lane, 4.0)
+                    T.tile.cast(floor_index, lane, "CAST_RINT", rotary)
+                    T.reinterpretcast(offsets, floor_index, "uint32_t")
+                else:
+                    for i in T.Parallel(rotary):
+                        offsets[i] = T.cast((i % 2 * half + i // 2) * 4, "uint32")
                 T.tile.gather(a, result, offsets, 0)
                 T.tile.cast(y, a, "CAST_RINT", rotary)
                 T.copy(source[: dimension - rotary], out[row, head, : dimension - rotary])
@@ -243,8 +294,16 @@ def gather_attention(rows, capacity, compressed_capacity, compressed=True):
                         if source >= 0 and source < compressed_capacity:
                             T.copy(long_kv[source, :], values)
                             flag[0] = 0
+                T.set_flag("S", "MTE3", 6)
+                T.wait_flag("S", "MTE3", 6)
                 T.copy(values, out[row, slot, :])
                 T.copy(flag[:1], mask[row, slot : slot + 1])
+                # A bounded physical block handles successive query rows.
+                # Both producers must wait until DMA has consumed their UB.
+                T.set_flag("MTE3", "V", 7)
+                T.wait_flag("MTE3", "V", 7)
+                T.set_flag("MTE3", "S", 7)
+                T.wait_flag("MTE3", "S", 7)
 
     return main
 

@@ -10,12 +10,20 @@ def row_count(capacity, dynamic=False):
         return capacity
     if type(capacity) is not int or capacity < 1:
         raise ValueError("Invalid symbolic row capacity")
-    return T.dynamic("m")
+    if hasattr(T, "dynamic"):
+        return T.dynamic("m")
+    # TileLang-Ascend's pinned frontend uses the same free shape scalar,
+    # before the CUDA frontend introduced T.dynamic.
+    from tilelang import tvm
+
+    return tvm.tir.Var("m", "int32")
 
 
 def explicit_rows(function):
     """Keep m in the exported host ABI, including affine-only tensor shapes."""
-    from tvm import tirx as tir
+    from tilelang import tvm
+
+    tir = getattr(tvm, "tirx", None) or tvm.tir
 
     variables = set()
 

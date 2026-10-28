@@ -14,6 +14,21 @@ import tempfile
 import numpy as np
 
 
+def validate_hadamard32(rotation):
+    """Require the exact uniform signed Walsh bank used by the fast kernel."""
+    matrix = np.asarray(rotation, dtype=np.float32)
+    if matrix.shape != (32, 32) or not np.isfinite(matrix).all() or matrix[0, 0] <= 0:
+        raise ValueError("Expected a finite 32x32 signed Walsh rotation")
+    walsh = np.array(
+        [[(-1) ** ((i & j).bit_count()) for j in range(32)] for i in range(32)],
+        dtype=np.float32,
+    )
+    if not (
+        np.all(np.abs(matrix) == matrix[0, 0]) and np.array_equal(matrix, matrix[:, :1] * walsh)
+    ):
+        raise ValueError("Fast Engram requires uniform signed Walsh rows in canonical order")
+
+
 def next_prime(start, seen):
     candidate = start + 1
     while True:

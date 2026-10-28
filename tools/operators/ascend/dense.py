@@ -5,13 +5,16 @@ import math
 import tilelang.language as T
 
 
-def projection(rows, output, reduction, integer=False, block_k=128, tile_n=64):
+def projection(rows, output, reduction, integer=False, block_k=128, tile_n=64, tile_m=16):
     alignment = 32 if integer else 128
-    if rows < 1 or output % 32 or reduction % alignment:
+    if (isinstance(rows, int) and rows < 1) or output % 32 or reduction % alignment:
         raise ValueError("A2 projection requires positive rows and aligned N/K")
     if tile_n not in (32, 64, 128, 256):
         raise ValueError("A2 projection N tile must be 32, 64, 128 or 256")
-    block_m, block_n = 16, math.gcd(output, tile_n)
+    if tile_m not in (16, 32, 64):
+        raise ValueError("A2 projection M tile must be 16, 32 or 64")
+    block_m, block_n = tile_m, math.gcd(output, tile_n)
+    vector_m = block_m // 2
     if block_n * 128 * (1 if integer else 2) > 32768:
         raise ValueError("A2 projection B tile exceeds the L0B ping-pong slot")
     legal_k = 0 < block_k <= 512 and block_k % alignment == 0
@@ -58,19 +61,21 @@ def projection(rows, output, reduction, integer=False, block_k=128, tile_n=64):
                 )
                 T.set_cross_flag("FIX", 0)
             with T.Scope("V"):
-                raw = T.alloc_ub((8, block_n), accum_dtype)
-                accumulator = T.alloc_ub((8, block_n), "float32")
-                sa = T.alloc_ub((8, 1), "float32")
+                raw = T.alloc_ub((vector_m, block_n), accum_dtype)
+                accumulator = T.alloc_ub((vector_m, block_n), "float32")
+                sa = T.alloc_ub((vector_m, 1), "float32")
                 sw = T.alloc_ub((1, block_n), "float32")
-                broadcast = T.alloc_ub((8, block_n), "float32")
-                y = T.alloc_ub((8, block_n), "bfloat16")
-                start = bm * block_m + vid * 8
+                broadcast = T.alloc_ub((vector_m, block_n), "float32")
+                y = T.alloc_ub((vector_m, block_n), "bfloat16")
+                start = bm * block_m + vid * vector_m
                 T.wait_cross_flag(0)
                 if start < rows:
-                    valid = T.min(8, rows - start)
-                    T.copy(workspace[start : start + 8, bn * block_n : (bn + 1) * block_n], raw)
+                    valid = T.min(vector_m, rows - start)
+                    T.copy(
+                        workspace[start : start + vector_m, bn * block_n : (bn + 1) * block_n], raw
+                    )
                     if integer:
-                        T.tile.cast(accumulator, raw, "CAST_RINT", 8 * block_n)
+                        T.tile.cast(accumulator, raw, "CAST_RINT", vector_m * block_n)
                     else:
                         T.copy(raw, accumulator)
                     T.tile.fill(sa, 0.0)
@@ -80,7 +85,7 @@ def projection(rows, output, reduction, integer=False, block_k=128, tile_n=64):
                     T.tile.mul(accumulator, accumulator, broadcast)
                     T.tile.broadcast(broadcast, sw)
                     T.tile.mul(accumulator, accumulator, broadcast)
-                    T.tile.cast(y, accumulator, "CAST_RINT", 8 * block_n)
+                    T.tile.cast(y, accumulator, "CAST_RINT", vector_m * block_n)
                     T.copy(
                         y[:valid, :], out[start : start + valid, bn * block_n : (bn + 1) * block_n]
                     )

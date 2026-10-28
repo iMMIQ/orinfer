@@ -62,19 +62,34 @@ struct View {
     parent: String,
     offset: usize,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Packet {
     rows: usize,
+    #[serde(default)]
+    min_rows: usize,
     coordinates: packet::Coordinates,
     body: Vec<Instruction>,
     head: Vec<Instruction>,
     reset: Vec<String>,
     best_value: String,
     best_index: String,
+    logits: Option<String>,
     vocab_first: u32,
 }
-#[derive(Deserialize)]
+impl Packet {
+    fn prefill_plan(&self) -> orinfer_model_sdk::model::PrefillPlan {
+        orinfer_model_sdk::model::PrefillPlan {
+            chunk_tokens: self.rows,
+            min_tokens: self.min_rows,
+            prefill_program: "prefill".into(),
+            head_program: "head".into(),
+            stages: vec![],
+            live_buffers: vec![],
+        }
+    }
+}
+#[derive(Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Instruction {
     Fork,
@@ -234,6 +249,9 @@ struct Worker {
     buffers: BTreeMap<String, Buffer>,
     w4: BTreeMap<String, Rc<GroupedW4A8>>,
     packets: BTreeMap<usize, Rc<Execution>>,
+    packet_templates: Vec<Packet>,
+    package: PathBuf,
+    snapshots: bool,
     checkpoint: Checkpoint,
     hasher: Hasher,
     tables: Arc<BTreeMap<usize, SharedInt8Rows>>,
@@ -542,6 +560,9 @@ impl Worker {
             buffers,
             w4: BTreeMap::new(),
             packets: BTreeMap::new(),
+            packet_templates: rank.packets.clone(),
+            package: package.to_owned(),
+            snapshots,
             checkpoint,
             hasher: Hasher::new(layout)?,
             tables,
@@ -553,8 +574,10 @@ impl Worker {
             steps: BTreeMap::new(),
         };
         for packet in rank.packets {
-            let body = worker.compile(&packet.body, package, snapshots)?;
-            let head = worker.compile(&packet.head, package, snapshots)?;
+            let body =
+                worker.compile(&packet.body, package, snapshots, (packet.rows, packet.rows))?;
+            let head =
+                worker.compile(&packet.head, package, snapshots, (packet.rows, packet.rows))?;
             if worker
                 .packets
                 .insert(packet.rows, Rc::new(Execution { packet, body, head }))
@@ -593,7 +616,17 @@ impl Worker {
         instructions: &[Instruction],
         base: &Path,
         snapshots: bool,
+        extent: (usize, usize),
     ) -> Result<Vec<Step>> {
+        let (capacity, actual) = extent;
+        let scaled = |n: usize| -> Result<usize> {
+            if capacity == 0 || !n.is_multiple_of(capacity) {
+                return Err("Packet row expression differs from capacity".into());
+            }
+            (n / capacity)
+                .checked_mul(actual)
+                .ok_or_else(|| "Packet row extent overflow".into())
+        };
         branches::validate_instructions(instructions)?;
         let mut steps = vec![];
         let mut pending: Vec<SegmentOp> = vec![];
@@ -652,11 +685,13 @@ impl Worker {
                     }
                 };
                 let t = Instant::now();
-                pending.push(SegmentOp::Kernel(Kernel::bind(
-                    &self.session,
-                    &template,
-                    &operands,
-                )?));
+                pending.push(SegmentOp::Kernel(
+                    if template.spec().row_capacity()?.is_some() {
+                        Kernel::bind_rows(&self.session, &template, &operands, actual)?
+                    } else {
+                        Kernel::bind(&self.session, &template, &operands)?
+                    },
+                ));
                 self.phases.binds.0 += 1;
                 self.phases.binds.1 += t.elapsed().as_secs_f64();
                 continue;
@@ -675,11 +710,13 @@ impl Worker {
                 } else {
                     Element::Bfloat16
                 };
-                self.check_reduce(&source, &destination, *elements, element)?;
+                let elements =
+                    scaled(usize::try_from(*elements).map_err(|_| "Reduce size overflow")?)? as u64;
+                self.check_reduce(&source, &destination, elements, element)?;
                 pending.push(SegmentOp::Reduce {
                     source,
                     destination,
-                    elements: *elements,
+                    elements,
                     element,
                 });
                 continue;
@@ -700,12 +737,14 @@ impl Worker {
                 };
                 self.session.require(&source)?;
                 self.session.require(&destination)?;
+                let elements =
+                    scaled(usize::try_from(*elements).map_err(|_| "Gather size overflow")?)? as u64;
                 let bytes = elements
                     .checked_mul(element.bytes())
                     .ok_or("Model gather extent overflow")?;
                 let output = bytes.checked_mul(8).ok_or("Model gather output overflow")?;
                 if source.overlaps(&destination)
-                    || *elements == 0
+                    || elements == 0
                     || bytes > source.bytes() as u64
                     || output > destination.bytes() as u64
                 {
@@ -714,7 +753,7 @@ impl Worker {
                 pending.push(SegmentOp::Gather {
                     source,
                     destination,
-                    elements: *elements,
+                    elements,
                     element,
                 });
                 continue;
@@ -730,12 +769,21 @@ impl Worker {
                 groups,
             } = instruction
             {
-                let b = buffers
+                let mut b = buffers
                     .iter()
                     .map(|n| get(&self.buffers, n))
                     .collect::<Result<Vec<_>>>()?;
+                let rows = scaled(*rows)?;
+                let input_bytes = rows.checked_mul(*input).ok_or("W4 input extent overflow")?;
+                let output_bytes = rows
+                    .checked_mul(*output)
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or("W4 output extent overflow")?;
+                for (slot, bytes) in [(0, input_bytes), (4, rows * 4), (5, output_bytes)] {
+                    b[slot] = b[slot].slice(0, bytes)?;
+                }
                 let mut ends = vec![0; *experts];
-                *ends.last_mut().ok_or("Empty W4 expert bank")? = *rows as i64;
+                *ends.last_mut().ok_or("Empty W4 expert bank")? = rows as i64;
                 let counts = match groups {
                     Some(name) => Some(get(&self.buffers, name)?),
                     None => None,
@@ -746,7 +794,7 @@ impl Worker {
                 let plan = Rc::new(GroupedW4A8::prepare_with_workspace(
                     &self.session,
                     GroupedShape {
-                        rows: *rows,
+                        rows,
                         input: *input,
                         output: *output,
                         experts: *experts,
@@ -765,7 +813,12 @@ impl Worker {
                 )?);
                 self.phases.aclnn.0 += 1;
                 self.phases.aclnn.1 += t.elapsed().as_secs_f64();
-                if self.w4.insert(name.clone(), Rc::clone(&plan)).is_some() {
+                let name = if capacity == actual {
+                    name.clone()
+                } else {
+                    format!("{name}/rows/{actual}")
+                };
+                if self.w4.insert(name, Rc::clone(&plan)).is_some() {
                     return Err("Duplicate W4 binding".into());
                 }
                 // W4 graph nodes use the same stream-ordered scratch as direct
@@ -980,14 +1033,31 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                 }
             }
         }
-        if rank.packets.len() != 2 {
-            return Err("Expected single-row decode and 16-row prefill packets".into());
+        if rank.packets.len() != 2 || rank.packets[0].rows != 1 || rank.packets[0].min_rows != 0 {
+            return Err("Expected single-row decode and one prefill template".into());
+        }
+        if rank
+            .packets
+            .iter()
+            .map(|p| (p.rows, p.min_rows))
+            .collect::<Vec<_>>()
+            != model.ranks[0]
+                .packets
+                .iter()
+                .map(|p| (p.rows, p.min_rows))
+                .collect::<Vec<_>>()
+        {
+            return Err("TP ranks have different row contracts".into());
         }
         for packet in &rank.packets {
             branches::validate_instructions(&packet.body)?;
             branches::validate_instructions(&packet.head)?;
-            if ![1, 16].contains(&packet.rows) {
-                return Err("Unsupported packet row count".into());
+            if packet.rows == 0
+                || packet.rows > 4096
+                || packet.rows > model.capacity
+                || (packet.min_rows != 0 && (packet.min_rows != 2 || packet.rows < 2))
+            {
+                return Err("Invalid packet row capacity".into());
             }
             let layers = packet
                 .body
@@ -1021,6 +1091,12 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                         kernels.insert(manifest.clone(), spec);
                     }
                     let spec = &kernels[manifest];
+                    if spec
+                        .row_capacity()?
+                        .is_some_and(|cap| packet.min_rows == 0 || cap != packet.rows)
+                    {
+                        return Err("Packet/AOT dynamic row capacities differ".into());
+                    }
                     if bindings.len() != spec.operands.len() {
                         return Err("Packet/AOT operand count differs".into());
                     }

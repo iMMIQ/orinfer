@@ -122,6 +122,46 @@ impl Fixture {
 }
 
 #[test]
+fn aot_dynamic_rows_bind_real_extent_and_preserve_tail() {
+    use super::kernels::{Kernel, Template};
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let (path, mut spec) = fixture.aot();
+    spec.parameters.insert("_row_capacity".into(), 4.into());
+    let descriptor =
+        std::ffi::CString::new(serde_json::to_string(&spec.identity()).unwrap()).unwrap();
+    // SAFETY: The fixture copies the descriptor, as in Fixture::aot.
+    unsafe {
+        fixture
+            .library
+            .get::<unsafe extern "C" fn(*const std::ffi::c_char)>(b"test_kernel_contract\0")
+            .unwrap()(descriptor.as_ptr());
+    }
+    std::fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let template = Template::load(&session, &path).unwrap();
+    let input = session.allocate(4).unwrap();
+    let output = session.allocate(4).unwrap();
+    let buffers = [input.clone(), output.clone()];
+    assert!(Kernel::bind_rows(&session, &template, &buffers, 0).is_err());
+    assert!(Kernel::bind_rows(&session, &template, &buffers, 5).is_err());
+    for rows in [1, 3, 4] {
+        let kernel = Kernel::bind_rows(&session, &template, &buffers, rows).unwrap();
+        session
+            .upload(&input, 0, &[1, 2, 3, 4])
+            .unwrap()
+            .wait()
+            .unwrap();
+        session.upload(&output, 0, &[9; 4]).unwrap().wait().unwrap();
+        kernel.enqueue(&session).unwrap().wait().unwrap();
+        let actual = session.download(&output, 0, 4).unwrap();
+        assert_eq!(&actual[..rows], &[1, 2, 3, 4][..rows]);
+        assert_eq!(&actual[rows..], &vec![9; 4 - rows]);
+    }
+    drop((template, buffers, input, output, session));
+    fixture.assert_clean();
+}
+
+#[test]
 fn aot_binding_rejects_foreign_buffers_aliases_and_tampered_contract() {
     use super::kernels::Kernel;
     let mut fixture = Fixture::new();
