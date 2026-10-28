@@ -1,4 +1,6 @@
-use super::{Limits, Model, RootInfo, Session, SharedTables, Worker, load_spec, packet::Best};
+use super::{
+    Limits, Model, RootInfo, Session, SharedTables, Worker, affinity, load_spec, packet::Best,
+};
 use crate::artifact::Result;
 use orinfer_model_sdk::model::PrefillPlan;
 use serde::{Deserialize, Serialize};
@@ -43,6 +45,8 @@ pub struct Report {
     capacity: usize,
     load_s: f64,
     logits_dump: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_cpus: Option<Vec<Vec<usize>>>,
     requests: Vec<Request>,
     scope: &'static str,
 }
@@ -100,6 +104,7 @@ pub fn run(
     if ranks.iter().enumerate().any(|(i, r)| r.rank != i as u32) {
         return Err("A2 ranks must be ordered 0..7".into());
     }
+    let worker_cpus = affinity::from_env(ranks.len())?;
     let load = Instant::now();
     let bootstrap = Session::new(0, Limits::default())?;
     let root = RootInfo::new(&bootstrap, 8)?;
@@ -110,6 +115,9 @@ pub fn run(
         let model_ref: &Model = &model;
         let shared_tables = &shared_tables;
         for rank in ranks {
+            let cpus = worker_cpus
+                .as_ref()
+                .map(|all| all[rank.rank as usize].clone());
             let (send, commands) = mpsc::channel();
             let (reply, receive) = mpsc::channel();
             let root = root.clone();
@@ -117,6 +125,9 @@ pub fn run(
             let package = &package;
             handles.push(scope.spawn(move || {
                 let loaded = (|| {
+                    if let Some(cpus) = cpus.as_deref() {
+                        affinity::apply(cpus)?;
+                    }
                     let session = Session::new(
                         rank.rank,
                         Limits {
@@ -220,6 +231,7 @@ pub fn run(
                 capacity: model.capacity,
                 load_s,
                 logits_dump: std::env::var_os("ORINFER_A2_LOGITS_DIR").is_some(),
+                worker_cpus,
                 requests,
                 scope: "Complete 40-layer original-checkpoint native Rust/TileLang + ACLNN W4A8; single sequence, no prefix reuse or speculation; host submission and HCCL included",
             })

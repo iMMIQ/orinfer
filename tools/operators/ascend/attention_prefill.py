@@ -3,9 +3,11 @@
 import tilelang.language as T
 
 
-def selected_mask(rows, length, selected=512):
+def selected_mask(rows, length, selected=512, explicit_sync=False, store_unroll=1):
     if length % 128:
         raise ValueError("Dense prefill attention requires a 128-aligned KV bank")
+    if store_unroll not in (1, 8, 16, 32) or selected < 1 or selected % store_unroll:
+        raise ValueError("Mask stores require complete groups of 1/8/16/32 indices")
 
     @T.prim_func
     def main(
@@ -23,17 +25,19 @@ def selected_mask(rows, length, selected=512):
                 T.wait_flag("MTE2", "S", 6)
                 T.set_flag("V", "S", 6)
                 T.wait_flag("V", "S", 6)
-                for i in T.serial(selected):
-                    key = ids[i]
-                    if key >= 0 and key < length:
-                        values[key] = 1
+                for group in T.serial(selected // store_unroll):
+                    for lane in T.unroll(store_unroll):
+                        key = ids[group * store_unroll + lane]
+                        if key >= 0 and key < length:
+                            values[key] = 1
                 T.set_flag("S", "MTE3", 6)
                 T.wait_flag("S", "MTE3", 6)
                 T.copy(values, mask[row, :])
                 T.set_flag("MTE3", "V", 7)
                 T.wait_flag("MTE3", "V", 7)
 
-    return main
+    # All transfers, Scalar stores and UB reuse have paired flags above.
+    return main.with_attr("orinfer.explicit_sync", True) if explicit_sync else main
 
 
 def qk(rows, capacity, ratio=2, compressed=True, heads=8, dimension=512, windowed=True):

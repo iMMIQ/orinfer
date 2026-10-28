@@ -115,6 +115,9 @@ def compile_kernel(
         # compiler tensor geometry while retaining the checked physical span.
         spec["shape"] = shape
     stages = split_resources(function) if row_capacity is not None else [function]
+    explicit_sync = bool(function.attrs and function.attrs.get("orinfer.explicit_sync", False))
+    if explicit_sync and len(stages) != 1:
+        raise ValueError("Explicit pipeline synchronization requires a single native stage")
     if row_capacity is not None:
         stages = [bounded_grid(stage, grid_limit) for stage in stages]
     compiler = {
@@ -126,6 +129,8 @@ def compile_kernel(
         "scalar_cache": "entry-invalidate-exit-clean-v1",
         "cube_launch": "independent-aic-v1",
     }
+    if explicit_sync:
+        compiler["pipeline_sync"] = "explicit-v1"
     module = Path(__file__).with_name(name.split(".")[0] + ".py")
     # Production names identify the source module. Include its inlined math
     # and the shared compiler/file helpers; unrelated operators have independent
@@ -168,7 +173,7 @@ def compile_kernel(
             raise ValueError("AOT cache library hash differs")
         return output / "kernel.json"
     configs = {
-        tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
+        tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: not explicit_sync,
         tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
         tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
         tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,

@@ -1,4 +1,5 @@
 //! Original-checkpoint single-sequence A2 execution and latency measurements.
+mod affinity;
 mod benchmark;
 mod branches;
 mod packet;

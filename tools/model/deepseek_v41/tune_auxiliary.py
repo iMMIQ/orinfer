@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--sinkhorn-only", action="store_true")
     parser.add_argument("--reuse-operand-only", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
+    parser.add_argument("--mask-only", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     args = parser.parse_args()
@@ -38,6 +39,7 @@ def main():
                 args.sinkhorn_only,
                 args.reuse_operand_only,
                 args.quantize_only,
+                args.mask_only,
             )
         )
         > 1
@@ -48,7 +50,7 @@ def main():
     from kernels.model.rows import row_count
     from tools.model.deepseek_v41.floating import bf16_parts
     from tools.model.deepseek_v41.tune import file_hash_bytes, npu_benchmark, read_weight
-    from tools.operators.ascend import dense, floating, model_ops, moe, vector
+    from tools.operators.ascend import attention_prefill, dense, floating, model_ops, moe, vector
     from tools.operators.ascend.build import compile_kernel
 
     torch.set_num_threads(4)
@@ -87,6 +89,7 @@ def main():
                 "model_ops.convert",
                 "vector.mhc_split_sinkhorn",
                 "vector.quantize",
+                "attention_prefill.selected_mask",
             ):
                 continue
             if (kind == "floating.split") != args.split_only:
@@ -96,6 +99,8 @@ def main():
             if (kind == "vector.mhc_split_sinkhorn") != args.sinkhorn_only:
                 continue
             if (kind == "vector.quantize") != args.quantize_only:
+                continue
+            if (kind == "attention_prefill.selected_mask") != args.mask_only:
                 continue
             if kind == "vector.quantize" and manifest["parameters"]["width"] > 256:
                 continue
@@ -125,7 +130,24 @@ def main():
             capacity = params.pop("_row_capacity")
             grid_limit = params.pop("_grid_limit", 64)
             row_factor = 1
-            if kind == "vector.quantize":
+            if kind == "attention_prefill.selected_mask":
+                baseline_config = dict(
+                    explicit_sync=params.get("explicit_sync", False),
+                    store_unroll=params.get("store_unroll", 1),
+                )
+                configs = [baseline_config] + [
+                    dict(explicit_sync=explicit, store_unroll=unroll)
+                    for explicit, unroll in (
+                        (False, 1),
+                        (True, 1),
+                        (True, 8),
+                        (True, 16),
+                        (True, 32),
+                    )
+                    if dict(explicit_sync=explicit, store_unroll=unroll) != baseline_config
+                ]
+                factory = attention_prefill.selected_mask
+            elif kind == "vector.quantize":
                 row_factor, remainder = divmod(params["rows"], capacity)
                 if remainder or row_factor < 1:
                     raise ValueError("Quantization rows must have the packet row multiplier")
@@ -238,13 +260,18 @@ def main():
                 identity["weight_sha256"] = file_hash_bytes(weight)
 
             def valid(record):
+                expected_compiler = dict(descriptor["compiler"])
+                if kind == "attention_prefill.selected_mask":
+                    expected_compiler.pop("pipeline_sync", None)
+                    if record["config"]["explicit_sync"]:
+                        expected_compiler["pipeline_sync"] = "explicit-v1"
                 paths_to_check = [record["manifest"]]
                 if record.get("reducer_manifest"):
                     paths_to_check.append(record["reducer_manifest"])
                 for relative in paths_to_check:
                     path = base / relative
                     spec = json.loads(path.read_text())
-                    if spec["compiler"] != descriptor["compiler"] or spec["library"][
+                    if spec["compiler"] != expected_compiler or spec["library"][
                         "sha256"
                     ] != file_hash(path.parent / "kernel.so"):
                         return False
@@ -306,6 +333,8 @@ def main():
                 )
             if weight is not None:
                 tensors[1].copy_(weight)
+            if kind == "attention_prefill.selected_mask":
+                tensors[0].random_(-2, params["length"] + 2)
             expected = [torch.empty_like(tensors[i]) for i in outputs]
             reference_tensors = list(tensors)
             for slot, out in zip(outputs, expected, strict=True):
@@ -562,6 +591,8 @@ def main():
                 manifest=chosen,
                 reducer_manifest=reducer_manifest,
             )
+            if not valid(result):
+                raise ValueError("Selected auxiliary kernel identity differs")
             atomic_json(record, result)
             replacements[step["manifest"]] = chosen
             print(dict(op=kind, **result), flush=True)
