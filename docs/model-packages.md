@@ -505,9 +505,11 @@ orinfer serve artifacts/models/dsv41-a2-service --model deepseek-v41-flash-1017-
 ```bash
 bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.private_schedule \
   --plan /path/to/native-batch/model.json --output artifacts/a2-kv-schedule \
-  --operator kv_int8.gather_attention --parameters '{"tile_slots":16}'
+  --operator kv_int8.gather_attention --parameters '{"tile_slots":16,"bulk_store":true}'
 ```
 
 该入口复用 `batch.compile_task` 与 `private_rows`，检查输入／输出 dtype、owner 指针列序和物理字节范围，生成新的 work 表及最终资产。`--min-owner-rows N` 沿现有 owner range 契约保留更短 owner 的原绑定；decode 程序及权重保持已验证的编译资产。`gather_attention` 的 1／4／8／16 slot 配置共享整数读取后的 FP16／FP32 转换、scale 广播及 BF16 输出边界，按离线测量选定配置后发布。`validate_private_rows --op kv_int8.gather_attention --rows 1 17 128` 对照独立参考，并检查无效索引、环形 SWA、反向 owner、非对齐尾部及修改 KV／scale 后的 Graph replay。
+
+`bulk_store:true` 使用与下游 attention 一致的连续 512 维视图，一次写回整个 slot tile，合并逐 slot 的输出等待与拷贝。`validate_private_rows` 加 `--bulk-store` 验证此调度，并覆盖 FP16 scale 的零值、次正规值及极值。完整模型的 prefix 恢复诊断覆盖 17、129、2049 和 8193 token，包含环形 SWA 跨界后的 owner 迁移。
 
 `bench-ascend-batch` 的显式 `frames` 可携带 `decode:true` 和固定 token 历史；阶段时间与 decode 输出计数跟随 frame 角色。比较 decode 调度时保持相同输入历史，并单独保留自由生成结果。

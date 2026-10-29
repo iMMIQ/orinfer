@@ -14,6 +14,7 @@ def main():
     p.add_argument("--owners", type=int, default=3)
     p.add_argument("--rows", type=int, nargs="+", help="Owner row lengths for KV gather checks")
     p.add_argument("--kv-compressed", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--bulk-store", action="store_true")
     p.add_argument("--op", nargs="+", help="Restrict validation to named primitive families")
     a = p.parse_args()
     if not 1 <= a.owners <= 128:
@@ -65,6 +66,7 @@ def main():
                     compressed=compressed,
                     swa_storage_rows=256,
                     tile_slots=tile,
+                    bulk_store=a.bulk_store,
                 ),
             )
             for compressed in (False, True)
@@ -199,6 +201,11 @@ def main():
                     v = torch.full(shape, 17, dtype=dtype)
                 elif dtype.is_floating_point:
                     v = (torch.randn(shape) * 0.25).to(dtype)
+                    if tensor.name in ("swa_scales", "long_scales"):
+                        v.flatten()[:8] = torch.tensor(
+                            [0, 2**-24, 2**-14, 65504, -(2**-24), -65504, 0.125, 1],
+                            dtype=dtype,
+                        )
                 elif name == "gather_attention" and dtype == torch.int8:
                     v = torch.randint(-127, 128, shape, dtype=dtype)
                 else:
@@ -310,7 +317,7 @@ def main():
                         decoded.append(values)
                         masks.append(torch.where(valid, 0, -1).int())
                     actual = data[owner][by_name["out"]][:length].cpu()
-                    wanted = torch.cat(decoded, 1)
+                    wanted = torch.cat(decoded, 1).reshape(actual.shape)
                     if not torch.equal(actual, wanted):
                         locations = (actual != wanted).nonzero()[:8]
                         print(

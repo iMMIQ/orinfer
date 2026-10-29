@@ -155,7 +155,13 @@ def decode_prefix(rows, capacity, ratio=1, windowed=False):
 
 
 def gather_attention(
-    rows, capacity, compressed_capacity, compressed=True, swa_storage_rows=0, tile_slots=1
+    rows,
+    capacity,
+    compressed_capacity,
+    compressed=True,
+    swa_storage_rows=0,
+    tile_slots=1,
+    bulk_store=False,
 ):
     """Gather cache rows and decode groups using one shared quantization body.
 
@@ -180,7 +186,7 @@ def gather_attention(
         long_scales: T.Tensor((compressed_capacity, 8), "float16"),
         swa_indices: T.Tensor((rows, 128), "int32"),
         long_indices: T.Tensor((rows, 512), "int32"),
-        out: T.Tensor((rows, selected, 8, 64), "bfloat16"),
+        out: T.Tensor((rows, selected, 512), "bfloat16"),
         mask: T.Tensor((rows, selected), "int32"),
     ):
         with T.Kernel(T.ceildiv(rows * tiles, 2), is_npu=True) as (cid, vid):
@@ -191,12 +197,13 @@ def gather_attention(
             half_scales = T.alloc_ub((groups, 1), "float16")
             scale = T.alloc_ub((groups, 1), "float32")
             broadcast = T.alloc_ub((groups, 64), "float32")
-            y = T.alloc_ub((groups, 64), "bfloat16")
+            y = T.alloc_ub((tile_slots, 512), "bfloat16")
             flag = T.alloc_ub((max(8, tile_slots),), "int32")
             flat = cid * 2 + vid
             row, first = flat // tiles, flat % tiles * tile_slots
             if row < rows:
-                T.tile.fill(y, 0.0)
+                if tile_slots == 1 or not bulk_store:
+                    T.tile.fill(y, 0.0)
                 if tile_slots > 1:
                     T.reinterpretcast(q, zeros, "int8_t")
                     T.tile.fill(zeros, 0)
@@ -248,8 +255,11 @@ def gather_attention(
                                 flag[lane] = 0
                 if tile_slots > 1:
                     decode_values(q, half_values, values, half_scales, scale, broadcast, y, groups)
-                for lane in T.serial(tile_slots):
-                    T.copy(y[lane * 8 : (lane + 1) * 8, :], out[row, first + lane, :, :])
+                if bulk_store:
+                    T.copy(y, out[row, first : first + tile_slots, :])
+                else:
+                    for lane in T.serial(tile_slots):
+                        T.copy(y[lane, :], out[row, first + lane, :])
                 T.copy(flag[:tile_slots], mask[row, first : first + tile_slots])
                 T.pipe_barrier("ALL")
 

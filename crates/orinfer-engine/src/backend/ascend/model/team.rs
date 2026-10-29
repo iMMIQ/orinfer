@@ -480,7 +480,7 @@ mod state_tests {
                 .0
                 .remove(0)
         };
-        for length in [17usize, 129, 2049] {
+        for length in [17usize, 129, 2049, 8193] {
             team.exchange(Command::Admit(vec![17, 7])).unwrap();
             let input = (0..length)
                 .map(|i| ((i * 73 + 11) % 129280) as u32)
