@@ -319,6 +319,18 @@ struct W4Key {
     workspace: usize,
 }
 type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
+
+fn host_row_cache_budget() -> Result<usize> {
+    let mib = match std::env::var("ORINFER_A2_HOST_ROW_CACHE_MIB") {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|_| "Invalid A2 host row cache MiB")?,
+        Err(std::env::VarError::NotPresent) => 2048,
+        Err(_) => return Err("Invalid A2 host row cache environment".into()),
+    };
+    mib.checked_mul(1024 * 1024)
+        .ok_or_else(|| "Host row cache budget overflow".into())
+}
 struct Worker {
     session: Session,
     comm: Communicator,
@@ -633,20 +645,24 @@ impl Worker {
         let tables = shared_tables
             .get_or_init(|| {
                 let mut tables = BTreeMap::new();
+                let table_budget = host_row_cache_budget()? / layout.layers.len().max(1);
                 for layer in &layout.layers {
                     let prefix = format!("layers.{}.engram.embed", layer.layer);
                     tables.insert(
                         layer.layer,
-                        SharedInt8Rows::new(Int8Rows::open(
-                            &checkpoint.path(&format!("{prefix}.weight"))?,
-                            &format!("{prefix}.weight"),
-                            &checkpoint.path(&format!("{prefix}.scale"))?,
-                            &format!("{prefix}.scale"),
-                            Shard {
-                                first: 0,
-                                rows: layer.rows,
-                            },
-                        )?),
+                        SharedInt8Rows::with_cache(
+                            Int8Rows::open(
+                                &checkpoint.path(&format!("{prefix}.weight"))?,
+                                &format!("{prefix}.weight"),
+                                &checkpoint.path(&format!("{prefix}.scale"))?,
+                                &format!("{prefix}.scale"),
+                                Shard {
+                                    first: 0,
+                                    rows: layer.rows,
+                                },
+                            )?,
+                            table_budget,
+                        )?,
                     );
                 }
                 Ok(Arc::new(tables))

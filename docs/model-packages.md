@@ -498,6 +498,8 @@ orinfer serve artifacts/models/dsv41-a2-service --model deepseek-v41-flash-1017-
 
 `GET /metrics` 导出请求排队、首 token 前、解码、结束处理的 wall time histogram，以及运行／等待请求数和原生计算／计划准备累计时间。统计从前处理完成、请求进入 worker 队列开始，准入／恢复计入排队阶段；前处理与网络需结合客户端 TTFT 分析。阶段包含调度等待，不能相加解释成独占 GPU 时间。Chat 请求的 `ignore_eos:true` 保持指定生成上限，适用于固定输出长度回放。
 
+A2 的 Engram CPU 行表使用共 2 GiB 的跨 packet 行缓存，由各 rank 共享，按行 ID 保留原始 INT8 权重及 FP32 scale 字节。预算包含缓存数组、标签及替换元数据；最近 packet 和在途上传沿用原有的有界 staging。`ORINFER_A2_HOST_ROW_CACHE_MIB` 设置总预算，`0` 关闭跨 packet 行缓存；`ORINFER_HOST_ROW_CACHE_REPORT=1` 在模型释放时输出累计 packet 命中、唯一行命中／读取数及保留字节，便于定位主机取表成本。
+
 `python3 -m tools.bench.agentx_mini --help` 提供固定 Mini-Weka 短测入口：保留原始 16 个窗口、64 个 profiling 请求、并发 16、seed 42、180 秒 profiling 和每 lane 一次 warmup，记录输入哈希、服务二进制、健康状态及 metrics。默认总时限 900 秒，到时终止本轮客户端并保留诊断；中断结果不能作为通过的短测分数。该入口连接已运行服务，不部署后端或修改设备设置。
 
 私有算子的离线调度重建可直接复用已编译计划：

@@ -8,7 +8,9 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+mod cache;
 pub mod validation;
+use cache::RowCache;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Shard {
@@ -153,9 +155,25 @@ pub struct Int8Rows {
 /// Replicated device workers share one immutable row packet. Keep only the
 /// latest query per store; changing query order, repetitions or owner rows
 /// replaces the cache without invalidating packets still held by consumers.
+/// An optional bounded row cache survives these packet replacements.
 pub struct SharedInt8Rows {
     store: Int8Rows,
-    last: Mutex<Option<RowBatch>>,
+    state: Mutex<SharedState>,
+    report: bool,
+}
+#[derive(Clone, Default, serde::Serialize)]
+pub struct HostRowCacheStatistics {
+    pub gathers: u64,
+    pub packet_hits: u64,
+    pub unique_row_hits: u64,
+    pub unique_row_reads: u64,
+    pub entries: usize,
+    pub reserved_bytes: usize,
+}
+struct SharedState {
+    last: Option<RowBatch>,
+    cache: Option<RowCache>,
+    statistics: HostRowCacheStatistics,
 }
 struct RowBatch {
     ids: Vec<u64>,
@@ -165,31 +183,82 @@ impl SharedInt8Rows {
     pub fn new(store: Int8Rows) -> Self {
         Self {
             store,
-            last: Mutex::new(None),
+            state: Mutex::new(SharedState {
+                last: None,
+                cache: None,
+                statistics: HostRowCacheStatistics::default(),
+            }),
+            report: std::env::var_os("ORINFER_HOST_ROW_CACHE_REPORT").is_some(),
         }
+    }
+    /// The row budget includes payload, tags, ages and allocation overhead.
+    /// The most recent packet and caller-owned staging remain separately bounded.
+    pub fn with_cache(store: Int8Rows, budget: usize) -> Result<Self> {
+        let cache = RowCache::new(store.row_bytes(), budget)?;
+        let mut result = Self::new(store);
+        result
+            .state
+            .get_mut()
+            .map_err(|_| "Host cache poisoned")?
+            .cache = cache;
+        Ok(result)
+    }
+    pub fn statistics(&self) -> Result<HostRowCacheStatistics> {
+        let state = self.state.lock().map_err(|_| "Host cache poisoned")?;
+        let mut statistics = state.statistics.clone();
+        if let Some(cache) = &state.cache {
+            statistics.entries = cache.entries();
+            statistics.reserved_bytes = cache.bytes();
+        }
+        Ok(statistics)
     }
     pub fn gather(&self, ids: &[u64], max_bytes: usize) -> Result<Arc<Vec<u8>>> {
         ids.len()
             .checked_mul(self.store.row_bytes())
             .filter(|&n| n <= max_bytes)
             .ok_or("Host-row staging budget exceeded")?;
-        let mut last = self
-            .last
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| "Shared host-row reader poisoned")?;
-        if let Some(batch) = last.as_ref().filter(|batch| batch.ids == ids) {
-            return Ok(Arc::clone(&batch.bytes));
+        if let Some(bytes) = state
+            .last
+            .as_ref()
+            .filter(|batch| batch.ids == ids)
+            .map(|batch| Arc::clone(&batch.bytes))
+        {
+            state.statistics.gathers += 1;
+            state.statistics.packet_hits += 1;
+            return Ok(bytes);
         }
         // Hold the cache lock across the parallel gather so simultaneous rank
         // misses join one read rather than submitting duplicate random I/O.
         let mut bytes = vec![];
-        self.store.gather_into(ids, &mut bytes, max_bytes)?;
+        let (hits, reads) =
+            self.store
+                .gather_cached_into(ids, &mut bytes, max_bytes, state.cache.as_mut())?;
+        state.statistics.gathers += 1;
+        state.statistics.unique_row_hits += hits as u64;
+        state.statistics.unique_row_reads += reads as u64;
         let bytes = Arc::new(bytes);
-        *last = Some(RowBatch {
+        state.last = Some(RowBatch {
             ids: ids.to_vec(),
             bytes: Arc::clone(&bytes),
         });
         Ok(bytes)
+    }
+}
+impl Drop for SharedInt8Rows {
+    fn drop(&mut self) {
+        if self.report
+            && let Ok(statistics) = self.statistics()
+        {
+            eprintln!(
+                "HOST_ROWS_CACHE table_rows={} {}",
+                self.store.shard.rows,
+                serde_json::to_string(&statistics).unwrap_or_default()
+            );
+        }
     }
 }
 impl Int8Rows {
@@ -231,6 +300,16 @@ impl Int8Rows {
     /// Rows resolve in parallel: the backing table is a random-read store,
     /// and cache-miss stalls from sequential reads would idle the device.
     pub fn gather_into(&self, ids: &[u64], out: &mut Vec<u8>, max_bytes: usize) -> Result<()> {
+        self.gather_cached_into(ids, out, max_bytes, None)
+            .map(|_| ())
+    }
+    fn gather_cached_into(
+        &self,
+        ids: &[u64],
+        out: &mut Vec<u8>,
+        max_bytes: usize,
+        mut cache: Option<&mut RowCache>,
+    ) -> Result<(usize, usize)> {
         use rayon::prelude::*;
         let bytes = ids
             .len()
@@ -252,16 +331,36 @@ impl Int8Rows {
         out.clear();
         out.resize(bytes, 0);
         let weight_bytes = self.weight.row_bytes;
+        let mut hits = vec![false; unique.len()];
+        for (index, &row) in unique.iter().enumerate() {
+            if let Some(data) = cache.as_deref_mut().and_then(|cache| cache.get(row)) {
+                out[index * self.row_bytes..(index + 1) * self.row_bytes].copy_from_slice(data);
+                hits[index] = true;
+            }
+        }
         let result: Result<()> = out[..unique.len() * self.row_bytes]
             .par_chunks_mut(self.row_bytes)
             .enumerate()
             .try_for_each(|(index, packet)| {
+                if hits[index] {
+                    return Ok(());
+                }
                 let row = usize::try_from(unique[index]).map_err(|_| "Host row offset overflow")?;
                 let (values, scales) = packet.split_at_mut(weight_bytes);
                 self.weight.read_row_at(row, values)?;
                 self.scale.read_row_at(row, scales)
             });
         result?;
+        if let Some(cache) = cache {
+            for (index, &row) in unique.iter().enumerate() {
+                if !hits[index] {
+                    cache.insert(
+                        row,
+                        &out[index * self.row_bytes..(index + 1) * self.row_bytes],
+                    );
+                }
+            }
+        }
         // First-appearance slots never exceed their destination indices.
         // Expanding backwards preserves every unread compact source row and
         // needs no second payload allocation.
@@ -271,7 +370,8 @@ impl Int8Rows {
                 out.copy_within(begin..begin + self.row_bytes, destination * self.row_bytes);
             }
         }
-        Ok(())
+        let hit_count = hits.iter().filter(|&&hit| hit).count();
+        Ok((hit_count, unique.len() - hit_count))
     }
 }
 
@@ -392,5 +492,56 @@ mod tests {
         assert_eq!(&changed[..36], &expected[36..72]);
         assert_eq!(&changed[36..], &expected[..36]);
         assert_eq!(*batches[0], expected);
+
+        let cached = SharedInt8Rows::with_cache(all, 65536).unwrap();
+        let first = cached.gather(&[3, 0, 2, 3], 144).unwrap();
+        assert_eq!(cached.statistics().unwrap().unique_row_reads, 3);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let cached = &cached;
+                    scope.spawn(move || {
+                        let ids = if i % 2 == 0 {
+                            vec![1, 3, 1, 0, 2]
+                        } else {
+                            vec![2, 1, 3]
+                        };
+                        let bytes = cached.gather(&ids, 180).unwrap();
+                        (ids, bytes)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let (ids, bytes) = handle.join().unwrap();
+                let wanted: Vec<u8> = ids
+                    .into_iter()
+                    .flat_map(|id| {
+                        let row = id as usize;
+                        weights[row * 32..(row + 1) * 32]
+                            .iter()
+                            .chain(&scales[row * 4..(row + 1) * 4])
+                            .copied()
+                    })
+                    .collect();
+                assert_eq!(*bytes, wanted);
+            }
+        });
+        assert_eq!(cached.statistics().unwrap().unique_row_reads, 4);
+        let reordered = cached.gather(&[2, 3, 0, 2], 144).unwrap();
+        assert_eq!(&reordered[..36], &first[72..108]);
+        assert_eq!(&reordered[36..72], &first[..36]);
+        assert_eq!(&reordered[72..108], &first[36..72]);
+        assert_eq!(&reordered[108..], &first[72..108]);
+        let statistics = cached.statistics().unwrap();
+        assert_eq!(statistics.unique_row_reads, 4);
+        assert!(statistics.unique_row_hits >= 3);
+        assert_eq!(statistics.entries, 4);
+        assert!(statistics.reserved_bytes <= 65536);
+        assert!(cached.gather(&[4], 144).is_err());
+        assert!(cached.gather(&[2, 3, 0, 2], 143).is_err());
+        let same = cached.gather(&[2, 3, 0, 2], 144).unwrap();
+        assert!(Arc::ptr_eq(&reordered, &same));
+        assert!(cached.statistics().unwrap().packet_hits >= 1);
+        assert_eq!(cached.statistics().unwrap().unique_row_reads, 4);
     }
 }
