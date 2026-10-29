@@ -74,6 +74,33 @@ def interleave_rows(rows, count, width, ranks=8, dtype="int32"):
     return main
 
 
+def zero_row_tail(rows, capacity, width, dtype="bfloat16"):
+    """Define unused fixed-capacity collective rows without touching live rows."""
+    if capacity < 2 or width < 1 or dtype not in ("bfloat16", "float32"):
+        raise ValueError("Invalid collective tail geometry")
+    block = math.gcd(width, 256)
+    blocks = width // block
+
+    @T.prim_func
+    def main(
+        positions: T.Tensor((rows,), "int32"),
+        out: T.Tensor((capacity, width), dtype),
+    ):
+        with T.Kernel(T.max(1, T.ceildiv((capacity - rows) * blocks, 2)), is_npu=True) as (
+            cid,
+            vid,
+        ):
+            zeros = T.alloc_ub((block,), dtype)
+            index = cid * 2 + vid
+            row = rows + index // blocks
+            column = index % blocks * block
+            if row < capacity:
+                T.tile.fill(zeros, 0)
+                T.copy(zeros, out[row, column : column + block])
+
+    return main
+
+
 def last_row(rows, width):
     """Copy the actual last row from a capacity-backed dynamic activation."""
     block = math.gcd(width, 256)

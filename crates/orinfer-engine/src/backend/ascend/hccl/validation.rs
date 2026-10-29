@@ -23,6 +23,7 @@ struct Rank {
     all_reduce_verified: bool,
     all_gather_verified: bool,
     all_to_all_v_verified: bool,
+    reduce_scatter_graph_verified: bool,
     initialize_ms: f64,
 }
 
@@ -92,7 +93,7 @@ pub fn run(devices: &[u32]) -> Result<Report> {
     })?;
     Ok(Report {
         ranks,
-        scope: "Native HCCL AllReduce, AllGather and variable-count AlltoAllV across device contexts; no model execution",
+        scope: "Native HCCL AllReduce, AllGather, ReduceScatter with changed-input Graph replay and variable-count AlltoAllV across device contexts; no model execution",
     })
 }
 fn count(source: u32, destination: u32) -> u64 {
@@ -167,14 +168,171 @@ fn validate_rank(session: &Session, root: &RootInfo, rank: u32, device: u32) -> 
         return Err(format!("HCCL AlltoAllV mismatch on rank {rank}"));
     }
     comm.check_async_error()?;
+    validate_scatter(session, &comm, rank)?;
     Ok(Rank {
         rank,
         device,
         all_reduce_verified: true,
         all_gather_verified: true,
         all_to_all_v_verified: true,
+        reduce_scatter_graph_verified: true,
         initialize_ms,
     })
+}
+
+fn scatter_input(rank: u32, elements: usize, step: u32, element: Element) -> Vec<u8> {
+    use half::bf16;
+    let mut output = Vec::with_capacity(elements * element.bytes() as usize);
+    let mixed = std::env::var_os("ORINFER_ASCEND_SCATTER_MIXED").is_some();
+    for i in 0..elements {
+        let bits = (i as u32)
+            .wrapping_mul(1664525)
+            .wrapping_add(rank.wrapping_mul(1013904223))
+            .wrapping_add(step.wrapping_mul(747796405));
+        let value = if mixed {
+            let value = ((bits & 65535) as i32 - 32768) as f32 / 1024.;
+            if bits & 0x40000 == 0 {
+                value
+            } else {
+                value / 1024.
+            }
+        } else {
+            // Every intermediate sum is exactly representable even in BF16.
+            ((bits >> 16) % 15) as f32 - 7.
+        };
+        match element {
+            Element::Bfloat16 => {
+                output.extend_from_slice(&bf16::from_f32(value).to_bits().to_le_bytes())
+            }
+            _ => output.extend_from_slice(&value.to_le_bytes()),
+        }
+    }
+    output
+}
+
+fn validate_scatter(session: &Session, comm: &Communicator, rank: u32) -> Result<()> {
+    use crate::backend::ascend::graph::Graph;
+    // The complete 2K/TP8/hidden5120 geometry used by the model's reductions.
+    let count = 256 * 5120;
+    let mut differences = Vec::new();
+    for element in [Element::Float32, Element::Bfloat16] {
+        let bytes = count * element.bytes() as usize;
+        let total = bytes * comm.ranks() as usize;
+        let source = session.allocate(total)?;
+        let all = session.allocate(total)?;
+        let partition = session.allocate(bytes)?;
+        let direct = session.allocate(bytes)?;
+        let gathered = session.allocate(total)?;
+        let input = scatter_input(rank, count * comm.ranks() as usize, 0, element);
+        upload_large(session, &source, &input)?;
+        comm.all_reduce_sum(
+            session,
+            &source,
+            &all,
+            (count * comm.ranks() as usize) as u64,
+            element,
+        )?
+        .wait()?;
+        comm.reduce_scatter_sum(session, &source, &partition, count as u64, element)?
+            .wait()?;
+
+        let check = |step: u32| -> Result<()> {
+            let expected = session.download(&all, rank as usize * bytes, bytes)?;
+            let actual = session.download(&partition, 0, bytes)?;
+            if let Some(directory) = std::env::var_os("ORINFER_ASCEND_SCATTER_DUMP") {
+                let directory = std::path::Path::new(&directory);
+                std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+                for (kind, data) in [("allreduce", &expected), ("scatter", &actual)] {
+                    std::fs::write(
+                        directory.join(format!("r{rank}-{element:?}-{step}-{kind}.bin")),
+                        data,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            if expected != actual {
+                let mismatches = expected
+                    .chunks_exact(element.bytes() as usize)
+                    .zip(actual.chunks_exact(element.bytes() as usize))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                return Err(format!(
+                    "ReduceScatter {element:?} differs from AllReduce on rank {rank}: {mismatches}/{count} elements"
+                ));
+            }
+            Ok(())
+        };
+        if let Err(error) = check(0) {
+            differences.push(error);
+        }
+        comm.validate_scatter(session, &source, &partition, count as u64, element)?;
+        // SAFETY: The checked same-context bindings and communicator are held
+        // by the captured graph and all its replay completion events.
+        let graph = unsafe {
+            Graph::capture(
+                session,
+                Box::new((comm.clone(), source.clone(), partition.clone())),
+                |stream| comm.scatter_on_stream(stream, &source, &partition, count as u64, element),
+            )
+        }?;
+        for step in [1, 2] {
+            let input = scatter_input(rank, count * comm.ranks() as usize, step, element);
+            upload_large(session, &source, &input)?;
+            comm.all_reduce_sum(
+                session,
+                &source,
+                &all,
+                (count * comm.ranks() as usize) as u64,
+                element,
+            )?
+            .wait()?;
+            comm.reduce_scatter_sum(session, &source, &direct, count as u64, element)?
+                .wait()?;
+            graph.enqueue(session)?.wait()?;
+            if session.download(&direct, 0, bytes)? != session.download(&partition, 0, bytes)? {
+                differences.push(format!(
+                    "ReduceScatter {element:?} Graph differs from direct execution on rank {rank}"
+                ));
+            }
+            if let Err(error) = check(step) {
+                differences.push(error);
+            }
+            comm.all_gather(session, &partition, &gathered, count as u64, element)?
+                .wait()?;
+            if read_large(session, &gathered)? != read_large(session, &all)? {
+                differences.push(format!(
+                    "ReduceScatter/AllGather {element:?} mismatch on rank {rank}"
+                ));
+            }
+        }
+        comm.check_async_error()?;
+    }
+    if differences.is_empty() {
+        Ok(())
+    } else {
+        Err(differences.join("; "))
+    }
+}
+
+fn upload_large(
+    session: &Session,
+    buffer: &super::super::runtime::Buffer,
+    bytes: &[u8],
+) -> Result<()> {
+    const CHUNK: usize = 8 << 20;
+    for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
+        session.upload(buffer, index * CHUNK, chunk)?.wait()?;
+    }
+    Ok(())
+}
+
+fn read_large(session: &Session, buffer: &super::super::runtime::Buffer) -> Result<Vec<u8>> {
+    const CHUNK: usize = 8 << 20;
+    let mut bytes = Vec::with_capacity(buffer.bytes());
+    for offset in (0..buffer.bytes()).step_by(CHUNK) {
+        bytes.extend(session.download(buffer, offset, (buffer.bytes() - offset).min(CHUNK))?);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

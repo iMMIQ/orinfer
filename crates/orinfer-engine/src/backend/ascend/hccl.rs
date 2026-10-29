@@ -15,13 +15,15 @@ pub const ROOT_BYTES: usize = 4108;
 struct NativeRoot {
     bytes: [u8; ROOT_BYTES],
 }
+type ReduceFn = unsafe extern "C" fn(Handle, Handle, u64, i32, i32, Handle, Handle) -> i32;
 struct Api {
     _library: Library,
     root: unsafe extern "C" fn(*mut NativeRoot) -> i32,
     init: unsafe extern "C" fn(u32, *const NativeRoot, u32, *mut Handle) -> i32,
     destroy: unsafe extern "C" fn(Handle) -> i32,
     async_error: unsafe extern "C" fn(Handle, *mut i32) -> i32,
-    reduce: unsafe extern "C" fn(Handle, Handle, u64, i32, i32, Handle, Handle) -> i32,
+    reduce: ReduceFn,
+    scatter: Option<ReduceFn>,
     gather: unsafe extern "C" fn(Handle, Handle, u64, i32, Handle, Handle) -> i32,
     exchange: unsafe extern "C" fn(
         *const c_void,
@@ -67,6 +69,10 @@ impl Api {
                     .get(b"HcclGetCommAsyncError\0")
                     .map_err(|e| e.to_string())?,
                 reduce: *library.get(b"HcclAllReduce\0").map_err(|e| e.to_string())?,
+                scatter: library
+                    .get::<ReduceFn>(b"HcclReduceScatter\0")
+                    .ok()
+                    .map(|s| *s),
                 gather: *library.get(b"HcclAllGather\0").map_err(|e| e.to_string())?,
                 exchange: *library.get(b"HcclAlltoAllV\0").map_err(|e| e.to_string())?,
                 _library: library,
@@ -137,7 +143,11 @@ impl RootInfo {
     }
     #[cfg(test)]
     pub(super) fn fixture(session: &Session, path: &Path) -> Result<Self> {
-        Self::with_api(session, 1, Api::from_path(path)?)
+        Self::fixture_ranks(session, path, 1)
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_ranks(session: &Session, path: &Path, ranks: u32) -> Result<Self> {
+        Self::with_api(session, ranks, Api::from_path(path)?)
     }
 }
 
@@ -345,6 +355,88 @@ impl Communicator {
             )
         }
     }
+    /// Reduce a rank-major input to this rank's contiguous output partition.
+    /// `count` is the number of output elements on each rank.
+    pub fn reduce_scatter_sum(
+        &self,
+        session: &Session,
+        source: &Buffer,
+        destination: &Buffer,
+        count: u64,
+        element: Element,
+    ) -> Result<Ticket> {
+        self.validate_scatter(session, source, destination, count, element)?;
+        let comm = self.clone();
+        // SAFETY: Same-context, disjoint ranges and both element extents are
+        // checked. The completion retains the communicator and allocations.
+        unsafe {
+            session.submit_compute(
+                vec![],
+                Box::new((self.clone(), source.clone(), destination.clone())),
+                move |stream| comm.scatter_on_stream(stream, source, destination, count, element),
+            )
+        }
+    }
+
+    pub(super) fn validate_scatter(
+        &self,
+        session: &Session,
+        source: &Buffer,
+        destination: &Buffer,
+        count: u64,
+        element: Element,
+    ) -> Result<()> {
+        self.validate(session, source, destination)?;
+        if self.native.api.scatter.is_none() {
+            return Err("HCCL library does not provide ReduceScatter".into());
+        }
+        let output = count
+            .checked_mul(element.bytes())
+            .ok_or("HCCL ReduceScatter byte size overflow")?;
+        let input = output
+            .checked_mul(u64::from(self.ranks))
+            .ok_or("HCCL ReduceScatter input size overflow")?;
+        if source.overlaps(destination)
+            || count == 0
+            || input > source.bytes() as u64
+            || output > destination.bytes() as u64
+        {
+            return Err("HCCL ReduceScatter requires disjoint spans with valid extents".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn scatter_on_stream(
+        &self,
+        stream: Handle,
+        source: &Buffer,
+        destination: &Buffer,
+        count: u64,
+        element: Element,
+    ) -> Result<()> {
+        let scatter = self
+            .native
+            .api
+            .scatter
+            .ok_or("HCCL ReduceScatter unavailable")?;
+        // SAFETY: The enclosing completion or captured segment validated both
+        // extents and retains the same-context buffers and communicator.
+        self.native.status(
+            unsafe {
+                scatter(
+                    source.pointer(),
+                    destination.pointer(),
+                    count,
+                    element.native(),
+                    0,
+                    self.native.handle,
+                    stream,
+                )
+            },
+            "HCCL ReduceScatter",
+        )
+    }
+
     pub fn all_gather(
         &self,
         session: &Session,

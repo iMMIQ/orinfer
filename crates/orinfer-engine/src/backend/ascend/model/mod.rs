@@ -112,6 +112,8 @@ enum Instruction {
         int32: bool,
         #[serde(default)]
         fixed_rows: bool,
+        #[serde(default)]
+        trace_only: bool,
     },
     Kernel {
         manifest: String,
@@ -124,6 +126,10 @@ enum Instruction {
         destination: String,
         elements: u64,
         fp32: bool,
+        #[serde(default)]
+        scatter: bool,
+        #[serde(default)]
+        fixed_rows: bool,
     },
     W4 {
         name: String,
@@ -197,6 +203,7 @@ enum SegmentOp {
         destination: Buffer,
         elements: u64,
         element: Element,
+        scatter: bool,
     },
     W4(Rc<GroupedW4A8>),
 }
@@ -243,8 +250,13 @@ fn enqueue_segment(
                 destination,
                 elements,
                 element,
+                scatter,
             } => {
-                comm.reduce_on_stream(stream, source, destination, *elements, *element)?;
+                if *scatter {
+                    comm.scatter_on_stream(stream, source, destination, *elements, *element)?;
+                } else {
+                    comm.reduce_on_stream(stream, source, destination, *elements, *element)?;
+                }
             }
             SegmentOp::W4(plan) => plan.execute_on_stream(stream)?,
         }
@@ -724,6 +736,8 @@ impl Worker {
                 destination,
                 elements,
                 fp32,
+                scatter,
+                fixed_rows,
             } = instruction
             {
                 let source = get(&self.buffers, source)?;
@@ -733,14 +747,25 @@ impl Worker {
                 } else {
                     Element::Bfloat16
                 };
-                let elements =
-                    scaled(usize::try_from(*elements).map_err(|_| "Reduce size overflow")?)? as u64;
-                self.check_reduce(&source, &destination, elements, element)?;
+                let count = usize::try_from(*elements).map_err(|_| "Reduce size overflow")?;
+                let elements = if *fixed_rows { count } else { scaled(count)? } as u64;
+                if *scatter {
+                    self.comm.validate_scatter(
+                        &self.session,
+                        &source,
+                        &destination,
+                        elements,
+                        element,
+                    )?;
+                } else {
+                    self.check_reduce(&source, &destination, elements, element)?;
+                }
                 pending.push(SegmentOp::Reduce {
                     source,
                     destination,
                     elements,
                     element,
+                    scatter: *scatter,
                 });
                 continue;
             }
@@ -751,8 +776,12 @@ impl Worker {
                 fp32,
                 int32,
                 fixed_rows,
+                trace_only,
             } = instruction
             {
+                if *trace_only && !self.snapshots {
+                    continue;
+                }
                 let source = get(&self.buffers, source)?;
                 let destination = get(&self.buffers, destination)?;
                 let element = gather_element(*fp32, *int32)?;

@@ -825,6 +825,7 @@ fn collective_completion_retains_communicator_and_validates_byte_units() {
         comm.all_gather(&session, &a, &b, u64::MAX, Element::Float32)
             .is_err()
     );
+    session.fill(&b, 0).unwrap().wait().unwrap();
     let gathered = comm
         .all_gather(&session, &a, &b, 4, Element::Float32)
         .unwrap();
@@ -834,6 +835,61 @@ fn collective_completion_retains_communicator_and_validates_byte_units() {
     assert_eq!(fixture.counter(8), 0);
     assert_eq!(session.download(&b, 0, 16).unwrap(), [7; 16]);
     drop((gathered, ticket, a, b, root, session));
+    fixture.assert_clean();
+}
+
+#[test]
+fn reduce_scatter_checks_rank_extents_types_and_completion_ownership() {
+    use super::hccl::{Communicator, Element, RootInfo};
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let root = RootInfo::fixture_ranks(&session, &fixture._dir.path().join("libacl-fixture.so"), 8)
+        .unwrap();
+    let source = session.allocate(128).unwrap();
+    let destination = session.allocate(16).unwrap();
+    let short = session.allocate(8).unwrap();
+    let comm = Communicator::join(&session, &root, 0).unwrap();
+    let input = (0..128u8).collect::<Vec<_>>();
+    session.upload(&source, 0, &input).unwrap().wait().unwrap();
+    for count in [0, 5, u64::MAX] {
+        assert!(
+            comm.reduce_scatter_sum(&session, &source, &destination, count, Element::Float32)
+                .is_err()
+        );
+    }
+    assert!(
+        comm.reduce_scatter_sum(&session, &source, &source, 4, Element::Float32)
+            .is_err()
+    );
+    assert!(
+        comm.reduce_scatter_sum(&session, &destination, &source, 4, Element::Float32)
+            .is_err()
+    );
+    assert!(
+        comm.reduce_scatter_sum(&session, &source, &short, 4, Element::Float32)
+            .is_err()
+    );
+    for (element, count) in [
+        (Element::Float32, 4),
+        (Element::Bfloat16, 8),
+        (Element::Int8, 16),
+    ] {
+        session.fill(&destination, 0).unwrap().wait().unwrap();
+        comm.reduce_scatter_sum(&session, &source, &destination, count, element)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(session.download(&destination, 0, 16).unwrap(), input[..16]);
+    }
+    let ticket = comm
+        .reduce_scatter_sum(&session, &source, &destination, 4, Element::Int32)
+        .unwrap();
+    drop((comm, source));
+    assert_eq!(fixture.counter(8), 1);
+    ticket.wait().unwrap();
+    assert_eq!(fixture.counter(8), 0);
+    assert_eq!(session.download(&destination, 0, 16).unwrap(), input[..16]);
+    drop((ticket, destination, short, root, session));
     fixture.assert_clean();
 }
 

@@ -89,6 +89,31 @@ fn collective_and_local_kernel_contracts_are_backward_compatible() {
         }
     ));
     let old: Instruction = serde_json::from_value(serde_json::json!({
+        "op": "reduce", "source": "a", "destination": "b", "elements": 16, "fp32": false
+    }))
+    .unwrap();
+    assert!(matches!(
+        old,
+        Instruction::Reduce {
+            scatter: false,
+            fixed_rows: false,
+            ..
+        }
+    ));
+    let scatter: Instruction = serde_json::from_value(serde_json::json!({
+        "op": "reduce", "source": "a", "destination": "b", "elements": 16,
+        "fp32": true, "scatter": true, "fixed_rows": true
+    }))
+    .unwrap();
+    assert!(matches!(
+        scatter,
+        Instruction::Reduce {
+            scatter: true,
+            fixed_rows: true,
+            ..
+        }
+    ));
+    let old: Instruction = serde_json::from_value(serde_json::json!({
         "op": "kernel", "manifest": "kernel.json", "buffers": []
     }))
     .unwrap();

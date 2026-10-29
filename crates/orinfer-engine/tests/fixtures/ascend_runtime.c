@@ -103,12 +103,16 @@ int HcclCommInitRootInfo(uint32_t ranks,const void *root,uint32_t rank,void **co
 }
 int HcclCommDestroy(void *comm) {free(comm);counters[8]--;return 0;}
 int HcclGetCommAsyncError(void *comm,int *status) {(void)comm;*status=0;return 0;}
+static size_t hccl_bytes(int type) {return type==0?1:type==11?2:(type==5||type==6)?8:4;}
 int HcclAllReduce(void *source,void *destination,uint64_t n,int type,int op,void *comm,void *stream) {
-    (void)op;(void)comm;size_t bytes=n*(type==0?1:type==5?8:4);
+    (void)op;(void)comm;size_t bytes=n*hccl_bytes(type);
     return aclrtMemcpyAsync(destination,bytes,source,bytes,3,stream);
 }
+int HcclReduceScatter(void *source,void *destination,uint64_t n,int type,int op,void *comm,void *stream) {
+    return HcclAllReduce(source,destination,n,type,op,comm,stream);
+}
 int HcclAllGather(void *source,void *destination,uint64_t n,int type,void *comm,void *stream) {
-    (void)comm;size_t bytes=n*(type==0?4:type==6?2:1);
+    (void)comm;size_t bytes=n*hccl_bytes(type);
     jobs[count++]=(Job){.dst=destination,.src=source,.n=bytes,.kind=1,.stream=stream};return 0;
 }
 int HcclAlltoAllV(const void *source,const void *counts,const void *offsets,int type,const void *destination,

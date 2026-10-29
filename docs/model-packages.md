@@ -122,14 +122,14 @@ flock -w 5 artifacts/gpu-experiment.lock orinfer validate-ascend-kernels \
 
 AOT 算子描述是独立的验收/编译格式，现有模型包与模型 C ABI 保持原版本。验收比较四组改变输入的结果，其中两组使用 Rust 原生 Graph replay；INT8 输出、行搬运和 ring 提交逐字节对照。FP32 敏感投影与 mHC 点积使用独立的 FP64 参考，再舍入到 FP32，避免 CPU BLAS 的累加顺序影响判断。C2 先读取上次残余再单独提交最后 32 个已接受位置，metadata 明确传递请求页、前驱行、位置和提交边界。完整模型绑定与分布式单流由下述实验入口执行；prefix 快照恢复和 AgentX 并发性能仍需接入。
 
-`backend/ascend/hccl.rs` 提供原生 AllReduce SUM、变长 AlltoAllV 和异步错误检查。Bootstrap 在指定会话的 context 内生成，opaque root bytes 可传给其他 rank 进程。通信与计算使用同一 compute stream 顺序，完成事件持有 communicator、buffer 和 host count arrays；空 peer 计数和重复调用仍保持所有 rank 的共同 collective 顺序。调用者在 step 边界检查异步通信错误。
+`backend/ascend/hccl.rs` 提供原生 AllReduce SUM、AllGather、ReduceScatter SUM、变长 AlltoAllV 和异步错误检查。Bootstrap 在指定会话的 context 内生成，opaque root bytes 可传给其他 rank 进程。通信与计算使用同一 compute stream 顺序，完成事件持有 communicator、buffer 和 host count arrays；空 peer 计数和重复调用仍保持所有 rank 的共同 collective 顺序。调用者在 step 边界检查异步通信错误。
 
 ```bash
 # 与现有服务共卡时，为本次验收选择独立的 NPU 通信端口：
 HCCL_NPU_SOCKET_PORT_RANGE=auto orinfer validate-hccl --devices 0,1,2,3,4,5,6,7
 ```
 
-验证器在同一进程的独立线程/context 上检查 2–8 卡的 AllReduce 和含空 peer 的非均匀 AlltoAllV，并在全部 rank 完成显存预检查后统一准入。HCCL 自身的通信缓冲不计入会话显存预算，每卡验收前要求至少 512 MiB 空闲 HBM。已在 2 卡和 8 卡 910B3 上验证。实验入口使用同一进程的独立 worker/context；跨进程编排、设备侧 MoE dispatch 与 collective Graph 捕获仍需接入。A2 上加入 MC² 算子后需重新按对应端口约束验收；本命令只使用独立 collective。
+验证器在同一进程的独立线程/context 上检查 2–8 卡的 AllReduce、AllGather、ReduceScatter 和含空 peer 的非均匀 AlltoAllV，并在全部 rank 完成显存预检查后统一准入。ReduceScatter 使用 FP32／BF16 可精确求和的数据验证连续行分片、重新汇总及改变输入后的 Graph replay；混合尺度浮点数据用于单独评估求和顺序的差异。HCCL 自身的通信缓冲不计入会话显存预算，每卡验收前要求至少 512 MiB 空闲 HBM。已在 2 卡和 8 卡 910B3 上验证。实验入口使用同一进程的独立 worker/context；AllReduce、AllGather 和 ReduceScatter 可与设备计算共同捕获为 Graph；跨进程编排和设备侧 MoE dispatch 仍需接入。A2 上加入 MC² 算子后需重新按对应端口约束验收；本命令只使用独立 collective。
 
 DSv4.1 Engram 的 CPU 路径使用离线导出的 tokenizer 压缩映射、确定的整数 hash 参数和显式 token 历史；prefill 分块、恢复和 speculative 回滚无需读取可变 KV 页镜像。`host_rows` 以稳定分组和去重生成 owner 计划，保留原查询顺序的恢复索引；只读映射 INT8 表与 FP32 group-32 scales，按预算打包选中行，整表不注册到 ACL。实验入口已连接 NPU 投影；NUMA worker 绑定和预取重叠仍需接入。
 
@@ -224,6 +224,10 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 `tools.model.deepseek_v41.tune_prefill_qk --plan PLAN --output DIR` 为 `min_rows>=512` 的 prefill packet 选择 QK 遍历方式，输出同一资产目录的 `*-qk-tuned.json`。候选按当前 SWA 窗口和长 KV 前缀枚举有效块，对早晚 query 块折叠排列，并比较 key 分块数与物理 grid；共享同一 BF16 MMA 和 FP32 累加计算体。离线调优包含原库与新默认实现，逐位检查全部分数和未写区域，在同一 Graph 中同时改变 query 与位置，并抽查独立 FP32 点积。512 行和容量上限的测量经几何平均选择每种几何的一个实现；短片段复用原计划的行数选择范围。`--compile-only --compile-workers N` 通过现有 `build.compile_task` 预编译候选，后续测量按源码、编译器、设备和库身份缓存；输出计划只引用选定实现。完整请求另验收 2K、分块、4K／8K 和全部请求状态。
 
 `tools.model.deepseek_v41.shard_indexer --plan PLAN --output PLAN_SHARDED --min-rows 512` 为 TP8 动态 prefill 计划生成交错分行的 indexer 和 TopK 路径，输出与输入位于同一资产目录。每卡打包 `rank + 8*i` 行，复用原 INT32 点积和逐头 FP32 累加，再通过固定大小的 INT32 AllGather 恢复全局选中索引；权重和请求私有状态保持原布局。局部行容量为 packet 容量的八分之一，尾部填充行的选择长度为零。较短片段复用原 packet 的物理容量和算子，以独立的 `min_rows`／`max_rows` 范围选择；加载时拒绝间断或重叠的范围。局部算子显式声明固定行数，AOT 容量和逐操作数字节数继续严格匹配。
+
+`tools.model.deepseek_v41.sequence_parallel --plan PLAN --output PLAN_PARTITIONED --min-rows 512` 在已有 TP8 大行数 packet 上复用本地行模板，输出与输入位于同一资产目录。每卡持续保存连续八分之一行的残差，mHC、归一化、FP32 路由和 A8 量化复用原计算体与归约顺序。默认保留原 AllReduce，将结果的本卡行视图交给局部后处理；全局注意力和专家投影读取 AllGather 汇总的归一化输入、A8/scale 以及路由结果。A8 通过四字节 INT32 视图无损传输。两处 Engram 和最终输出头沿用汇总后的原计算；层快照启用时才汇总完整残差。较短 packet 保留原实现，范围由 `--min-rows` 分开。
+
+`--reduce-scatter` 生成原生 ReduceScatter 的实验候选：每卡输出数量固定为局部容量，未使用的输入行在计算流上清零。原生接口检查源／目标范围、跨 rank 输入容量和资源生存期，支持改变输入后的 ACL Graph replay。此集合通信与 AllReduce 的浮点求和顺序可能不同；该候选的模型质量需要通过相同 teacher 历史的官方对照验收，默认使用 AllReduce 路径。
 
 上述工具可通过 `run.sh --without-devices` 离线编译。`tools.operators.ascend.validate_sharded_indexer --baseline PLAN --plan PLAN_SHARDED --output DIR` 在设备上逐卡比较原始分数、TopK、填充行和索引重排，以独立参考抽查分数，并验证修改输入后的 Graph replay。完整请求另用 `bench-ascend` 验证分块、缓存状态、输出与 TPS。
 
