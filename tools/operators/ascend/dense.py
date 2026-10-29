@@ -143,6 +143,9 @@ def fp32_partials(rows, output, reduction, splits=8, activation_dtype="bfloat16"
                     T.reduce_sum(product, partial, dim=1)
                     T.tile.add(total, total, partial)
                 T.copy(total, out[row, tile, split, :])
+                # Bounded dynamic grids reuse this UB tile for another row.
+                # Complete the GM store before the following zero-fill.
+                T.pipe_barrier("ALL")
 
     return main
 
@@ -165,5 +168,6 @@ def fp32_reduce(rows, output, splits=8):
                 T.copy(partials[row, tile, :, :], p)
                 T.reduce_sum(p, total, dim=0)
                 T.copy(total[0, :], out[row, tile * 32 : (tile + 1) * 32])
+                T.pipe_barrier("ALL")
 
     return main

@@ -17,7 +17,7 @@ pub(crate) mod snapshot;
 mod state_table;
 mod transfers;
 mod virtual_memory;
-mod weight_arena;
+use super::arena as weight_arena;
 mod weight_upload;
 pub(crate) use cudarc::driver::sys;
 pub(crate) type Handle = sys::CUgraphExec;

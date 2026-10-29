@@ -1,5 +1,7 @@
 //! Original-checkpoint single-sequence A2 execution and latency measurements.
 mod affinity;
+mod batch;
+mod batch_benchmark;
 mod benchmark;
 mod branches;
 #[cfg(test)]
@@ -31,6 +33,7 @@ use std::{
     time::Instant,
 };
 
+pub use batch_benchmark::run as run_batch;
 pub use benchmark::{Report, run};
 
 #[derive(Deserialize)]
@@ -48,6 +51,8 @@ struct Model {
     row_selections: BTreeMap<String, Vec<KernelVariant>>,
     #[serde(default = "default_packet_cache_capacity")]
     packet_cache_capacity: usize,
+    #[serde(default)]
+    batch: Option<batch::Contract>,
 }
 fn default_packet_cache_capacity() -> usize {
     64
@@ -95,6 +100,8 @@ struct Packet {
     best_index: String,
     logits: Option<String>,
     vocab_first: u32,
+    #[serde(default)]
+    batch_decode: bool,
 }
 impl Packet {
     fn dispatch_max(&self) -> usize {
@@ -143,6 +150,10 @@ enum Instruction {
         fixed_rows: Option<usize>,
         #[serde(default)]
         row_expression: Option<RowExpression>,
+        #[serde(default)]
+        owner_work: Option<RowExpression>,
+        #[serde(default)]
+        owners: bool,
     },
     Reduce {
         source: String,
@@ -327,6 +338,7 @@ struct Worker {
     templates: BTreeMap<PathBuf, Rc<Template>>,
     phases: LoadPhases,
     steps: BTreeMap<usize, packet::StepStats>,
+    batch: Option<batch::Runtime>,
 }
 
 /// Host-to-device chunk and pipeline depth; in-flight pinned memory stays
@@ -667,7 +679,14 @@ impl Worker {
             templates: BTreeMap::new(),
             phases,
             steps: BTreeMap::new(),
+            batch: model
+                .batch
+                .as_ref()
+                .map(|contract| batch::Runtime::new(contract.clone(), model.packet_cache_capacity)),
         };
+        if model.batch.is_some() {
+            return Ok(worker);
+        }
         for packet in rank.packets {
             let actual = packet.dispatch_max();
             let body = worker.compile(&packet.body, package, snapshots, (packet.rows, actual))?;
@@ -712,6 +731,16 @@ impl Worker {
         base: &Path,
         snapshots: bool,
         extent: (usize, usize),
+    ) -> Result<Vec<Step>> {
+        self.compile_bound(instructions, base, snapshots, extent, None)
+    }
+    fn compile_bound(
+        &mut self,
+        instructions: &[Instruction],
+        base: &Path,
+        snapshots: bool,
+        extent: (usize, usize),
+        layout: Option<&batch::Layout>,
     ) -> Result<Vec<Step>> {
         let (mut capacity, actual) = extent;
         let mut active_rows = actual;
@@ -774,7 +803,14 @@ impl Worker {
                     fork_count = 0;
                     steps.push(Step::Snapshot {
                         name: name.clone(),
-                        buffer: get(&self.buffers, buffer)?,
+                        buffer: {
+                            let b = get(&self.buffers, buffer)?;
+                            if layout.is_some() {
+                                b.slice(0, b.bytes() / capacity * active_rows)?
+                            } else {
+                                b
+                            }
+                        },
                     });
                 }
                 continue;
@@ -784,14 +820,27 @@ impl Worker {
                 buffers,
                 fixed_rows,
                 row_expression,
+                owner_work,
+                owners,
             } = instruction
             {
-                let rows = row_contract::kernel_rows(
-                    active_rows,
-                    capacity,
-                    *fixed_rows,
-                    row_expression.as_ref(),
-                )?;
+                let rows = if let Some(grid) = owner_work {
+                    batch::work_items(layout.ok_or("Owner kernel needs batch layout")?, grid)?
+                        .len()
+                        .div_ceil(2)
+                } else if *owners {
+                    layout
+                        .ok_or("Head kernel needs batch layout")?
+                        .outputs
+                        .len()
+                } else {
+                    row_contract::kernel_rows(
+                        active_rows,
+                        capacity,
+                        *fixed_rows,
+                        row_expression.as_ref(),
+                    )?
+                };
                 let manifest = self
                     .row_selections
                     .get(manifest)
@@ -819,13 +868,47 @@ impl Worker {
                         *buffer = buffer.slice(0, operand.bytes()?)?;
                     }
                 }
-                pending.push(SegmentOp::Kernel(
-                    if template.spec().row_capacity()?.is_some() {
-                        Kernel::bind_rows(&self.session, &template, &operands, rows)?
-                    } else {
-                        Kernel::bind(&self.session, &template, &operands)?
-                    },
-                ));
+                let mut kernel = if template.spec().row_capacity()?.is_some() {
+                    Kernel::bind_rows(&self.session, &template, &operands, rows)?
+                } else {
+                    Kernel::bind(&self.session, &template, &operands)?
+                };
+                if owner_work.is_some() {
+                    let runtime = self
+                        .batch
+                        .as_ref()
+                        .ok_or("Owner kernel needs a batch contract")?;
+                    let accesses: Vec<batch::Access> =
+                        serde_json::from_value(template.spec().parameters["_owner_access"].clone())
+                            .map_err(|e| e.to_string())?;
+                    let hazards = accesses
+                        .iter()
+                        .map(|a| {
+                            Ok((
+                                get(
+                                    &self.buffers,
+                                    &runtime
+                                        .contract
+                                        .columns
+                                        .get(
+                                            *runtime
+                                                .contract
+                                                .pointers
+                                                .get(&buffers[1])
+                                                .ok_or("Owner pointer mapping missing")?
+                                                .get(a.column)
+                                                .ok_or("Local owner column out of range")?,
+                                        )
+                                        .ok_or("Owner column out of range")?
+                                        .buffer,
+                                )?,
+                                a.write,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    kernel = kernel.with_hazards(&self.session, hazards)?;
+                }
+                pending.push(SegmentOp::Kernel(kernel));
                 self.phases.binds.0 += 1;
                 self.phases.binds.1 += t.elapsed().as_secs_f64();
                 continue;
@@ -1198,6 +1281,7 @@ fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf, HashLayou
 
 /// Reject incomplete or mismatched packages before allocating resident weights.
 fn preflight(model: &Model, base: &Path) -> Result<()> {
+    batch::validate(model)?;
     let mut kernels = BTreeMap::<String, super::kernels::Spec>::new();
     let used: std::collections::BTreeSet<_> = model
         .ranks
@@ -1290,7 +1374,9 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                 }
             }
         }
-        validate_dispatch(&rank.packets)?;
+        if model.batch.is_none() {
+            validate_dispatch(&rank.packets)?;
+        }
         if rank
             .packets
             .iter()
@@ -1305,6 +1391,29 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
             return Err("TP ranks have different row contracts".into());
         }
         for packet in &rank.packets {
+            let coordinates = &packet.coordinates;
+            if [
+                &coordinates.base_cos,
+                &coordinates.base_sin,
+                &coordinates.long_cos,
+                &coordinates.long_sin,
+                &coordinates.source_cos,
+                &coordinates.source_sin,
+                &coordinates.slots,
+                &coordinates.c2_slots,
+                &coordinates.swa_indices,
+                &coordinates.c1_indices,
+                &coordinates.c2_indices,
+                &coordinates.c1_lengths,
+                &coordinates.c2_lengths,
+                &coordinates.ring,
+                &coordinates.premix,
+            ]
+            .iter()
+            .any(|name| !buffers.contains_key(name.as_str()))
+            {
+                return Err("Packet coordinate buffer is not defined".into());
+            }
             branches::validate_instructions(&packet.body)?;
             branches::validate_instructions(&packet.head)?;
             if packet.rows == 0
@@ -1342,15 +1451,61 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                     buffers: bindings,
                     fixed_rows,
                     row_expression,
+                    owner_work,
+                    owners,
                 } = instruction
                 {
                     let spec = &kernels[manifest];
-                    let expected = row_contract::kernel_rows(
-                        current_capacity,
-                        current_capacity,
-                        *fixed_rows,
-                        row_expression.as_ref(),
-                    )?;
+                    let expected = if owner_work.is_some() {
+                        4096
+                    } else if *owners {
+                        model
+                            .batch
+                            .as_ref()
+                            .ok_or("Owner head requires batch contract")?
+                            .owners
+                    } else {
+                        row_contract::kernel_rows(
+                            current_capacity,
+                            current_capacity,
+                            *fixed_rows,
+                            row_expression.as_ref(),
+                        )?
+                    };
+                    if owner_work.is_some() != spec.op.starts_with("private_rows.") {
+                        return Err("Owner dispatch and AOT identity differ".into());
+                    }
+                    if let Some(grid) = owner_work {
+                        let c = model.batch.as_ref().ok_or("Missing owner contract")?;
+                        if *owners
+                            || fixed_rows.is_some()
+                            || row_expression.is_some()
+                            || bindings.len() < 3
+                            || c.work.get(&bindings[0]) != Some(grid)
+                            || !c.pointers.contains_key(&bindings[1])
+                            || bindings[2] != c.active
+                            || spec.parameters["_owner_token_capacity"].as_u64()
+                                != Some(packet.rows as u64)
+                        {
+                            return Err("Owner kernel/table/row contract differs".into());
+                        }
+                        let accesses: Vec<batch::Access> =
+                            serde_json::from_value(spec.parameters["_owner_access"].clone())
+                                .map_err(|e| e.to_string())?;
+                        let mapping = &c.pointers[&bindings[1]];
+                        if accesses.is_empty()
+                            || !accesses.iter().any(|a| a.write)
+                            || accesses.iter().any(|a| {
+                                a.column >= mapping.len()
+                                    || c.columns[mapping[a.column]]
+                                        .decode
+                                        .is_some_and(|d| d != packet.batch_decode)
+                            })
+                        {
+                            return Err("Invalid owner pointee access contract".into());
+                        }
+                    }
+
                     if spec
                         .row_capacity()?
                         .is_some_and(|cap| packet.min_rows == 0 || cap != expected)

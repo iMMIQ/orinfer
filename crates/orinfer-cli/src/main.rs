@@ -130,6 +130,15 @@ enum Command {
         #[arg(long)]
         trace: Option<PathBuf>,
     },
+    /// Benchmark shared-row native A2 requests with owner-private state.
+    BenchAscendBatch {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long)]
+        inputs: PathBuf,
+    },
     /// Validate native HCCL AllReduce and variable-count AlltoAllV on 2..8 devices.
     ValidateHccl {
         #[arg(long, value_delimiter = ',', required = true)]
@@ -575,6 +584,13 @@ fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
             output_tokens,
             repeats,
             trace.as_deref(),
+        )?),
+        Command::BenchAscendBatch {
+            plan,
+            model_dir,
+            inputs,
+        } => print_json(&orinfer_engine::backend::ascend::model::run_batch(
+            &plan, &model_dir, &inputs,
         )?),
         Command::ValidateHccl { devices } => print_json(
             orinfer_engine::backend::ascend::hccl::validation::run(&devices)?,

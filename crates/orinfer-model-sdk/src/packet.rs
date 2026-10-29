@@ -1,4 +1,5 @@
 //! Common packet operand-table contract for ordinary and speculative rows.
+use crate::architecture::BatchSegment;
 use crate::{
     artifact::{Dtype, Result},
     model::Manifest,
@@ -64,4 +65,40 @@ pub struct PacketCopy {
     pub destination: String,
     pub kernel: String,
     pub row_bytes: usize,
+}
+
+/// Contiguous live rows, independent of the model's computation or state layout.
+#[derive(Clone, Debug)]
+pub struct Rows {
+    pub starts: Vec<usize>,
+    pub total: usize,
+}
+
+impl Rows {
+    pub fn new(lengths: impl IntoIterator<Item = usize>, capacity: usize) -> Result<Self> {
+        let mut starts = Vec::new();
+        let mut total = 0usize;
+        for length in lengths {
+            if length == 0 {
+                return Err("Empty packet segment".into());
+            }
+            starts.push(total);
+            total = total.checked_add(length).ok_or("Packet row overflow")?;
+            if total > capacity {
+                return Err("Packet row capacity exceeded".into());
+            }
+        }
+        if starts.is_empty() {
+            return Err("Empty packet".into());
+        }
+        Ok(Self { starts, total })
+    }
+
+    pub fn packet(segments: &[BatchSegment], owners: usize, capacity: usize) -> Result<Self> {
+        let mut slots = BTreeSet::new();
+        if segments.len() > owners || segments.iter().any(|s| !slots.insert(s.slot)) {
+            return Err("Packet requires distinct owners within capacity".into());
+        }
+        Self::new(segments.iter().map(|s| s.tokens), capacity)
+    }
 }

@@ -93,6 +93,9 @@ pub fn run(
         return Err("At least two output tokens and one repeat are required".into());
     }
     let (mut model, package, layout) = load_spec(plan, model_dir)?;
+    if model.batch.is_some() {
+        return Err("Native batch plans use bench-ascend-batch".into());
+    }
     let inputs: Inputs = crate::model::read(inputs)?;
     if inputs.cases.is_empty()
         || inputs.cases.iter().any(|c| {

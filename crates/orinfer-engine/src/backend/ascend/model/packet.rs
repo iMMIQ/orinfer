@@ -60,18 +60,33 @@ fn ints(values: &[i32]) -> Vec<u8> {
     values.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 impl Worker {
-    fn put(&self, inputs: &mut Vec<(Buffer, Vec<u8>)>, name: &str, data: &[u8]) -> Result<()> {
-        inputs.push((
-            get(&self.buffers, name)?.slice(0, data.len())?,
-            data.to_vec(),
-        ));
-        Ok(())
-    }
     fn coordinate(&self, names: &Coordinates, base: usize, rows: usize) -> Result<()> {
+        self.coordinate_at(names, base, rows, 0)
+    }
+    pub(super) fn coordinate_at(
+        &self,
+        names: &Coordinates,
+        base: usize,
+        rows: usize,
+        offset: usize,
+    ) -> Result<()> {
         if rows == 0 || base.checked_add(rows).is_none_or(|end| end > self.capacity) {
             return Err("Packet exceeds model context capacity".into());
         }
         let mut inputs = vec![];
+        let put = |inputs: &mut Vec<(Buffer, Vec<u8>)>, name: &str, data: &[u8]| -> Result<()> {
+            if !data.len().is_multiple_of(rows) {
+                return Err("Coordinate row stride differs".into());
+            }
+            let byte_offset = offset
+                .checked_mul(data.len() / rows)
+                .ok_or("Coordinate offset overflow")?;
+            inputs.push((
+                get(&self.buffers, name)?.slice(byte_offset, data.len())?,
+                data.to_vec(),
+            ));
+            Ok(())
+        };
         for (asset, target, compressed) in [
             ("base_cos", &names.base_cos, false),
             ("base_sin", &names.base_sin, false),
@@ -94,14 +109,14 @@ impl Worker {
                         .ok_or("RoPE position outside table")?,
                 );
             }
-            self.put(&mut inputs, target, &data)?;
+            put(&mut inputs, target, &data)?;
         }
         let slots = (base..base + rows).map(|p| p as i32).collect::<Vec<_>>();
         let c2_slots = (base..base + rows)
             .map(|p| if p % 2 == 1 { (p / 2) as i32 } else { -1 })
             .collect::<Vec<_>>();
-        self.put(&mut inputs, &names.slots, &ints(&slots))?;
-        self.put(&mut inputs, &names.c2_slots, &ints(&c2_slots))?;
+        put(&mut inputs, &names.slots, &ints(&slots))?;
+        put(&mut inputs, &names.c2_slots, &ints(&c2_slots))?;
         let mut swa = vec![-1; rows * 128];
         let mut metadata = vec![0; rows * 8];
         let mut mix = vec![0f32; rows * 8];
@@ -120,9 +135,9 @@ impl Worker {
             ]);
             mix[row * 8] = 1.0;
         }
-        self.put(&mut inputs, &names.swa_indices, &ints(&swa))?;
-        self.put(&mut inputs, &names.ring, &ints(&metadata))?;
-        self.put(
+        put(&mut inputs, &names.swa_indices, &ints(&swa))?;
+        put(&mut inputs, &names.ring, &ints(&metadata))?;
+        put(
             &mut inputs,
             &names.premix,
             &mix.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
@@ -144,8 +159,8 @@ impl Worker {
                     ids[row * capacity + slot] = slot as i32;
                 }
             }
-            self.put(&mut inputs, indices, &ints(&ids))?;
-            self.put(&mut inputs, lengths, &ints(&lens))?;
+            put(&mut inputs, indices, &ints(&ids))?;
+            put(&mut inputs, lengths, &ints(&lens))?;
         }
         self.session.upload_inputs(&inputs)?;
         Ok(())
@@ -279,6 +294,17 @@ impl Worker {
         valid: &[bool],
         logits: bool,
     ) -> Result<Ticket> {
+        self.enqueue_packet_retained(execution, tokens, hashes, valid, logits, vec![])
+    }
+    pub(super) fn enqueue_packet_retained(
+        &mut self,
+        execution: Rc<Execution>,
+        tokens: &[u32],
+        hashes: &[i64],
+        valid: &[bool],
+        logits: bool,
+        retained: Vec<Buffer>,
+    ) -> Result<Ticket> {
         let head = if logits {
             execution.head.as_slice()
         } else {
@@ -297,8 +323,10 @@ impl Worker {
         // submit_compute fences partial submission on failure. Each forward
         // completes before these packet resources can be invoked again.
         unsafe {
-            self.session
-                .submit_compute(vec![], Box::new(Rc::clone(&execution)), |stream| {
+            self.session.submit_compute(
+                vec![],
+                Box::new((Rc::clone(&execution), retained)),
+                |stream| {
                     let head = if logits {
                         execution.head.as_slice()
                     } else {
@@ -340,8 +368,29 @@ impl Worker {
                         }
                     }
                     Ok(())
-                })
+                },
+            )
         }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn trace_packet(
+        &mut self,
+        execution: &Execution,
+        tokens: &[u32],
+        hashes: &[i64],
+        valid: &[bool],
+        head: bool,
+        path: &Path,
+    ) -> Result<()> {
+        let trace = (self.rank == 0).then_some(path);
+        for step in execution
+            .body
+            .iter()
+            .chain(if head { execution.head.as_slice() } else { &[] })
+        {
+            self.step(step, tokens, hashes, valid, 0, trace)?;
+        }
+        self.session.synchronize()
     }
     /// Prints and clears per-row-count step accounting for this rank.
     pub(super) fn report_steps(&mut self) {

@@ -108,6 +108,12 @@ impl Spec {
             .operands
             .iter()
             .any(|o| matches!(o.access, Access::Write | Access::ReadWrite))
+            && !(self.op.starts_with("private_rows.")
+                && self
+                    .parameters
+                    .get("_owner_writes")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|v| !v.is_empty()))
         {
             return Err("AOT kernel requires a declared output".into());
         }
@@ -240,6 +246,7 @@ impl Bound {
 #[derive(Clone)]
 pub struct Kernel {
     bound: Rc<Bound>,
+    hazards: Vec<(Buffer, bool)>,
 }
 
 /// A model fragment submits one ordered native batch and records one completion
@@ -330,6 +337,7 @@ impl Kernel {
             }
         }
         Ok(Self {
+            hazards: Vec::new(),
             bound: Rc::new(Bound {
                 context: Rc::clone(&session.context),
                 template: Rc::clone(template),
@@ -348,6 +356,28 @@ impl Kernel {
             .iter()
             .zip(&self.bound.template.spec.operands)
             .map(|(buffer, operand)| (buffer, operand.access.writes()))
+            .chain(
+                self.hazards
+                    .iter()
+                    .map(|(buffer, writes)| (buffer, *writes)),
+            )
+    }
+    /// Logical pointee ranges for an address-table kernel. Actual owner arenas
+    /// are retained by the enclosing frame; these ranges preserve alias/fork
+    /// dependencies when the table's addresses change between replays.
+    pub(super) fn with_hazards(
+        mut self,
+        session: &Session,
+        hazards: Vec<(Buffer, bool)>,
+    ) -> Result<Self> {
+        if !self.spec().op.starts_with("private_rows.") || hazards.is_empty() {
+            return Err("Logical pointees require an indirect owner kernel".into());
+        }
+        for (buffer, _) in &hazards {
+            session.require(buffer)?;
+        }
+        self.hazards = hazards;
+        Ok(self)
     }
     pub fn template(&self) -> &Rc<Template> {
         &self.bound.template

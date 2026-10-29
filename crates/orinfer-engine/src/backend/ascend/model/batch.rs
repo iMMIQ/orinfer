@@ -1,0 +1,762 @@
+//! Owner-private state and shared token rows for native A2 packets.
+use super::{Buffer, Execution, Instruction, Worker, get};
+use crate::artifact::Result;
+use orinfer_model_sdk::{
+    architecture::BatchSegment, operators::dynamic::RowExpression, packet::Rows,
+};
+use serde::Deserialize;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    rc::Rc,
+};
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Column {
+    pub buffer: String,
+    pub row_bytes: Option<usize>,
+    pub row_alignment: usize,
+    pub decode: Option<bool>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Contract {
+    pub owners: usize,
+    pub columns: Vec<Column>,
+    pub private: Vec<String>,
+    pub pointers: BTreeMap<String, Vec<usize>>,
+    pub active: String,
+    pub endpoints: String,
+    pub work: BTreeMap<String, RowExpression>,
+}
+#[derive(Deserialize)]
+pub(super) struct Access {
+    pub column: usize,
+    pub write: bool,
+}
+pub(super) struct Owner {
+    pub buffers: BTreeMap<String, Buffer>,
+    pub history: Vec<u32>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Key {
+    decode: bool,
+    lengths: Vec<usize>,
+    outputs: usize,
+}
+pub(super) struct Runtime {
+    pub contract: Contract,
+    pub owners: BTreeMap<usize, Owner>,
+    cache: BTreeMap<Key, Rc<Execution>>,
+    lru: VecDeque<Key>,
+    capacity: usize,
+}
+impl Runtime {
+    pub fn new(contract: Contract, capacity: usize) -> Self {
+        Self {
+            contract,
+            owners: BTreeMap::new(),
+            cache: BTreeMap::new(),
+            lru: VecDeque::new(),
+            capacity,
+        }
+    }
+}
+#[derive(Clone)]
+pub(super) struct Layout {
+    pub segments: Vec<BatchSegment>,
+    pub rows: Rows,
+    pub outputs: Vec<usize>,
+    pub decode: bool,
+}
+impl Layout {
+    pub fn new(
+        segments: Vec<BatchSegment>,
+        outputs: Vec<usize>,
+        decode: bool,
+        capacity: usize,
+        owners: usize,
+    ) -> Result<Self> {
+        let rows = Rows::packet(&segments, owners, capacity)?;
+        if decode && segments.iter().any(|s| s.tokens != 1)
+            || outputs.iter().any(|&i| i >= segments.len())
+            || outputs.windows(2).any(|p| p[0] >= p[1])
+        {
+            return Err("Invalid owner output/role layout".into());
+        }
+        Ok(Self {
+            segments,
+            rows,
+            outputs,
+            decode,
+        })
+    }
+    fn key(&self) -> Key {
+        let mut lengths = self.segments.iter().map(|s| s.tokens).collect::<Vec<_>>();
+        lengths.sort_unstable();
+        Key {
+            decode: self.decode,
+            lengths,
+            outputs: self.outputs.len(),
+        }
+    }
+}
+pub(super) fn work_items(layout: &Layout, grid: &RowExpression) -> Result<Vec<[i32; 2]>> {
+    let mut out = vec![];
+    for (owner, segment) in layout.segments.iter().enumerate() {
+        for block in 0..grid.resolve(segment.tokens)?.min(64) {
+            out.push([owner as i32, block as i32]);
+        }
+    }
+    if out.is_empty() || out.len() > 8192 {
+        return Err("Owner work table exceeds its capacity".into());
+    }
+    if out.len() % 2 != 0 {
+        out.push([-1, 0]);
+    }
+    Ok(out)
+}
+impl Worker {
+    fn reserve_batch_memory(&mut self, needed: usize, stage: &str) -> Result<()> {
+        if self.session.memory_info()?.0 >= needed {
+            return Ok(());
+        }
+        self.session.synchronize()?;
+        let mut evicted = 0;
+        while self.session.memory_info()?.0 < needed {
+            let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
+            let Some(key) = runtime.lru.pop_front() else {
+                return Err(format!(
+                    "Insufficient A2 memory for {stage}, including capture headroom"
+                ));
+            };
+            runtime.cache.remove(&key);
+            self.w4.retain(|_, w| w.strong_count() > 0);
+            self.session.synchronize()?;
+            evicted += 1;
+        }
+        eprintln!(
+            "A2 rank {} evicted {evicted} cached packet shapes for {stage}",
+            self.rank
+        );
+        Ok(())
+    }
+    pub(super) fn admit(&mut self, ids: &[usize]) -> Result<()> {
+        let runtime = self.batch.as_ref().ok_or("Missing native batch contract")?;
+        let names = runtime.contract.private.clone();
+        let count = ids
+            .iter()
+            .copied()
+            .filter(|id| *id != 0 && !runtime.owners.contains_key(id))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let entries = names
+            .iter()
+            .filter(|n| !self.views.contains_key(*n))
+            .map(|n| Ok((n.as_str(), get(&self.buffers, n)?.bytes(), 256)))
+            .collect::<Result<Vec<_>>>()?;
+        let arena = crate::backend::arena::ArenaLayout::from_sizes(entries.into_iter())?;
+        let arena_bytes = arena
+            .allocation_bytes
+            .checked_add(255)
+            .ok_or("Owner arena alignment overflow")?;
+        // HUGE_FIRST rounds independent allocations in the device page pool.
+        // One aligned owner bank avoids charging a page for each small scale.
+        let per_owner = arena_bytes
+            .checked_add((2 << 20) - 1)
+            .ok_or("Owner physical extent overflow")?
+            / (2 << 20)
+            * (2 << 20);
+        let needed = per_owner
+            .checked_mul(count)
+            .and_then(|n| n.checked_add(3 << 30))
+            .ok_or("Owner admission estimate overflow")?;
+        self.reserve_batch_memory(needed, "owner admission")?;
+        for &id in ids {
+            if self.batch.as_ref().unwrap().owners.contains_key(&id) {
+                continue;
+            }
+            if self.batch.as_ref().unwrap().owners.len()
+                >= self.batch.as_ref().unwrap().contract.owners
+            {
+                return Err("Owner capacity exceeded".into());
+            }
+            let mut buffers = BTreeMap::new();
+            let bank = if id == 0 {
+                None
+            } else {
+                Some(self.session.allocate(arena_bytes)?)
+            };
+            let base = if let Some(bank) = &bank {
+                self.session.fill(bank, 0)?.wait()?;
+                usize::try_from(arena.base(bank.pointer() as usize as u64)?)
+                    .map_err(|e| e.to_string())?
+                    - (bank.pointer() as usize)
+            } else {
+                0
+            };
+            for name in &names {
+                let buffer = if id == 0 {
+                    get(&self.buffers, name)?
+                } else if let Some((view, bytes)) = self.views.get(name) {
+                    get(&buffers, &view.parent)?.slice(view.offset, *bytes)?
+                } else {
+                    bank.as_ref().unwrap().slice(
+                        base + arena.offsets[name],
+                        get(&self.buffers, name)?.bytes(),
+                    )?
+                };
+                buffers.insert(name.clone(), buffer);
+            }
+            self.batch.as_mut().unwrap().owners.insert(
+                id,
+                Owner {
+                    buffers,
+                    history: vec![],
+                },
+            );
+            self.reset_owner(id)?;
+        }
+        Ok(())
+    }
+    pub(super) fn reset_owner(&mut self, id: usize) -> Result<()> {
+        let names = self
+            .packet_templates
+            .iter()
+            .flat_map(|p| p.reset.iter())
+            .collect::<std::collections::BTreeSet<_>>();
+        let owner = self
+            .batch
+            .as_mut()
+            .ok_or("Missing batch runtime")?
+            .owners
+            .get_mut(&id)
+            .ok_or("Unknown owner")?;
+        for name in names {
+            self.session.fill(&get(&owner.buffers, name)?, 0)?.wait()?;
+        }
+        owner.history.clear();
+        Ok(())
+    }
+    pub(super) fn release_owners(&mut self) -> Result<()> {
+        self.session.synchronize()?;
+        self.batch
+            .as_mut()
+            .ok_or("Missing batch runtime")?
+            .owners
+            .clear();
+        Ok(())
+    }
+    pub(super) fn batch_cached(&self, layout: &Layout) -> Result<bool> {
+        Ok(self
+            .batch
+            .as_ref()
+            .ok_or("Missing batch runtime")?
+            .cache
+            .contains_key(&layout.key()))
+    }
+    pub(super) fn invalidate_batch(&mut self, layout: &Layout) -> Result<()> {
+        self.session.synchronize()?;
+        let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
+        let key = layout.key();
+        runtime.cache.remove(&key);
+        runtime.lru.retain(|k| k != &key);
+        self.w4.retain(|_, w| w.strong_count() > 0);
+        self.reserve_batch_memory(3 << 30, "coordinated Graph preparation")
+    }
+    pub(super) fn prepare_batch(&mut self, layout: &Layout) -> Result<()> {
+        let key = layout.key();
+        if !self
+            .batch
+            .as_ref()
+            .ok_or("Missing batch runtime")?
+            .cache
+            .contains_key(&key)
+        {
+            self.reserve_batch_memory(3 << 30, "Graph preparation")?;
+            let packet = self
+                .packet_templates
+                .iter()
+                .find(|p| p.batch_decode == layout.decode)
+                .cloned()
+                .ok_or("Missing batch family")?;
+            // Every indirect state access checks this stream-ordered word.
+            // Capturing a new shape cannot overwrite live KV or C2 rings.
+            super::upload(
+                &self.session,
+                &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
+                &0i32.to_le_bytes(),
+            )?;
+            self.update_batch_tables(layout)?;
+            if layout.rows.total > packet.rows {
+                return Err("Batch exceeds its family row capacity".into());
+            }
+            let base = self.package.clone();
+            let body = self.compile_bound(
+                &packet.body,
+                &base,
+                self.snapshots,
+                (packet.rows, layout.rows.total),
+                Some(layout),
+            )?;
+            let head = if layout.outputs.is_empty() {
+                vec![]
+            } else {
+                self.compile_bound(
+                    &packet.head,
+                    &base,
+                    false,
+                    (packet.rows, layout.rows.total),
+                    Some(layout),
+                )?
+            };
+            self.batch
+                .as_mut()
+                .unwrap()
+                .cache
+                .insert(key.clone(), Rc::new(Execution { packet, body, head }));
+        }
+        let runtime = self.batch.as_mut().unwrap();
+        runtime.lru.retain(|k| k != &key);
+        runtime.lru.push_back(key);
+        while runtime.cache.len() > runtime.capacity {
+            let old = runtime.lru.pop_front().unwrap();
+            runtime.cache.remove(&old);
+        }
+        self.w4.retain(|_, w| w.strong_count() > 0);
+        Ok(())
+    }
+    fn update_batch_tables(&self, layout: &Layout) -> Result<Vec<Buffer>> {
+        let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+        let mut values = Vec::new();
+        let mut retained = vec![];
+        for (lane, segment) in layout.segments.iter().enumerate() {
+            let owner = runtime
+                .owners
+                .get(&segment.slot)
+                .ok_or("Owner must be admitted before capture")?;
+            values.extend_from_slice(&(segment.tokens as u64).to_le_bytes());
+            for column in &runtime.contract.columns {
+                let buffer = if column.decode.is_some_and(|d| d != layout.decode) {
+                    None
+                } else if let Some(stride) = column.row_bytes {
+                    Some(
+                        get(&self.buffers, &column.buffer)?.slice(
+                            layout.segments[..lane]
+                                .iter()
+                                .map(|s| {
+                                    s.tokens.div_ceil(column.row_alignment) * column.row_alignment
+                                })
+                                .sum::<usize>()
+                                .checked_mul(stride)
+                                .ok_or("Owner offset overflow")?,
+                            segment
+                                .tokens
+                                .div_ceil(column.row_alignment)
+                                .checked_mul(column.row_alignment)
+                                .and_then(|q| q.checked_mul(stride))
+                                .ok_or("Owner span overflow")?,
+                        )?,
+                    )
+                } else {
+                    Some(get(&owner.buffers, &column.buffer)?)
+                };
+                let address = buffer.as_ref().map_or(0, |b| b.pointer() as usize as u64);
+                values.extend_from_slice(&address.to_le_bytes());
+                if let Some(buffer) = buffer {
+                    retained.push(buffer);
+                }
+            }
+        }
+        let width = runtime.contract.columns.len() + 1;
+        let addresses = values.as_chunks::<8>().0;
+        let mut inputs = vec![];
+        for (name, mapping) in &runtime.contract.pointers {
+            if mapping.iter().any(|&c| {
+                runtime.contract.columns[c]
+                    .decode
+                    .is_some_and(|d| d != layout.decode)
+            }) {
+                continue;
+            }
+            let mut data = Vec::with_capacity(layout.segments.len() * (mapping.len() + 1) * 8);
+            for owner in 0..layout.segments.len() {
+                data.extend_from_slice(&addresses[owner * width]);
+                for &column in mapping {
+                    data.extend_from_slice(&addresses[owner * width + column + 1]);
+                }
+            }
+            inputs.push((get(&self.buffers, name)?.slice(0, data.len())?, data));
+        }
+        for (name, grid) in &runtime.contract.work {
+            let data = work_items(layout, grid)?
+                .iter()
+                .flat_map(|p| p.iter().flat_map(|x| x.to_le_bytes()))
+                .collect::<Vec<_>>();
+            inputs.push((get(&self.buffers, name)?.slice(0, data.len())?, data));
+        }
+        let data = layout
+            .outputs
+            .iter()
+            .flat_map(|&i| {
+                ((layout.rows.starts[i] + layout.segments[i].tokens - 1) as i32).to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        if !data.is_empty() {
+            inputs.push((
+                get(&self.buffers, &runtime.contract.endpoints)?.slice(0, data.len())?,
+                data,
+            ));
+        }
+        self.session.upload_inputs(&inputs)?.wait()?;
+        Ok(retained)
+    }
+    fn trace_rings(&self, path: &std::path::Path, stage: &str) -> Result<()> {
+        if self.rank != 0 {
+            return Ok(());
+        }
+        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        for (id, owner) in &self.batch.as_ref().unwrap().owners {
+            for (name, b) in &owner.buffers {
+                if name.starts_with("cache.ring.") {
+                    let data = self.session.download(b, 0, b.bytes())?;
+                    std::fs::write(path.join(format!("{stage}-owner{id}-{name}.bin")), data)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn forward_batch(
+        &mut self,
+        layout: &Layout,
+        tokens: &[Vec<u32>],
+        full_logits: bool,
+    ) -> Result<Vec<(usize, super::packet::Best, Vec<f32>)>> {
+        if tokens.len() != layout.segments.len()
+            || tokens
+                .iter()
+                .zip(&layout.segments)
+                .any(|(t, s)| t.len() != s.tokens)
+        {
+            return Err("Batch input differs from row layout".into());
+        }
+        let execution = Rc::clone(
+            self.batch
+                .as_ref()
+                .ok_or("Missing batch runtime")?
+                .cache
+                .get(&layout.key())
+                .ok_or("Batch must be prepared before forward")?,
+        );
+        let retained = self.update_batch_tables(layout)?;
+        let mut joined = vec![];
+        let mut hashes = vec![];
+        let mut valid = vec![];
+        for (i, (segment, input)) in layout.segments.iter().zip(tokens).enumerate() {
+            let history = &self.batch.as_ref().unwrap().owners[&segment.slot].history;
+            self.coordinate_at(
+                &execution.packet.coordinates,
+                history.len(),
+                segment.tokens,
+                layout.rows.starts[i],
+            )?;
+            let mut owner_hashes = vec![];
+            let mut owner_valid = vec![];
+            self.hasher
+                .hash_into(history, input, &mut owner_hashes, &mut owner_valid)?;
+            hashes.extend(owner_hashes);
+            valid.extend(owner_valid);
+            joined.extend_from_slice(input);
+        }
+        super::upload(
+            &self.session,
+            &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
+            &1i32.to_le_bytes(),
+        )?;
+        if let Some(trace) = std::env::var_os("ORINFER_A2_BATCH_TRACE") {
+            let name = layout
+                .segments
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}-{}-{}",
+                        s.slot,
+                        self.batch.as_ref().unwrap().owners[&s.slot].history.len(),
+                        s.tokens
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("_");
+            let path = std::path::PathBuf::from(trace).join(name);
+            self.trace_rings(&path, "before")?;
+            self.trace_packet(
+                &execution,
+                &joined,
+                &hashes,
+                &valid,
+                !layout.outputs.is_empty(),
+                &path,
+            )?;
+            self.trace_rings(&path, "after")?;
+        } else {
+            self.enqueue_packet_retained(
+                Rc::clone(&execution),
+                &joined,
+                &hashes,
+                &valid,
+                !layout.outputs.is_empty(),
+                retained,
+            )?
+            .wait()?;
+        }
+        let mut output = vec![];
+        if !layout.outputs.is_empty() {
+            let count = layout.outputs.len();
+            let values = self.session.download(
+                &get(&self.buffers, &execution.packet.best_value)?,
+                0,
+                count * 4,
+            )?;
+            let indices = self.session.download(
+                &get(&self.buffers, &execution.packet.best_index)?,
+                0,
+                count * 4,
+            )?;
+            let logits = if full_logits {
+                Some(
+                    self.session.download(
+                        &get(
+                            &self.buffers,
+                            execution
+                                .packet
+                                .logits
+                                .as_ref()
+                                .ok_or("Missing batch logits")?,
+                        )?,
+                        0,
+                        count * 16160 * 4,
+                    )?,
+                )
+            } else {
+                None
+            };
+            for (i, &lane) in layout.outputs.iter().enumerate() {
+                let value = f32::from_le_bytes(values[i * 4..i * 4 + 4].try_into().unwrap());
+                let index = i32::from_le_bytes(indices[i * 4..i * 4 + 4].try_into().unwrap());
+                if !value.is_finite() || !(0..16160).contains(&index) {
+                    return Err("Invalid batched output".into());
+                }
+                let probs = logits.as_ref().map_or(vec![], |b| {
+                    b[i * 16160 * 4..(i + 1) * 16160 * 4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|v| f32::from_le_bytes(*v))
+                        .collect()
+                });
+                output.push((
+                    layout.segments[lane].slot,
+                    super::packet::Best {
+                        value,
+                        token: execution.packet.vocab_first + index as u32,
+                    },
+                    probs,
+                ));
+            }
+        }
+        for (segment, input) in layout.segments.iter().zip(tokens) {
+            self.batch
+                .as_mut()
+                .unwrap()
+                .owners
+                .get_mut(&segment.slot)
+                .unwrap()
+                .history
+                .extend_from_slice(input);
+        }
+        Ok(output)
+    }
+}
+
+pub(super) fn validate(model: &super::Model) -> Result<()> {
+    let Some(c) = &model.batch else { return Ok(()) };
+    if !(1..=128).contains(&c.owners)
+        || c.columns.is_empty()
+        || model.ranks.iter().any(|r| r.packets.len() != 2)
+    {
+        return Err("Invalid batch contract".into());
+    }
+    for rank in &model.ranks {
+        let buffers = rank
+            .buffers
+            .iter()
+            .map(|b| (b.name.as_str(), b))
+            .collect::<BTreeMap<_, _>>();
+        for column in &c.columns {
+            let b = buffers
+                .get(column.buffer.as_str())
+                .ok_or("Unknown owner column")?;
+            if b.weight.is_some()
+                || b.data.is_some()
+                || b.prepared_weight.is_some()
+                || column.row_bytes == Some(0)
+                || !column.row_alignment.is_power_of_two()
+                || column.row_alignment > 256
+            {
+                return Err("Owner column cannot own immutable weights".into());
+            }
+            if column.row_bytes.is_none() && !c.private.contains(&column.buffer) {
+                return Err("Fixed owner column is not private".into());
+            }
+        }
+        let unique = c.private.iter().collect::<std::collections::BTreeSet<_>>();
+        if unique.len() != c.private.len() {
+            return Err("Duplicate private state role".into());
+        }
+        let mut parents = std::collections::BTreeSet::new();
+        for name in &c.private {
+            let b = buffers
+                .get(name.as_str())
+                .ok_or("Missing private owner state")?;
+            if b.weight.is_some()
+                || b.data.is_some()
+                || b.prepared_weight.is_some()
+                || b.view
+                    .as_ref()
+                    .is_some_and(|v| !parents.contains(&v.parent))
+            {
+                return Err("Invalid private allocation/view order".into());
+            }
+            parents.insert(name.clone());
+        }
+        if rank.packets.iter().filter(|p| p.batch_decode).count() != 1
+            || rank.packets.iter().filter(|p| !p.batch_decode).count() != 1
+        {
+            return Err("Batch requires one family per role".into());
+        }
+        for column in &c.columns {
+            match (column.row_bytes, column.decode) {
+                (None, None) => {}
+                (Some(stride), Some(decode)) => {
+                    let p = rank
+                        .packets
+                        .iter()
+                        .find(|p| p.batch_decode == decode)
+                        .unwrap();
+                    if p.rows
+                        .checked_add(c.owners * (column.row_alignment - 1))
+                        .and_then(|q| stride.checked_mul(q))
+                        != Some(buffers[column.buffer.as_str()].bytes)
+                    {
+                        return Err("Owner column physical row stride differs".into());
+                    }
+                }
+                _ => return Err("Owner row column requires a family".into()),
+            }
+        }
+        for (name, grid) in &c.work {
+            if buffers.get(name.as_str()).map(|b| b.bytes) != Some(8192 * 2 * 4) {
+                return Err("Invalid owner work capacity".into());
+            }
+            grid.resolve(1)?;
+        }
+        if buffers.get(c.endpoints.as_str()).map(|b| b.bytes) != Some(c.owners * 4) {
+            return Err("Invalid owner output endpoints".into());
+        }
+        if c.pointers.is_empty() || buffers.get(c.active.as_str()).map(|b| b.bytes) != Some(4) {
+            return Err("Invalid owner table shape".into());
+        }
+        for (name, mapping) in &c.pointers {
+            if mapping.is_empty()
+                || mapping.iter().any(|&i| i >= c.columns.len())
+                || buffers.get(name.as_str()).map(|b| b.bytes)
+                    != Some(c.owners * (mapping.len() + 1) * 8)
+            {
+                return Err("Invalid owner pointer mapping".into());
+            }
+        }
+        for p in &rank.packets {
+            if p.min_rows != 1
+                || p.max_rows.is_some()
+                || (p.batch_decode && p.rows != c.owners)
+                || p.reset.iter().any(|n| !unique.contains(n))
+            {
+                return Err("Invalid batch family/reset contract".into());
+            }
+            for s in p.body.iter().chain(&p.head) {
+                if let Instruction::Kernel {
+                    owner_work: Some(grid),
+                    ..
+                } = s
+                {
+                    for q in [1, p.rows] {
+                        grid.resolve(q)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn layout(lengths: &[usize], owners: &[usize]) -> Result<Layout> {
+        Layout::new(
+            lengths
+                .iter()
+                .zip(owners)
+                .map(|(&tokens, &slot)| BatchSegment { tokens, slot })
+                .collect(),
+            vec![0],
+            false,
+            4096,
+            128,
+        )
+    }
+    #[test]
+    fn arbitrary_batch_work_covers_each_logical_owner_tile() {
+        let grid:RowExpression=serde_json::from_value(serde_json::json!({"op":"multiply","lhs":{"op":"rows"},"rhs":{"op":"constant","value":3}})).unwrap();
+        for batch in 1..=128 {
+            let lengths = (0..batch).map(|i| 1 + i % 31).collect::<Vec<_>>();
+            let ids = (0..batch).map(|i| i * 17 + 9).collect::<Vec<_>>();
+            let l = layout(&lengths, &ids).unwrap();
+            let work = work_items(&l, &grid).unwrap();
+            assert_eq!(work.len() % 2, 0);
+            for (owner, &q) in lengths.iter().enumerate() {
+                let physical = work
+                    .iter()
+                    .filter(|p| p[0] == owner as i32)
+                    .map(|p| p[1] as usize)
+                    .collect::<Vec<_>>();
+                assert_eq!(physical, (0..(3 * q).min(64)).collect::<Vec<_>>());
+                let mut logical = physical
+                    .into_iter()
+                    .flat_map(|p| (p..3 * q).step_by(64))
+                    .collect::<Vec<_>>();
+                logical.sort_unstable();
+                assert_eq!(logical, (0..3 * q).collect::<Vec<_>>());
+            }
+        }
+    }
+    #[test]
+    fn graph_identity_follows_shape_and_role_not_owner_order() {
+        let a = layout(&[1, 7, 3], &[91, 4, 33]).unwrap();
+        let b = layout(&[3, 1, 7], &[8, 77, 5]).unwrap();
+        assert_eq!(a.key(), b.key());
+        assert_eq!(a.rows.starts, vec![0, 1, 8]);
+        assert_eq!(b.rows.starts, vec![0, 3, 4]);
+        assert!(layout(&[1, 7], &[9, 9]).is_err());
+        assert!(layout(&[0], &[8]).is_err());
+        assert!(Layout::new(a.segments.clone(), vec![0], true, 4096, 128).is_err());
+        assert!(Layout::new(a.segments.clone(), vec![2, 0], false, 4096, 128).is_err());
+        let mut c = a.clone();
+        c.outputs.push(2);
+        assert_ne!(a.key(), c.key());
+        let mut d = a.clone();
+        d.decode = true;
+        assert_ne!(a.key(), d.key());
+    }
+}

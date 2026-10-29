@@ -76,7 +76,7 @@ orinfer devices --backend ascend
 ORINFER_ASCEND_LIBRARY=/path/to/libascendcl.so orinfer devices --backend ascend
 ```
 
-Ascend 探测共享进程内 ACL 初始化，读取卡数与 SoC，不分配设备内存或执行 kernel。最后一个会话、buffer、图和完成事件释放后才结束本进程持有的初始化。输出中的 `api_symbols` 仅表示当前库存在对应入口，芯片能力需要实际验证。当前 `model_execution_available` 为 false，表示公共 `serve`/`batch` 执行器尚未注册；DSv4.1 单流实验入口见下文。现有 CUDA 执行包 schema 1、C ABI v1、`--cuda-graph` 和统计字段保留；`--graph` 是相同参数的别名。
+Ascend 探测共享进程内 ACL 初始化，读取卡数与 SoC，不分配设备内存或执行 kernel。最后一个会话、buffer、图和完成事件释放后才结束本进程持有的初始化。输出中的 `api_symbols` 仅表示当前库存在对应入口，芯片能力需要实际验证。当前 `model_execution_available` 为 false，表示公共 `serve`/`batch` 执行器尚未注册；DSv4.1 原生实验入口见下文。现有 CUDA 执行包 schema 1、C ABI v1、`--cuda-graph` 和统计字段保留；`--graph` 是相同参数的别名。
 
 原生设备资源位于 `backend/ascend/runtime.rs`：每会话独占 context、compute/transfer stream，显存与 pinned 内存受独立预算约束；异步提交持有 buffer、主机副本和原生算子资源直到事件完成。跨流等待也持有源事件。完成确认失败时隔离仍可能被 DMA 使用的存储和 context，避免提前释放；释放资源只销毁所属 context，不重置整卡。Ascend 数字错误码进入统一错误分类，执行失败会使 worker 退出而非按普通请求错误继续服务。
 
@@ -247,7 +247,40 @@ bash tools/operators/ascend/run.sh --without-devices \
 
 `bench-ascend` 的 `ttft_s` 保留准备与重置之后的计时范围；`request_ttft_s` 和 `request_e2e_s` 包含两者。`preparations` 记录每个输入第一次执行时的形状准备、重置和首输出，预热使用同一完整输入。`python -m tools.bench.ascend_regression --reference OLD.json --candidate NEW.json --output GATE.json` 按相同输入身份、分块、重复次数和执行环境逐场景比较完整请求中位数，任一场景超过默认 5% 回退即失败；新增请求计时字段必须两侧同时存在。输出 token 差异单独报告，质量验收仍需固定历史概率和状态检查。
 
-上述收敛入口当前用于单请求的动态 token 行；`M` 表示一个请求的片段长度。原生 A2 公共服务和多 owner batch 尚未注册，当前容量也限定可运行的上下文范围。任意 batch／上下文长度的性能承诺需要相应执行器和实测覆盖。
+上述收敛入口用于单请求的动态 token 行；`M` 表示一个请求的片段长度。原生多 owner 实验通过下面的独立入口构建，公共 A2 服务执行器尚未注册。
+
+### A2 原生多请求 batch
+
+`tools.model.deepseek_v41.batch` 从保留 `min_rows=2` 完整未分片主体的 INT8-KV 计划构建多请求执行包。投影、HC、路由和专家合并执行 `M=sum(q_i)` 行；attention、KV、索引缓存和 C2 环通过请求地址表调用同源算子。执行包提供一个动态 prefill 家族和一个动态 decode 家族，支持容量内的任意整数 batch；默认最多 128 个 resident owner、每轮 2048 token 行、每请求 4096 上下文位置。实际准入同时受设备内存预算限制。
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices python3 \
+  -m tools.model.deepseek_v41.batch \
+  --plan artifacts/ascend-model/model-kv-int8.json \
+  --output artifacts/ascend-model/model-batch.json \
+  --package-output artifacts/ascend-model/batch-package \
+  --owners 128 --rows 2048 --capacity 4096 --compile-workers 4
+
+HCCL_DETERMINISTIC=strict orinfer bench-ascend-batch \
+  --plan artifacts/ascend-model/batch-package/model.json \
+  --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
+  --inputs inputs-batch.json
+```
+
+输入可直接声明不同长度的请求；Rust 按 `chunk_tokens` 预算自动分块，每个请求在最后一个 prefill 片段执行输出头，再合并后续普通 decode：
+
+```json
+{"cases":[{"name":"mixed","requests":[{"owner":7,"tokens":[0,27620,3494]},{"owner":91,"tokens":[0,27620]}],"chunk_tokens":2048,"decode_steps":16,"repeats":3,"compare_serial":true}]}
+```
+
+也可用 `frames` 代替 `requests`，逐轮声明 `requests` 与 `decode`；每条请求的 `output` 控制该轮是否执行输出头。`decode:true` 要求各请求正好一行；默认家族接受不同片段长度及一行续算。自动 decode 要求每个 owner 的最后一个输入片段请求输出。owner 身份与行顺序独立，未出现在某轮的请求保留完整状态。
+
+`compare_serial` 使用 batch 实际生成的固定历史，按相同计算家族逐请求重放，比较完整词表概率和 greedy 输出。它验证请求隔离及批量算术，不替代官方 BF16/FP8 质量对照。报告区分 forward 时间与执行计划准备时间；完整请求吞吐包含 CPU 坐标、Engram 查找、传输、计算、HCCL、输出头和同步，预热测量排除加载、准入、重置与 Graph 捕获。
+
+该入口要求进程启动前设置 `HCCL_DETERMINISTIC=strict`，使用保持跨卡求和顺序的归约。普通 `true` 模式仍会随消息长度改变 BF16 求和顺序，不能保证不同 batch 的同历史输出一致；入口在加载权重前检查此条件。当前原生验收使用 CANN 9.2。
+
+Graph 按计算家族、片段长度集合与输出数缓存，地址表和位置在 replay 前更新。捕获期间关闭私有状态访问；完成事件持有实际请求 buffer。请求状态复用公共对齐 arena 布局，额外请求的私有状态各使用一块原生分配，避免小张量独立分配的页池开销。Graph 缓存同时受实际空闲显存约束；各 rank 在捕获前统一探测缓存，任一 rank 未命中时全体失效并重建该形状。首次准入、重置、捕获和首轮 forward 的成本保留在 `preparations`，`request_s` 另包含本轮重置与准备。PV workspace 采用声明的行补齐规则；Engram AllGather 复用 `gather_columns` 还原行布局。上下文使用包内固定容量，跨包扩容和公共服务接入另行实现。该入口使用完整 decoder；近似后缀重放仍通过单请求实验入口选择。
+
 
 `tools.model.deepseek_v41.quantize_kv --plan BF16_PLAN --output INT8_PLAN` 将尚未量化 KV 的 DSv4.1 TP8 原生计划转换为 INT8 缓存，输出与输入共用资产目录。40 层 SWA 和四个共享压缩 KV bank 均按每 64 个值使用一个 FP16 scale，512 维每行共 528 字节。写入按实际存储的 FP16 scale 做对称舍入，整数范围为 −127..127；scale 下限为 FP16 最小正数，上限为 65504。零组写零，`-1` 位置跳过写入，其他越界位置设置错误标志。压缩器的 FP32 ring 状态和索引器现有 INT8 格式保持各自的契约。
 

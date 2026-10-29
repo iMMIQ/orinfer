@@ -177,40 +177,7 @@ pub(crate) fn indirect(
     Ok((plan, bindings))
 }
 
-/// Contiguous live rows, independent of the model's computation or state layout.
-pub(crate) struct Rows {
-    pub starts: Vec<usize>,
-    pub total: usize,
-}
-
-impl Rows {
-    pub fn new(lengths: impl IntoIterator<Item = usize>, capacity: usize) -> Result<Self> {
-        let mut starts = Vec::new();
-        let mut total = 0usize;
-        for length in lengths {
-            if length == 0 {
-                return Err("Empty packet segment".into());
-            }
-            starts.push(total);
-            total = total.checked_add(length).ok_or("Packet row overflow")?;
-            if total > capacity {
-                return Err("Packet row capacity exceeded".into());
-            }
-        }
-        if starts.is_empty() {
-            return Err("Empty packet".into());
-        }
-        Ok(Self { starts, total })
-    }
-
-    pub fn packet(segments: &[BatchSegment], owners: usize, capacity: usize) -> Result<Self> {
-        let mut slots = BTreeSet::new();
-        if segments.len() > owners || segments.iter().any(|s| !slots.insert(s.slot)) {
-            return Err("Packet requires distinct owners within capacity".into());
-        }
-        Self::new(segments.iter().map(|s| s.tokens), capacity)
-    }
-}
+pub(crate) use orinfer_model_sdk::packet::Rows;
 
 pub(crate) fn view(buffer: &str, row: usize, stride: usize) -> Result<BufferView> {
     Ok(BufferView {

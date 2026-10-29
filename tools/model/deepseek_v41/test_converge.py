@@ -148,6 +148,32 @@ class ConvergenceTests(unittest.TestCase):
         result = compact_buffers(model)["row_selections"]["kernel.json"]
         self.assertEqual(result, [dict(min_rows=16, max_rows=16, kernels=["small.json"])])
 
+    def test_owner_work_and_selected_heads_use_their_own_row_axes(self):
+        model = self.model()
+        model["batch"] = dict(owners=128)
+        packet = model["ranks"][0]["packets"][0]
+        packet["body"] = [
+            dict(
+                op="kernel", manifest="private.json", buffers=["result"], owner_work=expression("m")
+            )
+        ]
+        packet["head"] = [dict(op="kernel", manifest="head.json", buffers=["result"], owners=True)]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, capacity in [("private.json", 4096), ("head.json", 128)]:
+                (root / name).write_text(
+                    json.dumps(
+                        dict(
+                            parameters={"_row_capacity": capacity},
+                            operands=[dict(dtype="i32", shape=[256])],
+                        )
+                    )
+                )
+            validate_rows(model, root)
+            model["batch"]["owners"] = 127
+            with self.assertRaises(ValueError):
+                validate_rows(model, root)
+
     def test_publication_links_only_live_assets_and_rejects_escaping_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

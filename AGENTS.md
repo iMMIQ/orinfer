@@ -4,7 +4,7 @@
 
 ## 范围
 
-- 推理基线为 Jetson AGX Orin 64GB，aarch64/CUDA SM87；共享运行时同时支持 Altus A2 / Ascend 910B 的原生资源、异步传输、W4A8 grouped matmul、ACL Graph 和 HCCL 集合通信验收，提供 DSv4.1 原始 W4A8 完整 40 层的实验性单流 `bench-ascend`，公共服务执行器尚未注册。CUDA 数值、Graph 和性能验收仍在 Orin 上执行。
+- 推理基线为 Jetson AGX Orin 64GB，aarch64/CUDA SM87；共享运行时同时支持 Altus A2 / Ascend 910B 的原生资源、异步传输、W4A8 grouped matmul、ACL Graph 和 HCCL 集合通信验收，提供 DSv4.1 原始 W4A8 完整 40 层的实验性单流 `bench-ascend` 与最多 128 owner 的 `bench-ascend-batch`，公共服务执行器尚未注册。CUDA 数值、Graph 和性能验收仍在 Orin 上执行。
 - 支持 Qwen3.8-27B、Qwen3.5-4B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和 Index-Translate-2B/9B/35B（Qwen3_5）的文本、图片和多图输入。
 - Qwen3-ASR-1.7B 使用 Qwen3 全注意力解码器、标准 RMSNorm、128 维全 RoPE 和无输出 gate；复用 Qwen 动态行执行流程。文本采用两级 E8P Q4A8，前 4 层 Q/K/V 与 FFN 保留同一 signed-block128 输入基下的 W8，attention 输出投影保留 W8；音频编码器和 projector 保留 FP16，KV 使用 group-64 INT8。Rust 负责音频解码、16 kHz 重采样和 128-bin log-mel，TileLang 执行有界 CNN 与 104-token 窗口编码器。音频特征、位置和输入身份属于请求私有状态及 prefix 缓存身份。
 - ASR 的 Q/K/V 与 gate/up 通过无损拼接权重输出行共享整数投影模板。音频 CNN 使用 NHWC；前处理按帧组并行，多个录音按 104-token 窗口边界打包编码，再写回各 owner 的特征。逐窗口有效长度保持录音边界；GPU 验收覆盖改变输入、反向准入、空闲 arena 复用、prefix 恢复及完整请求。
@@ -13,6 +13,7 @@
 - Qwen 公共动态行执行器将普通 decode 的 token 输入、prepare、embedding、媒体覆盖、位置推进、MTP hidden 捕获、最终 norm 和输出分发作为地址表 packet 执行；混合普通 packet 中的 decode 前缀复用同一边界。离线通过 independent_rows 包装原始一行算术，层状态表后追加固定顺序的边界列，Rust 与 Python 共享列序契约并验证反向 owner、batch 变化、取消复用与 MTP 衔接。完整 logits 与选中 token 保留各请求的输出语义。
 - 在线运行时用 Rust，生产 GPU kernel 以 TileLang 为源；Python 只用于离线转换、编译、参考和验证。A2 已有 ACLNN W4A8 grouped matmul 保留为接通模型的基线；新增 A2 算子用 TileLang-Ascend 离线编译，由 Rust 的指针表 C ABI 加载。AOT 库内描述必须与外部 dtype、shape、访问方式和编译身份一致，Graph 和完成事件持有全部原生资源。
 - DSv4.1 A2 的 W4 bank、scale 和 assist 在离线阶段准备并落盘；在线直接读取物理布局，按计划校验形状和字节范围，不执行 W4 转置、全量参考对照或权重 payload 哈希扫描。
+- DSv4.1 A2 多请求共享权重和聚合 token 行，KV、C2 环及解码 KV workspace 按 owner 隔离，私有状态复用公共对齐 arena 布局。Graph 准备关闭私有状态写入，缓存按实际显存预留回收；捕获前统一探测各 rank 缓存，任一 rank 未命中时全体失效同一形状并捕获，保持 HCCL 序列一致。可变行数 BF16 集合归约要求启动前设置 `HCCL_DETERMINISTIC=strict`，保持跨 batch 的求和顺序。原生 batch 包默认 2048 行与每 owner 4096 上下文，准入同时校验 owner 数及显存预算。
 - 模型实现、公共执行组件、TileLang kernel 和离线构建工具在统一 workspace 维护，共享架构与计算策略组件。orinfer-models 分别注册模型适配器与计算策略，部署包内 Rust cdylib 通过版本化 C ABI 生成执行程序、动态 batch 和状态绑定，匹配的 TileLang cubin 与库同包发布。公共 CUDA 执行器从模型契约读取模型族、层数、维度和层序；新增架构通过适配器注册接入。
 - 第一阶段包含 prefix cache 与多请求 batching；缓存恢复和 batch 调度必须保持完整 KV/GDN/卷积/MTP 状态及请求隔离。
 - 项目许可证为 LGPL-3.0-or-later，保留第三方版权和许可证声明。

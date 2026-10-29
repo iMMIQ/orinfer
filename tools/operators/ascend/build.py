@@ -89,7 +89,9 @@ def compile_kernel(
         raise ValueError("AOT tensor count differs from compiler ABI")
     if any(p["access"] not in ("read", "write", "read_write", "scratch") for p in operands):
         raise ValueError("AOT operand has an invalid access mode")
-    if not any(p["access"] in ("write", "read_write") for p in operands):
+    if not any(p["access"] in ("write", "read_write") for p in operands) and not (
+        name.startswith("private_rows.") and parameters.get("_owner_writes")
+    ):
         raise ValueError("AOT kernel requires a declared output")
     analyzer = tilelang.tvm.arith.Analyzer()
     operands = [dict(spec) for spec in operands]
@@ -192,6 +194,10 @@ def compile_kernel(
             artifact.kernel_source, grid_limit=grid_limit if row_capacity is not None else None
         )
         source = lower_independent_cube(source)
+        if name.startswith("private_rows."):
+            from tools.operators.ascend.private_rows import lower_aliases
+
+            source = lower_aliases(source, parameters["_owner_aliases"])
         source = lower_scalar_cache(source)
         prototype = re.search(r'extern "C" void call\(([^)]*)\)', source)
         if prototype is None:

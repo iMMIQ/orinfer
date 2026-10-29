@@ -138,12 +138,16 @@ def merge(rows, sources, selected=512):
     return main
 
 
-def finalize(rows, selected=512):
+def finalize(rows, selected=512, output_count=0):
+    count = output_count or selected
+    if not 1 <= count <= selected:
+        raise ValueError("Finalized output count must be within the selected candidates")
+
     @T.prim_func
     def main(
         candidates: T.Tensor((rows, 2 * selected), "float32"),
-        indices: T.Tensor((rows, selected), "int32"),
-        values: T.Tensor((rows, selected), "float32"),
+        indices: T.Tensor((rows, count), "int32"),
+        values: T.Tensor((rows, count), "float32"),
     ):
         with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
             pairs = T.alloc_ub((2 * selected,), "float32")
@@ -159,7 +163,7 @@ def finalize(rows, selected=512):
                 T.tile.compare(mask, vv, -T.infinity("float32"), "GT")
                 T.tile.select(vi, mask, vi, -1.0, "VSEL_TENSOR_SCALAR_MODE")
                 T.tile.cast(oi, vi, "CAST_RINT", selected)
-                T.copy(oi, indices[row, :])
-                T.copy(vv, values[row, :])
+                T.copy(oi[:count], indices[row, :])
+                T.copy(vv[:count], values[row, :])
 
     return main

@@ -230,6 +230,10 @@ def validate_rows(model, base):
                                 if operand.get("access") == "scratch" and required > buffers[name]:
                                     raise ValueError("Selected scratch exceeds allocation: " + name)
                         bound = step.get("fixed_rows", capacity)
+                        if step.get("owner_work") is not None:
+                            bound = 4096
+                        elif step.get("owners"):
+                            bound = model["batch"]["owners"]
                         if "row_expression" in step:
                             if "fixed_rows" in step:
                                 raise ValueError("Ambiguous kernel row contract")

@@ -5,7 +5,7 @@ use crate::{
 };
 use std::{alloc::Layout, collections::BTreeMap};
 
-pub(super) struct ArenaLayout {
+pub(crate) struct ArenaLayout {
     pub offsets: BTreeMap<String, usize>,
     pub allocation_bytes: usize,
     pub padding_bytes: usize,
@@ -13,22 +13,35 @@ pub(super) struct ArenaLayout {
 }
 impl ArenaLayout {
     pub fn new<'a>(buffers: impl Iterator<Item = &'a Buffer<TensorIdentity>>) -> Result<Self> {
+        Self::try_from_sizes(buffers.map(|buffer| {
+            Ok((
+                buffer.name.as_str(),
+                buffer.bytes()?,
+                usize::try_from(buffer.alignment).map_err(|e| e.to_string())?,
+            ))
+        }))
+    }
+    pub fn from_sizes<'a>(buffers: impl Iterator<Item = (&'a str, usize, usize)>) -> Result<Self> {
+        Self::try_from_sizes(buffers.map(Ok))
+    }
+    fn try_from_sizes<'a>(
+        buffers: impl Iterator<Item = Result<(&'a str, usize, usize)>>,
+    ) -> Result<Self> {
         let mut layout = Layout::from_size_align(0, 1).map_err(|e| e.to_string())?;
         let mut offsets = BTreeMap::new();
         let mut payload = 0usize;
         for buffer in buffers {
-            let bytes = buffer.bytes()?;
-            let alignment = usize::try_from(buffer.alignment).map_err(|e| e.to_string())?;
+            let (name, bytes, alignment) = buffer?;
             let next = Layout::from_size_align(bytes, alignment).map_err(|e| e.to_string())?;
             let (extended, offset) = layout.extend(next).map_err(|e| e.to_string())?;
-            if offsets.insert(buffer.name.clone(), offset).is_some() {
+            if offsets.insert(name.to_owned(), offset).is_some() {
                 return Err("Duplicate arena buffer".into());
             }
             payload = payload.checked_add(bytes).ok_or("Buffer arena overflow")?;
             layout = extended;
         }
-        // CUDA allocations guarantee 256-byte alignment. Larger contracts get
-        // headroom for aligning the bank base within the owned allocation.
+        // CUDA guarantees 256-byte alignment. Other callers reserve base
+        // alignment headroom explicitly. Larger contracts add their own here.
         let extra = if layout.align() > 256 {
             layout.align() - 1
         } else {
