@@ -1,4 +1,4 @@
-"""Select one A2 dynamic projection configuration across real prefill lengths.
+"""Select shared A2 projection configurations across real token-row lengths.
 
 Reads the native build contract and real checkpoint weights. Candidate kernels
 share the projection factory, bounded row ABI and capacity-backed operands.
@@ -76,6 +76,7 @@ def main():
     p.add_argument("--plan", type=Path, required=True)
     p.add_argument("--model-dir", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--package-output", type=Path, help="Publish only selected native assets")
     p.add_argument("--rows", type=int, nargs="+")
     p.add_argument("--maximum-regression", type=float, default=0.05)
     p.add_argument("--device", type=int, default=7)
@@ -93,7 +94,11 @@ def main():
         action="store_true",
         help="Tune only dynamic projection kernels with an explicit local row binding",
     )
+    p.add_argument("--decode-only", action="store_true", help="Tune the shared batch decode family")
     search = p.add_mutually_exclusive_group()
+    search.add_argument(
+        "--grid-only", action="store_true", help="Measure same-source 64/128/256 CTA bounds"
+    )
     search.add_argument("--pipeline-only", action="store_true")
     search.add_argument("--joint", action="store_true", help="Joint M/N/K/pipeline candidates")
     search.add_argument(
@@ -124,6 +129,8 @@ def main():
     definitions = {b["name"]: b for b in model["ranks"][0]["buffers"]}
     groups = {}
     for packet in model["ranks"][0]["packets"]:
+        if args.decode_only and not packet.get("batch_decode", False):
+            continue
         for step in packet["body"] + packet["head"]:
             if step["op"] != "kernel" or step["manifest"] in groups:
                 continue
@@ -178,10 +185,16 @@ def main():
             else None
         )
         configs = projection_configs(parameters, args.pipeline_only, args.wide_integer, args.joint)
+        if args.grid_only:
+            configs = [
+                dict(configs[0], grid_limit=g) for g in dict.fromkeys((grid_limit, 64, 128, 256))
+            ]
         baseline = configs[0]
 
         def compile_one(config):
-            params = dict(parameters, **config)
+            compiled_parameters = dict(parameters, **config)
+            selected_grid = compiled_parameters.pop("grid_limit", grid_limit)
+            params = dict(compiled_parameters)
             params["rows"] = row_count(capacity, True)
             with LOWER_LOCK:
                 function = projection(**params)
@@ -196,10 +209,10 @@ def main():
                 function,
                 manifest["op"],
                 operands,
-                dict(parameters, **config),
+                compiled_parameters,
                 base / "cache",
                 row_capacity=capacity,
-                grid_limit=grid_limit,
+                grid_limit=selected_grid,
             )
 
         current = json.loads(compile_one(baseline).read_text())
@@ -385,7 +398,14 @@ def main():
             for step in packet["body"] + packet["head"]:
                 if step["op"] == "kernel":
                     step["manifest"] = replacements.get(step["manifest"], step["manifest"])
+    from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+
+    model = compact_buffers(model)
+    validate_rows(model, base)
     atomic_json(args.plan.with_name(args.plan.stem + "-tuned.json"), model)
+    if args.package_output:
+        count = publish_package(model, base, args.package_output)
+        print(json.dumps(dict(package=str(args.package_output), assets=count)), flush=True)
 
 
 def read_weight(root, index, weight):

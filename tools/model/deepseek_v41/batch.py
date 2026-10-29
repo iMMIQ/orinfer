@@ -103,13 +103,11 @@ def build(
                 workers,
                 [
                     "--min-rows",
-                    "512" if sequence_parallel else "2",
-                    "--owner-min-rows",
-                    "512",
+                    "2",
                     "--tile-m",
                     "64",
                     "--tile-k",
-                    "256",
+                    "128",
                     "--reuse-kv",
                 ],
             )
@@ -246,11 +244,6 @@ def build(
             for key in ("capacity", "compressed_capacity", "table_rows", "length"):
                 if key not in dynamic and parameters.get(key) in (old_capacity, old_capacity // 2):
                     parameters[key] = parameters[key] * capacity // old_capacity
-            if module_name == "attention_fused" and name == "prefill":
-                # Re-evaluate the existing tile's alignment for the deployment
-                # context rather than retaining the source context's fallback.
-                if not parameters["compressed"] or (capacity // parameters["ratio"]) % 256 == 0:
-                    parameters["tile_k"] = 256
             if module_name == "topk" and name == "merge":
                 prior = "batch." + family + "." + step["buffers"][0]
                 parameters["sources"] = definitions[prior]["bytes"] // (cap * 1024 * 4)
@@ -641,6 +634,7 @@ def build(
         endpoints="batch.endpoints",
         work=work,
         work_ranges=work_ranges,
+        prefill_quantum=min(512, rows) if sequence_parallel else 1,
     )
     print(
         f"Compile {len(tasks)} shared batch kernels; {len(columns)} pointer columns; {len(private)} private allocations/views",

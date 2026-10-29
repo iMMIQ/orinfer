@@ -253,7 +253,7 @@ bash tools/operators/ascend/run.sh --without-devices \
 
 `tools.model.deepseek_v41.batch` 从保留 `min_rows=2` 完整未分片主体的 INT8-KV 计划构建多请求执行包。投影、HC、路由和专家合并执行 `M=sum(q_i)` 行；attention、KV、索引缓存和 C2 环通过请求地址表调用同源算子。执行包提供一个动态 prefill 家族和一个动态 decode 家族，支持容量内的任意整数 batch；默认最多 128 个 resident owner、每轮 2048 token 行、每请求 4096 上下文位置。实际准入同时受设备内存预算限制。
 
-默认构建复用现有 `sequence_parallel` 与 `fuse_attention` 离线变换，保留动态行表达式及共享 buffer 的视图偏移。Prefill 按总行数使用连续的短行／序列分片区间，大行数同时复用共享 KV/Qa 投影与 ReduceScatter；当前序列变换要求行容量与输入计划一致。Attention 的融合选择按每个 owner 的真实片段长度执行：512 行以下保留原 QK/softmax/PV，512 行起采用现有融合实现，混合 packet 通过工作表选择 owner。各 batch 共享这些算子工厂，不按 batch 复制算术。原完整参考可用 `--no-sequence-parallel --no-shared-attention --no-reduce-scatter --no-fused-attention` 构建。
+默认构建复用现有 `sequence_parallel` 与 `fuse_attention` 离线变换，保留动态行表达式及共享 buffer 的视图偏移。Prefill 按总行数使用连续的短行／序列分片区间，大行数同时复用共享 KV/Qa 投影与 ReduceScatter；当前序列变换要求行容量与输入计划一致。各 owner 的 prefill attention 复用一个融合计算体，保持全局归一化后的 BF16 概率与连续 FP32 PV 累积；独立的 `prefill_quantum` 控制序列分片调度。Decode 投影与 PV 保留同源融合 Cube/Vector 模板及显式完成握手。各 batch 通过真实行数和离线配置选择复用这些计算体。原完整参考可用 `--no-sequence-parallel --no-shared-attention --no-reduce-scatter --no-fused-attention` 构建。
 
 ```bash
 bash tools/operators/ascend/run.sh --without-devices python3 \
@@ -263,11 +263,25 @@ bash tools/operators/ascend/run.sh --without-devices python3 \
   --package-output artifacts/ascend-model/batch-package \
   --owners 128 --rows 2048 --capacity 4096 --compile-workers 4
 
-HCCL_DETERMINISTIC=strict orinfer bench-ascend-batch \
+orinfer bench-ascend-batch \
   --plan artifacts/ascend-model/batch-package/model.json \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
   --inputs inputs-batch.json
 ```
+
+可选的小行数调优使用现有真实权重、Graph 测量和共享选择表组件，比较同源 64/128/256 CTA 边界。默认完整覆盖 1–128 行及各几何的大行数采样；发布阶段保留间接地址表声明的 owner 状态、视图及工作区，只包含最终选中的实现：
+
+```bash
+bash tools/operators/ascend/run.sh python3 \
+  -m tools.model.deepseek_v41.tune \
+  --plan artifacts/ascend-model/model-batch.json \
+  --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
+  --output artifacts/ascend-model/batch-tuning \
+  --decode-only --grid-only \
+  --package-output artifacts/ascend-model/batch-selected
+```
+
+随后将 `bench-ascend-batch --plan` 指向 `batch-selected/model.json`。稳定布局的地址表、工作表和输出索引按执行家族、owner 顺序、片段长度和输出位置缓存，准入及释放使缓存失效。主机输入通过最多 4 MiB 的 pinned 分块在 compute stream 上传；预算不足时等待已提交 DMA 的完成事件，再复用缓冲。调用者可在方法返回后释放源数据。
 
 输入可直接声明不同长度的请求；Rust 按 `chunk_tokens` 预算自动分块，每个请求在最后一个 prefill 片段执行输出头，再合并后续普通 decode：
 
@@ -283,7 +297,7 @@ HCCL_DETERMINISTIC=strict orinfer bench-ascend-batch \
 
 `compare_whole_prompt:true` 配合 `compare_serial:true`，对 `requests` 使用单请求最大容量分块作为参考，检查批量自动分块及后续 teacher-forced decode 的状态一致性。显式 `frames` 沿用原片段边界。设置 `ORINFER_A2_BATCH_LOGITS_DIR` 时，预热验证位置的完整 FP32 logits 按 case、frame 和 owner 写入指定目录，供跨包概率／NLL 对照。
 
-该入口要求进程启动前设置 `HCCL_DETERMINISTIC=strict`，使用保持跨卡求和顺序的归约。普通 `true` 模式仍会随消息长度改变 BF16 求和顺序，不能保证不同 batch 的同历史输出一致；入口在加载权重前检查此条件。当前原生验收使用 CANN 9.2。
+该入口默认使用高性能通信，不要求设置 `HCCL_DETERMINISTIC`。需要固定跨 batch 的 BF16 归约顺序时，在进程启动前显式设置 `HCCL_DETERMINISTIC=strict`；此模式单独测量性能。`compare_serial` 以固定历史的最大概率绝对差 0.02 为门限，greedy 差异另报；默认通信在 B128 的跨 batch 对照尚未通过，详见 [性能与验证记录](performance.md#融合动态-decode-与地址表复用2026-10-29)。请求私有状态和 owner 隔离保持独立检查。当前原生验收使用 CANN 9.2，TP8 为当前模型接通方案，后续并行策略按实际显存和完整请求性能选择。
 
 Graph 按计算家族、片段长度集合与输出数缓存，地址表和位置在 replay 前更新。捕获期间关闭私有状态访问；完成事件持有实际请求 buffer。请求状态复用公共对齐 arena 布局，额外请求的私有状态各使用一块原生分配，避免小张量独立分配的页池开销。Graph 缓存同时受实际空闲显存约束；各 rank 在捕获前统一探测缓存，任一 rank 未命中时全体失效并重建该形状。首次准入、重置、捕获和首轮 forward 的成本保留在 `preparations`，`request_s` 另包含本轮重置与准备。私有 scratch 采用声明的物理行补齐规则；Engram AllGather 复用 `gather_columns` 还原行布局。上下文使用包内固定容量，跨包扩容和公共服务接入另行实现。该入口使用完整 decoder；近似后缀重放仍通过单请求实验入口选择。
 

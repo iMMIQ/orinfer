@@ -62,7 +62,10 @@ def bounded_grid(function, limit=64):
         iteration = tir.Var("row_tile", "int32")
         extent = node.value
         logical = physical + iteration * limit
-        count = tir.floordiv(extent - physical + limit - 1, limit)
+        # Keep the trip count independent of the physical CTA. Dependent
+        # interval bounds can expand recursively in the pinned TIR simplifier
+        # when a coupled primitive contains multiple compute phases.
+        count = tir.floordiv(extent + limit - 1, limit)
 
         def wrap(body):
             if isinstance(body, tir.AttrStmt) and body.attr_key == "thread_extent":
@@ -72,7 +75,11 @@ def bounded_grid(function, limit=64):
                 0,
                 count,
                 tir.ForKind.SERIAL,
-                tir.stmt_functor.substitute(body, {physical: logical}),
+                tir.IfThenElse(
+                    logical < extent,
+                    tir.stmt_functor.substitute(body, {physical: logical}),
+                    None,
+                ),
             )
 
         return tir.AttrStmt(node.node, node.attr_key, tir.Min(extent, limit), wrap(node.body))

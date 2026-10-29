@@ -102,17 +102,6 @@ impl RootInfo {
     pub fn new(session: &Session, ranks: u32) -> Result<Self> {
         Self::with_api(session, ranks, Api::load()?)
     }
-    /// Keep the rank reduction order independent of collective message length.
-    /// HCCL reads its process environment at initialization, before rank joins.
-    /// Ordinary deterministic mode can change BF16 order with message length.
-    pub fn new_ordered(session: &Session, ranks: u32) -> Result<Self> {
-        if !std::env::var("HCCL_DETERMINISTIC")
-            .is_ok_and(|value| value.eq_ignore_ascii_case("strict"))
-        {
-            return Err("Variable-row BF16 reductions require HCCL_DETERMINISTIC=strict".into());
-        }
-        Self::new(session, ranks)
-    }
     fn with_api(session: &Session, ranks: u32, api: Arc<Api>) -> Result<Self> {
         if ranks == 0 || ranks > 1024 {
             return Err("Invalid HCCL rank count".into());

@@ -12,13 +12,20 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--owners", type=int, default=3)
+    p.add_argument("--op", nargs="+", help="Restrict validation to named primitive families")
     a = p.parse_args()
     if not 1 <= a.owners <= 128:
         p.error("owners must be in 1..128")
     import torch
     import torch_npu  # noqa: F401
     from kernels.model.rows import row_count
-    from tools.operators.ascend import attention_prefill, attention_fused, kv_int8, compressor
+    from tools.operators.ascend import (
+        attention_cube,
+        attention_prefill,
+        attention_fused,
+        kv_int8,
+        compressor,
+    )
     from tools.operators.ascend.build import compile_kernel, operand
     from tools.operators.ascend.geometry import physical_shapes
     from tools.operators.ascend.private_rows import indirect
@@ -36,6 +43,8 @@ def main():
     }
     report = []
     for module, name, params in [
+        (attention_cube, "pv", dict(rows=capacity, heads=8, selected=128)),
+        (attention_cube, "pv", dict(rows=capacity, heads=8, selected=640)),
         (kv_int8, "scatter", dict(rows=capacity, table_rows=256)),
         (attention_prefill, "qk", dict(rows=capacity, capacity=256, compressed=False)),
         (attention_prefill, "pv", dict(rows=capacity, capacity=256, compressed=False)),
@@ -49,6 +58,8 @@ def main():
             ),
         ),
     ]:
+        if a.op and module.__name__.split(".")[-1] + "." + name not in a.op:
+            continue
         factory = getattr(module, name)
         row_key = "tokens" if "tokens" in params else "rows"
         function = factory(**dict(params, **{row_key: row_count(capacity, True)}))
@@ -193,13 +204,44 @@ def main():
                 call(0, expected[owner], length)
             graph.replay()
             torch.npu.synchronize()
+            if module is attention_cube:
+                by_name = {tensor.name: i for i, tensor in enumerate(tensors)}
+                for owner, length in zip(order, lengths, strict=True):
+                    if owner not in (order[0], order[-1]):
+                        continue
+                    probability = (
+                        data[owner][by_name["probabilities"]][:length, : params["heads"]]
+                        .cpu()
+                        .double()
+                    )
+                    kv = data[owner][by_name["kv"]][:length].cpu().double()
+                    wanted = (probability @ kv).to(torch.bfloat16)
+                    actual = data[owner][by_name["output"]][:length].cpu()
+                    torch.testing.assert_close(actual, wanted, atol=0.02, rtol=0.008)
             for owner in range(a.owners):
                 for tensor, value, want in zip(tensors, data[owner], expected[owner], strict=True):
                     if tensor.name in writes:
                         if name == "prefill" and tensor.name != "output":
                             # Padded scratch rows do not carry semantic values.
                             continue
-                        assert torch.equal(value.cpu(), want.cpu()), (name, owner, tensor.name)
+                        actual_cpu, expected_cpu = value.cpu(), want.cpu()
+                        if not torch.equal(actual_cpu, expected_cpu):
+                            print(
+                                dict(
+                                    op=name,
+                                    owner=owner,
+                                    tensor=tensor.name,
+                                    actual_finite=bool(torch.isfinite(actual_cpu).all()),
+                                    expected_finite=bool(torch.isfinite(expected_cpu).all()),
+                                    max_abs=float(
+                                        (actual_cpu.float() - expected_cpu.float()).abs().max()
+                                    ),
+                                    actual=actual_cpu.flatten()[:16].float().tolist(),
+                                    expected=expected_cpu.flatten()[:16].float().tolist(),
+                                ),
+                                flush=True,
+                            )
+                        assert torch.equal(actual_cpu, expected_cpu), (name, owner, tensor.name)
         del graph
         report.append(
             dict(
@@ -210,9 +252,14 @@ def main():
                 capture_disabled=True,
                 graph_replay=True,
                 exact_reference=True,
+                reference_manifest=str(reference),
+                private_manifest=str(private),
+                source_sha256=file_hash(Path(module.__file__)),
             )
         )
         print(report[-1], flush=True)
+    if not report:
+        raise ValueError("No primitive matched --op")
     atomic_json(a.output / "result.json", report)
 
 

@@ -134,6 +134,39 @@ class ConvergenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_rows(invalid, root)
 
+    def test_indirect_publication_keeps_owner_pointees_and_table_roots(self):
+        model = self.model()
+        buffers = model["ranks"][0]["buffers"]
+        buffers.extend(
+            [
+                dict(name="owner.bank", bytes=128),
+                dict(name="owner.view", bytes=64, view=dict(parent="owner.bank", offset=0)),
+                *[dict(name=n, bytes=64) for n in ("pointers", "work", "active", "endpoints")],
+            ]
+        )
+        model["batch"] = dict(
+            private=["owner.bank", "owner.view"],
+            columns=[dict(buffer="unused.score.bank"), dict(buffer="owner.view")],
+            pointers={"pointers": [0, 1]},
+            work={"work": expression("m")},
+            active="active",
+            endpoints="endpoints",
+        )
+        result = compact_buffers(model)
+        names = {b["name"] for b in result["ranks"][0]["buffers"]}
+        self.assertTrue(
+            {
+                "unused.score.bank",
+                "owner.bank",
+                "owner.view",
+                "pointers",
+                "work",
+                "active",
+                "endpoints",
+            }
+            <= names
+        )
+
     def test_publication_drops_choices_outside_the_programs_real_local_rows(self):
         model = self.model()
         model["row_selections"] = {

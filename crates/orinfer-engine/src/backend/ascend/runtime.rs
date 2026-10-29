@@ -637,9 +637,36 @@ impl Session {
             },
         )
     }
-    /// Stage a bounded group of complete inputs with one pinned lease and
-    /// completion. Compute-stream ordering protects earlier readers when a
-    /// later layer reuses the same input buffers.
+    fn input_pinned(&self, bytes: usize) -> Result<Rc<Pinned>> {
+        loop {
+            self.reap()?;
+            match self.pinned(bytes) {
+                Ok(host) => return Ok(host),
+                Err(error)
+                    if error == "Ascend pinned allocation exceeds session budget or is empty" =>
+                {
+                    // Only wait for already-recorded DMA backing. The enclosing
+                    // packet completion is not recorded until submission ends.
+                    let oldest = self
+                        .pending
+                        .borrow()
+                        .iter()
+                        .find(|c| {
+                            c.retained
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|r| r._host.is_some())
+                        })
+                        .cloned();
+                    oldest.ok_or(error)?.wait()?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    /// Copy complete inputs into bounded pinned slabs. Each slab's completion
+    /// owns its DMA backing; pressure waits for the oldest submitted upload.
+    /// Compute-stream order protects earlier readers of reused device inputs.
     pub(super) fn upload_inputs(&self, inputs: &[(Buffer, Vec<u8>)]) -> Result<Ticket> {
         let mut bytes = 0usize;
         for (buffer, data) in inputs {
@@ -651,51 +678,74 @@ impl Session {
                 .checked_add(data.len())
                 .ok_or("Input upload overflow")?;
         }
-        self.reap()?;
-        let host = self.pinned(bytes)?;
-        let mut offset = 0;
-        for (_, data) in inputs {
-            // SAFETY: Exclusive pinned allocation spans the checked total; each
-            // source slice is copied before this method returns.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    host.pointer.cast::<u8>().add(offset),
-                    data.len(),
-                );
-            }
-            offset += data.len();
+        if bytes == 0 {
+            return Err("Model input upload is empty".into());
         }
-        self.submit(
-            self.context.compute,
-            Retained {
-                _buffers: inputs.iter().map(|(buffer, _)| buffer.clone()).collect(),
-                _host: Some(Rc::clone(&host)),
-                _extra: None,
-            },
-            |stream| {
-                let mut offset = 0;
-                for (buffer, data) in inputs {
-                    check(
-                        // SAFETY: Complete device spans and disjoint slices of
-                        // the retained pinned source were checked above; H2D=1.
-                        unsafe {
-                            (self.context.api.memcpy)(
-                                buffer.pointer(),
-                                data.len(),
-                                host.pointer.cast::<u8>().add(offset).cast(),
-                                data.len(),
-                                1,
-                                stream,
-                            )
-                        },
-                        "ACL input upload",
-                    )?;
-                    offset += data.len();
+        let capacity = (4 << 20).min(self.context.limits.pinned_bytes);
+        // Weight loading can leave idle 8 MiB leases. Do not retain that
+        // physical capacity for each small input slab queued behind compute.
+        self.pinned_cache
+            .borrow_mut()
+            .retain(|host| host.bytes <= capacity || Rc::strong_count(host) != 1);
+        let (mut index, mut offset) = (0, 0);
+        let mut last = None;
+        while bytes > 0 {
+            let size = bytes.min(capacity);
+            let host = self.input_pinned(size)?;
+            let mut pieces = vec![];
+            let mut written = 0;
+            while written < size {
+                let (buffer, data) = &inputs[index];
+                let count = (data.len() - offset).min(size - written);
+                // SAFETY: The exclusive slab and source span were checked;
+                // every caller-owned byte is copied before returning.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data.as_ptr().add(offset),
+                        host.pointer.cast::<u8>().add(written),
+                        count,
+                    );
                 }
-                Ok(())
-            },
-        )
+                pieces.push((buffer.clone(), offset, written, count));
+                written += count;
+                offset += count;
+                if offset == data.len() {
+                    index += 1;
+                    offset = 0;
+                }
+            }
+            last = Some(self.submit(
+                self.context.compute,
+                Retained {
+                    _buffers: pieces.iter().map(|(b, ..)| b.clone()).collect(),
+                    _host: Some(Rc::clone(&host)),
+                    _extra: None,
+                },
+                |stream| {
+                    for (buffer, offset, start, count) in &pieces {
+                        let destination = buffer.range(*offset, *count)?;
+                        check(
+                            // SAFETY: Checked destination and slab extents,
+                            // retained source and destination; H2D=1.
+                            unsafe {
+                                (self.context.api.memcpy)(
+                                    destination,
+                                    *count,
+                                    host.pointer.cast::<u8>().add(*start).cast(),
+                                    *count,
+                                    1,
+                                    stream,
+                                )
+                            },
+                            "ACL input upload",
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?);
+            bytes -= size;
+        }
+        last.ok_or_else(|| "Model input upload is empty".into())
     }
     pub fn download(&self, buffer: &Buffer, offset: usize, bytes: usize) -> Result<Vec<u8>> {
         self.require(buffer)?;

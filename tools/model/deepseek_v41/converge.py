@@ -18,8 +18,16 @@ from tools.build.files import atomic_json, file_hash, source_hash
 from tools.model.row_contract import resolve
 
 
-def referenced_buffers(rank):
+def referenced_buffers(rank, batch=None):
     used = set()
+    if batch is not None:
+        # Indirect kernels name pointer/work tables in their instructions;
+        # the owner ABI also keeps their pointees and private views alive.
+        used.update(batch["private"])
+        used.update(column["buffer"] for column in batch["columns"])
+        used.update(batch["pointers"])
+        used.update(batch["work"])
+        used.update((batch["active"], batch["endpoints"]))
     for packet in rank["packets"]:
         used.update(v for v in packet["coordinates"].values() if isinstance(v, str))
         used.update(packet["reset"])
@@ -56,7 +64,7 @@ def referenced_buffers(rank):
 
 def compact_buffers(model):
     for rank in model["ranks"]:
-        used = referenced_buffers(rank)
+        used = referenced_buffers(rank, model.get("batch"))
         rank["buffers"] = [b for b in rank["buffers"] if b["name"] in used]
     used = {
         s["manifest"]

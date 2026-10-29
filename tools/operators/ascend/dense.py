@@ -70,6 +70,7 @@ def projection(
                     workspace[bm * block_m : (bm + 1) * block_m, bn * block_n : (bn + 1) * block_n],
                 )
                 T.set_cross_flag("FIX", 0)
+                T.wait_cross_flag(1)
             with T.Scope("V"):
                 raw = T.alloc_ub((vector_m, block_n), accum_dtype)
                 accumulator = T.alloc_ub((vector_m, block_n), "float32")
@@ -99,8 +100,11 @@ def projection(
                     T.copy(
                         y[:valid, :], out[start : start + valid, bn * block_n : (bn + 1) * block_n]
                     )
+                T.set_cross_flag("MTE3", 1)
 
-    return main
+    return main.with_attr("orinfer.coupled_resources", True).with_attr(
+        "orinfer.explicit_cross_sync", True
+    )
 
 
 def fp32_partials(rows, output, reduction, splits=8, activation_dtype="bfloat16"):

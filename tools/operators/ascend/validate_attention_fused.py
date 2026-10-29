@@ -24,7 +24,7 @@ def main():
     torch.npu.set_device(args.device)
     spec = json.loads(args.manifest.read_text())
     p = spec["parameters"]
-    maximum, capacity, ratio = p["_row_capacity"], p["capacity"], p["ratio"]
+    maximum, capacity, ratio = p["_row_capacity"], p["capacity"], p.get("ratio", 2)
     kinds = dict(bf16=torch.bfloat16, i32=torch.int32, f32=torch.float32)
     tensors = [
         torch.empty(v["shape"], dtype=kinds[v["dtype"]], device="npu") for v in spec["operands"]
@@ -78,7 +78,7 @@ def main():
                 for row in samples:
                     pos = int(positions[row])
                     values = short[max(0, pos - 127) : pos + 1]
-                    if p["compressed"]:
+                    if p.get("compressed", True):
                         values = torch.cat([values, compressed[selected[row].bool()]])
                     keys = values.float().numpy().astype(np.float64)
                     scores = q[row * 8 : (row + 1) * 8].float().numpy().astype(np.float64) @ keys.T
@@ -115,7 +115,42 @@ def main():
             reports.append(dict(rows=rows, start=start, fp64=error, changed_graph=changed))
             print(reports[-1], flush=True)
             del graph
-    atomic_json(args.output, dict(seed=20261002, manifest=str(args.manifest), checks=reports))
+    # Two live keys isolate the placement of the BF16 probability rounding.
+    # Normalizing an unnormalized BF16 PV result gives a different answer.
+    probe_query = torch.zeros_like(query)
+    probe_query[:, 0] = 1
+    probe_keys = torch.zeros_like(swa)
+    probe_keys[0], probe_keys[1] = 16, -16
+    probe_keys[0, 0], probe_keys[1, 0] = 8, -8
+    tensors[0].copy_(probe_query.npu())
+    tensors[1].copy_(probe_keys.npu())
+    tensors[2].zero_()
+    tensors[3].copy_((torch.arange(maximum, dtype=torch.int32) + 1).npu())
+    tensors[4].zero_()
+    tensors[6].fill_(17)
+    launch(1)
+    torch.npu.synchronize()
+    dots = np.array([8, -8], dtype=np.float64)[None, :] * 512**-0.5
+    sinks = sink.numpy().astype(np.float64)[:, None]
+    maximum_score = np.maximum(dots.max(-1, keepdims=True), sinks)
+    exponents = np.exp(dots - maximum_score)
+    probabilities = exponents / (exponents.sum(-1, keepdims=True) + np.exp(sinks - maximum_score))
+    rounded = torch.from_numpy(probabilities).bfloat16().float().double()
+    expected = (rounded @ probe_keys[:2].float().double()).bfloat16()
+    actual = tensors[6][:8].cpu()
+    assert torch.equal(actual, expected), (
+        "Normalized BF16 probability boundary",
+        (actual.float() - expected.float()).abs().max().item(),
+    )
+    atomic_json(
+        args.output,
+        dict(
+            seed=20261002,
+            manifest=str(args.manifest),
+            checks=reports,
+            normalized_probability_probe_equal=True,
+        ),
+    )
 
 
 if __name__ == "__main__":

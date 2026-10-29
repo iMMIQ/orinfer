@@ -98,6 +98,7 @@ def pv(rows, heads, selected, dimension=512, tile_d=32):
                     T.gemm_v0(a, b, c, init=(k == 0))
                 T.copy(c, workspace[row, :, tile * tile_d : (tile + 1) * tile_d])
                 T.set_cross_flag("FIX", 0)
+                T.wait_cross_flag(1)
             with T.Scope("V"):
                 x = T.alloc_ub((8, tile_d), "float32")
                 y = T.alloc_ub((8, tile_d), "bfloat16")
@@ -113,5 +114,8 @@ def pv(rows, heads, selected, dimension=512, tile_d=32):
                         y[:valid, :],
                         output[row, start : start + valid, tile * tile_d : (tile + 1) * tile_d],
                     )
+                T.set_cross_flag("MTE3", 1)
 
-    return main
+    return main.with_attr("orinfer.coupled_resources", True).with_attr(
+        "orinfer.explicit_cross_sync", True
+    )

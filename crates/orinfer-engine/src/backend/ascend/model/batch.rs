@@ -30,6 +30,20 @@ pub(super) struct Contract {
     pub work: BTreeMap<String, RowExpression>,
     #[serde(default)]
     pub work_ranges: BTreeMap<String, WorkRange>,
+    #[serde(default)]
+    pub prefill_quantum: Option<usize>,
+}
+impl Contract {
+    pub(super) fn preferred_span(&self) -> usize {
+        self.prefill_quantum.unwrap_or_else(|| {
+            self.work_ranges
+                .values()
+                .map(|r| r.min_rows)
+                .filter(|&n| n > 1)
+                .min()
+                .unwrap_or(1)
+        })
+    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +66,16 @@ pub(super) struct Key {
     lengths: Vec<usize>,
     outputs: usize,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TableKey {
+    family: (bool, usize),
+    segments: Vec<(usize, usize)>,
+    outputs: Vec<usize>,
+}
+struct BoundTables {
+    key: TableKey,
+    retained: Vec<Buffer>,
+}
 pub(super) struct Runtime {
     pub contract: Contract,
     pub owners: BTreeMap<usize, Owner>,
@@ -59,6 +83,7 @@ pub(super) struct Runtime {
     lru: VecDeque<Key>,
     capacity: usize,
     tables: BTreeMap<(bool, usize), TableUse>,
+    bound_tables: Option<BoundTables>,
 }
 struct TableUse {
     pointers: BTreeSet<String>,
@@ -97,6 +122,7 @@ impl Runtime {
             lru: VecDeque::new(),
             capacity,
             tables,
+            bound_tables: None,
         }
     }
 }
@@ -136,6 +162,13 @@ impl Layout {
             decode: self.decode,
             lengths,
             outputs: self.outputs.len(),
+        }
+    }
+    fn table_key(&self, min_rows: usize) -> TableKey {
+        TableKey {
+            family: (self.decode, min_rows),
+            segments: self.segments.iter().map(|s| (s.slot, s.tokens)).collect(),
+            outputs: self.outputs.clone(),
         }
     }
 }
@@ -190,6 +223,10 @@ impl Worker {
         Ok(())
     }
     pub(super) fn admit(&mut self, ids: &[usize]) -> Result<()> {
+        self.batch
+            .as_mut()
+            .ok_or("Missing native batch contract")?
+            .bound_tables = None;
         let runtime = self.batch.as_ref().ok_or("Missing native batch contract")?;
         let names = runtime.contract.private.clone();
         let count = ids
@@ -288,11 +325,9 @@ impl Worker {
     }
     pub(super) fn release_owners(&mut self) -> Result<()> {
         self.session.synchronize()?;
-        self.batch
-            .as_mut()
-            .ok_or("Missing batch runtime")?
-            .owners
-            .clear();
+        let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
+        runtime.bound_tables = None;
+        runtime.owners.clear();
         Ok(())
     }
     pub(super) fn batch_cached(&self, layout: &Layout) -> Result<bool> {
@@ -378,8 +413,18 @@ impl Worker {
         self.w4.retain(|_, w| w.strong_count() > 0);
         Ok(())
     }
-    fn update_batch_tables(&self, layout: &Layout, packet: &super::Packet) -> Result<Vec<Buffer>> {
+    fn update_batch_tables(
+        &mut self,
+        layout: &Layout,
+        packet: &super::Packet,
+    ) -> Result<Vec<Buffer>> {
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+        let key = layout.table_key(packet.min_rows);
+        if let Some(bound) = &runtime.bound_tables
+            && bound.key == key
+        {
+            return Ok(bound.retained.clone());
+        }
         let used = runtime
             .tables
             .get(&(packet.batch_decode, packet.min_rows))
@@ -483,6 +528,10 @@ impl Worker {
             ));
         }
         self.session.upload_inputs(&inputs)?.wait()?;
+        self.batch.as_mut().unwrap().bound_tables = Some(BoundTables {
+            key,
+            retained: retained.clone(),
+        });
         Ok(retained)
     }
     fn trace_rings(&self, path: &std::path::Path, stage: &str) -> Result<()> {
@@ -716,6 +765,9 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             .collect::<Vec<_>>();
         let capacity = prefill[0].rows;
         super::validate_row_ranges(&prefill, 1, Some(capacity))?;
+        if !(1..=capacity).contains(&c.preferred_span()) {
+            return Err("Invalid prefill scheduling quantum".into());
+        }
         for column in &c.columns {
             match (column.row_bytes, column.decode) {
                 (None, None) => {}
@@ -807,6 +859,21 @@ mod tests {
         )
     }
     #[test]
+    fn address_tables_keep_owner_and_output_order_when_graphs_share_a_shape() {
+        let a = layout(&[1, 1], &[91, 8]).unwrap();
+        let b = layout(&[1, 1], &[8, 91]).unwrap();
+        assert_eq!(a.key(), b.key());
+        assert_ne!(a.table_key(1), b.table_key(1));
+        let mut output = a.clone();
+        output.outputs = vec![1];
+        assert_eq!(a.key(), output.key());
+        assert_ne!(a.table_key(1), output.table_key(1));
+        assert_ne!(a.table_key(1), a.table_key(512));
+        let mut decode = a.clone();
+        decode.decode = true;
+        assert_ne!(a.table_key(1), decode.table_key(1));
+    }
+    #[test]
     fn arbitrary_batch_work_covers_each_logical_owner_tile() {
         let grid:RowExpression=serde_json::from_value(serde_json::json!({"op":"multiply","lhs":{"op":"rows"},"rhs":{"op":"constant","value":3}})).unwrap();
         for batch in 1..=128 {
@@ -872,4 +939,25 @@ mod tests {
         d.decode = true;
         assert_ne!(a.key(), d.key());
     }
+}
+#[test]
+fn scheduling_quantum_is_independent_of_attention_work_selection() {
+    let base = serde_json::json!({
+        "owners": 128, "columns": [], "private": [], "pointers": {},
+        "active": "a", "endpoints": "e", "work": {}, "work_ranges": {}
+    });
+    let mut contract: Contract = serde_json::from_value(base).unwrap();
+    assert_eq!(contract.preferred_span(), 1);
+    contract.work_ranges.insert(
+        "old".into(),
+        WorkRange {
+            min_rows: 512,
+            max_rows: 2048,
+        },
+    );
+    assert_eq!(contract.preferred_span(), 512);
+    contract.prefill_quantum = Some(256);
+    assert_eq!(contract.preferred_span(), 256);
+    contract.work_ranges.clear();
+    assert_eq!(contract.preferred_span(), 256);
 }

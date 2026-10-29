@@ -253,6 +253,47 @@ fn aot_program_orders_shared_operands_and_retains_the_whole_fragment() {
 }
 
 #[test]
+fn input_slabs_split_buffers_and_backpressure_within_the_pinned_budget() {
+    let mut fixture = Fixture::new();
+    let session = Session::with_driver(
+        Arc::clone(fixture.driver.as_ref().unwrap()),
+        0,
+        Limits {
+            device_bytes: 64,
+            pinned_bytes: 8,
+            timeout_ms: 100,
+        },
+    )
+    .unwrap();
+    let a = session.allocate(4).unwrap();
+    let b = session.allocate(5).unwrap();
+    let c = session.allocate(11).unwrap();
+    let output = session.allocate(11).unwrap();
+    let mut inputs = vec![
+        (a.clone(), vec![1; 4]),
+        (b.clone(), vec![2; 5]),
+        (c.clone(), vec![3; 11]),
+    ];
+    let uploaded = session.upload_inputs(&inputs).unwrap();
+    assert!(session.pinned_bytes() <= 8);
+    for (_, data) in &mut inputs {
+        data.fill(99);
+    }
+    drop(inputs);
+    let read = session.copy(&c, 0, &output, 0, 11).unwrap();
+    let overwrite = session.upload_inputs(&[(c.clone(), vec![4; 11])]).unwrap();
+    assert!(session.pinned_bytes() <= 8);
+    assert_eq!(session.download(&a, 0, 4).unwrap(), [1; 4]);
+    assert_eq!(session.download(&b, 0, 5).unwrap(), [2; 5]);
+    assert_eq!(session.download(&output, 0, 8).unwrap(), [3; 8]);
+    assert_eq!(session.download(&output, 8, 3).unwrap(), [3; 3]);
+    assert_eq!(session.download(&c, 0, 8).unwrap(), [4; 8]);
+    assert_eq!(session.download(&c, 8, 3).unwrap(), [4; 3]);
+    drop((uploaded, read, overwrite, a, b, c, output, session));
+    fixture.assert_clean();
+}
+
+#[test]
 fn input_batch_copies_host_data_and_preserves_compute_reader_order() {
     let mut fixture = Fixture::new();
     let session = fixture.session();

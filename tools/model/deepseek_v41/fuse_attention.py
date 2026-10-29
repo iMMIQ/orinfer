@@ -2,7 +2,6 @@
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
-from copy import deepcopy
 import json
 import multiprocessing
 from pathlib import Path
@@ -18,12 +17,6 @@ def main():
     parser.add_argument("--tile-k", type=int, choices=[128, 256], default=128)
     parser.add_argument("--reuse-kv", action="store_true")
     parser.add_argument(
-        "--owner-min-rows",
-        type=int,
-        default=0,
-        help="Keep the original chain below this owner-local query length",
-    )
-    parser.add_argument(
         "--min-rows",
         type=int,
         default=2,
@@ -37,6 +30,7 @@ def main():
         parser.error("Fused prefill requires a minimum of two rows")
     from tools.model.deepseek_v41.build import compile_task
     from tools.operators.ascend.build import operand
+    from tools.operators.ascend.attention_fused import score_tiles
 
     base = args.plan.parent
     model = json.loads(args.plan.read_text())
@@ -108,12 +102,15 @@ def main():
                     (m * 8 + args.tile_m - 1) // args.tile_m,
                 )
                 scratch, tile_k = [], parameters["tile_k"]
+                cached_tiles = score_tiles(
+                    c, parameters["ratio"], parameters["compressed"], args.tile_m, tile_k
+                )
                 for name, dtype, shape, size in (
                     (
                         "scores",
                         "f32",
-                        [blocks, args.tile_m, tile_k],
-                        blocks * args.tile_m * tile_k * 4,
+                        [blocks, args.tile_m, cached_tiles * tile_k],
+                        blocks * cached_tiles * args.tile_m * tile_k * 4,
                     ),
                     (
                         "probabilities",
@@ -123,7 +120,8 @@ def main():
                     ),
                     ("output", "f32", [blocks, args.tile_m, 512], blocks * args.tile_m * 512 * 4),
                 ):
-                    name = f"attention.fused.{m}.{args.tile_m}.{tile_k}.{int(args.reuse_kv)}.{name}"
+                    geometry = f"{cached_tiles}." if name == "scores" else ""
+                    name = f"attention.fused.{m}.{args.tile_m}.{tile_k}.{int(args.reuse_kv)}.{geometry}{name}"
                     definition = dict(name=name, bytes=size)
                     if name not in definitions:
                         rank["buffers"].append(definition)
@@ -156,13 +154,6 @@ def main():
                         dynamic_arguments={"rows": 1},
                         placeholder=f"@fused_attention{len(tasks)}",
                     )
-                if args.owner_min_rows:
-                    if not 2 <= args.owner_min_rows <= capacity:
-                        raise ValueError("Invalid owner attention selection boundary")
-                    for original in old[index : end + 1]:
-                        original = deepcopy(original)
-                        original["owner_range"] = [1, args.owner_min_rows - 1]
-                        body.append(original)
                 fused = dict(
                     op="kernel",
                     manifest=tasks[key]["placeholder"],
@@ -171,8 +162,6 @@ def main():
                     + [pv["buffers"][4]]
                     + [s[0] for s in scratch],
                 )
-                if args.owner_min_rows:
-                    fused["owner_range"] = [args.owner_min_rows, capacity]
                 body.append(fused)
                 index, count = end + 1, count + 1
             if count not in (0, 40):
