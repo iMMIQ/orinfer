@@ -480,7 +480,7 @@ Flash Next 的当前原生包可通过 `tools/model/flash_next/build.py` 重新�
 ```bash
 bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.long_context \
   --plan /path/to/prepared-int8/model.json --output artifacts/a2-long \
-  --capacity 262144 --owners 32
+  --capacity 262144 --owners 32 --length-input --gather-slots 16
 python3 -m tools.model.deepseek_v41.service \
   --plan artifacts/a2-long/package/model.json --model-dir /path/to/original-checkpoint \
   --output artifacts/models/dsv41-a2-service
@@ -491,6 +491,8 @@ orinfer serve artifacts/models/dsv41-a2-service --model deepseek-v41-flash-1017-
 ```
 
 输入是已准备物理 W4 bank 的原始单请求 INT8 KV 计划。构建器扩展 RoPE、完整因果索引及递归 TopK，复用已有 gather、QK、softmax、PV；索引 Cube 中间结果使用有界工作区。SWA 保留 4096 行环，覆盖 2048 行 packet 和 128 行因果窗口。压缩 KV 与 key 按各层 1／2 压缩率保留完整上下文，KV 为 group-64 INT8 加 FP16 scale，计算边界保持 BF16。checkpoint 复制有效压缩历史、SWA 尾部和完整 FP32 压缩环；恢复后重新绑定 owner 地址及位置。
+
+`--length-input` 让同一索引 Cube 工厂读取每行的有效前缀长度，按 owner 内单调递增的位置决定实际 key tile 数，写入有效 score 前缀。TopK 使用相同长度屏蔽其余容量，完整有效候选与原有归约顺序保持一致。此模式以长度向量替代稠密因果索引矩阵，同时适用于 decode 和 prefill。`--gather-slots` 选择同一 INT8 gather 工厂每次转换的槽位数。可重复提供 `--reuse-cache /path/to/compiled/cache`，复用完整编译对象；编译器仍校验对象身份和库哈希。
 
 当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样及 prefix 恢复。工具定义／工具调用、媒体、MTP、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的实验性原生计划封装，由上述 Python 发布器生成；通用模型 cdylib C ABI 打包、`package install` 和 `validate-model` 尚未接通此封装。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
 

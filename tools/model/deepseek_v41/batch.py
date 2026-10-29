@@ -434,6 +434,11 @@ def build(
 
         for source in old_packets:
             family = "decode" if source["rows"] == 1 else "prefill"
+            prefix_lengths = any(
+                source_spec(s)["parameters"].get("length_input", False)
+                for s in source["body"]
+                if s["op"] == "kernel"
+            )
             packet = deepcopy(source)
             packet.update(
                 rows=owners if family == "decode" else rows,
@@ -451,7 +456,7 @@ def build(
                 if not isinstance(old, str):
                     continue
                 size = original[old]["bytes"] * packet["rows"] // source["rows"]
-                if role in ("c1_indices", "c2_indices"):
+                if role in ("c1_indices", "c2_indices") and not prefix_lengths:
                     size = size * capacity // old_capacity
                 define("batch." + family + "." + old, size)
 
@@ -468,7 +473,9 @@ def build(
                         )
                         custom = dict(
                             op="model_ops.causal_indices",
-                            parameters=dict(rows=1, capacity=old_capacity, ratio=ratio),
+                            parameters=dict(
+                                rows=1, capacity=old_capacity, ratio=ratio, dense=not prefix_lengths
+                            ),
                             operands=[
                                 dict(access="read"),
                                 dict(access="write"),

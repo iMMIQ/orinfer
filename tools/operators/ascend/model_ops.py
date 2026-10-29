@@ -7,16 +7,16 @@ import tilelang.language as T
 from tools.operators.ascend.vector_math import div_127_fp32, div_fp32_scalar, rsqrt_fp32
 
 
-def causal_indices(rows, capacity, ratio=1):
+def causal_indices(rows, capacity, ratio=1, dense=True):
     """Build the full-coverage causal index view on device from token positions."""
     length = capacity // ratio
     block = 128
-    tiles = (length + block - 1) // block
+    tiles = (length + block - 1) // block if dense else 1
 
     @T.prim_func
     def main(
         positions: T.Tensor((rows,), "int32"),
-        indices: T.Tensor((rows, length), "int32"),
+        indices: T.Tensor((rows, length if dense else 1), "int32"),
         lengths: T.Tensor((rows,), "int32"),
     ):
         with T.Kernel(T.ceildiv(rows * tiles, 2), is_npu=True) as (cid, vid):
@@ -28,13 +28,14 @@ def causal_indices(rows, capacity, ratio=1):
             row, tile = index // tiles, index % tiles
             if row < rows:
                 count = (positions[row] + 1) // ratio
-                T.tile.createvecindex(ids, T.float32(0.0))
-                T.tile.add(ids, ids, T.cast(tile * block, "float32"))
-                T.tile.compare(mask, ids, T.cast(count, "float32"), "LT")
-                T.tile.select(ids, mask, ids, -1.0, "VSEL_TENSOR_SCALAR_MODE")
-                T.tile.cast(out, ids, "CAST_RINT", block)
-                valid = T.min(block, length - tile * block)
-                T.copy(out[:valid], indices[row, tile * block : tile * block + valid])
+                if dense:
+                    T.tile.createvecindex(ids, T.float32(0.0))
+                    T.tile.add(ids, ids, T.cast(tile * block, "float32"))
+                    T.tile.compare(mask, ids, T.cast(count, "float32"), "LT")
+                    T.tile.select(ids, mask, ids, -1.0, "VSEL_TENSOR_SCALAR_MODE")
+                    T.tile.cast(out, ids, "CAST_RINT", block)
+                    valid = T.min(block, length - tile * block)
+                    T.copy(out[:valid], indices[row, tile * block : tile * block + valid])
                 if tile == 0:
                     length_value[0] = count
                     T.copy(length_value[:1], lengths[row : row + 1])

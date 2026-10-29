@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import json
 from pathlib import Path
+import shutil
 
 from tools.build.files import atomic_json
 from tools.model.deepseek_v41.converge import (
@@ -23,7 +24,7 @@ from tools.model.deepseek_v41.converge import (
 from tools.model.deepseek_v41.service import state_layout
 
 
-def prepare(model, base, capacity, storage):
+def prepare(model, base, capacity, storage, length_input=False, gather_slots=1):
     from tools.operators.ascend.geometry import physical_shapes
 
     old_capacity = model["capacity"]
@@ -133,6 +134,16 @@ def prepare(model, base, capacity, storage):
         prefill["body"] = body
 
         for packet in rank["packets"]:
+            causal_lengths = {}
+            if length_input:
+                coordinates = packet["coordinates"]
+                for ratio in (1, 2):
+                    name = coordinates[f"c{ratio}_indices"]
+                    causal_lengths[name] = coordinates[f"c{ratio}_lengths"]
+                    definitions[name]["bytes"] = packet["rows"] * 4
+                for item in packet["body"]:
+                    if item["op"] == "kernel" and spec(item)["op"] == "model_ops.causal_indices":
+                        causal_lengths[item["buffers"][1]] = item["buffers"][2]
             body = []
             index = 0
             old = packet["body"]
@@ -155,7 +166,13 @@ def prepare(model, base, capacity, storage):
                         definitions[name]["bytes"] = storage * width
                 elif kind == "kv_int8.gather_attention":
                     params["swa_storage_rows"] = storage
+                    if packet is prefill:
+                        params["tile_slots"] = gather_slots
                     step["manifest"] = metadata(kind, params, accesses)
+                elif kind == "model_ops.causal_indices" and length_input:
+                    params["dense"] = False
+                    step["manifest"] = metadata(kind, params, accesses)
+                    definitions[step["buffers"][1]]["bytes"] = packet["rows"] * 4
                 elif kind.startswith("indexer"):
                     # The causal index view is contiguous and contains only -1
                     # or the key's own slot; the Cube factory preserves its law.
@@ -167,6 +184,9 @@ def prepare(model, base, capacity, storage):
                     if kind != "indexer_cube.causal_logits":
                         params = dict(tile_s=128, vector_mask=True)
                     params.update(rows=packet["rows"], length=length, workspace_tiles=64)
+                    if length_input:
+                        step["buffers"][5] = causal_lengths[step["buffers"][5]]
+                        params["length_input"] = True
                     workspace = (
                         packet["coordinates"]["slots"].removesuffix("slots") + "index.bounded"
                     )
@@ -230,6 +250,9 @@ def main():
     parser.add_argument("--owners", type=int, default=32)
     parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--resume-preparation", action="store_true")
+    parser.add_argument("--length-input", action="store_true")
+    parser.add_argument("--gather-slots", type=int, choices=(1, 4, 8, 16), default=1)
+    parser.add_argument("--reuse-cache", type=Path, action="append", default=[])
     args = parser.parse_args()
     if args.output.exists() and not args.resume_preparation:
         parser.error("Preserve existing build directories")
@@ -247,7 +270,21 @@ def main():
         source = canonical(json.loads((base / "model.json").read_text()))
     else:
         publish_package(source, args.plan.parent, base)
-    source = prepare(source, base, args.capacity, args.swa_storage_rows)
+    cache_root = base / "cache"
+    cache_root.mkdir(exist_ok=True)
+    for cache in args.reuse_cache:
+        if not cache.is_dir():
+            parser.error(f"Compiled cache directory does not exist: {cache}")
+        for entry in cache.iterdir():
+            if (entry / "kernel.json").is_file() and (entry / "kernel.so").is_file():
+                target = cache_root / entry.name
+                if not target.exists():
+                    shutil.copytree(
+                        entry, target, copy_function=lambda a, b: Path(b).hardlink_to(a)
+                    )
+    source = prepare(
+        source, base, args.capacity, args.swa_storage_rows, args.length_input, args.gather_slots
+    )
     atomic_json(base / "model-selected-context-source.json", source)
     from tools.model.deepseek_v41 import batch
     from tools.model.deepseek_v41.build import rope_tables

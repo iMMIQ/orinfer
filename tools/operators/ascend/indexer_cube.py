@@ -15,7 +15,14 @@ def causal_logits(
     direct_sum=False,
     prefetch_inputs=False,
     workspace_tiles=0,
+    length_input=False,
 ):
+    """Score every causal key, optionally reading per-row prefix lengths.
+
+    Length inputs are monotone within an owner packet. In that mode only
+    scores inside each prefix are written; TopK consumes the same lengths
+    and masks the remaining capacity before selection.
+    """
     if heads != 32 or dimension != 128 or tile_s not in (32, 64, 128):
         raise ValueError("Causal index Cube requires H32/D128 and aligned key tiles")
     if tile_rows not in (1, 2, 4, 8) or tile_rows * heads * tile_s * 4 > 131072:
@@ -24,6 +31,8 @@ def causal_logits(
     padded = blocks * tile_s
     if workspace_tiles not in (0, 64):
         raise ValueError("Indexer scratch tiles must match the shared 64-CTA owner schedule")
+    if length_input and workspace_tiles != 64:
+        raise ValueError("Length-driven indexing requires the bounded CTA schedule")
     workspace_width = min(padded, workspace_tiles * tile_s) if workspace_tiles else padded
     lanes = tile_s // 2
     factor = dimension**-0.5 * heads**-0.5
@@ -35,7 +44,7 @@ def causal_logits(
         keys: T.Tensor((length, dimension), "int8"),
         key_scale: T.Tensor((length,), "float16"),
         weights: T.Tensor((rows, heads), "bfloat16"),
-        indices: T.Tensor((rows, length), "int32"),
+        indices: T.Tensor((rows, 1 if length_input else length), "int32"),
         out: T.Tensor((rows, length), "float32"),
         workspace: T.Tensor((rows * heads, workspace_width), "int32"),
     ):
@@ -45,18 +54,29 @@ def causal_logits(
         with T.Kernel(
             64 if workspace_tiles else T.ceildiv(rows, tile_rows) * blocks, is_npu=True
         ) as (cid, vid):
+            live_blocks = (
+                T.max(1, T.ceildiv(T.min(length, T.max(0, indices[rows - 1, 0])), tile_s))
+                if length_input
+                else blocks
+            )
             for iteration in T.serial(
-                T.ceildiv(T.ceildiv(rows, tile_rows) * blocks - cid, 64) if workspace_tiles else 1
+                T.ceildiv(T.ceildiv(rows, tile_rows) * live_blocks - cid, 64)
+                if workspace_tiles
+                else 1
             ):
                 logical = cid + iteration * 64
-                first, tile = logical // blocks * tile_rows, logical % blocks
+                first, tile = logical // live_blocks * tile_rows, logical % live_blocks
                 valid_rows = T.min(tile_rows, rows - first)
                 start = tile * tile_s
                 with T.Scope("C"):
                     a = T.alloc_L1((tile_rows * heads, dimension), "int8")
                     b = T.alloc_L1((tile_s, dimension), "int8")
                     c = T.alloc_L0C((tile_rows * heads, tile_s), "int32")
-                    if indices[first + valid_rows - 1, start] >= 0:
+                    if (
+                        indices[first + valid_rows - 1, 0] > start
+                        if length_input
+                        else indices[first + valid_rows - 1, start] >= 0
+                    ):
                         valid = T.min(tile_s, length - start)
                         T.copy(
                             query[first * heads : (first + valid_rows) * heads, :],
@@ -90,14 +110,28 @@ def causal_logits(
                     mask = T.alloc_ub((lanes // 8,), "uint8")
                     expanded = T.alloc_ub((heads, lanes), "float32")
                     column = start + vid * lanes
-                    if indices[first + valid_rows - 1, start] >= 0:
+                    if (
+                        indices[first + valid_rows - 1, 0] > start
+                        if length_input
+                        else indices[first + valid_rows - 1, start] >= 0
+                    ):
                         T.wait_cross_flag(0)
                     for row_offset in T.serial(tile_rows):
                         row = first + row_offset
                         if row < rows:
-                            if indices[row, start] >= 0:
-                                if column < length:
-                                    valid = T.min(lanes, length - column)
+                            if (
+                                indices[row, 0] > start
+                                if length_input
+                                else indices[row, start] >= 0
+                            ):
+                                if column < (
+                                    T.min(length, indices[row, 0]) if length_input else length
+                                ):
+                                    valid = T.min(
+                                        lanes,
+                                        (T.min(length, indices[row, 0]) if length_input else length)
+                                        - column,
+                                    )
                                     T.copy(
                                         workspace[
                                             row * heads : (row + 1) * heads,
@@ -110,7 +144,10 @@ def causal_logits(
                                         T.copy(query_scale[row, :], qs_half)
                                         T.copy(weights[row, :], w_bf)
                                         T.copy(key_scale[column : column + valid], ks_half[:valid])
-                                        T.copy(indices[row, column : column + valid], ids[:valid])
+                                        if not length_input:
+                                            T.copy(
+                                                indices[row, column : column + valid], ids[:valid]
+                                            )
                                     T.tile.cast(dots, raw, "CAST_RINT", heads * lanes)
                                     if not prefetch_inputs:
                                         T.copy(query_scale[row, :], qs_half)
@@ -144,9 +181,9 @@ def causal_logits(
                                                 T.tile.mul(partial, partial, ks)
                                                 T.tile.mul(partial, partial, w[head, 0])
                                             T.tile.add(total, total, partial)
-                                    if not prefetch_inputs:
+                                    if not prefetch_inputs and not length_input:
                                         T.copy(indices[row, column : column + valid], ids[:valid])
-                                    if vector_mask:
+                                    if vector_mask and not length_input:
                                         T.tile.cast(partial, ids, "CAST_NONE", lanes)
                                         T.tile.compare(mask, partial, 0.0, "GE")
                                         T.tile.select(
@@ -156,19 +193,23 @@ def causal_logits(
                                             -T.infinity("float32"),
                                             "VSEL_TENSOR_SCALAR_MODE",
                                         )
-                                    else:
+                                    elif not length_input:
                                         for lane in T.serial(lanes):
                                             if ids[lane] < 0:
                                                 total[0, lane] = -T.infinity("float32")
                                     T.copy(total[0, :valid], out[row, column : column + valid])
-                            else:
+                            elif not length_input:
                                 if column < length:
                                     valid = T.min(lanes, length - column)
                                     T.tile.fill(total, -T.infinity("float32"))
                                     T.copy(total[0, :valid], out[row, column : column + valid])
 
                     if workspace_tiles != 0:
-                        if indices[first + valid_rows - 1, start] >= 0:
+                        if (
+                            indices[first + valid_rows - 1, 0] > start
+                            if length_input
+                            else indices[first + valid_rows - 1, start] >= 0
+                        ):
                             T.set_cross_flag("MTE3", 1)
 
     return (
