@@ -162,21 +162,27 @@ def gather_attention(
     swa_storage_rows=0,
     tile_slots=1,
     bulk_store=False,
+    reuse_long=False,
 ):
     """Gather cache rows and decode groups using one shared quantization body.
 
     The selected-slot tile is an offline schedule choice. Larger tiles batch
     casts and scale broadcasts across slots; every group keeps the same FP16
     scale and BF16 rounding boundary as the one-slot schedule.
+    ``reuse_long`` preserves the previously gathered long slots and mask. The
+    offline plan must prove their inputs and owner layout have not changed
+    since a complete gather in this packet; only the SWA slots are updated.
     """
     selected = 640 if compressed else 128
+    if reuse_long and not compressed:
+        raise ValueError("Long KV reuse requires compressed attention")
     storage = swa_storage_rows or capacity
     if storage < 128 or storage > capacity:
         raise ValueError("SWA storage must cover the complete sliding window")
     if tile_slots not in (1, 4, 8, 16):
         raise ValueError("KV slot tiles must fit the A2 UB and divide both selected widths")
     groups = tile_slots * 8
-    tiles = selected // tile_slots
+    tiles = (128 if reuse_long else selected) // tile_slots
 
     @T.prim_func
     def main(

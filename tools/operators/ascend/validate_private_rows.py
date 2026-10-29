@@ -15,6 +15,9 @@ def main():
     p.add_argument("--rows", type=int, nargs="+", help="Owner row lengths for KV gather checks")
     p.add_argument("--kv-compressed", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--bulk-store", action="store_true")
+    p.add_argument(
+        "--reuse-long", action="store_true", help="Check full gather then SWA-only reuse"
+    )
     p.add_argument("--op", nargs="+", help="Restrict validation to named primitive families")
     a = p.parse_args()
     if not 1 <= a.owners <= 128:
@@ -25,6 +28,8 @@ def main():
         or a.op != ["kv_int8.gather_attention"]
     ):
         p.error("--rows requires one 1..2048 length per owner and --op kv_int8.gather_attention")
+    if a.reuse_long and (a.op != ["kv_int8.gather_attention"] or a.kv_compressed is not True):
+        p.error("--reuse-long requires --op kv_int8.gather_attention --kv-compressed")
     import torch
     import torch_npu  # noqa: F401
     from kernels.model.rows import row_count
@@ -67,6 +72,7 @@ def main():
                     swa_storage_rows=256,
                     tile_slots=tile,
                     bulk_store=a.bulk_store,
+                    reuse_long=a.reuse_long,
                 ),
             )
             for compressed in (False, True)
@@ -113,11 +119,16 @@ def main():
             )
             for t, shape in zip(tensors, shapes, strict=True)
         ]
+        reference_function = (
+            factory(**dict(params, reuse_long=False, rows=row_count(capacity, True)))
+            if a.reuse_long
+            else function
+        )
         reference = compile_kernel(
-            function,
+            reference_function,
             module.__name__.split(".")[-1] + "." + name,
             specs,
-            params,
+            dict(params, reuse_long=False) if a.reuse_long else params,
             a.output / "cache",
             row_capacity=capacity,
         )
@@ -270,6 +281,21 @@ def main():
                     if tensor.name in writes:
                         value.fill_(17)
                         want.fill_(17)
+            if a.reuse_long:
+                # The previous layer initializes all long slots. Its successor
+                # changes only SWA and must preserve those converted long rows.
+                for owner, length in zip(order, lengths, strict=True):
+                    call(0, data[owner], length)
+                for owner in range(a.owners):
+                    for tensor, value, want in zip(
+                        tensors, data[owner], expected[owner], strict=True
+                    ):
+                        if tensor.name == "swa":
+                            value.neg_()
+                            want.copy_(value)
+                        elif tensor.name == "swa_scales":
+                            value.mul_(0.5)
+                            want.copy_(value)
             for owner, length in zip(order, lengths, strict=True):
                 call(0, expected[owner], length)
             graph.replay()

@@ -19,12 +19,123 @@ from tools.model.deepseek_v41.batch import DTYPES, SIZES, compile_task
 from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
 
 
-def rebuild(plan, output, operator, overrides, first):
+def reusable_long_gathers(rank, contract, describe):
+    """Prove packet-local gather reuse, invalidating on any aliased write.
+
+    Views conservatively alias their entire root allocation. Owner ranges are
+    tracked separately: a short-owner variant cannot initialize a large-owner
+    variant. This only removes repeated conversion; it never changes KV state
+    or carries scratch contents from a previous packet.
+    """
+    definitions = {b["name"]: b for b in rank["buffers"]}
+
+    def root(name):
+        seen = set()
+        while "view" in definitions[name]:
+            if name in seen:
+                raise ValueError("Cyclic buffer view")
+            seen.add(name)
+            name = definitions[name]["view"]["parent"]
+        return name
+
+    def written(step, spec):
+        if step["op"] == "kernel":
+            writes = {
+                name
+                for name, operand in zip(step["buffers"], spec["operands"], strict=True)
+                if operand["access"] in ("write", "read_write", "scratch")
+            }
+            if "owner_work" in step:
+                mapping = contract["pointers"][step["buffers"][1]]
+                writes.update(
+                    contract["columns"][mapping[a["column"]]]["buffer"]
+                    for a in spec["parameters"]["_owner_access"]
+                    if a["write"]
+                )
+        elif step["op"] in ("embed", "gather", "reduce"):
+            writes = {step["destination"]}
+        elif step["op"] == "w4":
+            writes = {step["buffers"][-1], step["workspace"]}
+        elif step["op"] == "lookup":
+            writes = {step[k] for k in ("values", "scales", "mask")}
+        elif step["op"] in ("fork", "switch", "join", "snapshot"):
+            writes = set()
+        else:
+            return None  # Unknown instructions or row changes invalidate all.
+        return {root(name) for name in writes}
+
+    selected = set()
+    for packet_index, packet in enumerate(rank["packets"]):
+        if packet.get("batch_decode"):
+            continue
+        live = {}
+        for step_index, step in enumerate(packet["body"]):
+            spec = describe(step["manifest"]) if step["op"] == "kernel" else None
+            key, extent, protected = None, None, None
+            if (
+                spec is not None
+                and spec["op"] == "private_rows.kv_int8_gather_attention"
+                and spec["parameters"]["compressed"]
+            ):
+                p = spec["parameters"]
+                if p.get("reuse_long", False):
+                    raise ValueError("Reuse analysis requires complete reference gathers")
+                mapping = contract["pointers"][step["buffers"][1]]
+                if len(mapping) != 8 or p["_owner_access"] != [
+                    dict(column=i, write=i >= 6) for i in range(8)
+                ]:
+                    raise ValueError("Unexpected gather pointer contract")
+                columns = [contract["columns"][mapping[i]] for i in (2, 3, 5, 6, 7)]
+                input_roots = {root(c["buffer"]) for c in columns[:3]}
+                output_roots = {root(c["buffer"]) for c in columns[3:]}
+                if input_roots & output_roots or len(output_roots) != 2:
+                    raise ValueError("Gather output aliases a source or another output")
+                key = json.dumps(
+                    [
+                        columns,
+                        [
+                            p[k]
+                            for k in ("capacity", "compressed_capacity", "_owner_token_capacity")
+                        ],
+                        step.get("row_expression"),
+                        step.get("fixed_rows"),
+                    ],
+                    sort_keys=True,
+                )
+                extent = contract.get("work_ranges", {}).get(
+                    step["buffers"][0], dict(min_rows=1, max_rows=p["_owner_token_capacity"])
+                )
+                lower, upper = extent["min_rows"], extent["max_rows"]
+                ranges = live.get(key, (set(), []))[1]
+                cursor = lower
+                for first, last in sorted(ranges):
+                    if first <= cursor:
+                        cursor = max(cursor, last + 1)
+                if cursor > upper:
+                    selected.add((packet_index, step_index))
+                protected = input_roots | output_roots
+            writes = written(step, spec)
+            live = {
+                k: value
+                for k, value in live.items()
+                if writes is not None and (k == key or not value[0] & writes)
+            }
+            if key is not None:
+                ranges = live.get(key, (set(), []))[1]
+                live[key] = protected, ranges + [(extent["min_rows"], extent["max_rows"])]
+    return selected
+
+
+def rebuild(plan, output, operator, overrides, first, *, reuse_long_kv=False):
     from kernels.model.rows import row_count
     from tools.operators.ascend.private_rows import indirect
     from tools.operators.ascend.geometry import physical_shapes
 
     model = json.loads(plan.read_text())
+    if "reuse_long" in overrides or (
+        reuse_long_kv and (operator != "kv_int8.gather_attention" or first != 1)
+    ):
+        raise ValueError("Use --reuse-long-kv with the complete KV gather owner domain")
     if output.exists() or not model.get("batch") or first < 1 or "rows" in overrides:
         raise ValueError(
             "Require a native rows plan, positive owner length and new output directory"
@@ -55,11 +166,15 @@ def rebuild(plan, output, operator, overrides, first):
         return role
 
     for rank in model["ranks"]:
-        for packet in rank["packets"]:
+        reusable = reusable_long_gathers(rank, contract, describe) if reuse_long_kv else None
+        for packet_index, packet in enumerate(rank["packets"]):
             if packet.get("batch_decode"):
                 continue
             body = []
-            for original in packet["body"]:
+            for step_index, original in enumerate(packet["body"]):
+                if reusable is not None and (packet_index, step_index) not in reusable:
+                    body.append(original)
+                    continue
                 if original["op"] != "kernel":
                     body.append(original)
                     continue
@@ -90,6 +205,8 @@ def rebuild(plan, output, operator, overrides, first):
                         key: value for key, value in parameters.items() if not key.startswith("_")
                     }
                     arguments.update(overrides)
+                    if reuse_long_kv:
+                        arguments["reuse_long"] = True
                     function = factory(**dict(arguments, rows=row_count(capacity, True)))
                     tensors = [
                         function.buffer_map[p] for p in function.params if p in function.buffer_map
@@ -197,6 +314,7 @@ def rebuild(plan, output, operator, overrides, first):
         operator=operator,
         parameters=overrides,
         first_owner_rows=first,
+        reuse_long_kv=reuse_long_kv,
     )
 
 
@@ -207,10 +325,18 @@ def main():
     parser.add_argument("--operator", required=True)
     parser.add_argument("--parameters", type=json.loads, required=True)
     parser.add_argument("--min-owner-rows", type=int, default=1)
+    parser.add_argument("--reuse-long-kv", action="store_true")
     args = parser.parse_args()
     print(
         json.dumps(
-            rebuild(args.plan, args.output, args.operator, args.parameters, args.min_owner_rows)
+            rebuild(
+                args.plan,
+                args.output,
+                args.operator,
+                args.parameters,
+                args.min_owner_rows,
+                reuse_long_kv=args.reuse_long_kv,
+            )
         ),
         flush=True,
     )

@@ -10,6 +10,125 @@ from tools.model.deepseek_v41.converge import compact_buffers, publish_package, 
 from tools.model.row_contract import expression, resolve
 from tools.model.row_selection import aggregate_winner, bounded_choices, guarded_winner
 from tools.model.deepseek_v41.sequence_parallel import external_reads
+from tools.model.deepseek_v41.private_schedule import reusable_long_gathers
+
+
+class LongGatherReuseTests(unittest.TestCase):
+    def fixture(self):
+        names = ["swa", "swa.scale", "long", "long.scale", "si", "li", "out", "mask"]
+        contract = dict(
+            columns=[dict(buffer=name, row_bytes=None) for name in names],
+            pointers=dict(p=list(range(8))),
+            work_ranges=dict(
+                short=dict(min_rows=1, max_rows=511), large=dict(min_rows=512, max_rows=2048)
+            ),
+        )
+        specs = dict(
+            gather=dict(
+                op="private_rows.kv_int8_gather_attention",
+                parameters=dict(
+                    compressed=True,
+                    capacity=262144,
+                    compressed_capacity=131072,
+                    _owner_token_capacity=2048,
+                    _owner_access=[dict(column=i, write=i >= 6) for i in range(8)],
+                ),
+                operands=[dict(access="read") for _ in range(3)],
+            ),
+            write=dict(op="write", operands=[dict(access="write")]),
+        )
+        rank = dict(
+            buffers=[dict(name=name, bytes=1024) for name in names]
+            + [
+                dict(name="work", bytes=1024),
+                dict(name="short", bytes=1024),
+                dict(name="large", bytes=1024),
+                dict(name="p", bytes=1024),
+                dict(name="active", bytes=4),
+                dict(name="out.view", bytes=1, view=dict(parent="out", offset=0)),
+            ],
+            packets=[],
+        )
+        return rank, contract, specs
+
+    def gather(self, work="work", pointers="p"):
+        return dict(
+            op="kernel", manifest="gather", buffers=[work, pointers, "active"], owner_work={}
+        )
+
+    def check(self, steps, expected, change=None):
+        rank, contract, specs = self.fixture()
+        rank["packets"] = [dict(body=steps)]
+        if change:
+            change(rank, contract, specs)
+        self.assertEqual(
+            reusable_long_gathers(rank, contract, specs.__getitem__), {(0, i) for i in expected}
+        )
+
+    def test_each_packet_starts_full_and_swa_changes_allow_long_reuse(self):
+        steps = [self.gather(), dict(op="kernel", manifest="write", buffers=["swa"]), self.gather()]
+        self.check(steps, [2])
+        rank, contract, specs = self.fixture()
+        rank["packets"] = [dict(body=[self.gather(), self.gather()]) for _ in range(2)]
+        self.assertEqual(reusable_long_gathers(rank, contract, specs.__getitem__), {(0, 1), (1, 1)})
+
+    def test_every_source_output_and_alias_write_invalidates(self):
+        for name in ("long", "long.scale", "li", "out", "mask", "out.view"):
+            with self.subTest(buffer=name):
+                self.check(
+                    [
+                        self.gather(),
+                        dict(op="kernel", manifest="write", buffers=[name]),
+                        self.gather(),
+                        self.gather(),
+                    ],
+                    [3],
+                )
+        self.check([self.gather(), dict(op="future_unknown"), self.gather()], [])
+        self.check([self.gather(), dict(op="limit_rows", rows=128), self.gather()], [])
+
+    def test_disjoint_owner_variants_require_complete_coverage(self):
+        self.check([self.gather("short"), self.gather("large"), self.gather()], [2])
+        self.check([self.gather("short"), self.gather(), self.gather("large")], [2])
+        self.check([self.gather("short"), self.gather("short"), self.gather("large")], [1])
+
+    def test_pointer_or_row_layout_change_requires_full_gather(self):
+        for column in (2, 3, 5, 6, 7):
+
+            def change(rank, contract, specs):
+                replacement = dict(contract["columns"][column], row_bytes=128)
+                contract["columns"].append(replacement)
+                contract["pointers"]["q"] = list(range(8))
+                contract["pointers"]["q"][column] = 8
+
+            self.check([self.gather(), self.gather(pointers="q")], [], change)
+        other = dict(self.gather(), fixed_rows=17)
+        self.check([self.gather(), other], [])
+
+    def test_explicit_stream_boundaries_preserve_only_unmodified_values(self):
+        self.check(
+            [
+                self.gather(),
+                dict(op="fork"),
+                dict(op="kernel", manifest="write", buffers=["swa"]),
+                dict(op="switch"),
+                dict(op="snapshot", buffer="out"),
+                dict(op="join"),
+                self.gather(),
+            ],
+            [6],
+        )
+        self.check(
+            [self.gather(), dict(op="gather", source="swa", destination="out.view"), self.gather()],
+            [],
+        )
+
+    def test_aliasing_output_is_rejected(self):
+        def change(rank, contract, specs):
+            contract["columns"][6]["buffer"] = "long"
+
+        with self.assertRaisesRegex(ValueError, "aliases"):
+            self.check([self.gather()], [], change)
 
 
 class ConvergenceTests(unittest.TestCase):

@@ -516,4 +516,6 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 
 `bulk_store:true` 使用与下游 attention 一致的连续 512 维视图，一次写回整个 slot tile，合并逐 slot 的输出等待与拷贝。`validate_private_rows` 加 `--bulk-store` 验证此调度，并覆盖 FP16 scale 的零值、次正规值及极值。完整模型的 prefix 恢复诊断覆盖 17、129、2049 和 8193 token，包含环形 SWA 跨界后的 owner 迁移。
 
+上述 `private_schedule` 命令使用 `--parameters '{}' --reuse-long-kv` 时，在同一 prefill packet 内复用已经转换的长 KV；每层继续更新私有的 128 个 SWA slot。离线检查共享 bank、scale、选中索引、输出及 mask 的指针列和行布局，遇到相关写入或别名写入时重新完整转换。每个 packet 的首次读取、owner range 未覆盖部分和未知指令后的读取均执行完整转换。所有配置复用 `kv_int8.gather_attention`，保持原始 INT8／FP16 scale 到 BF16 的边界，普通 decode 保留原绑定。`validate_private_rows --op kv_int8.gather_attention --kv-compressed --bulk-store --reuse-long --rows 1 17 129` 对照完整 gather，覆盖初始化后 SWA 改变、反向 owner、尾部和 Graph replay。
+
 `bench-ascend-batch` 的显式 `frames` 可携带 `decode:true` 和固定 token 历史；阶段时间与 decode 输出计数跟随 frame 角色。比较 decode 调度时保持相同输入历史，并单独保留自由生成结果。
