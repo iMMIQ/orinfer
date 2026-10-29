@@ -679,10 +679,9 @@ impl Worker {
             templates: BTreeMap::new(),
             phases,
             steps: BTreeMap::new(),
-            batch: model
-                .batch
-                .as_ref()
-                .map(|contract| batch::Runtime::new(contract.clone(), model.packet_cache_capacity)),
+            batch: model.batch.as_ref().map(|contract| {
+                batch::Runtime::new(contract.clone(), model.packet_cache_capacity, &rank.packets)
+            }),
         };
         if model.batch.is_some() {
             return Ok(worker);
@@ -825,9 +824,15 @@ impl Worker {
             } = instruction
             {
                 let rows = if let Some(grid) = owner_work {
-                    batch::work_items(layout.ok_or("Owner kernel needs batch layout")?, grid)?
-                        .len()
-                        .div_ceil(2)
+                    batch::work_items(
+                        layout.ok_or("Owner kernel needs batch layout")?,
+                        grid,
+                        self.batch
+                            .as_ref()
+                            .and_then(|b| b.contract.work_ranges.get(&buffers[0])),
+                    )?
+                    .len()
+                    .div_ceil(2)
                 } else if *owners {
                     layout
                         .ok_or("Head kernel needs batch layout")?
@@ -1636,15 +1641,23 @@ fn validate_dispatch(packets: &[Packet]) -> Result<()> {
     if decode.rows != 1 || decode.min_rows != 0 || decode.dispatch_max() != 1 || packets.len() < 2 {
         return Err("Expected single-row decode followed by prefill ranges".into());
     }
-    let mut next = 2;
-    for packet in &packets[1..] {
+    validate_row_ranges(&packets[1..].iter().collect::<Vec<_>>(), 2, None)
+}
+
+fn validate_row_ranges(packets: &[&Packet], first: usize, capacity: Option<usize>) -> Result<()> {
+    let mut next = first;
+    for packet in packets {
         if packet.min_rows != next
             || packet.dispatch_max() < next
             || packet.dispatch_max() > packet.rows
+            || capacity.is_some_and(|c| packet.rows != c)
         {
             return Err("A2 prefill ranges must be ordered, contiguous and disjoint".into());
         }
         next = packet.dispatch_max() + 1;
+    }
+    if packets.is_empty() || capacity.is_some_and(|c| next != c + 1) {
+        return Err("A2 row ranges do not cover their declared capacity".into());
     }
     Ok(())
 }

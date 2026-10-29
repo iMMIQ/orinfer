@@ -18,7 +18,7 @@ def main():
     import torch
     import torch_npu  # noqa: F401
     from kernels.model.rows import row_count
-    from tools.operators.ascend import attention_prefill, kv_int8, compressor
+    from tools.operators.ascend import attention_prefill, attention_fused, kv_int8, compressor
     from tools.operators.ascend.build import compile_kernel, operand
     from tools.operators.ascend.geometry import physical_shapes
     from tools.operators.ascend.private_rows import indirect
@@ -41,6 +41,13 @@ def main():
         (attention_prefill, "pv", dict(rows=capacity, capacity=256, compressed=False)),
         (compressor, "pool", dict(tokens=capacity, pages=2)),
         (compressor, "commit", dict(tokens=capacity, pages=2)),
+        (
+            attention_fused,
+            "prefill",
+            dict(
+                rows=capacity, capacity=256, compressed=False, tile_m=64, tile_k=128, reuse_kv=True
+            ),
+        ),
     ]:
         factory = getattr(module, name)
         row_key = "tokens" if "tokens" in params else "rows"
@@ -54,6 +61,7 @@ def main():
             "pv": {"output", "workspace"},
             "pool": {"out", "errors"},
             "commit": {"ring", "errors"},
+            "prefill": {"output", "score_tile", "probability_tile", "output_tile"},
         }[name]
         specs = [
             operand(
@@ -188,6 +196,9 @@ def main():
             for owner in range(a.owners):
                 for tensor, value, want in zip(tensors, data[owner], expected[owner], strict=True):
                     if tensor.name in writes:
+                        if name == "prefill" and tensor.name != "output":
+                            # Padded scratch rows do not carry semantic values.
+                            continue
                         assert torch.equal(value.cpu(), want.cpu()), (name, owner, tensor.name)
         del graph
         report.append(

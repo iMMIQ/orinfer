@@ -16,7 +16,13 @@ import multiprocessing
 from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
-from tools.model.deepseek_v41.converge import canonical, publish_package, validate_rows
+from tools.model.deepseek_v41.converge import (
+    canonical,
+    publish_package,
+    run_transform,
+    validate_rows,
+)
+from tools.model.row_contract import resolve
 
 SIZES = dict(i8=1, i32=4, i64=8, f16=2, bf16=2, f32=4, u64=8)
 DTYPES = dict(
@@ -51,7 +57,19 @@ def compile_task(item):
     return task["key"], str(path.relative_to(base))
 
 
-def build(plan, output, owners, capacity, rows, workers):
+def build(
+    plan,
+    output,
+    owners,
+    capacity,
+    rows,
+    workers,
+    *,
+    sequence_parallel=False,
+    shared_attention=False,
+    reduce_scatter=False,
+    fused_attention=False,
+):
     from kernels.model.rows import row_count
     from tools.operators.ascend.build import operand
     from tools.operators.ascend.geometry import physical_shapes
@@ -59,14 +77,53 @@ def build(plan, output, owners, capacity, rows, workers):
 
     base = plan.parent
     model = canonical(json.loads(plan.read_text()))
+    if sequence_parallel and rows != model["ranks"][0]["packets"][1]["rows"]:
+        raise ValueError("Sequence transforms require the source packet capacity")
+    if sequence_parallel or fused_attention:
+        current = output.with_name(output.stem + "-reference.json")
+        atomic_json(current, model)
+        if sequence_parallel:
+            target = output.with_name(output.stem + "-sequence.json")
+            run_transform(
+                "sequence_parallel",
+                current,
+                target,
+                workers,
+                ["--min-rows", "512"]
+                + (["--reduce-scatter"] if reduce_scatter else [])
+                + (["--shared-attention"] if shared_attention else []),
+            )
+            current = target
+        if fused_attention:
+            target = output.with_name(output.stem + "-attention.json")
+            run_transform(
+                "fuse_attention",
+                current,
+                target,
+                workers,
+                [
+                    "--min-rows",
+                    "512" if sequence_parallel else "2",
+                    "--owner-min-rows",
+                    "512",
+                    "--tile-m",
+                    "64",
+                    "--tile-k",
+                    "256",
+                    "--reuse-kv",
+                ],
+            )
+            current = target
+        model = json.loads(current.read_text())
     old_capacity = model["capacity"]
     model["capacity"] = capacity
     model.pop("row_selections", None)
-    specs, tasks, columns, work = {}, {}, [], {}
+    specs, tasks, columns, work, work_ranges = {}, {}, [], {}, {}
     column_ids = {}
     pointer_tables = {}
     expected_columns = None
     geometry_cache = {}
+    indirect_cache = {}
     source_hashes = {}
     for rank in model["ranks"]:
         original = {b["name"]: b for b in rank["buffers"]}
@@ -88,6 +145,20 @@ def build(plan, output, owners, capacity, rows, workers):
 
         def immutable(name):
             return any(k in original[name] for k in ("weight", "data", "prepared_weight"))
+
+        def runtime_buffer(name, family, size=None):
+            old = original[name]
+            if immutable(name):
+                return define(name, old["bytes"], old)
+            label = "batch." + family + "." + name
+            if label in definitions:
+                return define(label, definitions[label]["bytes"] if size is None else size)
+            size = old["bytes"] if size is None else size
+            if "view" in old and name.startswith("sequence."):
+                view = deepcopy(old["view"])
+                view["parent"] = runtime_buffer(view["parent"], family)
+                return define(label, size, dict(view=view))
+            return define(label, size)
 
         def binding(name, shape, dtype, *, family, source_rows, head=False, alignment=1):
             size = math.prod(shape) * SIZES[dtype]
@@ -133,6 +204,8 @@ def build(plan, output, owners, capacity, rows, workers):
                 if label not in private:
                     private.append(label)
             else:
+                if old and "view" in old and name.startswith("sequence."):
+                    return runtime_buffer(name, family, size)
                 # Row workspaces are independent allocations; dropping obsolete
                 # static views makes mixed-owner slices unambiguous.
                 define(label, size)
@@ -152,12 +225,15 @@ def build(plan, output, owners, capacity, rows, workers):
             if head and module_name == "topk" and name == "finalize":
                 parameters["output_count"] = 1
             old_rows = packet["rows"]
-            cap = owners if head else (owners if family == "decode" else rows)
+            packet_cap = owners if family == "decode" else rows
+            axis = step.get("row_expression")
+            source_rows = resolve(axis, old_rows) if axis else step.get("fixed_rows", old_rows)
+            cap = owners if head else (resolve(axis, packet_cap) if axis else packet_cap)
             dynamic = {}
             for key in ("rows", "tokens", "expert_rows"):
                 if key in parameters:
                     # Output head has its own row axis, independent of aggregate M.
-                    divisor = 1 if head else old_rows
+                    divisor = 1 if head else source_rows
                     if parameters[key] % divisor:
                         raise ValueError("Nonintegral row factor")
                     dynamic[key] = parameters[key] // divisor
@@ -170,6 +246,11 @@ def build(plan, output, owners, capacity, rows, workers):
             for key in ("capacity", "compressed_capacity", "table_rows", "length"):
                 if key not in dynamic and parameters.get(key) in (old_capacity, old_capacity // 2):
                     parameters[key] = parameters[key] * capacity // old_capacity
+            if module_name == "attention_fused" and name == "prefill":
+                # Re-evaluate the existing tile's alignment for the deployment
+                # context rather than retaining the source context's fallback.
+                if not parameters["compressed"] or (capacity // parameters["ratio"]) % 256 == 0:
+                    parameters["tile_k"] = 256
             if module_name == "topk" and name == "merge":
                 prior = "batch." + family + "." + step["buffers"][0]
                 parameters["sources"] = definitions[prior]["bytes"] // (cap * 1024 * 4)
@@ -219,13 +300,7 @@ def build(plan, output, owners, capacity, rows, workers):
                         family=family,
                         source_rows=old_rows,
                         head=head,
-                        alignment=alignment
-                        if (
-                            module_name == "attention_prefill"
-                            and name == "pv"
-                            and old_operand["access"] == "scratch"
-                        )
-                        else 1,
+                        alignment=alignment if (old_operand["access"] == "scratch") else 1,
                     )
                 )
             indirect_op = module_name.startswith(
@@ -240,6 +315,8 @@ def build(plan, output, owners, capacity, rows, workers):
                 specs=operands,
             )
             result = dict(op="kernel", buffers=bound)
+            if axis is not None and not head:
+                result["row_expression"] = axis
             if head:
                 result["owners"] = True
             if indirect_op:
@@ -286,14 +363,30 @@ def build(plan, output, owners, capacity, rows, workers):
                     )
                     aliases[port.name + "_owner"] = str(port.dtype)
                 # The final pointer table width is filled after every rank.
-                _, identities, grid = indirect(function, indices, owners, cap)
+                wrapper_key = (geometry_key, tuple(indices.items()))
+                if wrapper_key not in indirect_cache:
+                    _, identities, grid = indirect(function, indices, owners, cap)
+                    indirect_cache[wrapper_key] = identities, grid
+                identities, grid = indirect_cache[wrapper_key]
                 import hashlib
 
                 work_name = (
                     "batch.work."
-                    + hashlib.sha256(json.dumps(grid, sort_keys=True).encode()).hexdigest()[:16]
+                    + hashlib.sha256(
+                        json.dumps(
+                            [grid, step["owner_range"]] if "owner_range" in step else grid,
+                            sort_keys=True,
+                        ).encode()
+                    ).hexdigest()[:16]
                 )
                 work[work_name] = grid
+                if "owner_range" in step:
+                    work_ranges[work_name] = dict(
+                        min_rows=step["owner_range"][0],
+                        max_rows=packet_cap
+                        if step["owner_range"][1] == old_rows
+                        else step["owner_range"][1],
+                    )
                 define(work_name, 8192 * 2 * 4)
                 pointer_name = (
                     "batch.pointers."
@@ -345,10 +438,9 @@ def build(plan, output, owners, capacity, rows, workers):
             packet = deepcopy(source)
             packet.update(
                 rows=owners if family == "decode" else rows,
-                min_rows=1,
+                min_rows=1 if source.get("min_rows", 0) < 3 else source["min_rows"],
                 batch_decode=family == "decode",
             )
-            packet.pop("max_rows", None)
             packet["coordinates"] = {
                 k: ("batch." + family + "." + v if isinstance(v, str) else v)
                 for k, v in source["coordinates"].items()
@@ -387,6 +479,8 @@ def build(plan, output, owners, capacity, rows, workers):
                         steps.append(kernel(stub, source, family, custom=custom))
                 for step in source[part]:
                     if step["op"] == "kernel":
+                        if step.get("owner_range", [1])[0] > packet["rows"]:
+                            continue
                         op = source_spec(step)["op"]
                         if op == "memory.last_row":
                             continue
@@ -443,7 +537,7 @@ def build(plan, output, owners, capacity, rows, workers):
                                         * packet["rows"]
                                         // source["rows"]
                                     )
-                                    define("batch." + family + "." + old, size)
+                                    runtime_buffer(old, family, size)
                                 s[key] = old if immutable(old) else "batch." + family + "." + old
                         for key in ("buffers", "groups"):
                             names = s.get(key)
@@ -463,7 +557,7 @@ def build(plan, output, owners, capacity, rows, workers):
                                         if not old.endswith(".counts"):
                                             size = size * packet["rows"] // source["rows"]
                                     label = "batch." + family + "." + old
-                                    define(label, size)
+                                    runtime_buffer(old, family, size)
                                     mapped.append(label)
                             s[key] = mapped[0] if isinstance(names, str) else mapped
                         if s["op"] in ("gather", "reduce") and not s.get("fixed_rows"):
@@ -546,6 +640,7 @@ def build(plan, output, owners, capacity, rows, workers):
         active="batch.active",
         endpoints="batch.endpoints",
         work=work,
+        work_ranges=work_ranges,
     )
     print(
         f"Compile {len(tasks)} shared batch kernels; {len(columns)} pointer columns; {len(private)} private allocations/views",
@@ -579,18 +674,35 @@ def compile_contract(model, tasks, base, output, workers):
 
 
 def owner_geometry(port, cap):
+    from tilelang import tvm
+
     first, last = physical_shapes_single(port, 1), physical_shapes_single(port, cap)
     if first == last:
         return first, last, 0
     if first[1:] != last[1:]:
         return first, last, 1
+    variables = {}
+    extent = math.prod(port.shape)
+    tvm.tir.stmt_functor.post_order_visit(
+        extent, lambda n: variables.setdefault(n, n) if isinstance(n, tvm.tir.Var) else None
+    )
+    row = next(iter(variables)) if len(variables) == 1 else None
+    analyzer = tvm.arith.Analyzer()
     for alignment in (1, 2, 4, 8, 16, 32, 64, 128, 256):
         if cap % alignment:
             continue
-        factor = last[0] // cap
-        if factor > 0 and all(
-            physical_shapes_single(port, q)[0]
-            == ((q + alignment - 1) // alignment) * alignment * factor
+        volume = math.prod(last)
+        if (
+            volume % cap == 0
+            and row is not None
+            and analyzer.can_prove(
+                extent == ((row + alignment - 1) // alignment) * alignment * (volume // cap)
+            )
+        ):
+            return first, last, alignment
+        if volume % cap == 0 and all(
+            math.prod(physical_shapes_single(port, q))
+            == ((q + alignment - 1) // alignment) * alignment * (volume // cap)
             for q in range(1, cap + 1)
         ):
             return first, last, alignment
@@ -650,6 +762,10 @@ def main():
     p.add_argument("--capacity", type=int, default=4096)
     p.add_argument("--rows", type=int, default=2048)
     p.add_argument("--compile-workers", type=int, default=4)
+    p.add_argument("--sequence-parallel", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--shared-attention", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--reduce-scatter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--fused-attention", action=argparse.BooleanOptionalAction, default=True)
     a = p.parse_args()
     input_path = a.plan or a.rebuild_contract
     if (
@@ -670,7 +786,20 @@ def main():
             contract["model"], contract["tasks"], input_path.parent, a.output, a.compile_workers
         )
     else:
-        model = build(a.plan, a.output, a.owners, a.capacity, a.rows, a.compile_workers)
+        if a.reduce_scatter and not a.sequence_parallel:
+            p.error("ReduceScatter requires the shared sequence transform")
+        model = build(
+            a.plan,
+            a.output,
+            a.owners,
+            a.capacity,
+            a.rows,
+            a.compile_workers,
+            sequence_parallel=a.sequence_parallel,
+            shared_attention=a.shared_attention,
+            reduce_scatter=a.reduce_scatter,
+            fused_attention=a.fused_attention,
+        )
     if a.package_output:
         publish_package(model, input_path.parent, a.package_output)
 

@@ -2,6 +2,7 @@
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
+from copy import deepcopy
 import json
 import multiprocessing
 from pathlib import Path
@@ -16,6 +17,12 @@ def main():
     parser.add_argument("--tile-m", type=int, choices=[16, 32, 64], default=32)
     parser.add_argument("--tile-k", type=int, choices=[128, 256], default=128)
     parser.add_argument("--reuse-kv", action="store_true")
+    parser.add_argument(
+        "--owner-min-rows",
+        type=int,
+        default=0,
+        help="Keep the original chain below this owner-local query length",
+    )
     parser.add_argument(
         "--min-rows",
         type=int,
@@ -149,16 +156,24 @@ def main():
                         dynamic_arguments={"rows": 1},
                         placeholder=f"@fused_attention{len(tasks)}",
                     )
-                body.append(
-                    dict(
-                        op="kernel",
-                        manifest=tasks[key]["placeholder"],
-                        buffers=step["buffers"][:4]
-                        + softmax[0]["buffers"][2:4]
-                        + [pv["buffers"][4]]
-                        + [s[0] for s in scratch],
-                    )
+                if args.owner_min_rows:
+                    if not 2 <= args.owner_min_rows <= capacity:
+                        raise ValueError("Invalid owner attention selection boundary")
+                    for original in old[index : end + 1]:
+                        original = deepcopy(original)
+                        original["owner_range"] = [1, args.owner_min_rows - 1]
+                        body.append(original)
+                fused = dict(
+                    op="kernel",
+                    manifest=tasks[key]["placeholder"],
+                    buffers=step["buffers"][:4]
+                    + softmax[0]["buffers"][2:4]
+                    + [pv["buffers"][4]]
+                    + [s[0] for s in scratch],
                 )
+                if args.owner_min_rows:
+                    fused["owner_range"] = [args.owner_min_rows, capacity]
+                body.append(fused)
                 index, count = end + 1, count + 1
             if count not in (0, 40):
                 raise ValueError("The prefill packet does not cover 40 attention layers")

@@ -1,4 +1,31 @@
-use super::{Element, Instruction, Packet, bounded_rows, gather_element, validate_dispatch};
+use super::{
+    Element, Instruction, Packet, bounded_rows, gather_element, validate_dispatch,
+    validate_row_ranges,
+};
+
+#[test]
+fn owner_batch_ranges_share_dispatch_validation_from_one_through_capacity() {
+    let short = packet(2048, 1, Some(511));
+    let long = packet(2048, 512, None);
+    validate_row_ranges(&[&short, &long], 1, Some(2048)).unwrap();
+    for q in 1..=2048 {
+        assert_eq!(
+            [&short, &long]
+                .iter()
+                .filter(|p| p.min_rows <= q && q <= p.dispatch_max())
+                .count(),
+            1
+        );
+    }
+    for invalid in [
+        packet(2048, 513, None),
+        packet(2048, 511, None),
+        packet(2048, 512, Some(2047)),
+        packet(1024, 512, None),
+    ] {
+        assert!(validate_row_ranges(&[&short, &invalid], 1, Some(2048)).is_err());
+    }
+}
 
 #[test]
 fn compacted_suffix_rows_keep_short_packets_and_reject_invalid_extents() {

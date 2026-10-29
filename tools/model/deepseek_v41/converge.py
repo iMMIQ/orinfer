@@ -323,6 +323,25 @@ def publish_package(model, base, destination):
     return len(assets)
 
 
+def run_transform(module, source, output, workers, options=()):
+    """Compose the existing offline transforms without another compiler path."""
+    previous = sys.argv
+    try:
+        sys.argv = [
+            module,
+            "--plan",
+            str(source),
+            "--output",
+            str(output),
+            "--compile-workers",
+            str(workers),
+            *options,
+        ]
+        importlib.import_module("tools.model.deepseek_v41." + module).main()
+    finally:
+        sys.argv = previous
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
@@ -381,21 +400,7 @@ def main():
     def run(module, options):
         nonlocal current
         output = prefix.with_name(prefix.name + f"-{len(stages)}.json")
-        previous = sys.argv
-        try:
-            sys.argv = [
-                module,
-                "--plan",
-                str(current),
-                "--output",
-                str(output),
-                "--compile-workers",
-                str(args.compile_workers),
-                *options,
-            ]
-            importlib.import_module("tools.model.deepseek_v41." + module).main()
-        finally:
-            sys.argv = previous
+        run_transform(module, current, output, args.compile_workers, options)
         stages.append(dict(stage=module, sha256=file_hash(output)))
         current = output
 

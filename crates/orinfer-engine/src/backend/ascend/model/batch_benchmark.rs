@@ -30,6 +30,8 @@ struct Case {
     decode_steps: usize,
     #[serde(default)]
     compare_serial: bool,
+    #[serde(default)]
+    compare_whole_prompt: bool,
     #[serde(default = "one")]
     repeats: usize,
 }
@@ -217,7 +219,7 @@ fn forward(
     }
     Ok((outputs, start.elapsed().as_secs_f64(), preparation))
 }
-fn plan_frames(requests: &[Request], budget: usize) -> Result<Vec<Frame>> {
+fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<Vec<Frame>> {
     if requests.is_empty()
         || budget < requests.len()
         || requests.iter().any(|r| r.tokens.is_empty())
@@ -232,11 +234,64 @@ fn plan_frames(requests: &[Request], budget: usize) -> Result<Vec<Frame>> {
     }
     let mut positions = vec![0; requests.len()];
     let mut frames = vec![];
+    let mut cursor = 0;
     while positions
         .iter()
         .zip(requests)
         .any(|(&p, r)| p < r.tokens.len())
     {
+        if preferred > 1 {
+            let mut remaining = budget;
+            let mut selected = vec![];
+            for step in 0..requests.len() {
+                let i = (cursor + step) % requests.len();
+                let left = requests[i].tokens.len() - positions[i];
+                if left == 0 {
+                    continue;
+                }
+                let count = left.min(preferred).min(budget);
+                if count <= remaining {
+                    selected.push((i, count));
+                    remaining -= count;
+                }
+            }
+            while remaining > 0 {
+                let mut active = selected
+                    .iter()
+                    .filter(|(i, n)| positions[*i] + *n < requests[*i].tokens.len())
+                    .count();
+                if active == 0 {
+                    break;
+                }
+                for (i, n) in &mut selected {
+                    let left = requests[*i].tokens.len() - positions[*i] - *n;
+                    if left == 0 {
+                        continue;
+                    }
+                    let count = left.min(remaining.div_ceil(active));
+                    *n += count;
+                    remaining -= count;
+                    active -= 1;
+                }
+            }
+            cursor = (selected.last().ok_or("Empty prefill selection")?.0 + 1) % requests.len();
+            let mut rows = vec![];
+            for (i, count) in selected {
+                let r = &requests[i];
+                let end = positions[i] + count;
+                rows.push(Request {
+                    owner: r.owner,
+                    tokens: r.tokens[positions[i]..end].to_vec(),
+                    output: end == r.tokens.len(),
+                });
+                positions[i] = end;
+            }
+            frames.push(Frame {
+                decode: false,
+                requests: rows,
+            });
+            continue;
+        }
         let mut active = positions
             .iter()
             .zip(requests)
@@ -320,6 +375,13 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
         .as_ref()
         .ok_or("bench-ascend-batch requires a native batch plan")?;
     let owners = contract.owners;
+    let preferred = contract
+        .work_ranges
+        .values()
+        .map(|r| r.min_rows)
+        .filter(|&n| n > 1)
+        .min()
+        .unwrap_or(1);
     let capacity = model.ranks[0]
         .packets
         .iter()
@@ -339,6 +401,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
             case.frames = plan_frames(
                 &case.requests,
                 case.chunk_tokens.unwrap_or(capacity).min(capacity),
+                preferred,
             )?;
         }
         if case.frames.is_empty() || case.repeats == 0 {
@@ -511,6 +574,26 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                             owners,
                             case.compare_serial && repeat == 0,
                         )?;
+                        if repeat == 0
+                            && case.compare_serial
+                            && let Some(directory) = std::env::var_os("ORINFER_A2_BATCH_LOGITS_DIR")
+                        {
+                            let directory = Path::new(&directory).join(&case.name);
+                            std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+                            for value in &out {
+                                let bytes = value
+                                    .logits
+                                    .iter()
+                                    .flat_map(|v| v.to_le_bytes())
+                                    .collect::<Vec<_>>();
+                                std::fs::write(
+                                    directory
+                                        .join(format!("frame{index}-owner{}.f32", value.owner)),
+                                    bytes,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            }
+                        }
                         preparation_s += prepare;
                         if index < case.frames.len() {
                             prefill_s += elapsed;
@@ -553,6 +636,40 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                             let mut serial = vec![vec![]; frames.len()];
                             for &owner in ids.iter().rev() {
                                 exchange(&peers, Command::Admit(vec![owner]))?;
+                                if case.compare_whole_prompt && !case.requests.is_empty() {
+                                    let request =
+                                        case.requests.iter().find(|r| r.owner == owner).unwrap();
+                                    let last = case
+                                        .frames
+                                        .iter()
+                                        .rposition(|f| f.requests.iter().any(|r| r.owner == owner))
+                                        .unwrap();
+                                    for frame in
+                                        plan_frames(std::slice::from_ref(request), capacity, 1)?
+                                    {
+                                        let (out, _, _) =
+                                            forward(&peers, &frame, capacity, owners, true)?;
+                                        serial[last].extend(out);
+                                    }
+                                    for (index, frame) in
+                                        frames.iter().enumerate().skip(case.frames.len())
+                                    {
+                                        let one = Frame {
+                                            decode: frame.decode,
+                                            requests: frame
+                                                .requests
+                                                .iter()
+                                                .filter(|r| r.owner == owner)
+                                                .cloned()
+                                                .collect(),
+                                        };
+                                        let (out, _, _) =
+                                            forward(&peers, &one, owners, owners, true)?;
+                                        serial[index].extend(out);
+                                    }
+                                    exchange(&peers, Command::Release)?;
+                                    continue;
+                                }
                                 for (index, frame) in frames.iter().enumerate() {
                                     let f = Frame {
                                         decode: frame.decode,
@@ -701,6 +818,44 @@ mod tests {
         }
     }
     #[test]
+    fn model_chunk_quantum_fills_packets_without_short_long_request_tails() {
+        for batch in [1, 2, 3, 4, 5, 8, 16, 31, 64, 127, 128] {
+            let requests = (0..batch)
+                .map(|i| Request {
+                    owner: i * 17 + 9,
+                    tokens: vec![i as u32; 2048],
+                    output: false,
+                })
+                .collect::<Vec<_>>();
+            let frames = plan_frames(&requests, 2048, 512).unwrap();
+            assert_eq!(frames.len(), batch);
+            for frame in &frames {
+                assert_eq!(
+                    frame.requests.iter().map(|r| r.tokens.len()).sum::<usize>(),
+                    2048
+                );
+                assert!(frame.requests.iter().all(|r| r.tokens.len() >= 512));
+            }
+            for r in &requests {
+                let parts = frames
+                    .iter()
+                    .flat_map(|f| &f.requests)
+                    .filter(|p| p.owner == r.owner)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    parts
+                        .iter()
+                        .flat_map(|p| &p.tokens)
+                        .copied()
+                        .collect::<Vec<_>>(),
+                    r.tokens
+                );
+                assert!(parts.last().unwrap().output);
+                assert!(parts[..parts.len() - 1].iter().all(|p| !p.output));
+            }
+        }
+    }
+    #[test]
     fn unequal_requests_keep_identity_and_exact_tokens_across_chunks() {
         let requests = [
             Request {
@@ -719,7 +874,7 @@ mod tests {
                 output: false,
             },
         ];
-        let frames = plan_frames(&requests, 11).unwrap();
+        let frames = plan_frames(&requests, 11, 1).unwrap();
         for frame in &frames {
             assert!(frame.requests.iter().map(|r| r.tokens.len()).sum::<usize>() <= 11);
             assert!(frame.requests.iter().all(|r| !r.tokens.is_empty()));
@@ -738,6 +893,6 @@ mod tests {
             assert!(segments.last().unwrap().output);
             assert!(segments[..segments.len() - 1].iter().all(|r| !r.output));
         }
-        assert!(plan_frames(&requests, 2).is_err());
+        assert!(plan_frames(&requests, 2, 1).is_err());
     }
 }

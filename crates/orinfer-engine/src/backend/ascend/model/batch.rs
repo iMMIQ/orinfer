@@ -6,7 +6,7 @@ use orinfer_model_sdk::{
 };
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     rc::Rc,
 };
 
@@ -28,6 +28,14 @@ pub(super) struct Contract {
     pub active: String,
     pub endpoints: String,
     pub work: BTreeMap<String, RowExpression>,
+    #[serde(default)]
+    pub work_ranges: BTreeMap<String, WorkRange>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorkRange {
+    pub min_rows: usize,
+    pub max_rows: usize,
 }
 #[derive(Deserialize)]
 pub(super) struct Access {
@@ -50,15 +58,45 @@ pub(super) struct Runtime {
     cache: BTreeMap<Key, Rc<Execution>>,
     lru: VecDeque<Key>,
     capacity: usize,
+    tables: BTreeMap<(bool, usize), TableUse>,
+}
+struct TableUse {
+    pointers: BTreeSet<String>,
+    work: BTreeSet<String>,
+    columns: Vec<bool>,
 }
 impl Runtime {
-    pub fn new(contract: Contract, capacity: usize) -> Self {
+    pub fn new(contract: Contract, capacity: usize, packets: &[super::Packet]) -> Self {
+        let mut tables = BTreeMap::new();
+        for packet in packets {
+            let mut used = TableUse {
+                pointers: BTreeSet::new(),
+                work: BTreeSet::new(),
+                columns: vec![false; contract.columns.len()],
+            };
+            for step in packet.body.iter().chain(&packet.head) {
+                if let Instruction::Kernel {
+                    owner_work: Some(_),
+                    buffers,
+                    ..
+                } = step
+                {
+                    used.work.insert(buffers[0].clone());
+                    used.pointers.insert(buffers[1].clone());
+                    for &column in &contract.pointers[&buffers[1]] {
+                        used.columns[column] = true;
+                    }
+                }
+            }
+            tables.insert((packet.batch_decode, packet.min_rows), used);
+        }
         Self {
             contract,
             owners: BTreeMap::new(),
             cache: BTreeMap::new(),
             lru: VecDeque::new(),
             capacity,
+            tables,
         }
     }
 }
@@ -101,14 +139,24 @@ impl Layout {
         }
     }
 }
-pub(super) fn work_items(layout: &Layout, grid: &RowExpression) -> Result<Vec<[i32; 2]>> {
+pub(super) fn work_items(
+    layout: &Layout,
+    grid: &RowExpression,
+    range: Option<&WorkRange>,
+) -> Result<Vec<[i32; 2]>> {
     let mut out = vec![];
     for (owner, segment) in layout.segments.iter().enumerate() {
+        if range.is_some_and(|r| segment.tokens < r.min_rows || segment.tokens > r.max_rows) {
+            continue;
+        }
         for block in 0..grid.resolve(segment.tokens)?.min(64) {
             out.push([owner as i32, block as i32]);
         }
     }
-    if out.is_empty() || out.len() > 8192 {
+    if out.is_empty() {
+        return Ok(vec![[-1, 0], [-1, 0]]);
+    }
+    if out.len() > 8192 {
         return Err("Owner work table exceeds its capacity".into());
     }
     if out.len() % 2 != 0 {
@@ -277,7 +325,11 @@ impl Worker {
             let packet = self
                 .packet_templates
                 .iter()
-                .find(|p| p.batch_decode == layout.decode)
+                .find(|p| {
+                    p.batch_decode == layout.decode
+                        && p.min_rows <= layout.rows.total
+                        && layout.rows.total <= p.dispatch_max()
+                })
                 .cloned()
                 .ok_or("Missing batch family")?;
             // Every indirect state access checks this stream-ordered word.
@@ -287,7 +339,7 @@ impl Worker {
                 &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
                 &0i32.to_le_bytes(),
             )?;
-            self.update_batch_tables(layout)?;
+            self.update_batch_tables(layout, &packet)?;
             if layout.rows.total > packet.rows {
                 return Err("Batch exceeds its family row capacity".into());
             }
@@ -326,8 +378,32 @@ impl Worker {
         self.w4.retain(|_, w| w.strong_count() > 0);
         Ok(())
     }
-    fn update_batch_tables(&self, layout: &Layout) -> Result<Vec<Buffer>> {
+    fn update_batch_tables(&self, layout: &Layout, packet: &super::Packet) -> Result<Vec<Buffer>> {
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+        let used = runtime
+            .tables
+            .get(&(packet.batch_decode, packet.min_rows))
+            .ok_or("Missing packet table usage")?;
+        let mut aligned = BTreeMap::new();
+        aligned.insert(1, layout.rows.clone());
+        for (index, column) in runtime.contract.columns.iter().enumerate() {
+            let alignment = column.row_alignment;
+            if used.columns[index]
+                && column.row_bytes.is_some()
+                && !aligned.contains_key(&alignment)
+            {
+                aligned.insert(
+                    alignment,
+                    Rows::new(
+                        layout
+                            .segments
+                            .iter()
+                            .map(|s| s.tokens.div_ceil(alignment) * alignment),
+                        layout.rows.total + layout.segments.len() * (alignment - 1),
+                    )?,
+                );
+            }
+        }
         let mut values = Vec::new();
         let mut retained = vec![];
         for (lane, segment) in layout.segments.iter().enumerate() {
@@ -336,31 +412,27 @@ impl Worker {
                 .get(&segment.slot)
                 .ok_or("Owner must be admitted before capture")?;
             values.extend_from_slice(&(segment.tokens as u64).to_le_bytes());
-            for column in &runtime.contract.columns {
-                let buffer = if column.decode.is_some_and(|d| d != layout.decode) {
-                    None
-                } else if let Some(stride) = column.row_bytes {
-                    Some(
-                        get(&self.buffers, &column.buffer)?.slice(
-                            layout.segments[..lane]
-                                .iter()
-                                .map(|s| {
-                                    s.tokens.div_ceil(column.row_alignment) * column.row_alignment
-                                })
-                                .sum::<usize>()
-                                .checked_mul(stride)
-                                .ok_or("Owner offset overflow")?,
-                            segment
-                                .tokens
-                                .div_ceil(column.row_alignment)
-                                .checked_mul(column.row_alignment)
-                                .and_then(|q| q.checked_mul(stride))
-                                .ok_or("Owner span overflow")?,
-                        )?,
-                    )
-                } else {
-                    Some(get(&owner.buffers, &column.buffer)?)
-                };
+            for (index, column) in runtime.contract.columns.iter().enumerate() {
+                let buffer =
+                    if !used.columns[index] || column.decode.is_some_and(|d| d != layout.decode) {
+                        None
+                    } else if let Some(stride) = column.row_bytes {
+                        Some(
+                            get(&self.buffers, &column.buffer)?.slice(
+                                aligned[&column.row_alignment].starts[lane]
+                                    .checked_mul(stride)
+                                    .ok_or("Owner offset overflow")?,
+                                segment
+                                    .tokens
+                                    .div_ceil(column.row_alignment)
+                                    .checked_mul(column.row_alignment)
+                                    .and_then(|q| q.checked_mul(stride))
+                                    .ok_or("Owner span overflow")?,
+                            )?,
+                        )
+                    } else {
+                        Some(get(&owner.buffers, &column.buffer)?)
+                    };
                 let address = buffer.as_ref().map_or(0, |b| b.pointer() as usize as u64);
                 values.extend_from_slice(&address.to_le_bytes());
                 if let Some(buffer) = buffer {
@@ -371,7 +443,8 @@ impl Worker {
         let width = runtime.contract.columns.len() + 1;
         let addresses = values.as_chunks::<8>().0;
         let mut inputs = vec![];
-        for (name, mapping) in &runtime.contract.pointers {
+        for name in &used.pointers {
+            let mapping = &runtime.contract.pointers[name];
             if mapping.iter().any(|&c| {
                 runtime.contract.columns[c]
                     .decode
@@ -388,8 +461,9 @@ impl Worker {
             }
             inputs.push((get(&self.buffers, name)?.slice(0, data.len())?, data));
         }
-        for (name, grid) in &runtime.contract.work {
-            let data = work_items(layout, grid)?
+        for name in &used.work {
+            let grid = &runtime.contract.work[name];
+            let data = work_items(layout, grid, runtime.contract.work_ranges.get(name))?
                 .iter()
                 .flat_map(|p| p.iter().flat_map(|x| x.to_le_bytes()))
                 .collect::<Vec<_>>();
@@ -449,7 +523,7 @@ impl Worker {
                 .get(&layout.key())
                 .ok_or("Batch must be prepared before forward")?,
         );
-        let retained = self.update_batch_tables(layout)?;
+        let retained = self.update_batch_tables(layout, &execution.packet)?;
         let mut joined = vec![];
         let mut hashes = vec![];
         let mut valid = vec![];
@@ -583,7 +657,7 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
     let Some(c) = &model.batch else { return Ok(()) };
     if !(1..=128).contains(&c.owners)
         || c.columns.is_empty()
-        || model.ranks.iter().any(|r| r.packets.len() != 2)
+        || model.ranks.iter().any(|r| r.packets.len() < 2)
     {
         return Err("Invalid batch contract".into());
     }
@@ -631,10 +705,17 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             parents.insert(name.clone());
         }
         if rank.packets.iter().filter(|p| p.batch_decode).count() != 1
-            || rank.packets.iter().filter(|p| !p.batch_decode).count() != 1
+            || rank.packets.iter().all(|p| p.batch_decode)
         {
-            return Err("Batch requires one family per role".into());
+            return Err("Batch requires one decode and complete prefill dispatch".into());
         }
+        let prefill = rank
+            .packets
+            .iter()
+            .filter(|p| !p.batch_decode)
+            .collect::<Vec<_>>();
+        let capacity = prefill[0].rows;
+        super::validate_row_ranges(&prefill, 1, Some(capacity))?;
         for column in &c.columns {
             match (column.row_bytes, column.decode) {
                 (None, None) => {}
@@ -661,6 +742,14 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             }
             grid.resolve(1)?;
         }
+        if c.work_ranges.iter().any(|(name, r)| {
+            !c.work.contains_key(name)
+                || r.min_rows == 0
+                || r.min_rows > r.max_rows
+                || r.max_rows > 4096
+        }) {
+            return Err("Invalid owner-local work selection".into());
+        }
         if buffers.get(c.endpoints.as_str()).map(|b| b.bytes) != Some(c.owners * 4) {
             return Err("Invalid owner output endpoints".into());
         }
@@ -677,8 +766,9 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             }
         }
         for p in &rank.packets {
-            if p.min_rows != 1
-                || p.max_rows.is_some()
+            if p.min_rows == 0
+                || p.min_rows > p.dispatch_max()
+                || p.dispatch_max() > p.rows
                 || (p.batch_decode && p.rows != c.owners)
                 || p.reset.iter().any(|n| !unique.contains(n))
             {
@@ -723,7 +813,7 @@ mod tests {
             let lengths = (0..batch).map(|i| 1 + i % 31).collect::<Vec<_>>();
             let ids = (0..batch).map(|i| i * 17 + 9).collect::<Vec<_>>();
             let l = layout(&lengths, &ids).unwrap();
-            let work = work_items(&l, &grid).unwrap();
+            let work = work_items(&l, &grid, None).unwrap();
             assert_eq!(work.len() % 2, 0);
             for (owner, &q) in lengths.iter().enumerate() {
                 let physical = work
@@ -740,6 +830,29 @@ mod tests {
                 assert_eq!(logical, (0..3 * q).collect::<Vec<_>>());
             }
         }
+    }
+    #[test]
+    fn owner_work_selection_keeps_query_policy_across_mixed_packets() {
+        let grid: RowExpression = serde_json::from_value(serde_json::json!({"op":"rows"})).unwrap();
+        let mixed = layout(&[1, 511, 512, 513], &[91, 8, 44, 7]).unwrap();
+        let short = WorkRange {
+            min_rows: 1,
+            max_rows: 511,
+        };
+        let long = WorkRange {
+            min_rows: 512,
+            max_rows: 4096,
+        };
+        let a = work_items(&mixed, &grid, Some(&short)).unwrap();
+        let b = work_items(&mixed, &grid, Some(&long)).unwrap();
+        assert!(a.iter().all(|p| p[0] < 2));
+        assert!(b.iter().all(|p| p[0] >= 2));
+        let one = layout(&[511], &[99]).unwrap();
+        assert_eq!(
+            work_items(&one, &grid, Some(&long)).unwrap(),
+            [[-1, 0], [-1, 0]]
+        );
+        assert_eq!(work_items(&one, &grid, Some(&short)).unwrap().len(), 64);
     }
     #[test]
     fn graph_identity_follows_shape_and_role_not_owner_order() {
