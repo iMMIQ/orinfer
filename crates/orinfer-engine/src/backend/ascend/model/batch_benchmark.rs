@@ -94,6 +94,24 @@ struct Preparation {
     first_prefill_s: f64,
     first_decode_s: f64,
 }
+#[derive(Default)]
+struct Timings {
+    prefill_s: f64,
+    decode_s: f64,
+    input_tokens: usize,
+    decode_tokens: usize,
+}
+impl Timings {
+    fn record(&mut self, frame: &Frame, outputs: usize, seconds: f64) {
+        if frame.decode {
+            self.decode_s += seconds;
+            self.decode_tokens += outputs;
+        } else {
+            self.prefill_s += seconds;
+            self.input_tokens += frame.requests.iter().map(|r| r.tokens.len()).sum::<usize>();
+        }
+    }
+}
 #[derive(Serialize)]
 struct Comparison {
     positions: usize,
@@ -385,10 +403,8 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                 let reset = Instant::now();
                 team.exchange(Command::Reset(ids.clone()))?;
                 let reset_s = reset.elapsed().as_secs_f64();
-                let mut prefill_s = 0.;
-                let mut decode_s = 0.;
+                let mut timings = Timings::default();
                 let mut preparation_s = 0.;
-                let mut input_tokens = 0;
                 let mut outputs = vec![];
                 let mut frames = case.frames.clone();
                 let mut last_outputs = std::collections::BTreeMap::<usize, Output>::new();
@@ -421,12 +437,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                         }
                     }
                     preparation_s += prepare;
-                    if index < case.frames.len() {
-                        prefill_s += elapsed;
-                        input_tokens += f.requests.iter().map(|r| r.tokens.len()).sum::<usize>();
-                    } else {
-                        decode_s += elapsed;
-                    }
+                    timings.record(f, out.len(), elapsed);
                     for output in &out {
                         last_outputs.insert(output.owner, output.clone());
                     }
@@ -447,6 +458,12 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                     }
                     outputs.push(out);
                 }
+                let Timings {
+                    prefill_s,
+                    decode_s,
+                    input_tokens,
+                    decode_tokens,
+                } = timings;
                 if repeat == 0 {
                     preparations.push(Preparation {
                         name: case.name.clone(),
@@ -539,11 +556,6 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                     }
                     continue;
                 }
-                let decode_tokens = outputs
-                    .iter()
-                    .skip(case.frames.len())
-                    .map(Vec::len)
-                    .sum::<usize>();
                 measurements.push(Measurement {
                     name: case.name.clone(),
                     repeat: repeat - 1,
@@ -588,6 +600,25 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_teacher_decode_frames_keep_their_phase_and_output_count() {
+        let case: Case = serde_json::from_value(serde_json::json!({
+            "name": "teacher", "frames": [
+                {"requests":[{"owner":17,"tokens":[1,2,3],"output":true}]},
+                {"decode":true,"requests":[{"owner":17,"tokens":[7],"output":true}]},
+                {"decode":true,"requests":[{"owner":17,"tokens":[9]}]}
+            ]
+        }))
+        .unwrap();
+        let mut times = Timings::default();
+        for (frame, (outputs, seconds)) in case.frames.iter().zip([(1, 1.), (1, 0.2), (0, 0.3)]) {
+            times.record(frame, outputs, seconds);
+        }
+        assert_eq!(times.input_tokens, 3);
+        assert_eq!(times.prefill_s, 1.);
+        assert_eq!(times.decode_s, 0.5);
+        assert_eq!(times.decode_tokens, 1);
+    }
     #[test]
     fn model_chunk_quantum_fills_packets_without_short_long_request_tails() {
         for batch in [1, 2, 3, 4, 5, 8, 16, 31, 64, 127, 128] {
