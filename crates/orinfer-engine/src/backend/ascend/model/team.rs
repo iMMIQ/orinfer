@@ -1,0 +1,524 @@
+//! Thread-affine TP workers shared by benchmarks and continuous generation.
+use super::super::{
+    hccl::RootInfo,
+    runtime::{Limits, Session},
+};
+use super::{Model, SharedTables, Worker, affinity, batch::Layout, load_spec};
+use crate::artifact::Result;
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{Arc, mpsc},
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone)]
+pub(super) enum Command {
+    Admit(Vec<usize>),
+    Reset(Vec<usize>),
+    Release(Option<usize>),
+    Cached(Layout),
+    Invalidate(Layout),
+    Prepare(Layout),
+    Forward(Layout, Vec<Vec<u32>>, bool),
+    Save { owner: usize, snapshot: u64 },
+    Restore { owner: usize, snapshot: u64 },
+    Evict(u64),
+    Memory,
+    Stop,
+}
+pub(super) enum Reply {
+    Ready,
+    Cached(bool),
+    Outputs(Vec<Output>),
+    Bytes(usize),
+}
+#[derive(Clone)]
+pub(super) struct Output {
+    pub owner: usize,
+    pub token: u32,
+    pub value: f32,
+    pub logits: Vec<f32>,
+}
+struct Peer {
+    send: mpsc::Sender<Command>,
+    receive: mpsc::Receiver<Result<Reply>>,
+}
+pub(super) struct Team {
+    peers: Vec<Peer>,
+    handles: Vec<JoinHandle<()>>,
+    pub model: Arc<Model>,
+    pub load_s: f64,
+    pub rows: usize,
+    pub owner_bytes: usize,
+    // Drop worker contexts and communication groups before the bootstrap context.
+    _bootstrap: Session,
+}
+impl Team {
+    pub fn load(plan: &Path, model_dir: &Path) -> Result<Self> {
+        let model_dir = model_dir
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let (mut model, package, layout) = load_spec(plan, &model_dir)?;
+        if model.batch.is_none() {
+            return Err("A2 service requires a native rows plan".into());
+        }
+        let private = &model.batch.as_ref().unwrap().private;
+        let owner_bytes = model.ranks[0]
+            .buffers
+            .iter()
+            .filter(|b| private.contains(&b.name) && b.view.is_none())
+            .map(|b| b.bytes)
+            .sum();
+        let rows = model.ranks[0]
+            .packets
+            .iter()
+            .filter(|p| !p.batch_decode)
+            .map(|p| p.rows)
+            .max()
+            .ok_or("Missing A2 prefill rows")?;
+        let ranks = std::mem::take(&mut model.ranks);
+        let cpus = affinity::from_env(ranks.len())?;
+        let started = Instant::now();
+        let bootstrap = Session::new(0, Limits::default())?;
+        let root = RootInfo::new(&bootstrap, ranks.len() as u32)?;
+        let shared = Arc::new(SharedTables::new());
+        let model = Arc::new(model);
+        let mut team = Self {
+            peers: vec![],
+            handles: vec![],
+            model: Arc::clone(&model),
+            load_s: 0.,
+            rows,
+            owner_bytes,
+            _bootstrap: bootstrap,
+        };
+        for rank in ranks {
+            let cpus = cpus.as_ref().map(|v| v[rank.rank as usize].clone());
+            let root = root.clone();
+            let shared = Arc::clone(&shared);
+            let model = Arc::clone(&model);
+            let package = package.clone();
+            let layout = layout.clone();
+            let model_dir = model_dir.to_owned();
+            let (send, commands) = mpsc::channel();
+            let (reply, receive) = mpsc::channel();
+            let index = rank.rank;
+            let handle = std::thread::Builder::new()
+                .name(format!("orinfer-a2-{index}"))
+                .spawn(move || {
+                    let result = (|| {
+                        if let Some(cpus) = cpus.as_deref() {
+                            affinity::apply(cpus)?;
+                        }
+                        Worker::load(
+                            Session::new(
+                                index,
+                                Limits {
+                                    device_bytes: 58 << 30,
+                                    pinned_bytes: 64 << 20,
+                                    timeout_ms: 30000,
+                                },
+                            )?,
+                            &root,
+                            rank,
+                            &model,
+                            &model_dir,
+                            &package,
+                            layout,
+                            false,
+                            &shared,
+                        )
+                    })();
+                    let mut worker = match result {
+                        Ok(worker) => worker,
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                            return;
+                        }
+                    };
+                    if reply.send(Ok(Reply::Ready)).is_err() {
+                        return;
+                    }
+                    let mut snapshots = BTreeMap::new();
+                    while let Ok(command) = commands.recv() {
+                        let result = match command {
+                            Command::Stop => break,
+                            Command::Admit(ids) => worker.admit(&ids).map(|_| Reply::Ready),
+                            Command::Reset(ids) => ids
+                                .into_iter()
+                                .try_for_each(|id| worker.reset_owner(id))
+                                .map(|_| Reply::Ready),
+                            Command::Release(None) => worker.release_owners().map(|_| Reply::Ready),
+                            Command::Release(Some(owner)) => {
+                                worker.release_owner(owner).map(|_| Reply::Ready)
+                            }
+                            Command::Cached(layout) => {
+                                worker.batch_cached(&layout).map(Reply::Cached)
+                            }
+                            Command::Invalidate(layout) => {
+                                worker.invalidate_batch(&layout).map(|_| Reply::Ready)
+                            }
+                            Command::Prepare(layout) => {
+                                worker.prepare_batch(&layout).map(|_| Reply::Ready)
+                            }
+                            Command::Forward(layout, tokens, full) => {
+                                worker.forward_batch(&layout, &tokens, full).map(|values| {
+                                    Reply::Outputs(
+                                        values
+                                            .into_iter()
+                                            .map(|(owner, best, logits)| Output {
+                                                owner,
+                                                token: best.token,
+                                                value: best.value,
+                                                logits,
+                                            })
+                                            .collect(),
+                                    )
+                                })
+                            }
+                            Command::Save { owner, snapshot } => {
+                                worker.save_owner(owner).map(|saved| {
+                                    let bytes = saved.bytes();
+                                    snapshots.insert(snapshot, saved);
+                                    Reply::Bytes(bytes)
+                                })
+                            }
+                            Command::Restore { owner, snapshot } => snapshots
+                                .get(&snapshot)
+                                .ok_or_else(|| "Missing A2 prefix snapshot".into())
+                                .and_then(|saved| worker.restore_owner(owner, saved))
+                                .map(|_| Reply::Ready),
+                            Command::Evict(snapshot) => {
+                                snapshots.remove(&snapshot);
+                                Ok(Reply::Ready)
+                            }
+                            Command::Memory => worker
+                                .session
+                                .memory_info()
+                                .map(|(free, _)| Reply::Bytes(free)),
+                        };
+                        let failed = result.is_err();
+                        if let Err(error) = &result {
+                            eprintln!("A2 rank {index}: {error}");
+                        }
+                        if reply.send(result).is_err() || failed {
+                            break;
+                        }
+                    }
+                    let _ = worker.session.synchronize();
+                })
+                .map_err(|error| error.to_string())?;
+            team.handles.push(handle);
+            team.peers.push(Peer { send, receive });
+        }
+        for peer in &team.peers {
+            peer.receive
+                .recv_timeout(Duration::from_secs(1800))
+                .map_err(|error| format!("A2 load: {error}"))??;
+        }
+        team.load_s = started.elapsed().as_secs_f64();
+        Ok(team)
+    }
+    pub fn exchange(&self, command: Command) -> Result<Vec<Reply>> {
+        exchange(&self.peers, command)
+    }
+    pub fn forward(
+        &self,
+        layout: Layout,
+        tokens: Vec<Vec<u32>>,
+        full: bool,
+    ) -> Result<(Vec<Output>, f64, f64)> {
+        forward(&self.peers, layout, tokens, full)
+    }
+    pub fn forward_with(
+        &self,
+        layout: Layout,
+        tokens: Vec<Vec<u32>>,
+        full: bool,
+        maintenance: impl FnOnce(),
+    ) -> Result<(Vec<Output>, f64, f64)> {
+        forward_with(&self.peers, layout, tokens, full, maintenance)
+    }
+    pub fn minimum_bytes(&self, command: Command) -> Result<usize> {
+        self.bytes(command, false)
+    }
+    pub fn maximum_bytes(&self, command: Command) -> Result<usize> {
+        self.bytes(command, true)
+    }
+    fn bytes(&self, command: Command, maximum: bool) -> Result<usize> {
+        self.exchange(command)?
+            .into_iter()
+            .map(|reply| match reply {
+                Reply::Bytes(bytes) => Ok(bytes),
+                _ => Err("Invalid A2 byte reply".into()),
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .reduce(|a, b| if maximum { a.max(b) } else { a.min(b) })
+            .ok_or_else(|| "Empty A2 team".into())
+    }
+}
+impl Drop for Team {
+    fn drop(&mut self) {
+        for peer in &self.peers {
+            let _ = peer.send.send(Command::Stop);
+        }
+        for handle in self.handles.drain(..) {
+            if handle.join().is_err() {
+                eprintln!("A2 worker panicked during teardown");
+            }
+        }
+    }
+}
+
+fn exchange(peers: &[Peer], command: Command) -> Result<Vec<Reply>> {
+    for peer in peers {
+        peer.send
+            .send(command.clone())
+            .map_err(|error| error.to_string())?;
+    }
+    let results = peers
+        .iter()
+        .map(|peer| {
+            peer.receive
+                .recv_timeout(Duration::from_secs(1800))
+                .map_err(|error| format!("A2 worker: {error}"))?
+        })
+        .collect::<Vec<_>>();
+    results.into_iter().collect()
+}
+
+fn forward(
+    peers: &[Peer],
+    layout: Layout,
+    tokens: Vec<Vec<u32>>,
+    full: bool,
+) -> Result<(Vec<Output>, f64, f64)> {
+    forward_with(peers, layout, tokens, full, || {})
+}
+fn forward_with(
+    peers: &[Peer],
+    layout: Layout,
+    tokens: Vec<Vec<u32>>,
+    full: bool,
+    maintenance: impl FnOnce(),
+) -> Result<(Vec<Output>, f64, f64)> {
+    let started = Instant::now();
+    let cached = exchange(peers, Command::Cached(layout.clone()))?;
+    if !cached
+        .iter()
+        .all(|reply| matches!(reply, Reply::Cached(true)))
+    {
+        exchange(peers, Command::Invalidate(layout.clone()))?;
+    }
+    exchange(peers, Command::Prepare(layout.clone()))?;
+    let prepare_s = started.elapsed().as_secs_f64();
+    let started = Instant::now();
+    let command = Command::Forward(layout, tokens, full);
+    for peer in peers {
+        peer.send
+            .send(command.clone())
+            .map_err(|error| error.to_string())?;
+    }
+    maintenance();
+    let results = peers
+        .iter()
+        .map(|peer| {
+            peer.receive
+                .recv_timeout(Duration::from_secs(1800))
+                .map_err(|error| format!("A2 forward: {error}"))?
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ranks = results
+        .into_iter()
+        .map(|reply| match reply {
+            Reply::Outputs(outputs) => Ok(outputs),
+            _ => Err("Invalid A2 output reply".into()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut outputs = ranks.first().cloned().ok_or("Missing A2 TP output")?;
+    for (i, output) in outputs.iter_mut().enumerate() {
+        output.logits.clear();
+        for rank in &ranks {
+            let value = rank.get(i).ok_or("A2 TP output count differs")?;
+            if value.owner != output.owner {
+                return Err("A2 TP output owner differs".into());
+            }
+            if value.value > output.value
+                || value.value == output.value && value.token < output.token
+            {
+                output.token = value.token;
+                output.value = value.value;
+            }
+            output.logits.extend_from_slice(&value.logits);
+        }
+    }
+    Ok((outputs, started.elapsed().as_secs_f64(), prepare_s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
+        for statuses in [[true, true], [true, false]] {
+            std::thread::scope(|scope| {
+                let mut peers = vec![];
+                let mut maintained = vec![];
+                let recapture = !statuses.iter().all(|&hit| hit);
+                for hit in statuses {
+                    let (send, commands) = mpsc::channel();
+                    let (reply, receive) = mpsc::channel();
+                    let (maintenance, completed) = mpsc::channel();
+                    maintained.push(maintenance);
+                    peers.push(Peer { send, receive });
+                    scope.spawn(move || {
+                        assert!(matches!(
+                            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+                            Command::Cached(_)
+                        ));
+                        reply.send(Ok(Reply::Cached(hit))).unwrap();
+                        if recapture {
+                            assert!(matches!(
+                                commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+                                Command::Invalidate(_)
+                            ));
+                            reply.send(Ok(Reply::Ready)).unwrap();
+                        }
+                        assert!(matches!(
+                            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+                            Command::Prepare(_)
+                        ));
+                        reply.send(Ok(Reply::Ready)).unwrap();
+                        assert!(matches!(
+                            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+                            Command::Forward(_, _, false)
+                        ));
+                        // Workers cannot complete until host maintenance has run.
+                        completed.recv_timeout(Duration::from_secs(5)).unwrap();
+                        reply.send(Ok(Reply::Outputs(vec![]))).unwrap();
+                    });
+                }
+                let layout = Layout::new(
+                    vec![orinfer_model_sdk::architecture::BatchSegment {
+                        slot: 17,
+                        tokens: 2,
+                    }],
+                    vec![],
+                    false,
+                    8,
+                    2,
+                )
+                .unwrap();
+                assert!(
+                    forward_with(&peers, layout, vec![vec![0, 1]], false, || {
+                        for maintenance in maintained {
+                            maintenance.send(()).unwrap();
+                        }
+                    })
+                    .unwrap()
+                    .0
+                    .is_empty()
+                );
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use orinfer_model_sdk::architecture::BatchSegment;
+    #[test]
+    #[ignore = "Requires the complete native TP8 A2 service package and eight NPUs"]
+    fn native_prefix_restore_keeps_both_compression_ratios_and_owner_identity() {
+        use std::os::fd::AsRawFd;
+        assert!(
+            std::env::var("HCCL_DETERMINISTIC")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("strict")),
+            "Exact cross-request logits diagnostic uses explicit strict communication; normal serving uses the default"
+        );
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open("artifacts/gpu-experiment.lock")
+            .unwrap();
+        assert_eq!(
+            // SAFETY: the owned descriptor outlives the model and its worker threads.
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("ORINFER_A2_STATE_MODEL")
+                .expect("Set ORINFER_A2_STATE_MODEL to the published native service directory"),
+        );
+        let descriptor: serde_json::Value =
+            crate::model::read(&directory.join("cache/model.json")).unwrap();
+        let plan = directory
+            .join("cache/packages")
+            .join(descriptor["execution_package"].as_str().unwrap())
+            .join("model.json");
+        let team = Team::load(&plan, &directory).unwrap();
+        let forward = |slot, tokens: Vec<u32>, full| {
+            let layout = Layout::new(
+                vec![BatchSegment {
+                    slot,
+                    tokens: tokens.len(),
+                }],
+                vec![0],
+                false,
+                team.rows,
+                128,
+            )
+            .unwrap();
+            team.forward(layout, vec![tokens], full)
+                .unwrap()
+                .0
+                .remove(0)
+        };
+        for length in [17usize, 129, 2049] {
+            team.exchange(Command::Admit(vec![17, 7])).unwrap();
+            let input = (0..length)
+                .map(|i| ((i * 73 + 11) % 129280) as u32)
+                .collect::<Vec<_>>();
+            for chunk in input.chunks(team.rows) {
+                forward(17, chunk.to_vec(), false);
+            }
+            team.exchange(Command::Save {
+                owner: 17,
+                snapshot: length as u64,
+            })
+            .unwrap();
+            let expected = forward(17, vec![13, 17, 23], true);
+            team.exchange(Command::Release(Some(17))).unwrap();
+            team.exchange(Command::Admit(vec![91])).unwrap();
+            team.exchange(Command::Restore {
+                owner: 91,
+                snapshot: length as u64,
+            })
+            .unwrap();
+            let actual = forward(91, vec![13, 17, 23], true);
+            assert_eq!(expected.token, actual.token, "prefix length {length}");
+            assert_eq!(expected.logits, actual.logits, "prefix length {length}");
+            for chunk in input.chunks(team.rows) {
+                forward(7, chunk.iter().map(|&v| (v + 1) % 129280).collect(), false);
+            }
+            let changed = forward(7, vec![13, 17, 23], true);
+            assert_ne!(
+                actual.logits, changed.logits,
+                "changed input must execute with the reused Graph"
+            );
+            team.exchange(Command::Evict(length as u64)).unwrap();
+            team.exchange(Command::Release(None)).unwrap();
+            eprintln!(
+                "A2 prefix {length}: complete logits equal after owner remap; changed input differs"
+            );
+        }
+        drop(team);
+        drop(lock);
+    }
+}

@@ -75,6 +75,8 @@ pub struct ChatRequest {
     pub seed: Option<i64>,
     pub max_tokens: Option<usize>,
     pub max_completion_tokens: Option<usize>,
+    #[serde(default)]
+    pub ignore_eos: bool,
     #[serde(default, deserialize_with = "nullable_default")]
     pub stream: bool,
     pub stream_options: Option<Value>,
@@ -105,6 +107,7 @@ pub struct Prepared {
     pub images: Vec<orinfer_engine::vision::ImageInput>,
     pub audios: Vec<orinfer_engine::audio::AudioInput>,
     pub max_tokens: usize,
+    pub ignore_eos: bool,
     pub sampling: Options,
     pub tools: Vec<Value>,
     pub tool_choice: Value,
@@ -119,6 +122,7 @@ pub struct Prepared {
 }
 
 pub struct ChatCodec {
+    pub tools_supported: bool,
     pub audio: Option<orinfer_engine::audio::AudioSpec>,
     pub tokenizer: Tokenizer,
     pub asset_hashes: std::collections::BTreeMap<String, String>,
@@ -220,6 +224,7 @@ impl ChatCodec {
             sampling_defaults.temperature = 0.;
         }
         Ok(Self {
+            tools_supported: descriptor["metadata"]["target"] != "ascend910b",
             audio,
             sampling_defaults,
             tokenizer,
@@ -634,6 +639,7 @@ impl ChatCodec {
             images,
             audios,
             max_tokens,
+            ignore_eos: request.ignore_eos,
             sampling,
             tools,
             tool_choice: choice,

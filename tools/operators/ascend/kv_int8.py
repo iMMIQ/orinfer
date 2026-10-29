@@ -17,7 +17,7 @@ def decode_row(cache, scales, index, q, half_values, values, half_scales, scale,
     T.tile.cast(y, values, "CAST_RINT", 512)
 
 
-def scatter(rows, table_rows, reference_bf16=False):
+def scatter(rows, table_rows, reference_bf16=False, logical_capacity=0):
     """Round against the published FP16 scale before storing a unique cache row.
 
     ``-1`` skips a row; other invalid indices set the existing error flag. The
@@ -58,8 +58,9 @@ def scatter(rows, table_rows, reference_bf16=False):
             flag = T.alloc_ub((8,), "int32")
             row = cid * 2 + vid
             if row < rows:
-                index = indices[row]
-                if index >= 0 and index < table_rows:
+                source_index = indices[row]
+                index = source_index % table_rows if logical_capacity else source_index
+                if source_index >= 0 and source_index < (logical_capacity or table_rows):
                     T.copy(source[row, :, :], xb)
                     T.tile.cast(x, xb, "CAST_NONE", 512)
                     T.tile.min(x, x, 8319008.0)
@@ -93,7 +94,9 @@ def scatter(rows, table_rows, reference_bf16=False):
                     else:
                         T.copy(q, cache[index, :, :])
                     T.copy(half_scales[:, 0], scales[index, :])
-                flag[0] = T.if_then_else(index < -1 or index >= table_rows, 1, 0)
+                flag[0] = T.if_then_else(
+                    source_index < -1 or source_index >= (logical_capacity or table_rows), 1, 0
+                )
                 T.copy(flag[:1], errors[row : row + 1])
                 T.pipe_barrier("ALL")
 
@@ -146,14 +149,17 @@ def decode_prefix(rows, capacity, ratio=1, windowed=False):
     return main
 
 
-def gather_attention(rows, capacity, compressed_capacity, compressed=True):
+def gather_attention(rows, capacity, compressed_capacity, compressed=True, swa_storage_rows=0):
     """Read selected INT8 rows directly into the bounded decode compute tile."""
     selected = 640 if compressed else 128
+    storage = swa_storage_rows or capacity
+    if storage < 128 or storage > capacity:
+        raise ValueError("SWA storage must cover the complete sliding window")
 
     @T.prim_func
     def main(
-        swa: T.Tensor((capacity, 8, 64), "int8"),
-        swa_scales: T.Tensor((capacity, 8), "float16"),
+        swa: T.Tensor((storage, 8, 64), "int8"),
+        swa_scales: T.Tensor((storage, 8), "float16"),
         long_kv: T.Tensor((compressed_capacity, 8, 64), "int8"),
         long_scales: T.Tensor((compressed_capacity, 8), "float16"),
         swa_indices: T.Tensor((rows, 128), "int32"),
@@ -181,7 +187,7 @@ def gather_attention(rows, capacity, compressed_capacity, compressed=True):
                         decode_row(
                             swa,
                             swa_scales,
-                            source,
+                            source % storage,
                             q,
                             half_values,
                             values,

@@ -6,6 +6,7 @@ pub(crate) mod defaults;
 mod grammar;
 mod image;
 mod lifecycle;
+mod metrics;
 mod output;
 mod preparation;
 pub(crate) mod startup;
@@ -122,6 +123,7 @@ async fn serve(settings: Settings) -> Result<()> {
     let limits = state.limits;
     let router = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics::endpoint))
         .route("/v1/models", get(models))
         .route(
             "/v1/chat/completions",
@@ -295,7 +297,7 @@ async fn health(State(state): State<Service>) -> Response {
         "default_request_params":state.default_request_params.as_ref(),
         "chat_capabilities":{"streaming":true,"default_stream":state.default_request_params.get("stream").and_then(Value::as_bool).unwrap_or(false),"max_choices":1,
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
-            "tools":{"function":true,"strict":true,"required":true,"incremental_arguments":true},
+            "tools":{"function":state.codec.tools_supported,"strict":state.codec.tools_supported,"required":state.codec.tools_supported,"incremental_arguments":state.codec.tools_supported},
             "logprobs":true,"max_top_logprobs":20,"logit_bias":true,"stored_completions":false,
             "images":state.vision.is_some(),"video":false,"audio":state.codec.audio.is_some(),"default_max_completion_tokens":state.default_request_params.get("max_completion_tokens").and_then(Value::as_u64).or_else(|| state.default_request_params.get("max_tokens").and_then(Value::as_u64)).unwrap_or(8192),
             "thinking_token_budget":true,"prompt_cache":{"key":true,"retention":["in-memory","24h"],"persistent":false,"ttl_guaranteed":false}},

@@ -13,6 +13,7 @@ pub(super) struct Activity {
     pub queued: AtomicUsize,
     pub statistics: std::sync::Mutex<scheduler::Statistics>,
     pub admission: std::sync::Mutex<AdmissionStatistics>,
+    pub measurements: std::sync::Mutex<super::metrics::Measurements>,
 }
 
 /// Wall time in admission includes policy, memory checks and request startup.
@@ -171,6 +172,7 @@ struct Active<'a> {
     started: Instant,
     queue_s: f64,
     first_token_s: Option<f64>,
+    last_token_s: Option<f64>,
     reasoning_tokens: usize,
     raw_bytes: usize,
     pending_scores: VecDeque<(std::ops::Range<usize>, Value)>,
@@ -197,6 +199,7 @@ impl<'a> Active<'a> {
             started: Instant::now(),
             queue_s,
             first_token_s: None,
+            last_token_s: None,
             reasoning_tokens: 0,
             raw_bytes: 0,
             pending_scores: VecDeque::new(),
@@ -207,6 +210,9 @@ impl<'a> Active<'a> {
         if !tokens.is_empty() && self.first_token_s.is_none() {
             self.first_token_s = Some(self.mailbox.job.queued.elapsed().as_secs_f64());
         }
+        if !tokens.is_empty() {
+            self.last_token_s = Some(self.mailbox.job.queued.elapsed().as_secs_f64());
+        }
         let scores = self.request.take_logprobs();
         for (index, &token) in tokens.iter().enumerate() {
             if self.mailbox.job.events.is_closed() || self.mailbox.failed {
@@ -214,7 +220,7 @@ impl<'a> Active<'a> {
                 break;
             }
             self.count += 1;
-            if codec.eos.contains(&token) {
+            if codec.eos.contains(&token) && !self.mailbox.job.prepared.ignore_eos {
                 self.ending = Some(Ending::Eos);
                 break;
             }
@@ -434,6 +440,21 @@ pub(super) fn worker(
                 }
                 if let Err(error) = a.finish(model_id) {
                     a.mailbox.send(ModelEvent::Failed(error));
+                } else if !matches!(a.ending, Some(Ending::Cancelled | Ending::Failed(_)))
+                    && let Some(first_s) = a.first_token_s
+                    && let Ok(mut measurements) = activity.measurements.lock()
+                {
+                    measurements.observe(
+                        super::metrics::Completed {
+                            queue_s: a.queue_s,
+                            first_s,
+                            last_s: a.last_token_s.unwrap_or(first_s),
+                            complete_s: a.mailbox.job.queued.elapsed().as_secs_f64(),
+                            prompt_tokens: a.mailbox.job.prepared.input.len(),
+                            output_tokens: a.count,
+                        },
+                        a.request.prefix_statistics(),
+                    );
                 }
                 completed.push(a.mailbox);
             } else {
@@ -855,6 +876,7 @@ mod tests {
                 input: vec![1],
                 images: vec![],
                 max_tokens: 16,
+                ignore_eos: false,
                 sampling: Default::default(),
                 tools: vec![],
                 tool_choice: json!("auto"),

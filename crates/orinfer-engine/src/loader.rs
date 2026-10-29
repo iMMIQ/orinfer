@@ -467,7 +467,10 @@ mod tests {
     }
 }
 
-fn validate_frontend_assets(root: &Path, expected: &BTreeMap<String, String>) -> Result<()> {
+pub(crate) fn validate_frontend_assets(
+    root: &Path,
+    expected: &BTreeMap<String, String>,
+) -> Result<()> {
     let names: &[&str] = if expected.contains_key("processor_config.json") {
         &[
             "tokenizer.json",

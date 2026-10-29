@@ -46,7 +46,7 @@ check: check-locks lint
 	$(PYTHON) -m unittest tools.model.test_row_selection tools.model.flash_next.tests.test_convergence tools.model.flash_next.tests.test_build -v
 	$(PYTHON) -m unittest tools.model.flash_next.tests.test_ple tools.model.flash_next.tests.test_chunks tools.model.flash_next.tests.test_validation tools.model.flash_next.tests.test_original tools.model.flash_next.tests.test_teacher_inputs tools.model.flash_next.tests.test_speculation tools.model.flash_next.tests.test_config -v
 	$(PYTHON) -m unittest tools.model.test_attach_execution tools.model.test_package tools.model.test_catalog tools.model.test_publication tools.model.test_row_contract tools.model.test_vision_capacity tools.release.test_package tools.test_reference -v
-	$(PYTHON) -m unittest tools.model.deepseek_v41.test_engram tools.model.deepseek_v41.test_prepare tools.model.deepseek_v41.test_official tools.model.deepseek_v41.test_floating tools.model.deepseek_v41.test_converge tools.operators.ascend.test_vector_launch tools.operators.ascend.test_scalar_cache -v
+	$(PYTHON) -m unittest tools.model.deepseek_v41.test_engram tools.model.deepseek_v41.test_prepare tools.model.deepseek_v41.test_official tools.model.deepseek_v41.test_floating tools.model.deepseek_v41.test_converge tools.model.deepseek_v41.test_service tools.operators.ascend.test_vector_launch tools.operators.ascend.test_scalar_cache -v
 	$(PYTHON) tools/bench/validate_plan.py
 
 info:

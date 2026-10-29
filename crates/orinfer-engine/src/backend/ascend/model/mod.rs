@@ -7,7 +7,10 @@ mod branches;
 #[cfg(test)]
 mod dispatch_tests;
 mod packet;
+pub(crate) mod provider;
 mod row_contract;
+mod state;
+mod team;
 mod weights;
 
 use super::{
@@ -1261,11 +1264,11 @@ fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf, HashLayou
     if model.schema_version != 1
         || model.layers != 40
         || model.ranks.len() != 8
-        || !(128..=16384).contains(&model.capacity)
+        || !(128..=262144).contains(&model.capacity)
         || !model.capacity.is_multiple_of(32)
         || !(4..=4096).contains(&model.packet_cache_capacity)
     {
-        return Err("Expected complete 40-layer TP8 A2 plan with capacity <=16384".into());
+        return Err("Expected complete 40-layer TP8 A2 plan with capacity <=262144".into());
     }
     read_identity(model_dir, &model.config)?;
     read_identity(model_dir, &model.index)?;

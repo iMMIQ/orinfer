@@ -76,7 +76,7 @@ orinfer devices --backend ascend
 ORINFER_ASCEND_LIBRARY=/path/to/libascendcl.so orinfer devices --backend ascend
 ```
 
-Ascend 探测共享进程内 ACL 初始化，读取卡数与 SoC，不分配设备内存或执行 kernel。最后一个会话、buffer、图和完成事件释放后才结束本进程持有的初始化。输出中的 `api_symbols` 仅表示当前库存在对应入口，芯片能力需要实际验证。当前 `model_execution_available` 为 false，表示公共 `serve`/`batch` 执行器尚未注册；DSv4.1 原生实验入口见下文。现有 CUDA 执行包 schema 1、C ABI v1、`--cuda-graph` 和统计字段保留；`--graph` 是相同参数的别名。
+Ascend 探测共享进程内 ACL 初始化，读取卡数与 SoC，不分配设备内存或执行 kernel。最后一个会话、buffer、图和完成事件释放后才结束本进程持有的初始化。输出中的 `api_symbols` 仅表示当前库存在对应入口，芯片能力需要实际验证。`model_execution_available` 表示已注册实验性 DSv4.1 原生 provider；服务范围见下文。现有 CUDA 执行包 schema 1、C ABI v1、`--cuda-graph` 和统计字段保留；`--graph` 是相同参数的别名。
 
 原生设备资源位于 `backend/ascend/runtime.rs`：每会话独占 context、compute/transfer stream，显存与 pinned 内存受独立预算约束；异步提交持有 buffer、主机副本和原生算子资源直到事件完成。跨流等待也持有源事件。完成确认失败时隔离仍可能被 DMA 使用的存储和 context，避免提前释放；释放资源只销毁所属 context，不重置整卡。Ascend 数字错误码进入统一错误分类，执行失败会使 worker 退出而非按普通请求错误继续服务。
 
@@ -149,7 +149,7 @@ CPU 验收读取真实表的小批量行，检查所有 token 分块边界的 ha
 
 `backend/ascend/model/` 提供 DSv4.1 Flash-1017 原始 W4A8 checkpoint 的实验性单流执行入口 `bench-ascend`。八个 Rust worker 各持有独立 ACL context，以 TP8 执行 attention、每卡 48 个专家执行 MoE，并通过 HCCL 合并结果。执行计划包含全部 40 层、Engram CPU 行查找、C2/C1 缓存、索引 TopK 与输出头。W4 grouped matmul 保留 ACLNN，其余设备计算从 TileLang AOT 库加载；连续 TileLang、W4 和 HCCL 调用共同捕获为 ACL Graph，按原执行顺序复用同一 W4 workspace。设置 `ORINFER_A2_W4_NO_CAPTURE=1` 可单独提交 W4，供诊断使用。
 
-该入口使用独立的实验计划描述，公共模型包 schema 1 和 C ABI v1 保持原样；`serve` 的 Ascend 执行器仍未注册。当前上下文容量限定为 128–16384，须为 32 的倍数；默认 8448，覆盖 8K 输入和 128 个输出。此范围内候选块覆盖完整历史。prefill 使用容量有界的动态行模板，`--prefill-capacity` 默认 16，支持 2–4096，且不超过上下文容量。单行 decode 复用独立 AOT；prefill 根据剩余长度和共享 `PrefillPlan` 契约选择真实块长，尾块保持真实长度。请求间清空历史和残余压缩状态，通过因果索引隔离旧 KV。prefix 复用、并发调度及 MTP 需要后续接入。
+该入口使用独立的实验计划描述，公共模型包 schema 1 和 C ABI v1 保持原样；公共服务通过下述实验性原生 provider 接入。当前上下文容量限定为 128–16384，须为 32 的倍数；默认 8448，覆盖 8K 输入和 128 个输出。此范围内候选块覆盖完整历史。prefill 使用容量有界的动态行模板，`--prefill-capacity` 默认 16，支持 2–4096，且不超过上下文容量。单行 decode 复用独立 AOT；prefill 根据剩余长度和共享 `PrefillPlan` 契约选择真实块长，尾块保持真实长度。请求间清空历史和残余压缩状态，通过因果索引隔离旧 KV。prefix 复用、并发调度及 MTP 需要后续接入。
 
 动态 AOT 的指针表 ABI v2 显式传递真实 token 行数；operand 描述保存容量几何，库内外同时固定容量和物理 grid 上限。专家算子保留 `6*m` 等行数倍率，各 kernel 使用同一个有界行标量。编译器将逻辑 grid 映射到有限物理块上的循环；显式 Cube/Vector 计算体拆成同一库内的两个 stream 有序阶段，阶段间通过原 workspace 传递结果。通信长度、W4 tensor 视图和输出头末行随真实块长绑定。新行数的 Graph 注册在请求 reset 之前完成；每个 Graph 保留不可变的行数、库与全部 operand。因果索引在设备上从位置生成。
 
@@ -247,7 +247,7 @@ bash tools/operators/ascend/run.sh --without-devices \
 
 `bench-ascend` 的 `ttft_s` 保留准备与重置之后的计时范围；`request_ttft_s` 和 `request_e2e_s` 包含两者。`preparations` 记录每个输入第一次执行时的形状准备、重置和首输出，预热使用同一完整输入。`python -m tools.bench.ascend_regression --reference OLD.json --candidate NEW.json --output GATE.json` 按相同输入身份、分块、重复次数和执行环境逐场景比较完整请求中位数，任一场景超过默认 5% 回退即失败；新增请求计时字段必须两侧同时存在。输出 token 差异单独报告，质量验收仍需固定历史概率和状态检查。
 
-上述收敛入口用于单请求的动态 token 行；`M` 表示一个请求的片段长度。原生多 owner 实验通过下面的独立入口构建，公共 A2 服务执行器尚未注册。
+上述收敛入口用于单请求的动态 token 行；`M` 表示一个请求的片段长度。原生多 owner 计划通过下面的入口构建，公共 A2 服务复用同一执行团队和行模板。
 
 ### A2 原生多请求 batch
 
@@ -470,3 +470,30 @@ bash tools/operators/run.sh tools/model/validate_model_package_gpu.py artifacts/
 夹具验证三种 Graph 模式、输入变化和完整 logits；真实模型质量与性能另行验收。
 
 Flash Next 的当前原生包可通过 `tools/model/flash_next/build.py` 重新生成整数投影与执行包。该入口读取模型固定的架构绑定契约，按真实矩阵调优，支持内容校验与断点恢复；状态、浮点归约和联合专家组合保持输入中的已验证实现。输入须为当前原生模型并包含匹配的执行包；量化中间权重需先完成模型组装。用法见 [Flash Next 构建](../tools/model/flash_next/README.md)。
+
+### A2 文本服务与长上下文
+
+实验性 DSv4.1 A2 provider 复用公共 `Model`／`RequestState`、连续 worker、Chat/SSE 前端和 radix prefix cache。原生八个线程持有各自的 ACL context、HCCL communicator、请求私有状态及 Graph；`bench-ascend-batch` 使用同一团队。普通 decode 和混合 prefill packet 复用已发布的动态行模板。
+
+离线生成 262K 计划并发布服务目录：
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.long_context \
+  --plan /path/to/prepared-int8/model.json --output artifacts/a2-long \
+  --capacity 262144 --owners 32
+python3 -m tools.model.deepseek_v41.service \
+  --plan artifacts/a2-long/package/model.json --model-dir /path/to/original-checkpoint \
+  --output artifacts/models/dsv41-a2-service
+source /usr/local/Ascend/cann/set_env.sh
+orinfer serve artifacts/models/dsv41-a2-service --model deepseek-v41-flash-1017-w4a8 \
+  --listen 127.0.0.1:18818 --mtp-drafts 0 --max-active-requests 32 \
+  --prefix-cache-mib 8192 --gpu-lock artifacts/gpu-experiment.lock
+```
+
+输入是已准备物理 W4 bank 的原始单请求 INT8 KV 计划。构建器扩展 RoPE、完整因果索引及递归 TopK，复用已有 gather、QK、softmax、PV；索引 Cube 中间结果使用有界工作区。SWA 保留 4096 行环，覆盖 2048 行 packet 和 128 行因果窗口。压缩 KV 与 key 按各层 1／2 压缩率保留完整上下文，KV 为 group-64 INT8 加 FP16 scale，计算边界保持 BF16。checkpoint 复制有效压缩历史、SWA 尾部和完整 FP32 压缩环；恢复后重新绑定 owner 地址及位置。
+
+当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样及 prefix 恢复。工具定义／工具调用、媒体、MTP、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的实验性原生计划封装，由上述 Python 发布器生成；通用模型 cdylib C ABI 打包、`package install` 和 `validate-model` 尚未接通此封装。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
+
+`GET /metrics` 导出请求排队、首 token 前、解码、结束处理的 wall time histogram，以及运行／等待请求数和原生计算／计划准备累计时间。统计从前处理完成、请求进入 worker 队列开始，准入／恢复计入排队阶段；前处理与网络需结合客户端 TTFT 分析。阶段包含调度等待，不能相加解释成独占 GPU 时间。Chat 请求的 `ignore_eos:true` 保持指定生成上限，适用于固定输出长度回放。
+
+`python3 -m tools.bench.agentx_mini --help` 提供固定 Mini-Weka 短测入口：保留原始 16 个窗口、64 个 profiling 请求、并发 16、seed 42、180 秒 profiling 和每 lane 一次 warmup，记录输入哈希、服务二进制、健康状态及 metrics。默认总时限 900 秒，到时终止本轮客户端并保留诊断；中断结果不能作为通过的短测分数。该入口连接已运行服务，不部署后端或修改设备设置。

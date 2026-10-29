@@ -1,16 +1,13 @@
 //! Complete TP8 requests with shared rows and owner-private causal state.
 use super::{
-    Limits, Model, RootInfo, Session, SharedTables, Worker, affinity, batch::Layout, load_spec,
+    batch::Layout,
+    load_spec,
+    team::{Command, Team},
 };
 use crate::artifact::Result;
 use orinfer_model_sdk::architecture::BatchSegment;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeSet,
-    path::Path,
-    sync::mpsc,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeSet, path::Path, time::Instant};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,29 +55,7 @@ struct Output {
     owner: usize,
     token: u32,
     #[serde(skip)]
-    value: f32,
-    #[serde(skip)]
     logits: Vec<f32>,
-}
-#[derive(Clone)]
-enum Command {
-    Admit(Vec<usize>),
-    Reset(Vec<usize>),
-    Cached(Layout),
-    Invalidate(Layout),
-    Prepare(Layout),
-    Forward(Layout, Vec<Vec<u32>>, bool),
-    Release,
-    Stop,
-}
-enum Reply {
-    Ready,
-    Cached(bool),
-    Outputs(Vec<Output>),
-}
-struct Peer {
-    send: mpsc::Sender<Command>,
-    receive: mpsc::Receiver<Result<Reply>>,
 }
 #[derive(Serialize)]
 pub struct Report {
@@ -127,20 +102,6 @@ struct Comparison {
     max_probability_error: f64,
 }
 
-fn exchange(peers: &[Peer], command: Command) -> Result<Vec<Reply>> {
-    for peer in peers {
-        peer.send.send(command.clone()).map_err(|e| e.to_string())?;
-    }
-    let results = peers
-        .iter()
-        .map(|p| {
-            p.receive
-                .recv_timeout(Duration::from_secs(1800))
-                .map_err(|e| format!("A2 batch worker: {e}"))?
-        })
-        .collect::<Vec<_>>();
-    results.into_iter().collect()
-}
 fn frame_layout(frame: &Frame, capacity: usize, owners: usize) -> Result<Layout> {
     Layout::new(
         frame
@@ -163,61 +124,29 @@ fn frame_layout(frame: &Frame, capacity: usize, owners: usize) -> Result<Layout>
     )
 }
 fn forward(
-    peers: &[Peer],
+    team: &Team,
     frame: &Frame,
     cap: usize,
     owners: usize,
     full: bool,
 ) -> Result<(Vec<Output>, f64, f64)> {
-    let layout = frame_layout(frame, cap, owners)?;
-    let prepare = Instant::now();
-    // Pressure may evict different old shapes on different devices. All ranks
-    // must capture the same collective sequence when any rank misses a shape.
-    let hits = exchange(peers, Command::Cached(layout.clone()))?;
-    let mut all_cached = true;
-    for reply in hits {
-        match reply {
-            Reply::Cached(hit) => all_cached &= hit,
-            _ => return Err("Invalid batch cache reply".into()),
-        }
-    }
-    if !all_cached {
-        exchange(peers, Command::Invalidate(layout.clone()))?;
-    }
-    exchange(peers, Command::Prepare(layout.clone()))?;
-    let preparation = prepare.elapsed().as_secs_f64();
-    let start = Instant::now();
-    let ranks = exchange(
-        peers,
-        Command::Forward(
-            layout,
-            frame.requests.iter().map(|r| r.tokens.clone()).collect(),
-            full,
-        ),
+    let (values, seconds, preparation) = team.forward(
+        frame_layout(frame, cap, owners)?,
+        frame.requests.iter().map(|r| r.tokens.clone()).collect(),
+        full,
     )?;
-    let ranks = ranks
-        .into_iter()
-        .map(|reply| match reply {
-            Reply::Outputs(outputs) => Ok(outputs),
-            _ => Err("Invalid batch output reply".into()),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut outputs = ranks.first().cloned().ok_or("Missing TP outputs")?;
-    for (i, out) in outputs.iter_mut().enumerate() {
-        out.logits.clear();
-        for rank in &ranks {
-            let v = rank.get(i).ok_or("TP head count differs")?;
-            if v.owner != out.owner {
-                return Err("TP output ownership differs".into());
-            }
-            if v.value > out.value || v.value == out.value && v.token < out.token {
-                out.value = v.value;
-                out.token = v.token;
-            }
-            out.logits.extend_from_slice(&v.logits);
-        }
-    }
-    Ok((outputs, start.elapsed().as_secs_f64(), preparation))
+    Ok((
+        values
+            .into_iter()
+            .map(|value| Output {
+                owner: value.owner,
+                token: value.token,
+                logits: value.logits,
+            })
+            .collect(),
+        seconds,
+        preparation,
+    ))
 }
 fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<Vec<Frame>> {
     if requests.is_empty()
@@ -369,7 +298,7 @@ fn compare(batch: &[Vec<Output>], serial: &[Vec<Output>]) -> Result<Comparison> 
 }
 
 pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
-    let (mut model, package, layout) = load_spec(plan, model_dir)?;
+    let (model, _, _) = load_spec(plan, model_dir)?;
     let contract = model
         .batch
         .as_ref()
@@ -433,243 +362,124 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
             return Err("Automatic decode requires each owner's final prefill output".into());
         }
     }
-    let ranks = std::mem::take(&mut model.ranks);
-    let worker_cpus = affinity::from_env(ranks.len())?;
-    let load = Instant::now();
-    let bootstrap = Session::new(0, Limits::default())?;
-    let root = RootInfo::new(&bootstrap, 8)?;
-    let shared = SharedTables::new();
-    std::thread::scope(|scope| {
-        let mut handles = vec![];
-        let mut peers = vec![];
-        for rank in ranks {
-            let rank_index = rank.rank;
-            let cpus = worker_cpus.as_ref().map(|v| v[rank.rank as usize].clone());
-            let (send, commands) = mpsc::channel();
-            let (reply, receive) = mpsc::channel();
-            let root = root.clone();
-            let layout = layout.clone();
-            let model_ref: &Model = &model;
-            let package = &package;
-            let shared = &shared;
-            handles.push(scope.spawn(move || {
-                let loaded = (|| {
-                    if let Some(c) = cpus.as_deref() {
-                        affinity::apply(c)?;
+    let team = Team::load(plan, model_dir)?;
+    let load_s = team.load_s;
+    eprintln!("A2 shared batch model loaded in {load_s:.3}s");
+    (|| {
+        let mut measurements = vec![];
+        let mut preparations = vec![];
+        for case in &inputs.cases {
+            let ids = case
+                .frames
+                .iter()
+                .flat_map(|f| f.requests.iter().map(|r| r.owner))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let admission = Instant::now();
+            team.exchange(Command::Release(None))?;
+            team.exchange(Command::Admit(ids.clone()))?;
+            let owner_admission_s = admission.elapsed().as_secs_f64();
+            let mut validation = None;
+            for repeat in 0..=case.repeats {
+                let reset = Instant::now();
+                team.exchange(Command::Reset(ids.clone()))?;
+                let reset_s = reset.elapsed().as_secs_f64();
+                let mut prefill_s = 0.;
+                let mut decode_s = 0.;
+                let mut preparation_s = 0.;
+                let mut input_tokens = 0;
+                let mut outputs = vec![];
+                let mut frames = case.frames.clone();
+                let mut last_outputs = std::collections::BTreeMap::<usize, Output>::new();
+                for index in 0..case.frames.len() + case.decode_steps {
+                    let f = &frames[index];
+                    let (out, elapsed, prepare) = forward(
+                        &team,
+                        f,
+                        if f.decode { owners } else { capacity },
+                        owners,
+                        case.compare_serial && repeat == 0,
+                    )?;
+                    if repeat == 0
+                        && case.compare_serial
+                        && let Some(directory) = std::env::var_os("ORINFER_A2_BATCH_LOGITS_DIR")
+                    {
+                        let directory = Path::new(&directory).join(&case.name);
+                        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+                        for value in &out {
+                            let bytes = value
+                                .logits
+                                .iter()
+                                .flat_map(|v| v.to_le_bytes())
+                                .collect::<Vec<_>>();
+                            std::fs::write(
+                                directory.join(format!("frame{index}-owner{}.f32", value.owner)),
+                                bytes,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
                     }
-                    Worker::load(
-                        Session::new(
-                            rank.rank,
-                            Limits {
-                                device_bytes: 58 << 30,
-                                pinned_bytes: 64 << 20,
-                                timeout_ms: 30000,
-                            },
-                        )?,
-                        &root,
-                        rank,
-                        model_ref,
-                        model_dir,
-                        package,
-                        layout,
-                        std::env::var_os("ORINFER_A2_BATCH_TRACE").is_some(),
-                        shared,
-                    )
-                })();
-                let mut worker = match loaded {
-                    Ok(w) => w,
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                        return;
+                    preparation_s += prepare;
+                    if index < case.frames.len() {
+                        prefill_s += elapsed;
+                        input_tokens += f.requests.iter().map(|r| r.tokens.len()).sum::<usize>();
+                    } else {
+                        decode_s += elapsed;
                     }
-                };
-                if reply.send(Ok(Reply::Ready)).is_err() {
-                    return;
-                }
-                while let Ok(command) = commands.recv() {
-                    let result = match command {
-                        Command::Stop => break,
-                        Command::Admit(ids) => worker.admit(&ids).map(|_| Reply::Ready),
-                        Command::Reset(ids) => ids
-                            .into_iter()
-                            .try_for_each(|id| worker.reset_owner(id))
-                            .map(|_| Reply::Ready),
-                        Command::Release => worker.release_owners().map(|_| Reply::Ready),
-                        Command::Cached(layout) => worker.batch_cached(&layout).map(Reply::Cached),
-                        Command::Invalidate(layout) => {
-                            worker.invalidate_batch(&layout).map(|_| Reply::Ready)
-                        }
-                        Command::Prepare(layout) => {
-                            worker.prepare_batch(&layout).map(|_| Reply::Ready)
-                        }
-                        Command::Forward(layout, tokens, full) => {
-                            worker.forward_batch(&layout, &tokens, full).map(|v| {
-                                Reply::Outputs(
-                                    v.into_iter()
-                                        .map(|(owner, best, logits)| Output {
-                                            owner,
-                                            token: best.token,
-                                            value: best.value,
-                                            logits,
-                                        })
-                                        .collect(),
-                                )
-                            })
-                        }
-                    };
-                    let failed = result.is_err();
-                    if let Err(error) = &result {
-                        eprintln!("A2 batch rank {rank_index} failed: {error}");
+                    for output in &out {
+                        last_outputs.insert(output.owner, output.clone());
                     }
-                    if reply.send(result).is_err() || failed {
-                        break;
-                    }
-                }
-                let _ = worker.session.synchronize();
-            }));
-            peers.push(Peer { send, receive });
-        }
-        let result = (|| {
-            for peer in &peers {
-                peer.receive
-                    .recv_timeout(Duration::from_secs(1800))
-                    .map_err(|e| format!("A2 batch load: {e}"))??;
-            }
-            let load_s = load.elapsed().as_secs_f64();
-            eprintln!("A2 shared batch model loaded in {load_s:.3}s");
-            let mut measurements = vec![];
-            let mut preparations = vec![];
-            for case in &inputs.cases {
-                let ids = case
-                    .frames
-                    .iter()
-                    .flat_map(|f| f.requests.iter().map(|r| r.owner))
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                let admission = Instant::now();
-                exchange(&peers, Command::Release)?;
-                exchange(&peers, Command::Admit(ids.clone()))?;
-                let owner_admission_s = admission.elapsed().as_secs_f64();
-                let mut validation = None;
-                for repeat in 0..=case.repeats {
-                    let reset = Instant::now();
-                    exchange(&peers, Command::Reset(ids.clone()))?;
-                    let reset_s = reset.elapsed().as_secs_f64();
-                    let mut prefill_s = 0.;
-                    let mut decode_s = 0.;
-                    let mut preparation_s = 0.;
-                    let mut input_tokens = 0;
-                    let mut outputs = vec![];
-                    let mut frames = case.frames.clone();
-                    let mut last_outputs = std::collections::BTreeMap::<usize, Output>::new();
-                    for index in 0..case.frames.len() + case.decode_steps {
-                        let f = &frames[index];
-                        let (out, elapsed, prepare) = forward(
-                            &peers,
-                            f,
-                            if f.decode { owners } else { capacity },
-                            owners,
-                            case.compare_serial && repeat == 0,
-                        )?;
-                        if repeat == 0
-                            && case.compare_serial
-                            && let Some(directory) = std::env::var_os("ORINFER_A2_BATCH_LOGITS_DIR")
-                        {
-                            let directory = Path::new(&directory).join(&case.name);
-                            std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-                            for value in &out {
-                                let bytes = value
-                                    .logits
-                                    .iter()
-                                    .flat_map(|v| v.to_le_bytes())
-                                    .collect::<Vec<_>>();
-                                std::fs::write(
-                                    directory
-                                        .join(format!("frame{index}-owner{}.f32", value.owner)),
-                                    bytes,
-                                )
-                                .map_err(|e| e.to_string())?;
-                            }
-                        }
-                        preparation_s += prepare;
-                        if index < case.frames.len() {
-                            prefill_s += elapsed;
-                            input_tokens +=
-                                f.requests.iter().map(|r| r.tokens.len()).sum::<usize>();
-                        } else {
-                            decode_s += elapsed;
-                        }
-                        for output in &out {
-                            last_outputs.insert(output.owner, output.clone());
-                        }
-                        if index + 1 >= case.frames.len()
-                            && index + 1 < case.frames.len() + case.decode_steps
-                        {
-                            frames.push(Frame {
-                                decode: true,
-                                requests: last_outputs
-                                    .values()
-                                    .map(|o| Request {
-                                        owner: o.owner,
-                                        tokens: vec![o.token],
-                                        output: true,
-                                    })
-                                    .collect(),
-                            });
-                        }
-                        outputs.push(out);
-                    }
-                    if repeat == 0 {
-                        preparations.push(Preparation {
-                            name: case.name.clone(),
-                            owner_admission_s,
-                            reset_s,
-                            graph_preparation_s: preparation_s,
-                            first_prefill_s: prefill_s,
-                            first_decode_s: decode_s,
+                    if index + 1 >= case.frames.len()
+                        && index + 1 < case.frames.len() + case.decode_steps
+                    {
+                        frames.push(Frame {
+                            decode: true,
+                            requests: last_outputs
+                                .values()
+                                .map(|o| Request {
+                                    owner: o.owner,
+                                    tokens: vec![o.token],
+                                    output: true,
+                                })
+                                .collect(),
                         });
-                        if case.compare_serial {
-                            exchange(&peers, Command::Release)?;
-                            let mut serial = vec![vec![]; frames.len()];
-                            for &owner in ids.iter().rev() {
-                                exchange(&peers, Command::Admit(vec![owner]))?;
-                                if case.compare_whole_prompt && !case.requests.is_empty() {
-                                    let request =
-                                        case.requests.iter().find(|r| r.owner == owner).unwrap();
-                                    let last = case
-                                        .frames
-                                        .iter()
-                                        .rposition(|f| f.requests.iter().any(|r| r.owner == owner))
-                                        .unwrap();
-                                    for frame in
-                                        plan_frames(std::slice::from_ref(request), capacity, 1)?
-                                    {
-                                        let (out, _, _) =
-                                            forward(&peers, &frame, capacity, owners, true)?;
-                                        serial[last].extend(out);
-                                    }
-                                    for (index, frame) in
-                                        frames.iter().enumerate().skip(case.frames.len())
-                                    {
-                                        let one = Frame {
-                                            decode: frame.decode,
-                                            requests: frame
-                                                .requests
-                                                .iter()
-                                                .filter(|r| r.owner == owner)
-                                                .cloned()
-                                                .collect(),
-                                        };
-                                        let (out, _, _) =
-                                            forward(&peers, &one, owners, owners, true)?;
-                                        serial[index].extend(out);
-                                    }
-                                    exchange(&peers, Command::Release)?;
-                                    continue;
+                    }
+                    outputs.push(out);
+                }
+                if repeat == 0 {
+                    preparations.push(Preparation {
+                        name: case.name.clone(),
+                        owner_admission_s,
+                        reset_s,
+                        graph_preparation_s: preparation_s,
+                        first_prefill_s: prefill_s,
+                        first_decode_s: decode_s,
+                    });
+                    if case.compare_serial {
+                        team.exchange(Command::Release(None))?;
+                        let mut serial = vec![vec![]; frames.len()];
+                        for &owner in ids.iter().rev() {
+                            team.exchange(Command::Admit(vec![owner]))?;
+                            if case.compare_whole_prompt && !case.requests.is_empty() {
+                                let request =
+                                    case.requests.iter().find(|r| r.owner == owner).unwrap();
+                                let last = case
+                                    .frames
+                                    .iter()
+                                    .rposition(|f| f.requests.iter().any(|r| r.owner == owner))
+                                    .unwrap();
+                                for frame in
+                                    plan_frames(std::slice::from_ref(request), capacity, 1)?
+                                {
+                                    let (out, _, _) =
+                                        forward(&team, &frame, capacity, owners, true)?;
+                                    serial[last].extend(out);
                                 }
-                                for (index, frame) in frames.iter().enumerate() {
-                                    let f = Frame {
+                                for (index, frame) in
+                                    frames.iter().enumerate().skip(case.frames.len())
+                                {
+                                    let one = Frame {
                                         decode: frame.decode,
                                         requests: frame
                                             .requests
@@ -678,147 +488,106 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                             .cloned()
                                             .collect(),
                                     };
-                                    if f.requests.is_empty() {
-                                        continue;
-                                    }
-                                    let (out, _, _) = forward(
-                                        &peers,
-                                        &f,
-                                        if f.decode { owners } else { capacity },
-                                        owners,
-                                        true,
-                                    )?;
+                                    let (out, _, _) = forward(&team, &one, owners, owners, true)?;
                                     serial[index].extend(out);
                                 }
-                                exchange(&peers, Command::Release)?;
+                                team.exchange(Command::Release(None))?;
+                                continue;
                             }
-                            validation = Some(compare(&outputs, &serial)?);
-                            let c = validation.as_ref().unwrap();
-                            eprintln!(
-                                "{}: serial positions {}, greedy {}, max logits {}, max probability {}",
-                                case.name,
-                                c.positions,
-                                c.greedy_equal,
-                                c.max_abs_logit,
-                                c.max_probability_error
-                            );
-                            // Default BF16 collectives can change reduction order
-                            // across message lengths. Near-tied greedy choices
-                            // remain diagnostic; fixed-history probabilities are
-                            // the numerical acceptance condition.
-                            if c.max_probability_error > 0.02 {
-                                return Err("Batched/serial quality validation failed".into());
+                            for (index, frame) in frames.iter().enumerate() {
+                                let f = Frame {
+                                    decode: frame.decode,
+                                    requests: frame
+                                        .requests
+                                        .iter()
+                                        .filter(|r| r.owner == owner)
+                                        .cloned()
+                                        .collect(),
+                                };
+                                if f.requests.is_empty() {
+                                    continue;
+                                }
+                                let (out, _, _) = forward(
+                                    &team,
+                                    &f,
+                                    if f.decode { owners } else { capacity },
+                                    owners,
+                                    true,
+                                )?;
+                                serial[index].extend(out);
                             }
-                            exchange(&peers, Command::Admit(ids.clone()))?;
+                            team.exchange(Command::Release(None))?;
                         }
-                        continue;
+                        validation = Some(compare(&outputs, &serial)?);
+                        let c = validation.as_ref().unwrap();
+                        eprintln!(
+                            "{}: serial positions {}, greedy {}, max logits {}, max probability {}",
+                            case.name,
+                            c.positions,
+                            c.greedy_equal,
+                            c.max_abs_logit,
+                            c.max_probability_error
+                        );
+                        // Default BF16 collectives can change reduction order
+                        // across message lengths. Near-tied greedy choices
+                        // remain diagnostic; fixed-history probabilities are
+                        // the numerical acceptance condition.
+                        if c.max_probability_error > 0.02 {
+                            return Err("Batched/serial quality validation failed".into());
+                        }
+                        team.exchange(Command::Admit(ids.clone()))?;
                     }
-                    let decode_tokens = outputs
-                        .iter()
-                        .skip(case.frames.len())
-                        .map(Vec::len)
-                        .sum::<usize>();
-                    measurements.push(Measurement {
-                        name: case.name.clone(),
-                        repeat: repeat - 1,
-                        batch: ids.len(),
-                        input_tokens,
-                        prefill_s,
-                        prefill_tokens_per_s: input_tokens as f64 / prefill_s,
-                        decode_s,
-                        decode_tokens_per_s: if decode_s > 0. {
-                            decode_tokens as f64 / decode_s
-                        } else {
-                            0.
-                        },
-                        preparation_s,
-                        reset_s,
-                        request_s: reset_s + preparation_s + prefill_s + decode_s,
-                        output_tokens: outputs,
-                        serial: validation.take(),
-                    });
-                    eprintln!(
-                        "{} B{} repeat {} prefill {:.2} tok/s",
-                        case.name,
-                        ids.len(),
-                        repeat - 1,
-                        input_tokens as f64 / prefill_s
-                    );
+                    continue;
                 }
+                let decode_tokens = outputs
+                    .iter()
+                    .skip(case.frames.len())
+                    .map(Vec::len)
+                    .sum::<usize>();
+                measurements.push(Measurement {
+                    name: case.name.clone(),
+                    repeat: repeat - 1,
+                    batch: ids.len(),
+                    input_tokens,
+                    prefill_s,
+                    prefill_tokens_per_s: input_tokens as f64 / prefill_s,
+                    decode_s,
+                    decode_tokens_per_s: if decode_s > 0. {
+                        decode_tokens as f64 / decode_s
+                    } else {
+                        0.
+                    },
+                    preparation_s,
+                    reset_s,
+                    request_s: reset_s + preparation_s + prefill_s + decode_s,
+                    output_tokens: outputs,
+                    serial: validation.take(),
+                });
+                eprintln!(
+                    "{} B{} repeat {} prefill {:.2} tok/s",
+                    case.name,
+                    ids.len(),
+                    repeat - 1,
+                    input_tokens as f64 / prefill_s
+                );
             }
-            Ok(Report {
-                layers: 40,
-                tensor_parallel: 8,
-                owner_capacity: owners,
-                context_capacity: model.capacity,
-                load_s,
-                requests: measurements,
-                preparations,
-                scope: "Complete shared-row native TP8 requests with owner-private INT8 KV; warm forward timings exclude compilation, Graph preparation, admission and reset; preparation is reported separately",
-            })
-        })();
-        for peer in &peers {
-            let _ = peer.send.send(Command::Stop);
         }
-        for handle in handles {
-            if handle.join().is_err() {
-                return Err("A2 batch worker panicked".into());
-            }
-        }
-        result
-    })
+        Ok(Report {
+            layers: 40,
+            tensor_parallel: 8,
+            owner_capacity: owners,
+            context_capacity: model.capacity,
+            load_s,
+            requests: measurements,
+            preparations,
+            scope: "Complete shared-row native TP8 requests with owner-private INT8 KV; warm forward timings exclude compilation, Graph preparation, admission and reset; preparation is reported separately",
+        })
+    })()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
-        for statuses in [[true, true], [true, false]] {
-            std::thread::scope(|scope| {
-                let mut peers = vec![];
-                let recapture = !statuses.iter().all(|&hit| hit);
-                for hit in statuses {
-                    let (send, commands) = mpsc::channel();
-                    let (reply, receive) = mpsc::channel();
-                    peers.push(Peer { send, receive });
-                    scope.spawn(move || {
-                        assert!(matches!(
-                            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                            Command::Cached(_)
-                        ));
-                        reply.send(Ok(Reply::Cached(hit))).unwrap();
-                        if recapture {
-                            assert!(matches!(
-                                commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                                Command::Invalidate(_)
-                            ));
-                            reply.send(Ok(Reply::Ready)).unwrap();
-                        }
-                        assert!(matches!(
-                            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                            Command::Prepare(_)
-                        ));
-                        reply.send(Ok(Reply::Ready)).unwrap();
-                        assert!(matches!(
-                            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                            Command::Forward(_, _, false)
-                        ));
-                        reply.send(Ok(Reply::Outputs(vec![]))).unwrap();
-                    });
-                }
-                let frame = Frame {
-                    decode: false,
-                    requests: vec![Request {
-                        owner: 17,
-                        tokens: vec![0, 1],
-                        output: false,
-                    }],
-                };
-                assert!(forward(&peers, &frame, 8, 2, false).unwrap().0.is_empty());
-            });
-        }
-    }
     #[test]
     fn model_chunk_quantum_fills_packets_without_short_long_request_tails() {
         for batch in [1, 2, 3, 4, 5, 8, 16, 31, 64, 127, 128] {

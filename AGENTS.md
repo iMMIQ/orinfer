@@ -4,7 +4,7 @@
 
 ## 范围
 
-- 推理基线为 Jetson AGX Orin 64GB，aarch64/CUDA SM87；共享运行时同时支持 Altus A2 / Ascend 910B 的原生资源、异步传输、W4A8 grouped matmul、ACL Graph 和 HCCL 集合通信验收，提供 DSv4.1 原始 W4A8 完整 40 层的实验性单流 `bench-ascend` 与最多 128 owner 的 `bench-ascend-batch`，公共服务执行器尚未注册。CUDA 数值、Graph 和性能验收仍在 Orin 上执行。
+- 推理基线为 Jetson AGX Orin 64GB，aarch64/CUDA SM87；共享运行时同时支持 Altus A2 / Ascend 910B 的原生资源、异步传输、W4A8 grouped matmul、ACL Graph 和 HCCL 集合通信验收，DSv4.1 原始 W4A8 完整 40 层通过实验性原生 provider 接入公共请求接口、HTTP/SSE、连续调度及 prefix cache，保留原生 bench 入口。CUDA 数值、Graph 和性能验收仍在 Orin 上执行。
 - 支持 Qwen3.8-27B、Qwen3.5-4B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和 Index-Translate-2B/9B/35B（Qwen3_5）的文本、图片和多图输入。
 - Qwen3-ASR-1.7B 使用 Qwen3 全注意力解码器、标准 RMSNorm、128 维全 RoPE 和无输出 gate；复用 Qwen 动态行执行流程。文本采用两级 E8P Q4A8，前 4 层 Q/K/V 与 FFN 保留同一 signed-block128 输入基下的 W8，attention 输出投影保留 W8；音频编码器和 projector 保留 FP16，KV 使用 group-64 INT8。Rust 负责音频解码、16 kHz 重采样和 128-bin log-mel，TileLang 执行有界 CNN 与 104-token 窗口编码器。音频特征、位置和输入身份属于请求私有状态及 prefix 缓存身份。
 - ASR 的 Q/K/V 与 gate/up 通过无损拼接权重输出行共享整数投影模板。音频 CNN 使用 NHWC；前处理按帧组并行，多个录音按 104-token 窗口边界打包编码，再写回各 owner 的特征。逐窗口有效长度保持录音边界；GPU 验收覆盖改变输入、反向准入、空闲 arena 复用、prefix 恢复及完整请求。
@@ -52,6 +52,7 @@
 - Flash Next 最终包通过原生 build.py 和共享 row_selection.py 离线调优，按测量结果生成局部选择表，只发布被选择的实现。混合因果段及 MTP warm 支持连续 1–512 行；剩余长度与延迟预算决定实际片段。MixedRows 在现有 ABI v1 flags 中显式携带前置 prefill 片段数，以该字段识别 prefill/验证角色；缓存身份包含该角色边界。warm 用一个 min_tokens=1 的容量模板，MtpLength 必须在映射动态 KV 前更新。最终执行包重打包资产，移除未引用的候选及旧 cubin。共享大行数计算通过 row_tuning.py 与 row_convergence.py 按测量结果发布；专家路由与上下投影共同选择。HC injection 的直接与矩阵 tile 统一 BF16 MMA K16 累加顺序，单行参考也保持相同契约；候选必须保持相同的 MMA K16 累加与舍入契约。动态绑定合并只改身份，保留原始 grid、实参表达式和 token 到专家行倍率。动态 MTP 在映射 KV 之前写入真实验证长度。视觉使用一个动态 patch 模板，merger launch 按实际 patch 数除以 4；提高视觉容量时须保持现有文本程序的行数契约。MTP 验证、恢复、捕获各用一个容量 8、min_tokens=2 的入口，运行时传递真实长度，固定形状参考包仅作离线构建输入。
 - 跨 block 同步使用显式声明的 cooperative launch，并校验 occupancy。
 - 性能验收使用真实模型的完整请求 TPS。合成探针、算子微测和四输出 profile 用于定位局部成本。
+- DSv4.1 A2 的最终性能目标以 Mini-Weka agent 端到端回放衡量，先接通 orinfer 的 HTTP、长上下文和完整 prefix 状态。只运行用户授权的短测，调优阶段不执行一小时回放；保留固定输入／输出长度、同源主 agent 片段和每轮瓶颈证据，参考 vLLM-Ascend、SGLang 与 DeepInfer 后实现优化、验证、提交并推送。
 - 质量对照官方 BF16 或同模型 FP8，固定 seed20261002 及 teacher-forced 历史；质量结合任务结果、target NLL、token 概率和长上下文行为判断，token 一致率作为诊断指标。
 
 ## 开发

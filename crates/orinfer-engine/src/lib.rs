@@ -1,7 +1,7 @@
 //! Shared model runtime with device-owned execution backends.
 //!
-//! CUDA executes Orin model packages. Ascend provides CANN discovery and native
-//! launch contracts; its model executor is not registered yet.
+//! CUDA executes Orin model packages. Ascend provides CANN discovery and an
+//! experimental native DSv4.1 provider through the shared request interface.
 
 pub mod architecture;
 pub mod artifact;

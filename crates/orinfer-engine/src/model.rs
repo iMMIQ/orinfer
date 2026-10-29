@@ -188,9 +188,15 @@ pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
 }
 
 /// Thread-affine resident model. All CUDA resources remain on the creating thread.
-pub struct Model(crate::runtime::ModelRuntime);
-pub use crate::runtime::requests::{GenerationInput, RequestState, StepOutput};
+enum Implementation {
+    Cuda(Box<crate::runtime::ModelRuntime>),
+    Ascend(Box<crate::backend::ascend::model::provider::Runtime>),
+}
+pub struct Model(Implementation);
+mod request;
+pub use crate::runtime::requests::{GenerationInput, StepOutput};
 pub use crate::runtime::scoring::{Probe, ScoreCase, ScoreReport, ScoreRequests, TokenProbability};
+pub use request::RequestState;
 
 pub fn score_with_options(
     path: &Path,
@@ -202,32 +208,48 @@ pub fn score_with_options(
 }
 impl Model {
     pub fn expert_cache_statistics(&self) -> Option<crate::execution::ExpertCacheStatistics> {
-        self.0.expert_cache_statistics()
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.expert_cache_statistics(),
+            Implementation::Ascend(inner) => inner.expert_cache_statistics(),
+        }
     }
     pub fn frontend_assets(&self) -> &std::collections::BTreeMap<String, String> {
-        &self.0.frontend_assets
+        match &self.0 {
+            Implementation::Cuda(inner) => &inner.frontend_assets,
+            Implementation::Ascend(inner) => inner.frontend_assets(),
+        }
     }
-
     pub fn batching_supported(&self) -> bool {
-        !self.0.manifest.batch_profiles.is_empty()
+        match &self.0 {
+            Implementation::Cuda(inner) => !inner.manifest.batch_profiles.is_empty(),
+            Implementation::Ascend(inner) => inner.batching_supported(),
+        }
     }
-    /// A cold prompt fitting this extent can join one native prefill packet.
     pub fn prefill_packet_capacity(&self) -> usize {
-        self.0
-            .manifest
-            .batch_layout
-            .as_ref()
-            .map_or(1, |layout| layout.segment_tokens.max(1))
+        match &self.0 {
+            Implementation::Cuda(inner) => inner
+                .manifest
+                .batch_layout
+                .as_ref()
+                .map_or(1, |layout| layout.segment_tokens.max(1)),
+            Implementation::Ascend(inner) => inner.prefill_packet_capacity(),
+        }
     }
     pub fn scheduler_statistics(&self) -> crate::scheduler::Statistics {
-        self.0.scheduling_statistics()
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.scheduling_statistics(),
+            Implementation::Ascend(inner) => inner.scheduler_statistics(),
+        }
     }
     pub fn estimated_request_cost(
         &self,
         input: &[u32],
         images: &[crate::vision::ImageInput],
     ) -> Result<crate::scheduler::Waiting> {
-        self.0.waiting_cost(input, images)
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.waiting_cost(input, images),
+            Implementation::Ascend(inner) => inner.estimated_request_cost(input, images),
+        }
     }
     pub fn request_hint(
         &self,
@@ -235,23 +257,41 @@ impl Model {
         images: &[crate::vision::ImageInput],
         audios: &[crate::audio::AudioInput],
     ) -> Result<crate::scheduler::RequestHint> {
-        self.0.request_hint(input, images, audios)
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.request_hint(input, images, audios),
+            Implementation::Ascend(inner) => inner.request_hint(input, images, audios),
+        }
     }
     pub fn estimated_hint_cost(
         &self,
         hint: &crate::scheduler::RequestHint,
     ) -> Result<crate::scheduler::Waiting> {
-        self.0.hint_cost(hint)
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.hint_cost(hint),
+            Implementation::Ascend(inner) => inner.estimated_hint_cost(hint),
+        }
     }
     pub fn share_prefill_checkpoint(
-        &self,
+        &mut self,
         request: &mut RequestState,
         hint: &crate::scheduler::RequestHint,
     ) -> Result<bool> {
-        self.0.share_prefill_checkpoint(request, hint)
+        match &mut self.0 {
+            Implementation::Cuda(inner) => {
+                let request = request.cuda_mut()?;
+                inner.share_prefill_checkpoint(request, hint)
+            }
+            Implementation::Ascend(inner) => {
+                let request = request.ascend_mut()?;
+                inner.share_prefill_checkpoint(request, hint)
+            }
+        }
     }
     pub fn prefix_cache_enabled(&self) -> bool {
-        self.0.prefix_cache_limit > 0
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.prefix_cache_limit > 0,
+            Implementation::Ascend(inner) => inner.prefix_cache_enabled(),
+        }
     }
     pub fn decode_admission_allowed(
         &self,
@@ -259,82 +299,175 @@ impl Model {
         prompt_tokens: usize,
         options: &crate::scheduler::Options,
     ) -> bool {
-        self.0
-            .decode_admission_allowed(active, prompt_tokens, options)
+        match &self.0 {
+            Implementation::Cuda(inner) => {
+                let active = active
+                    .iter()
+                    .filter_map(|request| request.cuda_ref())
+                    .collect::<Vec<_>>();
+                inner.decode_admission_allowed(&active, prompt_tokens, options)
+            }
+            Implementation::Ascend(inner) => {
+                let active = active
+                    .iter()
+                    .filter_map(|request| request.ascend_ref())
+                    .collect::<Vec<_>>();
+                inner.decode_admission_allowed(&active, prompt_tokens, options)
+            }
+        }
     }
     pub fn can_admit(
         &mut self,
         input: &GenerationInput,
         options: &crate::scheduler::Options,
     ) -> Result<bool> {
-        self.0.can_admit_request(input, options)
+        match &mut self.0 {
+            Implementation::Cuda(inner) => inner.can_admit_request(input, options),
+            Implementation::Ascend(inner) => inner.can_admit(input, options),
+        }
     }
     pub fn start_request(
         &mut self,
         input: GenerationInput,
         cancelled: impl Fn() -> bool,
     ) -> Result<RequestState> {
-        self.0.start_request(input, &cancelled)
+        match &mut self.0 {
+            Implementation::Cuda(inner) => inner
+                .start_request(input, &cancelled)
+                .map(RequestState::cuda),
+            Implementation::Ascend(inner) => inner
+                .start_request(input, cancelled)
+                .map(RequestState::ascend),
+        }
     }
     pub fn advance_requests(
         &mut self,
         requests: &mut [&mut RequestState],
         options: &crate::scheduler::Options,
     ) -> Result<Vec<StepOutput>> {
-        self.0.advance_requests(requests, options)
+        match &mut self.0 {
+            Implementation::Cuda(inner) => {
+                let mut requests = requests
+                    .iter_mut()
+                    .map(|request| request.cuda_mut())
+                    .collect::<Result<Vec<_>>>()?;
+                inner.advance_requests(&mut requests, options)
+            }
+            Implementation::Ascend(inner) => {
+                let mut requests = requests
+                    .iter_mut()
+                    .map(|request| request.ascend_mut())
+                    .collect::<Result<Vec<_>>>()?;
+                inner.advance_requests(&mut requests, options)
+            }
+        }
     }
-    /// Run bounded CPU-only queue/output work while a submitted packet executes.
-    /// The callback cannot access the model or commit request state.
     pub fn advance_requests_with(
         &mut self,
         requests: &mut [&mut RequestState],
         options: &crate::scheduler::Options,
         maintenance: impl FnOnce(),
     ) -> Result<Vec<StepOutput>> {
-        self.0.advance_requests_with(requests, options, maintenance)
+        match &mut self.0 {
+            Implementation::Cuda(inner) => {
+                let mut requests = requests
+                    .iter_mut()
+                    .map(|request| request.cuda_mut())
+                    .collect::<Result<Vec<_>>>()?;
+                inner.advance_requests_with(&mut requests, options, maintenance)
+            }
+            Implementation::Ascend(inner) => {
+                let mut requests = requests
+                    .iter_mut()
+                    .map(|request| request.ascend_mut())
+                    .collect::<Result<Vec<_>>>()?;
+                inner.advance_requests_with(&mut requests, options, maintenance)
+            }
+        }
     }
     pub fn finish_request(&mut self, request: &mut RequestState, cache: bool) -> Result<()> {
-        self.0.finish_request(request, cache)
+        match &mut self.0 {
+            Implementation::Cuda(inner) => {
+                let request = request.cuda_mut()?;
+                inner.finish_request(request, cache)
+            }
+            Implementation::Ascend(inner) => {
+                let request = request.ascend_mut()?;
+                inner.finish_request(request, cache)
+            }
+        }
     }
     pub fn load(path: &Path) -> Result<Self> {
         Self::load_with_options(path, LoadOptions::default())
     }
     pub fn load_with_options(path: &Path, options: LoadOptions) -> Result<Self> {
-        crate::runtime::ModelRuntime::load_with_options(path, options).map(Self)
+        let descriptor = resolve_manifest(path)?;
+        let raw: serde_json::Value = read(&descriptor)?;
+        if crate::backend::ascend::model::provider::Runtime::recognizes(&raw) {
+            crate::backend::ascend::model::provider::Runtime::load(path, options)
+                .map(|inner| Self(Implementation::Ascend(Box::new(inner))))
+        } else {
+            crate::runtime::ModelRuntime::load_with_options(path, options)
+                .map(|inner| Self(Implementation::Cuda(Box::new(inner))))
+        }
     }
     pub fn max_context(&self) -> usize {
-        self.0.manifest.max_context
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.manifest.max_context,
+            Implementation::Ascend(inner) => inner.max_context(),
+        }
     }
     pub fn mtp_drafts(&self) -> usize {
-        self.0
-            .manifest
-            .mtp
-            .as_ref()
-            .map_or(0, |s| s.default_verification_tokens - 1)
+        match &self.0 {
+            Implementation::Cuda(inner) => inner
+                .manifest
+                .mtp
+                .as_ref()
+                .map_or(0, |s| s.default_verification_tokens - 1),
+            Implementation::Ascend(inner) => inner.mtp_drafts(),
+        }
     }
     pub fn vocab(&self) -> usize {
-        self.0.manifest.vocab
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.manifest.vocab,
+            Implementation::Ascend(inner) => inner.vocab(),
+        }
     }
     pub fn vision(&self) -> Option<&crate::vision::VisionSpec> {
-        self.0.manifest.vision.as_ref()
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.manifest.vision.as_ref(),
+            Implementation::Ascend(inner) => inner.vision(),
+        }
     }
     pub fn speculation_statistics(&self) -> Option<&crate::mtp::Statistics> {
-        self.0.speculation_statistics.as_ref()
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.speculation_statistics.as_ref(),
+            Implementation::Ascend(inner) => inner.speculation_statistics(),
+        }
     }
     pub fn prefix_statistics(&self) -> &crate::prefix::Statistics {
-        &self.0.prefix_statistics
+        match &self.0 {
+            Implementation::Cuda(inner) => &inner.prefix_statistics,
+            Implementation::Ascend(inner) => inner.prefix_statistics(),
+        }
     }
-    /// CPU-only scheduling estimate; does not touch LRU or CUDA state.
     pub fn cached_prefix_tokens(
         &self,
         input: &[u32],
         images: &[crate::vision::ImageInput],
     ) -> Result<usize> {
-        self.0.prefix_match_tokens(input, images)
+        match &self.0 {
+            Implementation::Cuda(inner) => inner.prefix_match_tokens(input, images),
+            Implementation::Ascend(inner) => inner.cached_prefix_tokens(input, images),
+        }
     }
-    /// Exact token boundaries supplied by an API template. Consumed by the next request.
     pub fn set_prefix_cache_hints(&mut self, positions: Vec<usize>) {
-        self.0.prefix_hints = positions;
+        match &mut self.0 {
+            Implementation::Cuda(inner) => {
+                inner.prefix_hints = positions;
+            }
+            Implementation::Ascend(inner) => inner.set_prefix_cache_hints(positions),
+        }
     }
     pub fn generate(
         &mut self,
@@ -344,8 +477,12 @@ impl Model {
         cancelled: impl Fn() -> bool,
         emit: impl FnMut(u32) -> bool,
     ) -> Result<usize> {
-        self.0
-            .generate(input, None, limit, options, cancelled, emit)
+        match &mut self.0 {
+            Implementation::Cuda(inner) => {
+                inner.generate(input, None, limit, options, cancelled, emit)
+            }
+            Implementation::Ascend(inner) => inner.generate(input, limit, options, cancelled, emit),
+        }
     }
     pub fn generate_visual(
         &mut self,
@@ -356,8 +493,14 @@ impl Model {
         cancelled: impl Fn() -> bool,
         emit: impl FnMut(u32) -> bool,
     ) -> Result<usize> {
-        self.0
-            .generate(input, Some(images), limit, options, cancelled, emit)
+        match &mut self.0 {
+            Implementation::Cuda(inner) => {
+                inner.generate(input, Some(images), limit, options, cancelled, emit)
+            }
+            Implementation::Ascend(inner) => {
+                inner.generate_visual(input, images, limit, options, cancelled, emit)
+            }
+        }
     }
 }
 

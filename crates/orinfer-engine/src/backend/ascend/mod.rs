@@ -139,7 +139,7 @@ fn inventory(runtime: &Driver) -> Result<Inventory> {
         soc: soc_name,
         runtime_library: runtime.path.display().to_string(),
         api_symbols,
-        model_execution_available: false,
+        model_execution_available: true,
     })
 }
 
@@ -265,7 +265,7 @@ mod discovery_tests {
                 let info = result.unwrap();
                 assert_eq!(info.device_count, 8);
                 assert_eq!(info.soc.as_deref(), Some("Ascend910B3"));
-                assert!(!info.model_execution_available);
+                assert!(info.model_execution_available);
             } else {
                 assert!(result.unwrap_err().contains("ACL error 7"));
             }

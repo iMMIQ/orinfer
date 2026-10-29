@@ -1,0 +1,20 @@
+{# Plain-text DeepSeek V4.1 encoding. Special-token conventions: DeepSeek/MIT. #}
+{%- if tools %}{{ raise_exception('Native A2 text frontend does not render tool definitions') }}{% endif -%}
+{{- '<｜begin▁of▁sentence｜>' -}}
+{%- for message in messages -%}
+{%- if message.tool_calls %}{{ raise_exception('Native A2 text frontend does not render tool calls') }}{% endif -%}
+{%- if message.role == 'system' -%}
+{{- ('<｜System｜>' if not loop.first else '') + message.content -}}
+{%- elif message.role in ['user', 'developer'] -%}
+{{- '<｜User｜>' + message.content -}}
+{%- elif message.role == 'assistant' -%}
+{{- message.content + '<｜end▁of▁sentence｜>' -}}
+{%- else -%}
+{{- raise_exception('Native A2 text frontend requires system, user, developer or assistant messages') -}}
+{%- endif -%}
+{%- if message.role in ['user', 'developer'] or (message.role == 'system' and not loop.first) -%}
+{%- if loop.last or messages[loop.index].role == 'assistant' -%}
+{{- '<｜Assistant｜>' + ('<think>' if enable_thinking else '</think>') -}}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}

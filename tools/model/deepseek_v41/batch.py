@@ -241,7 +241,13 @@ def build(
                 parameters["table_rows"] = cap
             if module_name == "routing_parallel" and name == "prefix":
                 parameters["scan_rows"] = cap
-            for key in ("capacity", "compressed_capacity", "table_rows", "length"):
+            for key in (
+                "capacity",
+                "compressed_capacity",
+                "table_rows",
+                "length",
+                "logical_capacity",
+            ):
                 if key not in dynamic and parameters.get(key) in (old_capacity, old_capacity // 2):
                     parameters[key] = parameters[key] * capacity // old_capacity
             if module_name == "topk" and name == "merge":

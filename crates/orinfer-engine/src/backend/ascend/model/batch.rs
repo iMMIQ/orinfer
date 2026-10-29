@@ -32,6 +32,8 @@ pub(super) struct Contract {
     pub work_ranges: BTreeMap<String, WorkRange>,
     #[serde(default)]
     pub prefill_quantum: Option<usize>,
+    #[serde(default)]
+    pub state: Vec<super::state::StateLayout>,
 }
 impl Contract {
     pub(super) fn preferred_span(&self) -> usize {
@@ -72,7 +74,7 @@ struct TableKey {
     segments: Vec<(usize, usize)>,
     outputs: Vec<usize>,
 }
-struct BoundTables {
+pub(super) struct BoundTables {
     key: TableKey,
     retained: Vec<Buffer>,
 }
@@ -83,7 +85,7 @@ pub(super) struct Runtime {
     lru: VecDeque<Key>,
     capacity: usize,
     tables: BTreeMap<(bool, usize), TableUse>,
-    bound_tables: Option<BoundTables>,
+    pub(super) bound_tables: Option<BoundTables>,
 }
 struct TableUse {
     pointers: BTreeSet<String>,
@@ -736,6 +738,22 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
         let unique = c.private.iter().collect::<std::collections::BTreeSet<_>>();
         if unique.len() != c.private.len() {
             return Err("Duplicate private state role".into());
+        }
+        let mut state_roles = BTreeSet::new();
+        for state in &c.state {
+            if !state_roles.insert(&state.buffer) || !c.private.contains(&state.buffer) {
+                return Err("Snapshot state must name unique owner-private buffers".into());
+            }
+            let buffer = buffers
+                .get(state.buffer.as_str())
+                .ok_or("Missing snapshot state buffer")?;
+            if buffer.view.is_some()
+                || state.tokens_per_row == 0 && (state.circular || state.window.is_some())
+                || state.circular && state.window.is_none()
+            {
+                return Err("Invalid snapshot state geometry".into());
+            }
+            state.spans(model.capacity, buffer.bytes)?;
         }
         let mut parents = std::collections::BTreeSet::new();
         for name in &c.private {

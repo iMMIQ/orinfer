@@ -11,6 +11,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", type=int, default=7)
+    p.add_argument("--workspace-tiles", type=int, choices=(0, 64), default=0)
+    p.add_argument("--row-capacity", type=int, default=129)
+    p.add_argument("--rows", type=int, nargs="+", default=[1, 2, 17, 127, 128, 129])
+    p.add_argument("--position-start", type=int, default=0)
     p.add_argument("--compile-only", action="store_true")
     p.add_argument("--tile-rows", type=int, default=1)
     p.add_argument("--tile-s", type=int, default=64)
@@ -31,7 +35,11 @@ def main():
     torch.set_num_threads(4)
     if not args.compile_only:
         torch.npu.set_device(args.device)
-    capacity = 129
+    capacity = args.row_capacity
+    if not 1 <= min(args.rows) <= max(args.rows) <= capacity:
+        p.error("Invalid tested row extent")
+    if args.position_start < 0:
+        p.error("Causal positions must be nonnegative")
     reports = []
     for length in args.lengths:
         parameters = dict(
@@ -42,6 +50,7 @@ def main():
             vector_mask=args.vector_mask,
             direct_sum=args.direct_sum,
             prefetch_inputs=args.prefetch_inputs,
+            workspace_tiles=args.workspace_tiles,
         )
         shapes = [
             ("query", "i8", [capacity, 32, 128], "read"),
@@ -54,7 +63,15 @@ def main():
             (
                 "workspace",
                 "i32",
-                [capacity, 32, (length + args.tile_s - 1) // args.tile_s * args.tile_s],
+                [
+                    capacity,
+                    32,
+                    min(
+                        (length + args.tile_s - 1) // args.tile_s,
+                        args.workspace_tiles or (length + args.tile_s - 1) // args.tile_s,
+                    )
+                    * args.tile_s,
+                ],
                 "scratch",
             ),
         ]
@@ -67,6 +84,7 @@ def main():
             vector_mask=args.vector_mask,
             direct_sum=args.direct_sum,
             prefetch_inputs=args.prefetch_inputs,
+            workspace_tiles=args.workspace_tiles,
         )
         path = compile_kernel(
             function,
@@ -79,7 +97,9 @@ def main():
         if args.compile_only:
             continue
         ids = torch.arange(length).expand(capacity, -1)
-        ids = torch.where(ids <= torch.arange(capacity)[:, None], ids, -1).int()
+        ids = torch.where(
+            ids <= args.position_start + torch.arange(capacity)[:, None], ids, -1
+        ).int()
         inputs = [
             torch.randint(-127, 128, (capacity, 32, 128), dtype=torch.int8),
             (torch.rand(capacity, 32) * 0.01).half(),
@@ -103,7 +123,7 @@ def main():
         ]
         entry.restype = ctypes.c_int32
         pointers = (ctypes.c_void_p * len(tensors))(*[t.data_ptr() for t in tensors])
-        for rows in (1, 2, 17, 127, 128, 129):
+        for rows in args.rows:
             inputs[5] = ids.clone()
             tensors[5].copy_(inputs[5])
 
@@ -139,7 +159,13 @@ def main():
             graph.replay()
             check()
             reports.append(
-                dict(length=length, rows=rows, changed_input_graph=True, changed_scales_mask=True)
+                dict(
+                    length=length,
+                    rows=rows,
+                    position_start=args.position_start,
+                    changed_input_graph=True,
+                    changed_scales_mask=True,
+                )
             )
             print(reports[-1], flush=True)
     atomic_json(args.output / "validation.json", reports)
