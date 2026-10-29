@@ -321,15 +321,18 @@ struct W4Key {
 type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
 
 fn host_row_cache_budget() -> Result<usize> {
-    let mib = match std::env::var("ORINFER_A2_HOST_ROW_CACHE_MIB") {
+    host_memory_budget("ORINFER_A2_HOST_ROW_CACHE_MIB", 2048)
+}
+fn host_memory_budget(name: &str, default_mib: usize) -> Result<usize> {
+    let mib = match std::env::var(name) {
         Ok(value) => value
             .parse::<usize>()
-            .map_err(|_| "Invalid A2 host row cache MiB")?,
-        Err(std::env::VarError::NotPresent) => 2048,
-        Err(_) => return Err("Invalid A2 host row cache environment".into()),
+            .map_err(|_| format!("Invalid {name} MiB"))?,
+        Err(std::env::VarError::NotPresent) => default_mib,
+        Err(_) => return Err(format!("Invalid {name} environment")),
     };
     mib.checked_mul(1024 * 1024)
-        .ok_or_else(|| "Host row cache budget overflow".into())
+        .ok_or_else(|| format!("{name} budget overflow"))
 }
 struct Worker {
     session: Session,
@@ -644,26 +647,48 @@ impl Worker {
         let t = Instant::now();
         let tables = shared_tables
             .get_or_init(|| {
-                let mut tables = BTreeMap::new();
-                let table_budget = host_row_cache_budget()? / layout.layers.len().max(1);
+                let mut stores = BTreeMap::new();
                 for layer in &layout.layers {
                     let prefix = format!("layers.{}.engram.embed", layer.layer);
-                    tables.insert(
+                    stores.insert(
                         layer.layer,
-                        SharedInt8Rows::with_cache(
-                            Int8Rows::open(
-                                &checkpoint.path(&format!("{prefix}.weight"))?,
-                                &format!("{prefix}.weight"),
-                                &checkpoint.path(&format!("{prefix}.scale"))?,
-                                &format!("{prefix}.scale"),
-                                Shard {
-                                    first: 0,
-                                    rows: layer.rows,
-                                },
-                            )?,
-                            table_budget,
+                        Int8Rows::open(
+                            &checkpoint.path(&format!("{prefix}.weight"))?,
+                            &format!("{prefix}.weight"),
+                            &checkpoint.path(&format!("{prefix}.scale"))?,
+                            &format!("{prefix}.scale"),
+                            Shard {
+                                first: 0,
+                                rows: layer.rows,
+                            },
                         )?,
                     );
+                }
+                let mut resident_budget = host_memory_budget("ORINFER_A2_HOST_TABLE_MIB", 0)?;
+                let resident = resident_budget != 0;
+                let required =
+                    stores
+                        .values()
+                        .try_fold(0usize, |total, store| -> Result<usize> {
+                            total
+                                .checked_add(store.required_resident_bytes()?)
+                                .ok_or("Host table total extent overflow".into())
+                        })?;
+                if resident && required > resident_budget {
+                    return Err("A2 resident host tables exceed configured budget".into());
+                }
+                let table_budget = if resident {
+                    0
+                } else {
+                    host_row_cache_budget()? / layout.layers.len().max(1)
+                };
+                let mut tables = BTreeMap::new();
+                for (layer, mut store) in stores {
+                    if resident {
+                        store = store.into_resident(resident_budget)?;
+                        resident_budget -= store.resident_bytes();
+                    }
+                    tables.insert(layer, SharedInt8Rows::with_cache(store, table_budget)?);
                 }
                 Ok(Arc::new(tables))
             })

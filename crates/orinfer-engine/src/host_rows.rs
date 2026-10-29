@@ -105,6 +105,7 @@ struct Plane {
     start: usize,
     row_bytes: usize,
     rows: usize,
+    resident: Option<(usize, Vec<u8>)>,
 }
 impl Plane {
     fn open(path: &Path, tensor: &str, dtype: Dtype) -> Result<Self> {
@@ -126,7 +127,31 @@ impl Plane {
             start,
             row_bytes,
             rows,
+            resident: None,
         })
+    }
+    fn load_rows(&mut self, first: usize, rows: usize) -> Result<()> {
+        use rayon::prelude::*;
+        use std::os::unix::fs::FileExt;
+        let bytes = rows
+            .checked_mul(self.row_bytes)
+            .ok_or("Resident host table extent overflow")?;
+        let offset = first
+            .checked_mul(self.row_bytes)
+            .and_then(|v| self.start.checked_add(v))
+            .ok_or("Resident host table offset overflow")?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(bytes).map_err(|e| e.to_string())?;
+        data.resize(bytes, 0);
+        data.par_chunks_mut(32 << 20)
+            .enumerate()
+            .try_for_each(|(chunk, target)| {
+                self.file
+                    .read_exact_at(target, (offset + chunk * (32 << 20)) as u64)
+                    .map_err(|e| e.to_string())
+            })?;
+        self.resident = Some((first, data));
+        Ok(())
     }
     /// pread one row into an exact slice. ZFS mmap page-fault readiness
     /// contends badly when several rank threads randomly read a
@@ -136,6 +161,17 @@ impl Plane {
         use std::os::unix::fs::FileExt;
         if target.len() != self.row_bytes {
             return Err("Host-row read target extent differs".into());
+        }
+        if let Some((first, data)) = &self.resident {
+            let begin = row
+                .checked_sub(*first)
+                .and_then(|v| v.checked_mul(self.row_bytes))
+                .ok_or("Resident host row outside table")?;
+            let source = data
+                .get(begin..begin + target.len())
+                .ok_or("Resident host row outside table")?;
+            target.copy_from_slice(source);
+            return Ok(());
         }
         let begin = self.start + row * self.row_bytes;
         self.file
@@ -169,6 +205,7 @@ pub struct HostRowCacheStatistics {
     pub unique_row_reads: u64,
     pub entries: usize,
     pub reserved_bytes: usize,
+    pub resident_bytes: usize,
 }
 struct SharedState {
     last: Option<RowBatch>,
@@ -206,6 +243,7 @@ impl SharedInt8Rows {
     pub fn statistics(&self) -> Result<HostRowCacheStatistics> {
         let state = self.state.lock().map_err(|_| "Host cache poisoned")?;
         let mut statistics = state.statistics.clone();
+        statistics.resident_bytes = self.store.resident_bytes();
         if let Some(cache) = &state.cache {
             statistics.entries = cache.entries();
             statistics.reserved_bytes = cache.bytes();
@@ -295,6 +333,44 @@ impl Int8Rows {
     pub fn row_bytes(&self) -> usize {
         self.row_bytes
     }
+    /// Payload and bounded allocation overhead for this shard, without staging.
+    pub fn required_resident_bytes(&self) -> Result<usize> {
+        usize::try_from(self.shard.rows)
+            .ok()
+            .and_then(|rows| rows.checked_mul(self.row_bytes))
+            .and_then(|bytes| bytes.checked_add(4096 + std::mem::size_of::<Self>()))
+            .ok_or_else(|| "Resident host table budget overflow".into())
+    }
+    pub fn resident_bytes(&self) -> usize {
+        match (&self.weight.resident, &self.scale.resident) {
+            (Some((_, weight)), Some((_, scale))) => {
+                weight.capacity() + scale.capacity() + 4096 + std::mem::size_of::<Self>()
+            }
+            _ => 0,
+        }
+    }
+    /// Read the immutable shard once at startup. Both planes keep their exact
+    /// checkpoint bytes; shared workers retain this one owner through Arc.
+    pub fn into_resident(mut self, budget: usize) -> Result<Self> {
+        if self.required_resident_bytes()? > budget {
+            return Err("Resident host table exceeds its budget".into());
+        }
+        if self.resident_bytes() != 0 {
+            return if self.resident_bytes() <= budget {
+                Ok(self)
+            } else {
+                Err("Resident host table allocation exceeds its budget".into())
+            };
+        }
+        let first = usize::try_from(self.shard.first).map_err(|_| "Host shard offset overflow")?;
+        let rows = usize::try_from(self.shard.rows).map_err(|_| "Host shard extent overflow")?;
+        self.weight.load_rows(first, rows)?;
+        self.scale.load_rows(first, rows)?;
+        if self.resident_bytes() > budget {
+            return Err("Resident host table allocation exceeds its budget".into());
+        }
+        Ok(self)
+    }
     /// Packet layout follows query order, with INT8 values followed by FP32 scales.
     /// All IDs and the budget are checked before modifying the destination.
     /// Rows resolve in parallel: the backing table is a random-read store,
@@ -378,6 +454,36 @@ impl Int8Rows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resident_chunks_keep_offsets_tails_and_owned_bytes() {
+        use std::os::unix::fs::FileExt;
+        let rows = (64 << 20) + 17;
+        let mut plane = Plane {
+            file: tempfile::tempfile().unwrap(),
+            start: 7,
+            row_bytes: 1,
+            rows: rows + 3,
+            resident: None,
+        };
+        plane
+            .file
+            .set_len((plane.start + plane.rows) as u64)
+            .unwrap();
+        let positions = [0, (32 << 20) - 1, 32 << 20, (64 << 20) - 1, rows - 1];
+        for (i, position) in positions.into_iter().enumerate() {
+            plane
+                .file
+                .write_all_at(&[i as u8 + 1], (10 + position) as u64)
+                .unwrap();
+        }
+        plane.load_rows(3, rows).unwrap();
+        plane.file.set_len(0).unwrap();
+        for (i, position) in positions.into_iter().enumerate() {
+            let mut actual = [0];
+            plane.read_row_at(3 + position, &mut actual).unwrap();
+            assert_eq!(actual, [i as u8 + 1]);
+        }
+    }
     #[test]
     fn stable_deduplication_preserves_query_order_and_empty_ranks() {
         let ids = [9, 0, 9, 4, 1, 4, 8];
@@ -527,6 +633,51 @@ mod tests {
             }
         });
         assert_eq!(cached.statistics().unwrap().unique_row_reads, 4);
+        let shard = Shard::for_rank(4, 2, 1).unwrap();
+        assert!(
+            Int8Rows::open(&w, "w", &s, "s", shard)
+                .unwrap()
+                .into_resident(35)
+                .is_err()
+        );
+        let rows = Int8Rows::open(&w, "w", &s, "s", shard).unwrap();
+        let budget = rows.required_resident_bytes().unwrap();
+        let resident = rows.into_resident(budget).unwrap();
+        assert!(resident.resident_bytes() <= budget);
+        let resident = resident.into_resident(budget).unwrap();
+        // Destroy the test payload, including any still-open file descriptors.
+        File::create(&w).unwrap();
+        File::create(&s).unwrap();
+        std::fs::remove_file(w).unwrap();
+        std::fs::remove_file(s).unwrap();
+        let shared = Arc::new(SharedInt8Rows::with_cache(resident, 0).unwrap());
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    let ids = if i % 2 == 0 { [3, 2, 3] } else { [2, 3, 2] };
+                    let bytes = shared.gather(&ids, 108).unwrap();
+                    (ids, bytes)
+                })
+            })
+            .collect();
+        for worker in workers {
+            let (ids, bytes) = worker.join().unwrap();
+            let wanted: Vec<u8> = ids
+                .iter()
+                .flat_map(|&row| {
+                    let row = row as usize;
+                    weights[row * 32..(row + 1) * 32]
+                        .iter()
+                        .chain(&scales[row * 4..(row + 1) * 4])
+                        .copied()
+                })
+                .collect();
+            assert_eq!(*bytes, wanted);
+        }
+        assert!(shared.gather(&[0], 36).is_err());
+        assert_eq!(shared.statistics().unwrap().reserved_bytes, 0);
+        assert_eq!(shared.statistics().unwrap().resident_bytes, budget);
         let reordered = cached.gather(&[2, 3, 0, 2], 144).unwrap();
         assert_eq!(&reordered[..36], &first[72..108]);
         assert_eq!(&reordered[36..72], &first[..36]);
