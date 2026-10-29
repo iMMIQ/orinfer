@@ -172,10 +172,16 @@ impl AssetReader {
             }
             mapping[start + begin..start + end].to_vec()
         } else {
-            fs::read(canonical).map_err(|e| format!("{}: {e}", id.file))?
+            fs::read(&canonical).map_err(|e| format!("{}: {e}", id.file))?
         };
-        if sha256(&data) != id.sha256 {
-            return Err(format!("{}: sha256 mismatch", id.file));
+        let actual = sha256(&data);
+        if actual != id.sha256 {
+            return Err(format!(
+                "{}: sha256 mismatch (expected {}, got {actual}, {} bytes)",
+                canonical.display(),
+                id.sha256,
+                data.len()
+            ));
         }
         Ok(data)
     }
