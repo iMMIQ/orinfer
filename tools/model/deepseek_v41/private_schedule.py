@@ -17,6 +17,99 @@ from pathlib import Path
 from tools.build.files import atomic_json, file_hash
 from tools.model.deepseek_v41.batch import DTYPES, SIZES, compile_task
 from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+from tools.model.row_selection import guarded_winner
+
+
+def select_schedule(
+    reports,
+    operator,
+    parameter,
+    defaults,
+    geometries,
+    source_sha256,
+    measurement_sha256,
+    maximum_regression=0.1,
+):
+    """Choose one same-source tile and one measured small-owner boundary.
+
+    Complete 1..128 measurements protect the small-owner domain. Larger rows
+    share one configuration, with a per-case guard across every geometry and
+    length in the supplied record. The existing work ranges publish the choice.
+    """
+    reference = defaults[parameter]
+
+    def geometry(parameters):
+        p = dict(defaults, **{k: v for k, v in parameters.items() if not k.startswith("_")})
+        p.pop("rows", None)
+        p.pop(parameter)
+        return json.dumps(p, sort_keys=True)
+
+    expected = {geometry(p) for p in geometries}
+    groups = {}
+    for report in reports:
+        if report["op"] != operator:
+            continue
+        if (
+            report["source_sha256"] != source_sha256
+            or (report.get("measurement_identity") or {}).get("measurement_source_sha256")
+            != measurement_sha256
+            or not all(report.get(k) for k in ("exact_reference", "graph_replay", "changed_owners"))
+        ):
+            raise ValueError("Tuning record lacks current-source numerical/Graph validation")
+        p = report["parameters"]
+        key = geometry(p)
+        config = json.dumps(p.get(parameter, reference))
+        measured = {r["rows"]: r["milliseconds"] for r in report["measurements"]}
+        if (
+            len(measured) != len(report["measurements"])
+            or not set(range(1, 129)) <= measured.keys()
+        ):
+            raise ValueError("Tuning needs unique complete small-owner measurements1..128")
+        variants = groups.setdefault(key, {})
+        if config in variants:
+            raise ValueError("Duplicate measured private schedule")
+        variants[config] = measured
+    if set(groups) != expected or not expected:
+        raise ValueError("Measured private geometries differ from the model")
+    variants = next(iter(groups.values()))
+    configs, lengths = set(variants), set(next(iter(variants.values())))
+    capacity = max(p["rows"] for p in geometries)
+    if capacity not in lengths or any(
+        not isinstance(r, int) or not 1 <= r <= capacity for r in lengths
+    ):
+        raise ValueError("Private tuning must cover the model capacity and valid row domain")
+    if any(
+        set(v) != configs or any(set(m) != lengths for m in v.values()) for v in groups.values()
+    ):
+        raise ValueError("Private schedules need matching configurations and row lengths")
+    baseline = json.dumps(reference)
+    if baseline not in configs:
+        raise ValueError("Missing original private schedule measurements")
+    if any(p.get(parameter, reference) != reference for p in geometries):
+        raise ValueError("Private tuning requires one original reference configuration")
+    policies = [(baseline, 1)] + [
+        (config, first) for config in sorted(configs - {baseline}) for first in range(1, 130)
+    ]
+    cases = [
+        dict(
+            rows=rows,
+            times={
+                str(i): measured[config if rows >= first else baseline][rows]
+                for i, (config, first) in enumerate(policies)
+            },
+        )
+        for measured in groups.values()
+        for rows in sorted(lengths)
+    ]
+    chosen = int(guarded_winner(cases, maximum_regression=maximum_regression))
+    config, first = policies[chosen]
+    return dict(
+        parameters={parameter: json.loads(config)},
+        first_owner_rows=first,
+        geometries=len(groups),
+        measured_lengths=sorted(lengths),
+        maximum_regression=maximum_regression,
+    )
 
 
 def reusable_long_gathers(rank, contract, describe):
@@ -126,7 +219,9 @@ def reusable_long_gathers(rank, contract, describe):
     return selected
 
 
-def rebuild(plan, output, operator, overrides, first, *, reuse_long_kv=False):
+def rebuild(
+    plan, output, operator, overrides, first, *, reuse_long_kv=False, measured_identity=None
+):
     from kernels.model.rows import row_count
     from tools.operators.ascend.private_rows import indirect
     from tools.operators.ascend.geometry import physical_shapes
@@ -276,6 +371,13 @@ def rebuild(plan, output, operator, overrides, first, *, reuse_long_kv=False):
                             )
                         )
                         replacements[key] = manifest
+                        if measured_identity is not None:
+                            compiled = describe(manifest)
+                            identity = {k: compiled[k] for k in measured_identity}
+                            if identity != measured_identity:
+                                raise ValueError(
+                                    "Measured source/compiler/target differs from compilation"
+                                )
                     schedules[signature] = key, grid
                 if extent["min_rows"] < lower:
                     short = deepcopy(original)
@@ -323,19 +425,85 @@ def main():
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--operator", required=True)
-    parser.add_argument("--parameters", type=json.loads, required=True)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--parameters", type=json.loads)
+    selection.add_argument("--tuning-record", type=Path)
+    parser.add_argument("--tuning-parameter")
+    parser.add_argument("--maximum-regression", type=float, default=0.1)
     parser.add_argument("--min-owner-rows", type=int, default=1)
     parser.add_argument("--reuse-long-kv", action="store_true")
     args = parser.parse_args()
+    selected = None
+    measured_identity = None
+    if args.tuning_record:
+        if not args.tuning_parameter or args.min_owner_rows != 1 or args.reuse_long_kv:
+            parser.error(
+                "Tuning selection requires one parameter and the complete reference domain"
+            )
+        module_name, name = args.operator.split(".")
+        module = importlib.import_module("tools.operators.ascend." + module_name)
+        factory = getattr(module, name)
+        defaults = {
+            k: p.default
+            for k, p in inspect.signature(factory).parameters.items()
+            if p.default is not inspect.Parameter.empty
+        }
+        if args.tuning_parameter not in defaults:
+            parser.error("Tuning parameter requires a factory default")
+        model = json.loads(args.plan.read_text())
+        descriptions, geometries = {}, []
+        for packet in model["ranks"][0]["packets"]:
+            if packet.get("batch_decode"):
+                continue
+            for step in packet["body"]:
+                if step["op"] != "kernel":
+                    continue
+                path = step["manifest"]
+                if path not in descriptions:
+                    descriptions[path] = json.loads((args.plan.parent / path).read_text())
+                spec = descriptions[path]
+                if spec["op"] == "private_rows." + args.operator.replace(".", "_"):
+                    geometries.append(spec["parameters"])
+        from tools.operators.ascend.validate_private_rows import measurement_source
+
+        reports = json.loads(args.tuning_record.read_text())
+        for report in reports:
+            if report["op"] != args.operator:
+                continue
+            path = Path(report["private_manifest"])
+            if file_hash(path) != report["measurement_identity"]["manifest_sha256"]:
+                raise ValueError("Measured private manifest changed")
+            spec = json.loads(path.read_text())
+            identity = {k: spec[k] for k in ("source_sha256", "compiler", "target")}
+            if measured_identity is not None and identity != measured_identity:
+                raise ValueError("Private tuning candidates have different compiler identities")
+            measured_identity = identity
+        selected = select_schedule(
+            reports,
+            args.operator,
+            args.tuning_parameter,
+            defaults,
+            geometries,
+            file_hash(Path(inspect.getfile(factory))),
+            measurement_source(),
+            args.maximum_regression,
+        )
+        args.parameters, args.min_owner_rows = selected["parameters"], selected["first_owner_rows"]
+    elif args.tuning_parameter:
+        parser.error("--tuning-parameter requires --tuning-record")
     print(
         json.dumps(
-            rebuild(
-                args.plan,
-                args.output,
-                args.operator,
-                args.parameters,
-                args.min_owner_rows,
-                reuse_long_kv=args.reuse_long_kv,
+            dict(
+                rebuild(
+                    args.plan,
+                    args.output,
+                    args.operator,
+                    args.parameters,
+                    args.min_owner_rows,
+                    reuse_long_kv=args.reuse_long_kv,
+                    measured_identity=measured_identity,
+                ),
+                selection=selected,
             )
         ),
         flush=True,

@@ -10,7 +10,109 @@ from tools.model.deepseek_v41.converge import compact_buffers, publish_package, 
 from tools.model.row_contract import expression, resolve
 from tools.model.row_selection import aggregate_winner, bounded_choices, guarded_winner
 from tools.model.deepseek_v41.sequence_parallel import external_reads
-from tools.model.deepseek_v41.private_schedule import reusable_long_gathers
+from tools.model.deepseek_v41.private_schedule import reusable_long_gathers, select_schedule
+
+
+class PrivateScheduleSelectionTests(unittest.TestCase):
+    def fixture(self):
+        rows = list(range(1, 129)) + [129, 512, 800, 2048]
+        reports = []
+        for selected in (128, 640):
+            for tile in (32, 128, 256):
+                reports.append(
+                    dict(
+                        op="attention_cube.pv",
+                        source_sha256="source",
+                        exact_reference=True,
+                        graph_replay=True,
+                        changed_owners=True,
+                        measurement_identity=dict(measurement_source_sha256="measure"),
+                        parameters=dict(rows=2048, heads=8, selected=selected, tile_d=tile),
+                        measurements=[
+                            dict(
+                                rows=r,
+                                milliseconds=(
+                                    1.3
+                                    if selected == 640
+                                    and ((tile == 128 and r == 1) or (tile == 256 and r == 17))
+                                    else 32 / tile
+                                ),
+                            )
+                            for r in rows
+                        ],
+                    )
+                )
+        return reports
+
+    def select(self, reports, **kw):
+        return select_schedule(
+            reports,
+            "attention_cube.pv",
+            "tile_d",
+            dict(dimension=512, tile_d=32),
+            [dict(rows=2048, heads=8, selected=s) for s in (128, 640)],
+            "source",
+            "measure",
+            **kw,
+        )
+
+    def test_one_guarded_configuration_and_complete_small_owner_boundary(self):
+        result = self.select(self.fixture())
+        self.assertEqual(result["parameters"], dict(tile_d=256))
+        self.assertEqual(result["first_owner_rows"], 18)
+        self.assertEqual(result["geometries"], 2)
+
+    def test_missing_interior_rows_or_capacity_cannot_publish_a_general_schedule(self):
+        for missing in (57, 2048):
+            reports = self.fixture()
+            for report in reports:
+                report["measurements"] = [x for x in report["measurements"] if x["rows"] != missing]
+            with self.assertRaises(ValueError):
+                self.select(reports)
+
+    def test_stale_source_or_measurement_and_missing_validation_are_rejected(self):
+        for field in ("source_sha256", "exact_reference", "graph_replay", "changed_owners"):
+            reports = self.fixture()
+            reports[0][field] = False
+            with self.assertRaisesRegex(ValueError, "current-source"):
+                self.select(reports)
+        reports = self.fixture()
+        reports[0]["measurement_identity"]["measurement_source_sha256"] = "stale"
+        with self.assertRaisesRegex(ValueError, "current-source"):
+            self.select(reports)
+
+    def test_duplicate_and_inconsistent_cases_or_geometries_are_rejected(self):
+        reports = self.fixture()
+        reports.append(deepcopy(reports[0]))
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            self.select(reports)
+        reports = self.fixture()
+        reports[0]["measurements"].append(reports[0]["measurements"][0])
+        with self.assertRaises(ValueError):
+            self.select(reports)
+        reports = self.fixture()
+        reports[0]["measurements"].append(dict(rows=1024, milliseconds=1))
+        with self.assertRaisesRegex(ValueError, "matching"):
+            self.select(reports)
+        with self.assertRaisesRegex(ValueError, "geometries"):
+            self.select(self.fixture()[:3])
+
+    def test_no_measured_safe_improvement_keeps_the_original(self):
+        reports = self.fixture()
+        for report in reports:
+            for item in report["measurements"]:
+                item["milliseconds"] = 1 if report["parameters"]["tile_d"] == 32 else 2
+        result = self.select(reports)
+        self.assertEqual(result["parameters"], dict(tile_d=32))
+        self.assertEqual(result["first_owner_rows"], 1)
+
+    def test_nonfinite_timings_and_regression_bounds_are_rejected(self):
+        reports = self.fixture()
+        reports[0]["measurements"][0]["milliseconds"] = float("nan")
+        with self.assertRaises(ValueError):
+            self.select(reports)
+        with self.assertRaises(ValueError):
+            self.select(self.fixture(), maximum_regression=float("nan"))
 
 
 class LongGatherReuseTests(unittest.TestCase):

@@ -4,7 +4,20 @@ import argparse
 import ctypes
 from pathlib import Path
 
-from tools.build.files import atomic_json, file_hash
+from tools.build.files import atomic_json, file_hash, source_hash
+
+
+def measurement_source():
+    root = Path(__file__).resolve().parents[3]
+    return source_hash(
+        root,
+        [
+            Path(__file__).resolve(),
+            root / "tools/model/tuning.py",
+            root / "tools/model/deepseek_v41/tune.py",
+            root / "tools/model/row_contract.py",
+        ],
+    )
 
 
 def main():
@@ -12,7 +25,9 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--owners", type=int, default=3)
-    p.add_argument("--rows", type=int, nargs="+", help="Owner row lengths for KV gather checks")
+    p.add_argument("--rows", type=int, nargs="+", help="Owner row lengths for gather or Cube PV")
+    p.add_argument("--pv-tile-d", type=int, nargs="+", choices=(32, 64, 128, 256), default=[32])
+    p.add_argument("--benchmark-rows", type=int, nargs="+", help="Measure single-owner PV lengths")
     p.add_argument("--kv-compressed", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--bulk-store", action="store_true")
     p.add_argument(
@@ -25,9 +40,14 @@ def main():
     if a.rows and (
         len(a.rows) != a.owners
         or not 1 <= min(a.rows) <= max(a.rows) <= 2048
-        or a.op != ["kv_int8.gather_attention"]
+        or a.op not in (["kv_int8.gather_attention"], ["attention_cube.pv"])
     ):
-        p.error("--rows requires one 1..2048 length per owner and --op kv_int8.gather_attention")
+        p.error("--rows requires one 1..2048 length per owner and a gather or Cube PV --op")
+    if a.benchmark_rows and (
+        a.op != ["attention_cube.pv"]
+        or not 1 <= min(a.benchmark_rows) <= max(a.benchmark_rows) <= 2048
+    ):
+        p.error("--benchmark-rows requires --op attention_cube.pv and lengths in1..2048")
     if a.reuse_long and (a.op != ["kv_int8.gather_attention"] or a.kv_compressed is not True):
         p.error("--reuse-long requires --op kv_int8.gather_attention --kv-compressed")
     import torch
@@ -47,7 +67,7 @@ def main():
     torch.set_num_threads(4)
     torch.manual_seed(20261002)
     torch.npu.set_device(a.device)
-    capacity, owners = max(a.rows) if a.rows else 16, 128
+    capacity, owners = max((a.rows or [16]) + (a.benchmark_rows or [])), 128
     kinds = {
         "int32": ("i32", torch.int32),
         "int8": ("i8", torch.int8),
@@ -57,8 +77,11 @@ def main():
     }
     report = []
     for module, name, params in [
-        (attention_cube, "pv", dict(rows=capacity, heads=8, selected=128)),
-        (attention_cube, "pv", dict(rows=capacity, heads=8, selected=640)),
+        *[
+            (attention_cube, "pv", dict(rows=capacity, heads=8, selected=selected, tile_d=tile))
+            for selected in (128, 640)
+            for tile in a.pv_tile_d
+        ],
         (kv_int8, "scatter", dict(rows=capacity, table_rows=256)),
         *[
             (
@@ -119,16 +142,19 @@ def main():
             )
             for t, shape in zip(tensors, shapes, strict=True)
         ]
-        reference_function = (
-            factory(**dict(params, reuse_long=False, rows=row_count(capacity, True)))
-            if a.reuse_long
-            else function
+        reference_params = dict(params)
+        if a.reuse_long:
+            reference_params["reuse_long"] = False
+        if module is attention_cube and name == "pv":
+            reference_params["tile_d"] = 32
+        reference_function = factory(
+            **dict(reference_params, **{row_key: row_count(capacity, True)})
         )
         reference = compile_kernel(
             reference_function,
             module.__name__.split(".")[-1] + "." + name,
             specs,
-            dict(params, reuse_long=False) if a.reuse_long else params,
+            reference_params,
             a.output / "cache",
             row_capacity=capacity,
         )
@@ -259,7 +285,7 @@ def main():
             call(1, [work, pointers, active], m)
         active.fill_(1)
         sequences = [(order, lengths), (list(reversed(order)), lengths)]
-        if name == "gather_attention":
+        if name == "gather_attention" or module is attention_cube:
             sequences.append((list(reversed(order)), lengths))
         for phase, (order, lengths) in enumerate(sequences):
             assert tables(order, lengths) == m
@@ -274,6 +300,17 @@ def main():
                             value.neg_()
                             want.copy_(value)
                         elif tensor.name in ("swa_scales", "long_scales"):
+                            value.mul_(0.5)
+                            want.copy_(value)
+            if module is attention_cube and phase == 2:
+                for owner in range(a.owners):
+                    for tensor, value, want in zip(
+                        tensors, data[owner], expected[owner], strict=True
+                    ):
+                        if tensor.name == "kv":
+                            value.neg_()
+                            want.copy_(value)
+                        elif tensor.name == "probabilities":
                             value.mul_(0.5)
                             want.copy_(value)
             for owner in range(a.owners):
@@ -402,6 +439,38 @@ def main():
 
             timing, measured = npu_benchmark(lambda: call(1, [work, pointers, active], m), 7, 2)
             del measured
+        measurements = []
+        identity = None
+        if a.benchmark_rows:
+            from tools.model.deepseek_v41.tune import npu_benchmark
+            from tools.model.tuning import measure, read_record, record_path
+
+            identity = dict(
+                manifest_sha256=file_hash(private),
+                rows=sorted(set(a.benchmark_rows)),
+                device=torch.npu.get_device_name(a.device),
+                torch_version=str(torch.__version__),
+                seed=20261002,
+                budget_ms=25,
+                max_repetitions=11,
+                measurement_source_sha256=measurement_source(),
+            )
+            record = record_path(a.output / "tuning", identity)
+            record.parent.mkdir(parents=True, exist_ok=True)
+            cached = read_record(record, identity)
+            if cached is not None:
+                measurements = cached["measurements"]
+            else:
+                for length in identity["rows"]:
+                    live = tables([0], [length])
+                    elapsed = measure(
+                        lambda: call(1, [work, pointers, active], live),
+                        budget_ms=identity["budget_ms"],
+                        max_repetitions=identity["max_repetitions"],
+                        benchmark=npu_benchmark,
+                    )
+                    measurements.append(dict(rows=length, milliseconds=elapsed))
+                atomic_json(record, dict(identity=identity, measurements=measurements))
         report.append(
             dict(
                 op=module.__name__.split(".")[-1] + "." + name,
@@ -416,6 +485,8 @@ def main():
                 source_sha256=file_hash(Path(module.__file__)),
                 parameters=params,
                 graph_timing=timing,
+                measurements=measurements,
+                measurement_identity=identity,
             )
         )
         print(report[-1], flush=True)

@@ -518,4 +518,18 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 
 上述 `private_schedule` 命令使用 `--parameters '{}' --reuse-long-kv` 时，在同一 prefill packet 内复用已经转换的长 KV；每层继续更新私有的 128 个 SWA slot。离线检查共享 bank、scale、选中索引、输出及 mask 的指针列和行布局，遇到相关写入或别名写入时重新完整转换。每个 packet 的首次读取、owner range 未覆盖部分和未知指令后的读取均执行完整转换。所有配置复用 `kv_int8.gather_attention`，保持原始 INT8／FP16 scale 到 BF16 的边界，普通 decode 保留原绑定。`validate_private_rows --op kv_int8.gather_attention --kv-compressed --bulk-store --reuse-long --rows 1 17 129` 对照完整 gather，覆盖初始化后 SWA 改变、反向 owner、尾部和 Graph replay。
 
+Cube PV 的输出列 tile 通过同一算子工厂与离线测量选择。下面的验证对照原 32 维 tile，检查完整输出、FP32 workspace、反向 owner、原地址数据改变和 Graph replay；测量覆盖连续 1–128 行、容量上限及常见大分块两侧：
+
+```bash
+bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate_private_rows \
+  --output PV_TUNING --op attention_cube.pv --owners 3 --rows 1 17 129 \
+  --pv-tile-d 32 64 128 256 \
+  --benchmark-rows {1..129} 255 256 257 511 512 513 799 800 801 1023 1024 1025 2047 2048
+bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.private_schedule \
+  --plan PLAN --output OUTPUT --operator attention_cube.pv \
+  --tuning-record PV_TUNING/result.json --tuning-parameter tile_d --maximum-regression 0.1
+```
+
+该入口复用共享调优缓存、Graph 测量及逐样本回退约束，选择一个动态配置和至多一个小 owner 边界；回退约束覆盖记录中的实测点。测量、算子及编译辅助源码、编译器和目标身份均参与检查，缺少数值验证、连续小行数或容量上限时拒绝发布。新包只保留被选中的资产，普通 decode 保留原绑定。PV 的 BF16 概率、每 128 个 KV slot 的 FP32 累加与 BF16 输出边界保持一致，发布前继续验收完整模型请求及 2048／2049 等尾部。
+
 `bench-ascend-batch` 的显式 `frames` 可携带 `decode:true` 和固定 token 历史；阶段时间与 decode 输出计数跟随 frame 角色。比较 decode 调度时保持相同输入历史，并单独保留自由生成结果。
