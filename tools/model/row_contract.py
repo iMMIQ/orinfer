@@ -5,6 +5,39 @@ import ast
 from tools.operators.abi import evaluate
 
 
+def resolve(value, rows, depth=0):
+    """Evaluate the SDK's checked u32 row expressions during offline validation."""
+    if type(rows) is not int or not 1 <= rows <= 0xFFFFFFFF or depth > 32:
+        raise ValueError("Invalid row expression extent or depth")
+    op = value.get("op")
+    if op == "rows" and set(value) == {"op"}:
+        return rows
+    if op == "constant" and set(value) == {"op", "value"}:
+        result = value["value"]
+    elif op in ("add", "subtract", "multiply", "divide", "remainder", "minimum") and set(value) == {
+        "op",
+        "lhs",
+        "rhs",
+    }:
+        left = resolve(value["lhs"], rows, depth + 1)
+        right = resolve(value["rhs"], rows, depth + 1)
+        if op in ("divide", "remainder") and right == 0:
+            raise ValueError("Row expression divides by zero")
+        result = {
+            "add": lambda: left + right,
+            "subtract": lambda: left - right,
+            "multiply": lambda: left * right,
+            "divide": lambda: left // right,
+            "remainder": lambda: left % right,
+            "minimum": lambda: min(left, right),
+        }[op]()
+    else:
+        raise ValueError("Unknown row expression contract")
+    if type(result) is not int or not 0 <= result <= 0xFFFFFFFF:
+        raise ValueError("Row expression arithmetic exceeds u32")
+    return result
+
+
 def expression(source, row_multiplier=1, constants=None):
     def visit(node):
         if isinstance(node, ast.Name) and constants and node.id in constants:

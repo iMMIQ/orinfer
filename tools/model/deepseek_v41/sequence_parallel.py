@@ -7,6 +7,7 @@ native collective candidate, whose floating reduction order needs validation.
 """
 
 import argparse
+import importlib
 from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 import json
@@ -15,9 +16,36 @@ import multiprocessing
 from pathlib import Path
 
 from tools.build.files import atomic_json
+from tools.model.row_contract import expression
 
 SIZES = {"i8": 1, "i32": 4, "bf16": 2, "f16": 2, "f32": 4}
 NAMES = {"bf16": "bfloat16", "f32": "float32"}
+
+
+def external_reads(program, candidates, descriptor):
+    """Find consumers of each local output before its next global overwrite."""
+    live, required = set(candidates), set()
+    for step in program:
+        if not live:
+            break
+        if step["op"] == "kernel":
+            ports = list(zip(step["buffers"], descriptor(step)["operands"], strict=True))
+            required.update(
+                name
+                for name, port in ports
+                if name in live and port["access"] in ("read", "read_write")
+            )
+            live.difference_update(name for name, port in ports if port["access"] != "read")
+        elif step["op"] in ("gather", "reduce"):
+            if step["source"] in live:
+                required.add(step["source"])
+            live.discard(step["destination"])
+        elif step["op"] == "snapshot" and step["buffer"] in live:
+            required.add(step["buffer"])
+        elif step["op"] == "w4":
+            required.update(live.intersection(step["buffers"][:5]))
+            live.discard(step["buffers"][5])
+    return required
 
 
 def main():
@@ -29,6 +57,9 @@ def main():
     parser.add_argument("--reduce-scatter", action="store_true")
     parser.add_argument("--shared-attention", action="store_true")
     parser.add_argument(
+        "--fixed-capacity", action="store_true", help="Build the legacy capacity-padded reference"
+    )
+    parser.add_argument(
         "--decoder-tail",
         action="store_true",
         help="Shard the compacted decoder rows using the same private-row templates",
@@ -38,10 +69,13 @@ def main():
         parser.error("Input and output must share their asset directory")
     from tools.model.deepseek_v41.build import compile_task
     from tools.operators.ascend.build import operand
+    from tools.operators.ascend.geometry import physical_shapes
+    from kernels.model.rows import row_count
 
     base = args.plan.parent
     model = json.loads(args.plan.read_text())
     tasks, descriptors = {}, {}
+    geometries = {}
 
     def descriptor(step):
         path = step["manifest"]
@@ -74,10 +108,8 @@ def main():
             replay_packets = [
                 p for p in rank["packets"] if any(s["op"] == "limit_rows" for s in p["body"])
             ]
-            if not replay_packets or args.shared_attention:
-                raise ValueError(
-                    "Decoder SP needs compacted packets and its existing attention projections"
-                )
+            if not replay_packets:
+                raise ValueError("Decoder SP needs compacted packets")
             packet = deepcopy(replay_packets[-1])
             boundary = next(i for i, s in enumerate(packet["body"]) if s["op"] == "limit_rows")
             packet["rows"] = packet["body"][boundary]["rows"]
@@ -90,7 +122,11 @@ def main():
                     packet["coordinates"][key] = f"replay{packet['rows']}." + source
             packets = [packet]
         else:
-            packets = [p for p in rank["packets"] if p.get("min_rows", 0) >= 512]
+            packets = [
+                p
+                for p in rank["packets"]
+                if p.get("min_rows", 0) > 0 and p.get("max_rows", p["rows"]) == p["rows"]
+            ]
         if len(packets) != 1:
             raise ValueError("Expected one selected large-row packet")
         packet = packets[0]
@@ -119,27 +155,31 @@ def main():
                 raise ValueError("Conflicting sequence buffer: " + name)
             return name
 
-        def narrow_shape(shape):
-            shape = list(shape)
-            if shape[0] % capacity == 0:
-                shape[0] //= 8
-            elif len(shape) > 1 and shape[1] == capacity:
-                shape[1] = count
-            else:
-                raise ValueError("Unsupported sequence row geometry: " + str(shape))
-            return shape
-
         def view(source, width, dtype):
+            layout = dict(parent=source, offset=rank["rank"] * count * width * SIZES[dtype])
+            if not args.fixed_capacity:
+                layout.update(
+                    row_capacity=capacity,
+                    offset_expression=expression(
+                        f"((m + 7) // 8) * {rank['rank'] * width * SIZES[dtype]}"
+                    ),
+                )
             return temp(
                 "view." + source,
                 count * width * SIZES[dtype],
-                dict(parent=source, offset=rank["rank"] * count * width * SIZES[dtype]),
+                layout,
             )
 
         def zero_tail(source, width, dtype):
             path = kernel(
                 "memory.zero_row_tail",
-                dict(rows=capacity, capacity=capacity, width=width, dtype=NAMES[dtype]),
+                dict(
+                    rows=capacity,
+                    capacity=capacity,
+                    width=width,
+                    dtype=NAMES[dtype],
+                    partitions=0 if args.fixed_capacity else 8,
+                ),
                 [
                     operand("positions", "i32", [capacity]),
                     operand("out", dtype, [capacity, width], "read_write"),
@@ -179,6 +219,11 @@ def main():
                 )
                 transport["elements"] //= 4
                 transport["int32"] = True
+            if not args.fixed_capacity:
+                transport.pop("fixed_rows")
+                transport["elements_expression"] = expression(
+                    f"((m + 7) // 8) * {transport['elements'] // count}"
+                )
             if trace:
                 transport["trace_only"] = True
             else:
@@ -190,24 +235,35 @@ def main():
             if parameters["rows"] != capacity:
                 raise ValueError("Local kernel has an unexpected row capacity")
             parameters["rows"] = count
+            key = json.dumps([manifest["op"], parameters], sort_keys=True)
+            if key not in geometries:
+                module, name = manifest["op"].split(".")
+                factory = getattr(importlib.import_module("tools.operators.ascend." + module), name)
+                geometries[key] = physical_shapes(
+                    factory(**dict(parameters, rows=row_count(count, True))), count
+                )
             specs = deepcopy(manifest["operands"])
-            for source, spec in zip(step["buffers"], specs, strict=True):
+            for source, spec, shape in zip(step["buffers"], specs, geometries[key], strict=True):
                 if any(key in definitions[source] for key in ("weight", "data", "prepared_weight")):
                     continue
                 if spec["access"] == "read" and source not in mapping:
                     raise ValueError("Local input has no preceding producer: " + source)
-                spec["shape"] = narrow_shape(spec["shape"])
+                spec["shape"] = shape
                 if spec["access"] != "read":
                     size = math.prod(spec["shape"]) * SIZES[spec["dtype"]]
                     mapping[source] = temp(source, size)
                     ready.discard(source)
             path = kernel(manifest["op"], parameters, specs, count)
-            return dict(
+            result = dict(
                 op="kernel",
                 manifest=path,
                 buffers=[mapping.get(b, b) for b in step["buffers"]],
                 fixed_rows=count,
             )
+            if not args.fixed_capacity:
+                result.pop("fixed_rows")
+                result["row_expression"] = expression("(m + 7) // 8")
+            return result
 
         norm_gathers = set()
         norm_source, norm_producer = None, None
@@ -270,15 +326,17 @@ def main():
                 if args.reduce_scatter:
                     body.append(zero_tail(step["source"], 5120, dtype))
                     mapping[destination] = temp(destination, count * 5120 * SIZES[dtype])
-                    body.append(
-                        dict(
-                            step,
-                            destination=mapping[destination],
-                            elements=count * 5120,
-                            scatter=True,
-                            fixed_rows=True,
-                        )
+                    collective = dict(
+                        step,
+                        destination=mapping[destination],
+                        elements=count * 5120,
+                        scatter=True,
+                        fixed_rows=True,
                     )
+                    if not args.fixed_capacity:
+                        collective.pop("fixed_rows")
+                        collective["elements_expression"] = expression("((m + 7) // 8) * 5120")
+                    body.append(collective)
                     ready.discard(destination)
                 else:
                     body.append(step)
@@ -368,10 +426,28 @@ def main():
                 actual = [
                     descriptor(op)["op"] if op["op"] == "kernel" else op["op"] for op in group
                 ]
+                if len(actual) > 4 and actual[4] == "kv_int8.scatter":
+                    expected[4] = "kv_int8.scatter"
                 if actual != expected:
                     raise ValueError("Unsupported KV/Qa branch: " + str(actual))
                 kv, norm, rope, scatter = group[1:5]
                 qa, norm_quant, qb, query_rope = group[6:10]
+                outputs = {
+                    name
+                    for original in (kv, norm, rope, qa, norm_quant)
+                    for name, port in zip(
+                        original["buffers"], descriptor(original)["operands"], strict=True
+                    )
+                    if port["access"] in ("write", "read_write")
+                }
+                gathered = {rope["buffers"][-1], *norm_quant["buffers"][2:4]}
+                missing = external_reads(
+                    body[index + 10 :] + packet["head"], outputs - gathered, descriptor
+                )
+                if missing:
+                    raise ValueError(
+                        "Shared attention needs additional output gathers: " + str(missing)
+                    )
                 for original in [kv, norm, qa, norm_quant]:
                     for binding in original["buffers"]:
                         if any(
@@ -391,7 +467,7 @@ def main():
                 if (
                     [op["op"] for op in before] != ["gather", "gather", "fork"]
                     or not before[0].get("int32")
-                    or not before[0].get("fixed_rows")
+                    or not (before[0].get("fixed_rows") or "elements_expression" in before[0])
                     or before[0]["elements"] != count * 1280
                     or not before[1]["destination"].endswith(".scale")
                 ):
@@ -428,8 +504,8 @@ def main():
                 index += 10
                 shared_groups += 1
                 local_kernels += 5
-            if shared_groups != 40:
-                raise ValueError("Expected all 40 common KV/Qa branches")
+            if shared_groups != reductions // 2:
+                raise ValueError("Shared KV/Qa branches differ from the selected layer count")
             body = shared_body
         packet["body"] = body
         if args.decoder_tail:

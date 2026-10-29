@@ -48,6 +48,7 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     worker_cpus: Option<Vec<Vec<usize>>>,
     requests: Vec<Request>,
+    preparations: Vec<Preparation>,
     scope: &'static str,
 }
 #[derive(Serialize)]
@@ -58,12 +59,26 @@ struct Request {
     output_tokens: usize,
     tokens_sha256: String,
     prefill_chunks: Vec<usize>,
+    prepare_s: f64,
+    reset_s: f64,
+    request_ttft_s: f64,
+    request_e2e_s: f64,
     ttft_s: f64,
     prefill_tokens_per_s_from_ttft: f64,
     decode_s: f64,
     decode_tokens_per_s: f64,
     e2e_s: f64,
     output_token_ids: Vec<u32>,
+}
+#[derive(Serialize)]
+struct Preparation {
+    name: String,
+    rows: Vec<usize>,
+    new_rows: Vec<usize>,
+    prepare_s: f64,
+    first_ttft_s: f64,
+    reset_s: f64,
+    first_request_ttft_s: f64,
 }
 
 pub fn run(
@@ -204,11 +219,26 @@ pub fn run(
             let load_s = load.elapsed().as_secs_f64();
             eprintln!("A2 complete model loaded in {load_s:.3}s");
             let mut requests = vec![];
+            let mut preparations = vec![];
+            let mut prepared: std::collections::BTreeSet<_> =
+                plans.iter().map(|p| p.chunk_tokens).collect();
             for input in &inputs.cases {
                 let trace = trace.filter(|_| input.trace != Some(false));
                 // Warm the same packet shapes and context extent, excluding
                 // weights, first-use registration and allocation from timing.
-                generate(&peers, input, 16, usize::MAX, trace, &plans)?;
+                let warm = generate(&peers, input, 16, usize::MAX, trace, &plans)?;
+                let rows: std::collections::BTreeSet<_> =
+                    warm.prefill_chunks.iter().copied().collect();
+                preparations.push(Preparation {
+                    name: input.name.clone(),
+                    rows: rows.iter().copied().collect(),
+                    new_rows: rows.difference(&prepared).copied().collect(),
+                    prepare_s: warm.prepare_s,
+                    first_ttft_s: warm.ttft_s,
+                    reset_s: warm.reset_s,
+                    first_request_ttft_s: warm.request_ttft_s,
+                });
+                prepared.extend(rows);
                 for repeat in 0..input.repeats.unwrap_or(repeats) {
                     let request = generate(
                         &peers,
@@ -233,7 +263,8 @@ pub fn run(
                 logits_dump: std::env::var_os("ORINFER_A2_LOGITS_DIR").is_some(),
                 worker_cpus,
                 requests,
-                scope: "Complete 40-layer original-checkpoint native Rust/TileLang + ACLNN W4A8; single sequence, no prefix reuse or speculation; host submission and HCCL included",
+                preparations,
+                scope: "Complete 40-layer original-checkpoint native Rust/TileLang + ACLNN W4A8; single sequence, no prefix reuse or speculation; legacy ttft_s excludes preparation/reset, request_ttft_s includes them; first-shape costs are reported in preparations",
             })
         })();
         for peer in &peers {
@@ -293,6 +324,7 @@ fn generate(
     trace: Option<&Path>,
     plans: &[PrefillPlan],
 ) -> Result<Request> {
+    let request_start = Instant::now();
     let mut chunks = vec![];
     let mut remaining = input.tokens.len();
     while remaining > 0 {
@@ -310,17 +342,21 @@ fn generate(
         .iter()
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
+    let prepare = Instant::now();
     for peer in peers {
         peer.send
             .send(Command::Prepare(shapes.iter().copied().collect()))
             .map_err(|e| e.to_string())?;
     }
     receive(peers)?;
+    let prepare_s = prepare.elapsed().as_secs_f64();
+    let reset = Instant::now();
     // Shape registration/capture precedes reset: warmups may mutate C2 rings.
     for peer in peers {
         peer.send.send(Command::Reset).map_err(|e| e.to_string())?;
     }
     receive(peers)?;
+    let reset_s = reset.elapsed().as_secs_f64();
     let start = Instant::now();
     let mut position = 0;
     let mut token = None;
@@ -335,6 +371,7 @@ fn generate(
         position = end;
     }
     let ttft_s = start.elapsed().as_secs_f64();
+    let request_ttft_s = request_start.elapsed().as_secs_f64();
     let mut tokens = vec![token.ok_or("Prefill omitted first token")?];
     let decode = Instant::now();
     for _ in 1..output_tokens {
@@ -356,5 +393,9 @@ fn generate(
         e2e_s: start.elapsed().as_secs_f64(),
         output_token_ids: tokens,
         prefill_chunks: chunks,
+        prepare_s,
+        reset_s,
+        request_ttft_s,
+        request_e2e_s: request_start.elapsed().as_secs_f64(),
     })
 }

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from tools.build.files import atomic_json
+from tools.model.row_contract import resolve
 
 
 def main():
@@ -61,7 +62,9 @@ def main():
         status = entries[name][1](
             pointers,
             len(pointers),
-            step.get("fixed_rows", rows),
+            resolve(step["row_expression"], rows)
+            if "row_expression" in step
+            else step.get("fixed_rows", rows),
             torch.npu.current_stream()._as_parameter_,
         )
         if status:
@@ -140,15 +143,27 @@ def main():
             torch.testing.assert_close(
                 original_scores[: min(rows, 2)], expected[: min(rows, 2)], atol=0, rtol=0
             )
-            assembled = torch.empty(capacity, 512, dtype=torch.int32)
+            dynamic = "row_expression" in next(
+                s
+                for s in shard_chains[0][length]
+                if descriptor(s)["op"] == "indexer_cube.causal_logits"
+            )
+            local_rows = (rows + 7) // 8 if dynamic else count
+            assembled = torch.empty(local_rows * 8, 512, dtype=torch.int32)
             for rank in range(8):
                 steps = shard_chains[rank][length]
                 tensors = allocate(steps, shared)
                 local_index = next(
                     s for s in steps if descriptor(s)["op"] == "indexer_cube.causal_logits"
                 )
-                global_ids = rank + torch.arange(count) * 8
+                global_ids = rank + torch.arange(local_rows) * 8
                 valid = global_ids < rows
+                for step in steps:
+                    for name, port in zip(
+                        step["buffers"], descriptor(step)["operands"], strict=True
+                    ):
+                        if port["access"] != "read":
+                            tensors[name].fill_(17)
 
                 def run():
                     for step in steps:
@@ -161,7 +176,7 @@ def main():
                     if m["op"] == "memory.partition_rows":
                         width = m["parameters"]["width"]
                         source, output = step["buffers"]
-                        actual = tensors[output].cpu().reshape(count, width)
+                        actual = tensors[output].cpu().reshape(count, width)[:local_rows]
                         expected_pack = (
                             tensors[source]
                             .cpu()
@@ -171,11 +186,19 @@ def main():
                         if not m["parameters"]["repeat_last"]:
                             expected_pack[~valid] = 0
                         torch.testing.assert_close(actual, expected_pack, atol=0, rtol=0)
-                actual = tensors[local_index["buffers"][6]].cpu()
+                        if dynamic:
+                            assert bool((tensors[output][local_rows:] == 17).all()), (
+                                "Partition wrote its capacity tail"
+                            )
+                actual = tensors[local_index["buffers"][6]].cpu()[:local_rows]
                 torch.testing.assert_close(
                     actual[valid], original_scores[global_ids[valid]], atol=0, rtol=0
                 )
-                selection = tensors[steps[-1]["buffers"][1]].cpu()
+                selection = tensors[steps[-1]["buffers"][1]].cpu()[:local_rows]
+                if dynamic:
+                    assert bool((tensors[steps[-1]["buffers"][1]][local_rows:] == 17).all()), (
+                        "TopK wrote its capacity tail"
+                    )
                 torch.testing.assert_close(
                     selection[valid], expected_selected[global_ids[valid]], atol=0, rtol=0
                 )
@@ -212,7 +235,7 @@ def main():
             assert descriptor(interleave)["op"] == "memory.interleave_rows"
             tensors = allocate([interleave])
             gathered = torch.cat([assembled[r::8] for r in range(8)])
-            tensors[interleave["buffers"][0]].copy_(gathered)
+            tensors[interleave["buffers"][0]][: len(gathered)].copy_(gathered)
             tensors[interleave["buffers"][1]].fill_(-7)
             launch(interleave, tensors, rows)
             torch.npu.synchronize()
@@ -221,11 +244,14 @@ def main():
             assert bool((result[rows:] == -7).all()), "Interleave wrote outside actual rows"
             if rows in (17, 513, 2048):
                 _, graph = npu_benchmark(lambda: launch(interleave, tensors, rows), 1, 1)
-                tensors[interleave["buffers"][0]].copy_(gathered.flip(0))
+                tensors[interleave["buffers"][0]][: len(gathered)].copy_(gathered.flip(0))
                 graph.replay()
                 torch.npu.synchronize()
                 shuffled = (
-                    gathered.flip(0).reshape(8, count, 512).permute(1, 0, 2).reshape(capacity, 512)
+                    gathered.flip(0)
+                    .reshape(8, local_rows, 512)
+                    .permute(1, 0, 2)
+                    .reshape(local_rows * 8, 512)
                 )
                 torch.testing.assert_close(
                     tensors[interleave["buffers"][1]].cpu()[:rows], shuffled[:rows], atol=0, rtol=0

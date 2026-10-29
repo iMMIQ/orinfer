@@ -19,6 +19,14 @@ pub struct KernelVariant {
     pub kernels: Vec<String>,
 }
 
+impl KernelVariant {
+    pub fn accepts(&self, rows: usize) -> bool {
+        self.multiple_of != 0
+            && (self.min_rows..=self.max_rows).contains(&rows)
+            && rows.is_multiple_of(self.multiple_of)
+    }
+}
+
 fn unit_multiple() -> usize {
     1
 }
@@ -237,12 +245,10 @@ impl RowExecution {
         };
         for operation in operations {
             if let Operation::Kernel { name } = operation
-                && let Some(variant) = self.variants.get(name).and_then(|variants| {
-                    variants.iter().find(|v| {
-                        (v.min_rows..=v.max_rows).contains(&rows)
-                            && rows.is_multiple_of(v.multiple_of)
-                    })
-                })
+                && let Some(variant) = self
+                    .variants
+                    .get(name)
+                    .and_then(|variants| variants.iter().find(|v| v.accepts(rows)))
             {
                 for name in &variant.kernels {
                     append(Operation::Kernel { name: name.clone() })?;

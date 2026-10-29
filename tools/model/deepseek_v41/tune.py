@@ -7,12 +7,14 @@ Only the selected library replaces each geometry in the published model plan.
 
 import argparse
 import ctypes
+from copy import deepcopy
 import json
+import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
-from tools.model.row_selection import aggregate_winner
+from tools.model.row_selection import bounded_choices, guarded_winner, samples
 from tools.model.tuning import compile_candidates, measure, read_record, record_path
 
 
@@ -31,6 +33,9 @@ def projection_configs(parameters, pipeline_only=False, wide_integer=False, join
             dict(baseline, tile_m=m, tile_n=n, block_k=k, pipeline_stages=s)
             for m, n, k, s in (
                 (32, 128, 128, 2),
+                (32, 128, 512, 2),
+                (32, 64, 512, 2),
+                (64, 64, 512, 2),
                 (64, 64, 128, 2),
                 (64, 128, 128, 0),
                 (64, 128, 128, 2),
@@ -71,7 +76,8 @@ def main():
     p.add_argument("--plan", type=Path, required=True)
     p.add_argument("--model-dir", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
+    p.add_argument("--rows", type=int, nargs="+")
+    p.add_argument("--maximum-regression", type=float, default=0.05)
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--compile-workers", type=int, default=4)
     p.add_argument(
@@ -85,7 +91,7 @@ def main():
     p.add_argument(
         "--local-only",
         action="store_true",
-        help="Tune only dynamic projection kernels with an explicit fixed_rows binding",
+        help="Tune only dynamic projection kernels with an explicit local row binding",
     )
     search = p.add_mutually_exclusive_group()
     search.add_argument("--pipeline-only", action="store_true")
@@ -98,18 +104,22 @@ def main():
     args = p.parse_args()
     if not 1 <= args.compile_workers <= 8:
         p.error("compile workers must be in 1..8")
+    if not math.isfinite(args.maximum_regression) or not 0 <= args.maximum_regression <= 1:
+        p.error("maximum regression must be finite, within 0..1")
     args.output.mkdir(parents=True, exist_ok=True)
     import torch
     import torch_npu  # noqa: F401
     from kernels.model.rows import row_count
     from tools.operators.ascend.build import LOWER_LOCK, compile_kernel
     from tools.operators.ascend.dense import projection
+    from tools.operators.ascend.geometry import physical_shapes
 
     torch.set_num_threads(4)
     torch.manual_seed(20261002)
     torch.npu.set_device(args.device)
     base = args.plan.parent
     model = json.loads(args.plan.read_text())
+    selections = model.setdefault("row_selections", {})
     index = json.loads((args.model_dir / model["index"]["file"]).read_text())["weight_map"]
     definitions = {b["name"]: b for b in model["ranks"][0]["buffers"]}
     groups = {}
@@ -128,6 +138,7 @@ def main():
                 if (
                     args.local_only
                     and step.get("fixed_rows") != manifest["parameters"]["_row_capacity"]
+                    and "row_expression" not in step
                 ):
                     continue
                 groups[step["manifest"]] = (
@@ -145,7 +156,9 @@ def main():
         if args.wide_integer and (not parameters["integer"] or parameters["output"] % 256):
             continue
         measured = (
-            [capacity] if args.local_only else sorted({r for r in args.rows if 1 <= r <= capacity})
+            sorted({r for r in args.rows if 1 <= r <= capacity})
+            if args.rows
+            else sorted(set(samples(capacity)) | set(range(1, min(capacity, 128) + 1)))
         )
         if not measured:
             raise ValueError("Missing bounded prefill measurements")
@@ -172,10 +185,17 @@ def main():
             params["rows"] = row_count(capacity, True)
             with LOWER_LOCK:
                 function = projection(**params)
+                shapes = physical_shapes(function, capacity)
+            operands = deepcopy(manifest["operands"])
+            for operand, shape in zip(operands, shapes, strict=True):
+                if operand["access"] == "scratch":
+                    if math.prod(shape) > math.prod(operand["shape"]):
+                        raise ValueError("Candidate exceeds the shared scratch allocation")
+                    operand["shape"] = shape
             return compile_kernel(
                 function,
                 manifest["op"],
-                manifest["operands"],
+                operands,
                 dict(parameters, **config),
                 base / "cache",
                 row_capacity=capacity,
@@ -190,27 +210,37 @@ def main():
             parameters=parameters,
             configs=configs,
             samples=measured,
+            maximum_regression=args.maximum_regression,
             seed=20261002,
             weight=weight,
             weight_sha256=file_hash_bytes(bank),
             scale_sha256=file_hash_bytes(channel) if channel is not None else None,
             scale=scaling,
             tuner_sha256=file_hash(Path(__file__)),
+            geometry_sha256=file_hash(Path(__file__).parents[2] / "operators/ascend/geometry.py"),
+            selection_sha256=file_hash(Path(__file__).parents[1] / "row_selection.py"),
         )
         record = record_path(args.output, identity)
 
         def valid_record(record):
-            selected = base / record["manifest"]
-            descriptor = json.loads(selected.read_text())
-            return (
-                descriptor["source_sha256"] == current["source_sha256"]
-                and descriptor["compiler"] == current["compiler"]
-                and descriptor["library"]["sha256"] == file_hash(selected.parent / "kernel.so")
-            )
+            names = {record["manifest"]} | {p for v in record["variants"] for p in v["kernels"]}
+            for name in names:
+                selected = base / name
+                descriptor = json.loads(selected.read_text())
+                if not (
+                    descriptor["source_sha256"] == current["source_sha256"]
+                    and descriptor["compiler"] == current["compiler"]
+                    and descriptor["library"]["sha256"] == file_hash(selected.parent / "kernel.so")
+                ):
+                    return False
+            return True
 
         cached = read_record(record, identity, valid_record)
         if cached is not None:
             replacements[old] = cached["manifest"]
+            selections.pop(old, None)
+            if cached["variants"]:
+                selections[cached["manifest"]] = cached["variants"]
             continue
 
         with ThreadPoolExecutor(max_workers=args.compile_workers) as pool:
@@ -243,8 +273,9 @@ def main():
         token_scale = (torch.rand(capacity) * 0.01 if integer else torch.ones(capacity)).npu()
         channel_scale = (channel if integer else torch.ones(n)).npu()
         out = torch.empty((capacity + 64, n), dtype=torch.bfloat16, device="npu")
+        scratch_rows = manifest["operands"][5]["shape"][0]
         scratch = torch.empty(
-            ((capacity + 63) // 64 * 64, n),
+            (scratch_rows + 64, n),
             dtype=torch.int32 if integer else torch.float32,
             device="npu",
         )
@@ -270,6 +301,7 @@ def main():
                 if i in invalid:
                     continue
                 out.fill_(17)
+                scratch.fill_(17)
 
                 def run():
                     launch(i)
@@ -283,6 +315,9 @@ def main():
                         rtol=0 if integer else 0.008,
                     )
                     assert bool((out[rows:] == 17).all()), "A2 projection wrote the tail"
+                    assert bool((scratch[scratch_rows:] == 17).all()), (
+                        "A2 projection exceeded scratch"
+                    )
 
                 def change():
                     activation.neg_()
@@ -315,17 +350,30 @@ def main():
             measurements.append(dict(rows=rows, times=times))
         for sample in measurements:
             sample["times"] = {k: v for k, v in sample["times"].items() if int(k) not in invalid}
-        selected = int(aggregate_winner(measurements))
+        selected = int(guarded_winner(measurements, maximum_regression=args.maximum_regression))
         chosen = str(paths[selected].relative_to(base))
+        variants = [
+            dict(
+                min_rows=v["min_rows"],
+                max_rows=v["max_rows"],
+                multiple_of=1,
+                kernels=[str(paths[int(v["implementation"])].relative_to(base))],
+            )
+            for v in bounded_choices(measurements, str(selected), min(capacity, 128))
+        ]
         result = dict(
             identity=identity,
             measurements=measurements,
             rejected=rejected,
             config=legal[selected],
             manifest=chosen,
+            variants=variants,
         )
         atomic_json(record, result)
         replacements[old] = chosen
+        selections.pop(old, None)
+        if variants:
+            selections[chosen] = variants
         print(json.dumps(dict(geometry=[n, k, integer], **result)), flush=True)
         tensors = activation = device_weight = token_scale = channel_scale = out = scratch = (
             bank

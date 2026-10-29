@@ -165,6 +165,7 @@ impl Worker {
             self.packets
                 .insert(rows, Rc::new(Execution { packet, body, head }));
         }
+        self.touch_packet(rows);
         Ok(())
     }
 
@@ -520,8 +521,9 @@ impl Worker {
                 let up = t.elapsed().as_secs_f64();
                 let t = Instant::now();
                 for name in groups {
-                    self.w4
+                    self.routed_w4
                         .get(name)
+                        .and_then(|(_, plan)| plan.upgrade())
                         .ok_or("Routed W4 binding missing")?
                         .update_groups(&self.session, &ends)?;
                 }

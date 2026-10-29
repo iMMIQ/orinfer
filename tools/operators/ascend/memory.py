@@ -5,7 +5,9 @@ import math
 import tilelang.language as T
 
 
-def partition_rows(rows, count, width, first, stride=8, dtype="int32", repeat_last=False):
+def partition_rows(
+    rows, count, width, first, stride=8, dtype="int32", repeat_last=False, dynamic_count=False
+):
     """Pack interleaved rows; pad data with zero or repeat the last source row.
 
     Repeated index rows preserve the causal indexer's monotone tile guard.
@@ -13,6 +15,8 @@ def partition_rows(rows, count, width, first, stride=8, dtype="int32", repeat_la
     """
     if count < 1 or width < 1 or stride < 1 or not 0 <= first < stride:
         raise ValueError("Invalid interleaved row partition")
+    if dynamic_count:
+        count = T.ceildiv(rows, stride)
     block = math.gcd(width, 256)
     blocks = width // block
 
@@ -50,10 +54,12 @@ def partition_rows(rows, count, width, first, stride=8, dtype="int32", repeat_la
     return main
 
 
-def interleave_rows(rows, count, width, ranks=8, dtype="int32"):
+def interleave_rows(rows, count, width, ranks=8, dtype="int32", dynamic_count=False):
     """Restore global row order after gathering equal interleaved partitions."""
     if min(count, width, ranks) < 1:
         raise ValueError("Invalid interleaved gather geometry")
+    if dynamic_count:
+        count = T.ceildiv(rows, ranks)
     block = math.gcd(width, 256)
     blocks = width // block
 
@@ -74,19 +80,22 @@ def interleave_rows(rows, count, width, ranks=8, dtype="int32"):
     return main
 
 
-def zero_row_tail(rows, capacity, width, dtype="bfloat16"):
+def zero_row_tail(rows, capacity, width, dtype="bfloat16", partitions=0):
     """Define unused fixed-capacity collective rows without touching live rows."""
     if capacity < 2 or width < 1 or dtype not in ("bfloat16", "float32"):
         raise ValueError("Invalid collective tail geometry")
+    if partitions and (partitions < 1 or capacity % partitions):
+        raise ValueError("Collective partition must divide its capacity")
     block = math.gcd(width, 256)
     blocks = width // block
+    end = T.ceildiv(rows, partitions) * partitions if partitions else capacity
 
     @T.prim_func
     def main(
         positions: T.Tensor((rows,), "int32"),
         out: T.Tensor((capacity, width), dtype),
     ):
-        with T.Kernel(T.max(1, T.ceildiv((capacity - rows) * blocks, 2)), is_npu=True) as (
+        with T.Kernel(T.max(1, T.ceildiv((end - rows) * blocks, 2)), is_npu=True) as (
             cid,
             vid,
         ):
@@ -94,7 +103,7 @@ def zero_row_tail(rows, capacity, width, dtype="bfloat16"):
             index = cid * 2 + vid
             row = rows + index // blocks
             column = index % blocks * block
-            if row < capacity:
+            if row < end:
                 T.tile.fill(zeros, 0)
                 T.copy(zeros, out[row, column : column + block])
 

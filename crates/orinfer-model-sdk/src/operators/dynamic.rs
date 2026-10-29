@@ -15,6 +15,15 @@ pub enum RowExpression {
     Minimum { lhs: Box<Self>, rhs: Box<Self> },
 }
 impl RowExpression {
+    /// Resolve checked row arithmetic for kernels, views and collectives.
+    pub fn resolve(&self, rows: usize) -> Result<usize> {
+        let rows = u32::try_from(rows).map_err(|_| "Row extent exceeds u32")?;
+        if rows == 0 {
+            return Err("Row extent must be positive".into());
+        }
+        Ok(self.evaluate(rows, 0)? as usize)
+    }
+
     fn evaluate(&self, rows: u32, depth: usize) -> Result<u32> {
         if depth > 32 {
             return Err("Row expression exceeds nesting limit".into());

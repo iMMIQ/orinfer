@@ -15,6 +15,7 @@ import multiprocessing
 from pathlib import Path
 
 from tools.build.files import atomic_json
+from tools.model.row_contract import expression
 
 
 def main():
@@ -32,9 +33,9 @@ def main():
     if not 2 <= args.keep <= 512:
         parser.error("Replay suffix must lie in 2..512")
     from kernels.model.rows import row_count
-    from tilelang import tvm
     from tools.model.deepseek_v41.build import compile_task
     from tools.operators.ascend.build import operand
+    from tools.operators.ascend.geometry import physical_shapes
 
     base = args.plan.parent
     model = json.loads(args.plan.read_text())
@@ -181,36 +182,15 @@ def main():
                         )
                     )
                 function = functions[function_key]
-                tensors = [
-                    function.buffer_map[p] for p in function.params if p in function.buffer_map
-                ]
+                shapes = physical_shapes(function, args.keep)
                 specs = deepcopy(spec["operands"])
                 buffers = step["buffers"]
                 if op == "attention_prefill.replay_softmax":
                     specs.append(operand("replay_start", "i32", [1]))
                     buffers.append(replay_start)
-                if len(tensors) != len(specs):
+                if len(shapes) != len(specs):
                     raise ValueError("Replay tensor ABI differs from the source template")
-                analyzer = tvm.arith.Analyzer()
-                for tensor, binding in zip(tensors, specs, strict=True):
-                    shape = []
-                    for dimension in tensor.shape:
-                        variables = []
-                        tvm.tir.stmt_functor.post_order_visit(
-                            dimension,
-                            lambda node: (
-                                variables.append(node) if isinstance(node, tvm.tir.Var) else None
-                            ),
-                        )
-                        shape.append(
-                            int(
-                                analyzer.simplify(
-                                    tvm.tir.stmt_functor.substitute(
-                                        dimension, {v: args.keep for v in variables}
-                                    )
-                                )
-                            )
-                        )
+                for shape, binding in zip(shapes, specs, strict=True):
                     binding["shape"] = shape
                 for source, binding in zip(buffers, spec["operands"], strict=False):
                     if (
@@ -277,16 +257,18 @@ def main():
                 if packet.get("min_rows", 0) >= 512 and private in definitions:
                     size = original[source]["bytes"]
                     width = size // capacity // sizes[live[source]["dtype"]]
-                    body.append(
-                        dict(
-                            op="gather",
-                            source=private,
-                            destination=source,
-                            elements=capacity // 8 * width,
-                            fp32=live[source]["dtype"] == "f32",
-                            fixed_rows=True,
-                        )
+                    transport = dict(
+                        op="gather",
+                        source=private,
+                        destination=source,
+                        elements=capacity // 8 * width,
+                        fp32=live[source]["dtype"] == "f32",
+                        fixed_rows=True,
                     )
+                    if any(s.get("row_expression") for s in body):
+                        transport.pop("fixed_rows")
+                        transport["elements_expression"] = expression(f"((m + 7) // 8) * {width}")
+                    body.append(transport)
             path = kernel(
                 "decoder_replay.replay_start",
                 dict(rows=capacity, keep=args.keep),

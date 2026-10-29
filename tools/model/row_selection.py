@@ -16,6 +16,58 @@ def aggregate_winner(records):
     return min(sorted(names), key=lambda name: sum(math.log(row["times"][name]) for row in records))
 
 
+def guarded_winner(records, reference="0", maximum_regression=0.05):
+    """Minimize aggregate cost subject to a measured per-case regression bound."""
+    aggregate_winner(records)
+    if not math.isfinite(maximum_regression) or not 0 <= maximum_regression <= 1:
+        raise ValueError("Invalid per-case regression bound")
+    if reference not in records[0]["times"]:
+        raise ValueError("Missing regression reference")
+    legal = {
+        name
+        for name in records[0]["times"]
+        if all(
+            row["times"][name] <= row["times"][reference] * (1 + maximum_regression)
+            for row in records
+        )
+    }
+    return aggregate_winner(
+        [
+            dict(row, times={name: value for name, value in row["times"].items() if name in legal})
+            for row in records
+        ]
+    )
+
+
+def bounded_choices(records, default, capacity=128, minimum_gain=0.03):
+    """Publish small-row choices only when every integer in the domain was measured."""
+    aggregate_winner(records)
+    measured = {row["rows"]: row["times"] for row in records}
+    if not 0 <= minimum_gain < 1 or capacity < 1:
+        raise ValueError("Invalid bounded row selection policy")
+    if not set(range(1, capacity + 1)) <= measured.keys():
+        return []
+    result = []
+    for rows in range(1, capacity + 1):
+        times = measured[rows]
+        selected = min(sorted(times), key=times.__getitem__)
+        if times[selected] >= times[default] * (1 - minimum_gain):
+            selected = default
+        if selected == default:
+            continue
+        if (
+            result
+            and result[-1]["implementation"] == selected
+            and result[-1]["max_rows"] + 1 == rows
+        ):
+            result[-1]["max_rows"] = rows
+        else:
+            result.append(
+                dict(min_rows=rows, max_rows=rows, multiple_of=1, implementation=selected)
+            )
+    return result
+
+
 def project(selection, keys):
     """Coalesce a pipeline choice after restricting it to one component's knobs."""
     configs, indices, names = [], {}, {}

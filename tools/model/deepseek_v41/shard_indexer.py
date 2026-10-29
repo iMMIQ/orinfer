@@ -1,7 +1,7 @@
 """Partition prefill index scores/TopK by row and gather exact selected indices.
 
 The original packet remains the fallback for short fragments. New kernels reuse
-the existing indexer and TopK arithmetic with fixed local row capacity; weight
+the existing indexer and TopK arithmetic with bounded local row capacity; weight
 banks, request state and the global attention consumers retain their layouts.
 """
 
@@ -15,6 +15,7 @@ import multiprocessing
 from pathlib import Path
 
 from tools.build.files import atomic_json
+from tools.model.row_contract import expression
 
 
 def main():
@@ -23,6 +24,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--min-rows", type=int, default=512)
     parser.add_argument("--compile-workers", type=int, default=4)
+    parser.add_argument("--fixed-capacity", action="store_true")
     args = parser.parse_args()
     if args.output.parent.resolve() != args.plan.parent.resolve():
         parser.error("Output must share the input plan's asset directory")
@@ -89,6 +91,8 @@ def main():
                 dtype=names[dtype],
                 repeat_last=repeat_last,
             )
+            if not args.fixed_capacity:
+                params["dynamic_count"] = True
             manifest = kernel(memory, "partition_rows", params, specs, capacity)
             return output, dict(op="kernel", manifest=manifest, buffers=[source, output])
 
@@ -139,14 +143,16 @@ def main():
                 module_name, name = manifest["op"].split(".")
                 module = importlib.import_module("tools.operators.ascend." + module_name)
                 path = kernel(module, name, parameters, specs, count)
-                body.append(
-                    dict(
-                        op="kernel",
-                        manifest=path,
-                        buffers=[mapping.get(b, b) for b in old["buffers"]],
-                        fixed_rows=count,
-                    )
+                instruction = dict(
+                    op="kernel",
+                    manifest=path,
+                    buffers=[mapping.get(b, b) for b in old["buffers"]],
+                    fixed_rows=count,
                 )
+                if not args.fixed_capacity:
+                    instruction.pop("fixed_rows")
+                    instruction["row_expression"] = expression("(m + 7) // 8")
+                body.append(instruction)
 
             local_step(step, descriptor)
             index += 1
@@ -167,22 +173,26 @@ def main():
                     selected = next_step["buffers"][1]
                     break
             gathered = temp("gathered", [capacity, 512], "i32")
-            body.append(
-                dict(
-                    op="gather",
-                    source=mapping[selected],
-                    destination=gathered,
-                    elements=count * 512,
-                    fp32=False,
-                    int32=True,
-                    fixed_rows=True,
-                )
+            transport = dict(
+                op="gather",
+                source=mapping[selected],
+                destination=gathered,
+                elements=count * 512,
+                fp32=False,
+                int32=True,
+                fixed_rows=True,
             )
+            if not args.fixed_capacity:
+                transport.pop("fixed_rows")
+                transport["elements_expression"] = expression("((m + 7) // 8) * 512")
+            body.append(transport)
             specs = [
                 operand("source", "i32", [capacity, 512]),
                 operand("out", "i32", [capacity, 512], "write"),
             ]
             params = dict(rows=capacity, count=count, width=512, ranks=8, dtype="int32")
+            if not args.fixed_capacity:
+                params["dynamic_count"] = True
             path = kernel(memory, "interleave_rows", params, specs, capacity)
             body.append(dict(op="kernel", manifest=path, buffers=[gathered, selected]))
         if sources != 8:
