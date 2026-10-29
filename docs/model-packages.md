@@ -229,6 +229,12 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 `--reduce-scatter` 生成原生 ReduceScatter 的实验候选：每卡输出数量固定为局部容量，未使用的输入行在计算流上清零。原生接口检查源／目标范围、跨 rank 输入容量和资源生存期，支持改变输入后的 ACL Graph replay。此集合通信与 AllReduce 的浮点求和顺序可能不同；该候选的模型质量需要通过相同 teacher 历史的官方对照验收，默认使用 AllReduce 路径。
 
+`tools.model.deepseek_v41.quantize_kv --plan BF16_PLAN --output INT8_PLAN` 将尚未量化 KV 的 DSv4.1 TP8 原生计划转换为 INT8 缓存，输出与输入共用资产目录。40 层 SWA 和四个共享压缩 KV bank 均按每 64 个值使用一个 FP16 scale，512 维每行共 528 字节。写入按实际存储的 FP16 scale 做对称舍入，整数范围为 −127..127；scale 下限为 FP16 最小正数，上限为 65504。零组写零，`-1` 位置跳过写入，其他越界位置设置错误标志。压缩器的 FP32 ring 状态和索引器现有 INT8 格式保持各自的契约。
+
+prefill 使用一个 SWA 和一个压缩 KV 的共享 BF16 工作区，仅解码当前窗口／前缀；同一压缩 source 的后续层复用已经解码的值。decode 将选中行读取与 group64 解量化融合，后续 QK／PV 继续使用 BF16 输入与原 FP32 累加边界。工作区属于计算暂存，不保留逐层 BF16 缓存副本。`--reference-bf16` 生成保存相同 INT8 舍入值的 BF16 对照计划，用于核对实际存储布局和状态，不用于部署。
+
+`tools.operators.ascend.validate_kv_int8 --plan INT8_PLAN --reference REFERENCE_PLAN --output REPORT` 通过固定编译镜像运行数值验收，覆盖独立 FP64 编码参考、FP16 scale、舍入边界、跳过／越界写入、动态尾部、选择读取、前缀及改变输入和位置后的 Graph replay。完整模型另用固定历史比较概率／NLL、分块与长上下文状态，并以完整请求测量性能。
+
 上述工具可通过 `run.sh --without-devices` 离线编译。`tools.operators.ascend.validate_sharded_indexer --baseline PLAN --plan PLAN_SHARDED --output DIR` 在设备上逐卡比较原始分数、TopK、填充行和索引重排，以独立参考抽查分数，并验证修改输入后的 Graph replay。完整请求另用 `bench-ascend` 验证分块、缓存状态、输出与 TPS。
 
 `--fast-engram` 为动态 prefill 启用批量 32 阶蝶形旋转。构建器要求 checkpoint 的旋转块恰为标准顺序、统一幅值、带行符号的 Walsh 矩阵；不匹配时构建失败。计算读取原始 FP32 系数，保留输入乘系数与输出 FP32 边界。`validate_rotation` 检查原 bank、FP64 参考误差、动态尾部和改变输入后的 Graph replay；单行 decode 保留通用旋转。
