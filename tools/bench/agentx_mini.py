@@ -2,6 +2,8 @@
 
 The service owns the GPU lock. This client never deploys or reconfigures it.
 An interrupted run retains diagnostics and cannot qualify as a benchmark score.
+Periodic memory sampling uses proc/status; PSS is collected before replay so
+walking a large model's page tables does not stall its timed work.
 """
 
 import argparse
@@ -105,6 +107,22 @@ def main():
     process = Path("/proc") / str(args.service_pid)
     executable = process / "exe"
     service_command = (process / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+    service_environment = dict.fromkeys(
+        (
+            "ORINFER_A2_HOST_TABLE_MIB",
+            "ORINFER_A2_HOST_ROW_CACHE_MIB",
+            "ORINFER_A2_WORKER_CPUS",
+            "ORINFER_HOST_ROW_CACHE_REPORT",
+            "HCCL_OP_EXPANSION_MODE",
+            "HCCL_DETERMINISTIC",
+            "HCCL_NPU_SOCKET_PORT_RANGE",
+        )
+    )
+    for entry in (process / "environ").read_bytes().split(b"\0"):
+        key, _, value = entry.partition(b"=")
+        name = key.decode(errors="replace")
+        if name in service_environment:
+            service_environment[name] = value.decode(errors="replace")
     if "serve " not in service_command:
         raise ValueError("The recorded service PID is not a serve process")
     manifest = json.loads(args.manifest.read_text())
@@ -135,12 +153,18 @@ def main():
         temporary = tempfile.TemporaryDirectory(prefix="ori-mini-", dir="/tmp")
         environment["TMPDIR"] = temporary.name
         invocation = command(args)
+        memory_start = time.monotonic()
+        (args.output / "memory-before.txt").write_text((process / "smaps_rollup").read_text())
+        memory_before_s = time.monotonic() - memory_start
         provenance = dict(
             started_at=datetime.datetime.now().astimezone().isoformat(),
             command=invocation,
             wall_limit_s=args.wall_limit,
             service_pid=args.service_pid,
             service_command=service_command,
+            service_environment=service_environment,
+            periodic_memory_source="proc/status",
+            memory_before_s=memory_before_s,
             service_binary_sha256=file_hash(executable),
             service_model_sha256=file_hash(args.service_model / "cache/model.json"),
             manifest_sha256=file_hash(args.manifest),
@@ -172,12 +196,16 @@ def main():
                         os.killpg(child.pid, signal.SIGTERM)
                         break
                     record = dict(timestamp=time.time(), elapsed_s=elapsed)
+                    sample_start = time.monotonic()
                     try:
                         record["health"] = json.loads(fetch(args.url + "/health"))
                         record["metrics"] = fetch(args.url + "/metrics")
-                        record["memory"] = (process / "smaps_rollup").read_text()
+                        record["memory"] = (process / "status").read_text()
+                        record["process_io"] = (process / "io").read_text()
+                        record["process_stat"] = (process / "stat").read_text()
                     except (OSError, ValueError) as error:
                         record["error"] = str(error)
+                    record["observer_s"] = time.monotonic() - sample_start
                     samples.write(json.dumps(record) + "\n")
                     samples.flush()
                     time.sleep(2)
