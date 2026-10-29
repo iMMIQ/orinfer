@@ -511,7 +511,26 @@ def pv(
     return main
 
 
-def _bucketed_softmax(rows, capacity, ratio, compressed, heads, dimension, tile_heads, bucket):
+def replay_softmax(
+    rows,
+    capacity,
+    ratio=1,
+    compressed=True,
+    compact=True,
+    live_buckets=True,
+    tile_heads=4,
+    bucket=0,
+):
+    if not compressed or not compact or not live_buckets or ratio != 1:
+        raise ValueError("Decoder replay softmax requires the compact C1 attention contract")
+    return _bucketed_softmax(
+        rows, capacity, ratio, compressed, 8, 512, tile_heads, bucket, replay=True
+    )
+
+
+def _bucketed_softmax(
+    rows, capacity, ratio, compressed, heads, dimension, tile_heads, bucket, replay=False
+):
     """Normalize one prefix bucket with shared masks and scalar FP32 reciprocals."""
     if heads != 8 or dimension != 512 or tile_heads not in (1, 2, 4, 8):
         raise ValueError("Head tiles require H8/D512 and 1, 2, 4 or 8 heads")
@@ -526,7 +545,7 @@ def _bucketed_softmax(rows, capacity, ratio, compressed, heads, dimension, tile_
         raise ValueError("Head tile exceeds the bounded A2 softmax UB workspace")
 
     @T.macro
-    def normalize(scores, positions, selected, sink, probabilities, flat, active_long):
+    def normalize(scores, positions, selected, sink, probabilities, flat, active_long, lower_bound):
         xs = T.alloc_ub((tile_heads, span), "float32")
         xl = T.alloc_ub((tile_heads, active_long), "float32")
         lanes = T.alloc_ub((1, span), "float32")
@@ -561,7 +580,7 @@ def _bucketed_softmax(rows, capacity, ratio, compressed, heads, dimension, tile_
                 -T.infinity("float32"),
                 "VSEL_TENSOR_SCALAR_MODE",
             )
-        T.tile.compare(mask, lanes, T.cast(position - 128, "float32"), "GT")
+        T.tile.compare(mask, lanes, T.cast(T.max(position - 128, lower_bound - 1), "float32"), "GT")
         for h in T.unroll(tile_heads):
             T.tile.select(
                 xs[h : h + 1, :],
@@ -634,18 +653,70 @@ def _bucketed_softmax(rows, capacity, ratio, compressed, heads, dimension, tile_
                 end = positions[T.min(rows - 1, row // 16 * 16 + 15)] + 1
                 if not compressed or long_length == small:
                     if bucket == 0:
-                        normalize(scores, positions, selected, sink, probabilities, flat, active)
+                        normalize(scores, positions, selected, sink, probabilities, flat, active, 0)
                 elif bucket == 0:
                     if end <= 2048:
-                        normalize(scores, positions, selected, sink, probabilities, flat, active)
+                        normalize(scores, positions, selected, sink, probabilities, flat, active, 0)
                 elif bucket == 1:
                     if end > 2048:
                         if end <= 4096:
                             normalize(
-                                scores, positions, selected, sink, probabilities, flat, active
+                                scores, positions, selected, sink, probabilities, flat, active, 0
                             )
                 else:
                     if end > 4096:
-                        normalize(scores, positions, selected, sink, probabilities, flat, active)
+                        normalize(scores, positions, selected, sink, probabilities, flat, active, 0)
 
-    return main
+    @T.prim_func
+    def replay_main(
+        scores: T.Tensor((rows * heads, score_length), "float32"),
+        positions: T.Tensor((rows,), "int32"),
+        selected: T.Tensor((rows, long_length), "int32"),
+        sink: T.Tensor((heads,), "float32"),
+        probabilities: T.Tensor((rows * heads, probability_length), "bfloat16"),
+        replay_start: T.Tensor((1,), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(rows * heads, tile_heads * 2), is_npu=True) as (cid, vid):
+            flat = (cid * 2 + vid) * tile_heads
+            row = flat // heads
+            if row < rows:
+                end = positions[T.min(rows - 1, row // 16 * 16 + 15)] + 1
+                if bucket == 0:
+                    if end <= 2048:
+                        normalize(
+                            scores,
+                            positions,
+                            selected,
+                            sink,
+                            probabilities,
+                            flat,
+                            active,
+                            replay_start[0],
+                        )
+                elif bucket == 1:
+                    if end > 2048:
+                        if end <= 4096:
+                            normalize(
+                                scores,
+                                positions,
+                                selected,
+                                sink,
+                                probabilities,
+                                flat,
+                                active,
+                                replay_start[0],
+                            )
+                else:
+                    if end > 4096:
+                        normalize(
+                            scores,
+                            positions,
+                            selected,
+                            sink,
+                            probabilities,
+                            flat,
+                            active,
+                            replay_start[0],
+                        )
+
+    return replay_main if replay else main

@@ -27,6 +27,12 @@ def main():
     parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--min-rows", type=int, default=512)
     parser.add_argument("--reduce-scatter", action="store_true")
+    parser.add_argument("--shared-attention", action="store_true")
+    parser.add_argument(
+        "--decoder-tail",
+        action="store_true",
+        help="Shard the compacted decoder rows using the same private-row templates",
+    )
     args = parser.parse_args()
     if args.output.parent.resolve() != args.plan.parent.resolve():
         parser.error("Input and output must share their asset directory")
@@ -56,18 +62,42 @@ def main():
                 dynamic_arguments={"rows": 1},
                 placeholder=f"@sequence{len(tasks)}",
             )
+            descriptors[tasks[key]["placeholder"]] = dict(
+                op=op, parameters=parameters, operands=specs
+            )
         return tasks[key]["placeholder"]
 
     for rank in model["ranks"]:
         definitions = {d["name"]: d for d in rank["buffers"]}
-        packets = [p for p in rank["packets"] if p.get("min_rows", 0) >= 512]
+        replay_packets = []
+        if args.decoder_tail:
+            replay_packets = [
+                p for p in rank["packets"] if any(s["op"] == "limit_rows" for s in p["body"])
+            ]
+            if not replay_packets or args.shared_attention:
+                raise ValueError(
+                    "Decoder SP needs compacted packets and its existing attention projections"
+                )
+            packet = deepcopy(replay_packets[-1])
+            boundary = next(i for i, s in enumerate(packet["body"]) if s["op"] == "limit_rows")
+            packet["rows"] = packet["body"][boundary]["rows"]
+            packet["min_rows"] = 2
+            packet.pop("max_rows", None)
+            packet["body"] = packet["body"][boundary + 1 :]
+            packet["head"] = [s for s in packet["head"] if s["op"] != "limit_rows"]
+            for key, source in packet["coordinates"].items():
+                if isinstance(source, str) and f"replay{packet['rows']}." + source in definitions:
+                    packet["coordinates"][key] = f"replay{packet['rows']}." + source
+            packets = [packet]
+        else:
+            packets = [p for p in rank["packets"] if p.get("min_rows", 0) >= 512]
         if len(packets) != 1:
             raise ValueError("Expected one selected large-row packet")
         packet = packets[0]
         capacity = packet["rows"]
-        if not packet["min_rows"] <= args.min_rows <= capacity:
+        if not args.decoder_tail and not packet["min_rows"] <= args.min_rows <= capacity:
             raise ValueError("Selected minimum must lie inside the original large packet")
-        if args.min_rows > packet["min_rows"]:
+        if not args.decoder_tail and args.min_rows > packet["min_rows"]:
             fallback = deepcopy(packet)
             fallback["max_rows"] = args.min_rows - 1
             rank["packets"].insert(rank["packets"].index(packet), fallback)
@@ -198,6 +228,30 @@ def main():
         premix = packet["coordinates"]["premix"]
         body.append(zero_tail(premix, 8, "f32"))
         mapping[premix] = view(premix, 8, "f32")
+        if args.decoder_tail:
+            initial = set()
+            written = set()
+            for step in packet["body"]:
+                if step["op"] != "kernel":
+                    continue
+                manifest = descriptor(step)
+                for source, spec in zip(step["buffers"], manifest["operands"], strict=True):
+                    if (
+                        source not in written
+                        and source.endswith((".residual.a", ".residual.b", ".collapsed"))
+                        and spec["access"] in ("read", "read_write")
+                    ):
+                        initial.add(source)
+                written.update(
+                    source
+                    for source, spec in zip(step["buffers"], manifest["operands"], strict=True)
+                    if spec["access"] != "read"
+                )
+            for source in sorted(initial):
+                width = definitions[source]["bytes"] // capacity // 2
+                body.append(zero_tail(source, width, "bf16"))
+                mapping[source] = view(source, width, "bf16")
+                ready.add(source)
         for index, step in enumerate(packet["body"]):
             op = step["op"]
             if op == "embed":
@@ -277,10 +331,116 @@ def main():
             if kind == "engram.gate":
                 mapping[buffers[-1]] = view(buffers[-1], 20480, "bf16")
                 ready.add(buffers[-1])
-        if reductions != 80:
+        if reductions != (38 if args.decoder_tail else 80):
             raise ValueError("Expected all 80 body reductions")
         body.append(gather(packet["head"][0]["buffers"][0], "bf16", 5120))
+        if args.shared_attention:
+            shared_body, index, shared_groups = [], 0, 0
+            # Each KV/Qa projection and both norm weights refer to the same
+            # checkpoint ranges on all ranks; Qb remains tensor-parallel.
+            root_definitions = {d["name"]: d for d in model["ranks"][0]["buffers"]}
+            while index < len(body):
+                step = body[index]
+                if (
+                    step["op"] != "kernel"
+                    or descriptor(step)["op"] != "dense.projection"
+                    or not step["buffers"][4].endswith(".kv")
+                ):
+                    shared_body.append(step)
+                    index += 1
+                    continue
+                if index < 3 or len(shared_body) < 3:
+                    raise ValueError("Shared attention is missing its quantization/gather prefix")
+                group = body[index - 1 : index + 10]
+                expected = [
+                    "fork",
+                    "dense.projection",
+                    "model_ops.norm",
+                    "model_ops.partial_rope",
+                    "memory.scatter_rows",
+                    "switch",
+                    "dense.projection",
+                    "model_ops.norm_quant",
+                    "dense.projection",
+                    "model_ops.partial_rope",
+                    "join",
+                ]
+                actual = [
+                    descriptor(op)["op"] if op["op"] == "kernel" else op["op"] for op in group
+                ]
+                if actual != expected:
+                    raise ValueError("Unsupported KV/Qa branch: " + str(actual))
+                kv, norm, rope, scatter = group[1:5]
+                qa, norm_quant, qb, query_rope = group[6:10]
+                for original in [kv, norm, qa, norm_quant]:
+                    for binding in original["buffers"]:
+                        if any(
+                            key in definitions[binding] for key in ("weight", "prepared_weight")
+                        ):
+                            if definitions[binding] != root_definitions.get(binding):
+                                raise ValueError(
+                                    "Shared projection uses rank-specific weights: " + binding
+                                )
+                if (
+                    not qa["buffers"][3].startswith("w.")
+                    or not qa["buffers"][4].endswith(".q.a")
+                    or not qb["buffers"][0].endswith(".q.norm.quant")
+                ):
+                    raise ValueError("Unexpected shared query projection geometry")
+                before = shared_body[-3:]
+                if (
+                    [op["op"] for op in before] != ["gather", "gather", "fork"]
+                    or not before[0].get("int32")
+                    or not before[0].get("fixed_rows")
+                    or before[0]["elements"] != count * 1280
+                    or not before[1]["destination"].endswith(".scale")
+                ):
+                    raise ValueError("Shared attention must replace its original wide A8 gathers")
+                quant = definitions[before[0]["destination"]].get("view", {}).get("parent")
+                private_quant = definitions[before[0]["source"]].get("view", {}).get("parent")
+                if (
+                    quant != kv["buffers"][0]
+                    or before[1]["destination"] != kv["buffers"][2]
+                    or private_quant != mapping[kv["buffers"][0]]
+                    or before[1]["source"] != mapping[kv["buffers"][2]]
+                ):
+                    raise ValueError("Shared KV consumes a different quantization group")
+                del shared_body[-3:]
+                shared_body.append(dict(op="fork"))
+                for original in [kv, norm, rope]:
+                    manifest = descriptor(original)
+                    if original is rope:
+                        for binding, spec in zip(
+                            original["buffers"][1:3], manifest["operands"][1:3], strict=True
+                        ):
+                            width = math.prod(spec["shape"][1:])
+                            mapping[binding] = view(binding, width, spec["dtype"])
+                    shared_body.append(local(original, manifest))
+                shared_body.append(dict(op="switch"))
+                for original in [qa, norm_quant]:
+                    shared_body.append(local(original, descriptor(original)))
+                shared_body.append(dict(op="join"))
+                shared_body.append(gather(rope["buffers"][-1], "bf16", 512))
+                shared_body.append(scatter)
+                shared_body.append(gather(norm_quant["buffers"][2], "i8", 1280))
+                shared_body.append(gather(norm_quant["buffers"][3], "f32", 1))
+                shared_body.extend([qb, query_rope])
+                index += 10
+                shared_groups += 1
+                local_kernels += 5
+            if shared_groups != 40:
+                raise ValueError("Expected all 40 common KV/Qa branches")
+            body = shared_body
         packet["body"] = body
+        if args.decoder_tail:
+            for original in replay_packets:
+                boundary = next(
+                    i for i, s in enumerate(original["body"]) if s["op"] == "limit_rows"
+                )
+                if original["body"][boundary]["rows"] != capacity:
+                    raise ValueError("Decoder suffix capacities differ")
+                original["body"] = original["body"][: boundary + 1] + deepcopy(body)
+                original["head"] = [dict(op="limit_rows", rows=capacity)] + deepcopy(packet["head"])
         print(
             dict(
                 rank=rank["rank"],

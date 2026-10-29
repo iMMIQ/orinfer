@@ -103,6 +103,11 @@ enum Instruction {
     Fork,
     Switch,
     Join,
+    /// Subsequent row-dependent launches consume an already compacted suffix.
+    /// Coordinates and live state must be compacted by preceding kernels.
+    LimitRows {
+        rows: usize,
+    },
     Gather {
         source: String,
         destination: String,
@@ -643,22 +648,28 @@ impl Worker {
         snapshots: bool,
         extent: (usize, usize),
     ) -> Result<Vec<Step>> {
-        let (capacity, actual) = extent;
-        let scaled = |n: usize| -> Result<usize> {
-            if capacity == 0 || !n.is_multiple_of(capacity) {
-                return Err("Packet row expression differs from capacity".into());
-            }
-            (n / capacity)
-                .checked_mul(actual)
-                .ok_or_else(|| "Packet row extent overflow".into())
-        };
+        let (mut capacity, actual) = extent;
+        let mut active_rows = actual;
         branches::validate_instructions(instructions)?;
         let mut steps = vec![];
         let mut pending: Vec<SegmentOp> = vec![];
         let mut fork_count = 0;
         let mut fork_stack = Vec::new();
         for instruction in instructions {
+            let scaled = |n: usize| -> Result<usize> {
+                if capacity == 0 || !n.is_multiple_of(capacity) {
+                    return Err("Packet row expression differs from capacity".into());
+                }
+                (n / capacity)
+                    .checked_mul(active_rows)
+                    .ok_or_else(|| "Packet row extent overflow".into())
+            };
             match instruction {
+                Instruction::LimitRows { rows } => {
+                    active_rows = bounded_rows(active_rows, capacity, *rows)?;
+                    capacity = *rows;
+                    continue;
+                }
                 Instruction::Fork => {
                     pending.push(SegmentOp::Fork(fork_count));
                     fork_stack.push(fork_count);
@@ -721,7 +732,7 @@ impl Worker {
                             &self.session,
                             &template,
                             &operands,
-                            fixed_rows.unwrap_or(actual),
+                            fixed_rows.unwrap_or(active_rows),
                         )?
                     } else {
                         Kernel::bind(&self.session, &template, &operands)?
@@ -914,6 +925,7 @@ impl Worker {
                     mask: get(&self.buffers, mask)?,
                 },
                 Instruction::Snapshot { .. }
+                | Instruction::LimitRows { .. }
                 | Instruction::Fork
                 | Instruction::Switch
                 | Instruction::Join
@@ -1121,7 +1133,15 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
             if layers != (0..40).map(|i| format!("layer{i:02}")).collect() {
                 return Err("A2 execution packet does not cover all 40 layers".into());
             }
+            let mut current_capacity = packet.rows;
             for instruction in packet.body.iter().chain(&packet.head) {
+                if let Instruction::LimitRows { rows } = instruction {
+                    if packet.min_rows == 0 {
+                        return Err("Decode packets cannot truncate their rows".into());
+                    }
+                    bounded_rows(current_capacity, current_capacity, *rows)?;
+                    current_capacity = *rows;
+                }
                 if let Instruction::Kernel {
                     manifest,
                     buffers: bindings,
@@ -1140,8 +1160,8 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                         kernels.insert(manifest.clone(), spec);
                     }
                     let spec = &kernels[manifest];
-                    let expected = fixed_rows.unwrap_or(packet.rows);
-                    if fixed_rows.is_some_and(|rows| rows == 0 || rows > packet.rows)
+                    let expected = fixed_rows.unwrap_or(current_capacity);
+                    if fixed_rows.is_some_and(|rows| rows == 0 || rows > current_capacity)
                         || spec
                             .row_capacity()?
                             .is_some_and(|cap| packet.min_rows == 0 || cap != expected)
@@ -1173,7 +1193,7 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                 } = instruction
                 {
                     if *experts != 48
-                        || *rows != packet.rows * 6
+                        || *rows != current_capacity * 6
                         || !input.is_multiple_of(256)
                         || !output.is_multiple_of(32)
                     {
@@ -1214,6 +1234,13 @@ fn gather_element(fp32: bool, int32: bool) -> Result<Element> {
         (false, false) => Ok(Element::Bfloat16),
         (true, true) => Err("AllGather has conflicting element types".into()),
     }
+}
+
+fn bounded_rows(actual: usize, capacity: usize, limit: usize) -> Result<usize> {
+    if actual == 0 || actual > capacity || limit == 0 || limit > capacity {
+        return Err("Compacted row extent exceeds its packet capacity".into());
+    }
+    Ok(actual.min(limit))
 }
 
 fn validate_dispatch(packets: &[Packet]) -> Result<()> {

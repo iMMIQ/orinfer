@@ -114,7 +114,8 @@ def compile_kernel(
         # Model bindings may flatten contiguous dimensions. Publish the actual
         # compiler tensor geometry while retaining the checked physical span.
         spec["shape"] = shape
-    stages = split_resources(function) if row_capacity is not None else [function]
+    coupled = bool(function.attrs and function.attrs.get("orinfer.coupled_resources", False))
+    stages = split_resources(function) if row_capacity is not None and not coupled else [function]
     explicit_sync = bool(function.attrs and function.attrs.get("orinfer.explicit_sync", False))
     if explicit_sync and len(stages) != 1:
         raise ValueError("Explicit pipeline synchronization requires a single native stage")
@@ -131,6 +132,8 @@ def compile_kernel(
     }
     if explicit_sync:
         compiler["pipeline_sync"] = "explicit-v1"
+    if coupled:
+        compiler["resource_schedule"] = "coupled-cube-vector-v1"
     module = Path(__file__).with_name(name.split(".")[0] + ".py")
     # Production names identify the source module. Include its inlined math
     # and the shared compiler/file helpers; unrelated operators have independent

@@ -1,4 +1,25 @@
-use super::{Element, Instruction, Packet, gather_element, validate_dispatch};
+use super::{Element, Instruction, Packet, bounded_rows, gather_element, validate_dispatch};
+
+#[test]
+fn compacted_suffix_rows_keep_short_packets_and_reject_invalid_extents() {
+    for actual in 1..=2048 {
+        assert_eq!(bounded_rows(actual, 2048, 140).unwrap(), actual.min(140));
+    }
+    assert_eq!(bounded_rows(2048, 2048, 128).unwrap(), 128);
+    for (actual, capacity, limit) in [
+        (0, 2048, 128),
+        (2049, 2048, 128),
+        (17, 2048, 0),
+        (17, 2048, 2049),
+    ] {
+        assert!(bounded_rows(actual, capacity, limit).is_err());
+    }
+    let instruction: Instruction = serde_json::from_value(serde_json::json!({
+        "op": "limit_rows", "rows": 140
+    }))
+    .unwrap();
+    assert!(matches!(instruction, Instruction::LimitRows { rows: 140 }));
+}
 
 fn packet(rows: usize, min_rows: usize, max_rows: Option<usize>) -> Packet {
     let mut coordinates = serde_json::Map::new();

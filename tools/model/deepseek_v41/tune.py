@@ -16,7 +16,7 @@ from tools.model.row_selection import aggregate_winner
 from tools.model.tuning import compile_candidates, measure, read_record, record_path
 
 
-def projection_configs(parameters, pipeline_only=False, wide_integer=False):
+def projection_configs(parameters, pipeline_only=False, wide_integer=False, joint=False):
     baseline = {
         key: parameters.get(key, default)
         for key, default in (
@@ -26,7 +26,23 @@ def projection_configs(parameters, pipeline_only=False, wide_integer=False):
             ("pipeline_stages", 0),
         )
     }
-    if wide_integer:
+    if joint:
+        configs = [
+            dict(baseline, tile_m=m, tile_n=n, block_k=k, pipeline_stages=s)
+            for m, n, k, s in (
+                (32, 128, 128, 2),
+                (64, 64, 128, 2),
+                (64, 128, 128, 0),
+                (64, 128, 128, 2),
+                (64, 128, 128, 3),
+                (128, 64, 128, 2),
+                (128, 128, 128, 2),
+                (64, 128, 256, 2),
+                (64, 128, 512, 2),
+            )
+            if parameters["reduction"] % k == 0 and (s == 0 or parameters["reduction"] // k >= s)
+        ]
+    elif wide_integer:
         configs = [
             dict(baseline, tile_m=128, tile_n=256, pipeline_stages=s)
             for s in (0, 2, 3)
@@ -58,8 +74,22 @@ def main():
     p.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--compile-workers", type=int, default=4)
+    p.add_argument(
+        "--geometry",
+        type=int,
+        nargs=2,
+        action="append",
+        metavar=("N", "K"),
+        help="Limit tuning to these measured output/reduction geometries",
+    )
+    p.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Tune only dynamic projection kernels with an explicit fixed_rows binding",
+    )
     search = p.add_mutually_exclusive_group()
     search.add_argument("--pipeline-only", action="store_true")
+    search.add_argument("--joint", action="store_true", help="Joint M/N/K/pipeline candidates")
     search.add_argument(
         "--wide-integer",
         action="store_true",
@@ -89,11 +119,24 @@ def main():
                 continue
             manifest = json.loads((base / step["manifest"]).read_text())
             if manifest["op"] == "dense.projection" and "_row_capacity" in manifest["parameters"]:
+                if (
+                    args.geometry
+                    and [manifest["parameters"]["output"], manifest["parameters"]["reduction"]]
+                    not in args.geometry
+                ):
+                    continue
+                if (
+                    args.local_only
+                    and step.get("fixed_rows") != manifest["parameters"]["_row_capacity"]
+                ):
+                    continue
                 groups[step["manifest"]] = (
                     manifest,
                     definitions[step["buffers"][1]],
                     definitions[step["buffers"][3]],
                 )
+    if not groups:
+        raise ValueError("No dynamic projection kernels match the selected geometry and scope")
     replacements = {}
     for old, (manifest, weight, scaling) in groups.items():
         parameters = dict(manifest["parameters"])
@@ -101,7 +144,9 @@ def main():
         grid_limit = parameters.pop("_grid_limit", 64)
         if args.wide_integer and (not parameters["integer"] or parameters["output"] % 256):
             continue
-        measured = sorted({r for r in args.rows if 1 <= r <= capacity})
+        measured = (
+            [capacity] if args.local_only else sorted({r for r in args.rows if 1 <= r <= capacity})
+        )
         if not measured:
             raise ValueError("Missing bounded prefill measurements")
         bank = read_bank(
@@ -119,7 +164,7 @@ def main():
             if parameters["integer"]
             else None
         )
-        configs = projection_configs(parameters, args.pipeline_only, args.wide_integer)
+        configs = projection_configs(parameters, args.pipeline_only, args.wide_integer, args.joint)
         baseline = configs[0]
 
         def compile_one(config):

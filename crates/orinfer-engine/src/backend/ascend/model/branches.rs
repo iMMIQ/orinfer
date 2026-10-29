@@ -25,6 +25,7 @@ pub(super) fn validate_instructions(instructions: &[Instruction]) -> Result<()> 
                 return Err("HCCL collectives remain on the main branch".into());
             }
             Instruction::Embed { .. }
+            | Instruction::LimitRows { .. }
             | Instruction::Lookup { .. }
             | Instruction::Route { .. }
             | Instruction::Snapshot { .. }
@@ -157,6 +158,12 @@ mod tests {
             vec![Instruction::Fork],
             vec![Instruction::Fork, Instruction::Join],
             vec![Instruction::Fork, Instruction::Switch, Instruction::Switch],
+            vec![
+                Instruction::Fork,
+                Instruction::LimitRows { rows: 128 },
+                Instruction::Switch,
+                Instruction::Join,
+            ],
             vec![
                 Instruction::Fork,
                 Instruction::Snapshot {
