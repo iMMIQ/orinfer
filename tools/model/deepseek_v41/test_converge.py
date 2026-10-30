@@ -234,6 +234,117 @@ class LongGatherReuseTests(unittest.TestCase):
 
 
 class ConvergenceTests(unittest.TestCase):
+    def test_owner_token_capacity_follows_partition_and_work_scalar_stays_bounded(self):
+        ports = [
+            dict(dtype="i32", shape=[8192, 2]),
+            dict(dtype="u64", shape=[8, 2]),
+            dict(dtype="i32", shape=[1]),
+        ]
+        model = dict(
+            batch=dict(partitioned_tables={"w": 8, "p": 8}),
+            ranks=[
+                dict(
+                    buffers=[
+                        dict(name=name, bytes=size)
+                        for name, size in [("w", 8192 * 2 * 4), ("p", 8 * 2 * 8), ("a", 4)]
+                    ],
+                    packets=[
+                        dict(
+                            rows=2048,
+                            body=[
+                                dict(
+                                    op="kernel",
+                                    manifest="private.json",
+                                    buffers=["w", "p", "a"],
+                                    owner_work=expression("64"),
+                                )
+                            ],
+                            head=[],
+                        )
+                    ],
+                )
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "private.json"
+            spec = dict(
+                parameters=dict(_row_capacity=4096, _owner_token_capacity=256), operands=ports
+            )
+            path.write_text(json.dumps(spec))
+            validate_rows(model, root)
+            spec["parameters"]["_owner_token_capacity"] = 2048
+            path.write_text(json.dumps(spec))
+            with self.assertRaisesRegex(ValueError, "Owner token capacity"):
+                validate_rows(model, root)
+            spec["parameters"]["_owner_token_capacity"] = 256
+            path.write_text(json.dumps(spec))
+            for stride in (0, 4):
+                model["batch"]["partitioned_tables"]["w"] = stride
+                with self.assertRaisesRegex(ValueError, "Owner token capacity"):
+                    validate_rows(model, root)
+
+    def test_pruning_owner_tables_releases_dead_workspace_and_keeps_local_roles(self):
+        packet = dict(
+            coordinates={},
+            reset=[],
+            body=[
+                dict(
+                    op="kernel",
+                    manifest="local.json",
+                    owner_work=expression("64"),
+                    buffers=["local.work", "local.pointers", "active"],
+                )
+            ],
+            head=[],
+        )
+        model = dict(
+            batch=dict(
+                owners=8,
+                private=["keys"],
+                active="active",
+                endpoints="endpoints",
+                columns=[
+                    dict(buffer="old.scores"),
+                    dict(buffer="keys"),
+                    dict(buffer="local.scores", row_partition=8),
+                ],
+                pointers={"old.pointers": [0, 1], "local.pointers": [1, 2]},
+                work={"old.work": expression("64"), "local.work": expression("64")},
+                work_ranges={"old.work": dict(min_rows=1, max_rows=2048)},
+                partitioned_tables={"local.work": 8, "local.pointers": 8, "old.work": 8},
+            ),
+            ranks=[
+                dict(
+                    buffers=[
+                        dict(name=name, bytes=8)
+                        for name in (
+                            "old.scores",
+                            "keys",
+                            "local.scores",
+                            "old.pointers",
+                            "local.pointers",
+                            "old.work",
+                            "local.work",
+                            "active",
+                            "endpoints",
+                        )
+                    ],
+                    packets=[packet],
+                )
+            ],
+        )
+        compact_buffers(model, owner_tables=True)
+        batch = model["batch"]
+        self.assertEqual(batch["pointers"], {"local.pointers": [0, 1]})
+        self.assertEqual([c["buffer"] for c in batch["columns"]], ["keys", "local.scores"])
+        self.assertEqual(batch["partitioned_tables"], {"local.work": 8, "local.pointers": 8})
+        self.assertEqual(batch["work_ranges"], {})
+        self.assertEqual(
+            {b["name"] for b in model["ranks"][0]["buffers"]},
+            {"keys", "local.scores", "local.pointers", "local.work", "active", "endpoints"},
+        )
+
     def test_shared_projection_checks_consumers_before_the_next_write(self):
         def kernel(access, name="local"):
             return dict(op="kernel", buffers=[name], ports=[dict(access=access)])

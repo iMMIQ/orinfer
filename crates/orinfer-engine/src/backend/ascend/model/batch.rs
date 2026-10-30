@@ -17,6 +17,8 @@ pub(super) struct Column {
     pub row_bytes: Option<usize>,
     pub row_alignment: usize,
     pub decode: Option<bool>,
+    #[serde(default)]
+    pub row_partition: Option<usize>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,12 +32,37 @@ pub(super) struct Contract {
     pub work: BTreeMap<String, RowExpression>,
     #[serde(default)]
     pub work_ranges: BTreeMap<String, WorkRange>,
+    /// Pointer/work tables selecting global rows rank%stride + n*stride.
+    #[serde(default)]
+    pub partitioned_tables: BTreeMap<String, usize>,
     #[serde(default)]
     pub prefill_quantum: Option<usize>,
     #[serde(default)]
     pub state: Vec<super::state::StateLayout>,
 }
 impl Contract {
+    pub(super) fn token_capacity(&self, table: &str, rows: usize) -> Result<usize> {
+        match self.partitioned_tables.get(table) {
+            None => Ok(rows),
+            Some(&stride) if stride > 1 => Ok(rows.div_ceil(stride)),
+            _ => Err("Invalid owner row partition stride".into()),
+        }
+    }
+    pub(super) fn work_items(
+        &self,
+        layout: &Layout,
+        grid: &RowExpression,
+        name: &str,
+        rank: usize,
+    ) -> Result<Vec<[i32; 2]>> {
+        let range = self.work_ranges.get(name);
+        if let Some(&stride) = self.partitioned_tables.get(name) {
+            let view = layout.rows.partition(stride, rank % stride)?;
+            work_lengths(view.lengths, grid, range)
+        } else {
+            work_items(layout, grid, range)
+        }
+    }
     pub(super) fn preferred_span(&self) -> usize {
         self.prefill_quantum.unwrap_or_else(|| {
             self.work_ranges
@@ -67,6 +94,7 @@ pub(super) struct Key {
     decode: bool,
     lengths: Vec<usize>,
     outputs: usize,
+    partitioned_lengths: Vec<usize>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TableKey {
@@ -93,6 +121,15 @@ struct TableUse {
     columns: Vec<bool>,
 }
 impl Runtime {
+    fn key(&self, layout: &Layout) -> Key {
+        let mut key = layout.key();
+        if !layout.decode && !self.contract.partitioned_tables.is_empty() {
+            // Reordering owners changes the count of selected rows per owner,
+            // and hence indirect launch extents, even for equal sorted lengths.
+            key.partitioned_lengths = layout.segments.iter().map(|s| s.tokens).collect();
+        }
+        key
+    }
     pub fn new(contract: Contract, capacity: usize, packets: &[super::Packet]) -> Self {
         let mut tables = BTreeMap::new();
         for packet in packets {
@@ -164,6 +201,7 @@ impl Layout {
             decode: self.decode,
             lengths,
             outputs: self.outputs.len(),
+            partitioned_lengths: vec![],
         }
     }
     fn table_key(&self, min_rows: usize) -> TableKey {
@@ -179,12 +217,19 @@ pub(super) fn work_items(
     grid: &RowExpression,
     range: Option<&WorkRange>,
 ) -> Result<Vec<[i32; 2]>> {
+    work_lengths(layout.segments.iter().map(|s| s.tokens), grid, range)
+}
+fn work_lengths(
+    lengths: impl IntoIterator<Item = usize>,
+    grid: &RowExpression,
+    range: Option<&WorkRange>,
+) -> Result<Vec<[i32; 2]>> {
     let mut out = vec![];
-    for (owner, segment) in layout.segments.iter().enumerate() {
-        if range.is_some_and(|r| segment.tokens < r.min_rows || segment.tokens > r.max_rows) {
+    for (owner, tokens) in lengths.into_iter().enumerate() {
+        if tokens == 0 || range.is_some_and(|r| tokens < r.min_rows || tokens > r.max_rows) {
             continue;
         }
-        for block in 0..grid.resolve(segment.tokens)?.min(64) {
+        for block in 0..grid.resolve(tokens)?.min(64) {
             out.push([owner as i32, block as i32]);
         }
     }
@@ -333,24 +378,24 @@ impl Worker {
         Ok(())
     }
     pub(super) fn batch_cached(&self, layout: &Layout) -> Result<bool> {
-        Ok(self
-            .batch
-            .as_ref()
-            .ok_or("Missing batch runtime")?
-            .cache
-            .contains_key(&layout.key()))
+        let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+        Ok(runtime.cache.contains_key(&runtime.key(layout)))
     }
     pub(super) fn invalidate_batch(&mut self, layout: &Layout) -> Result<()> {
         self.session.synchronize()?;
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
-        let key = layout.key();
+        let key = runtime.key(layout);
         runtime.cache.remove(&key);
         runtime.lru.retain(|k| k != &key);
         self.w4.retain(|_, w| w.strong_count() > 0);
         self.reserve_batch_memory(3 << 30, "coordinated Graph preparation")
     }
     pub(super) fn prepare_batch(&mut self, layout: &Layout) -> Result<()> {
-        let key = layout.key();
+        let key = self
+            .batch
+            .as_ref()
+            .ok_or("Missing batch runtime")?
+            .key(layout);
         if !self
             .batch
             .as_ref()
@@ -432,23 +477,20 @@ impl Worker {
             .get(&(packet.batch_decode, packet.min_rows))
             .ok_or("Missing packet table usage")?;
         let mut aligned = BTreeMap::new();
-        aligned.insert(1, layout.rows.clone());
+        aligned.insert((1, 1), layout.rows.partition(1, 0)?);
         for (index, column) in runtime.contract.columns.iter().enumerate() {
-            let alignment = column.row_alignment;
-            if used.columns[index]
-                && column.row_bytes.is_some()
-                && !aligned.contains_key(&alignment)
-            {
-                aligned.insert(
-                    alignment,
-                    Rows::new(
-                        layout
-                            .segments
-                            .iter()
-                            .map(|s| s.tokens.div_ceil(alignment) * alignment),
-                        layout.rows.total + layout.segments.len() * (alignment - 1),
-                    )?,
-                );
+            if used.columns[index] && column.row_bytes.is_some() {
+                let stride = column.row_partition.unwrap_or(1);
+                let alignment = column.row_alignment;
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    aligned.entry((stride, 1))
+                {
+                    entry.insert(layout.rows.partition(stride, self.rank as usize % stride)?);
+                }
+                if alignment > 1 && !aligned.contains_key(&(stride, alignment)) {
+                    let view = aligned[&(stride, 1)].aligned(alignment)?;
+                    aligned.insert((stride, alignment), view);
+                }
             }
         }
         let mut values = Vec::new();
@@ -460,26 +502,29 @@ impl Worker {
                 .ok_or("Owner must be admitted before capture")?;
             values.extend_from_slice(&(segment.tokens as u64).to_le_bytes());
             for (index, column) in runtime.contract.columns.iter().enumerate() {
-                let buffer =
-                    if !used.columns[index] || column.decode.is_some_and(|d| d != layout.decode) {
+                let buffer = if !used.columns[index]
+                    || column.decode.is_some_and(|d| d != layout.decode)
+                {
+                    None
+                } else if let Some(stride) = column.row_bytes {
+                    let view = &aligned[&(column.row_partition.unwrap_or(1), column.row_alignment)];
+                    if view.lengths[lane] == 0 {
                         None
-                    } else if let Some(stride) = column.row_bytes {
+                    } else {
                         Some(
                             get(&self.buffers, &column.buffer)?.slice(
-                                aligned[&column.row_alignment].starts[lane]
+                                view.starts[lane]
                                     .checked_mul(stride)
                                     .ok_or("Owner offset overflow")?,
-                                segment
-                                    .tokens
-                                    .div_ceil(column.row_alignment)
-                                    .checked_mul(column.row_alignment)
-                                    .and_then(|q| q.checked_mul(stride))
+                                view.lengths[lane]
+                                    .checked_mul(stride)
                                     .ok_or("Owner span overflow")?,
                             )?,
                         )
-                    } else {
-                        Some(get(&owner.buffers, &column.buffer)?)
-                    };
+                    }
+                } else {
+                    Some(get(&owner.buffers, &column.buffer)?)
+                };
                 let address = buffer.as_ref().map_or(0, |b| b.pointer() as usize as u64);
                 values.extend_from_slice(&address.to_le_bytes());
                 if let Some(buffer) = buffer {
@@ -501,7 +546,13 @@ impl Worker {
             }
             let mut data = Vec::with_capacity(layout.segments.len() * (mapping.len() + 1) * 8);
             for owner in 0..layout.segments.len() {
-                data.extend_from_slice(&addresses[owner * width]);
+                if let Some(&stride) = runtime.contract.partitioned_tables.get(name) {
+                    data.extend_from_slice(
+                        &(aligned[&(stride, 1)].lengths[owner] as u64).to_le_bytes(),
+                    );
+                } else {
+                    data.extend_from_slice(&addresses[owner * width]);
+                }
                 for &column in mapping {
                     data.extend_from_slice(&addresses[owner * width + column + 1]);
                 }
@@ -510,7 +561,9 @@ impl Worker {
         }
         for name in &used.work {
             let grid = &runtime.contract.work[name];
-            let data = work_items(layout, grid, runtime.contract.work_ranges.get(name))?
+            let data = runtime
+                .contract
+                .work_items(layout, grid, name, self.rank as usize)?
                 .iter()
                 .flat_map(|p| p.iter().flat_map(|x| x.to_le_bytes()))
                 .collect::<Vec<_>>();
@@ -566,12 +619,11 @@ impl Worker {
         {
             return Err("Batch input differs from row layout".into());
         }
+        let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
         let execution = Rc::clone(
-            self.batch
-                .as_ref()
-                .ok_or("Missing batch runtime")?
+            runtime
                 .cache
-                .get(&layout.key())
+                .get(&runtime.key(layout))
                 .ok_or("Batch must be prepared before forward")?,
         );
         let retained = self.update_batch_tables(layout, &execution.packet)?;
@@ -712,6 +764,12 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
     {
         return Err("Invalid batch contract".into());
     }
+    let valid_partition = |stride: usize| stride > 1 && model.ranks.len().is_multiple_of(stride);
+    if c.partitioned_tables.iter().any(|(name, &stride)| {
+        !valid_partition(stride) || (!c.pointers.contains_key(name) && !c.work.contains_key(name))
+    }) {
+        return Err("Invalid owner row partition table".into());
+    }
     for rank in &model.ranks {
         let buffers = rank
             .buffers
@@ -728,6 +786,9 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
                 || column.row_bytes == Some(0)
                 || !column.row_alignment.is_power_of_two()
                 || column.row_alignment > 256
+                || column
+                    .row_partition
+                    .is_some_and(|n| !valid_partition(n) || column.row_bytes.is_none())
             {
                 return Err("Owner column cannot own immutable weights".into());
             }
@@ -796,6 +857,7 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
                         .find(|p| p.batch_decode == decode)
                         .unwrap();
                     if p.rows
+                        .div_ceil(column.row_partition.unwrap_or(1))
                         .checked_add(c.owners * (column.row_alignment - 1))
                         .and_then(|q| stride.checked_mul(q))
                         != Some(buffers[column.buffer.as_str()].bytes)
@@ -834,6 +896,13 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             {
                 return Err("Invalid owner pointer mapping".into());
             }
+            let partition = c.partitioned_tables.get(name).copied().unwrap_or(1);
+            if mapping.iter().any(|&i| {
+                c.columns[i].row_bytes.is_some()
+                    && c.columns[i].row_partition.unwrap_or(1) != partition
+            }) {
+                return Err("Owner pointer table mixes row partitions".into());
+            }
         }
         for p in &rank.packets {
             if p.min_rows == 0
@@ -847,9 +916,16 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             for s in p.body.iter().chain(&p.head) {
                 if let Instruction::Kernel {
                     owner_work: Some(grid),
+                    buffers,
                     ..
                 } = s
                 {
+                    if buffers.len() < 3
+                        || c.partitioned_tables.get(&buffers[0])
+                            != c.partitioned_tables.get(&buffers[1])
+                    {
+                        return Err("Owner work and pointers select different rows".into());
+                    }
                     for q in [1, p.rows] {
                         grid.resolve(q)?;
                     }
@@ -875,6 +951,36 @@ mod tests {
             4096,
             128,
         )
+    }
+    #[test]
+    fn partitioned_work_keeps_original_owner_and_graph_order() {
+        let mut contract: Contract = serde_json::from_value(serde_json::json!({
+            "owners": 32, "columns": [], "private": [], "pointers": {},
+            "active": "a", "endpoints": "e", "work": {}
+        }))
+        .unwrap();
+        let a = layout(&[1, 7, 3], &[91, 4, 33]).unwrap();
+        let b = layout(&[3, 1, 7], &[8, 77, 5]).unwrap();
+        let original = Runtime::new(contract.clone(), 8, &[]);
+        assert_eq!(original.key(&a), original.key(&b));
+        contract.partitioned_tables.insert("w".into(), 8);
+        assert_eq!(contract.token_capacity("w", 2048).unwrap(), 256);
+        assert_eq!(contract.token_capacity("w", 2047).unwrap(), 256);
+        assert_eq!(contract.token_capacity("original", 2048).unwrap(), 2048);
+        let runtime = Runtime::new(contract.clone(), 8, &[]);
+        assert_ne!(runtime.key(&a), runtime.key(&b));
+        let reordered_ids = layout(&[1, 7, 3], &[33, 91, 4]).unwrap();
+        assert_eq!(runtime.key(&a), runtime.key(&reordered_ids));
+        let grid: RowExpression =
+            serde_json::from_value(serde_json::json!({"op":"constant","value":64})).unwrap();
+        let work = contract.work_items(&a, &grid, "w", 7).unwrap();
+        assert_eq!(work.len(), 64);
+        assert!(work.iter().all(|p| p[0] == 1));
+        let empty = layout(&[1, 2], &[9, 4]).unwrap();
+        assert_eq!(
+            contract.work_items(&empty, &grid, "w", 7).unwrap(),
+            [[-1, 0], [-1, 0]]
+        );
     }
     #[test]
     fn address_tables_keep_owner_and_output_order_when_graphs_share_a_shape() {

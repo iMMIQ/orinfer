@@ -251,11 +251,13 @@ def rebuild(
             descriptions[path] = json.loads((base / path).read_text())
         return descriptions[path]
 
-    def work(rank, grid, lower, upper):
-        key = json.dumps([grid, lower, upper], sort_keys=True)
+    def work(rank, grid, lower, upper, partition):
+        key = json.dumps([grid, lower, upper] + ([partition] if partition else []), sort_keys=True)
         role = "batch.work." + hashlib.sha256(key.encode()).hexdigest()[:16]
         contract["work"][role] = grid
         contract.setdefault("work_ranges", {})[role] = dict(min_rows=lower, max_rows=upper)
+        if partition:
+            contract.setdefault("partitioned_tables", {})[role] = partition
         if not any(buffer["name"] == role for buffer in rank["buffers"]):
             rank["buffers"].append(dict(name=role, bytes=8192 * 2 * 4))
         return role
@@ -283,6 +285,7 @@ def rebuild(
                     )
                 parameters = descriptor["parameters"]
                 capacity = parameters["_owner_token_capacity"]
+                partition = contract.get("partitioned_tables", {}).get(original["buffers"][0])
                 extent = contract.get("work_ranges", {}).get(
                     original["buffers"][0], dict(min_rows=1, max_rows=capacity)
                 )
@@ -382,13 +385,13 @@ def rebuild(
                 if extent["min_rows"] < lower:
                     short = deepcopy(original)
                     short["buffers"][0] = work(
-                        rank, original["owner_work"], extent["min_rows"], lower - 1
+                        rank, original["owner_work"], extent["min_rows"], lower - 1, partition
                     )
                     body.append(short)
                 step = deepcopy(original)
                 step["manifest"] = replacements[key]
                 step["owner_work"] = grid
-                step["buffers"][0] = work(rank, grid, lower, upper)
+                step["buffers"][0] = work(rank, grid, lower, upper, partition)
                 body.append(step)
                 changed += 1
             packet["body"] = body
@@ -405,7 +408,7 @@ def rebuild(
     contract["work_ranges"] = {
         name: value for name, value in contract.get("work_ranges", {}).items() if name in live
     }
-    model = compact_buffers(model)
+    model = compact_buffers(model, owner_tables=bool(contract.get("partitioned_tables")))
     validate_rows(model, base)
     atomic_json(base / "model-scheduled.json", model)
     publish_package(model, base, output / "package")

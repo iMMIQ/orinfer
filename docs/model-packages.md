@@ -512,7 +512,7 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
   --operator kv_int8.gather_attention --parameters '{"tile_slots":16,"bulk_store":true}'
 ```
 
-该入口复用 `batch.compile_task` 与 `private_rows`，检查输入／输出 dtype、owner 指针列序和物理字节范围，生成新的 work 表及最终资产。`--min-owner-rows N` 沿现有 owner range 契约保留更短 owner 的原绑定；decode 程序及权重保持已验证的编译资产。`gather_attention` 的 1／4／8／16 slot 配置共享整数读取后的 FP16／FP32 转换、scale 广播及 BF16 输出边界，按离线测量选定配置后发布。`validate_private_rows --op kv_int8.gather_attention --rows 1 17 128` 对照独立参考，并检查无效索引、环形 SWA、反向 owner、非对齐尾部及修改 KV／scale 后的 Graph replay。
+该入口复用 `batch.compile_task` 与 `private_rows`，检查输入／输出 dtype、owner 指针列序和物理字节范围，生成新的 work 表及最终资产。`--min-owner-rows N` 沿现有 owner range 契约保留更短 owner 的原绑定；分片计划按 owner 的局部选中行数应用该范围，并保留指针表／work 表的分片角色。decode 程序及权重保持已验证的编译资产。`gather_attention` 的 1／4／8／16 slot 配置共享整数读取后的 FP16／FP32 转换、scale 广播及 BF16 输出边界，按离线测量选定配置后发布。`validate_private_rows --op kv_int8.gather_attention --rows 1 17 128` 对照独立参考，并检查无效索引、环形 SWA、反向 owner、非对齐尾部及修改 KV／scale 后的 Graph replay。
 
 `bulk_store:true` 使用与下游 attention 一致的连续 512 维视图，一次写回整个 slot tile，合并逐 slot 的输出等待与拷贝。`validate_private_rows` 加 `--bulk-store` 验证此调度，并覆盖 FP16 scale 的零值、次正规值及极值。完整模型的 prefix 恢复诊断覆盖 17、129、2049 和 8193 token，包含环形 SWA 跨界后的 owner 迁移。
 
@@ -533,3 +533,12 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 该入口复用共享调优缓存、Graph 测量及逐样本回退约束，选择一个动态配置和至多一个小 owner 边界；回退约束覆盖记录中的实测点。测量、算子及编译辅助源码、编译器和目标身份均参与检查，缺少数值验证、连续小行数或容量上限时拒绝发布。新包只保留被选中的资产，普通 decode 保留原绑定。PV 的 BF16 概率、每 128 个 KV slot 的 FP32 累加与 BF16 输出边界保持一致，发布前继续验收完整模型请求及 2048／2049 等尾部。
 
 `bench-ascend-batch` 的显式 `frames` 可携带 `decode:true` 和固定 token 历史；阶段时间与 decode 输出计数跟随 frame 角色。比较 decode 调度时保持相同输入历史，并单独保留自由生成结果。
+
+owner-private 计划可复用查询行分片构建器：
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.shard_indexer \
+  --plan PLAN --output artifacts/a2-query-partition --compile-workers 4
+```
+
+该构建器对完整动态 prefill 行域使用同一套 INT8 indexer 和 TopK 工厂，各卡计算间隔分配的查询行，回收每条查询的 512 个 INT32 索引并恢复全局行序。共享 `Rows` 派生每个原 owner 的紧凑行数和偏移；`partitioned_tables` 声明指针表／work 表的分片步长，行列的 `row_partition` 声明物理容量。没有选中行的 owner 保留原槽位并使用空 work guard；私有 key、scale、KV 和压缩状态继续按原 owner 绑定。Graph 身份包含有序的 owner 行数布局，原地址表仍随 owner、真实行数和输出角色更新。构建器验证物理范围并裁掉失效的指针表、列和工作区；decode 使用原绑定。全局 TopK value 消费者需要显式回收契约，当前入口拒绝这类输入计划。 `validate_sharded_indexer --baseline BASELINE --plan PARTITIONED --output OUTPUT` 对照已发布的原算子链，覆盖不同私有 key、完整有效分数、TopK 值／索引、精确 tie、空 owner 分片、尾部和改变输入后的 Graph replay；`--rows` 可指定检查的全局查询行数。实际集合通信与请求状态由完整模型及 prefix 恢复验收。

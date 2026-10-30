@@ -868,15 +868,18 @@ impl Worker {
             } = instruction
             {
                 let rows = if let Some(grid) = owner_work {
-                    batch::work_items(
-                        layout.ok_or("Owner kernel needs batch layout")?,
-                        grid,
-                        self.batch
-                            .as_ref()
-                            .and_then(|b| b.contract.work_ranges.get(&buffers[0])),
-                    )?
-                    .len()
-                    .div_ceil(2)
+                    self.batch
+                        .as_ref()
+                        .ok_or("Missing batch runtime")?
+                        .contract
+                        .work_items(
+                            layout.ok_or("Owner kernel needs batch layout")?,
+                            grid,
+                            &buffers[0],
+                            self.rank as usize,
+                        )?
+                        .len()
+                        .div_ceil(2)
                 } else if *owners {
                     layout
                         .ok_or("Head kernel needs batch layout")?
@@ -1526,6 +1529,11 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                     }
                     if let Some(grid) = owner_work {
                         let c = model.batch.as_ref().ok_or("Missing owner contract")?;
+                        let owner_capacity = bindings
+                            .first()
+                            .map(|table| c.token_capacity(table, packet.rows))
+                            .transpose()?
+                            .unwrap_or(packet.rows);
                         if *owners
                             || fixed_rows.is_some()
                             || row_expression.is_some()
@@ -1534,7 +1542,7 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                             || !c.pointers.contains_key(&bindings[1])
                             || bindings[2] != c.active
                             || spec.parameters["_owner_token_capacity"].as_u64()
-                                != Some(packet.rows as u64)
+                                != Some(owner_capacity as u64)
                         {
                             return Err("Owner kernel/table/row contract differs".into());
                         }

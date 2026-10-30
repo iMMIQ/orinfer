@@ -62,7 +62,34 @@ def referenced_buffers(rank, batch=None):
     return used
 
 
-def compact_buffers(model):
+def compact_buffers(model, *, owner_tables=False):
+    batch = model.get("batch")
+    if batch is not None and owner_tables:
+        indirect = [
+            step
+            for rank in model["ranks"]
+            for packet in rank["packets"]
+            for step in packet["body"] + packet["head"]
+            if step["op"] == "kernel" and "owner_work" in step
+        ]
+        pointers = {step["buffers"][1] for step in indirect}
+        work = {step["buffers"][0] for step in indirect}
+        live = sorted({column for name in pointers for column in batch["pointers"][name]})
+        remap = {old: new for new, old in enumerate(live)}
+        batch["columns"] = [batch["columns"][index] for index in live]
+        batch["pointers"] = {
+            name: [remap[index] for index in mapping]
+            for name, mapping in batch["pointers"].items()
+            if name in pointers
+        }
+        batch["work"] = {name: grid for name, grid in batch["work"].items() if name in work}
+        for field in ("work_ranges", "partitioned_tables"):
+            if field in batch:
+                batch[field] = {
+                    name: value
+                    for name, value in batch[field].items()
+                    if name in (work if field == "work_ranges" else work | pointers)
+                }
     for rank in model["ranks"]:
         used = referenced_buffers(rank, model.get("batch"))
         rank["buffers"] = [b for b in rank["buffers"] if b["name"] in used]
@@ -240,6 +267,28 @@ def validate_rows(model, base):
                         bound = step.get("fixed_rows", capacity)
                         if step.get("owner_work") is not None:
                             bound = 4096
+                            tables = model["batch"].get("partitioned_tables", {})
+                            if (
+                                tables
+                                or "_owner_token_capacity" in spec["parameters"]
+                                or spec.get("op", "").startswith("private_rows.")
+                            ):
+                                if len(step["buffers"]) < 3:
+                                    raise ValueError(
+                                        "Owner token capacity requires complete owner tables"
+                                    )
+                                stride = tables.get(step["buffers"][0], 1)
+                                if (
+                                    not isinstance(stride, int)
+                                    or isinstance(stride, bool)
+                                    or stride < 1
+                                    or tables.get(step["buffers"][1], 1) != stride
+                                    or spec["parameters"].get("_owner_token_capacity")
+                                    != (packet["rows"] + stride - 1) // stride
+                                ):
+                                    raise ValueError(
+                                        "Owner token capacity differs from its row partition"
+                                    )
                         elif step.get("owners"):
                             bound = model["batch"]["owners"]
                         if "row_expression" in step:
