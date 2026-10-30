@@ -18,6 +18,45 @@ from tools.build.files import atomic_json, file_hash, source_hash
 from tools.model.row_contract import resolve
 
 
+def check_intermediate_liveness(program, candidates, describe, contract, definitions):
+    """Reject extra direct or owner-table readers of removed intermediates."""
+
+    def root(name):
+        while name in definitions and "view" in definitions[name]:
+            name = definitions[name]["view"]["parent"]
+        return name
+
+    live = {root(name) for name in candidates}
+    for step in program:
+        reads, writes = set(), set()
+        if step["op"] == "kernel":
+            spec = describe(step)
+            if "owner_work" in step:
+                columns = contract["pointers"][step["buffers"][1]]
+                for access in spec["parameters"]["_owner_access"]:
+                    name = contract["columns"][columns[access["column"]]]["buffer"]
+                    (writes if access["write"] else reads).add(root(name))
+            else:
+                for name, port in zip(step["buffers"], spec["operands"], strict=True):
+                    if port["access"] in ("read", "read_write"):
+                        reads.add(root(name))
+                    if port["access"] != "read":
+                        writes.add(root(name))
+        elif step["op"] in ("gather", "exchange", "reduce"):
+            reads.add(root(step["source"]))
+            writes.add(root(step["destination"]))
+        elif step["op"] == "snapshot":
+            reads.add(root(step["buffer"]))
+        elif step["op"] == "w4":
+            reads.update(root(n) for n in step["buffers"][:5])
+            writes.add(root(step["buffers"][5]))
+        if live & reads:
+            raise ValueError("Removed intermediate still has a reader")
+        live.difference_update(writes)
+        if not live:
+            break
+
+
 def referenced_buffers(rank, batch=None):
     used = set()
     if batch is not None:

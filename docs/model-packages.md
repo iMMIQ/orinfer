@@ -94,6 +94,8 @@ orinfer validate-ascend --device 0
 
 local TopK 的空块使用交错的 `(-inf, -1)` 候选对。`tools.operators.ascend.validate_topk_empty --baseline BASE_PLAN --plan PLAN --output REPORT` 对照发布库的完整候选 buffer，覆盖空／短／完整前缀、并列分数、行尾及改变分数和长度后的 Graph replay；报告另含短、长上下文的算子耗时。
 
+`tools.model.deepseek_v41.fuse_topk --plan PLAN --output OUTPUT` 将已有 32／64 个候选块的三层四路归并收敛为一次 query 内的 UB 滚动归并，默认用于 `min_rows >= 512` 的 packet family。它与独立归并共享计算组件，保留逐层输入顺序和 FP32 候选对。每行从现有分片长度列读取有效块数，跳过整棵空子树；生产者必须是已将空候选规范化为 `(-inf,-1)` 的融合索引器。构建器验证生产者、物理分片和中间结果的存活范围，省去两级 GM 中间结果的读写，不增加 owner 私有状态。`tools.operators.ascend.validate_topk_tree --baseline BASE_PLAN --plan PLAN --output REPORT` 对照已发布的三次归并，覆盖并列分数、空／完整上下文、非对齐 query 行、未使用尾部及改变输入和长度后的 Graph replay。
+
 已有原生计划可使用 `tools.model.deepseek_v41.build --rebuild-plan PLAN --rebuild-op topk.local` 只重建相关算子，输出同目录的 `PLAN-selected.json`。`--rebuild-op` 可重复提供，未出现在计划中的算子名会报错；未选中的库和权重保持原引用。重建复用公共编译任务及内容缓存，最终部署仍需发布新的执行包。
 
 当前离线编译镜像面向 aarch64，使用调用者提供的 CANN 9.1 / Python 3.12 运行时基础镜像，固定 TileLang-Ascend wheel 的版本与 SHA256。基础镜像需包含匹配的 PyTorch、torch_npu 和 CANN 编译器。`run.sh` 将所选基础镜像解析为本地不可变镜像 ID；板上运行时串行取得 GPU 实验锁，无卡编译使用 `--without-devices`。运行前先结束占用同一批 NPU 的开发容器；驱动的容器设备归属可能持续到容器退出。编译产物、参考数据和缓存保存在 `artifacts`：

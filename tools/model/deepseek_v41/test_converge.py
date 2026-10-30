@@ -13,6 +13,78 @@ from tools.model.deepseek_v41.sequence_parallel import external_reads
 from tools.model.deepseek_v41.private_schedule import reusable_long_gathers, select_schedule
 
 
+class TopKTreeTests(unittest.TestCase):
+    def fixture(self):
+        descriptions = {
+            str(i): dict(op="topk.merge", parameters=dict(sources=s, _row_capacity=256))
+            for i, s in enumerate([32, 8, 2])
+        }
+        steps = [
+            dict(op="kernel", manifest=str(i), buffers=[f"b{i}", f"b{i + 1}"], fixed_rows=17)
+            for i in range(3)
+        ]
+        producer = dict(op="kernel", manifest="producer", buffers=["work", "pointers", "active"])
+        descriptions["producer"] = dict(
+            op="private_rows.indexer_fused_causal_topk",
+            parameters=dict(
+                length=131072,
+                _owner_token_capacity=256,
+                _owner_aliases=dict(
+                    query_owner="int8", indices_owner="int32", candidates_owner="float32"
+                ),
+            ),
+        )
+        batch = dict(
+            pointers=dict(pointers=[0, 1, 2]),
+            columns=[
+                {},
+                dict(buffer="lengths", row_bytes=4, row_partition=8),
+                dict(buffer="b0", row_bytes=131072, row_partition=8),
+            ],
+        )
+        return steps, producer, descriptions, batch, dict(lengths=dict(bytes=1024))
+
+    def test_complete_tree_retains_row_binding(self):
+        from tools.model.deepseek_v41.fuse_topk import merge_chain
+
+        steps, _, descriptions, _, _ = self.fixture()
+
+        def describe(step):
+            return descriptions[step["manifest"]]
+
+        self.assertEqual(merge_chain(steps, 0, describe), steps)
+        self.assertIsNone(merge_chain(steps, 1, describe))
+        with self.assertRaises(ValueError):
+            merge_chain(steps[:-1], 0, describe)
+        for key, value in [("fixed_rows", 18), ("buffers", ["other", "b2"])]:
+            bad = deepcopy(steps)
+            bad[1][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                merge_chain(bad, 0, describe)
+
+    def test_causal_mask_uses_matching_partitioned_producer_lengths(self):
+        from tools.model.deepseek_v41.fuse_topk import causal_lengths
+
+        steps, producer, descriptions, batch, definitions = self.fixture()
+
+        def describe(step):
+            return descriptions[step["manifest"]]
+
+        self.assertEqual(causal_lengths(producer, steps, describe, batch, definitions), "lengths")
+        for key, value in [("row_bytes", 8), ("row_partition", 4), ("buffer", "other")]:
+            bad = deepcopy(batch)
+            bad["columns"][1 if key != "buffer" else 2][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                causal_lengths(producer, steps, describe, bad, definitions)
+        descriptions["0"]["parameters"]["selected"] = 256
+        with self.assertRaises(ValueError):
+            causal_lengths(producer, steps, describe, batch, definitions)
+        descriptions["0"]["parameters"]["selected"] = 512
+        descriptions["producer"]["parameters"]["length"] = 65536
+        with self.assertRaises(ValueError):
+            causal_lengths(producer, steps, describe, batch, definitions)
+
+
 class LocalIndexerChainTests(unittest.TestCase):
     def fixture(self):
         kinds = [

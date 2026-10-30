@@ -145,6 +145,38 @@ def local(rows, length, selected=512):
     return main
 
 
+@T.macro
+def merge_group(
+    candidates,
+    out,
+    source_row,
+    output_row,
+    source_group,
+    output_group,
+    sources,
+    selected,
+    a,
+    b,
+    c,
+    d,
+    merged,
+):
+    """The same ordered four-way merge for GM and UB tree levels."""
+    T.tile.fill(a, -T.infinity("float32"))
+    T.tile.fill(b, -T.infinity("float32"))
+    T.tile.fill(c, -T.infinity("float32"))
+    T.tile.fill(d, -T.infinity("float32"))
+    T.copy(candidates[source_row, source_group * 4, :], a)
+    if source_group * 4 + 1 < sources:
+        T.copy(candidates[source_row, source_group * 4 + 1, :], b)
+    if source_group * 4 + 2 < sources:
+        T.copy(candidates[source_row, source_group * 4 + 2, :], c)
+    if source_group * 4 + 3 < sources:
+        T.copy(candidates[source_row, source_group * 4 + 3, :], d)
+    T.tile.merge_sort(merged, a, b, c, d)
+    T.copy(merged[: 2 * selected], out[output_row, output_group, :])
+
+
 def merge(rows, sources, selected=512):
     groups = (sources + 3) // 4
 
@@ -163,19 +195,84 @@ def merge(rows, sources, selected=512):
             row = index // groups
             group = index % groups
             if row < rows:
-                T.tile.fill(a, -T.infinity("float32"))
-                T.tile.fill(b, -T.infinity("float32"))
-                T.tile.fill(c, -T.infinity("float32"))
-                T.tile.fill(d, -T.infinity("float32"))
-                T.copy(candidates[row, group * 4, :], a)
-                if group * 4 + 1 < sources:
-                    T.copy(candidates[row, group * 4 + 1, :], b)
-                if group * 4 + 2 < sources:
-                    T.copy(candidates[row, group * 4 + 2, :], c)
-                if group * 4 + 3 < sources:
-                    T.copy(candidates[row, group * 4 + 3, :], d)
-                T.tile.merge_sort(merged, a, b, c, d)
-                T.copy(merged[: 2 * selected], out[row, group, :])
+                merge_group(
+                    candidates, out, row, row, group, group, sources, selected, a, b, c, d, merged
+                )
+
+    return main
+
+
+def merge_tree(rows, sources, selected=512):
+    """Preserve the four-way tree, bypassing canonical empty causal subtrees."""
+    if sources not in (32, 64) or selected < 32 or selected > 512 or selected % 32:
+        raise ValueError("Fused TopK tree requires32/64 sources and32-aligned selected<=512")
+    second_groups = (sources + 15) // 16
+
+    @T.prim_func
+    def main(
+        candidates: T.Tensor((rows, sources, 2 * selected), "float32"),
+        lengths: T.Tensor((rows, 1), "int32"),
+        out: T.Tensor((rows, 1, 2 * selected), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            a = T.alloc_ub((2 * selected,), "float32")
+            b = T.alloc_ub((2 * selected,), "float32")
+            c = T.alloc_ub((2 * selected,), "float32")
+            d = T.alloc_ub((2 * selected,), "float32")
+            merged = T.alloc_ub((8 * selected,), "float32")
+            first_stage = T.alloc_ub((1, 4, 2 * selected), "float32")
+            second_stage = T.alloc_ub((1, second_groups, 2 * selected), "float32")
+            empty = T.alloc_ub((2 * selected,), "float32")
+            row = cid * 2 + vid
+            if row < rows:
+                live = T.max(1, T.ceildiv(T.min(sources * 4096, T.max(0, lengths[row, 0])), 4096))
+                if live < sources:
+                    # The producer canonicalizes every inactive leaf to (-inf, -1).
+                    # Merging four such leaves preserves this exact bit pattern.
+                    T.copy(candidates[row, live, :], empty)
+                for parent in T.serial(second_groups):
+                    if parent * 16 < live:
+                        for child in T.serial(4):
+                            group = parent * 4 + child
+                            if group * 4 < live:
+                                merge_group(
+                                    candidates,
+                                    first_stage,
+                                    row,
+                                    0,
+                                    group,
+                                    child,
+                                    sources,
+                                    selected,
+                                    a,
+                                    b,
+                                    c,
+                                    d,
+                                    merged,
+                                )
+                            else:
+                                T.copy(empty, first_stage[0, child, :])
+                        merge_group(
+                            first_stage,
+                            second_stage,
+                            0,
+                            0,
+                            0,
+                            parent,
+                            4,
+                            selected,
+                            a,
+                            b,
+                            c,
+                            d,
+                            merged,
+                        )
+                    else:
+                        T.copy(empty, second_stage[0, parent, :])
+                merge_group(
+                    second_stage, out, 0, row, 0, 0, second_groups, selected, a, b, c, d, merged
+                )
+                T.pipe_barrier("ALL")
 
     return main
 
