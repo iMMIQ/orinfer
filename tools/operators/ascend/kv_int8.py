@@ -22,7 +22,7 @@ def decode_row(cache, scales, index, q, half_values, values, half_scales, scale,
     decode_values(q, half_values, values, half_scales, scale, broadcast, y, 8)
 
 
-def scatter(rows, table_rows, reference_bf16=False, logical_capacity=0):
+def _scatter(rows, table_rows, reference_bf16=False, logical_capacity=0, staging_rows=0):
     """Round against the published FP16 scale before storing a unique cache row.
 
     ``-1`` skips a row; other invalid indices set the existing error flag. The
@@ -31,14 +31,8 @@ def scatter(rows, table_rows, reference_bf16=False, logical_capacity=0):
     """
     dtype = "bfloat16" if reference_bf16 else "int8"
 
-    @T.prim_func
-    def main(
-        source: T.Tensor((rows, 8, 64), "bfloat16"),
-        indices: T.Tensor((rows,), "int32"),
-        cache: T.Tensor((table_rows, 8, 64), dtype),
-        scales: T.Tensor((table_rows, 8), "float16"),
-        errors: T.Tensor((rows,), "int32"),
-    ):
+    @T.macro
+    def run(source, indices, cache, scales, errors, staged):
         with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
             xb = T.alloc_ub((8, 64), "bfloat16")
             x = T.alloc_ub((8, 64), "float32")
@@ -63,6 +57,27 @@ def scatter(rows, table_rows, reference_bf16=False, logical_capacity=0):
             flag = T.alloc_ub((8,), "int32")
             row = cid * 2 + vid
             if row < rows:
+                if staging_rows:
+                    end = T.min(logical_capacity, T.max(0, indices[0]))
+                    begin = T.max(0, end - 127)
+                    for part in T.serial(T.ceildiv(end - begin, rows)):
+                        history_index = begin + row + part * rows
+                        if history_index < end:
+                            physical = history_index % table_rows
+                            decode_row(
+                                cache,
+                                scales,
+                                physical,
+                                q,
+                                rounded,
+                                x,
+                                half_scales,
+                                scale,
+                                broadcast,
+                                y,
+                            )
+                            T.copy(y, staged[physical, :, :])
+                            T.pipe_barrier("ALL")
                 source_index = indices[row]
                 index = source_index % table_rows if logical_capacity else source_index
                 if source_index >= 0 and source_index < (logical_capacity or table_rows):
@@ -98,6 +113,12 @@ def scatter(rows, table_rows, reference_bf16=False, logical_capacity=0):
                         T.copy(y, cache[index, :, :])
                     else:
                         T.copy(q, cache[index, :, :])
+                    if staging_rows:
+                        T.tile.cast(rounded, q, "CAST_NONE", 512)
+                        T.tile.cast(x, rounded, "CAST_NONE", 512)
+                        T.tile.mul(x, x, broadcast)
+                        T.tile.cast(y, x, "CAST_RINT", 512)
+                        T.copy(y, staged[index, :, :])
                     T.copy(half_scales[:, 0], scales[index, :])
                 flag[0] = T.if_then_else(
                     source_index < -1 or source_index >= (logical_capacity or table_rows), 1, 0
@@ -105,7 +126,42 @@ def scatter(rows, table_rows, reference_bf16=False, logical_capacity=0):
                 T.copy(flag[:1], errors[row : row + 1])
                 T.pipe_barrier("ALL")
 
+    if staging_rows:
+        if reference_bf16 or staging_rows != table_rows or not logical_capacity:
+            raise ValueError("Staged scatter requires matching INT8 circular cache geometry")
+
+        @T.prim_func
+        def main(
+            source: T.Tensor((rows, 8, 64), "bfloat16"),
+            indices: T.Tensor((rows,), "int32"),
+            cache: T.Tensor((table_rows, 8, 64), dtype),
+            scales: T.Tensor((table_rows, 8), "float16"),
+            errors: T.Tensor((rows,), "int32"),
+            staged: T.Tensor((staging_rows, 8, 64), "bfloat16"),
+        ):
+            run(source, indices, cache, scales, errors, staged)
+    else:
+
+        @T.prim_func
+        def main(
+            source: T.Tensor((rows, 8, 64), "bfloat16"),
+            indices: T.Tensor((rows,), "int32"),
+            cache: T.Tensor((table_rows, 8, 64), dtype),
+            scales: T.Tensor((table_rows, 8), "float16"),
+            errors: T.Tensor((rows,), "int32"),
+        ):
+            run(source, indices, cache, scales, errors, cache)
+
     return main
+
+
+def scatter(rows, table_rows, reference_bf16=False, logical_capacity=0):
+    return _scatter(rows, table_rows, reference_bf16, logical_capacity)
+
+
+def scatter_staged(rows, table_rows, logical_capacity):
+    """Stage contiguous current rows and their prior 127 rows without new storage."""
+    return _scatter(rows, table_rows, False, logical_capacity, table_rows)
 
 
 def decode_prefix(rows, capacity, ratio=1, windowed=False):
@@ -182,10 +238,13 @@ def gather_tile(
     tile_slots,
     bulk_store,
     groups,
+    staged_swa,
+    staged,
+    staged_rows,
 ):
-    if tile_slots == 1 or not bulk_store:
+    if tile_slots == 1 or not bulk_store or staged:
         T.tile.fill(y, 0.0)
-    if tile_slots > 1:
+    if tile_slots > 1 and (not staged or first >= 128):
         T.reinterpretcast(q, zeros, "int8_t")
         T.tile.fill(zeros, 0)
         T.tile.fill(half_scales, 0.0)
@@ -195,16 +254,24 @@ def gather_tile(
         if slot < 128:
             source = swa_indices[row, slot]
             if source >= 0 and source < capacity:
-                T.copy(swa[source % storage, :, :], q[lane * 8 : (lane + 1) * 8, :])
-                if tile_slots == 1:
-                    T.copy(swa_scales[source % storage, :], half_scales[:, 0])
+                if staged:
+                    T.copy(
+                        staged_swa[source % storage, :, :],
+                        staged_rows[lane * 8 : (lane + 1) * 8, :],
+                    )
                 else:
-                    # FP16 scale rows are 16 bytes; scalar packing
-                    # avoids unaligned 32-byte UB DMA destinations.
-                    for group in T.unroll(8):
-                        half_scales[lane * 8 + group, 0] = swa_scales[source % storage, group]
-                if tile_slots == 1:
-                    decode_values(q, half_values, values, half_scales, scale, broadcast, y, groups)
+                    T.copy(swa[source % storage, :, :], q[lane * 8 : (lane + 1) * 8, :])
+                    if tile_slots == 1:
+                        T.copy(swa_scales[source % storage, :], half_scales[:, 0])
+                    else:
+                        # FP16 scale rows are 16 bytes; scalar packing
+                        # avoids unaligned 32-byte UB DMA destinations.
+                        for group in T.unroll(8):
+                            half_scales[lane * 8 + group, 0] = swa_scales[source % storage, group]
+                    if tile_slots == 1:
+                        decode_values(
+                            q, half_values, values, half_scales, scale, broadcast, y, groups
+                        )
                 flag[lane] = 0
         else:
             if compressed:
@@ -228,7 +295,7 @@ def gather_tile(
                             groups,
                         )
                     flag[lane] = 0
-    if tile_slots > 1:
+    if tile_slots > 1 and (not staged or first >= 128):
         decode_values(q, half_values, values, half_scales, scale, broadcast, y, groups)
     if bulk_store:
         T.copy(y, out[row, first : first + tile_slots, :])
@@ -289,6 +356,8 @@ def gather_attention(
             scale = T.alloc_ub((groups, 1), "float32")
             broadcast = T.alloc_ub((groups, 64), "float32")
             y = T.alloc_ub((tile_slots, 512), "bfloat16")
+            staged_rows = T.alloc_ub((groups, 64), "bfloat16")
+            T.reinterpretcast(staged_rows, y, "bfloat16_t")
             flag = T.alloc_ub((max(8, tile_slots),), "int32")
             flat = cid * 2 + vid
             row, first = flat // tiles, flat % tiles * tile_slots
@@ -320,6 +389,9 @@ def gather_attention(
                     tile_slots,
                     bulk_store,
                     groups,
+                    swa,
+                    False,
+                    staged_rows,
                 )
 
     return main

@@ -34,6 +34,7 @@ def main():
     p.add_argument("--benchmark-rows", type=int, nargs="+", help="Measure single-owner PV lengths")
     p.add_argument("--kv-compressed", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--bulk-store", action="store_true")
+    p.add_argument("--staged-swa", action="store_true")
     p.add_argument(
         "--reuse-long", action="store_true", help="Check full gather then SWA-only reuse"
     )
@@ -113,6 +114,7 @@ def main():
             for heads in a.attention_heads
         ],
         (kv_int8, "scatter", dict(rows=capacity, table_rows=256)),
+        (kv_int8, "scatter_staged", dict(rows=capacity, table_rows=256, logical_capacity=1024)),
         *[
             (
                 kv_int8,
@@ -144,6 +146,7 @@ def main():
                     swa_storage_rows=256,
                     tile_slots=tile,
                     reuse_long=a.reuse_long,
+                    staged_swa=a.staged_swa,
                 ),
             )
             for compressed in (False, True)
@@ -180,6 +183,7 @@ def main():
         columns = {t.name: i for i, t in enumerate(owned)}
         writes = {
             "scatter": {"cache", "scales", "errors"},
+            "scatter_staged": {"cache", "scales", "errors", "staged"},
             "gather_attention": {"out", "mask"},
             "qk": {"scores"},
             "pv": {"output", "workspace"},
@@ -313,7 +317,13 @@ def main():
                             dtype=dtype,
                         )
                 elif (
-                    name in ("gather_attention", "selected_int8", "causal_topk")
+                    name
+                    in (
+                        "gather_attention",
+                        "selected_int8",
+                        "causal_topk",
+                        "scatter_staged",
+                    )
                     and dtype == torch.int8
                 ):
                     v = torch.randint(-127, 128, shape, dtype=dtype)
@@ -372,18 +382,44 @@ def main():
             call(1, private_values(), m)
         active.fill_(1)
         sequences = [(order, lengths), (list(reversed(order)), lengths)]
-        if name in ("gather_attention", "selected_int8", "causal_topk") or module is attention_cube:
+        if (
+            name
+            in (
+                "gather_attention",
+                "selected_int8",
+                "causal_topk",
+                "scatter_staged",
+            )
+            or module is attention_cube
+        ):
             sequences.append((list(reversed(order)), lengths))
         for phase, (order, lengths) in enumerate(sequences):
             assert tables(order, lengths) == m
-            if name in ("gather_attention", "selected_int8", "causal_topk") and phase == 2:
+            if (
+                name
+                in (
+                    "gather_attention",
+                    "selected_int8",
+                    "causal_topk",
+                    "scatter_staged",
+                )
+                and phase == 2
+            ):
                 # Scatter/quantization updates these addresses between model
                 # steps. Exercise Scalar scale loads after actual GM updates.
                 for owner in range(a.owners):
                     for tensor, value, want in zip(
                         tensors, data[owner], expected[owner], strict=True
                     ):
-                        if tensor.name in ("swa", "long_kv", "query", "keys"):
+                        if tensor.name in (
+                            "swa",
+                            "long_kv",
+                            "query",
+                            "keys",
+                            "cache",
+                            "source",
+                            "staged_swa_cache",
+                        ):
                             value.neg_()
                             want.copy_(value)
                         elif tensor.name in (
@@ -391,6 +427,7 @@ def main():
                             "long_scales",
                             "query_scale",
                             "key_scale",
+                            "scales",
                         ):
                             value.mul_(0.5)
                             want.copy_(value)

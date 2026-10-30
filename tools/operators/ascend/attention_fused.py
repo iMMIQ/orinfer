@@ -357,6 +357,7 @@ def selected_int8(
     heads=64,
     tile_slots=16,
     reuse_long=False,
+    staged_swa=False,
 ):
     """One paired-core selected-KV gather/QK/softmax/PV invocation per query.
 
@@ -377,22 +378,23 @@ def selected_int8(
     half_heads, decode_groups = heads // 2, tile_slots * 8
     produced = 128 if reuse_long else selected
 
-    @T.prim_func
-    def main(
-        query: T.Tensor((rows, heads, dimension), "bfloat16"),
-        swa: T.Tensor((storage, 8, 64), "int8"),
-        swa_scales: T.Tensor((storage, 8), "float16"),
-        long_kv: T.Tensor((compressed_capacity, 8, 64), "int8"),
-        long_scales: T.Tensor((compressed_capacity, 8), "float16"),
-        swa_indices: T.Tensor((rows, 128), "int32"),
-        long_indices: T.Tensor((rows, 512), "int32"),
-        sink: T.Tensor((heads,), "float32"),
-        output: T.Tensor((rows, heads, dimension), "bfloat16"),
-        kv_workspace: T.Tensor((rows, selected, dimension), "bfloat16"),
-        mask_workspace: T.Tensor((rows, selected), "int32"),
-        score_workspace: T.Tensor((rows, heads, selected), "float32"),
-        probability_workspace: T.Tensor((rows, heads, selected), "bfloat16"),
-        output_workspace: T.Tensor((rows, heads, dimension), "float32"),
+    @T.macro
+    def run(
+        query,
+        swa,
+        swa_scales,
+        long_kv,
+        long_scales,
+        swa_indices,
+        long_indices,
+        sink,
+        output,
+        kv_workspace,
+        mask_workspace,
+        score_workspace,
+        probability_workspace,
+        output_workspace,
+        staged_swa_cache,
     ):
         with T.Kernel(rows, is_npu=True) as (cid, vid):
             T.reads(
@@ -404,6 +406,7 @@ def selected_int8(
                 swa_indices[0:rows, :],
                 long_indices[0:rows, :],
                 sink[:],
+                staged_swa_cache[:, :, :],
                 kv_workspace[0:rows, :, :],
                 mask_workspace[0:rows, :],
                 score_workspace[0:rows, :, :],
@@ -450,6 +453,8 @@ def selected_int8(
                     scale = T.alloc_ub((decode_groups, 1), "float32")
                     broadcast = T.alloc_ub((decode_groups, 64), "float32")
                     decoded = T.alloc_ub((tile_slots, dimension), "bfloat16")
+                    staged_rows = T.alloc_ub((decode_groups, 64), "bfloat16")
+                    T.reinterpretcast(staged_rows, decoded, "bfloat16_t")
                     flag = T.alloc_ub((max(8, tile_slots),), "int32")
                     x = T.alloc_ub((1, selected), "float32")
                     ids = T.alloc_ub((1, selected), "int32")
@@ -490,6 +495,9 @@ def selected_int8(
                             tile_slots,
                             True,
                             decode_groups,
+                            staged_swa_cache,
+                            staged_swa,
+                            staged_rows,
                         )
                     T.set_cross_flag("MTE3", 0)
                     T.wait_cross_flag(1)
@@ -537,6 +545,80 @@ def selected_int8(
                         )
                     T.set_cross_flag("MTE3", 4)
                     T.pipe_barrier("ALL")
+
+    if staged_swa:
+
+        @T.prim_func
+        def main(
+            query: T.Tensor((rows, heads, dimension), "bfloat16"),
+            swa: T.Tensor((storage, 8, 64), "int8"),
+            swa_scales: T.Tensor((storage, 8), "float16"),
+            long_kv: T.Tensor((compressed_capacity, 8, 64), "int8"),
+            long_scales: T.Tensor((compressed_capacity, 8), "float16"),
+            swa_indices: T.Tensor((rows, 128), "int32"),
+            long_indices: T.Tensor((rows, 512), "int32"),
+            sink: T.Tensor((heads,), "float32"),
+            output: T.Tensor((rows, heads, dimension), "bfloat16"),
+            kv_workspace: T.Tensor((rows, selected, dimension), "bfloat16"),
+            mask_workspace: T.Tensor((rows, selected), "int32"),
+            score_workspace: T.Tensor((rows, heads, selected), "float32"),
+            probability_workspace: T.Tensor((rows, heads, selected), "bfloat16"),
+            output_workspace: T.Tensor((rows, heads, dimension), "float32"),
+            staged_swa_cache: T.Tensor((storage, 8, 64), "bfloat16"),
+        ):
+            run(
+                query,
+                swa,
+                swa_scales,
+                long_kv,
+                long_scales,
+                swa_indices,
+                long_indices,
+                sink,
+                output,
+                kv_workspace,
+                mask_workspace,
+                score_workspace,
+                probability_workspace,
+                output_workspace,
+                staged_swa_cache,
+            )
+    else:
+
+        @T.prim_func
+        def main(
+            query: T.Tensor((rows, heads, dimension), "bfloat16"),
+            swa: T.Tensor((storage, 8, 64), "int8"),
+            swa_scales: T.Tensor((storage, 8), "float16"),
+            long_kv: T.Tensor((compressed_capacity, 8, 64), "int8"),
+            long_scales: T.Tensor((compressed_capacity, 8), "float16"),
+            swa_indices: T.Tensor((rows, 128), "int32"),
+            long_indices: T.Tensor((rows, 512), "int32"),
+            sink: T.Tensor((heads,), "float32"),
+            output: T.Tensor((rows, heads, dimension), "bfloat16"),
+            kv_workspace: T.Tensor((rows, selected, dimension), "bfloat16"),
+            mask_workspace: T.Tensor((rows, selected), "int32"),
+            score_workspace: T.Tensor((rows, heads, selected), "float32"),
+            probability_workspace: T.Tensor((rows, heads, selected), "bfloat16"),
+            output_workspace: T.Tensor((rows, heads, dimension), "float32"),
+        ):
+            run(
+                query,
+                swa,
+                swa_scales,
+                long_kv,
+                long_scales,
+                swa_indices,
+                long_indices,
+                sink,
+                output,
+                kv_workspace,
+                mask_workspace,
+                score_workspace,
+                probability_workspace,
+                output_workspace,
+                swa,
+            )
 
     return (
         main.with_attr("orinfer.coupled_resources", True)

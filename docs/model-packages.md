@@ -365,6 +365,16 @@ bash tools/operators/ascend/run.sh --without-devices python3 \
 
 输出计划位于 `a2-engram-sequence/package/model.json`。构建器将 Engram 投影后的 AllGather 改为按实际行数的 AlltoAllV，复用原来的列恢复、split、Hadamard 和 gate 工厂，在本 rank 的序列行上完成门控；门控前的 residual AllGather 同时移除。完整 2K packet 的投影接收数据降为原来的八分之一。尾部沿现有 `zero_row_tail` 清零到 8 行边界，token mask 和输出 residual 复用当前动态 rank 视图，保持 BF16 边界及 FP32 门控归约。`validate_engram_sequence --baseline BASE_PLAN --plan NEW_PLAN --output REPORT` 对比完整激活和首／末 rank 的序列切片，覆盖 513 行尾部、2K 和改变输入后的 Graph；真实 TP8 通信及完整请求另用短测确认。
 
+selected attention 的 SWA 解量化可以按当前窗口准备一次，并由同一 packet 内的查询共享：
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices python3 \
+  -m tools.model.deepseek_v41.kv_staging \
+  --plan SELECTED_ATTENTION_PLAN --output artifacts/a2-kv-staging
+```
+
+输出计划位于 `a2-kv-staging/package/model.json`。离线检查原 SWA 写入与 attention 之间的工作区访问：索引器 Cube 工作区在此区间空闲的层，将当前片段及其之前的至多 127 行的 BF16 暂存并入原 INT8 写入 kernel，各 query 按原选中顺序共享读取；其余层保留原绑定。两者复用同一写入／解量化与 attention 计算体，保持 INT8 缓存、FP16 scale、FP32 运算及 BF16 概率边界。4096 行临时环借用 owner 私有索引器 Cube 工作区前 4 MiB，不增加 owner 分配；每层重新准备，prefix 恢复无需保存临时值。`validate_kv_staging --output REPORT` 对照原始 scatter/attention，检查完整 INT8 缓存、scale、暂存值、选中 KV、mask、概率和输出，并在环形跨界及工作区被覆盖后验证 Graph replay；`--reuse-long` 覆盖保留长 KV 的调用。`validate_private_rows --op kv_int8.scatter_staged --output REPORT` 检查融合写入的 owner 换序、短尾和捕获保护；消费侧使用 `--op attention_fused.selected_int8 --staged-swa --kv-slot-tiles 16 --attention-heads 64`。
+
 
 `tools.model.deepseek_v41.quantize_kv --plan BF16_PLAN --output INT8_PLAN` 将尚未量化 KV 的 DSv4.1 TP8 原生计划转换为 INT8 缓存，输出与输入共用资产目录。40 层 SWA 和四个共享压缩 KV bank 均按每 64 个值使用一个 FP16 scale，512 维每行共 528 字节。写入按实际存储的 FP16 scale 做对称舍入，整数范围为 −127..127；scale 下限为 FP16 最小正数，上限为 65504。零组写零，`-1` 位置跳过写入，其他越界位置设置错误标志。压缩器的 FP32 ring 状态和索引器现有 INT8 格式保持各自的契约。
 
