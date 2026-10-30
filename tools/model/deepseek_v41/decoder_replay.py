@@ -31,14 +31,31 @@ def main():
         help="Retained decoder rows per owner (128..512 for owner-row plans)",
     )
     parser.add_argument("--compile-workers", type=int, default=4)
+    parser.add_argument(
+        "--final-prompt-only",
+        action="store_true",
+        help="Run decoder replay only for the final prompt window; reserve that window on prefix restore",
+    )
     args = parser.parse_args()
     if json.loads(args.plan.read_text()).get("batch"):
         from tools.model.deepseek_v41.decoder_rows import build
 
-        print(json.dumps(build(args.plan, args.output, args.keep, args.compile_workers)))
+        print(
+            json.dumps(
+                build(
+                    args.plan,
+                    args.output,
+                    args.keep,
+                    args.compile_workers,
+                    final_prompt_only=args.final_prompt_only,
+                )
+            )
+        )
         return
     if args.tail_template is None:
         parser.error("The legacy single-owner experiment requires --tail-template")
+    if args.final_prompt_only:
+        parser.error("Final-prompt replay requires an owner-row plan")
     if any(
         p.parent.resolve() != args.plan.parent.resolve() for p in (args.tail_template, args.output)
     ):

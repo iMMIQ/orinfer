@@ -399,6 +399,10 @@ uv run --locked python -m tools.model.deepseek_v41.decoder_replay \
 
 被裁剪片段的 decoder SWA 限定在保留后缀内；短片段继续读取其既有历史。该策略改变模型近似状态，执行包身份固定保留长度与行布局，prefix 快照保存完整共享 KV、压缩环及各层末窗口的实际状态；公共 HTTP、原生入口及后续 decode 读取同一策略。持久 KV 仍为 group-64 INT8／FP16 scale，owner arena 大小保持原契约。完整计算与 bounded replay 应分别记录性能和质量；单流旧实验的 `--tail-template` 入口继续保留。
 
+`--final-prompt-only` 将 owner-row 包的 decoder 重放范围改为整个 prompt 的最后窗口。中间 prefill 片段执行 0–20 层；最终片段执行共享前缀及最后 `keep` 行的 21–39 层。混合 packet 中，正在 decode 的 owner 保留一行及既有 decoder 历史，其余中间片段在 decoder 视图中保留零行和原 owner 槽位。所有 owner 都没有 decoder 行时，Graph 在共享 KV 边界结束；角色和有序长度共同参与 Graph 身份。动态投影、MoE、attention 与行搬运继续使用相同算子。
+
+该模式的 HTTP 调度为长于 packet 容量的 prompt 预留完整最终窗口，并在窗口前保存 prefix 检查点。prefix 命中上限为 `prompt_len - keep`，恢复后重新构建 decoder SWA；快照保留 producer SWA、共享 compressed KV/index key 和压缩环，省略 21–39 层的 decoder SWA。普通 decode 继续使用重建后的请求私有状态。原生 `bench-ascend-batch` 的自动请求规划采用相同窗口边界；显式 prefill 帧须将至少 `min(prompt_len, keep)` 个最终 token 放在输出帧，短尾拆分会报错。与逐片段重放相比，这一模式改变最终窗口的近似起点，质量应单独验收；执行包身份记录该选项。
+
 
 `tools.model.deepseek_v41.sequence_parallel --decoder-tail --plan REPLAY_PLAN --output TAIL_SP_PLAN` 为截短后的 decoder 复用相同的 TP8 私有行模板；构建 replay 时的 `--keep` 必须能被 8 整除，例如 128。跨边界的 residual 与 collapsed 输入先映射到各 rank 的有效行分片，再沿原有集合通信边界执行；`--reduce-scatter` 同时为后缀启用 ReduceScatter。随后可用 `tools.model.deepseek_v41.reduce_scatter` 转换完整前缀中的集合通信，保留各部分独立验收的计划。
 

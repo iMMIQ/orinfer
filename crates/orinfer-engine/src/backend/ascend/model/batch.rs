@@ -63,7 +63,7 @@ impl Contract {
             .decoder_replay
             .as_ref()
             .filter(|r| r.tables.contains(name))
-            .map(|r| layout.suffix(r.keep))
+            .map(|r| layout.decoder(r.keep, r.final_prompt_only))
             .transpose()?;
         let layout = decoder.as_ref().unwrap_or(layout);
         let range = self.work_ranges.get(name);
@@ -106,12 +106,14 @@ pub(super) struct Key {
     lengths: Vec<usize>,
     outputs: usize,
     partitioned_lengths: Vec<usize>,
+    decoder_roles: Vec<super::replay::Role>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TableKey {
     family: (bool, usize),
     segments: Vec<(usize, usize)>,
     outputs: Vec<usize>,
+    decoder_roles: Vec<super::replay::Role>,
 }
 pub(super) struct BoundTables {
     key: TableKey,
@@ -134,6 +136,15 @@ struct TableUse {
 impl Runtime {
     fn key(&self, layout: &Layout) -> Key {
         let mut key = layout.key();
+        if self
+            .contract
+            .decoder_replay
+            .as_ref()
+            .is_some_and(|r| r.final_prompt_only)
+        {
+            key.decoder_roles = layout.decoder_roles.clone();
+            key.partitioned_lengths = layout.segments.iter().map(|s| s.tokens).collect();
+        }
         if !layout.decode && !self.contract.partitioned_tables.is_empty() {
             // Reordering owners changes the count of selected rows per owner,
             // and hence indirect launch extents, even for equal sorted lengths.
@@ -182,6 +193,7 @@ pub(super) struct Layout {
     pub rows: Rows,
     pub outputs: Vec<usize>,
     pub decode: bool,
+    pub decoder_roles: Vec<super::replay::Role>,
 }
 impl Layout {
     pub fn new(
@@ -198,12 +210,66 @@ impl Layout {
         {
             return Err("Invalid owner output/role layout".into());
         }
+        let decoder_roles = (0..segments.len())
+            .map(|i| {
+                if decode {
+                    super::replay::Role::Continue
+                } else if outputs.contains(&i) {
+                    super::replay::Role::Final
+                } else {
+                    super::replay::Role::Producer
+                }
+            })
+            .collect();
         Ok(Self {
             segments,
             rows,
             outputs,
             decode,
+            decoder_roles,
         })
+    }
+    pub(super) fn decoder(&self, keep: usize, final_prompt_only: bool) -> Result<Self> {
+        if !final_prompt_only {
+            return self.suffix(keep);
+        }
+        if self.decode
+            || !(128..=512).contains(&keep)
+            || self.decoder_roles.len() != self.segments.len()
+        {
+            return Err("Invalid final-prompt decoder layout".into());
+        }
+        let mut view = self.clone();
+        // Preserve zero-row owners and their operand-table lanes.
+        let lengths = self
+            .segments
+            .iter()
+            .zip(&self.decoder_roles)
+            .map(|(s, role)| {
+                if *role == super::replay::Role::Producer {
+                    0
+                } else {
+                    s.tokens.min(keep)
+                }
+            })
+            .collect::<Vec<_>>();
+        let selected = orinfer_model_sdk::packet::RowView {
+            starts: vec![0; lengths.len()],
+            lengths,
+            total: 0,
+        }
+        .aligned(1)?;
+        view.rows = Rows {
+            starts: selected.starts,
+            total: selected.total,
+        };
+        for (s, n) in view.segments.iter_mut().zip(selected.lengths) {
+            s.tokens = n;
+        }
+        if view.outputs.iter().any(|&i| view.segments[i].tokens == 0) {
+            return Err("Output owner has no decoder rows".into());
+        }
+        Ok(view)
     }
     pub(super) fn suffix(&self, keep: usize) -> Result<Self> {
         if self.decode || !(128..=512).contains(&keep) {
@@ -223,16 +289,21 @@ impl Layout {
             self.segments.len(),
         )
     }
-    pub(super) fn suffix_map(
+    pub(super) fn row_map(
         &self,
-        keep: usize,
+        decoder: &Self,
         source: usize,
         destination: usize,
         rank: usize,
         contiguous: bool,
     ) -> Result<Vec<i32>> {
         if self.decode
-            || !(128..=512).contains(&keep)
+            || decoder.segments.len() != self.segments.len()
+            || self
+                .segments
+                .iter()
+                .zip(&decoder.segments)
+                .any(|(s, d)| s.slot != d.slot || d.tokens > s.tokens)
             || source == 0
             || destination == 0
             || rank >= destination
@@ -242,7 +313,7 @@ impl Layout {
         let mut selected = vec![];
         for (i, segment) in self.segments.iter().enumerate() {
             let end = self.rows.starts[i] + segment.tokens;
-            selected.extend(end - segment.tokens.min(keep)..end);
+            selected.extend(end - decoder.segments[i].tokens..end);
         }
         let width = selected.len().div_ceil(destination);
         let selected = if contiguous {
@@ -276,6 +347,7 @@ impl Layout {
             lengths,
             outputs: self.outputs.len(),
             partitioned_lengths: vec![],
+            decoder_roles: vec![],
         }
     }
     fn table_key(&self, min_rows: usize) -> TableKey {
@@ -283,6 +355,7 @@ impl Layout {
             family: (self.decode, min_rows),
             segments: self.segments.iter().map(|s| (s.slot, s.tokens)).collect(),
             outputs: self.outputs.clone(),
+            decoder_roles: self.decoder_roles.clone(),
         }
     }
 }
@@ -555,7 +628,7 @@ impl Worker {
             .decoder_replay
             .as_ref()
             .filter(|_| !layout.decode)
-            .map(|r| layout.suffix(r.keep))
+            .map(|r| layout.decoder(r.keep, r.final_prompt_only))
             .transpose()?;
         let mut aligned = BTreeMap::new();
         aligned.insert((false, 1, 1), layout.rows.partition(1, 0)?);
@@ -679,8 +752,8 @@ impl Worker {
         {
             for map in &replay.maps {
                 let data = layout
-                    .suffix_map(
-                        replay.keep,
+                    .row_map(
+                        selected,
                         map.source_partition,
                         map.destination_partition,
                         self.rank as usize % map.destination_partition,
@@ -766,28 +839,47 @@ impl Worker {
                 layout.rows.starts[i],
             )?;
             if let Some(names) = &execution.packet.decoder_coordinates {
-                let keep = self
+                let replay = self
                     .batch
                     .as_ref()
                     .unwrap()
                     .contract
                     .decoder_replay
                     .as_ref()
-                    .ok_or("Missing decoder replay contract")?
-                    .keep;
-                let suffix = layout.suffix(keep)?;
-                let skipped = segment.tokens.saturating_sub(keep);
-                self.coordinate_at_bounded(
-                    names,
-                    history.len() + skipped,
-                    suffix.segments[i].tokens,
-                    suffix.rows.starts[i],
-                    Some(if skipped > 0 {
-                        history.len() + skipped
-                    } else {
-                        0
-                    }),
-                )?;
+                    .ok_or("Missing decoder replay contract")?;
+                let keep = replay.keep;
+                let final_prompt_only = replay.final_prompt_only;
+                let suffix = layout.decoder(keep, final_prompt_only)?;
+                let count = suffix.segments[i].tokens;
+                let skipped = segment.tokens - count;
+                if final_prompt_only
+                    && layout.decoder_roles[i] == super::replay::Role::Final
+                    && count < keep
+                    && history.len() + segment.tokens > keep
+                {
+                    return Err(
+                        "Final decoder packet must contain the complete retained prompt window"
+                            .into(),
+                    );
+                }
+                if count > 0 {
+                    self.coordinate_at_bounded(
+                        names,
+                        history.len() + skipped,
+                        count,
+                        suffix.rows.starts[i],
+                        Some(
+                            if skipped > 0
+                                || final_prompt_only
+                                    && layout.decoder_roles[i] == super::replay::Role::Final
+                            {
+                                history.len() + skipped
+                            } else {
+                                0
+                            },
+                        ),
+                    )?;
+                }
             }
             let mut owner_hashes = vec![];
             let mut owner_valid = vec![];

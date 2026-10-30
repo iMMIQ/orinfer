@@ -282,6 +282,70 @@ fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<
     Ok(frames)
 }
 
+fn plan_prompt_frames(requests: &[Request], budget: usize, keep: usize) -> Result<Vec<Frame>> {
+    // Validate owner identities and token inputs with the common planner.
+    if requests.is_empty()
+        || budget == 0
+        || requests.iter().any(|r| r.tokens.is_empty())
+        || requests
+            .iter()
+            .map(|r| r.owner)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != requests.len()
+    {
+        return Err("Invalid prompt replay requests/chunk budget".into());
+    }
+    if budget < keep && requests.iter().any(|r| r.tokens.len() > budget) {
+        return Err("Prompt replay chunk budget must hold its final window".into());
+    }
+    let mut positions = vec![0; requests.len()];
+    let mut frames = vec![];
+    let mut cursor = 0;
+    while positions
+        .iter()
+        .zip(requests)
+        .any(|(&p, r)| p < r.tokens.len())
+    {
+        let mut remaining = budget;
+        let mut rows = vec![];
+        let mut next = cursor;
+        for step in 0..requests.len() {
+            let i = (cursor + step) % requests.len();
+            let left = requests[i].tokens.len() - positions[i];
+            if left == 0 || remaining == 0 {
+                continue;
+            }
+            let Some(count) = super::replay::prompt_rows(
+                left,
+                remaining,
+                keep,
+                requests[i].tokens.len() > budget,
+            ) else {
+                continue;
+            };
+            let end = positions[i] + count;
+            rows.push(Request {
+                owner: requests[i].owner,
+                tokens: requests[i].tokens[positions[i]..end].to_vec(),
+                output: end == requests[i].tokens.len(),
+            });
+            positions[i] = end;
+            remaining -= count;
+            next = (i + 1) % requests.len();
+        }
+        if rows.is_empty() {
+            return Err("Prompt replay planner made no progress".into());
+        }
+        frames.push(Frame {
+            decode: false,
+            requests: rows,
+        });
+        cursor = next;
+    }
+    Ok(frames)
+}
+
 fn compare(batch: &[Vec<Output>], serial: &[Vec<Output>]) -> Result<Comparison> {
     let mut result = Comparison {
         positions: 0,
@@ -352,11 +416,14 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
             if !case.frames.is_empty() {
                 return Err("Supply requests or explicit frames".into());
             }
-            case.frames = plan_frames(
-                &case.requests,
-                case.chunk_tokens.unwrap_or(capacity).min(capacity),
-                preferred,
-            )?;
+            let budget = case.chunk_tokens.unwrap_or(capacity).min(capacity);
+            case.frames = if let Some(replay) = &contract.decoder_replay
+                && replay.final_prompt_only
+            {
+                plan_prompt_frames(&case.requests, budget, replay.keep)?
+            } else {
+                plan_frames(&case.requests, budget, preferred)?
+            };
         }
         if case.frames.is_empty() || case.repeats == 0 {
             return Err("Empty batch case/repeats".into());
@@ -633,6 +700,41 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prompt_planner_reserves_final_windows_without_losing_owner_tokens() {
+        let requests = [17usize, 129, 2048, 2049, 4097, 8193]
+            .into_iter()
+            .enumerate()
+            .map(|(owner, n)| Request {
+                owner,
+                tokens: (0..n as u32).collect(),
+                output: true,
+            })
+            .collect::<Vec<_>>();
+        let frames = plan_prompt_frames(&requests, 2048, 128).unwrap();
+        for frame in &frames {
+            assert!(frame.requests.iter().map(|r| r.tokens.len()).sum::<usize>() <= 2048);
+        }
+        for r in &requests {
+            let parts = frames
+                .iter()
+                .flat_map(|f| &f.requests)
+                .filter(|p| p.owner == r.owner)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                parts
+                    .iter()
+                    .flat_map(|r| &r.tokens)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                r.tokens
+            );
+            assert!(parts.last().unwrap().output);
+            assert!(parts.last().unwrap().tokens.len() >= r.tokens.len().min(128));
+            assert!(parts[..parts.len() - 1].iter().all(|p| !p.output));
+        }
+        assert!(plan_prompt_frames(&requests, 127, 128).is_err());
+    }
     #[test]
     fn explicit_teacher_decode_frames_keep_their_phase_and_output_count() {
         let case: Case = serde_json::from_value(serde_json::json!({

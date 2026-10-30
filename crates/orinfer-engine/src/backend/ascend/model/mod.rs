@@ -820,12 +820,21 @@ impl Worker {
             .map(|b| {
                 layout
                     .ok_or("Decoder rows require an owner layout")?
-                    .suffix(b.keep)
+                    .decoder(
+                        b.keep,
+                        self.batch.as_ref().is_some_and(|r| {
+                            r.contract
+                                .decoder_replay
+                                .as_ref()
+                                .is_some_and(|r| r.final_prompt_only)
+                        }),
+                    )
             })
             .transpose()?;
         let clipped = decoder_layout
             .as_ref()
             .is_some_and(|l| l.rows.total < actual);
+        let empty_decoder = decoder_layout.as_ref().is_some_and(|l| l.rows.total == 0);
         let mut current_layout = layout;
         let mut steps = vec![];
         let mut pending: Vec<SegmentOp> = vec![];
@@ -843,7 +852,7 @@ impl Worker {
             .flatten()
             .collect();
         for (index, instruction) in instructions.iter().enumerate() {
-            if !clipped && boundary.as_ref().is_some_and(|b| b.skip(index)) {
+            if (!clipped || empty_decoder) && boundary.as_ref().is_some_and(|b| b.skip(index)) {
                 continue;
             }
             let scaled = |n: usize| -> Result<usize> {
@@ -858,6 +867,9 @@ impl Worker {
                 Instruction::DecoderRows { .. } => {
                     current_layout = decoder_layout.as_ref();
                     active_rows = current_layout.ok_or("Missing decoder layout")?.rows.total;
+                    if active_rows == 0 {
+                        break;
+                    }
                     continue;
                 }
                 Instruction::LimitRows { rows } => {

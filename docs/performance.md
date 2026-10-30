@@ -146,6 +146,20 @@ Attention 保留 16-token 块的 FP32 打分、在线 softmax 和逐块累积，
 
 单流固定历史 decode 为 50.10／49.45 tokens/s，B32 aggregate decode 为 261.39 tokens/s。owner 私有分配与完整计算包相同。边界搬运在单请求与混合长度、rank 0／7、改输入后的 Graph replay 中逐值一致。复现通信下，混合 owner 换序／释放复用的 16 个完整词表位置逐位一致；17／129／2049／8193 prefix 在 owner 重映射恢复后完整 logits 一致。正常服务保持默认通信；其跨 batch／重排的概率差异仍需独立质量验收，复现模式的状态对照不替代官方模型质量验收。
 
+`--final-prompt-only` 是另一个显式选择：中间片段执行完整的 0–20 层，最后窗口执行 21–39 层，混合 packet 的已有 decode 行继续其历史。长 prompt 为最终 128 行保存 producer 检查点，prefix 恢复后重建 decoder SWA。算子和每 owner 的常驻分配保持相同；纯中间 packet 的 W4 调用由 80 次减为 42 次，query exchange 由 82 次减为 44 次。
+
+同一 Mini-Weka 输入、默认高性能通信、关闭投机、240 秒 wall limit，比较逐片段 replay128 与最终窗口 replay128。实际末次采样分别为 238.38／238.33 秒，均处于 warmup/prefill，decode 增量为零，没有完整 agent 得分。
+
+| 短测指标 | 逐片段窗口 | 最终窗口 | 变化 |
+| --- | ---: | ---: | ---: |
+| 完成的 prefill token | 1,291,303 | 1,499,385 | +16.11% |
+| batch/Graph 准备耗时 | 20.32 s | 15.88 s | −21.85% |
+| warmup 请求完成数 | 14/16 | 15/16 | 增加 1 个 |
+
+相同固定历史的原生短测，最终窗口模式的 2K 为 6951.42 TPS、单流 decode 50.18 tokens/s，B32×17 为 3241.52 TPS、aggregate decode 259.37 tokens/s。2049 首轮波动后只补测该场景；配对结果为 6351.68 → 6054.51 TPS，回退 4.68%，候选 decode 50.38 tokens/s。输入窗口由 2048+1 改为 1921+128；计时、预热与末三轮均值规则相同。
+
+该模式仍有明确代价：同一个 36K HTTP prompt 重复命中时，处理 128 个 token，原模式只处理 4 个；8 输出请求的 wall time 为 0.302 → 0.366 秒，约回退 21%，尚待优化。32K 后追加 4K 的两次候选 wall time 为 1.38／2.37 秒，batch/Graph 准备分别为 0.38／1.32 秒，单次样本不能证明稳定的追加延迟收益。17／2049／8193 producer prefix 恢复后，最终 128 行及后续 decode 的完整 logits 在复现通信下与换 owner 前一致；默认通信的 HTTP 混跑通过 4 个实际混合迭代。默认通信的重复 greedy 输出只记录诊断，质量验收另行进行。
+
 ## 六模型统一基准（2026-10-21）
 
 README 的六模型表格使用本节固定英译中请求的统一基准。MTP 收益随任务与接受率变化。全部运行在本机 Jetson AGX Orin 64GB，使用 Rust release 完整请求状态机、`decode_only`、greedy、seed `20261002`，关闭 thinking 和 prefix cache。单流自适应 MTP 最多 3 草稿，多流由基准自动切换为 `mtp_drafts=0`。

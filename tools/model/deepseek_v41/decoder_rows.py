@@ -15,7 +15,7 @@ from tools.model.deepseek_v41.converge import compact_buffers, publish_package, 
 from tools.model.row_contract import expression
 
 
-def build(plan, output, keep=128, workers=4):
+def build(plan, output, keep=128, workers=4, final_prompt_only=False):
     from tools.operators.ascend.build import operand
     from tools.operators.ascend.private_rows import indirect
     from kernels.model.rows import row_count
@@ -368,7 +368,10 @@ def build(plan, output, keep=128, workers=4):
                     raise ValueError("Unsupported decoder operation: " + step["op"])
             if first_attention:
                 raise ValueError("Decoder boundary has no selected attention")
-            marker = dict(op="decoder_rows", keep=keep, prepare=len(prepare), select=len(select))
+            # SWA coordinates change on every final-window entry, including a
+            # full 128-row final packet that needs no hidden-row compaction.
+            selected_steps = len(select) - int(sp and final_prompt_only)
+            marker = dict(op="decoder_rows", keep=keep, prepare=len(prepare), select=selected_steps)
             packet["body"] = body + prepare + [marker] + select + tail
             packet["head"].insert(0, dict(op="decoder_rows", keep=keep, prepare=0, select=0))
             counts.append(
@@ -380,8 +383,18 @@ def build(plan, output, keep=128, workers=4):
                 )
             )
     contract["decoder_replay"] = dict(
-        keep=keep, tables=sorted(decoder_tables), maps=list(maps.values())
+        keep=keep,
+        final_prompt_only=final_prompt_only,
+        tables=sorted(decoder_tables),
+        maps=list(maps.values()),
     )
+    if final_prompt_only:
+        # Consumer SWA is always reconstructed from the final prompt window;
+        # prefix snapshots contain only producer state and shared KV sources.
+        decoder_state = {
+            f"cache.swa.{layer}{suffix}" for layer in range(21, 40) for suffix in ("", ".scale")
+        }
+        contract["state"] = [s for s in contract["state"] if s["buffer"] not in decoder_state]
     with ProcessPoolExecutor(
         max_workers=workers, mp_context=multiprocessing.get_context("spawn")
     ) as pool:
@@ -401,6 +414,7 @@ def build(plan, output, keep=128, workers=4):
     report = dict(
         model=str(output / "package/model.json"),
         keep=keep,
+        final_prompt_only=final_prompt_only,
         kernels=len(tasks),
         assets=assets,
         families=counts,

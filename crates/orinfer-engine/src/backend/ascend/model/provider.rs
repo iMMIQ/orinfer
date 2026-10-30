@@ -250,11 +250,22 @@ impl Runtime {
         self.hints = hints;
     }
     fn matched(&self, input: &[u32]) -> Option<u64> {
+        let reserve = self.final_decoder_window();
         self.cache
             .match_prefix_by(input, &Media::default(), |entry| {
-                Some(-(entry.tokens.len() as f64))
+                (entry.tokens.len() <= input.len().saturating_sub(reserve))
+                    .then_some(-(entry.tokens.len() as f64))
             })
             .checkpoint
+    }
+    fn final_decoder_window(&self) -> usize {
+        self.team
+            .model
+            .batch
+            .as_ref()
+            .and_then(|c| c.decoder_replay.as_ref())
+            .filter(|r| r.final_prompt_only)
+            .map_or(0, |r| r.keep)
     }
     pub fn cached_prefix_tokens(
         &self,
@@ -568,6 +579,7 @@ impl Runtime {
         let mut tokens = vec![];
         let mut outputs = vec![];
         let mut selected = vec![];
+        let keep = self.final_decoder_window();
         // Existing decode rows precede bounded prefill work in a shared packet.
         for prefill in [false, true] {
             for (i, request) in requests.iter().enumerate() {
@@ -576,7 +588,28 @@ impl Runtime {
                 }
                 let count = if prefill {
                     let next = 4096 - request.offset % 4096;
-                    (request.input.len() - request.offset).min(budget).min(next)
+                    let left = request.input.len() - request.offset;
+                    // A soft latency budget may expand for the first atomic
+                    // final window. Other owners defer until the next packet.
+                    let limit = if keep > 0 && left <= keep && segments.is_empty() {
+                        budget.max(left)
+                    } else {
+                        budget
+                    };
+                    let limit = if keep > 0 && left <= keep {
+                        limit
+                    } else {
+                        limit.min(next)
+                    };
+                    let Some(count) = super::replay::prompt_rows(
+                        left,
+                        limit,
+                        keep,
+                        request.input.len() > self.team.rows,
+                    ) else {
+                        continue;
+                    };
+                    count
                 } else {
                     1
                 };
@@ -594,7 +627,7 @@ impl Runtime {
                 });
                 tokens.push(values);
                 selected.push((i, count));
-                budget -= count;
+                budget = budget.saturating_sub(count);
             }
         }
         if segments.is_empty() {
@@ -616,7 +649,7 @@ impl Runtime {
             .iter()
             .filter(|&&(i, _)| requests[i].prefilling)
             .count();
-        let layout = Layout::new(
+        let mut layout = Layout::new(
             segments,
             outputs,
             !has_prefill,
@@ -627,6 +660,11 @@ impl Runtime {
             },
             self.team.model.batch.as_ref().unwrap().owners,
         )?;
+        for (lane, &(i, _)) in selected.iter().enumerate() {
+            if !requests[i].prefilling {
+                layout.decoder_roles[lane] = super::replay::Role::Continue;
+            }
+        }
         let (values, seconds, preparation) =
             self.team.forward_with(layout, tokens, full, maintenance)?;
         self.statistics.iterations += 1;
@@ -689,7 +727,11 @@ impl Runtime {
                     tokens: vec![token],
                 });
             }
-            if request.prefilling && request.cache_prompt && request.offset.is_multiple_of(4096) {
+            if request.prefilling
+                && request.cache_prompt
+                && (request.offset.is_multiple_of(4096)
+                    || keep > 0 && request.input.len() - request.offset == keep)
+            {
                 self.store(request)?;
             }
         }

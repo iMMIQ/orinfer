@@ -521,6 +521,18 @@ mod state_tests {
             .join(descriptor["execution_package"].as_str().unwrap())
             .join("model.json");
         let team = Team::load(&plan, &directory).unwrap();
+        if team
+            .model
+            .batch
+            .as_ref()
+            .unwrap()
+            .decoder_replay
+            .as_ref()
+            .is_some_and(|r| r.final_prompt_only)
+        {
+            verify_prompt_replay(&team);
+            return;
+        }
         let forward = |slot, tokens: Vec<u32>, full| {
             let layout = Layout::new(
                 vec![BatchSegment {
@@ -578,5 +590,80 @@ mod state_tests {
         }
         drop(team);
         drop(lock);
+    }
+
+    fn verify_prompt_replay(team: &Team) {
+        let contract = team.model.batch.as_ref().unwrap();
+        assert!(!contract.state.iter().any(|s| {
+            s.buffer
+                .strip_prefix("cache.swa.")
+                .and_then(|s| s.split('.').next())
+                .and_then(|s| s.parse::<usize>().ok())
+                .is_some_and(|layer| layer >= 21)
+        }));
+        let forward = |slot, tokens: Vec<u32>, output, decode| {
+            let layout = Layout::new(
+                vec![BatchSegment {
+                    slot,
+                    tokens: tokens.len(),
+                }],
+                if output { vec![0] } else { vec![] },
+                decode,
+                if decode { contract.owners } else { team.rows },
+                contract.owners,
+            )
+            .unwrap();
+            team.forward(layout, vec![tokens], output).unwrap().0
+        };
+        for length in [17usize, 2049, 8193] {
+            team.exchange(Command::Admit(vec![17, 7])).unwrap();
+            let input = (0..length)
+                .map(|i| ((i * 73 + 11) % 129280) as u32)
+                .collect::<Vec<_>>();
+            for chunk in input.chunks(team.rows) {
+                assert!(forward(17, chunk.to_vec(), false, false).is_empty());
+            }
+            team.exchange(Command::Save {
+                owner: 17,
+                snapshot: length as u64,
+            })
+            .unwrap();
+            let tail = (0..128).map(|i| (i * 13 + 17) as u32).collect::<Vec<_>>();
+            let mut expected = forward(17, tail.clone(), true, false);
+            expected.extend(forward(17, vec![13], true, true));
+            team.exchange(Command::Release(Some(17))).unwrap();
+            team.exchange(Command::Admit(vec![91])).unwrap();
+            team.exchange(Command::Restore {
+                owner: 91,
+                snapshot: length as u64,
+            })
+            .unwrap();
+            let mut actual = forward(91, tail.clone(), true, false);
+            actual.extend(forward(91, vec![13], true, true));
+            for (a, b) in actual.iter().zip(&expected) {
+                assert_eq!(
+                    a.logits, b.logits,
+                    "prompt cache {length}, final/decode logits"
+                );
+            }
+            for chunk in input.chunks(team.rows) {
+                forward(
+                    7,
+                    chunk.iter().map(|&v| (v + 1) % 129280).collect(),
+                    false,
+                    false,
+                );
+            }
+            let changed = forward(7, tail, true, false);
+            assert_ne!(
+                actual[0].logits, changed[0].logits,
+                "changed prefix must change output"
+            );
+            team.exchange(Command::Evict(length as u64)).unwrap();
+            team.exchange(Command::Release(None)).unwrap();
+            eprintln!(
+                "A2 prompt replay prefix {length}: empty consumer, rebuilt final128 and decode agree after owner remap"
+            );
+        }
     }
 }

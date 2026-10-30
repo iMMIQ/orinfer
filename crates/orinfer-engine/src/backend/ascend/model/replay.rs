@@ -8,8 +8,37 @@ use std::collections::{BTreeMap, BTreeSet};
 #[serde(deny_unknown_fields)]
 pub(super) struct Contract {
     pub keep: usize,
+    /// Rebuild decoder state only in the final prompt window.
+    #[serde(default)]
+    pub final_prompt_only: bool,
     pub tables: BTreeSet<String>,
     pub maps: Vec<RowMap>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Role {
+    Producer,
+    Final,
+    Continue,
+}
+
+/// Keep the final prompt window in one packet. Long prompts checkpoint before
+/// that window, so an exact prefix hit can rebuild it without replaying a block.
+pub(super) fn prompt_rows(left: usize, limit: usize, keep: usize, reserve: bool) -> Option<usize> {
+    if left == 0 || limit == 0 {
+        return None;
+    }
+    if keep == 0 {
+        return Some(left.min(limit));
+    }
+    if left <= keep {
+        return (left <= limit).then_some(left);
+    }
+    Some(if reserve || left > limit {
+        limit.min(left - keep)
+    } else {
+        left
+    })
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -184,6 +213,99 @@ mod tests {
     use super::*;
     use orinfer_model_sdk::architecture::BatchSegment;
     #[test]
+    fn final_window_is_atomic_at_chunk_and_checkpoint_tails() {
+        for length in [1usize, 17, 127, 128, 129, 2048, 2049, 4096, 4097, 32769] {
+            let mut left = length;
+            while left > 0 {
+                let next = 4096 - (length - left) % 4096;
+                let n = prompt_rows(left, 2048.min(next), 128, length > 2048)
+                    .or_else(|| prompt_rows(left, 128, 128, true))
+                    .unwrap();
+                assert!(n > 0 && n <= left);
+                if n == left {
+                    assert!(n >= 128.min(length));
+                }
+                left -= n;
+                if left > 0 {
+                    assert!(left >= 128);
+                }
+            }
+        }
+        assert_eq!(prompt_rows(128, 127, 128, true), None);
+        assert_eq!(prompt_rows(2048, 2048, 128, false), Some(2048));
+        assert_eq!(prompt_rows(2048, 2048, 128, true), Some(1920));
+        assert_eq!(prompt_rows(2049, 2048, 128, true), Some(1921));
+    }
+    #[test]
+    fn prompt_decoder_preserves_empty_lanes_and_live_decode_history() {
+        let mut layout = batch::Layout::new(
+            vec![
+                BatchSegment {
+                    slot: 17,
+                    tokens: 2048,
+                },
+                BatchSegment {
+                    slot: 91,
+                    tokens: 1,
+                },
+                BatchSegment {
+                    slot: 7,
+                    tokens: 128,
+                },
+            ],
+            vec![1, 2],
+            false,
+            4096,
+            128,
+        )
+        .unwrap();
+        layout.decoder_roles[1] = Role::Continue;
+        let selected = layout.decoder(128, true).unwrap();
+        assert_eq!(selected.rows.starts, vec![0, 0, 1]);
+        assert_eq!(selected.rows.total, 129);
+        assert_eq!(
+            selected
+                .segments
+                .iter()
+                .map(|s| (s.slot, s.tokens))
+                .collect::<Vec<_>>(),
+            vec![(17, 0), (91, 1), (7, 128)]
+        );
+        assert_eq!(selected.outputs, vec![1, 2]);
+        assert_eq!(
+            selected.decoder(128, true).unwrap().rows.starts,
+            selected.rows.starts
+        );
+        assert_eq!(
+            layout.row_map(&selected, 1, 1, 0, false).unwrap(),
+            (2048..2177).collect::<Vec<i32>>()
+        );
+        for rank in 0..8 {
+            let map = layout.row_map(&selected, 8, 8, rank, false).unwrap();
+            let mut expected = (2048..2177usize)
+                .skip(rank)
+                .step_by(8)
+                .map(|i| (i % 8 * 2177usize.div_ceil(8) + i / 8) as i32)
+                .collect::<Vec<_>>();
+            expected.resize(129usize.div_ceil(8), -1);
+            assert_eq!(map, expected);
+        }
+        layout.outputs.clear();
+        layout.decoder_roles.fill(Role::Producer);
+        let empty = layout.decoder(128, true).unwrap();
+        assert_eq!(empty.rows.total, 0);
+        assert!(layout.row_map(&empty, 1, 1, 0, false).unwrap().is_empty());
+        assert_eq!(empty.rows.partition(8, 7).unwrap().lengths, vec![0; 3]);
+        layout.outputs = vec![1];
+        layout.decoder_roles[1] = Role::Continue;
+        let one = layout.decoder(128, true).unwrap();
+        assert_eq!(one.rows.total, 1);
+        assert_eq!(one.rows.partition(8, 0).unwrap().lengths, vec![0, 1, 0]);
+        for rank in 1..8 {
+            assert_eq!(one.rows.partition(8, rank).unwrap().lengths, vec![0; 3]);
+        }
+    }
+    #[test]
     fn bounded_maps_preserve_each_owner_under_different_partitions() {
         for lengths in [
             vec![1, 1025, 17, 511],
@@ -208,7 +330,7 @@ mod tests {
                 suffix.rows.total,
                 lengths.iter().map(|&n| n.min(128)).sum::<usize>()
             );
-            let indices = layout.suffix_map(128, 1, 1, 0, false).unwrap();
+            let indices = layout.row_map(&suffix, 1, 1, 0, false).unwrap();
             for (owner, &n) in lengths.iter().enumerate() {
                 let kept = n.min(128);
                 let start = suffix.rows.starts[owner];
@@ -220,7 +342,7 @@ mod tests {
                 );
             }
             for source in [1, 8] {
-                let all = layout.suffix_map(128, source, 1, 0, false).unwrap();
+                let all = layout.row_map(&suffix, source, 1, 0, false).unwrap();
                 for rank in 0..8 {
                     let mut cyclic = all
                         .iter()
@@ -230,7 +352,7 @@ mod tests {
                         .collect::<Vec<_>>();
                     cyclic.resize(all.len().div_ceil(8), -1);
                     assert_eq!(
-                        layout.suffix_map(128, source, 8, rank, false).unwrap(),
+                        layout.row_map(&suffix, source, 8, rank, false).unwrap(),
                         cyclic
                     );
                     let width = all.len().div_ceil(8);
@@ -242,7 +364,7 @@ mod tests {
                         .collect::<Vec<_>>();
                     contiguous.resize(width, -1);
                     assert_eq!(
-                        layout.suffix_map(128, source, 8, rank, true).unwrap(),
+                        layout.row_map(&suffix, source, 8, rank, true).unwrap(),
                         contiguous
                     );
                 }
