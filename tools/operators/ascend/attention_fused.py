@@ -358,6 +358,7 @@ def selected_int8(
     tile_slots=16,
     reuse_long=False,
     staged_swa=False,
+    softmax_heads=1,
 ):
     """One paired-core selected-KV gather/QK/softmax/PV invocation per query.
 
@@ -365,7 +366,7 @@ def selected_int8(
     spills bridge AIV/AIC storage and retain the original FP32 scores, full-row
     normalization and normalized BF16 probability boundary.
     """
-    from tools.operators.ascend.attention_cube import softmax_row
+    from tools.operators.ascend.attention_cube import softmax_row, softmax_head_tile
     from tools.operators.ascend.kv_int8 import gather_tile
 
     selected = 640 if compressed else 128
@@ -376,6 +377,8 @@ def selected_int8(
         raise ValueError("Invalid selected attention cache/reuse geometry")
     dimension, tile_k, tile_d = 512, 128, 128
     half_heads, decode_groups = heads // 2, tile_slots * 8
+    if softmax_heads not in (1, 4, 8) or half_heads % softmax_heads:
+        raise ValueError("Softmax head tile must divide each Vector's head group")
     produced = 128 if reuse_long else selected
 
     @T.macro
@@ -456,14 +459,15 @@ def selected_int8(
                     staged_rows = T.alloc_ub((decode_groups, 64), "bfloat16")
                     T.reinterpretcast(staged_rows, decoded, "bfloat16_t")
                     flag = T.alloc_ub((max(8, tile_slots),), "int32")
-                    x = T.alloc_ub((1, selected), "float32")
+                    x = T.alloc_ub((softmax_heads, selected), "float32")
                     ids = T.alloc_ub((1, selected), "int32")
                     valid = T.alloc_ub((1, selected), "float32")
-                    mask = T.alloc_ub((selected // 8,), "uint8")
-                    maximum = T.alloc_ub((1, 1), "float32")
-                    denominator = T.alloc_ub((1, 1), "float32")
-                    sink_value = T.alloc_ub((1, 1), "float32")
-                    probability = T.alloc_ub((1, selected), "bfloat16")
+                    mask = T.alloc_ub((softmax_heads * selected // 8,), "uint8")
+                    maximum = T.alloc_ub((softmax_heads, 1), "float32")
+                    denominator = T.alloc_ub((softmax_heads, 1), "float32")
+                    sink_value = T.alloc_ub((softmax_heads, 1), "float32")
+                    probability = T.alloc_ub((softmax_heads, selected), "bfloat16")
+                    expanded = T.alloc_ub((softmax_heads, selected), "float32")
                     partial = T.alloc_ub((half_heads, tile_d), "float32")
                     result = T.alloc_ub((half_heads, tile_d), "bfloat16")
                     for part in T.serial(produced // (2 * tile_slots)):
@@ -501,27 +505,51 @@ def selected_int8(
                         )
                     T.set_cross_flag("MTE3", 0)
                     T.wait_cross_flag(1)
-                    for lane in T.serial(half_heads):
-                        head = vid * half_heads + lane
-                        softmax_row(
-                            score_workspace,
-                            mask_workspace,
-                            sink,
-                            probability_workspace,
-                            row,
-                            head,
-                            x,
-                            ids,
-                            valid,
-                            mask,
-                            maximum,
-                            denominator,
-                            sink_value,
-                            probability,
-                            selected,
-                            dimension,
-                            lane == 0,
-                        )
+                    if softmax_heads > 1:
+                        T.copy(mask_workspace[row, :], ids)
+                        T.tile.cast(valid, ids, "CAST_NONE", selected)
+                        T.tile.broadcast(expanded, valid)
+                        T.tile.compare(mask, expanded, -1.0, "GT")
+                    for lane in T.serial(half_heads // softmax_heads):
+                        head = vid * half_heads + lane * softmax_heads
+                        if softmax_heads > 1:
+                            softmax_head_tile(
+                                score_workspace,
+                                sink,
+                                probability_workspace,
+                                row,
+                                head,
+                                x,
+                                mask,
+                                maximum,
+                                denominator,
+                                sink_value,
+                                probability,
+                                expanded,
+                                selected,
+                                dimension,
+                                softmax_heads,
+                            )
+                        else:
+                            softmax_row(
+                                score_workspace,
+                                mask_workspace,
+                                sink,
+                                probability_workspace,
+                                row,
+                                head,
+                                x,
+                                ids,
+                                valid,
+                                mask,
+                                maximum,
+                                denominator,
+                                sink_value,
+                                probability,
+                                selected,
+                                dimension,
+                                lane == 0,
+                            )
                     T.set_cross_flag("MTE3", 2)
                     T.wait_cross_flag(3)
                     for d in T.serial(dimension // tile_d):

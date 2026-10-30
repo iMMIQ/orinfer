@@ -13,6 +13,39 @@ from tools.model.deepseek_v41.sequence_parallel import external_reads
 from tools.model.deepseek_v41.private_schedule import reusable_long_gathers, select_schedule
 
 
+class AttentionTileScopeTests(unittest.TestCase):
+    def test_only_large_family_attention_is_replaced_and_duplicates_are_shared(self):
+        from tools.model.deepseek_v41.tune_attention import attention_groups
+
+        def packet(minimum, name, **kw):
+            return dict(min_rows=minimum, body=[dict(op="kernel", manifest=name)], **kw)
+
+        model = dict(
+            ranks=[
+                dict(
+                    packets=[
+                        packet(1, "small.json"),
+                        packet(512, "decode.json", batch_decode=True),
+                        packet(512, "large.json"),
+                        packet(1024, "large.json"),
+                    ]
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "large.json").write_text(
+                json.dumps(dict(op="private_rows.attention_fused_selected_int8"))
+            )
+            self.assertEqual(list(attention_groups(model, root, 512)), ["large.json"])
+
+    def test_missing_selected_attention_is_rejected(self):
+        from tools.model.deepseek_v41.tune_attention import attention_groups
+
+        with self.assertRaises(ValueError):
+            attention_groups(dict(ranks=[dict(packets=[])]), Path("unused"), 512)
+
+
 class TopKTreeTests(unittest.TestCase):
     def fixture(self):
         descriptions = {

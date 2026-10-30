@@ -96,6 +96,8 @@ local TopK 的空块使用交错的 `(-inf, -1)` 候选对。`tools.operators.as
 
 `tools.model.deepseek_v41.fuse_topk --plan PLAN --output OUTPUT` 将已有 32／64 个候选块的三层四路归并收敛为一次 query 内的 UB 滚动归并，默认用于 `min_rows >= 512` 的 packet family。它与独立归并共享计算组件，保留逐层输入顺序和 FP32 候选对。每行从现有分片长度列读取有效块数，跳过整棵空子树；生产者必须是已将空候选规范化为 `(-inf,-1)` 的融合索引器。构建器验证生产者、物理分片和中间结果的存活范围，省去两级 GM 中间结果的读写，不增加 owner 私有状态。`tools.operators.ascend.validate_topk_tree --baseline BASE_PLAN --plan PLAN --output REPORT` 对照已发布的三次归并，覆盖并列分数、空／完整上下文、非对齐 query 行、未使用尾部及改变输入和长度后的 Graph replay。
 
+`tools.model.deepseek_v41.tune_attention --plan PLAN --output OUTPUT --compile-only` 为已有 TP8 H64、256 行查询容量的融合 selected attention 离线构建 4／8-head tile。去掉 `--compile-only` 后，在设备上对照输入包中逐头计算的已发布库，检查完整融合算子的 BF16 概率、输出、尾部及改变输入后的 Graph replay，并汇总多个实际 query 行数，为大行数 family 选择一个统一 tile。共享 softmax 组件保留逐行 FP32 归约、sink、标量倒数乘法及归一化后的 BF16 边界；sink 按 tile 连续读取。SWA、长 KV 首次读取和长 KV 复用使用相同模板及现有 owner ABI。数值不匹配的候选在全部几何中剔除。选择包含逐采样点 10% 回退门禁，缓存固定算子、编译器、设备和测量工具身份，最终 `OUTPUT/package/model.json` 仅引用被选择的库。完整请求和 Mini 性能另行验收。
+
 已有原生计划可使用 `tools.model.deepseek_v41.build --rebuild-plan PLAN --rebuild-op topk.local` 只重建相关算子，输出同目录的 `PLAN-selected.json`。`--rebuild-op` 可重复提供，未出现在计划中的算子名会报错；未选中的库和权重保持原引用。重建复用公共编译任务及内容缓存，最终部署仍需发布新的执行包。
 
 当前离线编译镜像面向 aarch64，使用调用者提供的 CANN 9.1 / Python 3.12 运行时基础镜像，固定 TileLang-Ascend wheel 的版本与 SHA256。基础镜像需包含匹配的 PyTorch、torch_npu 和 CANN 编译器。`run.sh` 将所选基础镜像解析为本地不可变镜像 ID；板上运行时串行取得 GPU 实验锁，无卡编译使用 `--without-devices`。运行前先结束占用同一批 NPU 的开发容器；驱动的容器设备归属可能持续到容器退出。编译产物、参考数据和缓存保存在 `artifacts`：

@@ -45,6 +45,41 @@ def qk(rows, heads, selected, dimension=512, tile_s=64, head_tile=16):
 
 
 @T.macro
+def softmax_values(
+    x,
+    mask,
+    maximum,
+    denominator,
+    sink_value,
+    p,
+    selected,
+    dimension,
+    head_tile,
+    expanded,
+):
+    """Full-row FP32 normalization, with the same scalar reciprocal per head."""
+    T.tile.mul(x, x, dimension**-0.5)
+    T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
+    T.reduce_max(x, maximum, dim=1)
+    T.tile.max(maximum, maximum, sink_value)
+    if head_tile == 1:
+        T.tile.sub(x, x, maximum[0, 0])
+    else:
+        T.tile.broadcast(expanded, maximum)
+        T.tile.sub(x, x, expanded)
+    T.tile.exp(x, x)
+    T.reduce_sum(x, denominator, dim=1)
+    T.tile.sub(sink_value, sink_value, maximum)
+    T.tile.exp(sink_value, sink_value)
+    T.tile.add(denominator, denominator, sink_value)
+    # Vector Div uses a different approximation from scalar reciprocal/Muls.
+    # Keep the latter so batching heads preserves the BF16 probability bits.
+    for lane in T.serial(head_tile):
+        T.tile.div(x[lane : lane + 1, :], x[lane : lane + 1, :], denominator[lane, 0])
+    T.tile.cast(p, x, "CAST_RINT", head_tile * selected)
+
+
+@T.macro
 def softmax_row(
     scores,
     indices,
@@ -69,20 +104,35 @@ def softmax_row(
         T.copy(indices[row, :], ids)
         T.tile.cast(valid, ids, "CAST_NONE", selected)
         T.tile.compare(mask, valid, -1.0, "GT")
-    T.tile.mul(x, x, dimension**-0.5)
-    T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
-    T.reduce_max(x, maximum, dim=1)
     sink_value[0, 0] = sink[head]
-    T.tile.max(maximum, maximum, sink_value)
-    T.tile.sub(x, x, maximum[0, 0])
-    T.tile.exp(x, x)
-    T.reduce_sum(x, denominator, dim=1)
-    T.tile.sub(sink_value, sink_value, maximum)
-    T.tile.exp(sink_value, sink_value)
-    T.tile.add(denominator, denominator, sink_value)
-    T.tile.div(x, x, denominator[0, 0])
-    T.tile.cast(p, x, "CAST_RINT", selected)
+    softmax_values(x, mask, maximum, denominator, sink_value, p, selected, dimension, 1, x)
     T.copy(p, probabilities[row, head, :])
+
+
+@T.macro
+def softmax_head_tile(
+    scores,
+    sink,
+    probabilities,
+    row,
+    head,
+    x,
+    mask,
+    maximum,
+    denominator,
+    sink_value,
+    p,
+    expanded,
+    selected,
+    dimension,
+    head_tile,
+):
+    T.copy(scores[row, head : head + head_tile, :], x)
+    T.copy(sink[head : head + head_tile], sink_value[:, 0])
+    softmax_values(
+        x, mask, maximum, denominator, sink_value, p, selected, dimension, head_tile, expanded
+    )
+    T.copy(p, probabilities[row, head : head + head_tile, :])
 
 
 def softmax(rows, heads, selected, dimension=512):
