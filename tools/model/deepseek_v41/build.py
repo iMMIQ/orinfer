@@ -1640,7 +1640,7 @@ def compile_task(task_and_output):
     return task["placeholder"], str(path.relative_to(output))
 
 
-def rebuild_kernels(plan, workers, *, all_kernels=False):
+def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None):
     """Recompile selected or all operators from an existing native build contract."""
     base = plan.parent
     model = json.loads(plan.read_text())
@@ -1659,11 +1659,17 @@ def rebuild_kernels(plan, workers, *, all_kernels=False):
                 if step["op"] != "kernel" or step["manifest"] in tasks:
                     continue
                 spec = json.loads((base / step["manifest"]).read_text())
-                if not all_kernels and (
-                    spec["op"] not in paired
-                    or (
-                        "_row_capacity" not in spec["parameters"]
-                        and spec["op"] != "model_ops.gather_attention"
+                if operators and spec["op"] not in operators:
+                    continue
+                if (
+                    not operators
+                    and not all_kernels
+                    and (
+                        spec["op"] not in paired
+                        or (
+                            "_row_capacity" not in spec["parameters"]
+                            and spec["op"] != "model_ops.gather_attention"
+                        )
                     )
                 ):
                     continue
@@ -1693,6 +1699,10 @@ def rebuild_kernels(plan, workers, *, all_kernels=False):
                     dynamic_arguments=symbolic,
                     placeholder=step["manifest"],
                 )
+    if operators and set(operators) - {
+        t["module"].split(".")[-1] + "." + t["name"] for t in tasks.values()
+    }:
+        raise ValueError("Selected operator is absent from the plan")
     replacements = {}
     with ProcessPoolExecutor(
         max_workers=workers, mp_context=multiprocessing.get_context("spawn")
@@ -1705,7 +1715,8 @@ def rebuild_kernels(plan, workers, *, all_kernels=False):
             for step in packet["body"] + packet["head"]:
                 if step["op"] == "kernel":
                     step["manifest"] = replacements.get(step["manifest"], step["manifest"])
-    output = plan.with_name(plan.stem + ("-rebuilt.json" if all_kernels else "-paired.json"))
+    suffix = "-selected.json" if operators else "-rebuilt.json" if all_kernels else "-paired.json"
+    output = plan.with_name(plan.stem + suffix)
     atomic_json(output, model)
     print(json.dumps(dict(model=str(output), rebuilt=len(replacements))), flush=True)
 
@@ -1717,6 +1728,7 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--rebuild-paired-plan", type=Path)
     parser.add_argument("--rebuild-plan", type=Path)
+    parser.add_argument("--rebuild-op", action="append", help="Rebuild only these operator names")
     parser.add_argument("--capacity", type=int, default=8448)
     parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--strategy", choices=("baseline", "optimized"), default="baseline")
@@ -1752,8 +1764,11 @@ def main():
             args.rebuild_plan or args.rebuild_paired_plan,
             args.compile_workers,
             all_kernels=args.rebuild_plan is not None,
+            operators=args.rebuild_op,
         )
         return
+    if args.rebuild_op:
+        parser.error("rebuild-op requires rebuild-plan or rebuild-paired-plan")
     if args.model_dir is None or args.engram_metadata is None or args.output is None:
         parser.error("model-dir, engram-metadata and output are required for a full build")
     if not 128 <= args.capacity <= 16384 or args.capacity % 32:
