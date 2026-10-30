@@ -11,6 +11,9 @@ pub(super) struct Contract {
     /// Rebuild decoder state only in the final prompt window.
     #[serde(default)]
     pub final_prompt_only: bool,
+    /// Closed program boundary after the persistent shared KV writes.
+    #[serde(default)]
+    pub source_ready: Option<String>,
     /// Consumer state needed to resume an identical, completed prompt.
     #[serde(default)]
     pub decoder_state: Vec<super::state::StateLayout>,
@@ -124,6 +127,10 @@ pub(super) fn validate_contract(
         return Ok(());
     };
     if !(128..=512).contains(&replay.keep)
+        || replay
+            .source_ready
+            .as_deref()
+            .is_some_and(|s| s != "source.kv.20")
         || !replay.decoder_state.is_empty() && !replay.final_prompt_only
         || replay.maps.is_empty()
         || replay.tables.is_empty()
@@ -177,7 +184,11 @@ pub(super) fn validate_packet(packet: &Packet, contract: Option<&batch::Contract
         || head.keep != replay.keep
         || head.prepare != 0
         || head.select != 0
-        || !matches!(body.index.checked_sub(body.prepare + 1).and_then(|i| packet.body.get(i)), Some(Instruction::Snapshot { name, .. }) if name == "layer20")
+        || !matches!(body.index.checked_sub(body.prepare + 1).and_then(|i| packet.body.get(i)), Some(Instruction::Snapshot { name, .. }) if name == replay.source_ready.as_deref().unwrap_or("layer20"))
+        || packet
+            .decoder_coordinates
+            .as_ref()
+            .is_some_and(|c| c.source_swa_indices.is_some() != replay.source_ready.is_some())
     {
         return Err("Decoder replay must follow the complete shared KV source layer".into());
     }

@@ -1,7 +1,8 @@
 """Build decoder SWA bounded replay from native A2 plans.
 
-The complete source layer 20 runs before compaction. Owner-row plans reuse the
-shared dynamic templates for each retained suffix; the legacy single-owner
+The shared KV source runs before compaction; --source-kv-boundary can defer
+layer 20's query/FFN work. Owner-row plans reuse the shared dynamic templates
+for each retained suffix; the legacy single-owner
 experiment takes its non-SP tail from --tail-template. This is an approximate
 state policy with separate model-quality acceptance.
 """
@@ -36,6 +37,11 @@ def main():
         action="store_true",
         help="Run decoder replay only for the final prompt window; reserve that window on prefix restore",
     )
+    parser.add_argument(
+        "--source-kv-boundary",
+        action="store_true",
+        help="Select query rows immediately after the last shared KV writes",
+    )
     args = parser.parse_args()
     if json.loads(args.plan.read_text()).get("batch"):
         from tools.model.deepseek_v41.decoder_rows import build
@@ -48,13 +54,14 @@ def main():
                     args.keep,
                     args.compile_workers,
                     final_prompt_only=args.final_prompt_only,
+                    source_kv_boundary=args.source_kv_boundary,
                 )
             )
         )
         return
     if args.tail_template is None:
         parser.error("The legacy single-owner experiment requires --tail-template")
-    if args.final_prompt_only:
+    if args.final_prompt_only or args.source_kv_boundary:
         parser.error("Final-prompt replay requires an owner-row plan")
     if any(
         p.parent.resolve() != args.plan.parent.resolve() for p in (args.tail_template, args.output)

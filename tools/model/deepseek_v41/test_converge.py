@@ -13,6 +13,65 @@ from tools.model.deepseek_v41.sequence_parallel import external_reads
 from tools.model.deepseek_v41.private_schedule import reusable_long_gathers, select_schedule
 
 
+class ProducerBoundaryTests(unittest.TestCase):
+    def fixture(self):
+        from tools.model.deepseek_v41.decoder_boundary import source_boundary
+
+        def kernel(name, buffers):
+            return dict(op="kernel", manifest=name, buffers=buffers)
+
+        specs = {
+            "hc": dict(operands=[dict(access="write")]),
+            "query": dict(operands=[dict(access="read"), dict(access="write")]),
+            "rope": dict(operands=[dict(access="read"), dict(access="write")]),
+            "kv": dict(
+                operands=[dict(access="read")] * 3,
+                parameters=dict(_owner_access=[dict(column=0, write=True)]),
+            ),
+            "consume": dict(operands=[dict(access="read")]),
+        }
+        write = dict(kernel("kv", ["work", "pointers", "active"]), owner_work={})
+        packet = dict(
+            coordinates=dict(slots="positions"),
+            body=[
+                dict(op="snapshot", name="layer19", buffer="hidden"),
+                dict(op="fork"),
+                kernel("hc", ["coefficients"]),
+                dict(op="switch"),
+                kernel("query", ["q.a", "x.q.b"]),
+                kernel("rope", ["x.q.b", "x.q.rope"]),
+                write,
+                kernel("consume", ["x.q.rope"]),
+                dict(op="join"),
+                dict(op="snapshot", name="layer20", buffer="hidden"),
+            ],
+        )
+        contract = dict(columns=[dict(buffer="cache.long.20")], pointers=dict(pointers=[0]))
+        return source_boundary, packet, contract, lambda step: specs[step["manifest"]]
+
+    def test_shared_writes_and_coefficients_complete_before_query_selection(self):
+        split, packet, contract, describe = self.fixture()
+        original = deepcopy(packet)
+        prefix, tail = split(packet, contract, describe)
+        self.assertEqual(packet, original)
+        self.assertEqual(prefix[-3]["manifest"], "kv")
+        self.assertEqual([s["op"] for s in prefix[-2:]], ["join", "snapshot"])
+        self.assertEqual([s.get("manifest") for s in tail[:3]], ["query", "rope", "consume"])
+        self.assertNotIn("join", [s["op"] for s in tail])
+
+    def test_a_query_consumer_before_shared_write_rejects_reordering(self):
+        split, packet, contract, describe = self.fixture()
+        packet["body"].insert(6, dict(op="kernel", manifest="consume", buffers=["x.q.rope"]))
+        with self.assertRaisesRegex(ValueError, "still required"):
+            split(packet, contract, describe)
+
+    def test_a_boundary_inside_nested_branches_is_rejected(self):
+        split, packet, contract, describe = self.fixture()
+        packet["body"].insert(6, dict(op="fork"))
+        with self.assertRaisesRegex(ValueError, "outer mHC"):
+            split(packet, contract, describe)
+
+
 class PrivateScheduleSelectionTests(unittest.TestCase):
     def fixture(self):
         rows = list(range(1, 129)) + [129, 512, 800, 2048]

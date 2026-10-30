@@ -166,6 +166,12 @@ Attention 保留 16-token 块的 FP32 打分、在线 softmax 和逐块累积，
 
 相同 240 秒 Mini 在末次 238.34 秒采样完成 1463992 个 prefill token，比前轮少 2.36%，比逐片段窗口基线多 13.37%，仍处于 warmup，没有完整 agent 得分。16 个请求均未命中完整头，该测量反映长输入路径；并发头命中独立验收。算子、动态行计划和 owner 常驻布局与上一包逐项相同。
 
+`--source-kv-boundary` 在第 20 层共享 KV/index key 写完后选择 query 行；Q-B、query RoPE、索引查询、attention 和 FFN 只执行保留行，第 20 层 SWA 仍读取完整历史。动态投影、attention、MoE 及 KV 算子沿用原实现；普通 decode packet、producer/decoder 快照声明和 owner 常驻分配逐项一致。纯中间 packet 的 W4 调用为 40 次，query exchange 为 42 次。边界搬运包含 FP32 mHC 系数和 INT8 Q-A，单请求与不等长混合 owner、rank 0/7 的非对齐尾部及改输入后的 Graph replay 逐值一致；17/2049/8193 的 producer 与完整 decoder 状态恢复在复现通信下保持后续完整 logits 一致。
+
+相同 token ID、默认通信和固定历史 decode 的原生短测，2K 为 7271.45 TPS（+4.60%），2049 为 6314.32 TPS（+4.29%，对照已接受的 6054.51 TPS 配对结果），B32×17 为 3133.19 TPS（−3.34%）。单流 decode 为 49.48/49.77 tokens/s，B32 aggregate decode 为 257.06 tokens/s。2K/2049 使用预热后末三轮平均耗时，B32 使用两轮；该结果衡量原生执行，HTTP 和 Mini 另行记录。
+
+同一固定输入与 240 秒 wall limit 的 Mini，末次采样为 238.35 秒：完成 1598120 个 prefill token，相比上一轮 1463992 增加 9.16%，相比此前 1499385 的最高记录增加 6.59%。16 个 warmup 请求在该 phase 的 223.05 秒全部完成，随后开始 profiling，记录 50 个 decode token；此前同一时限仍在 warmup。完整回放及最终报告尚未完成，不能据此报告完整 agent 吞吐或得分。计算耗时为 210.38 秒，约占采样 wall time 的 88.27%；batch/Graph 准备为 19.25 秒，warmup 末次采样为 15.53 秒，其余约 3.72 秒包含新 profiling 形状，不能与仅 warmup 的旧包直接比较为准备回退。混合 HTTP/SSE 检查执行 5 个实际混合迭代；同一 36K/8 输出请求的完整头命中为 0.278 秒，prefill 增量为零、decode 为 7 步。未追加配对或长时回放。
+
 ## 六模型统一基准（2026-10-21）
 
 README 的六模型表格使用本节固定英译中请求的统一基准。MTP 收益随任务与接受率变化。全部运行在本机 Jetson AGX Orin 64GB，使用 Rust release 完整请求状态机、`decode_only`、greedy、seed `20261002`，关闭 thinking 和 prefix cache。单流自适应 MTP 最多 3 草稿，多流由基准自动切换为 `mtp_drafts=0`。

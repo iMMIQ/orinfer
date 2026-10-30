@@ -11,11 +11,12 @@ from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
 from tools.model.deepseek_v41.batch import compile_task
+from tools.model.deepseek_v41.decoder_boundary import live_rows, source_boundary
 from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
 from tools.model.row_contract import expression
 
 
-def build(plan, output, keep=128, workers=4, final_prompt_only=False):
+def build(plan, output, keep=128, workers=4, final_prompt_only=False, source_kv_boundary=False):
     from tools.operators.ascend.build import operand
     from tools.operators.ascend.private_rows import indirect
     from kernels.model.rows import row_count
@@ -81,7 +82,7 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
                 rows=bound,
                 table_rows=capacity,
                 width=width,
-                dtype={"bf16": "bfloat16", "i32": "int32"}[dtype],
+                dtype={"bf16": "bfloat16", "i32": "int32", "i8": "int8", "f32": "float32"}[dtype],
                 index_dtype="int32",
             )
             specs = [
@@ -125,7 +126,11 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
             boundary = (
                 next(i for i, s in enumerate(packet["body"]) if s.get("name") == "layer20") + 1
             )
-            body, tail = packet["body"][:boundary], deepcopy(packet["body"][boundary:])
+            body, tail = (
+                source_boundary(packet, contract, describe)
+                if source_kv_boundary
+                else (packet["body"][:boundary], deepcopy(packet["body"][boundary:]))
+            )
             coordinates = packet["coordinates"]
             replacements = {}
             for key, name in coordinates.items():
@@ -143,9 +148,13 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
             }
             if not coordinates.get("device_indices"):
                 raise ValueError("Bounded decoder requires device-built compressed index views")
+            source_swa = None
+            if source_kv_boundary:
+                source_swa = define("batch.decoder.source_swa", capacity * 128 * 4)
+                packet["decoder_coordinates"]["source_swa_indices"] = source_swa
             sp = any(
                 step.get("buffers", [None])[0] == "batch.prefill.sequence.m2048.residual.a"
-                for step in tail[:12]
+                for step in packet["body"][boundary : boundary + 12]
                 if step.get("buffers")
             )
             stride = peers if sp else 1
@@ -156,8 +165,12 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
             maps[map_name] = dict(
                 buffer=map_name, source_partition=1, destination_partition=stride, contiguous=sp
             )
-            query_map = define("batch.decoder.map.query", capacity // peers * 4) if sp else map_name
-            if sp:
+            query_map = (
+                define("batch.decoder.map.query", capacity // peers * 4)
+                if sp and not source_kv_boundary
+                else map_name
+            )
+            if sp and not source_kv_boundary:
                 maps[query_map] = dict(
                     buffer=query_map, source_partition=peers, destination_partition=peers
                 )
@@ -165,22 +178,33 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
             prefix = "batch.prefill.m2048."
             if capacity != 2048:
                 raise ValueError("Current packet contract requires a 2048-row shared arena")
-            for suffix, width in [("residual.a", 20480), ("collapsed", 5120), ("selected", 512)]:
-                target = (
-                    ("batch.prefill.sequence.m2048." + suffix)
-                    if sp and suffix != "selected"
-                    else prefix + suffix
+            global_map = map_name
+            if sp and source_kv_boundary:
+                global_map = define("batch.decoder.map.global", capacity * 4)
+                maps[global_map] = dict(
+                    buffer=global_map, source_partition=1, destination_partition=1
                 )
-                dtype = "int32" if suffix == "selected" else "bfloat16"
-                kind = "i32" if suffix == "selected" else "bf16"
+            for suffix, width, kind, sequence in live_rows(source_kv_boundary):
+                distributed = sp and (sequence or suffix == "selected")
+                target = (
+                    "batch.prefill.sequence.m2048." + suffix if sp and sequence else prefix + suffix
+                )
                 if sp and suffix == "selected":
                     target = prefix + "selected.index_partition"
                 source = prefix + suffix
-                size = capacity * width * (4 if dtype == "int32" else 2)
+                size = capacity * width * {"bf16": 2, "i32": 4, "f32": 4, "i8": 1}[kind]
                 if definitions[source]["bytes"] != size:
                     raise ValueError("Decoder boundary source geometry differs: " + source)
-                if sp:
-                    prepare.append(gather(target, source, width, dtype, capacity))
+                if distributed:
+                    prepare.append(
+                        gather(
+                            target,
+                            source,
+                            width,
+                            {"f32": "float32", "i32": "int32"}.get(kind, "bfloat16"),
+                            capacity,
+                        )
+                    )
                     select.append(
                         move(
                             source,
@@ -193,14 +217,20 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
                         )
                     )
                 else:
-                    scratch = prefix + ("residual.b" if suffix == "residual.a" else "norm.attn")
-                    if definitions[scratch]["bytes"] < size:
-                        raise ValueError("Decoder compaction scratch is too small")
+                    scratch = prefix + (
+                        "residual.b"
+                        if source_kv_boundary or suffix == "residual.a"
+                        else "norm.attn"
+                    )
+                    if "view" in definitions[scratch] or definitions[scratch]["bytes"] < size:
+                        raise ValueError(
+                            "Decoder compaction requires independent, sufficient scratch"
+                        )
                     if definitions[scratch]["bytes"] != size:
                         scratch = define(
                             f"batch.decoder.scratch.{suffix}", size, dict(parent=scratch, offset=0)
                         )
-                    select.append(move(source, scratch, width, kind, capacity, 1, map_name))
+                    select.append(move(source, scratch, width, kind, capacity, 1, global_map))
                     identity = define("batch.decoder.identity", capacity * 4)
                     if "data" not in definitions[identity]:
                         path = base / "data/decoder-identity.bin"
@@ -245,6 +275,14 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
                         ],
                     )
                 )
+            source_swa_partition = source_swa
+            if sp and source_swa is not None:
+                source_swa_partition = define(
+                    "batch.decoder.source_swa.index_partition", capacity // peers * 128 * 4
+                )
+                select.append(
+                    dict(op="kernel", manifest=manifest, buffers=[source_swa, source_swa_partition])
+                )
             first_attention = True
             for step in tail + packet["head"]:
                 if step["op"] == "kernel":
@@ -264,11 +302,29 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
                                     "Decoder boundary precedes a persistent shared KV/key source: "
                                     + role
                                 )
+                        is_source = (
+                            source_kv_boundary
+                            and first_attention
+                            and desc["op"]
+                            in [
+                                "private_rows.kv_int8_gather_attention",
+                                "private_rows.attention_fused_selected_int8",
+                            ]
+                        )
                         ids = []
                         for old_id in contract["pointers"][old_pointer]:
                             col = deepcopy(contract["columns"][old_id])
                             if col["row_bytes"] is not None:
-                                col["buffer"] = clone_buffer(col["buffer"], replacements)
+                                col["buffer"] = (
+                                    source_swa_partition
+                                    if is_source
+                                    and col["buffer"]
+                                    in [
+                                        coordinates["swa_indices"],
+                                        "batch.query_attention.swa_indices",
+                                    ]
+                                    else clone_buffer(col["buffer"], replacements)
+                                )
                                 col["decoder"] = True
                                 identity = json.dumps(col, sort_keys=True)
                                 if identity not in decoder_columns:
@@ -298,6 +354,13 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
                             "private_rows.attention_fused_selected_int8",
                         ]:
                             p = desc["parameters"]
+                            if source_kv_boundary:
+                                if p.get("reuse_long"):
+                                    raise ValueError(
+                                        "Source attention must prepare its own long KV"
+                                    )
+                                first_attention = False
+                                continue
                             if not p.get("reuse_long"):
                                 raise ValueError(
                                     "Expected retained long KV at the decoder boundary"
@@ -368,9 +431,12 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
                     raise ValueError("Unsupported decoder operation: " + step["op"])
             if first_attention:
                 raise ValueError("Decoder boundary has no selected attention")
-            # SWA coordinates change on every final-window entry, including a
-            # full 128-row final packet that needs no hidden-row compaction.
-            selected_steps = len(select) - int(sp and final_prompt_only)
+            # Consumer coordinates change on every final-window entry. The
+            # last producer's independent SWA partition also needs preparing
+            # when no rows are clipped, in either replay policy.
+            selected_steps = (
+                len(select) - int(sp and final_prompt_only) - int(sp and source_kv_boundary)
+            )
             marker = dict(op="decoder_rows", keep=keep, prepare=len(prepare), select=selected_steps)
             packet["body"] = body + prepare + [marker] + select + tail
             packet["head"].insert(0, dict(op="decoder_rows", keep=keep, prepare=0, select=0))
@@ -388,6 +454,8 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
         tables=sorted(decoder_tables),
         maps=list(maps.values()),
     )
+    if source_kv_boundary:
+        contract["decoder_replay"]["source_ready"] = "source.kv.20"
     if final_prompt_only:
         # Consumer SWA is always reconstructed from the final prompt window;
         # prefix snapshots contain only producer state and shared KV sources.
@@ -418,6 +486,7 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
         model=str(output / "package/model.json"),
         keep=keep,
         final_prompt_only=final_prompt_only,
+        source_kv_boundary=source_kv_boundary,
         kernels=len(tasks),
         assets=assets,
         families=counts,

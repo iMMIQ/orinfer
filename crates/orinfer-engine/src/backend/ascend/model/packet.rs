@@ -21,6 +21,9 @@ pub(super) struct Coordinates {
     pub slots: String,
     pub c2_slots: String,
     pub swa_indices: String,
+    /// Selected queries of the last producer retain its full SWA history.
+    #[serde(default)]
+    pub source_swa_indices: Option<String>,
     pub c1_indices: String,
     pub c2_indices: String,
     pub c1_lengths: String,
@@ -29,8 +32,8 @@ pub(super) struct Coordinates {
     pub premix: String,
 }
 impl Coordinates {
-    pub(super) fn names(&self) -> [&str; 15] {
-        [
+    pub(super) fn names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = vec![
             &self.base_cos,
             &self.base_sin,
             &self.long_cos,
@@ -46,7 +49,9 @@ impl Coordinates {
             &self.c2_lengths,
             &self.ring,
             &self.premix,
-        ]
+        ];
+        names.extend(self.source_swa_indices.as_deref());
+        names
     }
 }
 #[derive(Clone, Copy, Debug)]
@@ -169,6 +174,17 @@ impl Worker {
             mix[row * 8] = 1.0;
         }
         put(&mut inputs, &names.swa_indices, &ints(&swa))?;
+        if let Some(source) = &names.source_swa_indices {
+            // Only the consumer layers rebuild SWA from the bounded window.
+            swa.fill(-1);
+            for row in 0..rows {
+                let position = base + row;
+                for (lane, previous) in (position.saturating_sub(127)..=position).enumerate() {
+                    swa[row * 128 + lane] = previous as i32;
+                }
+            }
+            put(&mut inputs, source, &ints(&swa))?;
+        }
         put(&mut inputs, &names.ring, &ints(&metadata))?;
         put(
             &mut inputs,

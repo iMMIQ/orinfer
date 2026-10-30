@@ -1577,7 +1577,14 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                 .body
                 .iter()
                 .filter_map(|step| {
-                    if let Instruction::Snapshot { name, .. } = step {
+                    if let Instruction::Snapshot { name, .. } = step
+                        && !model
+                            .batch
+                            .as_ref()
+                            .and_then(|c| c.decoder_replay.as_ref())
+                            .and_then(|c| c.source_ready.as_ref())
+                            .is_some_and(|s| s == name)
+                    {
                         Some(name.clone())
                     } else {
                         None
