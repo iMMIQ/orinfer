@@ -52,7 +52,13 @@ def compile_task(item):
         op = "private_rows." + op.replace(".", "_")
         capacity = 4096
     path = compile_kernel(
-        function, op, task["specs"], parameters, Path(base) / "cache", row_capacity=capacity
+        function,
+        op,
+        task["specs"],
+        parameters,
+        Path(base) / "cache",
+        row_capacity=capacity,
+        grid_limit=task.get("grid_limit", 64),
     )
     return task["key"], str(path.relative_to(base))
 

@@ -157,6 +157,8 @@ def compile_kernel(
         if "." in name and module in SOURCES
         else SOURCES
     )
+    if function.attrs and function.attrs.get("orinfer.component_sources"):
+        sources += [ROOT / str(name) for name in function.attrs["orinfer.component_sources"]]
     identity = {
         "source_sha256": source_hash(
             ROOT, sources + [ROOT / "tools/build/files.py", ROOT / "kernels/model/rows.py"]

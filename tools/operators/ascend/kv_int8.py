@@ -154,6 +154,91 @@ def decode_prefix(rows, capacity, ratio=1, windowed=False):
     return main
 
 
+@T.macro
+def gather_tile(
+    swa,
+    swa_scales,
+    long_kv,
+    long_scales,
+    swa_indices,
+    long_indices,
+    out,
+    mask,
+    q,
+    zeros,
+    half_values,
+    values,
+    half_scales,
+    scale,
+    broadcast,
+    y,
+    flag,
+    row,
+    first,
+    capacity,
+    compressed_capacity,
+    compressed,
+    storage,
+    tile_slots,
+    bulk_store,
+    groups,
+):
+    if tile_slots == 1 or not bulk_store:
+        T.tile.fill(y, 0.0)
+    if tile_slots > 1:
+        T.reinterpretcast(q, zeros, "int8_t")
+        T.tile.fill(zeros, 0)
+        T.tile.fill(half_scales, 0.0)
+    for lane in T.serial(tile_slots):
+        slot = first + lane
+        flag[lane] = -1
+        if slot < 128:
+            source = swa_indices[row, slot]
+            if source >= 0 and source < capacity:
+                T.copy(swa[source % storage, :, :], q[lane * 8 : (lane + 1) * 8, :])
+                if tile_slots == 1:
+                    T.copy(swa_scales[source % storage, :], half_scales[:, 0])
+                else:
+                    # FP16 scale rows are 16 bytes; scalar packing
+                    # avoids unaligned 32-byte UB DMA destinations.
+                    for group in T.unroll(8):
+                        half_scales[lane * 8 + group, 0] = swa_scales[source % storage, group]
+                if tile_slots == 1:
+                    decode_values(q, half_values, values, half_scales, scale, broadcast, y, groups)
+                flag[lane] = 0
+        else:
+            if compressed:
+                source = long_indices[row, slot - 128]
+                if source >= 0 and source < compressed_capacity:
+                    T.copy(long_kv[source, :, :], q[lane * 8 : (lane + 1) * 8, :])
+                    if tile_slots == 1:
+                        T.copy(long_scales[source, :], half_scales[:, 0])
+                    else:
+                        for group in T.unroll(8):
+                            half_scales[lane * 8 + group, 0] = long_scales[source, group]
+                    if tile_slots == 1:
+                        decode_values(
+                            q,
+                            half_values,
+                            values,
+                            half_scales,
+                            scale,
+                            broadcast,
+                            y,
+                            groups,
+                        )
+                    flag[lane] = 0
+    if tile_slots > 1:
+        decode_values(q, half_values, values, half_scales, scale, broadcast, y, groups)
+    if bulk_store:
+        T.copy(y, out[row, first : first + tile_slots, :])
+    else:
+        for lane in T.serial(tile_slots):
+            T.copy(y[lane, :], out[row, first + lane, :])
+    T.copy(flag[:tile_slots], mask[row, first : first + tile_slots])
+    T.pipe_barrier("ALL")
+
+
 def gather_attention(
     rows,
     capacity,
@@ -208,65 +293,33 @@ def gather_attention(
             flat = cid * 2 + vid
             row, first = flat // tiles, flat % tiles * tile_slots
             if row < rows:
-                if tile_slots == 1 or not bulk_store:
-                    T.tile.fill(y, 0.0)
-                if tile_slots > 1:
-                    T.reinterpretcast(q, zeros, "int8_t")
-                    T.tile.fill(zeros, 0)
-                    T.tile.fill(half_scales, 0.0)
-                for lane in T.serial(tile_slots):
-                    slot = first + lane
-                    flag[lane] = -1
-                    if slot < 128:
-                        source = swa_indices[row, slot]
-                        if source >= 0 and source < capacity:
-                            T.copy(swa[source % storage, :, :], q[lane * 8 : (lane + 1) * 8, :])
-                            if tile_slots == 1:
-                                T.copy(swa_scales[source % storage, :], half_scales[:, 0])
-                            else:
-                                # FP16 scale rows are 16 bytes; scalar packing
-                                # avoids unaligned 32-byte UB DMA destinations.
-                                for group in T.unroll(8):
-                                    half_scales[lane * 8 + group, 0] = swa_scales[
-                                        source % storage, group
-                                    ]
-                            if tile_slots == 1:
-                                decode_values(
-                                    q, half_values, values, half_scales, scale, broadcast, y, groups
-                                )
-                            flag[lane] = 0
-                    else:
-                        if compressed:
-                            source = long_indices[row, slot - 128]
-                            if source >= 0 and source < compressed_capacity:
-                                T.copy(long_kv[source, :, :], q[lane * 8 : (lane + 1) * 8, :])
-                                if tile_slots == 1:
-                                    T.copy(long_scales[source, :], half_scales[:, 0])
-                                else:
-                                    for group in T.unroll(8):
-                                        half_scales[lane * 8 + group, 0] = long_scales[
-                                            source, group
-                                        ]
-                                if tile_slots == 1:
-                                    decode_values(
-                                        q,
-                                        half_values,
-                                        values,
-                                        half_scales,
-                                        scale,
-                                        broadcast,
-                                        y,
-                                        groups,
-                                    )
-                                flag[lane] = 0
-                if tile_slots > 1:
-                    decode_values(q, half_values, values, half_scales, scale, broadcast, y, groups)
-                if bulk_store:
-                    T.copy(y, out[row, first : first + tile_slots, :])
-                else:
-                    for lane in T.serial(tile_slots):
-                        T.copy(y[lane, :], out[row, first + lane, :])
-                T.copy(flag[:tile_slots], mask[row, first : first + tile_slots])
-                T.pipe_barrier("ALL")
+                gather_tile(
+                    swa,
+                    swa_scales,
+                    long_kv,
+                    long_scales,
+                    swa_indices,
+                    long_indices,
+                    out,
+                    mask,
+                    q,
+                    zeros,
+                    half_values,
+                    values,
+                    half_scales,
+                    scale,
+                    broadcast,
+                    y,
+                    flag,
+                    row,
+                    first,
+                    capacity,
+                    compressed_capacity,
+                    compressed,
+                    storage,
+                    tile_slots,
+                    bulk_store,
+                    groups,
+                )
 
     return main

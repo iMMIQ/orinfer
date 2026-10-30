@@ -320,13 +320,18 @@ def rebuild(
                     tensors = [
                         function.buffer_map[p] for p in function.params if p in function.buffer_map
                     ]
-                    columns = {tensor.name: i for i, tensor in enumerate(tensors)}
-                    aliases = {tensor.name + "_owner": str(tensor.dtype) for tensor in tensors}
+                    owned = [
+                        tensor
+                        for tensor in tensors
+                        if tensor.name + "_owner" in parameters["_owner_aliases"]
+                    ]
+                    columns = {tensor.name: i for i, tensor in enumerate(owned)}
+                    aliases = {tensor.name + "_owner": str(tensor.dtype) for tensor in owned}
                     accesses = parameters["_owner_access"]
                     if (
                         aliases != parameters["_owner_aliases"]
                         or list(aliases) != list(parameters["_owner_aliases"])
-                        or [a["column"] for a in accesses] != list(range(len(tensors)))
+                        or [a["column"] for a in accesses] != list(range(len(owned)))
                     ):
                         raise ValueError("Private primitive tensor order/dtype differs")
                     mapping = contract["pointers"][original["buffers"][1]]
@@ -337,8 +342,13 @@ def rebuild(
                     definitions = {buffer["name"]: buffer for buffer in rank["buffers"]}
                     for live_rows in (1, capacity):
                         shapes = physical_shapes(function, live_rows)
-                        for tensor, shape, column_index in zip(
-                            tensors, shapes, mapping, strict=True
+                        owned_shapes = [
+                            (tensor, shape)
+                            for tensor, shape in zip(tensors, shapes, strict=True)
+                            if tensor.name in columns
+                        ]
+                        for (tensor, shape), column_index in zip(
+                            owned_shapes, mapping, strict=True
                         ):
                             column = contract["columns"][column_index]
                             if column["row_alignment"] != 1:
@@ -358,8 +368,12 @@ def rebuild(
                     _, identities, grid = indirect(
                         function, columns, contract["owners"], capacity, table_columns=len(mapping)
                     )
-                    if any(value is not None for value in identities[3:]):
-                        raise ValueError("Private schedule introduces external operands")
+                    if [value for value in identities[3:] if value is not None] != [
+                        tensor.name for tensor in tensors if tensor.name not in columns
+                    ]:
+                        raise ValueError("Private schedule changes external operand order")
+                    if any(spec["access"] != "read" for spec in descriptor["operands"][3:]):
+                        raise ValueError("Private schedule external operands must be read-only")
                     metadata = {
                         key: value for key, value in parameters.items() if key.startswith("_owner_")
                     }

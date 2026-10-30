@@ -346,3 +346,203 @@ def prefill(rows, capacity, ratio=2, compressed=True, tile_m=32, tile_k=128, reu
                 T.pipe_barrier("ALL")
 
     return main.with_attr("orinfer.coupled_resources", True)
+
+
+def selected_int8(
+    rows,
+    capacity,
+    compressed_capacity,
+    compressed=True,
+    swa_storage_rows=0,
+    heads=64,
+    tile_slots=16,
+    reuse_long=False,
+):
+    """One paired-core selected-KV gather/QK/softmax/PV invocation per query.
+
+    The producer and consumer of each query run within one kernel. Workspace
+    spills bridge AIV/AIC storage and retain the original FP32 scores, full-row
+    normalization and normalized BF16 probability boundary.
+    """
+    from tools.operators.ascend.attention_cube import softmax_row
+    from tools.operators.ascend.kv_int8 import gather_tile
+
+    selected = 640 if compressed else 128
+    storage = swa_storage_rows or capacity
+    if heads not in (16, 32, 64) or tile_slots not in (1, 4, 8, 16):
+        raise ValueError("Fused selected attention requires H16/32/64 and legal KV slot tiles")
+    if not 128 <= storage <= capacity or (reuse_long and not compressed):
+        raise ValueError("Invalid selected attention cache/reuse geometry")
+    dimension, tile_k, tile_d = 512, 128, 128
+    half_heads, decode_groups = heads // 2, tile_slots * 8
+    produced = 128 if reuse_long else selected
+
+    @T.prim_func
+    def main(
+        query: T.Tensor((rows, heads, dimension), "bfloat16"),
+        swa: T.Tensor((storage, 8, 64), "int8"),
+        swa_scales: T.Tensor((storage, 8), "float16"),
+        long_kv: T.Tensor((compressed_capacity, 8, 64), "int8"),
+        long_scales: T.Tensor((compressed_capacity, 8), "float16"),
+        swa_indices: T.Tensor((rows, 128), "int32"),
+        long_indices: T.Tensor((rows, 512), "int32"),
+        sink: T.Tensor((heads,), "float32"),
+        output: T.Tensor((rows, heads, dimension), "bfloat16"),
+        kv_workspace: T.Tensor((rows, selected, dimension), "bfloat16"),
+        mask_workspace: T.Tensor((rows, selected), "int32"),
+        score_workspace: T.Tensor((rows, heads, selected), "float32"),
+        probability_workspace: T.Tensor((rows, heads, selected), "bfloat16"),
+        output_workspace: T.Tensor((rows, heads, dimension), "float32"),
+    ):
+        with T.Kernel(rows, is_npu=True) as (cid, vid):
+            T.reads(
+                query[0:rows, :, :],
+                swa[:, :, :],
+                swa_scales[:, :],
+                long_kv[:, :, :],
+                long_scales[:, :],
+                swa_indices[0:rows, :],
+                long_indices[0:rows, :],
+                sink[:],
+                kv_workspace[0:rows, :, :],
+                mask_workspace[0:rows, :],
+                score_workspace[0:rows, :, :],
+                probability_workspace[0:rows, :, :],
+                output_workspace[0:rows, :, :],
+            )
+            T.writes(
+                output[0:rows, :, :],
+                kv_workspace[0:rows, :, :],
+                mask_workspace[0:rows, :],
+                score_workspace[0:rows, :, :],
+                probability_workspace[0:rows, :, :],
+                output_workspace[0:rows, :, :],
+            )
+            row = cid
+            if row < rows:
+                with T.Scope("C"):
+                    query_l1 = T.alloc_L1((heads, dimension), "bfloat16")
+                    key_l1 = T.alloc_L1((tile_k, dimension), "bfloat16")
+                    probability_l1 = T.alloc_L1((heads, selected), "bfloat16")
+                    value_l1 = T.alloc_L1((selected, tile_d), "bfloat16")
+                    acc = T.alloc_L0C((heads, 128), "float32")
+                    T.copy(query[row, :, :], query_l1)
+                    T.wait_cross_flag(0)
+                    for slot in T.serial(selected // tile_k):
+                        T.copy(kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :], key_l1)
+                        T.gemm_v0(query_l1, key_l1, acc, transpose_B=True, init=True, kL0Size=128)
+                        T.copy(acc, score_workspace[row, :, slot * 128 : (slot + 1) * 128])
+                    T.set_cross_flag("FIX", 1)
+                    T.wait_cross_flag(2)
+                    T.copy(probability_workspace[row, :, :], probability_l1)
+                    for d in T.serial(dimension // tile_d):
+                        T.copy(kv_workspace[row, :, d * tile_d : (d + 1) * tile_d], value_l1)
+                        T.gemm_v0(probability_l1, value_l1, acc, init=True, kL0Size=128)
+                        T.copy(acc, output_workspace[row, :, d * 128 : (d + 1) * 128])
+                    T.set_cross_flag("FIX", 3)
+                    T.wait_cross_flag(4)
+                with T.Scope("V"):
+                    q = T.alloc_ub((decode_groups, 64), "int8")
+                    zeros = T.alloc_ub((decode_groups, 16), "int32")
+                    half_values = T.alloc_ub((decode_groups, 64), "float16")
+                    values = T.alloc_ub((decode_groups, 64), "float32")
+                    half_scales = T.alloc_ub((decode_groups, 1), "float16")
+                    scale = T.alloc_ub((decode_groups, 1), "float32")
+                    broadcast = T.alloc_ub((decode_groups, 64), "float32")
+                    decoded = T.alloc_ub((tile_slots, dimension), "bfloat16")
+                    flag = T.alloc_ub((max(8, tile_slots),), "int32")
+                    x = T.alloc_ub((1, selected), "float32")
+                    ids = T.alloc_ub((1, selected), "int32")
+                    valid = T.alloc_ub((1, selected), "float32")
+                    mask = T.alloc_ub((selected // 8,), "uint8")
+                    maximum = T.alloc_ub((1, 1), "float32")
+                    denominator = T.alloc_ub((1, 1), "float32")
+                    sink_value = T.alloc_ub((1, 1), "float32")
+                    probability = T.alloc_ub((1, selected), "bfloat16")
+                    partial = T.alloc_ub((half_heads, tile_d), "float32")
+                    result = T.alloc_ub((half_heads, tile_d), "bfloat16")
+                    for part in T.serial(produced // (2 * tile_slots)):
+                        first = vid * (produced // 2) + part * tile_slots
+                        gather_tile(
+                            swa,
+                            swa_scales,
+                            long_kv,
+                            long_scales,
+                            swa_indices,
+                            long_indices,
+                            kv_workspace,
+                            mask_workspace,
+                            q,
+                            zeros,
+                            half_values,
+                            values,
+                            half_scales,
+                            scale,
+                            broadcast,
+                            decoded,
+                            flag,
+                            row,
+                            first,
+                            capacity,
+                            compressed_capacity,
+                            compressed,
+                            storage,
+                            tile_slots,
+                            True,
+                            decode_groups,
+                        )
+                    T.set_cross_flag("MTE3", 0)
+                    T.wait_cross_flag(1)
+                    for lane in T.serial(half_heads):
+                        head = vid * half_heads + lane
+                        softmax_row(
+                            score_workspace,
+                            mask_workspace,
+                            sink,
+                            probability_workspace,
+                            row,
+                            head,
+                            x,
+                            ids,
+                            valid,
+                            mask,
+                            maximum,
+                            denominator,
+                            sink_value,
+                            probability,
+                            selected,
+                            dimension,
+                            lane == 0,
+                        )
+                    T.set_cross_flag("MTE3", 2)
+                    T.wait_cross_flag(3)
+                    for d in T.serial(dimension // tile_d):
+                        first_head = vid * half_heads
+                        T.copy(
+                            output_workspace[
+                                row,
+                                first_head : first_head + half_heads,
+                                d * tile_d : (d + 1) * tile_d,
+                            ],
+                            partial,
+                        )
+                        T.tile.cast(result, partial, "CAST_RINT", half_heads * tile_d)
+                        T.copy(
+                            result,
+                            output[
+                                row,
+                                first_head : first_head + half_heads,
+                                d * tile_d : (d + 1) * tile_d,
+                            ],
+                        )
+                    T.set_cross_flag("MTE3", 4)
+                    T.pipe_barrier("ALL")
+
+    return (
+        main.with_attr("orinfer.coupled_resources", True)
+        .with_attr("orinfer.explicit_cross_sync", True)
+        .with_attr(
+            "orinfer.component_sources",
+            ["tools/operators/ascend/kv_int8.py", "tools/operators/ascend/attention_cube.py"],
+        )
+    )

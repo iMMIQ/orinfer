@@ -329,6 +329,21 @@ bash tools/operators/ascend/run.sh python3 \
 
 最终计划位于 `movement-tuned/package/model.json`，只引用被选择的算子；候选及逐行测量留在离线输出目录。权重、KV 状态和 decode 执行程序继续复用输入包。
 
+私有重调度支持同时包含 owner 张量与共享只读参数的算子。它保留原来的张量列、共享 sink 等外部参数的顺序和物理范围，并根据实际算子 grid 重新生成 work 表。`validate_private_rows --op attention_cube.softmax --attention-heads 64 --owners 3 --rows 1 3 9` 可检查 softmax 的私有包装、owner 换序、短尾、捕获保护及改变分数后的 Graph replay。
+
+KV gather 验证可通过 `--op kv_int8.gather_attention --kv-slot-tiles 16` 指定本轮发布的槽位配置，沿用该配置的数值、owner 和 Graph 检查。
+
+查询分片后的 selected INT8 attention 可将相邻的 gather、QK、softmax 和 PV 合并为一次 paired-core 调用：
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices python3 \
+  -m tools.model.deepseek_v41.fuse_attention --selected-int8 \
+  --plan QUERY_PARTITIONED_PLAN --output artifacts/a2-selected-attention \
+  --min-rows 512 --compile-workers 4
+```
+
+输出计划位于 `a2-selected-attention/package/model.json`。构建器要求选中 packet 的 40 层均使用 64 头计算、相邻的原始四段链路、相同 owner 视图和查询分片，复用原来的长 KV 复用标记。一个查询由同组 Cube／Vector 核完成，工作区连接核间阶段；Query 和概率各装入 L1 一次，同一查询的头共享有效项掩码。解量化和 softmax 与独立算子共享组件，保留 K128 FP32 累加、完整 softmax 及归一化后的 BF16 概率。KV 和请求状态布局保持原契约，较短 packet 沿用输入计划。`validate_private_rows --op attention_fused.selected_int8 --attention-heads 64 --kv-slot-tiles 16 --owners 3 --rows 1 3 9` 检查共享 sink、owner 换序、尾部、捕获保护和改变输入后的 Graph replay；添加 `--kv-compressed --reuse-long` 对照完整 gather，检查更新 SWA 后的长 KV 工作区复用。
+
 
 `tools.model.deepseek_v41.quantize_kv --plan BF16_PLAN --output INT8_PLAN` 将尚未量化 KV 的 DSv4.1 TP8 原生计划转换为 INT8 缓存，输出与输入共用资产目录。40 层 SWA 和四个共享压缩 KV bank 均按每 64 个值使用一个 FP16 scale，512 维每行共 528 字节。写入按实际存储的 FP16 scale 做对称舍入，整数范围为 −127..127；scale 下限为 FP16 最小正数，上限为 65504。零组写零，`-1` 位置跳过写入，其他越界位置设置错误标志。压缩器的 FP32 ring 状态和索引器现有 INT8 格式保持各自的契约。
 

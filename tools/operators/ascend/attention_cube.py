@@ -44,6 +44,47 @@ def qk(rows, heads, selected, dimension=512, tile_s=64, head_tile=16):
     return main
 
 
+@T.macro
+def softmax_row(
+    scores,
+    indices,
+    sink,
+    probabilities,
+    row,
+    head,
+    x,
+    ids,
+    valid,
+    mask,
+    maximum,
+    denominator,
+    sink_value,
+    p,
+    selected,
+    dimension,
+    prepare_mask=True,
+):
+    T.copy(scores[row, head, :], x)
+    if prepare_mask:
+        T.copy(indices[row, :], ids)
+        T.tile.cast(valid, ids, "CAST_NONE", selected)
+        T.tile.compare(mask, valid, -1.0, "GT")
+    T.tile.mul(x, x, dimension**-0.5)
+    T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
+    T.reduce_max(x, maximum, dim=1)
+    sink_value[0, 0] = sink[head]
+    T.tile.max(maximum, maximum, sink_value)
+    T.tile.sub(x, x, maximum[0, 0])
+    T.tile.exp(x, x)
+    T.reduce_sum(x, denominator, dim=1)
+    T.tile.sub(sink_value, sink_value, maximum)
+    T.tile.exp(sink_value, sink_value)
+    T.tile.add(denominator, denominator, sink_value)
+    T.tile.div(x, x, denominator[0, 0])
+    T.tile.cast(p, x, "CAST_RINT", selected)
+    T.copy(p, probabilities[row, head, :])
+
+
 def softmax(rows, heads, selected, dimension=512):
     if not 0 < heads <= 64 or selected % 64:
         raise ValueError("Cube softmax requires H<=64 and S%64=0")
@@ -68,24 +109,24 @@ def softmax(rows, heads, selected, dimension=512):
             index = cid * 2 + vid
             row, head = index // heads, index % heads
             if row < rows:
-                T.copy(scores[row, head, :], x)
-                T.copy(indices[row, :], ids)
-                T.tile.cast(valid, ids, "CAST_NONE", selected)
-                T.tile.compare(mask, valid, -1.0, "GT")
-                T.tile.mul(x, x, dimension**-0.5)
-                T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
-                T.reduce_max(x, maximum, dim=1)
-                sink_value[0, 0] = sink[head]
-                T.tile.max(maximum, maximum, sink_value)
-                T.tile.sub(x, x, maximum[0, 0])
-                T.tile.exp(x, x)
-                T.reduce_sum(x, denominator, dim=1)
-                T.tile.sub(sink_value, sink_value, maximum)
-                T.tile.exp(sink_value, sink_value)
-                T.tile.add(denominator, denominator, sink_value)
-                T.tile.div(x, x, denominator[0, 0])
-                T.tile.cast(p, x, "CAST_RINT", selected)
-                T.copy(p, probabilities[row, head, :])
+                softmax_row(
+                    scores,
+                    indices,
+                    sink,
+                    probabilities,
+                    row,
+                    head,
+                    x,
+                    ids,
+                    valid,
+                    mask,
+                    maximum,
+                    denominator,
+                    sink_value,
+                    p,
+                    selected,
+                    dimension,
+                )
 
     return main
 

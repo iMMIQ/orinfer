@@ -25,9 +25,12 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--owners", type=int, default=3)
-    p.add_argument("--rows", type=int, nargs="+", help="Owner row lengths for gather or Cube PV")
+    p.add_argument("--rows", type=int, nargs="+", help="Owner row lengths for selected attention")
     p.add_argument("--attention-heads", type=int, nargs="+", default=[8])
     p.add_argument("--pv-tile-d", type=int, nargs="+", choices=(32, 64, 128, 256), default=[32])
+    p.add_argument(
+        "--kv-slot-tiles", type=int, nargs="+", choices=(1, 4, 8, 16), default=[1, 4, 8, 16]
+    )
     p.add_argument("--benchmark-rows", type=int, nargs="+", help="Measure single-owner PV lengths")
     p.add_argument("--kv-compressed", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--bulk-store", action="store_true")
@@ -43,16 +46,27 @@ def main():
     if a.rows and (
         len(a.rows) != a.owners
         or not 1 <= min(a.rows) <= max(a.rows) <= 2048
-        or a.op not in (["kv_int8.gather_attention"], ["attention_cube.pv"])
+        or a.op
+        not in (
+            ["kv_int8.gather_attention"],
+            ["attention_cube.pv"],
+            ["attention_cube.softmax"],
+            ["attention_fused.selected_int8"],
+        )
     ):
-        p.error("--rows requires one 1..2048 length per owner and a gather or Cube PV --op")
+        p.error(
+            "--rows requires one 1..2048 length per owner and a gather, Cube PV or softmax --op"
+        )
     if a.benchmark_rows and (
-        a.op != ["attention_cube.pv"]
+        a.op not in (["attention_cube.pv"], ["attention_cube.softmax"])
         or not 1 <= min(a.benchmark_rows) <= max(a.benchmark_rows) <= 2048
     ):
-        p.error("--benchmark-rows requires --op attention_cube.pv and lengths in1..2048")
-    if a.reuse_long and (a.op != ["kv_int8.gather_attention"] or a.kv_compressed is not True):
-        p.error("--reuse-long requires --op kv_int8.gather_attention --kv-compressed")
+        p.error("--benchmark-rows requires Cube PV or softmax and lengths in1..2048")
+    if a.reuse_long and (
+        a.op not in (["kv_int8.gather_attention"], ["attention_fused.selected_int8"])
+        or a.kv_compressed is not True
+    ):
+        p.error("--reuse-long requires selected KV attention with --kv-compressed")
     import torch
     import torch_npu  # noqa: F401
     from kernels.model.rows import row_count
@@ -86,6 +100,15 @@ def main():
             for heads in a.attention_heads
             for tile in a.pv_tile_d
         ],
+        *[
+            (
+                attention_cube,
+                "softmax",
+                dict(rows=capacity, heads=heads, selected=selected),
+            )
+            for selected in (128, 640)
+            for heads in a.attention_heads
+        ],
         (kv_int8, "scatter", dict(rows=capacity, table_rows=256)),
         *[
             (
@@ -103,7 +126,27 @@ def main():
                 ),
             )
             for compressed in (False, True)
-            for tile in (1, 4, 8, 16)
+            for tile in a.kv_slot_tiles
+        ],
+        *[
+            (
+                attention_fused,
+                "selected_int8",
+                dict(
+                    rows=capacity,
+                    heads=heads,
+                    capacity=1024,
+                    compressed_capacity=512,
+                    compressed=compressed,
+                    swa_storage_rows=256,
+                    tile_slots=tile,
+                    reuse_long=a.reuse_long,
+                ),
+            )
+            for compressed in (False, True)
+            for tile in a.kv_slot_tiles
+            for heads in a.attention_heads
+            if heads in (16, 32, 64)
         ],
         (attention_prefill, "qk", dict(rows=capacity, capacity=256, compressed=False)),
         (attention_prefill, "pv", dict(rows=capacity, capacity=256, compressed=False)),
@@ -120,7 +163,7 @@ def main():
         if a.op and module.__name__.split(".")[-1] + "." + name not in a.op:
             continue
         if (
-            name == "gather_attention"
+            name in ("gather_attention", "selected_int8")
             and a.kv_compressed is not None
             and params["compressed"] != a.kv_compressed
         ):
@@ -130,15 +173,25 @@ def main():
         function = factory(**dict(params, **{row_key: row_count(capacity, True)}))
         tensors = [function.buffer_map[v] for v in function.params if v in function.buffer_map]
         shapes = physical_shapes(function, capacity)
-        columns = {t.name: i for i, t in enumerate(tensors)}
+        owned = [t for t in tensors if name != "selected_int8" or t.name != "sink"]
+        columns = {t.name: i for i, t in enumerate(owned)}
         writes = {
             "scatter": {"cache", "scales", "errors"},
             "gather_attention": {"out", "mask"},
             "qk": {"scores"},
             "pv": {"output", "workspace"},
+            "softmax": {"probabilities"},
             "pool": {"out", "errors"},
             "commit": {"ring", "errors"},
             "prefill": {"output", "score_tile", "probability_tile", "output_tile"},
+            "selected_int8": {
+                "output",
+                "kv_workspace",
+                "mask_workspace",
+                "score_workspace",
+                "probability_workspace",
+                "output_workspace",
+            },
         }[name]
         specs = [
             operand(
@@ -166,18 +219,19 @@ def main():
         metadata = dict(
             params,
             _owner_source_sha256=file_hash(Path(module.__file__)),
-            _owner_aliases={t.name + "_owner": str(t.dtype) for t in tensors},
+            _owner_aliases={t.name + "_owner": str(t.dtype) for t in owned},
             _owner_writes=sorted(writes),
-            _owner_access=[dict(column=i, write=t.name in writes) for i, t in enumerate(tensors)],
+            _owner_access=[dict(column=i, write=t.name in writes) for i, t in enumerate(owned)],
         )
         private = compile_kernel(
             wrapper,
             "private_rows." + module.__name__.split(".")[-1] + "_" + name,
             [
                 operand("OwnerWork", "i32", [8192, 2]),
-                operand("OwnerPointers", "u64", [owners, len(tensors) + 1]),
+                operand("OwnerPointers", "u64", [owners, len(owned) + 1]),
                 operand("PacketActive", "i32", [1]),
-            ],
+            ]
+            + [spec for t, spec in zip(tensors, specs, strict=True) if t.name not in columns],
             metadata,
             a.output / "cache",
             row_capacity=4096,
@@ -222,6 +276,11 @@ def main():
                     v[:, ::19] = -1
                     v[:, 3] = bound
                     v[:, 4] = -2
+                elif tensor.name == "indices" and name == "softmax":
+                    v = torch.arange(shape[1], dtype=dtype).expand(shape[0], -1).clone()
+                    v[:, owner % 3 :: 3] = -1
+                    if owner == 0:
+                        v[0, :] = -1
                 elif tensor.name in ("indices", "positions"):
                     v = torch.arange(shape[0], dtype=dtype) + ((owner * 19 + 13) % 128)
                 elif tensor.name == "metadata":
@@ -247,7 +306,7 @@ def main():
                             [0, 2**-24, 2**-14, 65504, -(2**-24), -65504, 0.125, 1],
                             dtype=dtype,
                         )
-                elif name == "gather_attention" and dtype == torch.int8:
+                elif name in ("gather_attention", "selected_int8") and dtype == torch.int8:
                     v = torch.randint(-127, 128, shape, dtype=dtype)
                 else:
                     v = torch.ones(shape, dtype=dtype)
@@ -255,18 +314,33 @@ def main():
                 values.append(v.npu())
             data.append(values)
             expected.append([x.clone() for x in values])
+        shared_indices = [i for i, t in enumerate(tensors) if t.name not in columns]
+        for owner in range(1, a.owners):
+            for i in shared_indices:
+                data[owner][i] = data[0][i]
+                expected[owner][i] = expected[0][i]
+        shared_values = [data[0][i] for i in shared_indices]
         work = torch.empty((8192, 2), dtype=torch.int32, device="npu")
-        pointers = torch.empty((owners, len(tensors) + 1), dtype=torch.int64, device="npu")
+        pointers = torch.empty((owners, len(owned) + 1), dtype=torch.int64, device="npu")
         active = torch.zeros(1, dtype=torch.int32, device="npu")
+
+        def private_values():
+            return [work, pointers, active] + shared_values
 
         def tables(order, lengths):
             from tools.model.row_contract import resolve
 
-            table = torch.zeros((owners, len(tensors) + 1), dtype=torch.int64)
+            table = torch.zeros((owners, len(owned) + 1), dtype=torch.int64)
             items = []
             for lane, (owner, length) in enumerate(zip(order, lengths, strict=True)):
                 table[lane] = torch.tensor(
-                    [length] + [v.data_ptr() for v in data[owner]], dtype=torch.int64
+                    [length]
+                    + [
+                        v.data_ptr()
+                        for t, v in zip(tensors, data[owner], strict=True)
+                        if t.name in columns
+                    ],
+                    dtype=torch.int64,
                 )
                 items.extend([[lane, t] for t in range(min(resolve(grid, length), 64))])
             if len(items) % 2:
@@ -278,7 +352,7 @@ def main():
         order = list(range(a.owners))
         lengths = a.rows or ([1, 3, 9] if a.owners == 3 else [1 + i % capacity for i in order])
         m = tables(order, lengths)
-        call(1, [work, pointers, active], m)
+        call(1, private_values(), m)
         torch.npu.synchronize()
         for owner in data:
             for tensor, value in zip(tensors, owner, strict=True):
@@ -286,21 +360,21 @@ def main():
                     assert torch.all(value == 17), (name, "disabled capture")
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            call(1, [work, pointers, active], m)
+            call(1, private_values(), m)
         active.fill_(1)
         sequences = [(order, lengths), (list(reversed(order)), lengths)]
-        if name == "gather_attention" or module is attention_cube:
+        if name in ("gather_attention", "selected_int8") or module is attention_cube:
             sequences.append((list(reversed(order)), lengths))
         for phase, (order, lengths) in enumerate(sequences):
             assert tables(order, lengths) == m
-            if name == "gather_attention" and phase == 2:
+            if name in ("gather_attention", "selected_int8") and phase == 2:
                 # Scatter/quantization updates these addresses between model
                 # steps. Exercise Scalar scale loads after actual GM updates.
                 for owner in range(a.owners):
                     for tensor, value, want in zip(
                         tensors, data[owner], expected[owner], strict=True
                     ):
-                        if tensor.name in ("swa", "long_kv"):
+                        if tensor.name in ("swa", "long_kv", "query"):
                             value.neg_()
                             want.copy_(value)
                         elif tensor.name in ("swa_scales", "long_scales"):
@@ -311,7 +385,7 @@ def main():
                     for tensor, value, want in zip(
                         tensors, data[owner], expected[owner], strict=True
                     ):
-                        if tensor.name == "kv":
+                        if tensor.name == "kv" or (name == "softmax" and tensor.name == "scores"):
                             value.neg_()
                             want.copy_(value)
                         elif tensor.name == "probabilities":
@@ -341,7 +415,7 @@ def main():
                 call(0, expected[owner], length)
             graph.replay()
             torch.npu.synchronize()
-            if module is attention_cube:
+            if module is attention_cube and name == "pv":
                 by_name = {tensor.name: i for i, tensor in enumerate(tensors)}
                 for owner, length in zip(order, lengths, strict=True):
                     if owner not in (order[0], order[-1]):
@@ -441,7 +515,7 @@ def main():
         if name == "gather_attention":
             from tools.model.deepseek_v41.tune import npu_benchmark
 
-            timing, measured = npu_benchmark(lambda: call(1, [work, pointers, active], m), 7, 2)
+            timing, measured = npu_benchmark(lambda: call(1, private_values(), m), 7, 2)
             del measured
         measurements = []
         identity = None
@@ -468,7 +542,7 @@ def main():
                 for length in identity["rows"]:
                     live = tables([0], [length])
                     elapsed = measure(
-                        lambda: call(1, [work, pointers, active], live),
+                        lambda: call(1, private_values(), live),
                         budget_ms=identity["budget_ms"],
                         max_repetitions=identity["max_repetitions"],
                         benchmark=npu_benchmark,

@@ -1,4 +1,4 @@
-"""Replace DSv4.1 prefill QK/softmax/PV chains with a shared tiled A2 kernel."""
+"""Fuse DSv4.1 prefill attention, including selected INT8 KV preparation."""
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
@@ -9,8 +9,256 @@ from pathlib import Path
 from tools.build.files import atomic_json
 
 
+def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
+    """Fuse the existing private selected-KV chain without changing its views."""
+    import hashlib
+    import inspect
+    import math
+    from kernels.model.rows import row_count
+    from tools.build.files import file_hash
+    from tools.model.deepseek_v41.batch import compile_task, DTYPES, SIZES
+    from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+    from tools.operators.ascend.attention_fused import selected_int8
+    from tools.operators.ascend.build import operand
+    from tools.operators.ascend.geometry import physical_shapes
+    from tools.operators.ascend.private_rows import indirect
+
+    if output.exists() or grid_limit not in (8, 16, 32, 64):
+        raise ValueError("Require a new output directory and a supported physical grid")
+    model = json.loads(plan.read_text())
+    validate_rows(model, plan.parent)
+    base = output / "source"
+    publish_package(model, plan.parent, base)
+    contract = model["batch"]
+    peers = len(model["ranks"])
+    descriptions, prototypes, tasks = {}, {}, {}
+
+    def describe(step):
+        if step.get("op") != "kernel":
+            return None
+        path = step["manifest"]
+        if path not in descriptions:
+            descriptions[path] = json.loads((base / path).read_text())
+        return descriptions[path]
+
+    def column_ids(step):
+        return contract["pointers"][step["buffers"][1]]
+
+    changed = 0
+    expected = [
+        "private_rows.kv_int8_gather_attention",
+        "private_rows.attention_cube_qk",
+        "private_rows.attention_cube_softmax",
+        "private_rows.attention_cube_pv",
+    ]
+    for rank in model["ranks"]:
+        definitions = {v["name"]: v for v in rank["buffers"]}
+
+        def buffer(name, size):
+            item = dict(name=name, bytes=size)
+            if name not in definitions:
+                definitions[name] = item
+                rank["buffers"].append(item)
+            elif definitions[name]["bytes"] != size:
+                raise ValueError("Fused table extent differs")
+
+        for packet in rank["packets"]:
+            if packet.get("batch_decode") or packet.get("min_rows", 1) < minimum:
+                continue
+            old, body, index, count = packet["body"], [], 0, 0
+            while index < len(old):
+                desc = describe(old[index])
+                if desc is None or desc["op"] != expected[0]:
+                    body.append(old[index])
+                    index += 1
+                    continue
+                chain = old[index : index + 4]
+                specs = [describe(v) for v in chain]
+                if (
+                    len(specs) != 4
+                    or any(s is None for s in specs)
+                    or [s["op"] for s in specs] != expected
+                ):
+                    raise ValueError("Require the original gather/QK/softmax/PV sequence")
+                g, q, s, p = [column_ids(v) for v in chain]
+                gp, qp, sp, pp = [v["parameters"] for v in specs]
+                if qp["heads"] != 64:
+                    body.append(old[index])
+                    index += 1
+                    continue
+                if not (q[1] == g[6] == p[1] and q[2] == s[0] and g[7] == s[1] and s[2] == p[0]):
+                    raise ValueError("Attention intermediates do not share their original views")
+                if len(chain[2]["buffers"]) != 4 or any(
+                    len(v["buffers"]) != 3 for v in (chain[0], chain[1], chain[3])
+                ):
+                    raise ValueError("Unexpected shared attention inputs")
+                capacities = {v["parameters"]["_owner_token_capacity"] for v in specs}
+                if len(capacities) != 1 or sp["heads"] != 64 or pp["heads"] != 64:
+                    raise ValueError("Attention owner geometries differ")
+                capacity = capacities.pop()
+                for step in chain:
+                    role = step["buffers"][0]
+                    if contract.get("partitioned_tables", {}).get(role) != peers:
+                        raise ValueError("Selected fusion requires common query partitioning")
+                    extent = contract.get("work_ranges", {}).get(role)
+                    if extent and extent != dict(min_rows=1, max_rows=capacity):
+                        raise ValueError(
+                            "Fuse measured owner schedule ranges before this transform"
+                        )
+                arguments = {
+                    k: v for k, v in gp.items() if not k.startswith("_") and k != "bulk_store"
+                }
+                arguments.update(rows=capacity, heads=64)
+                identity = json.dumps(arguments, sort_keys=True)
+                if identity not in prototypes:
+                    function = selected_int8(**dict(arguments, rows=row_count(capacity, True)))
+                    tensors = [
+                        function.buffer_map[v] for v in function.params if v in function.buffer_map
+                    ]
+                    owned = [v for v in tensors if v.name != "sink"]
+                    columns = {v.name: i for i, v in enumerate(owned)}
+                    _, identities, grid = indirect(
+                        function, columns, contract["owners"], capacity, table_columns=len(columns)
+                    )
+                    if identities[3:] != ["sink"]:
+                        raise ValueError("Unexpected fused shared input ABI")
+                    writes = {
+                        "output",
+                        "kv_workspace",
+                        "mask_workspace",
+                        "score_workspace",
+                        "probability_workspace",
+                        "output_workspace",
+                    }
+                    metadata = dict(
+                        _owner_token_capacity=capacity,
+                        _owner_source_sha256=file_hash(Path(inspect.getfile(selected_int8))),
+                        _owner_aliases={v.name + "_owner": str(v.dtype) for v in owned},
+                        _owner_access=[
+                            dict(column=i, write=v.name in writes) for i, v in enumerate(owned)
+                        ],
+                        _owner_writes=sorted(writes),
+                    )
+                    task = dict(
+                        key=f"@selected_fusion{len(tasks)}",
+                        module="tools.operators.ascend.attention_fused",
+                        name="selected_int8",
+                        arguments=arguments,
+                        capacity=capacity,
+                        dynamic=dict(rows=1),
+                        columns=columns,
+                        owners=contract["owners"],
+                        table_columns=len(columns),
+                        metadata=metadata,
+                        grid_limit=grid_limit,
+                        specs=[
+                            operand("OwnerWork", "i32", [8192, 2]),
+                            operand("OwnerPointers", "u64", [contract["owners"], len(columns) + 1]),
+                            operand("PacketActive", "i32", [1]),
+                            operand("sink", "f32", [64]),
+                        ],
+                    )
+                    tasks[identity] = task
+                    shapes = physical_shapes(function, capacity)
+                    sizes = {
+                        t.name: (shape, SIZES[DTYPES[str(t.dtype)]])
+                        for t, shape in zip(tensors, shapes, strict=True)
+                        if t.name in columns
+                    }
+                    prototypes[identity] = task["key"], grid, sizes
+                key, grid, sizes = prototypes[identity]
+                roles = dict(
+                    query=q[0],
+                    swa=g[0],
+                    swa_scales=g[1],
+                    long_kv=g[2],
+                    long_scales=g[3],
+                    swa_indices=g[4],
+                    long_indices=g[5],
+                    output=p[2],
+                    kv_workspace=g[6],
+                    mask_workspace=g[7],
+                    score_workspace=q[2],
+                    probability_workspace=s[2],
+                    output_workspace=p[3],
+                )
+                ids = []
+                for name, (shape, item_size) in sizes.items():
+                    col = contract["columns"][roles[name]]
+                    actual = math.prod(shape) * item_size
+                    bound = (
+                        capacity * col["row_bytes"]
+                        if col["row_bytes"] is not None
+                        else definitions[col["buffer"]]["bytes"]
+                    )
+                    if actual > bound or (col["row_bytes"] is not None and actual != bound):
+                        raise ValueError("Fused owner view changes physical geometry: " + name)
+                    ids.append(roles[name])
+                digest = hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]
+                pointer = "batch.selected_attention.pointers." + digest
+                work_digest = hashlib.sha256(
+                    json.dumps([grid, peers], sort_keys=True).encode()
+                ).hexdigest()[:16]
+                work = "batch.selected_attention.work." + work_digest
+                contract["pointers"][pointer] = ids
+                contract["work"][work] = grid
+                contract.setdefault("partitioned_tables", {}).update({pointer: peers, work: peers})
+                buffer(pointer, contract["owners"] * (len(ids) + 1) * 8)
+                buffer(work, 8192 * 2 * 4)
+                body.append(
+                    dict(
+                        op="kernel",
+                        manifest=key,
+                        owner_work=grid,
+                        buffers=[work, pointer, contract["active"], chain[2]["buffers"][3]],
+                    )
+                )
+                index += 4
+                count += 1
+                changed += 1
+            if count not in (0, 40):
+                raise ValueError("Fused packet must cover all 40 attention layers")
+            packet["body"] = body
+    if not changed:
+        raise ValueError("No selected private attention packet matched")
+    with ProcessPoolExecutor(
+        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        replacements = dict(pool.map(compile_task, [(v, str(base)) for v in tasks.values()]))
+    for rank in model["ranks"]:
+        for packet in rank["packets"]:
+            for step in packet["body"] + packet["head"]:
+                if step.get("manifest") in replacements:
+                    step["manifest"] = replacements[step["manifest"]]
+    live_work = {
+        s["buffers"][0]
+        for r in model["ranks"]
+        for p in r["packets"]
+        for s in p["body"] + p["head"]
+        if s["op"] == "kernel" and "owner_work" in s
+    }
+    contract["work"] = {n: v for n, v in contract["work"].items() if n in live_work}
+    contract["work_ranges"] = {
+        n: v for n, v in contract.get("work_ranges", {}).items() if n in live_work
+    }
+    compact_buffers(model, owner_tables=True)
+    validate_rows(model, base)
+    assets = publish_package(model, base, output / "package")
+    report = dict(
+        changed_chains=changed,
+        kernels=len(tasks),
+        assets=assets,
+        model=str(output / "package/model.json"),
+        grid_limit=grid_limit,
+    )
+    atomic_json(output / "selected-fusion.json", report)
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--selected-int8", action="store_true")
+    parser.add_argument("--grid-limit", type=int, choices=(8, 16, 32, 64), default=64)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tile-m", type=int, choices=[16, 32, 64], default=32)
@@ -24,6 +272,15 @@ def main():
     )
     parser.add_argument("--compile-workers", type=int, default=3)
     args = parser.parse_args()
+    if args.selected_int8:
+        print(
+            json.dumps(
+                build_selected(
+                    args.plan, args.output, args.compile_workers, args.min_rows, args.grid_limit
+                )
+            )
+        )
+        return
     if args.plan.parent.resolve() != args.output.parent.resolve():
         parser.error("Input and output must share the asset directory")
     if args.min_rows < 2:
