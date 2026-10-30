@@ -297,6 +297,17 @@ bash tools/operators/ascend/run.sh python3 \
 
 离线短测的 case 可设置 `record_routing:true`，在首次预热的每个 frame 完成后读取各 rank 的 W4 专家行计数。报告的 `routing` 保存 case、frame、角色、实际 token 行数及按计划 rank 顺序排列的计数；每项保留原始 groups buffer 名。读取由资源所属 worker 执行，耗时不计入 forward 测量。默认关闭，在线服务不采集该统计。
 
+可选的 decode router 分片复用现有 `dense.fp32_partials`、`dense.fp32_reduce` 和 `memory.gather_columns`。各 rank 计算连续的输出列，AllGather 后恢复完整 FP32 logits，再执行原来的 TopK。TP8 的 384 个专家按每 rank 48 个逻辑列分配，投影使用 64 列对齐视图，末端重叠列在恢复时裁剪；权重值、K 归约顺序和专家布局保持原契约。该转换作用于 `batch_decode` packet，prefill 继续使用完整投影。
+
+```bash
+bash tools/operators/ascend/run.sh python3 \
+  -m tools.model.deepseek_v41.router_sharding \
+  --plan artifacts/ascend-model/batch-selected/model.json \
+  --output artifacts/ascend-model/router-sharded
+```
+
+输出计划位于 `router-sharded/package/model.json`。单算子验收可运行 `tools.operators.ascend.validate_router_sharding --baseline BASE_PLAN --plan SHARDED_PLAN --output REPORT`，比较同一输入的完整／分片 FP32 投影、非对齐行尾和改变输入后的 Graph replay。完整请求另测固定历史概率及实际吞吐；默认高性能通信下，各 rank 输入的数值差异仍需纳入跨包概率对照。
+
 `compare_whole_prompt:true` 配合 `compare_serial:true`，对 `requests` 使用单请求最大容量分块作为参考，检查批量自动分块及后续 teacher-forced decode 的状态一致性。显式 `frames` 沿用原片段边界。设置 `ORINFER_A2_BATCH_LOGITS_DIR` 时，首次预热各输出位置的完整 FP32 logits 按 case、frame 和 owner 写入指定目录，供跨包概率／NLL 对照；独立导出不要求启用逐请求串行重放。
 
 该入口默认使用高性能通信，不要求设置 `HCCL_DETERMINISTIC`。需要固定跨 batch 的 BF16 归约顺序时，在进程启动前显式设置 `HCCL_DETERMINISTIC=strict`；此模式单独测量性能。`compare_serial` 以固定历史的最大概率绝对差 0.02 为门限，greedy 差异另报；默认通信在 B128 的跨 batch 对照尚未通过，详见 [性能与验证记录](performance.md#融合动态-decode-与地址表复用2026-10-29)。请求私有状态和 owner 隔离保持独立检查。当前原生验收使用 CANN 9.2，TP8 为当前模型接通方案，后续并行策略按实际显存和完整请求性能选择。

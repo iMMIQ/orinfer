@@ -46,8 +46,24 @@ def reference(kind, inputs, parameters):
         collapsed = reference("mhc_pre_apply", [updated, mix], parameters)[0]
         return [updated, collapsed]
     if kind == "gather_columns":
+        source = inputs[0]
+        width = parameters.get("output_width", 0) or parameters["width"]
+        logical, physical = width // source.shape[0], source.shape[-1]
         return [
-            inputs[0].permute(1, 0, 2).reshape(parameters["rows"], parameters["width"]).contiguous()
+            torch.cat(
+                [
+                    source[
+                        rank,
+                        :,
+                        max(0, rank * logical + physical - width) : max(
+                            0, rank * logical + physical - width
+                        )
+                        + logical,
+                    ]
+                    for rank in range(source.shape[0])
+                ],
+                dim=1,
+            ).contiguous()
         ]
     if kind == "gather_quantized_rows":
         table, scales, indices = inputs
