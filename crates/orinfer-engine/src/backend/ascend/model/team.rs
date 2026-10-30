@@ -543,6 +543,190 @@ mod state_tests {
     use super::*;
     use orinfer_model_sdk::architecture::BatchSegment;
     #[test]
+    #[ignore = "Requires the native TP8 A2 package and eight NPUs"]
+    fn graph_launch_identity_reuses_changed_lengths_and_decoder_roles() {
+        use super::super::replay::Role;
+        use std::os::fd::AsRawFd;
+        assert_eq!(std::env::var("HCCL_DETERMINISTIC").unwrap(), "strict");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open("artifacts/gpu-experiment.lock")
+            .unwrap();
+        assert_eq!(
+            // SAFETY: The descriptor outlives all native workers and device resources.
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("ORINFER_A2_STATE_MODEL").unwrap());
+        let descriptor: serde_json::Value =
+            crate::model::read(&directory.join("cache/model.json")).unwrap();
+        let plan = directory
+            .join("cache/packages")
+            .join(descriptor["execution_package"].as_str().unwrap())
+            .join("model.json");
+        let team = Team::load(&plan, &directory).unwrap();
+        team.exchange(Command::Admit(vec![7, 17])).unwrap();
+        let layout = |lengths: &[usize], slots: &[usize], roles: &[Role]| {
+            let mut layout = Layout::new(
+                lengths
+                    .iter()
+                    .zip(slots)
+                    .map(|(&tokens, &slot)| BatchSegment { slot, tokens })
+                    .collect(),
+                roles
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| (*r != Role::Producer).then_some(i))
+                    .collect(),
+                false,
+                team.rows,
+                32,
+            )
+            .unwrap();
+            layout.decoder_roles = roles.to_vec();
+            layout
+        };
+        let tokens = |l: &Layout| {
+            l.segments
+                .iter()
+                .map(|s| {
+                    (0..s.tokens)
+                        .map(|i| ((i * 73 + s.slot * 19 + 11) % 129280) as u32)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let same = |a: &[Output], b: &[Output]| {
+            assert_eq!(a.len(), b.len());
+            for (a, b) in a.iter().zip(b) {
+                assert_eq!(a.owner, b.owner);
+                assert_eq!(a.logits, b.logits);
+            }
+        };
+        // These layouts have identical local launches on some ranks and
+        // different launches on others. Every rank must keep them distinct.
+        let partial_a = layout(&[1, 15], &[7, 17], &[Role::Final; 2]);
+        let partial_b = layout(&[15, 1], &[7, 17], &[Role::Final; 2]);
+        team.exchange(Command::Reset(vec![7, 17])).unwrap();
+        team.forward(partial_a.clone(), tokens(&partial_a), true)
+            .unwrap();
+        assert!(
+            team.exchange(Command::Cached(partial_b.clone()))
+                .unwrap()
+                .iter()
+                .all(|r| matches!(r, Reply::Cached(false))),
+            "Partial rank aliases must never share a global cache class"
+        );
+        team.exchange(Command::Reset(vec![7, 17])).unwrap();
+        team.forward(partial_b.clone(), tokens(&partial_b), true)
+            .unwrap();
+        assert!(
+            team.exchange(Command::Cached(partial_a.clone()))
+                .unwrap()
+                .iter()
+                .all(|r| matches!(r, Reply::Cached(true)))
+        );
+        team.exchange(Command::Reset(vec![7, 17])).unwrap();
+        let reused = team
+            .forward(partial_a.clone(), tokens(&partial_a), true)
+            .unwrap()
+            .0;
+        team.exchange(Command::Reset(vec![7, 17])).unwrap();
+        team.exchange(Command::Invalidate(partial_a.clone()))
+            .unwrap();
+        let fresh = team
+            .forward(partial_a.clone(), tokens(&partial_a), true)
+            .unwrap()
+            .0;
+        same(&reused, &fresh);
+        eprintln!(
+            "A2 graph partial-rank aliases remain distinct; alternating graph cache hits equal fresh capture"
+        );
+        for (name, a, b, roles) in [
+            ("short", [33, 95], [35, 93], [Role::Final; 2]),
+            (
+                "partitioned producer",
+                [769, 1279],
+                [785, 1263],
+                [Role::Producer; 2],
+            ),
+        ] {
+            let a = layout(&a, &[7, 17], &roles);
+            let b = layout(&b, &[7, 17], &roles);
+            let tail = layout(&[128, 128], &[7, 17], &[Role::Final; 2]);
+            team.exchange(Command::Reset(vec![7, 17])).unwrap();
+            team.forward(a.clone(), tokens(&a), true).unwrap();
+            assert!(
+                team.exchange(Command::Cached(b.clone()))
+                    .unwrap()
+                    .iter()
+                    .all(|r| matches!(r, Reply::Cached(true))),
+                "{name} must reuse the captured launches"
+            );
+            team.exchange(Command::Reset(vec![7, 17])).unwrap();
+            let mut reused = team.forward(b.clone(), tokens(&b), true).unwrap().0;
+            if roles[0] == Role::Producer {
+                reused = team.forward(tail.clone(), tokens(&tail), true).unwrap().0;
+            }
+            team.exchange(Command::Reset(vec![7, 17])).unwrap();
+            team.exchange(Command::Invalidate(b.clone())).unwrap();
+            let mut fresh = team.forward(b.clone(), tokens(&b), true).unwrap().0;
+            if roles[0] == Role::Producer {
+                fresh = team.forward(tail.clone(), tokens(&tail), true).unwrap().0;
+            }
+            same(&reused, &fresh);
+            eprintln!(
+                "A2 graph {name}: changed length reuse equals a fresh capture, complete logits"
+            );
+        }
+        team.exchange(Command::Reset(vec![7, 17])).unwrap();
+        let prefix = layout(&[128], &[7], &[Role::Final]);
+        team.forward(prefix.clone(), tokens(&prefix), true).unwrap();
+        team.snapshot_allocations(7, 1, true).unwrap();
+        let restore = || {
+            for owner in [7, 17] {
+                team.exchange(Command::Restore { owner, snapshot: 1 })
+                    .unwrap();
+            }
+        };
+        let a = layout(&[1, 128], &[7, 17], &[Role::Continue, Role::Final]);
+        let b = layout(&[128, 1], &[17, 7], &[Role::Final, Role::Continue]);
+        restore();
+        team.forward(a.clone(), tokens(&a), true).unwrap();
+        assert!(
+            team.exchange(Command::Cached(b.clone()))
+                .unwrap()
+                .iter()
+                .all(|r| matches!(r, Reply::Cached(true)))
+        );
+        restore();
+        let reused = team.forward(b.clone(), tokens(&b), true).unwrap().0;
+        restore();
+        team.exchange(Command::Invalidate(b.clone())).unwrap();
+        let fresh = team.forward(b.clone(), tokens(&b), true).unwrap().0;
+        same(&reused, &fresh);
+        restore();
+        let mut changed = tokens(&b);
+        changed[0].fill(999);
+        let changed = team.forward(b, changed, true).unwrap().0;
+        assert!(
+            changed
+                .iter()
+                .zip(&fresh)
+                .any(|(a, b)| a.logits != b.logits)
+        );
+        team.exchange(Command::Evict(1)).unwrap();
+        eprintln!(
+            "A2 graph mixed: reversed owner roles reuse equals fresh capture; changed input executes"
+        );
+        drop(team);
+        drop(lock);
+    }
+    #[test]
     #[ignore = "Requires the complete native TP8 A2 service package and eight NPUs"]
     fn native_prefix_restore_keeps_both_compression_ratios_and_owner_identity() {
         use std::os::fd::AsRawFd;

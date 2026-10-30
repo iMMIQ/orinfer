@@ -57,6 +57,8 @@ struct Model {
     packet_cache_capacity: usize,
     #[serde(default)]
     batch: Option<batch::Contract>,
+    #[serde(skip)]
+    graph_launches: std::collections::BTreeSet<batch::WorkLaunch>,
 }
 fn default_packet_cache_capacity() -> usize {
     64
@@ -762,7 +764,12 @@ impl Worker {
             phases,
             steps: BTreeMap::new(),
             batch: model.batch.as_ref().map(|contract| {
-                batch::Runtime::new(contract.clone(), model.packet_cache_capacity, &rank.packets)
+                batch::Runtime::new(
+                    contract.clone(),
+                    model.packet_cache_capacity,
+                    &rank.packets,
+                    &model.graph_launches,
+                )
             }),
         };
         if model.batch.is_some() {
@@ -1424,7 +1431,7 @@ impl Worker {
 fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf, HashLayout)> {
     let path = path.canonicalize().map_err(|e| e.to_string())?;
     let base = path.parent().ok_or("Model plan has no parent")?.to_owned();
-    let model: Model = crate::model::read(&path)?;
+    let mut model: Model = crate::model::read(&path)?;
     if model.schema_version != 1
         || model.layers != 40
         || model.ranks.len() != 8
@@ -1448,6 +1455,7 @@ fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf, HashLayou
         return Err("Engram/tokenizer identity differs".into());
     }
     preflight(&model, &base)?;
+    model.graph_launches = batch::graph_launches(&model);
     Ok((model, base, layout))
 }
 

@@ -606,6 +606,8 @@ orinfer serve artifacts/models/dsv41-a2-service --model deepseek-v41-flash-1017-
 
 A2 服务在当前没有活跃 decoder 时按执行包的 token 行容量填充 prefill packet；单个请求仍在每 4096 token 的缓存检查点暂停并提交完整状态。有活跃 decoder 时，decode 行优先，混合 packet 继续按 `--prefill-budget-ms` 和原生吞吐估计限制总行数。不同分块长度复用同一个动态 prefill 模板；新的请求与取消在 packet 边界处理。
 
+A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 owner-work launch 行数缓存。加载时从全部 rank／family 提取共享 launch 描述，把每种分片的全 rank 行数纳入身份，保持各 rank 的复用关系一致；长度策略范围和 decoder 边界同时保留。这些编译参数相同的 owner 长度组合可共享已捕获程序。精确 owner、长度、角色和输出位置继续通过 stream 有序的地址表与 work 表更新。各 rank 在捕获前统一探测缓存，任一未命中时仍全体准备相同请求。`ORINFER_A2_BATCH_PROFILE=1` 输出 rank 0 冷准备的绑定、ACLNN、预热与捕获耗时。
+
 `--length-input` 让同一索引 Cube 工厂读取每行的有效前缀长度，按 owner 内单调递增的位置决定实际 key tile 数，写入有效 score 前缀。TopK 使用相同长度屏蔽其余容量，完整有效候选与原有归约顺序保持一致。此模式以长度向量替代稠密因果索引矩阵，同时适用于 decode 和 prefill。`--gather-slots` 选择同一 INT8 gather 工厂每次转换的槽位数。可重复提供 `--reuse-cache /path/to/compiled/cache`，复用完整编译对象；编译器仍校验对象身份和库哈希。
 
 当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样及 prefix 恢复。工具定义／工具调用、媒体、MTP、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的实验性原生计划封装，由上述 Python 发布器生成；通用模型 cdylib C ABI 打包、`package install` 和 `validate-model` 尚未接通此封装。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。

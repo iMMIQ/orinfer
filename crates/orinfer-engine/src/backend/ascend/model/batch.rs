@@ -102,11 +102,18 @@ pub(super) struct Owner {
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Key {
-    decode: bool,
-    lengths: Vec<usize>,
+    family: (bool, usize),
+    rows: usize,
+    decoder_rows: Option<usize>,
     outputs: usize,
-    partitioned_lengths: Vec<usize>,
-    decoder_roles: Vec<super::replay::Role>,
+    work_rows: Vec<usize>,
+}
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct WorkLaunch {
+    grid: RowExpression,
+    range: Option<(usize, usize)>,
+    partition: usize,
+    decoder: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TableKey {
@@ -126,36 +133,41 @@ pub(super) struct Runtime {
     lru: VecDeque<Key>,
     capacity: usize,
     tables: BTreeMap<(bool, usize), TableUse>,
+    families: Vec<(bool, usize)>,
+    launches: BTreeSet<WorkLaunch>,
     pub(super) bound_tables: Option<BoundTables>,
 }
 struct TableUse {
+    max_rows: usize,
     pointers: BTreeSet<String>,
     work: BTreeSet<String>,
     columns: Vec<bool>,
 }
 impl Runtime {
-    fn key(&self, layout: &Layout) -> Key {
-        let mut key = layout.key();
-        if self
-            .contract
-            .decoder_replay
-            .as_ref()
-            .is_some_and(|r| r.final_prompt_only)
-        {
-            key.decoder_roles = layout.decoder_roles.clone();
-            key.partitioned_lengths = layout.segments.iter().map(|s| s.tokens).collect();
-        }
-        if !layout.decode && !self.contract.partitioned_tables.is_empty() {
-            // Reordering owners changes the count of selected rows per owner,
-            // and hence indirect launch extents, even for equal sorted lengths.
-            key.partitioned_lengths = layout.segments.iter().map(|s| s.tokens).collect();
-        }
-        key
+    fn key(&self, layout: &Layout) -> Result<Key> {
+        let (family, _) = self
+            .families
+            .iter()
+            .find_map(|family| {
+                let used = &self.tables[family];
+                (family.0 == layout.decode
+                    && family.1 <= layout.rows.total
+                    && layout.rows.total <= used.max_rows)
+                    .then_some((*family, used))
+            })
+            .ok_or("Missing batch family")?;
+        shape_key(&self.contract, layout, family, &self.launches)
     }
-    pub fn new(contract: Contract, capacity: usize, packets: &[super::Packet]) -> Self {
+    pub fn new(
+        contract: Contract,
+        capacity: usize,
+        packets: &[super::Packet],
+        launches: &BTreeSet<WorkLaunch>,
+    ) -> Self {
         let mut tables = BTreeMap::new();
         for packet in packets {
             let mut used = TableUse {
+                max_rows: packet.dispatch_max(),
                 pointers: BTreeSet::new(),
                 work: BTreeSet::new(),
                 columns: vec![false; contract.columns.len()],
@@ -183,6 +195,11 @@ impl Runtime {
             lru: VecDeque::new(),
             capacity,
             tables,
+            families: packets
+                .iter()
+                .map(|p| (p.batch_decode, p.min_rows))
+                .collect(),
+            launches: launches.clone(),
             bound_tables: None,
         }
     }
@@ -339,17 +356,6 @@ impl Layout {
         result.resize(width, -1);
         Ok(result)
     }
-    fn key(&self) -> Key {
-        let mut lengths = self.segments.iter().map(|s| s.tokens).collect::<Vec<_>>();
-        lengths.sort_unstable();
-        Key {
-            decode: self.decode,
-            lengths,
-            outputs: self.outputs.len(),
-            partitioned_lengths: vec![],
-            decoder_roles: vec![],
-        }
-    }
     fn table_key(&self, min_rows: usize) -> TableKey {
         TableKey {
             family: (self.decode, min_rows),
@@ -359,6 +365,121 @@ impl Layout {
         }
     }
 }
+/// Use a common union of every rank/family launch descriptor, so equivalent
+/// layouts form the same cache class on every TP rank, including future tunes.
+pub(super) fn graph_launches(model: &super::Model) -> BTreeSet<WorkLaunch> {
+    let Some(contract) = &model.batch else {
+        return BTreeSet::new();
+    };
+    let mut launches = BTreeSet::new();
+    for rank in &model.ranks {
+        for packet in &rank.packets {
+            for program in [&packet.body, &packet.head] {
+                let mut decoder_domain = false;
+                for step in program {
+                    if matches!(step, Instruction::DecoderRows { .. }) {
+                        decoder_domain = true;
+                    }
+                    if let Instruction::Kernel {
+                        owner_work: Some(grid),
+                        buffers,
+                        ..
+                    } = step
+                    {
+                        launches.insert(WorkLaunch {
+                            grid: grid.clone(),
+                            range: contract
+                                .work_ranges
+                                .get(&buffers[0])
+                                .map(|r| (r.min_rows, r.max_rows)),
+                            partition: contract
+                                .partitioned_tables
+                                .get(&buffers[0])
+                                .copied()
+                                .unwrap_or(1),
+                            decoder: decoder_domain
+                                || contract
+                                    .decoder_replay
+                                    .as_ref()
+                                    .is_some_and(|r| r.tables.contains(&buffers[0])),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    launches
+}
+/// Graph nodes depend on launch extents, while tables carry owner identities,
+/// exact lengths and roles. Preserve every owner-work launch, including rank
+/// partitions and policy ranges, without specializing on its table contents.
+fn shape_key(
+    contract: &Contract,
+    layout: &Layout,
+    family: (bool, usize),
+    launches: &BTreeSet<WorkLaunch>,
+) -> Result<Key> {
+    let decoder = contract
+        .decoder_replay
+        .as_ref()
+        .filter(|_| !layout.decode)
+        .map(|r| layout.decoder(r.keep, r.final_prompt_only))
+        .transpose()?;
+    let mut partitions = BTreeMap::new();
+    let mut work_rows = Vec::with_capacity(launches.iter().map(|l| l.partition).sum());
+    for launch in launches {
+        if launch.decoder && decoder.as_ref().is_none_or(|d| d.rows.total == 0) {
+            continue;
+        }
+        let selected = if launch.decoder {
+            decoder.as_ref().ok_or("Missing decoder work layout")?
+        } else {
+            layout
+        };
+        for rank in 0..launch.partition {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                partitions.entry((launch.decoder, launch.partition, rank))
+            {
+                entry.insert(if launch.partition == 1 {
+                    selected
+                        .segments
+                        .iter()
+                        .map(|s| s.tokens)
+                        .collect::<Vec<_>>()
+                } else {
+                    selected.rows.partition(launch.partition, rank)?.lengths
+                });
+            }
+            let lengths = &partitions[&(launch.decoder, launch.partition, rank)];
+            let range = launch
+                .range
+                .map(|(min_rows, max_rows)| WorkRange { min_rows, max_rows });
+            let count = lengths.iter().copied().try_fold(0usize, |sum, tokens| {
+                sum.checked_add(work_blocks(tokens, &launch.grid, range.as_ref())?)
+                    .ok_or_else(|| "Owner work extent overflow".to_string())
+            })?;
+            if count > 8192 {
+                return Err("Owner work table exceeds its capacity".into());
+            }
+            work_rows.push(count.max(1).div_ceil(2));
+        }
+    }
+    Ok(Key {
+        family,
+        rows: layout.rows.total,
+        decoder_rows: decoder.as_ref().map(|d| d.rows.total),
+        outputs: layout.outputs.len(),
+        work_rows,
+    })
+}
+fn work_blocks(tokens: usize, grid: &RowExpression, range: Option<&WorkRange>) -> Result<usize> {
+    if tokens == 0 || range.is_some_and(|r| tokens < r.min_rows || tokens > r.max_rows) {
+        Ok(0)
+    } else {
+        Ok(grid.resolve(tokens)?.min(64))
+    }
+}
+
 pub(super) fn work_items(
     layout: &Layout,
     grid: &RowExpression,
@@ -373,10 +494,7 @@ fn work_lengths(
 ) -> Result<Vec<[i32; 2]>> {
     let mut out = vec![];
     for (owner, tokens) in lengths.into_iter().enumerate() {
-        if tokens == 0 || range.is_some_and(|r| tokens < r.min_rows || tokens > r.max_rows) {
-            continue;
-        }
-        for block in 0..grid.resolve(tokens)?.min(64) {
+        for block in 0..work_blocks(tokens, grid, range)? {
             out.push([owner as i32, block as i32]);
         }
     }
@@ -527,12 +645,12 @@ impl Worker {
     }
     pub(super) fn batch_cached(&self, layout: &Layout) -> Result<bool> {
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
-        Ok(runtime.cache.contains_key(&runtime.key(layout)))
+        Ok(runtime.cache.contains_key(&runtime.key(layout)?))
     }
     pub(super) fn invalidate_batch(&mut self, layout: &Layout) -> Result<()> {
         self.session.synchronize()?;
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
-        let key = runtime.key(layout);
+        let key = runtime.key(layout)?;
         runtime.cache.remove(&key);
         runtime.lru.retain(|k| k != &key);
         self.w4.retain(|_, w| w.strong_count() > 0);
@@ -543,7 +661,7 @@ impl Worker {
             .batch
             .as_ref()
             .ok_or("Missing batch runtime")?
-            .key(layout);
+            .key(layout)?;
         if !self
             .batch
             .as_ref()
@@ -551,6 +669,13 @@ impl Worker {
             .cache
             .contains_key(&key)
         {
+            let started = std::time::Instant::now();
+            let before = (
+                self.phases.warmups.1,
+                self.phases.captures.1,
+                self.phases.binds.1,
+                self.phases.aclnn.1,
+            );
             self.reserve_batch_memory(3 << 30, "Graph preparation")?;
             let packet = self
                 .packet_templates
@@ -597,6 +722,21 @@ impl Worker {
                 .unwrap()
                 .cache
                 .insert(key.clone(), Rc::new(Execution { packet, body, head }));
+            if self.rank == 0 && std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+                eprintln!(
+                    "A2 packet prepare {}",
+                    serde_json::json!({
+                        "rows": key.rows, "decode": layout.decode,
+                        "owner_lengths": layout.segments.iter().map(|s| s.tokens).collect::<Vec<_>>(),
+                        "decoder_rows": key.decoder_rows, "outputs": key.outputs,
+                        "work_rows": key.work_rows, "wall_s": started.elapsed().as_secs_f64(),
+                        "warmup_s": self.phases.warmups.1-before.0,
+                        "capture_s": self.phases.captures.1-before.1,
+                        "bind_s": self.phases.binds.1-before.2,
+                        "aclnn_s": self.phases.aclnn.1-before.3,
+                    })
+                );
+            }
         }
         let runtime = self.batch.as_mut().unwrap();
         runtime.lru.retain(|k| k != &key);
@@ -824,7 +964,7 @@ impl Worker {
         let execution = Rc::clone(
             runtime
                 .cache
-                .get(&runtime.key(layout))
+                .get(&runtime.key(layout)?)
                 .ok_or("Batch must be prepared before forward")?,
         );
         let retained = self.update_batch_tables(layout, &execution.packet)?;
@@ -1201,6 +1341,89 @@ mod tests {
             128,
         )
     }
+    fn contract() -> Contract {
+        serde_json::from_value(serde_json::json!({
+            "owners": 32, "columns": [], "private": [], "pointers": {},
+            "active": "a", "endpoints": "e", "work": {}
+        }))
+        .unwrap()
+    }
+    fn key(layout: &Layout) -> Key {
+        shape_key(&contract(), layout, (layout.decode, 1), &BTreeSet::new()).unwrap()
+    }
+    #[test]
+    fn launch_identity_matches_the_compilers_owner_work_extents() {
+        let mut contract = contract();
+        contract.decoder_replay = Some(
+            serde_json::from_value(serde_json::json!({
+                "keep":128,"final_prompt_only":true,"tables":["w"],"maps":[]
+            }))
+            .unwrap(),
+        );
+        let grid: RowExpression = serde_json::from_value(serde_json::json!({
+            "op":"divide","lhs":{"op":"add","lhs":{"op":"rows"},
+                "rhs":{"op":"constant","value":1}},"rhs":{"op":"constant","value":2}
+        }))
+        .unwrap();
+        for lengths in [
+            &[1, 15][..],
+            &[33, 95],
+            &[35, 93],
+            &[769, 1279],
+            &[771, 1277],
+            &[2048, 1],
+        ] {
+            let mut layout = layout(lengths, &[7, 17]).unwrap();
+            layout.outputs = vec![1];
+            layout.decoder_roles = vec![
+                super::super::replay::Role::Producer,
+                super::super::replay::Role::Final,
+            ];
+            for decoder in [false, true] {
+                for partition in [1, 8] {
+                    for range in [None, Some((1, 8)), Some((9, 2048))] {
+                        contract.partitioned_tables.clear();
+                        contract.work_ranges.clear();
+                        contract.decoder_replay.as_mut().unwrap().tables.clear();
+                        if decoder {
+                            contract
+                                .decoder_replay
+                                .as_mut()
+                                .unwrap()
+                                .tables
+                                .insert("w".into());
+                        }
+                        if partition > 1 {
+                            contract.partitioned_tables.insert("w".into(), partition);
+                        }
+                        if let Some((min_rows, max_rows)) = range {
+                            contract
+                                .work_ranges
+                                .insert("w".into(), WorkRange { min_rows, max_rows });
+                        }
+                        let launches = [WorkLaunch {
+                            grid: grid.clone(),
+                            range,
+                            partition,
+                            decoder,
+                        }]
+                        .into();
+                        let key = shape_key(&contract, &layout, (false, 1), &launches).unwrap();
+                        let expected = (0..partition)
+                            .map(|rank| {
+                                contract
+                                    .work_items(&layout, &grid, "w", rank)
+                                    .unwrap()
+                                    .len()
+                                    / 2
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(key.work_rows, expected);
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn partitioned_work_keeps_original_owner_and_graph_order() {
         let mut contract: Contract = serde_json::from_value(serde_json::json!({
@@ -1208,18 +1431,29 @@ mod tests {
             "active": "a", "endpoints": "e", "work": {}
         }))
         .unwrap();
-        let a = layout(&[1, 7, 3], &[91, 4, 33]).unwrap();
-        let b = layout(&[3, 1, 7], &[8, 77, 5]).unwrap();
-        let original = Runtime::new(contract.clone(), 8, &[]);
-        assert_eq!(original.key(&a), original.key(&b));
+        let a = layout(&[1, 15], &[91, 4]).unwrap();
+        let b = layout(&[15, 1], &[8, 77]).unwrap();
+        assert_eq!(key(&a), key(&b));
         contract.partitioned_tables.insert("w".into(), 8);
         assert_eq!(contract.token_capacity("w", 2048).unwrap(), 256);
         assert_eq!(contract.token_capacity("w", 2047).unwrap(), 256);
         assert_eq!(contract.token_capacity("original", 2048).unwrap(), 2048);
-        let runtime = Runtime::new(contract.clone(), 8, &[]);
-        assert_ne!(runtime.key(&a), runtime.key(&b));
-        let reordered_ids = layout(&[1, 7, 3], &[33, 91, 4]).unwrap();
-        assert_eq!(runtime.key(&a), runtime.key(&reordered_ids));
+        let launches = [WorkLaunch {
+            grid: RowExpression::Constant { value: 64 },
+            range: None,
+            partition: 8,
+            decoder: false,
+        }]
+        .into();
+        assert_ne!(
+            shape_key(&contract, &a, (false, 1), &launches).unwrap(),
+            shape_key(&contract, &b, (false, 1), &launches).unwrap()
+        );
+        let reordered_ids = layout(&[1, 15], &[33, 91]).unwrap();
+        assert_eq!(
+            shape_key(&contract, &a, (false, 1), &launches).unwrap(),
+            shape_key(&contract, &reordered_ids, (false, 1), &launches).unwrap()
+        );
         let grid: RowExpression =
             serde_json::from_value(serde_json::json!({"op":"constant","value":64})).unwrap();
         let work = contract.work_items(&a, &grid, "w", 7).unwrap();
@@ -1235,11 +1469,11 @@ mod tests {
     fn address_tables_keep_owner_and_output_order_when_graphs_share_a_shape() {
         let a = layout(&[1, 1], &[91, 8]).unwrap();
         let b = layout(&[1, 1], &[8, 91]).unwrap();
-        assert_eq!(a.key(), b.key());
+        assert_eq!(key(&a), key(&b));
         assert_ne!(a.table_key(1), b.table_key(1));
         let mut output = a.clone();
         output.outputs = vec![1];
-        assert_eq!(a.key(), output.key());
+        assert_eq!(key(&a), key(&output));
         assert_ne!(a.table_key(1), output.table_key(1));
         assert_ne!(a.table_key(1), a.table_key(512));
         let mut decode = a.clone();
@@ -1298,7 +1532,7 @@ mod tests {
     fn graph_identity_follows_shape_and_role_not_owner_order() {
         let a = layout(&[1, 7, 3], &[91, 4, 33]).unwrap();
         let b = layout(&[3, 1, 7], &[8, 77, 5]).unwrap();
-        assert_eq!(a.key(), b.key());
+        assert_eq!(key(&a), key(&b));
         assert_eq!(a.rows.starts, vec![0, 1, 8]);
         assert_eq!(b.rows.starts, vec![0, 3, 4]);
         assert!(layout(&[1, 7], &[9, 9]).is_err());
@@ -1307,10 +1541,10 @@ mod tests {
         assert!(Layout::new(a.segments.clone(), vec![2, 0], false, 4096, 128).is_err());
         let mut c = a.clone();
         c.outputs.push(2);
-        assert_ne!(a.key(), c.key());
+        assert_ne!(key(&a), key(&c));
         let mut d = a.clone();
         d.decode = true;
-        assert_ne!(a.key(), d.key());
+        assert_ne!(key(&a), key(&d));
     }
 }
 #[test]
