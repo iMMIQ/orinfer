@@ -247,6 +247,7 @@ impl Worker {
                     body,
                     head,
                     captured: true,
+                    direct_uses: std::cell::Cell::new(0),
                 }),
             );
         }

@@ -30,6 +30,7 @@ use orinfer_model_sdk::operators::dynamic::RowExpression;
 use orinfer_model_sdk::operators::rows::KernelVariant;
 use serde::Deserialize;
 use std::{
+    cell::Cell,
     collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
@@ -384,6 +385,7 @@ struct Execution {
     body: Vec<Step>,
     head: Vec<Step>,
     captured: bool,
+    direct_uses: Cell<u8>,
 }
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct W4Key {
@@ -480,6 +482,8 @@ struct LoadPhases {
     aclnn: (usize, f64),
     warmups: (usize, f64),
     captures: (usize, f64),
+    branches: (usize, f64),
+    dependencies: (usize, f64),
 }
 
 fn wait_in_flight(tickets: &mut VecDeque<Ticket>) -> Result<()> {
@@ -826,6 +830,7 @@ impl Worker {
                         body,
                         head,
                         captured: true,
+                        direct_uses: Cell::new(0),
                     }),
                 )
                 .is_some()
@@ -1410,9 +1415,13 @@ impl Worker {
         steps: &mut Vec<Step>,
         capture: bool,
     ) -> Result<()> {
+        let validation_started = Instant::now();
         let depths = branches::validate(pending)?;
+        self.phases.dependencies.0 += 1;
+        self.phases.dependencies.1 += validation_started.elapsed().as_secs_f64();
         let ops = Rc::new(pending.clone());
         let comm = self.comm.clone();
+        let branch_started = Instant::now();
         let parallel = if depths.is_empty() {
             None
         } else {
@@ -1422,6 +1431,8 @@ impl Worker {
                 Box::new((Rc::clone(&ops), comm.clone())),
             )?)
         };
+        self.phases.branches.0 += usize::from(parallel.is_some());
+        self.phases.branches.1 += branch_started.elapsed().as_secs_f64();
         let segment = Rc::new(Segment {
             ops,
             comm,

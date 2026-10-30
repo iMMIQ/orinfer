@@ -103,7 +103,7 @@ pub(super) struct Owner {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CacheState {
     Missing,
-    Direct,
+    Direct(u8),
     Graph,
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -658,7 +658,7 @@ impl Worker {
                 if e.captured {
                     CacheState::Graph
                 } else {
-                    CacheState::Direct
+                    CacheState::Direct(e.direct_uses.get())
                 }
             }))
     }
@@ -685,6 +685,9 @@ impl Worker {
                 self.phases.captures.1,
                 self.phases.binds.1,
                 self.phases.aclnn.1,
+                self.phases.templates.1,
+                self.phases.branches.1,
+                self.phases.dependencies.1,
             );
             self.reserve_batch_memory(3 << 30, "Graph preparation")?;
             let packet = self
@@ -744,6 +747,7 @@ impl Worker {
                     body,
                     head,
                     captured: capture,
+                    direct_uses: std::cell::Cell::new(0),
                 }),
             );
             if self.rank == 0 && std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
@@ -759,6 +763,9 @@ impl Worker {
                         "capture_s": self.phases.captures.1-before.1,
                         "bind_s": self.phases.binds.1-before.2,
                         "aclnn_s": self.phases.aclnn.1-before.3,
+                        "template_s": self.phases.templates.1-before.4,
+                        "branch_s": self.phases.branches.1-before.5,
+                        "dependency_s": self.phases.dependencies.1-before.6,
                     })
                 );
             }
@@ -1160,6 +1167,11 @@ impl Worker {
                 .unwrap()
                 .history
                 .extend_from_slice(input);
+        }
+        if !execution.captured {
+            execution
+                .direct_uses
+                .set(execution.direct_uses.get().saturating_add(1));
         }
         Ok(output)
     }

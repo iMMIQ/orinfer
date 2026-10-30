@@ -414,14 +414,27 @@ fn forward(
     forward_with(peers, layout, tokens, full, || {})
 }
 /// Every rank changes execution mode together. Any miss resets the shared
-/// class to direct; a uniformly present direct class is promoted on reuse.
-fn preparation(states: &[CacheState]) -> Result<(bool, bool)> {
+/// class to direct. Successful uses are counted on every rank; promotion waits
+/// for the slowest rank. Offline TP8 measurements put prefill amortization at
+/// 8–20 uses (0.31–0.46 s capture versus 24–41 ms saved per execution).
+fn preparation(states: &[CacheState], decode: bool) -> Result<(bool, bool)> {
     if states.is_empty() {
         return Err("Missing A2 TP cache states".into());
     }
-    let present = !states.contains(&CacheState::Missing);
-    let uniform = states.iter().all(|s| *s == states[0]);
-    Ok((!present || !uniform, present))
+    if states.contains(&CacheState::Missing) {
+        return Ok((true, false));
+    }
+    let graphs = states.iter().filter(|s| **s == CacheState::Graph).count();
+    if graphs > 0 {
+        return Ok((graphs != states.len(), true));
+    }
+    let required = if decode { 1 } else { 8 };
+    Ok((
+        false,
+        states
+            .iter()
+            .all(|s| matches!(s, CacheState::Direct(n) if *n >= required)),
+    ))
 }
 
 fn forward_with(
@@ -440,7 +453,7 @@ fn forward_with(
             _ => Err("Invalid A2 cache state reply".to_string()),
         })
         .collect::<Result<Vec<_>>>()?;
-    let (invalidate, capture) = preparation(&states)?;
+    let (invalidate, capture) = preparation(&states, layout.decode)?;
     if invalidate {
         exchange(peers, Command::Invalidate(layout.clone()))?;
     }
@@ -493,18 +506,54 @@ fn forward_with(
 mod tests {
     use super::*;
     #[test]
+    fn promotion_waits_for_successful_uses_on_every_rank() {
+        assert!(preparation(&[], false).is_err());
+        for decode in [false, true] {
+            assert_eq!(
+                preparation(&[CacheState::Missing, CacheState::Graph], decode).unwrap(),
+                (true, false)
+            );
+            assert_eq!(
+                preparation(&[CacheState::Graph, CacheState::Direct(0)], decode).unwrap(),
+                (true, true)
+            );
+            assert_eq!(
+                preparation(&[CacheState::Graph; 2], decode).unwrap(),
+                (false, true)
+            );
+        }
+        assert_eq!(
+            preparation(&[CacheState::Direct(0), CacheState::Direct(1)], true).unwrap(),
+            (false, false)
+        );
+        assert_eq!(
+            preparation(&[CacheState::Direct(1); 2], true).unwrap(),
+            (false, true)
+        );
+        assert_eq!(
+            preparation(&[CacheState::Direct(7), CacheState::Direct(8)], false).unwrap(),
+            (false, false)
+        );
+        assert_eq!(
+            preparation(&[CacheState::Direct(8), CacheState::Direct(9)], false).unwrap(),
+            (false, true)
+        );
+    }
+    #[test]
     fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
         for statuses in [
             [CacheState::Graph, CacheState::Graph],
-            [CacheState::Direct, CacheState::Direct],
+            [CacheState::Direct(1), CacheState::Direct(1)],
+            [CacheState::Direct(7), CacheState::Direct(8)],
+            [CacheState::Direct(8), CacheState::Direct(9)],
             [CacheState::Graph, CacheState::Missing],
-            [CacheState::Direct, CacheState::Graph],
+            [CacheState::Direct(1), CacheState::Graph],
             [CacheState::Missing, CacheState::Missing],
         ] {
             std::thread::scope(|scope| {
                 let mut peers = vec![];
                 let mut maintained = vec![];
-                let (recapture, capture) = preparation(&statuses).unwrap();
+                let (recapture, capture) = preparation(&statuses, false).unwrap();
                 for hit in statuses {
                     let (send, commands) = mpsc::channel();
                     let (reply, receive) = mpsc::channel();
@@ -568,6 +617,146 @@ mod tests {
 mod state_tests {
     use super::*;
     use orinfer_model_sdk::architecture::BatchSegment;
+    #[test]
+    #[ignore = "Offline release-mode TP8 timing probe; needs the real A2 package"]
+    // Reject only an explicitly selected debug probe, not the debug build.
+    #[allow(clippy::assertions_on_constants)]
+    fn measure_bound_direct_and_graph_packet_costs() {
+        use super::super::replay::Role;
+        use std::os::fd::AsRawFd;
+        assert!(
+            !cfg!(debug_assertions),
+            "Measure the optimized current-build test executable"
+        );
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open("artifacts/gpu-experiment.lock")
+            .unwrap();
+        assert_eq!(
+            // SAFETY: This owned descriptor outlives every native object below.
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        {
+            let session = Session::new(0, Limits::default()).unwrap();
+            for count in [1, 20, 40] {
+                let mut created = vec![];
+                let mut destroyed = vec![];
+                for _ in 0..5 {
+                    let start = Instant::now();
+                    let branches = super::super::super::graph::Branches::new(
+                        &session,
+                        &vec![0; count],
+                        Box::new(()),
+                    )
+                    .unwrap();
+                    created.push(start.elapsed().as_secs_f64());
+                    let start = Instant::now();
+                    drop(branches);
+                    destroyed.push(start.elapsed().as_secs_f64());
+                }
+                eprintln!(
+                    "A2 branch probe {}",
+                    serde_json::json!({"forks":count,
+                    "create_s":created,"destroy_s":destroyed})
+                );
+            }
+        }
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("ORINFER_A2_STATE_MODEL").unwrap());
+        let descriptor: serde_json::Value =
+            crate::model::read(&directory.join("cache/model.json")).unwrap();
+        let plan = directory
+            .join("cache/packages")
+            .join(descriptor["execution_package"].as_str().unwrap())
+            .join("model.json");
+        let team = Team::load(&plan, &directory).unwrap();
+        team.exchange(Command::Admit(vec![7, 17])).unwrap();
+        let layout = |lengths: &[usize], slots: &[usize], roles: &[Role], decode| {
+            let mut l = Layout::new(
+                lengths
+                    .iter()
+                    .zip(slots)
+                    .map(|(&tokens, &slot)| BatchSegment { tokens, slot })
+                    .collect(),
+                roles
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| (*r != Role::Producer).then_some(i))
+                    .collect(),
+                decode,
+                if decode { 32 } else { team.rows },
+                32,
+            )
+            .unwrap();
+            l.decoder_roles = roles.to_vec();
+            l
+        };
+        let tokens = |l: &Layout| {
+            l.segments
+                .iter()
+                .map(|s| {
+                    (0..s.tokens)
+                        .map(|i| ((i * 73 + s.slot * 19 + 11) % 129280) as u32)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let prefix = layout(&[128], &[7], &[Role::Final], false);
+        team.forward(prefix.clone(), tokens(&prefix), true).unwrap();
+        team.snapshot_allocations(7, 1, true).unwrap();
+        for (name, l) in [
+            ("decode1", layout(&[1], &[7], &[Role::Continue], true)),
+            ("final128", layout(&[128], &[7], &[Role::Final], false)),
+            (
+                "mixed800",
+                layout(
+                    &[1, 799],
+                    &[7, 17],
+                    &[Role::Continue, Role::Producer],
+                    false,
+                ),
+            ),
+            ("prefill2048", layout(&[2048], &[7], &[Role::Final], false)),
+        ] {
+            team.exchange(Command::Invalidate(l.clone())).unwrap();
+            team.exchange(Command::Prepare(l.clone(), false)).unwrap();
+            let mut timings = vec![];
+            let mut promotion_s = 0.;
+            for capture in [false, true] {
+                if capture {
+                    let start = Instant::now();
+                    team.exchange(Command::Prepare(l.clone(), true)).unwrap();
+                    promotion_s = start.elapsed().as_secs_f64();
+                }
+                let mut times = vec![];
+                for _ in 0..5 {
+                    for owner in [7, 17] {
+                        team.exchange(Command::Restore { owner, snapshot: 1 })
+                            .unwrap();
+                    }
+                    let start = Instant::now();
+                    let result = team
+                        .exchange(Command::Forward(l.clone(), tokens(&l), false))
+                        .unwrap();
+                    assert!(result.iter().all(|r| matches!(r, Reply::Outputs(_))));
+                    times.push(start.elapsed().as_secs_f64());
+                }
+                timings.push(times);
+            }
+            eprintln!(
+                "A2 packet mode probe {}",
+                serde_json::json!({"name":name,
+                "direct_s":timings[0],"graph_s":timings[1],"promotion_s":promotion_s})
+            );
+        }
+        team.exchange(Command::Evict(1)).unwrap();
+        drop(team);
+        drop(lock);
+    }
     #[test]
     #[ignore = "Requires the native TP8 A2 package and eight NPUs"]
     fn graph_launch_identity_reuses_changed_lengths_and_decoder_roles() {
@@ -644,7 +833,7 @@ mod state_tests {
             team.exchange(Command::Cached(partial_a.clone()))
                 .unwrap()
                 .iter()
-                .all(|r| matches!(r, Reply::Cached(CacheState::Direct)))
+                .all(|r| matches!(r, Reply::Cached(CacheState::Direct(1))))
         );
         assert!(
             team.exchange(Command::Cached(partial_b.clone()))
@@ -660,9 +849,20 @@ mod state_tests {
             team.exchange(Command::Cached(partial_a.clone()))
                 .unwrap()
                 .iter()
-                .all(|r| matches!(r, Reply::Cached(CacheState::Direct | CacheState::Graph)))
+                .all(|r| matches!(r, Reply::Cached(CacheState::Direct(_) | CacheState::Graph)))
         );
         team.exchange(Command::Reset(vec![7, 17])).unwrap();
+        for expected in 2..=8 {
+            team.forward(partial_a.clone(), tokens(&partial_a), false)
+                .unwrap();
+            assert!(
+                team.exchange(Command::Cached(partial_a.clone()))
+                    .unwrap()
+                    .iter()
+                    .all(|r| matches!(r, Reply::Cached(CacheState::Direct(n)) if *n == expected))
+            );
+            team.exchange(Command::Reset(vec![7, 17])).unwrap();
+        }
         let reused = team
             .forward(partial_a.clone(), tokens(&partial_a), true)
             .unwrap()
@@ -702,10 +902,11 @@ mod state_tests {
                 team.exchange(Command::Cached(b.clone()))
                     .unwrap()
                     .iter()
-                    .all(|r| matches!(r, Reply::Cached(CacheState::Direct | CacheState::Graph))),
+                    .all(|r| matches!(r, Reply::Cached(CacheState::Direct(_) | CacheState::Graph))),
                 "{name} must reuse the captured launches"
             );
             team.exchange(Command::Reset(vec![7, 17])).unwrap();
+            team.exchange(Command::Prepare(b.clone(), true)).unwrap();
             let mut reused = team.forward(b.clone(), tokens(&b), true).unwrap().0;
             if roles[0] == Role::Producer {
                 reused = team.forward(tail.clone(), tokens(&tail), true).unwrap().0;
@@ -739,9 +940,10 @@ mod state_tests {
             team.exchange(Command::Cached(b.clone()))
                 .unwrap()
                 .iter()
-                .all(|r| matches!(r, Reply::Cached(CacheState::Direct | CacheState::Graph)))
+                .all(|r| matches!(r, Reply::Cached(CacheState::Direct(_) | CacheState::Graph)))
         );
         restore();
+        team.exchange(Command::Prepare(b.clone(), true)).unwrap();
         let reused = team.forward(b.clone(), tokens(&b), true).unwrap().0;
         restore();
         team.exchange(Command::Invalidate(b.clone())).unwrap();
