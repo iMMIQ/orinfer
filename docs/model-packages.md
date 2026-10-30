@@ -355,6 +355,16 @@ bash tools/operators/ascend/run.sh --without-devices python3 \
 
 最终计划位于 `a2-fused-indexer/package/model.json`，沿用查询分片、后续 merge/finalize 和原 KV 状态。核内按实际因果长度流式处理 4096-key 块，完整 FP32 分数表由 64 个有界 Cube／Vector 槽位替代；Query、query scale 和 FP16 舍入后的 head 权重在块内复用。加权归约和 TopK 与独立算子共享组件，保持头顺序、候选值、并列顺序和 `(-inf,-1)` 哨兵。临时工作区按 owner 隔离，8-row 配置每个 owner、每个 rank 使用 16 MiB，计入现有显存准入预算。`validate_indexer_fused --output REPORT` 对照独立打分／TopK，检查零分并列、完整候选、长度边界和改变输入后的 Graph；`validate_private_rows --op indexer_fused.causal_topk --owners 3 --rows 1 3 9 --output REPORT` 检查新增临时工作区的 owner 换序、尾部及捕获保护。
 
+TP8 大 prefill 的 Engram 可以将投影列分片直接交换为已有的连续序列分片：
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices python3 \
+  -m tools.model.deepseek_v41.engram_sequence \
+  --plan SEQUENCE_PARTITIONED_PLAN --output artifacts/a2-engram-sequence
+```
+
+输出计划位于 `a2-engram-sequence/package/model.json`。构建器将 Engram 投影后的 AllGather 改为按实际行数的 AlltoAllV，复用原来的列恢复、split、Hadamard 和 gate 工厂，在本 rank 的序列行上完成门控；门控前的 residual AllGather 同时移除。完整 2K packet 的投影接收数据降为原来的八分之一。尾部沿现有 `zero_row_tail` 清零到 8 行边界，token mask 和输出 residual 复用当前动态 rank 视图，保持 BF16 边界及 FP32 门控归约。`validate_engram_sequence --baseline BASE_PLAN --plan NEW_PLAN --output REPORT` 对比完整激活和首／末 rank 的序列切片，覆盖 513 行尾部、2K 和改变输入后的 Graph；真实 TP8 通信及完整请求另用短测确认。
+
 
 `tools.model.deepseek_v41.quantize_kv --plan BF16_PLAN --output INT8_PLAN` 将尚未量化 KV 的 DSv4.1 TP8 原生计划转换为 INT8 缓存，输出与输入共用资产目录。40 层 SWA 和四个共享压缩 KV bank 均按每 64 个值使用一个 FP16 scale，512 维每行共 528 字节。写入按实际存储的 FP16 scale 做对称舍入，整数范围为 −127..127；scale 下限为 FP16 最小正数，上限为 65504。零组写零，`-1` 位置跳过写入，其他越界位置设置错误标志。压缩器的 FP32 ring 状态和索引器现有 INT8 格式保持各自的契约。
 
