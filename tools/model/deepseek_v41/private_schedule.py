@@ -220,7 +220,15 @@ def reusable_long_gathers(rank, contract, describe):
 
 
 def rebuild(
-    plan, output, operator, overrides, first, *, reuse_long_kv=False, measured_identity=None
+    plan,
+    output,
+    operator,
+    overrides,
+    first,
+    *,
+    reuse_long_kv=False,
+    measured_identity=None,
+    match_parameters=None,
 ):
     from kernels.model.rows import row_count
     from tools.operators.ascend.private_rows import indirect
@@ -284,6 +292,9 @@ def rebuild(
                         "Retarget selected variants through their original tuning entrypoint"
                     )
                 parameters = descriptor["parameters"]
+                if any(parameters.get(k) != v for k, v in (match_parameters or {}).items()):
+                    body.append(original)
+                    continue
                 capacity = parameters["_owner_token_capacity"]
                 partition = contract.get("partitioned_tables", {}).get(original["buffers"][0])
                 extent = contract.get("work_ranges", {}).get(
@@ -435,7 +446,16 @@ def main():
     parser.add_argument("--maximum-regression", type=float, default=0.1)
     parser.add_argument("--min-owner-rows", type=int, default=1)
     parser.add_argument("--reuse-long-kv", action="store_true")
+    parser.add_argument(
+        "--match-parameters",
+        type=json.loads,
+        help="Restrict replacement to these published primitive parameters",
+    )
     args = parser.parse_args()
+    if args.match_parameters is not None and (
+        not isinstance(args.match_parameters, dict) or not args.match_parameters
+    ):
+        parser.error("--match-parameters requires a nonempty JSON object")
     selected = None
     measured_identity = None
     if args.tuning_record:
@@ -465,7 +485,9 @@ def main():
                 if path not in descriptions:
                     descriptions[path] = json.loads((args.plan.parent / path).read_text())
                 spec = descriptions[path]
-                if spec["op"] == "private_rows." + args.operator.replace(".", "_"):
+                if spec["op"] == "private_rows." + args.operator.replace(".", "_") and all(
+                    spec["parameters"].get(k) == v for k, v in (args.match_parameters or {}).items()
+                ):
                     geometries.append(spec["parameters"])
         from tools.operators.ascend.validate_private_rows import measurement_source
 
@@ -505,6 +527,7 @@ def main():
                     args.min_owner_rows,
                     reuse_long_kv=args.reuse_long_kv,
                     measured_identity=measured_identity,
+                    match_parameters=args.match_parameters,
                 ),
                 selection=selected,
             )

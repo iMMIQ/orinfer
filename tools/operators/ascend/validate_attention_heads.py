@@ -2,9 +2,11 @@
 
 import argparse
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
+from itertools import product
 from pathlib import Path
 
-from tools.build.files import atomic_json
+from tools.build.files import atomic_json, file_hash
 
 
 def main():
@@ -12,60 +14,70 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--heads", type=int, nargs="+", default=[8, 17, 64])
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 7, 9, 17, 65])
+    parser.add_argument("--head-tiles", type=int, nargs="+", choices=[16, 32, 64], default=[16])
+    parser.add_argument("--benchmark-rows", type=int, nargs="+", default=[])
+    parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--device", type=int, default=7)
     args = parser.parse_args()
+    if not 1 <= args.compile_workers <= 8:
+        parser.error("compile workers must be in1..8")
     if not 1 <= min(args.heads) <= max(args.heads) <= 64:
         parser.error("heads must be in1..64")
-    if not 1 <= min(args.rows) <= max(args.rows) <= 256:
+    if not 1 <= min(args.rows + args.benchmark_rows) <= max(args.rows + args.benchmark_rows) <= 256:
         parser.error("query rows must be in1..256")
     import torch
     from kernels.model.rows import row_count
     from tools.operators.ascend import attention_cube
-    from tools.operators.ascend.build import compile_kernel, operand
+    from tools.operators.ascend.build import LOWER_LOCK, compile_kernel, operand
     from tools.operators.ascend.geometry import physical_shapes
 
     torch.set_num_threads(4)
     torch.manual_seed(20261002)
-    capacity = max(args.rows)
+    capacity = max(args.rows + args.benchmark_rows)
     dtype = {"bfloat16": "bf16", "float32": "f32", "int32": "i32"}
     kernels = {}
-    shapes = {}
     # Small-head calls are an independent execution partition of the same
     # arithmetic, with identical K128 accumulation and BF16 boundaries.
     heads = sorted(set(args.heads) | {8} | {h % 8 for h in args.heads if h % 8})
-    for selected in [128, 640]:
-        for head in heads:
-            for name in ["qk", "softmax", "pv"]:
-                params = dict(rows=capacity, heads=head, selected=selected)
-                if name == "pv":
-                    params["tile_d"] = 256
-                function = getattr(attention_cube, name)(
-                    **dict(params, rows=row_count(capacity, True))
-                )
-                tensors = [
-                    function.buffer_map[p] for p in function.params if p in function.buffer_map
-                ]
-                physical = physical_shapes(function, capacity)
-                writes = dict(qk={"scores"}, softmax={"probabilities"}, pv={"output", "workspace"})[
-                    name
-                ]
-                specs = [
-                    operand(
-                        t.name, dtype[str(t.dtype)], s, "read_write" if t.name in writes else "read"
-                    )
-                    for t, s in zip(tensors, physical, strict=True)
-                ]
-                manifest = compile_kernel(
-                    function,
-                    "attention_cube." + name,
-                    specs,
-                    params,
-                    args.output / "cache",
-                    row_capacity=capacity,
-                )
-                kernels[selected, head, name] = manifest
-                shapes[selected, head, name] = physical
+    configs = [
+        (selected, head, name, head_tile)
+        for selected in [128, 640]
+        for head in heads
+        for name, head_tile in [("softmax", 16)]
+        + list(product(["qk", "pv"], args.head_tiles if head > 16 else [16]))
+    ]
+
+    def compile_one(key):
+        selected, head, name, head_tile = key
+        params = dict(rows=capacity, heads=head, selected=selected)
+        if name != "softmax":
+            params["head_tile"] = head_tile
+        if name == "pv":
+            params["tile_d"] = 256
+        with LOWER_LOCK:
+            function = getattr(attention_cube, name)(**dict(params, rows=row_count(capacity, True)))
+            tensors = [function.buffer_map[p] for p in function.params if p in function.buffer_map]
+            physical = physical_shapes(function, capacity)
+        writes = dict(qk={"scores"}, softmax={"probabilities"}, pv={"output", "workspace"})[name]
+        specs = [
+            operand(
+                t.name, dtype[str(t.dtype)], shape, "read_write" if t.name in writes else "read"
+            )
+            for t, shape in zip(tensors, physical, strict=True)
+        ]
+        manifest = compile_kernel(
+            function,
+            "attention_cube." + name,
+            specs,
+            params,
+            args.output / "cache",
+            row_capacity=capacity,
+        )
+        return key, manifest
+
+    with ThreadPoolExecutor(max_workers=args.compile_workers) as pool:
+        kernels.update(pool.map(compile_one, configs))
     if args.compile_only:
         atomic_json(args.output / "compiled.json", [str(p) for p in kernels.values()])
         return
@@ -102,9 +114,9 @@ def main():
             torch.empty((capacity, padded, 512), dtype=torch.float32, device="npu"),
         ]
 
-    reports = []
+    reports, measurements = [], []
     for selected in [128, 640]:
-        for head in args.heads:
+        for head, head_tile in product(args.heads, args.head_tiles):
             query = torch.randn((capacity, head, 512)).bfloat16().npu()
             kv = torch.randn((capacity, selected, 512)).bfloat16().npu()
             indices = torch.arange(selected).repeat(capacity, 1).int()
@@ -114,19 +126,26 @@ def main():
             sink = torch.randn(head).float().npu()
             scores, probability, output, workspace = buffers(selected, head)
 
-            def chain(q, h, state, count, sinks):
+            def chain(q, h, state, count, sinks, tile=16):
                 s, p, o, w = state
-                launch((selected, h, "qk"), [q, kv, s], count)
-                launch((selected, h, "softmax"), [s, indices, sinks, p], count)
-                launch((selected, h, "pv"), [p, kv, o, w], count)
+                launch((selected, h, "qk", tile if h > 16 else 16), [q, kv, s], count)
+                launch((selected, h, "softmax", 16), [s, indices, sinks, p], count)
+                launch((selected, h, "pv", tile if h > 16 else 16), [p, kv, o, w], count)
 
             # Stable input/output addresses across changing data and lengths.
             for count in args.rows:
-                chain(query, head, [scores, probability, output, workspace], count, sink)
+                chain(query, head, [scores, probability, output, workspace], count, sink, head_tile)
                 torch.npu.synchronize()
                 graph = torch.npu.NPUGraph()
                 with torch.npu.graph(graph):
-                    chain(query, head, [scores, probability, output, workspace], count, sink)
+                    chain(
+                        query,
+                        head,
+                        [scores, probability, output, workspace],
+                        count,
+                        sink,
+                        head_tile,
+                    )
                 for phase in range(3):
                     if phase:
                         query.neg_()
@@ -168,11 +187,49 @@ def main():
                         selected=selected,
                         heads=head,
                         rows=count,
+                        head_tile=head_tile,
                         phases=3,
                         exact_head_partitions=True,
                     )
                 )
                 atomic_json(args.output / "validation.json", reports)
+            if args.benchmark_rows:
+                from tools.model.deepseek_v41.tune import npu_benchmark
+                from tools.model.tuning import measure
+
+                probability.fill_(1.0 / selected)
+                for count in args.benchmark_rows:
+                    for name, values in [
+                        ("qk", [query, kv, scores]),
+                        ("pv", [probability, kv, output, workspace]),
+                    ]:
+                        key = selected, head, name, head_tile if head > 16 else 16
+                        milliseconds = measure(
+                            lambda: launch(key, values, count),
+                            budget_ms=2,
+                            max_repetitions=32,
+                            benchmark=npu_benchmark,
+                        )
+                        measurements.append(
+                            dict(
+                                selected=selected,
+                                heads=head,
+                                head_tile=head_tile,
+                                rows=count,
+                                op="attention_cube." + name,
+                                milliseconds=milliseconds,
+                                manifest=str(kernels[key]),
+                            )
+                        )
+                atomic_json(
+                    args.output / "measurements.json",
+                    dict(
+                        source_sha256=file_hash(Path(attention_cube.__file__)),
+                        validator_sha256=file_hash(Path(__file__)),
+                        validation=reports,
+                        measurements=measurements,
+                    ),
+                )
     print(
         f"Verified {len(reports)} head/row geometries with changed-input Graph replay", flush=True
     )

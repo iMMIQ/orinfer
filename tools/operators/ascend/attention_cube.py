@@ -3,12 +3,21 @@
 import tilelang.language as T
 
 
-def qk(rows, heads, selected, dimension=512, tile_s=64):
+def _head_geometry(heads, head_tile):
+    padded = (heads + 15) // 16 * 16
+    if head_tile not in (16, 32, 64):
+        raise ValueError("Cube head tile must be16,32or64")
+    tile = min(padded, head_tile)
+    if padded % tile:
+        raise ValueError("Head tile must divide the padded head dimension")
+    return padded, tile, padded // tile
+
+
+def qk(rows, heads, selected, dimension=512, tile_s=64, head_tile=16):
     if not 0 < heads <= 64 or selected % tile_s or dimension % 128:
         raise ValueError("Cube attention requires H<=64, S%tile_s=0 and D%128=0")
     blocks = selected // tile_s
-    groups = (heads + 15) // 16
-    padded_heads = groups * 16
+    padded_heads, block_heads, groups = _head_geometry(heads, head_tile)
 
     @T.prim_func
     def main(
@@ -18,17 +27,19 @@ def qk(rows, heads, selected, dimension=512, tile_s=64):
     ):
         with T.Kernel(rows * groups * blocks, is_npu=True) as (cid, vid):
             row, tile = cid // (groups * blocks), cid % blocks
-            first = cid // blocks % groups * 16
-            live = T.min(16, heads - first)
+            first = cid // blocks % groups * block_heads
+            live = T.min(block_heads, heads - first)
             with T.Scope("C"):
-                a = T.alloc_L1((16, 128), "bfloat16")
+                a = T.alloc_L1((block_heads, 128), "bfloat16")
                 b = T.alloc_L1((tile_s, 128), "bfloat16")
-                c = T.alloc_L0C((16, tile_s), "float32")
+                c = T.alloc_L0C((block_heads, tile_s), "float32")
                 for k in T.serial(dimension // 128):
                     T.copy(query[row, first : first + live, k * 128 : (k + 1) * 128], a[:live, :])
                     T.copy(kv[row, tile * tile_s : (tile + 1) * tile_s, k * 128 : (k + 1) * 128], b)
                     T.gemm_v0(a, b, c, transpose_B=True, init=(k == 0))
-                T.copy(c, scores[row, first : first + 16, tile * tile_s : (tile + 1) * tile_s])
+                T.copy(
+                    c, scores[row, first : first + block_heads, tile * tile_s : (tile + 1) * tile_s]
+                )
 
     return main
 
@@ -79,12 +90,12 @@ def softmax(rows, heads, selected, dimension=512):
     return main
 
 
-def pv(rows, heads, selected, dimension=512, tile_d=32):
+def pv(rows, heads, selected, dimension=512, tile_d=32, head_tile=16):
     if not 0 < heads <= 64 or selected % 128 or dimension % tile_d:
         raise ValueError("Cube PV requires H<=64, S%128=0 and D%tile_d=0")
     blocks = dimension // tile_d
-    groups = (heads + 15) // 16
-    padded_heads = groups * 16
+    padded_heads, block_heads, groups = _head_geometry(heads, head_tile)
+    vector_heads = block_heads // 2
 
     @T.prim_func
     def main(
@@ -95,29 +106,39 @@ def pv(rows, heads, selected, dimension=512, tile_d=32):
     ):
         with T.Kernel(rows * groups * blocks, is_npu=True) as (cid, vid):
             row, tile = cid // (groups * blocks), cid % blocks
-            first = cid // blocks % groups * 16
+            first = cid // blocks % groups * block_heads
             with T.Scope("C"):
-                a = T.alloc_L1((16, 128), "bfloat16")
+                a = T.alloc_L1((block_heads, 128), "bfloat16")
                 b = T.alloc_L1((128, tile_d), "bfloat16")
-                c = T.alloc_L0C((16, tile_d), "float32")
+                c = T.alloc_L0C((block_heads, tile_d), "float32")
                 for k in T.serial(selected // 128):
-                    T.copy(probabilities[row, first : first + 16, k * 128 : (k + 1) * 128], a)
+                    T.copy(
+                        probabilities[row, first : first + block_heads, k * 128 : (k + 1) * 128], a
+                    )
                     T.copy(kv[row, k * 128 : (k + 1) * 128, tile * tile_d : (tile + 1) * tile_d], b)
                     T.gemm_v0(a, b, c, init=(k == 0))
-                T.copy(c, workspace[row, first : first + 16, tile * tile_d : (tile + 1) * tile_d])
+                T.copy(
+                    c,
+                    workspace[
+                        row, first : first + block_heads, tile * tile_d : (tile + 1) * tile_d
+                    ],
+                )
                 T.set_cross_flag("FIX", 0)
                 T.wait_cross_flag(1)
             with T.Scope("V"):
-                x = T.alloc_ub((8, tile_d), "float32")
-                y = T.alloc_ub((8, tile_d), "bfloat16")
-                start = first + vid * 8
+                x = T.alloc_ub((vector_heads, tile_d), "float32")
+                y = T.alloc_ub((vector_heads, tile_d), "bfloat16")
+                start = first + vid * vector_heads
                 T.wait_cross_flag(0)
                 if start < heads:
-                    valid = T.min(8, heads - start)
+                    valid = T.min(vector_heads, heads - start)
                     T.copy(
-                        workspace[row, start : start + 8, tile * tile_d : (tile + 1) * tile_d], x
+                        workspace[
+                            row, start : start + vector_heads, tile * tile_d : (tile + 1) * tile_d
+                        ],
+                        x,
                     )
-                    T.tile.cast(y, x, "CAST_RINT", 8 * tile_d)
+                    T.tile.cast(y, x, "CAST_RINT", vector_heads * tile_d)
                     T.copy(
                         y[:valid, :],
                         output[row, start : start + valid, tile * tile_d : (tile + 1) * tile_d],

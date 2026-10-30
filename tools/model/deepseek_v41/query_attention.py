@@ -14,7 +14,7 @@ from tools.build.files import file_hash
 from tools.model.row_contract import expression
 
 
-def build(plan, output, workers=4, minimum=512, pv_tile=256):
+def build(plan, output, workers=4, minimum=512, pv_tile=256, qk_head_tile=16, pv_head_tile=16):
     from kernels.model.rows import row_count
     from tools.model.deepseek_v41.batch import compile_task, DTYPES, SIZES
     from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
@@ -332,6 +332,8 @@ def build(plan, output, workers=4, minimum=512, pv_tile=256):
                     if parameters["heads"] != 8:
                         raise ValueError("Expected original eight local heads")
                     parameters["heads"] = 64
+                    if is_op(op_step, "attention_cube_qk"):
+                        parameters["head_tile"] = qk_head_tile
                     extra = []
                     if is_op(op_step, "attention_cube_softmax"):
                         old_sink = definitions[op_step["buffers"][3]]
@@ -376,7 +378,7 @@ def build(plan, output, workers=4, minimum=512, pv_tile=256):
                     for k, v in describe(pv["manifest"])["parameters"].items()
                     if not k.startswith("_")
                 }
-                parameters.update(heads=64, tile_d=pv_tile)
+                parameters.update(heads=64, tile_d=pv_tile, head_tile=pv_head_tile)
                 output_name = cols(pv)[2]["buffer"]
                 body.append(private(pv, parameters, cols(pv), [], local))
                 body.append(
@@ -454,10 +456,20 @@ def main():
     p.add_argument("--compile-workers", type=int, default=4)
     p.add_argument("--min-rows", type=int, default=512)
     p.add_argument("--pv-tile-d", type=int, default=256, choices=[32, 64, 128, 256])
+    p.add_argument("--qk-head-tile", type=int, choices=[16, 32, 64], default=16)
+    p.add_argument("--pv-head-tile", type=int, choices=[16, 32, 64], default=16)
     args = p.parse_args()
     print(
         json.dumps(
-            build(args.plan, args.output, args.compile_workers, args.min_rows, args.pv_tile_d)
+            build(
+                args.plan,
+                args.output,
+                args.compile_workers,
+                args.min_rows,
+                args.pv_tile_d,
+                args.qk_head_tile,
+                args.pv_head_tile,
+            )
         ),
         flush=True,
     )

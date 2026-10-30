@@ -556,3 +556,7 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 该变换要求 TP8 和已经启用查询分片的私有计划。大行数 packet 先通过 AlltoAllV 将每卡的全部查询／8 个头换为间隔分配的查询／64 个头，复用本地 TopK 和按 owner 绑定的 KV；PV 后进行反向交换，恢复原始行序与头分片，再执行原有位置变换、gate 和输出投影。短 packet 与 decode 沿用输入计划。各 owner 的 KV 更新仍覆盖全部输入行，私有列通过显式物理视图表达分片容量，尾部补零仅覆盖无效查询。共享计算体保持 K128 累加和 BF16 概率／输出边界。
 
 原生 `exchange` 指令以每个 peer 的元素数声明均匀 AlltoAllV，支持动态行表达式。捕获的操作持有通信器、源／目标 buffer 和稳定地址的 host counts；集合通信沿主 stream 顺序执行，资源保留到最后一个完成事件。`validate_attention_heads` 验证共享多头计算体；`validate_query_layout --help` 提供已发布移动算子的尾部、头序及改变输入后的 Graph 验证入口。架构验收完成后的配置调优按分阶段检查约定复用这些结果。
+
+QK 和 PV 在同一计算体中支持 `head_tile=16/32/64`，默认 16。tile 须整除按 16 对齐的头维度；不足一个 tile 时使用实际对齐维度，保持原物理行布局。K128 累加顺序、FP32 workspace 和 BF16 概率／输出边界保持一致。`validate_attention_heads --heads 64 --head-tiles 16 32 64 --rows 1 17 65 --benchmark-rows 64 65 256` 对照独立的 8 头执行，检查改变输入后的 Graph replay，并复用共享 Graph 测量记录各候选耗时；离线编译默认使用四个 worker，复用已编译缓存。
+
+根据实测选择配置后，可在 `query_attention` 首次构建时通过 `--qk-head-tile` 和 `--pv-head-tile` 传入；已有包沿用 `private_schedule` 重建。例如选中 64 时，分别对 `attention_cube.qk` 和 `attention_cube.pv` 使用 `--parameters '{"head_tile":64}' --match-parameters '{"heads":64}'`，后一阶段读取前一阶段的输出包。`--match-parameters` 匹配已发布的 primitive 参数，仅替换对应几何；其他 prefill 绑定和 decode 资产继续复用。完整请求短测覆盖实际 owner 聚合、2K/2049 和固定历史 decode，确认收益后再运行一次 Mini。
