@@ -195,7 +195,7 @@ def gather_quantized_rows(rows, table_rows, width):
     return main
 
 
-def gather_columns(rows, width, ranks=8, dtype="bfloat16", output_width=0):
+def gather_columns(rows, width, ranks=8, dtype="bfloat16", output_width=0, paths=1):
     """Restore row-major columns, including overlapping aligned projection tails.
 
     Each rank produces an aligned physical column span. When output_width is
@@ -206,6 +206,7 @@ def gather_columns(rows, width, ranks=8, dtype="bfloat16", output_width=0):
     output = output_width or width
     if (
         element_bytes is None
+        or not 1 <= paths <= 8
         or ranks < 1
         or width % ranks
         or output % ranks
@@ -216,11 +217,12 @@ def gather_columns(rows, width, ranks=8, dtype="bfloat16", output_width=0):
         raise ValueError("Gathered columns must have aligned, equal rank partitions")
     local = width // ranks
     logical = output // ranks
+    output_shape = (rows, output) if paths == 1 else (rows, paths, output)
 
     @T.prim_func
     def main(
         gathered: T.Tensor((ranks, rows, local), dtype),
-        out: T.Tensor((rows, output), dtype),
+        out: T.Tensor(output_shape, dtype),
     ):
         with T.Kernel(T.ceildiv(rows * ranks, 2), is_npu=True) as (cid, vid):
             data = T.alloc_ub((logical,), dtype)
@@ -229,7 +231,11 @@ def gather_columns(rows, width, ranks=8, dtype="bfloat16", output_width=0):
             if row < rows:
                 first = T.max(0, rank * logical + local - output)
                 T.copy(gathered[rank, row, first : first + logical], data)
-                T.copy(data, out[row, rank * logical : (rank + 1) * logical])
+                if paths == 1:
+                    T.copy(data, out[row, rank * logical : (rank + 1) * logical])
+                else:
+                    for path in T.serial(paths):
+                        T.copy(data, out[row, path, rank * logical : (rank + 1) * logical])
 
     return main
 

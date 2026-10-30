@@ -85,6 +85,14 @@ pub(super) struct StepStats {
 fn ints(values: &[i32]) -> Vec<u8> {
     values.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
+pub(super) fn embedding_span(first: usize, columns: usize) -> Result<std::ops::Range<usize>> {
+    let end = first
+        .checked_add(columns)
+        .filter(|&end| columns != 0 && end <= 5120)
+        .ok_or("Embedding columns outside the original row")?;
+    Ok(first * 2..end * 2)
+}
+
 impl Worker {
     fn coordinate(&self, names: &Coordinates, base: usize, rows: usize) -> Result<()> {
         self.coordinate_at(names, base, rows, 0)
@@ -367,8 +375,18 @@ impl Worker {
         };
         let mut embeddings = vec![];
         for step in execution.body.iter().chain(head) {
-            if let Step::Embed(destination) = step {
-                let data = self.embedding(tokens)?;
+            let input = match step {
+                Step::Embed {
+                    destination,
+                    first_column,
+                    columns,
+                } => Some((
+                    destination,
+                    self.embedding(tokens, *first_column, *columns)?,
+                )),
+                _ => None,
+            };
+            if let Some((destination, data)) = input {
                 embeddings.push(vec![(destination.slice(0, data.len())?, data)])
             }
         }
@@ -391,7 +409,7 @@ impl Worker {
                         match step {
                             Step::Graph(graph) => graph.execute_on_stream(stream)?,
                             Step::W4(plan) => plan.execute_on_stream(stream)?,
-                            Step::Embed(_) => {
+                            Step::Embed { .. } => {
                                 self.session.upload_inputs(
                                     &embeddings.next().ok_or("Packet embedding missing")?,
                                 )?;
@@ -544,7 +562,7 @@ impl Worker {
                 stats.lookup.0 += 1;
                 stats.lookup.1 += elapsed;
             }
-            Step::Embed(_) => {
+            Step::Embed { .. } => {
                 stats.embed.0 += 1;
                 stats.embed.1 += elapsed;
             }
@@ -642,8 +660,12 @@ impl Worker {
                 stats.route_grp.0 += 1;
                 stats.route_grp.1 += grp;
             }
-            Step::Embed(destination) => {
-                let values = self.embedding(tokens)?;
+            Step::Embed {
+                destination,
+                first_column,
+                columns,
+            } => {
+                let values = self.embedding(tokens, *first_column, *columns)?;
                 self.session
                     .upload_inputs(&[(destination.slice(0, values.len())?, values)])?;
             }
@@ -673,18 +695,19 @@ impl Worker {
         }
         Ok(())
     }
-    fn embedding(&mut self, tokens: &[u32]) -> Result<Vec<u8>> {
+    fn embedding(&mut self, tokens: &[u32], first: usize, columns: usize) -> Result<Vec<u8>> {
+        let span = embedding_span(first, columns)?;
         let embedding = self.checkpoint.read("embed.weight")?;
         if embedding.dtype != Dtype::BF16 || embedding.shape != [129280, 5120] {
             return Err("Embedding checkpoint layout differs".into());
         }
-        let mut values = Vec::with_capacity(tokens.len() * 10240);
+        let mut values = Vec::with_capacity(tokens.len() * span.len());
         for &token in tokens {
             let start = token as usize * 10240;
             values.extend_from_slice(
                 embedding
                     .data
-                    .get(start..start + 10240)
+                    .get(start + span.start..start + span.end)
                     .ok_or("Embedding token out of range")?,
             );
         }
@@ -735,5 +758,51 @@ impl Worker {
                 valid.iter().map(|&v| u8::from(v)).collect(),
             ),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embedding_span;
+
+    #[test]
+    fn embedding_instructions_keep_full_row_defaults_and_explicit_column_shards() {
+        use super::super::Instruction;
+
+        let full: Instruction =
+            serde_json::from_str(r#"{"op":"embed","destination":"x"}"#).unwrap();
+        assert!(matches!(
+            full,
+            Instruction::Embed {
+                first_column: 0,
+                columns: 5120,
+                ..
+            }
+        ));
+        let shard: Instruction = serde_json::from_str(
+            r#"{"op":"embed","destination":"x","first_column":4480,"columns":640}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            shard,
+            Instruction::Embed {
+                first_column: 4480,
+                columns: 640,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn embedding_column_shards_cover_original_bf16_bytes_and_reject_invalid_spans() {
+        let mut bytes = vec![];
+        for rank in 0..8 {
+            bytes.extend(embedding_span(rank * 640, 640).unwrap());
+        }
+        assert_eq!(bytes, (0..10240).collect::<Vec<_>>());
+        assert_eq!(embedding_span(0, 5120).unwrap(), 0..10240);
+        assert!(embedding_span(5120, 1).is_err());
+        assert!(embedding_span(0, 0).is_err());
+        assert!(embedding_span(usize::MAX, 1).is_err());
     }
 }

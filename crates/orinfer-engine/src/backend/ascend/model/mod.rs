@@ -124,6 +124,10 @@ impl Packet {
         }
     }
 }
+fn embedding_width() -> usize {
+    5120
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Instruction {
@@ -213,6 +217,10 @@ enum Instruction {
     },
     Embed {
         destination: String,
+        #[serde(default)]
+        first_column: usize,
+        #[serde(default = "embedding_width")]
+        columns: usize,
     },
     Lookup {
         layer: usize,
@@ -235,7 +243,11 @@ enum Step {
         groups: Vec<String>,
         rows: usize,
     },
-    Embed(Buffer),
+    Embed {
+        destination: Buffer,
+        first_column: usize,
+        columns: usize,
+    },
     Lookup {
         layer: usize,
         values: Buffer,
@@ -1273,7 +1285,15 @@ impl Worker {
                         .collect(),
                     rows: scaled(*rows)?,
                 },
-                Instruction::Embed { destination } => Step::Embed(get(&self.buffers, destination)?),
+                Instruction::Embed {
+                    destination,
+                    first_column,
+                    columns,
+                } => Step::Embed {
+                    destination: get(&self.buffers, destination)?,
+                    first_column: *first_column,
+                    columns: *columns,
+                },
                 Instruction::Lookup {
                     layer,
                     values,
@@ -1596,6 +1616,17 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
             }
             let mut current_capacity = packet.rows;
             for instruction in packet.body.iter().chain(&packet.head) {
+                if let Instruction::Embed {
+                    destination,
+                    first_column,
+                    columns,
+                } = instruction
+                {
+                    let span = packet::embedding_span(*first_column, *columns)?;
+                    if buffers.get(destination).copied() != Some(current_capacity * span.len()) {
+                        return Err("Embedding input geometry differs".into());
+                    }
+                }
                 if let Instruction::LimitRows { rows } = instruction {
                     if packet.min_rows == 0 {
                         return Err("Decode packets cannot truncate their rows".into());

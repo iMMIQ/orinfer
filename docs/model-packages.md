@@ -642,6 +642,15 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 
 `bench-ascend-batch` 的显式 `frames` 可携带 `decode:true` 和固定 token 历史；阶段时间与 decode 输出计数跟随 frame 角色。比较 decode 调度时保持相同输入历史，并单独保留自由生成结果。
 
+已收敛的 DSv4.1 计划可分片上传 embedding 列，并融合四路 mHC 展开：
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.embedding_columns \
+  --plan PLAN --output artifacts/a2-embedding-columns --compile-workers 4
+```
+
+该变换让每卡只从原始 BF16 embedding 读取自己的列分片，TP8 时每 token 上传 640 列，普通 decode 与小 prefill 用 AllGather 恢复列，分片 prefill 用 AlltoAllV 直接发送到原有的连续行分片。共享 `memory.gather_columns` 的 `paths=4` 模式直接写入四路 mHC residual。发送尾部复用 `zero_row_tail` 补零，各 peer 使用相同的动态行计数；接收区复用原 embedding 工作区。普通 decode、小 prefill 和分片 prefill 复用同一计算体。embedding 上传量降为原来的 1/8，使用原始 BF16 位表示，新增通信临时区计入显存预算。执行计划在提交前校验列范围、输入容量和 token 范围，后续计算与私有状态契约保持一致。新的 embedding 列字段需要匹配的原生运行时。
+
 owner-private 计划可复用查询行分片构建器：
 
 ```bash

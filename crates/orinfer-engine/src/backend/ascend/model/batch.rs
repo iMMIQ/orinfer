@@ -402,7 +402,8 @@ impl Worker {
             let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
             let Some(key) = runtime.lru.pop_front() else {
                 return Err(format!(
-                    "Insufficient A2 memory for {stage}, including capture headroom"
+                    "Insufficient A2 memory for {stage}, including capture headroom: free {}, required {needed} bytes",
+                    self.session.memory_info()?.0
                 ));
             };
             runtime.cache.remove(&key);

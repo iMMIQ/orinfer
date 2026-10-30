@@ -13,6 +13,144 @@ from tools.model.deepseek_v41.sequence_parallel import external_reads
 from tools.model.deepseek_v41.private_schedule import reusable_long_gathers, select_schedule
 
 
+class DeviceEmbeddingTests(unittest.TestCase):
+    def fixture(self, partitioned=False):
+        capacity, local = (2048, 256) if partitioned else (32, 32)
+        definitions = [dict(name="embedding", bytes=capacity * 5120 * 2)]
+        incoming = "embedding"
+        if partitioned:
+            incoming = "selected"
+            definitions.append(
+                dict(
+                    name=incoming,
+                    bytes=local * 5120 * 2,
+                    view=dict(
+                        parent="embedding",
+                        offset=256 * 3 * 10240,
+                        row_capacity=capacity,
+                        offset_expression=expression("((m + 7) // 8) * 30720"),
+                    ),
+                )
+            )
+        body = [dict(op="embed", destination="embedding")]
+        if partitioned:
+            body.append(dict(op="kernel", manifest="tail", buffers=["positions", "embedding"]))
+        body.append(dict(op="kernel", manifest="expand", buffers=[incoming, "residual"]))
+        if partitioned:
+            body[-1]["row_expression"] = expression("(m + 7) // 8")
+        specs = dict(
+            tail=dict(
+                op="memory.zero_row_tail",
+                parameters=dict(width=5120, dtype="bfloat16", partitions=8),
+            ),
+            expand=dict(op="vector.mhc_expand", parameters=dict(rows=local, width=5120)),
+            extra=dict(op="reader", operands=[dict(access="read"), dict(access="write")]),
+        )
+        ranks = []
+        for rank in range(8):
+            buffers = deepcopy(definitions)
+            if partitioned:
+                buffers[-1]["view"].update(
+                    offset=256 * rank * 10240,
+                    offset_expression=expression(f"((m + 7) // 8) * {rank * 10240}"),
+                )
+            ranks.append(
+                dict(
+                    rank=rank,
+                    buffers=buffers,
+                    packets=[
+                        dict(
+                            rows=capacity, coordinates=dict(slots="positions"), body=deepcopy(body)
+                        )
+                    ],
+                )
+            )
+        model = dict(ranks=ranks)
+        return model, lambda step: specs.get(step.get("manifest"))
+
+    def test_embedding_columns_preserve_partition_rows_and_exact_input_spans(self):
+        from tools.model.deepseek_v41.embedding_columns import transform
+
+        for partitioned in (False, True):
+            model, describe = self.fixture(partitioned)
+            compiled = []
+
+            def kernel(name, arguments, specs, capacity):
+                compiled.append((name, arguments, specs, capacity))
+                return name
+
+            self.assertEqual(transform(model, describe, kernel), 8)
+            for rank in model["ranks"]:
+                body = rank["packets"][0]["body"]
+                self.assertEqual(
+                    [s["op"] for s in body],
+                    ["embed", "kernel", "exchange", "kernel"]
+                    if partitioned
+                    else ["embed", "gather", "kernel"],
+                )
+                self.assertEqual(body[0]["columns"], 640)
+                self.assertEqual(body[0]["first_column"], rank["rank"] * 640)
+                self.assertEqual(
+                    body[-1].get("row_expression"),
+                    expression("(m + 7) // 8") if partitioned else None,
+                )
+                definitions = {b["name"]: b for b in rank["buffers"]}
+                self.assertEqual(
+                    definitions[body[0]["destination"]]["bytes"],
+                    rank["packets"][0]["rows"] * 640 * 2,
+                )
+                self.assertNotIn("w.embed.weight.device", definitions)
+                self.assertEqual(body[-1]["buffers"][-1], "residual")
+                restore = compiled[
+                    rank["rank"] * (2 if partitioned else 1) + (1 if partitioned else 0)
+                ]
+                self.assertEqual(restore[0], "gather_columns")
+                self.assertEqual(restore[1]["paths"], 4)
+                self.assertEqual(restore[2][-1]["shape"], [256 if partitioned else 32, 4, 5120])
+                for rows in (1, 7, 8, 17, 31, 32):
+                    self.assertEqual(
+                        resolve(body[-2]["elements_expression"], rows),
+                        ((rows + 7) // 8 if partitioned else rows) * 640,
+                    )
+
+    def test_removed_embedding_requires_no_other_consumer(self):
+        from tools.model.deepseek_v41.embedding_columns import transform
+
+        model, describe = self.fixture()
+        model["ranks"][0]["packets"][0]["body"].append(
+            dict(op="kernel", manifest="extra", buffers=["embedding", "other"])
+        )
+        with self.assertRaisesRegex(ValueError, "still has a reader"):
+            transform(model, describe, lambda *_: "fused")
+
+    def test_exchange_layout_matches_the_original_contiguous_prefill_slices(self):
+        from tools.model.deepseek_v41.embedding_columns import transform
+
+        model, describe = self.fixture(True)
+        transform(model, describe, lambda *_: "fused")
+        count = model["ranks"][0]["packets"][0]["body"][-2]["elements_expression"]
+        for rows in (17, 513, 1921, 2048):
+            local = resolve(count, rows) // 640
+            # Small logical columns expose row/peer ordering independently of
+            # the physical BF16 width. Each source sends contiguous row blocks.
+            source = [
+                [
+                    [row * 16 + rank * 2 + column for column in range(2)] if row < rows else [0, 0]
+                    for row in range(local * 8)
+                ]
+                for rank in range(8)
+            ]
+            for destination in range(8):
+                first = destination * local
+                received = [peer[first : first + local] for peer in source]
+                restored = [sum((peer[row] for peer in received), []) for row in range(local)]
+                expected = [
+                    list(range(row * 16, row * 16 + 16)) if row < rows else [0] * 16
+                    for row in range(first, first + local)
+                ]
+                self.assertEqual(restored, expected)
+
+
 class AttentionTileScopeTests(unittest.TestCase):
     def test_only_large_family_attention_is_replaced_and_duplicates_are_shared(self):
         from tools.model.deepseek_v41.tune_attention import attention_groups
