@@ -344,6 +344,17 @@ bash tools/operators/ascend/run.sh --without-devices python3 \
 
 输出计划位于 `a2-selected-attention/package/model.json`。构建器要求选中 packet 的 40 层均使用 64 头计算、相邻的原始四段链路、相同 owner 视图和查询分片，复用原来的长 KV 复用标记。一个查询由同组 Cube／Vector 核完成，工作区连接核间阶段；Query 和概率各装入 L1 一次，同一查询的头共享有效项掩码。解量化和 softmax 与独立算子共享组件，保留 K128 FP32 累加、完整 softmax 及归一化后的 BF16 概率。KV 和请求状态布局保持原契约，较短 packet 沿用输入计划。`validate_private_rows --op attention_fused.selected_int8 --attention-heads 64 --kv-slot-tiles 16 --owners 3 --rows 1 3 9` 检查共享 sink、owner 换序、尾部、捕获保护和改变输入后的 Graph replay；添加 `--kv-compressed --reuse-long` 对照完整 gather，检查更新 SWA 后的长 KV 工作区复用。
 
+稀疏索引器可以继续将 INT8 打分、32 头 FP32 加权归约和局部 TopK 合并，只输出原有候选格式：
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices python3 \
+  -m tools.model.deepseek_v41.fuse_indexer \
+  --plan QUERY_PARTITIONED_PLAN --output artifacts/a2-fused-indexer \
+  --min-rows 512 --tile-rows 8
+```
+
+最终计划位于 `a2-fused-indexer/package/model.json`，沿用查询分片、后续 merge/finalize 和原 KV 状态。核内按实际因果长度流式处理 4096-key 块，完整 FP32 分数表由 64 个有界 Cube／Vector 槽位替代；Query、query scale 和 FP16 舍入后的 head 权重在块内复用。加权归约和 TopK 与独立算子共享组件，保持头顺序、候选值、并列顺序和 `(-inf,-1)` 哨兵。临时工作区按 owner 隔离，8-row 配置每个 owner、每个 rank 使用 16 MiB，计入现有显存准入预算。`validate_indexer_fused --output REPORT` 对照独立打分／TopK，检查零分并列、完整候选、长度边界和改变输入后的 Graph；`validate_private_rows --op indexer_fused.causal_topk --owners 3 --rows 1 3 9 --output REPORT` 检查新增临时工作区的 owner 换序、尾部及捕获保护。
+
 
 `tools.model.deepseek_v41.quantize_kv --plan BF16_PLAN --output INT8_PLAN` 将尚未量化 KV 的 DSv4.1 TP8 原生计划转换为 INT8 缓存，输出与输入共用资产目录。40 层 SWA 和四个共享压缩 KV bank 均按每 64 个值使用一个 FP16 scale，512 维每行共 528 字节。写入按实际存储的 FP16 scale 做对称舍入，整数范围为 −127..127；scale 下限为 FP16 最小正数，上限为 65504。零组写零，`-1` 位置跳过写入，其他越界位置设置错误标志。压缩器的 FP32 ring 状态和索引器现有 INT8 格式保持各自的契约。
 

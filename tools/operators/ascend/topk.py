@@ -7,6 +7,84 @@ K candidates; no stage sorts the complete long-context row in UB.
 import tilelang.language as T
 
 
+@T.macro
+def select_chunk(
+    x,
+    pairs,
+    positions,
+    mask,
+    lanes,
+    halves,
+    floor_int,
+    floor_float,
+    offsets,
+    gather_offsets,
+    selected_indices,
+    selected_values,
+    selected_mask,
+    valid,
+    start,
+    selected,
+    block,
+):
+    if valid > 0:
+        T.tile.createvecindex(positions, T.float32(0.0))
+        T.tile.compare(mask, positions, T.cast(valid, "float32"), "LT")
+        T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
+        if selected == 512:
+            if valid <= 512:
+                T.tile.topk(pairs, x, selected, 512)
+            elif valid <= 1024:
+                T.tile.topk(pairs, x, selected, 1024)
+            elif valid <= 2048:
+                T.tile.topk(pairs, x, selected, 2048)
+            else:
+                T.tile.topk(pairs, x, selected, block)
+        else:
+            T.tile.topk(pairs, x, selected, block)
+    else:
+        T.tile.fill(pairs, -T.infinity("float32"))
+    # Add the chunk origin only to index lanes, using vector math.
+    T.tile.createvecindex(lanes, T.float32(0.0))
+    T.tile.mul(halves, lanes, 0.5)
+    T.tile.cast(floor_int, halves, "CAST_FLOOR", 2 * selected)
+    T.tile.cast(floor_float, floor_int, "CAST_NONE", 2 * selected)
+    T.tile.mul(floor_float, floor_float, 2.0)
+    T.tile.sub(offsets, lanes, floor_float)
+    T.tile.mul(offsets, offsets, T.cast(start, "float32"))
+    T.tile.add(pairs, pairs, offsets)
+    # Reuse the vector work buffers to canonicalize masked lanes.
+    # Every padding candidate is (-inf, -1), including short tails.
+    T.reinterpretcast(selected_indices, halves, "float")
+    T.reinterpretcast(selected_values, floor_float, "float")
+    T.tile.gather_mask(selected_indices, pairs, "P1010")
+    T.tile.gather_mask(selected_values, pairs, "P0101")
+    T.tile.compare(selected_mask, selected_values, -T.infinity("float32"), "GT")
+    T.tile.select(
+        selected_indices,
+        selected_mask,
+        selected_indices,
+        -1.0,
+        "VSEL_TENSOR_SCALAR_MODE",
+    )
+    T.copy(selected_values, lanes[:selected])
+    T.copy(selected_indices, lanes[selected:])
+    # Every offset is an exactly representable FP32 integer.
+    # Generate the interleave permutation with vector operations.
+    T.tile.createvecindex(offsets, T.float32(0.0))
+    T.tile.mul(halves, offsets, 0.5)
+    T.tile.cast(floor_int, halves, "CAST_FLOOR", 2 * selected)
+    T.tile.cast(floor_float, floor_int, "CAST_NONE", 2 * selected)
+    T.tile.mul(halves, floor_float, 2.0)
+    T.tile.sub(offsets, offsets, halves)
+    T.tile.mul(offsets, offsets, float(selected))
+    T.tile.add(offsets, offsets, floor_float)
+    T.tile.mul(offsets, offsets, 4.0)
+    T.tile.cast(floor_int, offsets, "CAST_RINT", 2 * selected)
+    T.reinterpretcast(gather_offsets, floor_int, "uint32_t")
+    T.tile.gather(pairs, lanes, gather_offsets, 0)
+
+
 def local(rows, length, selected=512):
     block = 4096 if selected <= 512 else 2048
     if selected not in (512, 2048) or length > 1 << 24:
@@ -43,61 +121,25 @@ def local(rows, length, selected=512):
                 if valid > 0:
                     T.tile.fill(x, -T.infinity("float32"))
                     T.copy(scores[row, start : start + available], x[:available])
-                    T.tile.createvecindex(positions, T.float32(0.0))
-                    T.tile.compare(mask, positions, T.cast(valid, "float32"), "LT")
-                    T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
-                    if selected == 512:
-                        if valid <= 512:
-                            T.tile.topk(pairs, x, selected, 512)
-                        elif valid <= 1024:
-                            T.tile.topk(pairs, x, selected, 1024)
-                        elif valid <= 2048:
-                            T.tile.topk(pairs, x, selected, 2048)
-                        else:
-                            T.tile.topk(pairs, x, selected, block)
-                    else:
-                        T.tile.topk(pairs, x, selected, block)
-                else:
-                    T.tile.fill(pairs, -T.infinity("float32"))
-                # Add the chunk origin only to index lanes, using vector math.
-                T.tile.createvecindex(lanes, T.float32(0.0))
-                T.tile.mul(halves, lanes, 0.5)
-                T.tile.cast(floor_int, halves, "CAST_FLOOR", 2 * selected)
-                T.tile.cast(floor_float, floor_int, "CAST_NONE", 2 * selected)
-                T.tile.mul(floor_float, floor_float, 2.0)
-                T.tile.sub(offsets, lanes, floor_float)
-                T.tile.mul(offsets, offsets, T.cast(start, "float32"))
-                T.tile.add(pairs, pairs, offsets)
-                # Reuse the vector work buffers to canonicalize masked lanes.
-                # Every padding candidate is (-inf, -1), including short tails.
-                T.reinterpretcast(selected_indices, halves, "float")
-                T.reinterpretcast(selected_values, floor_float, "float")
-                T.tile.gather_mask(selected_indices, pairs, "P1010")
-                T.tile.gather_mask(selected_values, pairs, "P0101")
-                T.tile.compare(selected_mask, selected_values, -T.infinity("float32"), "GT")
-                T.tile.select(
+                select_chunk(
+                    x,
+                    pairs,
+                    positions,
+                    mask,
+                    lanes,
+                    halves,
+                    floor_int,
+                    floor_float,
+                    offsets,
+                    gather_offsets,
                     selected_indices,
+                    selected_values,
                     selected_mask,
-                    selected_indices,
-                    -1.0,
-                    "VSEL_TENSOR_SCALAR_MODE",
+                    valid,
+                    start,
+                    selected,
+                    block,
                 )
-                T.copy(selected_values, lanes[:selected])
-                T.copy(selected_indices, lanes[selected:])
-                # Every offset is an exactly representable FP32 integer.
-                # Generate the interleave permutation with vector operations.
-                T.tile.createvecindex(offsets, T.float32(0.0))
-                T.tile.mul(halves, offsets, 0.5)
-                T.tile.cast(floor_int, halves, "CAST_FLOOR", 2 * selected)
-                T.tile.cast(floor_float, floor_int, "CAST_NONE", 2 * selected)
-                T.tile.mul(halves, floor_float, 2.0)
-                T.tile.sub(offsets, offsets, halves)
-                T.tile.mul(offsets, offsets, float(selected))
-                T.tile.add(offsets, offsets, floor_float)
-                T.tile.mul(offsets, offsets, 4.0)
-                T.tile.cast(floor_int, offsets, "CAST_RINT", 2 * selected)
-                T.reinterpretcast(gather_offsets, floor_int, "uint32_t")
-                T.tile.gather(pairs, lanes, gather_offsets, 0)
                 T.copy(pairs, out[row, chunk, :])
 
     return main

@@ -52,6 +52,7 @@ def main():
             ["attention_cube.pv"],
             ["attention_cube.softmax"],
             ["attention_fused.selected_int8"],
+            ["indexer_fused.causal_topk"],
         )
     ):
         p.error(
@@ -75,6 +76,7 @@ def main():
         attention_prefill,
         attention_fused,
         kv_int8,
+        indexer_fused,
         compressor,
     )
     from tools.operators.ascend.build import compile_kernel, operand
@@ -94,6 +96,7 @@ def main():
     }
     report = []
     for module, name, params in [
+        (indexer_fused, "causal_topk", dict(rows=capacity, length=8192, tile_rows=8)),
         *[
             (attention_cube, "pv", dict(rows=capacity, heads=heads, selected=selected, tile_d=tile))
             for selected in (128, 640)
@@ -192,6 +195,7 @@ def main():
                 "probability_workspace",
                 "output_workspace",
             },
+            "causal_topk": {"candidates", "cube_workspace", "score_workspace"},
         }[name]
         specs = [
             operand(
@@ -276,6 +280,8 @@ def main():
                     v[:, ::19] = -1
                     v[:, 3] = bound
                     v[:, 4] = -2
+                elif tensor.name == "indices" and name == "causal_topk":
+                    v = (torch.arange(shape[0], dtype=dtype) + 4080 + owner * 17).reshape(shape)
                 elif tensor.name == "indices" and name == "softmax":
                     v = torch.arange(shape[1], dtype=dtype).expand(shape[0], -1).clone()
                     v[:, owner % 3 :: 3] = -1
@@ -306,7 +312,10 @@ def main():
                             [0, 2**-24, 2**-14, 65504, -(2**-24), -65504, 0.125, 1],
                             dtype=dtype,
                         )
-                elif name in ("gather_attention", "selected_int8") and dtype == torch.int8:
+                elif (
+                    name in ("gather_attention", "selected_int8", "causal_topk")
+                    and dtype == torch.int8
+                ):
                     v = torch.randint(-127, 128, shape, dtype=dtype)
                 else:
                     v = torch.ones(shape, dtype=dtype)
@@ -363,21 +372,26 @@ def main():
             call(1, private_values(), m)
         active.fill_(1)
         sequences = [(order, lengths), (list(reversed(order)), lengths)]
-        if name in ("gather_attention", "selected_int8") or module is attention_cube:
+        if name in ("gather_attention", "selected_int8", "causal_topk") or module is attention_cube:
             sequences.append((list(reversed(order)), lengths))
         for phase, (order, lengths) in enumerate(sequences):
             assert tables(order, lengths) == m
-            if name in ("gather_attention", "selected_int8") and phase == 2:
+            if name in ("gather_attention", "selected_int8", "causal_topk") and phase == 2:
                 # Scatter/quantization updates these addresses between model
                 # steps. Exercise Scalar scale loads after actual GM updates.
                 for owner in range(a.owners):
                     for tensor, value, want in zip(
                         tensors, data[owner], expected[owner], strict=True
                     ):
-                        if tensor.name in ("swa", "long_kv", "query"):
+                        if tensor.name in ("swa", "long_kv", "query", "keys"):
                             value.neg_()
                             want.copy_(value)
-                        elif tensor.name in ("swa_scales", "long_scales"):
+                        elif tensor.name in (
+                            "swa_scales",
+                            "long_scales",
+                            "query_scale",
+                            "key_scale",
+                        ):
                             value.mul_(0.5)
                             want.copy_(value)
             if module is attention_cube and phase == 2:

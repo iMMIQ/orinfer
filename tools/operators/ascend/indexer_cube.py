@@ -3,6 +3,30 @@
 import tilelang.language as T
 
 
+@T.macro
+def weighted_head_sum(dots, total, partial, qs, ks, w, expanded, vector_scales, direct_sum, heads):
+    T.tile.fill(total, 0.0)
+    if vector_scales:
+        T.tile.max(dots, dots, 0.0)
+        T.tile.broadcast(expanded, qs)
+        T.tile.mul(dots, dots, expanded)
+        T.tile.broadcast(expanded, ks)
+        T.tile.mul(dots, dots, expanded)
+        T.tile.broadcast(expanded, w)
+        T.tile.mul(dots, dots, expanded)
+    for head in T.serial(heads):
+        if direct_sum and vector_scales:
+            T.tile.add(total, total, dots[head : head + 1, :])
+        else:
+            T.copy(dots[head : head + 1, :], partial)
+            if not vector_scales:
+                T.tile.max(partial, partial, 0.0)
+                T.tile.mul(partial, partial, qs[head, 0])
+                T.tile.mul(partial, partial, ks)
+                T.tile.mul(partial, partial, w[head, 0])
+            T.tile.add(total, total, partial)
+
+
 def causal_logits(
     rows,
     length,
@@ -161,26 +185,18 @@ def causal_logits(
                                     if not prefetch_inputs:
                                         T.copy(key_scale[column : column + valid], ks_half[:valid])
                                     T.tile.cast(ks, ks_half, "CAST_NONE", lanes)
-                                    T.tile.fill(total, 0.0)
-                                    if vector_scales:
-                                        T.tile.max(dots, dots, 0.0)
-                                        T.tile.broadcast(expanded, qs)
-                                        T.tile.mul(dots, dots, expanded)
-                                        T.tile.broadcast(expanded, ks)
-                                        T.tile.mul(dots, dots, expanded)
-                                        T.tile.broadcast(expanded, w)
-                                        T.tile.mul(dots, dots, expanded)
-                                    for head in T.serial(heads):
-                                        if direct_sum and vector_scales:
-                                            T.tile.add(total, total, dots[head : head + 1, :])
-                                        else:
-                                            T.copy(dots[head : head + 1, :], partial)
-                                            if not vector_scales:
-                                                T.tile.max(partial, partial, 0.0)
-                                                T.tile.mul(partial, partial, qs[head, 0])
-                                                T.tile.mul(partial, partial, ks)
-                                                T.tile.mul(partial, partial, w[head, 0])
-                                            T.tile.add(total, total, partial)
+                                    weighted_head_sum(
+                                        dots,
+                                        total,
+                                        partial,
+                                        qs,
+                                        ks,
+                                        w,
+                                        expanded,
+                                        vector_scales,
+                                        direct_sum,
+                                        heads,
+                                    )
                                     if not prefetch_inputs and not length_input:
                                         T.copy(indices[row, column : column + valid], ids[:valid])
                                     if vector_mask and not length_input:
