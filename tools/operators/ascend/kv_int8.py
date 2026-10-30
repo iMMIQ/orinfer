@@ -5,6 +5,20 @@ import tilelang.language as T
 from tools.operators.ascend.vector_math import div_127_fp32, div_fp32_rows
 
 
+def _contiguous_view(buffer, shape):
+    # The pinned wheel's T.reshape still calls an obsolete Buffer constructor.
+    # A declared view shares the original data pointer and allocation scope.
+    from tilelang import tvm
+
+    return tvm.tir.decl_buffer(
+        shape,
+        buffer.dtype,
+        name=buffer.name + "_contiguous",
+        data=buffer.data,
+        scope=buffer.scope(),
+    )
+
+
 @T.macro
 def decode_values(q, half_values, values, half_scales, scale, broadcast, y, groups):
     T.tile.cast(half_values, q, "CAST_NONE", groups * 64)
@@ -244,11 +258,53 @@ def gather_tile(
 ):
     if tile_slots == 1 or not bulk_store or staged:
         T.tile.fill(y, 0.0)
+    contiguous = T.alloc_ub((8,), "int32")
+    if tile_slots > 1 and bulk_store and not staged:
+        contiguous[0] = 0
+        if first + tile_slots <= 128:
+            # The usual SWA window is a contiguous logical interval. Verify
+            # every index and the physical ring boundary before using one DMA
+            # for all values and one for their group-64 FP16 scales.
+            T.copy(swa_indices[row, first : first + tile_slots], flag[:tile_slots])
+            source_begin = flag[0]
+            if (
+                source_begin >= 0
+                and source_begin + tile_slots <= capacity
+                and source_begin % storage + tile_slots <= storage
+            ):
+                contiguous[0] = 1
+                for lane in T.serial(1, tile_slots):
+                    if flag[lane] != source_begin + lane:
+                        contiguous[0] = 0
     if tile_slots > 1 and (not staged or first >= 128):
         T.reinterpretcast(q, zeros, "int8_t")
-        T.tile.fill(zeros, 0)
-        T.tile.fill(half_scales, 0.0)
-    for lane in T.serial(tile_slots):
+        if tile_slots > 1 and bulk_store and not staged:
+            if contiguous[0] == 0:
+                T.tile.fill(zeros, 0)
+                T.tile.fill(half_scales, 0.0)
+            else:
+                packed_scales = T.alloc_ub((tile_slots * 8,), "float16")
+                T.reinterpretcast(packed_scales, half_scales, "half")
+                source_begin = swa_indices[row, first] % storage
+                # The pinned A2 copy lowering consumes two-dimensional regions.
+                # Flatten token/group dimensions explicitly for the full tile.
+                flat_swa = _contiguous_view(swa, (storage * 8, 64))
+                flat_scales = _contiguous_view(swa_scales, (storage * 8,))
+                T.copy(flat_swa[source_begin * 8 : (source_begin + tile_slots) * 8, :], q)
+                # A flattened scale burst also avoids the 32-byte pitch of
+                # narrow multi-row GM-to-UB transfers on A2.
+                T.copy(
+                    flat_scales[source_begin * 8 : (source_begin + tile_slots) * 8], packed_scales
+                )
+                T.tile.fill(flag, 0)
+        else:
+            T.tile.fill(zeros, 0)
+            T.tile.fill(half_scales, 0.0)
+    for lane in T.serial(
+        T.if_then_else(contiguous[0] != 0, 0, tile_slots)
+        if tile_slots > 1 and bulk_store and not staged
+        else tile_slots
+    ):
         slot = first + lane
         flag[lane] = -1
         if slot < 128:

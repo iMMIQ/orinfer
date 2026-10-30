@@ -1615,8 +1615,80 @@ def rope_tables(output, capacity):
     return result
 
 
+def kernel_rebuild_task(spec, placeholder):
+    """Recover the existing raw/private compiler task without changing bindings."""
+    parameters = spec["parameters"]
+    private = spec["op"].startswith("private_rows.")
+    if private:
+        tail = spec["op"].removeprefix("private_rows.")
+        candidates = []
+        for source in (Path(__file__).parents[2] / "operators/ascend").glob("*.py"):
+            if tail.startswith(source.stem + "_"):
+                module = importlib.import_module("tools.operators.ascend." + source.stem)
+                name = tail.removeprefix(source.stem + "_")
+                if callable(getattr(module, name, None)):
+                    candidates.append((module, name))
+        if len(candidates) != 1:
+            raise ValueError("Private operator must identify exactly one factory: " + spec["op"])
+        module, name = candidates[0]
+        capacity = parameters["_owner_token_capacity"]
+    else:
+        module_name, name = spec["op"].split(".")
+        module = importlib.import_module("tools.operators.ascend." + module_name)
+        capacity = parameters.get("_row_capacity")
+    args = {k: v for k, v in parameters.items() if not k.startswith("_")}
+    dynamic = {
+        key: args[key] // capacity
+        for key in ("rows", "tokens", "expert_rows")
+        if capacity is not None and key in args and args[key] % capacity == 0
+    }
+    if (
+        capacity is not None
+        and module.__name__.endswith(".memory")
+        and name in ("gather_quantized_rows", "gather_rows")
+        and args.get("table_rows") == capacity
+    ):
+        dynamic["table_rows"] = 1
+    task = dict(
+        module=module.__name__,
+        name=name,
+        arguments=args,
+        specs=spec["operands"],
+        row_capacity=capacity,
+        grid_limit=parameters.get("_grid_limit", 64),
+        dynamic_arguments=dynamic,
+        placeholder=placeholder,
+        operator=spec["op"],
+    )
+    if private:
+        aliases = list(parameters["_owner_aliases"])
+        accesses = parameters["_owner_access"]
+        if len(aliases) != len(accesses):
+            raise ValueError("Private alias and access contracts differ")
+        metadata = {k: v for k, v in parameters.items() if k.startswith("_owner_")}
+        metadata["_owner_source_sha256"] = file_hash(Path(module.__file__))
+        task.update(
+            private=True,
+            key=placeholder,
+            capacity=capacity,
+            dynamic=dynamic,
+            columns={
+                a.removesuffix("_owner"): v["column"]
+                for a, v in zip(aliases, accesses, strict=True)
+            },
+            owners=spec["operands"][1]["shape"][0],
+            table_columns=spec["operands"][1]["shape"][1] - 1,
+            metadata=metadata,
+        )
+    return task
+
+
 def compile_task(task_and_output):
     task, output = task_and_output
+    if task.get("private"):
+        from tools.model.deepseek_v41.batch import compile_task as compile_private
+
+        return compile_private((task, output))
     torch.set_num_threads(2)
     output = Path(output)
     module = importlib.import_module(task["module"])
@@ -1653,55 +1725,41 @@ def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None):
         "floating.split",
         "model_ops.gather_attention",
     }
+    references = []
     for rank in model["ranks"]:
         for packet in rank["packets"]:
             for step in packet["body"] + packet["head"]:
-                if step["op"] != "kernel" or step["manifest"] in tasks:
-                    continue
-                spec = json.loads((base / step["manifest"]).read_text())
-                if operators and spec["op"] not in operators:
-                    continue
-                if (
-                    not operators
-                    and not all_kernels
-                    and (
-                        spec["op"] not in paired
-                        or (
-                            "_row_capacity" not in spec["parameters"]
-                            and spec["op"] != "model_ops.gather_attention"
-                        )
+                if step["op"] == "kernel":
+                    references.extend(
+                        (step, key)
+                        for key in ("manifest", "uncompacted_manifest")
+                        if step.get(key) is not None
                     )
-                ):
-                    continue
-                args = dict(spec["parameters"])
-                capacity = args.pop("_row_capacity", None)
-                limit = args.pop("_grid_limit", 64)
-                module, name = spec["op"].split(".")
-                symbolic = {
-                    key: args[key] // capacity
-                    for key in ("rows", "tokens", "expert_rows")
-                    if capacity is not None and key in args and args[key] % capacity == 0
-                }
-                if (
-                    capacity is not None
-                    and module == "memory"
-                    and name in ("gather_quantized_rows", "gather_rows")
-                    and args.get("table_rows") == capacity
-                ):
-                    symbolic["table_rows"] = 1
-                tasks[step["manifest"]] = dict(
-                    module="tools.operators.ascend." + module,
-                    name=name,
-                    arguments=args,
-                    specs=spec["operands"],
-                    row_capacity=capacity,
-                    grid_limit=limit,
-                    dynamic_arguments=symbolic,
-                    placeholder=step["manifest"],
-                )
-    if operators and set(operators) - {
-        t["module"].split(".")[-1] + "." + t["name"] for t in tasks.values()
-    }:
+    for variants in model.get("row_selections", {}).values():
+        for variant in variants:
+            references.extend((variant["kernels"], i) for i in range(len(variant["kernels"])))
+    descriptions = {}
+    for binding, key in references:
+        manifest = binding[key]
+        if manifest in tasks:
+            continue
+        if manifest not in descriptions:
+            descriptions[manifest] = json.loads((base / manifest).read_text())
+        spec = descriptions[manifest]
+        if operators and spec["op"] not in operators:
+            continue
+        if (
+            not operators
+            and not all_kernels
+            and (
+                spec["op"] not in paired
+                or "_row_capacity" not in spec["parameters"]
+                and spec["op"] != "model_ops.gather_attention"
+            )
+        ):
+            continue
+        tasks[manifest] = kernel_rebuild_task(spec, manifest)
+    if operators and set(operators) - {t["operator"] for t in tasks.values()}:
         raise ValueError("Selected operator is absent from the plan")
     replacements = {}
     with ProcessPoolExecutor(
@@ -1710,11 +1768,8 @@ def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None):
         for old, new in pool.map(compile_task, [(t, str(base)) for t in tasks.values()]):
             replacements[old] = new
             print(json.dumps(dict(rebuilt=len(replacements), total=len(tasks))), flush=True)
-    for rank in model["ranks"]:
-        for packet in rank["packets"]:
-            for step in packet["body"] + packet["head"]:
-                if step["op"] == "kernel":
-                    step["manifest"] = replacements.get(step["manifest"], step["manifest"])
+    for binding, key in references:
+        binding[key] = replacements.get(binding[key], binding[key])
     suffix = "-selected.json" if operators else "-rebuilt.json" if all_kernels else "-paired.json"
     output = plan.with_name(plan.stem + suffix)
     atomic_json(output, model)
