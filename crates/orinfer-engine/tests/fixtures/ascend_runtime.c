@@ -40,6 +40,11 @@ static int flush(void *stream) {
     return 0;
 }
 int test_counter(int n) { return counters[n]; }
+int test_pending_jobs(void) {
+    int pending=0;
+    for(int i=0;i<count;i++) pending += jobs[i].kind!=0;
+    return pending;
+}
 void test_failure(int n) { failure=n; }
 int aclInit(const char *p) { (void)p;counters[5]++;return 0; }
 int aclFinalize(void) { counters[6]++;return 0; }
@@ -113,6 +118,7 @@ int HcclReduceScatter(void *source,void *destination,uint64_t n,int type,int op,
     return HcclAllReduce(source,destination,n,type,op,comm,stream);
 }
 int HcclAllGather(void *source,void *destination,uint64_t n,int type,void *comm,void *stream) {
+    if(failure==14)return 7;
     (void)comm;size_t bytes=n*hccl_bytes(type);
     jobs[count++]=(Job){.dst=destination,.src=source,.n=bytes,.kind=1,.stream=stream};return 0;
 }

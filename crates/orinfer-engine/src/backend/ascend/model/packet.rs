@@ -240,8 +240,15 @@ impl Worker {
             let base = self.package.clone();
             let body = self.compile(&packet.body, &base, self.snapshots, (packet.rows, rows))?;
             let head = self.compile(&packet.head, &base, self.snapshots, (packet.rows, rows))?;
-            self.packets
-                .insert(rows, Rc::new(Execution { packet, body, head }));
+            self.packets.insert(
+                rows,
+                Rc::new(Execution {
+                    packet,
+                    body,
+                    head,
+                    captured: true,
+                }),
+            );
         }
         self.touch_packet(rows);
         Ok(())
@@ -408,6 +415,7 @@ impl Worker {
                     for step in execution.body.iter().chain(head) {
                         match step {
                             Step::Graph(graph) => graph.execute_on_stream(stream)?,
+                            Step::Segment(segment) => segment.execute_on_stream(stream)?,
                             Step::W4(plan) => plan.execute_on_stream(stream)?,
                             Step::Embed { .. } => {
                                 self.session.upload_inputs(
@@ -521,6 +529,7 @@ impl Worker {
             let t = Instant::now();
             let submission = match step {
                 Step::Graph(program) => program.enqueue(&self.session).map(|_| ()),
+                Step::Segment(segment) => segment.enqueue(&self.session).map(|_| ()),
                 Step::W4(plan) => plan.enqueue(&self.session).map(|_| ()),
                 _ => Ok(()),
             };
@@ -528,7 +537,7 @@ impl Worker {
             let elapsed = t.elapsed().as_secs_f64();
             let stats = self.steps.entry(tokens.len()).or_default();
             match step {
-                Step::Graph(_) => {
+                Step::Graph(_) | Step::Segment(_) => {
                     stats.graph.0 += 1;
                     stats.graph.1 += elapsed;
                 }
@@ -538,7 +547,7 @@ impl Worker {
                 }
                 _ => {}
             }
-            if matches!(step, Step::Graph(_) | Step::W4(_)) {
+            if matches!(step, Step::Graph(_) | Step::Segment(_) | Step::W4(_)) {
                 return result;
             }
             result?;
@@ -549,7 +558,7 @@ impl Worker {
         let rows = tokens.len();
         let stats = self.steps.entry(rows).or_default();
         match step {
-            Step::Graph(_) => {
+            Step::Graph(_) | Step::Segment(_) => {
                 stats.graph.0 += 1;
                 stats.graph.1 += elapsed;
             }
@@ -582,6 +591,9 @@ impl Worker {
         match step {
             Step::Graph(program) => {
                 program.enqueue(&self.session)?;
+            }
+            Step::Segment(segment) => {
+                segment.enqueue(&self.session)?;
             }
             Step::W4(plan) => {
                 plan.enqueue(&self.session)?;

@@ -100,6 +100,12 @@ pub(super) struct Owner {
     pub buffers: BTreeMap<String, Buffer>,
     pub history: Vec<u32>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CacheState {
+    Missing,
+    Direct,
+    Graph,
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Key {
     family: (bool, usize),
@@ -643,9 +649,18 @@ impl Worker {
         runtime.owners.clear();
         Ok(())
     }
-    pub(super) fn batch_cached(&self, layout: &Layout) -> Result<bool> {
+    pub(super) fn batch_cached(&self, layout: &Layout) -> Result<CacheState> {
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
-        Ok(runtime.cache.contains_key(&runtime.key(layout)?))
+        Ok(runtime
+            .cache
+            .get(&runtime.key(layout)?)
+            .map_or(CacheState::Missing, |e| {
+                if e.captured {
+                    CacheState::Graph
+                } else {
+                    CacheState::Direct
+                }
+            }))
     }
     pub(super) fn invalidate_batch(&mut self, layout: &Layout) -> Result<()> {
         self.session.synchronize()?;
@@ -656,19 +671,14 @@ impl Worker {
         self.w4.retain(|_, w| w.strong_count() > 0);
         self.reserve_batch_memory(3 << 30, "coordinated Graph preparation")
     }
-    pub(super) fn prepare_batch(&mut self, layout: &Layout) -> Result<()> {
+    pub(super) fn prepare_batch(&mut self, layout: &Layout, capture: bool) -> Result<()> {
         let key = self
             .batch
             .as_ref()
             .ok_or("Missing batch runtime")?
             .key(layout)?;
-        if !self
-            .batch
-            .as_ref()
-            .ok_or("Missing batch runtime")?
-            .cache
-            .contains_key(&key)
-        {
+        let previous = self.batch.as_ref().unwrap().cache.get(&key).cloned();
+        if previous.as_ref().is_none_or(|e| capture && !e.captured) {
             let started = std::time::Instant::now();
             let before = (
                 self.phases.warmups.1,
@@ -699,34 +709,49 @@ impl Worker {
                 return Err("Batch exceeds its family row capacity".into());
             }
             let base = self.package.clone();
-            let body = self.compile_bound(
-                &packet.body,
-                &base,
-                self.snapshots,
-                (packet.rows, layout.rows.total),
-                Some(layout),
-            )?;
-            let head = if layout.outputs.is_empty() {
-                vec![]
+            let (body, head) = if let Some(previous) = &previous {
+                (
+                    self.capture_steps(&previous.body)?,
+                    self.capture_steps(&previous.head)?,
+                )
             } else {
-                self.compile_bound(
-                    &packet.head,
+                let body = self.compile_bound(
+                    &packet.body,
                     &base,
-                    false,
+                    self.snapshots,
                     (packet.rows, layout.rows.total),
                     Some(layout),
-                )?
+                    capture,
+                )?;
+                let head = if layout.outputs.is_empty() {
+                    vec![]
+                } else {
+                    self.compile_bound(
+                        &packet.head,
+                        &base,
+                        false,
+                        (packet.rows, layout.rows.total),
+                        Some(layout),
+                        capture,
+                    )?
+                };
+                (body, head)
             };
-            self.batch
-                .as_mut()
-                .unwrap()
-                .cache
-                .insert(key.clone(), Rc::new(Execution { packet, body, head }));
+            self.batch.as_mut().unwrap().cache.insert(
+                key.clone(),
+                Rc::new(Execution {
+                    packet,
+                    body,
+                    head,
+                    captured: capture,
+                }),
+            );
             if self.rank == 0 && std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
                 eprintln!(
                     "A2 packet prepare {}",
                     serde_json::json!({
-                        "rows": key.rows, "decode": layout.decode,
+                        "rows": key.rows, "decode": layout.decode, "capture": capture,
+                        "promotion": previous.is_some(),
                         "owner_lengths": layout.segments.iter().map(|s| s.tokens).collect::<Vec<_>>(),
                         "decoder_rows": key.decoder_rows, "outputs": key.outputs,
                         "work_rows": key.work_rows, "wall_s": started.elapsed().as_secs_f64(),

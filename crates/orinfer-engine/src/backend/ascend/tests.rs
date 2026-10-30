@@ -109,6 +109,14 @@ impl Fixture {
                 .unwrap()(index);
         }
     }
+    pub(super) fn pending_jobs(&self) -> i32 {
+        // SAFETY: The private CPU fixture exports this exact zero-argument ABI.
+        unsafe {
+            self.library
+                .get::<unsafe extern "C" fn() -> i32>(b"test_pending_jobs\0")
+                .unwrap()()
+        }
+    }
     pub(super) fn assert_clean(&mut self) {
         self.driver.take();
         for index in 0..5 {
@@ -834,6 +842,27 @@ fn failed_completion_retires_and_quarantines_dma_backing() {
         0,
         "unfenced context must not finalize ACL"
     );
+}
+
+#[test]
+fn retirement_during_enqueue_quarantines_backing_even_if_main_fence_succeeds() {
+    let fixture = Fixture::new();
+    let session = fixture.session();
+    let buffer = session.allocate(8).unwrap();
+    // SAFETY: This simulates an unfenced auxiliary stream by retiring the
+    // context during submission; no unretained pointers are submitted.
+    let result = unsafe {
+        session.submit_compute(vec![buffer.clone()], Box::new(()), |_| {
+            session.context.retire();
+            Err("simulated auxiliary fence failure".into())
+        })
+    };
+    assert!(result.is_err());
+    assert!(session.allocate(1).is_err());
+    drop((buffer, session));
+    assert_eq!(fixture.counter(0), 1);
+    assert_eq!(fixture.counter(4), 1);
+    assert_eq!(fixture.counter(6), 0);
 }
 
 #[test]

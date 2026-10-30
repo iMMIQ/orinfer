@@ -3,7 +3,11 @@ use super::super::{
     hccl::RootInfo,
     runtime::{Limits, Session},
 };
-use super::{Model, SharedTables, Worker, affinity, batch::Layout, load_spec};
+use super::{
+    Model, SharedTables, Worker, affinity,
+    batch::{CacheState, Layout},
+    load_spec,
+};
 use crate::artifact::Result;
 use std::{
     collections::BTreeMap,
@@ -20,7 +24,7 @@ pub(super) enum Command {
     Release(Option<usize>),
     Cached(Layout),
     Invalidate(Layout),
-    Prepare(Layout),
+    Prepare(Layout, bool),
     Forward(Layout, Vec<Vec<u32>>, bool),
     Save {
         owner: usize,
@@ -38,7 +42,7 @@ pub(super) enum Command {
 }
 pub(super) enum Reply {
     Ready,
-    Cached(bool),
+    Cached(CacheState),
     Outputs(Vec<Output>),
     Bytes(usize),
     Allocations(BTreeMap<u64, usize>),
@@ -183,8 +187,8 @@ impl Team {
                             Command::Invalidate(layout) => {
                                 worker.invalidate_batch(&layout).map(|_| Reply::Ready)
                             }
-                            Command::Prepare(layout) => {
-                                worker.prepare_batch(&layout).map(|_| Reply::Ready)
+                            Command::Prepare(layout, capture) => {
+                                worker.prepare_batch(&layout, capture).map(|_| Reply::Ready)
                             }
                             Command::Forward(layout, tokens, full) => {
                                 worker.forward_batch(&layout, &tokens, full).map(|values| {
@@ -409,6 +413,17 @@ fn forward(
 ) -> Result<(Vec<Output>, f64, f64)> {
     forward_with(peers, layout, tokens, full, || {})
 }
+/// Every rank changes execution mode together. Any miss resets the shared
+/// class to direct; a uniformly present direct class is promoted on reuse.
+fn preparation(states: &[CacheState]) -> Result<(bool, bool)> {
+    if states.is_empty() {
+        return Err("Missing A2 TP cache states".into());
+    }
+    let present = !states.contains(&CacheState::Missing);
+    let uniform = states.iter().all(|s| *s == states[0]);
+    Ok((!present || !uniform, present))
+}
+
 fn forward_with(
     peers: &[Peer],
     layout: Layout,
@@ -418,13 +433,18 @@ fn forward_with(
 ) -> Result<(Vec<Output>, f64, f64)> {
     let started = Instant::now();
     let cached = exchange(peers, Command::Cached(layout.clone()))?;
-    if !cached
-        .iter()
-        .all(|reply| matches!(reply, Reply::Cached(true)))
-    {
+    let states = cached
+        .into_iter()
+        .map(|reply| match reply {
+            Reply::Cached(state) => Ok(state),
+            _ => Err("Invalid A2 cache state reply".to_string()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (invalidate, capture) = preparation(&states)?;
+    if invalidate {
         exchange(peers, Command::Invalidate(layout.clone()))?;
     }
-    exchange(peers, Command::Prepare(layout.clone()))?;
+    exchange(peers, Command::Prepare(layout.clone(), capture))?;
     let prepare_s = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let command = Command::Forward(layout, tokens, full);
@@ -474,11 +494,17 @@ mod tests {
     use super::*;
     #[test]
     fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
-        for statuses in [[true, true], [true, false]] {
+        for statuses in [
+            [CacheState::Graph, CacheState::Graph],
+            [CacheState::Direct, CacheState::Direct],
+            [CacheState::Graph, CacheState::Missing],
+            [CacheState::Direct, CacheState::Graph],
+            [CacheState::Missing, CacheState::Missing],
+        ] {
             std::thread::scope(|scope| {
                 let mut peers = vec![];
                 let mut maintained = vec![];
-                let recapture = !statuses.iter().all(|&hit| hit);
+                let (recapture, capture) = preparation(&statuses).unwrap();
                 for hit in statuses {
                     let (send, commands) = mpsc::channel();
                     let (reply, receive) = mpsc::channel();
@@ -500,7 +526,7 @@ mod tests {
                         }
                         assert!(matches!(
                             commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                            Command::Prepare(_)
+                            Command::Prepare(_, mode) if mode == capture
                         ));
                         reply.send(Ok(Reply::Ready)).unwrap();
                         assert!(matches!(
@@ -615,10 +641,16 @@ mod state_tests {
         team.forward(partial_a.clone(), tokens(&partial_a), true)
             .unwrap();
         assert!(
+            team.exchange(Command::Cached(partial_a.clone()))
+                .unwrap()
+                .iter()
+                .all(|r| matches!(r, Reply::Cached(CacheState::Direct)))
+        );
+        assert!(
             team.exchange(Command::Cached(partial_b.clone()))
                 .unwrap()
                 .iter()
-                .all(|r| matches!(r, Reply::Cached(false))),
+                .all(|r| matches!(r, Reply::Cached(CacheState::Missing))),
             "Partial rank aliases must never share a global cache class"
         );
         team.exchange(Command::Reset(vec![7, 17])).unwrap();
@@ -628,13 +660,19 @@ mod state_tests {
             team.exchange(Command::Cached(partial_a.clone()))
                 .unwrap()
                 .iter()
-                .all(|r| matches!(r, Reply::Cached(true)))
+                .all(|r| matches!(r, Reply::Cached(CacheState::Direct | CacheState::Graph)))
         );
         team.exchange(Command::Reset(vec![7, 17])).unwrap();
         let reused = team
             .forward(partial_a.clone(), tokens(&partial_a), true)
             .unwrap()
             .0;
+        assert!(
+            team.exchange(Command::Cached(partial_a.clone()))
+                .unwrap()
+                .iter()
+                .all(|r| matches!(r, Reply::Cached(CacheState::Graph)))
+        );
         team.exchange(Command::Reset(vec![7, 17])).unwrap();
         team.exchange(Command::Invalidate(partial_a.clone()))
             .unwrap();
@@ -644,7 +682,7 @@ mod state_tests {
             .0;
         same(&reused, &fresh);
         eprintln!(
-            "A2 graph partial-rank aliases remain distinct; alternating graph cache hits equal fresh capture"
+            "A2 graph partial-rank aliases remain distinct; alternating graph cache hits equal fresh direct execution"
         );
         for (name, a, b, roles) in [
             ("short", [33, 95], [35, 93], [Role::Final; 2]),
@@ -664,7 +702,7 @@ mod state_tests {
                 team.exchange(Command::Cached(b.clone()))
                     .unwrap()
                     .iter()
-                    .all(|r| matches!(r, Reply::Cached(true))),
+                    .all(|r| matches!(r, Reply::Cached(CacheState::Direct | CacheState::Graph))),
                 "{name} must reuse the captured launches"
             );
             team.exchange(Command::Reset(vec![7, 17])).unwrap();
@@ -680,7 +718,7 @@ mod state_tests {
             }
             same(&reused, &fresh);
             eprintln!(
-                "A2 graph {name}: changed length reuse equals a fresh capture, complete logits"
+                "A2 graph {name}: changed length reuse equals a fresh direct execution, complete logits"
             );
         }
         team.exchange(Command::Reset(vec![7, 17])).unwrap();
@@ -701,7 +739,7 @@ mod state_tests {
             team.exchange(Command::Cached(b.clone()))
                 .unwrap()
                 .iter()
-                .all(|r| matches!(r, Reply::Cached(true)))
+                .all(|r| matches!(r, Reply::Cached(CacheState::Direct | CacheState::Graph)))
         );
         restore();
         let reused = team.forward(b.clone(), tokens(&b), true).unwrap().0;
@@ -721,7 +759,7 @@ mod state_tests {
         );
         team.exchange(Command::Evict(1)).unwrap();
         eprintln!(
-            "A2 graph mixed: reversed owner roles reuse equals fresh capture; changed input executes"
+            "A2 graph mixed: reversed owner roles reuse equals fresh direct execution; changed input executes"
         );
         drop(team);
         drop(lock);

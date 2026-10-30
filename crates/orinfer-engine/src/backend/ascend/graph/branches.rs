@@ -16,6 +16,28 @@ pub(in crate::backend::ascend) struct Branches {
 }
 
 impl Branches {
+    /// A persistent direct segment can fail before its join is submitted.
+    /// Fence its auxiliary work before the enclosing packet releases operands.
+    pub(in crate::backend::ascend) fn fence(&self) -> Result<()> {
+        let result = (|| {
+            let _current = self.context.enter()?;
+            for stream in
+                std::iter::once(self.context.compute_stream()).chain(self.streams.iter().copied())
+            {
+                check(
+                    // SAFETY: The retained current context owns every stream.
+                    unsafe { (self.context.api.sync_stream)(stream, self.context.timeout_ms()) },
+                    "fence ACL branch after failed submission",
+                )?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.context.retire();
+        }
+        result
+    }
+
     pub(in crate::backend::ascend) fn new(
         session: &Session,
         depths: &[usize],

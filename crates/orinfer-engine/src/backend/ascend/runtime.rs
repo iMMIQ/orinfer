@@ -608,7 +608,7 @@ impl Session {
             )
         });
         if let Err(error) = result {
-            if self.context.sync(stream).is_err() {
+            if self.context.sync(stream).is_err() || self.context.poisoned.get() {
                 std::mem::forget(retained);
                 std::mem::forget(Rc::clone(&self.context));
             }

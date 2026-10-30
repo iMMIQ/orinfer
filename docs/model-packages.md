@@ -608,6 +608,10 @@ A2 服务在当前没有活跃 decoder 时按执行包的 token 行容量填充 
 
 A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 owner-work launch 行数缓存。加载时从全部 rank／family 提取共享 launch 描述，把每种分片的全 rank 行数纳入身份，保持各 rank 的复用关系一致；长度策略范围和 decoder 边界同时保留。这些编译参数相同的 owner 长度组合可共享已捕获程序。精确 owner、长度、角色和输出位置继续通过 stream 有序的地址表与 work 表更新。各 rank 在捕获前统一探测缓存，任一未命中时仍全体准备相同请求。`ORINFER_A2_BATCH_PROFILE=1` 输出 rank 0 冷准备的绑定、ACLNN、预热与捕获耗时。
 
+公共多 owner 入口按复用情况晋升 Graph：全局形状首次出现时绑定并直接提交同一套算子，再次命中时全体 rank 预热并捕获原绑定的 segment，后续使用 replay。晋升保留原 kernel、W4 计划、工作区及分支资源；每次实际捕获前仍执行完整 segment 预热。任一 rank 缺少缓存时全体重新从直接执行开始，已有缓存的模式不一致时统一重新捕获。直接提交与 Graph 共用指令顺序和完成事件的资源所有权；未能提交 join 的失败路径先排空辅助 stream，无法确认完成的资源随退休会话隔离。冷准备日志另含 `capture` 和 `promotion` 字段。
+
+晋升耗时计入再次命中该形状的请求，可能形成一次性的延迟尖峰；性能同时比较完整请求序列与热态吞吐。固定 Mini 短测使用相同源片段和输出长度目标，分别记录 warmup、已完成的 profiling 请求及未完成的回放范围。
+
 `--length-input` 让同一索引 Cube 工厂读取每行的有效前缀长度，按 owner 内单调递增的位置决定实际 key tile 数，写入有效 score 前缀。TopK 使用相同长度屏蔽其余容量，完整有效候选与原有归约顺序保持一致。此模式以长度向量替代稠密因果索引矩阵，同时适用于 decode 和 prefill。`--gather-slots` 选择同一 INT8 gather 工厂每次转换的槽位数。可重复提供 `--reuse-cache /path/to/compiled/cache`，复用完整编译对象；编译器仍校验对象身份和库哈希。
 
 当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样及 prefix 恢复。工具定义／工具调用、媒体、MTP、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的实验性原生计划封装，由上述 Python 发布器生成；通用模型 cdylib C ABI 打包、`package install` 和 `validate-model` 尚未接通此封装。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。

@@ -235,8 +235,10 @@ enum Instruction {
         buffer: String,
     },
 }
+#[derive(Clone)]
 enum Step {
-    Graph(super::graph::Graph),
+    Graph(Rc<super::graph::Graph>),
+    Segment(Rc<Segment>),
     W4(Rc<GroupedW4A8>),
     Route {
         indices: Buffer,
@@ -342,10 +344,46 @@ fn enqueue_segment(
     }
     Ok(())
 }
+/// Bound launches and branch resources shared by direct execution and capture.
+struct Segment {
+    ops: Rc<Vec<SegmentOp>>,
+    comm: Communicator,
+    parallel: Option<Rc<super::graph::Branches>>,
+}
+impl Segment {
+    fn fence_result<T>(&self, result: Result<T>) -> Result<T> {
+        result.or_else(|error| {
+            if let Some(parallel) = &self.parallel {
+                parallel
+                    .fence()
+                    .map_err(|fence| format!("{error}; {fence}"))?;
+            }
+            Err(error)
+        })
+    }
+    fn execute_on_stream(&self, stream: super::api::Handle) -> Result<()> {
+        self.fence_result(enqueue_segment(
+            &self.ops,
+            &self.comm,
+            self.parallel.as_deref(),
+            stream,
+        ))
+    }
+    fn enqueue(self: &Rc<Self>, session: &Session) -> Result<Ticket> {
+        // SAFETY: This bound segment owns every operand, executor, communicator
+        // and branch. The completion retains it and fences partial submission.
+        unsafe {
+            session.submit_compute(vec![], Box::new(Rc::clone(self)), |stream| {
+                self.execute_on_stream(stream)
+            })
+        }
+    }
+}
 struct Execution {
     packet: Packet,
     body: Vec<Step>,
     head: Vec<Step>,
+    captured: bool,
 }
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct W4Key {
@@ -781,7 +819,15 @@ impl Worker {
             let head = worker.compile(&packet.head, package, snapshots, (packet.rows, actual))?;
             if worker
                 .packets
-                .insert(actual, Rc::new(Execution { packet, body, head }))
+                .insert(
+                    actual,
+                    Rc::new(Execution {
+                        packet,
+                        body,
+                        head,
+                        captured: true,
+                    }),
+                )
                 .is_some()
             {
                 return Err("Duplicate packet row count".into());
@@ -820,7 +866,7 @@ impl Worker {
         snapshots: bool,
         extent: (usize, usize),
     ) -> Result<Vec<Step>> {
-        self.compile_bound(instructions, base, snapshots, extent, None)
+        self.compile_bound(instructions, base, snapshots, extent, None, true)
     }
     fn compile_bound(
         &mut self,
@@ -829,6 +875,7 @@ impl Worker {
         snapshots: bool,
         extent: (usize, usize),
         layout: Option<&batch::Layout>,
+        capture: bool,
     ) -> Result<Vec<Step>> {
         let (mut capacity, actual) = extent;
         let mut active_rows = actual;
@@ -920,7 +967,7 @@ impl Worker {
                 // Snapshots only observe device state for tracing; without
                 // tracing the step is inert and kernels merge across it.
                 if snapshots {
-                    self.capture_pending(&mut pending, &mut steps)?;
+                    self.capture_pending(&mut pending, &mut steps, capture)?;
                     fork_count = 0;
                     steps.push(Step::Snapshot {
                         name: name.clone(),
@@ -1259,14 +1306,14 @@ impl Worker {
                 if capture_w4 {
                     pending.push(SegmentOp::W4(plan));
                 } else {
-                    self.capture_pending(&mut pending, &mut steps)?;
+                    self.capture_pending(&mut pending, &mut steps, capture)?;
                     fork_count = 0;
                     steps.push(Step::W4(plan));
                 }
                 continue;
             }
             if !pending.is_empty() {
-                self.capture_pending(&mut pending, &mut steps)?;
+                self.capture_pending(&mut pending, &mut steps, capture)?;
                 fork_count = 0;
             }
             steps.push(match instruction {
@@ -1326,7 +1373,7 @@ impl Worker {
             });
         }
         if !pending.is_empty() {
-            self.capture_pending(&mut pending, &mut steps)?;
+            self.capture_pending(&mut pending, &mut steps, capture)?;
         }
         Ok(steps)
     }
@@ -1361,6 +1408,7 @@ impl Worker {
         &mut self,
         pending: &mut Vec<SegmentOp>,
         steps: &mut Vec<Step>,
+        capture: bool,
     ) -> Result<()> {
         let depths = branches::validate(pending)?;
         let ops = Rc::new(pending.clone());
@@ -1374,37 +1422,56 @@ impl Worker {
                 Box::new((Rc::clone(&ops), comm.clone())),
             )?)
         };
-        let _current = self.session.context.enter()?;
+        let segment = Rc::new(Segment {
+            ops,
+            comm,
+            parallel,
+        });
+        steps.push(if capture {
+            Step::Graph(Rc::new(self.capture_segment(segment)?))
+        } else {
+            Step::Segment(segment)
+        });
+        pending.clear();
+        Ok(())
+    }
+    fn capture_segment(&mut self, segment: Rc<Segment>) -> Result<super::graph::Graph> {
         let t = Instant::now();
-        // SAFETY: The warmup completion retains every operand and branch.
-        // Partial submission errors fence the main stream; Branches also
-        // fences auxiliary work if failure occurs before a matching join.
-        let warmup = unsafe {
-            self.session.submit_compute(
-                vec![],
-                Box::new((Rc::clone(&ops), comm.clone(), parallel.clone())),
-                |stream| enqueue_segment(&ops, &comm, parallel.as_deref(), stream),
-            )
-        }?;
-        warmup.wait()?;
+        // Warm every bound segment immediately before capture, even when its
+        // direct form has executed before: CANN lazy capture state requires it.
+        segment.enqueue(&self.session)?.wait()?;
         self.phases.warmups.0 += 1;
         self.phases.warmups.1 += t.elapsed().as_secs_f64();
         let t = Instant::now();
-        // SAFETY: The keepalive segment retains every bound kernel, buffer,
-        // communicator and ACLNN plan used by the replayed launches; all
-        // addresses are stable for the lifetime of the captured graph.
-        let graph = unsafe {
-            super::graph::Graph::capture(
-                &self.session,
-                Box::new((Rc::clone(&ops), comm.clone(), parallel.clone())),
-                move |stream| enqueue_segment(&ops, &comm, parallel.as_deref(), stream),
-            )?
+        // SAFETY: The segment retains all stable native operands, executors,
+        // collective resources and branch events through graph destruction.
+        let result = unsafe {
+            super::graph::Graph::capture(&self.session, Box::new(Rc::clone(&segment)), |stream| {
+                enqueue_segment(
+                    &segment.ops,
+                    &segment.comm,
+                    segment.parallel.as_deref(),
+                    stream,
+                )
+            })
         };
+        // Capture rolls back before branch fencing; synchronizing a stream
+        // while it is still being captured is not a valid cleanup operation.
+        let graph = segment.fence_result(result)?;
         self.phases.captures.0 += 1;
         self.phases.captures.1 += t.elapsed().as_secs_f64();
-        steps.push(Step::Graph(graph));
-        pending.clear();
-        Ok(())
+        Ok(graph)
+    }
+    fn capture_steps(&mut self, steps: &[Step]) -> Result<Vec<Step>> {
+        steps
+            .iter()
+            .map(|step| match step {
+                Step::Segment(segment) => self
+                    .capture_segment(Rc::clone(segment))
+                    .map(|graph| Step::Graph(Rc::new(graph))),
+                _ => Ok(step.clone()),
+            })
+            .collect()
     }
     fn reset(&self) -> Result<()> {
         let names: std::collections::BTreeSet<_> = self

@@ -4,6 +4,95 @@ use super::{
 };
 
 #[test]
+fn direct_segments_retain_parallel_resources_and_fence_partial_errors() {
+    use super::{Segment, SegmentOp};
+    use crate::backend::ascend::{
+        graph::Branches,
+        hccl::{Communicator, RootInfo},
+        kernels::Kernel,
+        tests::Fixture,
+    };
+    use std::rc::Rc;
+    for fail_before_join in [false, true] {
+        let mut fixture = Fixture::new();
+        let session = fixture.session();
+        let (path, _) = fixture.aot();
+        let root =
+            RootInfo::fixture(&session, &path.parent().unwrap().join("libacl-fixture.so")).unwrap();
+        let comm = Communicator::join(&session, &root, 0).unwrap();
+        let input = session.allocate(4).unwrap();
+        let output = session.allocate(4).unwrap();
+        let reduced = session.allocate(8).unwrap();
+        session
+            .upload(&input, 0, &[1, 2, 3, 4])
+            .unwrap()
+            .wait()
+            .unwrap();
+        let kernel = Kernel::load(&session, &path, &[input.clone(), output.clone()]).unwrap();
+        let mut ops = vec![
+            SegmentOp::Fork(0),
+            SegmentOp::Kernel(kernel),
+            SegmentOp::Switch(0),
+            SegmentOp::Reduce {
+                source: input.clone(),
+                destination: reduced.clone(),
+                elements: 1,
+                element: Element::Int32,
+                scatter: false,
+            },
+        ];
+        if fail_before_join {
+            // The fixture fails a valid native collective after both branches queue work.
+            ops.push(SegmentOp::Gather {
+                source: input.clone(),
+                destination: reduced.clone(),
+                elements: 1,
+                element: Element::Int32,
+            });
+        }
+        ops.push(SegmentOp::Join(0));
+        let depths = branches::validate(&ops).unwrap();
+        let ops = Rc::new(ops);
+        let parallel =
+            Branches::new(&session, &depths, Box::new((Rc::clone(&ops), comm.clone()))).unwrap();
+        let segment = Rc::new(Segment {
+            ops,
+            comm,
+            parallel: Some(parallel),
+        });
+        if fail_before_join {
+            fixture.failure(14);
+        }
+        let submitted = segment.enqueue(&session);
+        if fail_before_join {
+            assert!(submitted.is_err());
+            // Segment remains cached/alive; its Drop cannot supply this fence.
+            assert_eq!(fixture.pending_jobs(), 0);
+        }
+        drop((segment, input, reduced, root));
+        if fail_before_join {
+            // A native HCCL failure retires the context. The failed packet
+            // keeps all native backing even after our explicit branch fence.
+            assert_eq!(fixture.counter(8), 1);
+            assert_eq!(session.allocated_bytes(), 16);
+            drop((output, session));
+            assert_eq!(fixture.counter(0), 3);
+            assert_eq!(fixture.counter(4), 1);
+            assert_eq!(fixture.counter(6), 0);
+            continue;
+        }
+        assert_eq!(session.allocated_bytes(), 16);
+        assert_eq!(fixture.counter(8), 1);
+        submitted.unwrap().wait().unwrap();
+        assert_eq!(fixture.counter(8), 0);
+        assert_eq!(session.allocated_bytes(), 4);
+        assert_eq!(session.download(&output, 0, 4).unwrap(), [1, 2, 3, 4]);
+        drop((output, session));
+        fixture.assert_clean();
+    }
+}
+
+#[test]
 fn owner_batch_ranges_share_dispatch_validation_from_one_through_capacity() {
     let short = packet(2048, 1, Some(511));
     let long = packet(2048, 512, None);
