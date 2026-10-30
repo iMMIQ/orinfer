@@ -41,6 +41,7 @@ pub(super) enum Reply {
     Cached(bool),
     Outputs(Vec<Output>),
     Bytes(usize),
+    Allocations(BTreeMap<u64, usize>),
     RoutingGroups(Vec<RoutingGroup>),
 }
 #[derive(serde::Serialize)]
@@ -156,16 +157,24 @@ impl Team {
                         return;
                     }
                     let mut snapshots = BTreeMap::new();
+                    let mut lineage = BTreeMap::new();
                     while let Ok(command) = commands.recv() {
                         let result = match command {
                             Command::Stop => break,
                             Command::Admit(ids) => worker.admit(&ids).map(|_| Reply::Ready),
                             Command::Reset(ids) => ids
                                 .into_iter()
-                                .try_for_each(|id| worker.reset_owner(id))
+                                .try_for_each(|id| {
+                                    lineage.remove(&id);
+                                    worker.reset_owner(id)
+                                })
                                 .map(|_| Reply::Ready),
-                            Command::Release(None) => worker.release_owners().map(|_| Reply::Ready),
+                            Command::Release(None) => {
+                                lineage.clear();
+                                worker.release_owners().map(|_| Reply::Ready)
+                            }
                             Command::Release(Some(owner)) => {
+                                lineage.remove(&owner);
                                 worker.release_owner(owner).map(|_| Reply::Ready)
                             }
                             Command::Cached(layout) => {
@@ -196,18 +205,28 @@ impl Team {
                                 owner,
                                 snapshot,
                                 complete,
-                            } => worker.save_owner(owner, complete).map(|saved| {
-                                let bytes = saved.bytes();
-                                snapshots.insert(snapshot, saved);
-                                Reply::Bytes(bytes)
-                            }),
+                            } => {
+                                let parent = lineage.get(&owner).and_then(|id| snapshots.get(id));
+                                worker
+                                    .save_owner(owner, complete, snapshot, parent)
+                                    .map(|saved| {
+                                        let allocations = saved.allocations();
+                                        snapshots.insert(snapshot, saved);
+                                        lineage.insert(owner, snapshot);
+                                        Reply::Allocations(allocations)
+                                    })
+                            }
                             Command::Restore { owner, snapshot } => snapshots
                                 .get(&snapshot)
                                 .ok_or_else(|| "Missing A2 prefix snapshot".into())
                                 .and_then(|saved| worker.restore_owner(owner, saved))
-                                .map(|_| Reply::Ready),
+                                .map(|_| {
+                                    lineage.insert(owner, snapshot);
+                                    Reply::Ready
+                                }),
                             Command::Evict(snapshot) => {
                                 snapshots.remove(&snapshot);
+                                lineage.retain(|_, id| *id != snapshot);
                                 Ok(Reply::Ready)
                             }
                             Command::Memory => worker
@@ -261,12 +280,37 @@ impl Team {
         forward_with(&self.peers, layout, tokens, full, maintenance)
     }
     pub fn minimum_bytes(&self, command: Command) -> Result<usize> {
-        self.bytes(command, false)
+        self.bytes(command)
     }
-    pub fn maximum_bytes(&self, command: Command) -> Result<usize> {
-        self.bytes(command, true)
+    pub fn snapshot_allocations(
+        &self,
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    ) -> Result<BTreeMap<u64, usize>> {
+        let mut result: Option<BTreeMap<u64, usize>> = None;
+        for reply in self.exchange(Command::Save {
+            owner,
+            snapshot,
+            complete,
+        })? {
+            let Reply::Allocations(allocations) = reply else {
+                return Err("Invalid A2 snapshot allocation reply".into());
+            };
+            if let Some(combined) = &mut result {
+                if !combined.keys().eq(allocations.keys()) {
+                    return Err("TP snapshot allocation lineage differs".into());
+                }
+                for (id, bytes) in allocations {
+                    *combined.get_mut(&id).unwrap() = combined[&id].max(bytes);
+                }
+            } else {
+                result = Some(allocations);
+            }
+        }
+        result.ok_or_else(|| "Empty A2 snapshot team".into())
     }
-    fn bytes(&self, command: Command, maximum: bool) -> Result<usize> {
+    fn bytes(&self, command: Command) -> Result<usize> {
         self.exchange(command)?
             .into_iter()
             .map(|reply| match reply {
@@ -275,7 +319,7 @@ impl Team {
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
-            .reduce(|a, b| if maximum { a.max(b) } else { a.min(b) })
+            .reduce(usize::min)
             .ok_or_else(|| "Empty A2 team".into())
     }
 }
@@ -630,15 +674,26 @@ mod state_tests {
             let input = (0..length)
                 .map(|i| ((i * 73 + 11) % 129280) as u32)
                 .collect::<Vec<_>>();
-            for chunk in input.chunks(team.rows) {
+            let mut previous: Option<(u64, BTreeMap<u64, usize>)> = None;
+            for (index, chunk) in input.chunks(team.rows).enumerate() {
                 assert!(forward(17, chunk.to_vec(), false, false).is_empty());
+                let id = if (index + 1) * team.rows >= length {
+                    length as u64
+                } else {
+                    (2u64 << 32) + ((length as u64) << 16) + index as u64
+                };
+                let banks = team.snapshot_allocations(17, id, false).unwrap();
+                if let Some((old_id, old_banks)) = previous {
+                    if contract.state.iter().any(|s| s.append_only) {
+                        assert!(
+                            banks.keys().any(|id| old_banks.contains_key(id)),
+                            "closed KV banks must survive ancestor eviction"
+                        );
+                    }
+                    team.exchange(Command::Evict(old_id)).unwrap();
+                }
+                previous = Some((id, banks));
             }
-            team.exchange(Command::Save {
-                owner: 17,
-                snapshot: length as u64,
-                complete: false,
-            })
-            .unwrap();
             let tail = (0..128).map(|i| (i * 13 + 17) as u32).collect::<Vec<_>>();
             let mut expected = forward(17, tail.clone(), true, false);
             expected.extend(forward(17, vec![13], true, true));
@@ -664,6 +719,7 @@ mod state_tests {
                     complete: true,
                 })
                 .unwrap();
+                team.exchange(Command::Evict(length as u64)).unwrap();
             }
             actual.extend(forward(91, vec![13], true, true));
             for (a, b) in actual.iter().zip(&expected) {

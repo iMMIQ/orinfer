@@ -240,6 +240,12 @@ impl<T: Resident> Cache<T> {
         }
         allocations.values().sum()
     }
+    pub fn update_statistics(&self, statistics: &mut Statistics) {
+        statistics.resident_bytes = self.bytes;
+        statistics.logical_bytes = self.entries.values().map(|e| e.bytes).sum();
+        statistics.shared_bytes = statistics.logical_bytes.saturating_sub(self.bytes);
+        statistics.entries = self.entries.len();
+    }
     pub fn remove(&mut self, id: u64) -> Option<Entry<T>> {
         let entry = self.entries.remove(&id)?;
         self.root.remove(&entry.tokens, id);

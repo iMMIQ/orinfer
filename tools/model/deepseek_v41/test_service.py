@@ -1,7 +1,7 @@
 """CPU checks for explicit native A2 snapshot geometry."""
 
 import unittest
-from tools.model.deepseek_v41.service import state_layout
+from tools.model.deepseek_v41.service import enable_prefix_sharing, state_layout
 
 
 class StateLayoutTests(unittest.TestCase):
@@ -41,6 +41,23 @@ class StateLayoutTests(unittest.TestCase):
         self.assertEqual(items["cache.long.20"]["tokens_per_row"], 1)
         with self.assertRaisesRegex(ValueError, "SWA storage"):
             state_layout(self.model(262144, 4096))
+
+    def test_only_closed_linear_kv_rows_are_marked_shareable(self):
+        model = self.model(262144, 4096)
+        model["batch"]["state"] = state_layout(model, 4096)
+        self.assertTrue(all("append_only" not in s for s in model["batch"]["state"]))
+        enable_prefix_sharing(model)
+        states = {s["buffer"]: s for s in model["batch"]["state"]}
+        for name in (
+            "cache.long.2",
+            "cache.long.20",
+            "cache.long.2.scale",
+            "cache.key.20",
+            "cache.key_scale.20",
+        ):
+            self.assertTrue(states[name]["append_only"])
+        for name in ("cache.swa.0", "cache.swa.0.scale", "cache.ring.2"):
+            self.assertFalse(states[name].get("append_only", False))
 
 
 if __name__ == "__main__":

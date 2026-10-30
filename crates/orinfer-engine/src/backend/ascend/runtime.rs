@@ -838,30 +838,58 @@ impl Session {
         destination_offset: usize,
         bytes: usize,
     ) -> Result<Ticket> {
-        self.require(source)?;
-        self.require(destination)?;
-        let src = source.range(source_offset, bytes)?;
-        let dst = destination.range(destination_offset, bytes)?;
-        if bytes == 0
-            || (Rc::ptr_eq(&source.allocation, &destination.allocation)
-                && source.offset + source_offset < destination.offset + destination_offset + bytes
-                && destination.offset + destination_offset < source.offset + source_offset + bytes)
-        {
-            return Err("ACL device copy requires nonempty, nonoverlapping extents".into());
+        self.copy_many(&[(
+            source.clone(),
+            source_offset,
+            destination.clone(),
+            destination_offset,
+            bytes,
+        )])
+    }
+    /// Validate every span before submission and retain the whole ordered copy
+    /// batch through one completion. Cross-stream producers need a dependency.
+    pub(super) fn copy_many(
+        &self,
+        copies: &[(Buffer, usize, Buffer, usize, usize)],
+    ) -> Result<Ticket> {
+        if copies.is_empty() {
+            return Err("ACL device copy batch is empty".into());
+        }
+        let mut spans = Vec::with_capacity(copies.len());
+        let mut buffers = Vec::with_capacity(copies.len() * 2);
+        for (source, source_offset, destination, destination_offset, bytes) in copies {
+            self.require(source)?;
+            self.require(destination)?;
+            let src = source.range(*source_offset, *bytes)?;
+            let dst = destination.range(*destination_offset, *bytes)?;
+            if *bytes == 0
+                || (Rc::ptr_eq(&source.allocation, &destination.allocation)
+                    && source.offset + source_offset
+                        < destination.offset + destination_offset + bytes
+                    && destination.offset + destination_offset
+                        < source.offset + source_offset + bytes)
+            {
+                return Err("ACL device copy requires nonempty, nonoverlapping extents".into());
+            }
+            spans.push((src, dst, *bytes));
+            buffers.extend([source.clone(), destination.clone()]);
         }
         self.submit(
             self.context.compute,
             Retained {
-                _buffers: vec![source.clone(), destination.clone()],
+                _buffers: buffers,
                 _host: None,
                 _extra: None,
             },
             |stream| {
-                // SAFETY: Both checked, nonoverlapping spans are retained to the fence; D2D=3.
-                check(
-                    unsafe { (self.context.api.memcpy)(dst, bytes, src, bytes, 3, stream) },
-                    "ACL device copy",
-                )
+                for &(src, dst, bytes) in &spans {
+                    check(
+                        // SAFETY: All checked spans are retained through the batch fence; D2D=3.
+                        unsafe { (self.context.api.memcpy)(dst, bytes, src, bytes, 3, stream) },
+                        "ACL device copy",
+                    )?;
+                }
+                Ok(())
             },
         )
     }

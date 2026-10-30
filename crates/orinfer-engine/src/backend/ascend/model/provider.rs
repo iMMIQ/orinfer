@@ -45,12 +45,22 @@ struct Package {
 }
 struct Snapshot {
     id: u64,
-    bytes: usize,
+    banks: BTreeMap<u64, usize>,
     output: Option<Arc<Output>>,
 }
 impl Resident for Snapshot {
     fn allocations(&self, out: &mut BTreeMap<u64, usize>) {
-        out.insert(self.id, self.bytes);
+        // Even identities name device banks, odd identities name CPU heads.
+        // Every endpoint reports a shared bank with the same physical extent.
+        for (&id, &bytes) in &self.banks {
+            out.insert(id * 2, bytes);
+        }
+        if let Some(output) = &self.output {
+            out.insert(
+                self.id * 2 + 1,
+                output.logits.len() * 4 + std::mem::size_of::<Output>(),
+            );
+        }
     }
 }
 fn matched(cache: &Cache<Snapshot>, input: &[u32], reserve: usize) -> Option<u64> {
@@ -424,6 +434,7 @@ impl Runtime {
         if let Some(snapshot) = self.cache.evict_one() {
             self.team.exchange(Command::Evict(snapshot.id))?;
             self.prefix.evictions += 1;
+            self.cache.update_statistics(&mut self.prefix);
             Ok(true)
         } else {
             Ok(false)
@@ -576,20 +587,25 @@ impl Runtime {
         self.next_snapshot = self
             .next_snapshot
             .checked_add(1)
+            .filter(|&id| id <= u64::MAX / 2)
             .ok_or("A2 snapshot identity overflow")?;
         let id = self.next_snapshot;
-        let device_bytes = self.team.maximum_bytes(Command::Save {
-            owner: request.slot,
-            snapshot: id,
-            complete: output.is_some(),
-        })?;
+        let banks = self
+            .team
+            .snapshot_allocations(request.slot, id, output.is_some())?;
+        let device_bytes: usize = banks.values().sum();
         let bytes =
             device_bytes + output.map_or(0, |o| o.logits.len() * 4 + std::mem::size_of::<Output>());
+        let snapshot = Snapshot {
+            id,
+            banks,
+            output: output.cloned().map(Arc::new),
+        };
         if bytes > self.cache.budget {
             self.team.exchange(Command::Evict(id))?;
             return Ok(());
         }
-        while self.cache.bytes + bytes > self.cache.budget {
+        while self.cache.resident_with(Some(&snapshot)) > self.cache.budget {
             if !self.evict()? {
                 self.team.exchange(Command::Evict(id))?;
                 return Ok(());
@@ -610,21 +626,15 @@ impl Runtime {
         self.cache.insert(Entry::new(
             request.history[..count].to_vec(),
             Media::default(),
-            Snapshot {
-                id,
-                bytes,
-                output: output.cloned().map(Arc::new),
-            },
+            snapshot,
             bytes,
             0,
             output.is_some(),
         ));
         request.prefix.store_s += at.elapsed().as_secs_f64();
         request.prefix.checkpoints_stored += 1;
-        request.prefix.resident_bytes = self.cache.bytes;
-        request.prefix.entries = self.cache.entries.len();
-        self.prefix.resident_bytes = self.cache.bytes;
-        self.prefix.entries = self.cache.entries.len();
+        self.cache.update_statistics(&mut request.prefix);
+        self.cache.update_statistics(&mut self.prefix);
         Ok(())
     }
     pub fn share_prefill_checkpoint(
@@ -855,11 +865,9 @@ impl Runtime {
         self.release_resident(request.slot)?;
         self.active.remove(&request.slot);
         request.released = true;
-        request.prefix.resident_bytes = self.cache.bytes;
-        request.prefix.entries = self.cache.entries.len();
+        self.cache.update_statistics(&mut request.prefix);
         self.prefix = request.prefix.clone();
-        self.prefix.resident_bytes = self.cache.bytes;
-        self.prefix.entries = self.cache.entries.len();
+        self.cache.update_statistics(&mut self.prefix);
         Ok(())
     }
     pub fn generate(
@@ -934,6 +942,46 @@ mod tests {
             logits: vec![-1., 0., 3., 1.],
         })
     }
+    #[test]
+    fn shared_banks_and_cpu_heads_are_charged_once_after_parent_eviction() {
+        let mut cache = Cache::new(4096);
+        let head = output();
+        let head_bytes = head.logits.len() * 4 + std::mem::size_of::<Output>();
+        let parent = cache.insert(Entry::new(
+            vec![1, 2],
+            Media::default(),
+            Snapshot {
+                id: 2,
+                banks: [(1, 128), (2, 256)].into(),
+                output: Some(head),
+            },
+            384 + head_bytes,
+            0,
+            true,
+        ));
+        cache.insert(Entry::new(
+            vec![1, 2, 3],
+            Media::default(),
+            Snapshot {
+                id: 3,
+                banks: [(1, 128), (2, 256), (3, 512)].into(),
+                output: None,
+            },
+            896,
+            0,
+            false,
+        ));
+        let mut statistics = crate::prefix::Statistics::default();
+        cache.update_statistics(&mut statistics);
+        assert_eq!(statistics.resident_bytes, 896 + head_bytes);
+        assert_eq!(statistics.logical_bytes, 1280 + head_bytes);
+        assert_eq!(statistics.shared_bytes, 384);
+        cache.remove(parent).unwrap();
+        cache.update_statistics(&mut statistics);
+        assert_eq!(statistics.resident_bytes, 896);
+        assert_eq!(statistics.shared_bytes, 0);
+        assert_eq!(statistics.entries, 1);
+    }
     fn request(output: Arc<Output>, sampling: crate::sampling::Options) -> Request {
         Request {
             owner: 1,
@@ -965,7 +1013,7 @@ mod tests {
             Media::default(),
             Snapshot {
                 id: 1,
-                bytes: 0,
+                banks: BTreeMap::new(),
                 output: None,
             },
             0,
@@ -977,7 +1025,7 @@ mod tests {
             Media::default(),
             Snapshot {
                 id: 2,
-                bytes: 0,
+                banks: BTreeMap::new(),
                 output: None,
             },
             0,
@@ -990,7 +1038,7 @@ mod tests {
             Media::default(),
             Snapshot {
                 id: 3,
-                bytes: 0,
+                banks: BTreeMap::new(),
                 output: Some(output()),
             },
             0,

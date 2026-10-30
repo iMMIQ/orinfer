@@ -340,6 +340,44 @@ fn input_batch_copies_host_data_and_preserves_compute_reader_order() {
 }
 
 #[test]
+fn copy_batch_checks_every_span_before_queueing_and_retains_dropped_sources() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let source = session.allocate(8).unwrap();
+    let target = session.allocate(8).unwrap();
+    session
+        .upload(&source, 0, &[1, 2, 3, 4, 5, 6, 7, 8])
+        .unwrap()
+        .wait()
+        .unwrap();
+    session.fill(&target, 0).unwrap().wait().unwrap();
+    assert!(
+        session
+            .copy_many(&[
+                (source.clone(), 0, target.clone(), 0, 4),
+                (source.clone(), 7, target.clone(), 4, 2),
+            ])
+            .is_err()
+    );
+    assert_eq!(session.download(&target, 0, 8).unwrap(), [0; 8]);
+    let ticket = session
+        .copy_many(&[
+            (source.clone(), 4, target.clone(), 0, 4),
+            (source.clone(), 0, target.clone(), 4, 4),
+        ])
+        .unwrap();
+    drop(source);
+    assert!(!ticket.is_ready().unwrap());
+    ticket.wait().unwrap();
+    assert_eq!(
+        session.download(&target, 0, 8).unwrap(),
+        [5, 6, 7, 8, 1, 2, 3, 4]
+    );
+    drop((ticket, target, session));
+    fixture.assert_clean();
+}
+
+#[test]
 fn input_batch_validates_all_spans_before_submitting_and_fences_errors() {
     let mut fixture = Fixture::new();
     let session = fixture.session();

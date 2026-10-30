@@ -55,12 +55,27 @@ def state_layout(model, swa_storage_rows=0):
     return result
 
 
-def publish(plan, checkpoint, output):
+def enable_prefix_sharing(model):
+    for state in model["batch"]["state"]:
+        if (
+            state["buffer"].startswith(("cache.long.", "cache.key.", "cache.key_scale."))
+            and state["tokens_per_row"] in (1, 2)
+            and state["window"] is None
+            and not state.get("circular", False)
+        ):
+            # These writers commit a unique absolute row, with C2 slots
+            # published only after both tokens complete. Rings stay copied.
+            state["append_only"] = True
+
+
+def publish(plan, checkpoint, output, share_prefix_banks=False):
     model = deepcopy(json.loads(plan.read_text()))
     if not model.get("batch"):
         raise ValueError("Native A2 service requires shared rows and owner-private state")
     if not model["batch"].get("state"):
         model["batch"]["state"] = state_layout(model)
+    if share_prefix_banks:
+        enable_prefix_sharing(model)
     validate_rows(model, plan.parent)
     if output.exists():
         raise ValueError("Preserve existing model directories: " + str(output))
@@ -132,12 +147,15 @@ def main():
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--share-prefix-banks", action="store_true")
     args = parser.parse_args()
     print(
         json.dumps(
             dict(
                 output=str(args.output),
-                execution_package=publish(args.plan, args.model_dir, args.output),
+                execution_package=publish(
+                    args.plan, args.model_dir, args.output, args.share_prefix_banks
+                ),
             )
         )
     )

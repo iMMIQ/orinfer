@@ -598,6 +598,12 @@ orinfer serve artifacts/models/dsv41-a2-service --model deepseek-v41-flash-1017-
 
 输入是已准备物理 W4 bank 的原始单请求 INT8 KV 计划。构建器扩展 RoPE、完整因果索引及递归 TopK，复用已有 gather、QK、softmax、PV；索引 Cube 中间结果使用有界工作区。SWA 保留 4096 行环，覆盖 2048 行 packet 和 128 行因果窗口。压缩 KV 与 key 按各层 1／2 压缩率保留完整上下文，KV 为 group-64 INT8 加 FP16 scale，计算边界保持 BF16。checkpoint 复制有效压缩历史、SWA 尾部和完整 FP32 压缩环；恢复后重新绑定 owner 地址及位置。
 
+发布服务目录时加 `--share-prefix-banks`，为已封闭的线性 KV、index key 及其 scale 声明 `append_only`。同一 owner 连续保存的检查点共享旧 bank，只复制新增的封闭行；从已有检查点恢复后继续沿该快照共享。半速压缩只共享已经完成的 token 对，SWA、未完成压缩环及完整 prompt 的 decoder 状态各自复制。子快照持有 bank 的所有权，父快照淘汰后仍可恢复；重置或释放 owner 会清除其继承关系。旧包未声明该字段时继续完整复制。
+
+快照保存与恢复将全部 D2D 拷贝按 stream 顺序提交，以一个完成事件保护整批资源。缓存复用公共物理分配计费及淘汰策略，每个 bank 只计一次；完整分配中的对齐与未引用区域仍计入预算，CPU logits 独立计费。请求完成日志的 prefix 统计同时报告逻辑、物理常驻和共享字节。
+
+共享快照的真实模型恢复检查覆盖 17、2049 和 8193 token，包含父快照淘汰、SWA 环回绕、owner 迁移、完整 prompt 及后续 decode；独立状态诊断使用 strict 通信比较完整 logits。默认通信下另验收 32K／36K HTTP、完整命中和混合 SSE。端到端性能使用同源 240 秒 Mini 短测，完整 agent 任务质量单独验收。
+
 A2 服务在当前没有活跃 decoder 时按执行包的 token 行容量填充 prefill packet；单个请求仍在每 4096 token 的缓存检查点暂停并提交完整状态。有活跃 decoder 时，decode 行优先，混合 packet 继续按 `--prefill-budget-ms` 和原生吞吐估计限制总行数。不同分块长度复用同一个动态 prefill 模板；新的请求与取消在 packet 边界处理。
 
 `--length-input` 让同一索引 Cube 工厂读取每行的有效前缀长度，按 owner 内单调递增的位置决定实际 key tile 数，写入有效 score 前缀。TopK 使用相同长度屏蔽其余容量，完整有效候选与原有归约顺序保持一致。此模式以长度向量替代稠密因果索引矩阵，同时适用于 decode 和 prefill。`--gather-slots` 选择同一 INT8 gather 工厂每次转换的槽位数。可重复提供 `--reuse-cache /path/to/compiled/cache`，复用完整编译对象；编译器仍校验对象身份和库哈希。

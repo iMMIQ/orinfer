@@ -387,14 +387,7 @@ impl ModelRuntime {
         Ok(())
     }
     fn update_prefix_usage(&self, context: &mut Context) {
-        context.statistics.resident_bytes = self.prefix_cache.bytes;
-        context.statistics.logical_bytes =
-            self.prefix_cache.entries.values().map(|e| e.bytes).sum();
-        context.statistics.shared_bytes = context
-            .statistics
-            .logical_bytes
-            .saturating_sub(self.prefix_cache.bytes);
-        context.statistics.entries = self.prefix_cache.entries.len();
+        self.prefix_cache.update_statistics(&mut context.statistics);
     }
     pub(super) fn store_decoded_prefix(
         &mut self,
