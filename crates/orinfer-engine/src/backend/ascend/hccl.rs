@@ -532,38 +532,82 @@ impl Communicator {
         receive: Counts,
         element: Element,
     ) -> Result<Ticket> {
+        self.prepare_exchange(session, source, destination, send, receive, element)?
+            .enqueue(session)
+    }
+
+    pub(super) fn prepare_exchange(
+        &self,
+        session: &Session,
+        source: &Buffer,
+        destination: &Buffer,
+        send: Counts,
+        receive: Counts,
+        element: Element,
+    ) -> Result<Exchange> {
         self.validate(session, source, destination)?;
         send.validate(self.ranks, element, source.bytes())?;
         receive.validate(self.ranks, element, destination.bytes())?;
         if source.overlaps(destination) {
             return Err("HCCL AlltoAllV requires disjoint buffers".into());
         }
-        let native = Rc::clone(&self.native);
-        let counts = Rc::new((send, receive));
-        // SAFETY: Exact HcclAlltoAllV ABI and checked byte extents. Both host count
-        // arrays, communicator and device buffers are retained through completion.
+        Ok(Exchange {
+            native: Rc::clone(&self.native),
+            source: source.clone(),
+            destination: destination.clone(),
+            counts: Rc::new((send, receive)),
+            element,
+        })
+    }
+}
+
+/// Validated exchange bindings, including stable host count/displacement arrays.
+/// Both ordinary submissions and Graph segments retain the same owned operation.
+#[derive(Clone)]
+pub(super) struct Exchange {
+    native: Rc<NativeComm>,
+    source: Buffer,
+    destination: Buffer,
+    counts: Rc<(Counts, Counts)>,
+    element: Element,
+}
+impl Exchange {
+    pub(super) fn branch_accesses(&self) -> Vec<(Buffer, bool)> {
+        vec![
+            (self.source.clone(), false),
+            (self.destination.clone(), true),
+        ]
+    }
+    pub(super) fn execute_on_stream(&self, stream: Handle) -> Result<()> {
+        // SAFETY: prepare_exchange checked context, datatype and disjoint extents.
+        // The enclosing completion/Graph retains this operation, its count arrays,
+        // communicator and buffers; the supplied stream belongs to that context.
+        self.native.status(
+            unsafe {
+                (self.native.api.exchange)(
+                    self.source.pointer(),
+                    self.counts.0.counts.as_ptr().cast(),
+                    self.counts.0.offsets.as_ptr().cast(),
+                    self.element.native(),
+                    self.destination.pointer(),
+                    self.counts.1.counts.as_ptr().cast(),
+                    self.counts.1.offsets.as_ptr().cast(),
+                    self.element.native(),
+                    self.native.handle,
+                    stream,
+                )
+            },
+            "HCCL AlltoAllV",
+        )
+    }
+    fn enqueue(&self, session: &Session) -> Result<Ticket> {
+        session.same_context(&self.native.context)?;
+        // SAFETY: This owned operation retains all validated native resources
+        // until the submission completes, including the host count arrays.
         unsafe {
-            session.submit_compute(
-                vec![source.clone(), destination.clone()],
-                Box::new((Rc::clone(&native), Rc::clone(&counts))),
-                |stream| {
-                    native.status(
-                        (native.api.exchange)(
-                            source.pointer(),
-                            counts.0.counts.as_ptr().cast(),
-                            counts.0.offsets.as_ptr().cast(),
-                            element.native(),
-                            destination.pointer(),
-                            counts.1.counts.as_ptr().cast(),
-                            counts.1.offsets.as_ptr().cast(),
-                            element.native(),
-                            native.handle,
-                            stream,
-                        ),
-                        "HCCL AlltoAllV",
-                    )
-                },
-            )
+            session.submit_compute(vec![], Box::new(self.clone()), |stream| {
+                self.execute_on_stream(stream)
+            })
         }
     }
 }

@@ -466,6 +466,59 @@ class ConvergenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_rows(invalid, root)
 
+    def test_partitioned_owner_columns_require_an_exact_view_of_shared_workspace(self):
+        model = self.model()
+        rank = model["ranks"][0]
+        rank["buffers"] = [
+            dict(name="workspace", bytes=2048 * 4),
+            dict(name="local", bytes=256 * 4, view=dict(parent="workspace", offset=0)),
+        ]
+        rank["packets"][0].update(body=[], best_value="local", best_index="local")
+        model["batch"] = dict(
+            owners=32,
+            columns=[
+                dict(buffer="local", row_bytes=4, row_partition=8, decode=False, row_alignment=1)
+            ],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            validate_rows(model, root)
+            model["batch"]["columns"][0]["buffer"] = "workspace"
+            with self.assertRaisesRegex(ValueError, "physical row stride"):
+                validate_rows(model, root)
+
+    def test_exchange_counts_are_per_peer_for_both_read_and_write_spans(self):
+        model = self.model()
+        rank = model["ranks"][0]
+        rank["buffers"] = [
+            dict(name="source", bytes=256 * 8 * 4),
+            dict(name="dest", bytes=256 * 8 * 4),
+        ]
+        packet = rank["packets"][0]
+        packet.update(
+            body=[
+                dict(
+                    op="exchange",
+                    source="source",
+                    destination="dest",
+                    fp32=False,
+                    int32=True,
+                    elements=256,
+                    elements_expression=expression("(m + 7) // 8"),
+                )
+            ],
+            best_value="dest",
+            best_index="dest",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            validate_rows(model, root)
+            for name in ["source", "dest"]:
+                invalid = deepcopy(model)
+                next(b for b in invalid["ranks"][0]["buffers"] if b["name"] == name)["bytes"] -= 4
+                with self.assertRaisesRegex(ValueError, "span exceeds"):
+                    validate_rows(invalid, root)
+
     def test_indirect_publication_keeps_owner_pointees_and_table_roots(self):
         model = self.model()
         buffers = model["ranks"][0]["buffers"]

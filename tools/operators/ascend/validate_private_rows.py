@@ -26,6 +26,7 @@ def main():
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--owners", type=int, default=3)
     p.add_argument("--rows", type=int, nargs="+", help="Owner row lengths for gather or Cube PV")
+    p.add_argument("--attention-heads", type=int, nargs="+", default=[8])
     p.add_argument("--pv-tile-d", type=int, nargs="+", choices=(32, 64, 128, 256), default=[32])
     p.add_argument("--benchmark-rows", type=int, nargs="+", help="Measure single-owner PV lengths")
     p.add_argument("--kv-compressed", action=argparse.BooleanOptionalAction, default=None)
@@ -35,6 +36,8 @@ def main():
     )
     p.add_argument("--op", nargs="+", help="Restrict validation to named primitive families")
     a = p.parse_args()
+    if not 1 <= min(a.attention_heads) <= max(a.attention_heads) <= 64:
+        p.error("attention heads must be in1..64")
     if not 1 <= a.owners <= 128:
         p.error("owners must be in 1..128")
     if a.rows and (
@@ -78,8 +81,9 @@ def main():
     report = []
     for module, name, params in [
         *[
-            (attention_cube, "pv", dict(rows=capacity, heads=8, selected=selected, tile_d=tile))
+            (attention_cube, "pv", dict(rows=capacity, heads=heads, selected=selected, tile_d=tile))
             for selected in (128, 640)
+            for heads in a.attention_heads
             for tile in a.pv_tile_d
         ],
         (kv_int8, "scatter", dict(rows=capacity, table_rows=256)),

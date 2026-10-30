@@ -234,6 +234,22 @@ def validate_rows(model, base):
                 if any(offset + size > parent for offset in offsets):
                     raise ValueError("Dynamic view exceeds its parent: " + name)
             buffers[name] = size
+        contract = model.get("batch", {})
+        for column in contract.get("columns", []):
+            if column.get("row_bytes") is None:
+                continue
+            if column.get("decode") not in (True, False):
+                raise ValueError("Owner row column requires a family")
+            family = next(
+                p for p in rank["packets"] if p.get("batch_decode", False) == column["decode"]
+            )
+            stride = column.get("row_partition", 1)
+            if stride < 1:
+                raise ValueError("Invalid owner row partition")
+            rows = (family["rows"] + stride - 1) // stride
+            rows += contract["owners"] * (column.get("row_alignment", 1) - 1)
+            if rows * column["row_bytes"] != buffers[column["buffer"]]:
+                raise ValueError("Owner column physical row stride differs")
         for packet in rank["packets"]:
             for program in (packet["body"], packet["head"]):
                 capacity = packet["rows"]
@@ -302,7 +318,7 @@ def validate_rows(model, base):
                             expected := spec["parameters"].get("_row_capacity")
                         ) is not None and expected != bound:
                             raise ValueError("Kernel row capacity differs")
-                    elif step["op"] in ("gather", "reduce"):
+                    elif step["op"] in ("gather", "reduce", "exchange"):
                         count = step["elements"]
                         if "elements_expression" in step:
                             if step.get("fixed_rows"):
@@ -315,8 +331,10 @@ def validate_rows(model, base):
                         if step.get("fp32") and step.get("int32"):
                             raise ValueError("Ambiguous collective dtype")
                         byte_count = count * (4 if step.get("fp32") or step.get("int32") else 2)
-                        read = byte_count * (8 if step.get("scatter") else 1)
-                        write = byte_count * (8 if step["op"] == "gather" else 1)
+                        read = byte_count * (
+                            8 if step.get("scatter") or step["op"] == "exchange" else 1
+                        )
+                        write = byte_count * (8 if step["op"] in ("gather", "exchange") else 1)
                         if read > buffers[step["source"]] or write > buffers[step["destination"]]:
                             raise ValueError("Collective span exceeds allocation")
     return dict(

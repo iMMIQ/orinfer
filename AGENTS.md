@@ -60,6 +60,7 @@
 - 文档直接说明功能、用法、条件和验证范围，优先使用清晰的肯定句；技术限制按准确的支持范围和错误行为表述。
 
 - 先用 rg 检查调用者和依赖；保持修改小而完整。subagent 仅在用户或适用指令明确要求时启动。
+- 每轮性能优化采用分阶段检查：候选阶段只做相关算子数值和 Graph 验证、2K/2049、一个代表性 batch 及固定历史 decode 短测；契约未变时复用已通过的验证。确认收益后运行一次 240 秒 Mini，与冻结基线比较；仅在波动或疑似超过 10% 回退时补充配对复测。提交前统一运行一次 `make check`；状态、prefix 和隔离检查限定于实际改动的契约，架构首次验收完成后不随每个 tile 候选重复。禁止过度检查拖慢迭代，不因外部 CPU 活动阻塞测试。
 - 模型 packet 通过公共 Rows、视图及地址表绑定组件计算行布局；模型声明 owner 角色候选、计算顺序与状态边界。普通、混合、验证和 draft 复用这些组件。
 - 离线编译复用 compile/private_rows，调优复用 tuning 的候选、缓存及 Graph 测量；文件身份、原子元数据和共享 GPU 锁位于 tools/build。共享组件源码计入消费者缓存身份。
 - CPU Python 依赖由根目录 `pyproject.toml`/`uv.lock` 管理，CUDA 离线依赖由 `tools/environments/cuda` 中的独立 uv 项目管理；分别用 `make python-env` 和 `make cuda-env` 同步，工具通过 `uv run --locked` 执行。`make check` 执行 Rust 格式/编译/clippy/测试及 CPU 评测检查；CUDA GPU 验证用 `bash tools/operators/run.sh`，直接使用当前物理机的 CUDA 工具链和独立 uv 环境。

@@ -14,7 +14,7 @@ mod team;
 mod weights;
 
 use super::{
-    hccl::{Communicator, Element, RootInfo},
+    hccl::{Communicator, Counts, Element, Exchange, RootInfo},
     kernels::{Kernel, Template},
     operators::{GroupedInputs, GroupedShape, GroupedW4A8},
     runtime::{Buffer, Limits, Session, Ticket},
@@ -146,6 +146,19 @@ enum Instruction {
         #[serde(default)]
         trace_only: bool,
     },
+    Exchange {
+        source: String,
+        destination: String,
+        /// Element count per peer, evaluated for the current global row count.
+        elements: u64,
+        fp32: bool,
+        #[serde(default)]
+        int32: bool,
+        #[serde(default)]
+        fixed_rows: bool,
+        #[serde(default)]
+        elements_expression: Option<RowExpression>,
+    },
     Kernel {
         manifest: String,
         buffers: Vec<String>,
@@ -236,6 +249,7 @@ enum SegmentOp {
         elements: u64,
         element: Element,
     },
+    Exchange(Exchange),
     Kernel(Kernel),
     Reduce {
         source: Buffer,
@@ -275,6 +289,7 @@ fn enqueue_segment(
                     .join(*index, stream)?;
                 stream = parents.pop().ok_or("ACL branch parent missing")?;
             }
+            SegmentOp::Exchange(exchange) => exchange.execute_on_stream(stream)?,
             SegmentOp::Kernel(kernel) => kernel.launch_on_stream(stream)?,
             SegmentOp::Gather {
                 source,
@@ -1056,6 +1071,39 @@ impl Worker {
                 });
                 continue;
             }
+            if let Instruction::Exchange {
+                source,
+                destination,
+                elements,
+                fp32,
+                int32,
+                fixed_rows,
+                elements_expression,
+            } = instruction
+            {
+                let source = self.row_buffer(source, active_rows)?;
+                let destination = self.row_buffer(destination, active_rows)?;
+                let elements = row_contract::elements(
+                    usize::try_from(*elements).map_err(|_| "Exchange size overflow")?,
+                    active_rows,
+                    capacity,
+                    *fixed_rows,
+                    elements_expression.as_ref(),
+                )? as u64;
+                if elements == 0 {
+                    return Err("Model exchange requires nonzero peer counts".into());
+                }
+                let peers = vec![elements; self.comm.ranks() as usize];
+                pending.push(SegmentOp::Exchange(self.comm.prepare_exchange(
+                    &self.session,
+                    &source,
+                    &destination,
+                    Counts::new(peers.clone())?,
+                    Counts::new(peers)?,
+                    gather_element(*fp32, *int32)?,
+                )?));
+                continue;
+            }
             if let Instruction::W4 {
                 name,
                 rows,
@@ -1193,6 +1241,7 @@ impl Worker {
                 | Instruction::Switch
                 | Instruction::Join
                 | Instruction::Gather { .. }
+                | Instruction::Exchange { .. }
                 | Instruction::Kernel { .. }
                 | Instruction::Reduce { .. }
                 | Instruction::W4 { .. } => unreachable!(),
@@ -1600,7 +1649,9 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                         }
                     }
                 }
-                if let Instruction::Gather { fp32, int32, .. } = instruction {
+                if let Instruction::Gather { fp32, int32, .. }
+                | Instruction::Exchange { fp32, int32, .. } = instruction
+                {
                     gather_element(*fp32, *int32)?;
                 }
                 if let Instruction::Gather {
@@ -1614,6 +1665,12 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                     fixed_rows,
                     elements_expression,
                     ..
+                }
+                | Instruction::Exchange {
+                    elements,
+                    fixed_rows,
+                    elements_expression,
+                    ..
                 } = instruction
                 {
                     row_contract::elements(
@@ -1623,6 +1680,30 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                         *fixed_rows,
                         elements_expression.as_ref(),
                     )?;
+                }
+                if let Instruction::Exchange {
+                    source,
+                    destination,
+                    elements,
+                    fp32,
+                    int32,
+                    ..
+                } = instruction
+                {
+                    let bytes = elements
+                        .checked_mul(gather_element(*fp32, *int32)?.bytes())
+                        .and_then(|v| v.checked_mul(model.ranks.len() as u64))
+                        .ok_or("Model exchange extent overflow")?;
+                    if *elements == 0
+                        || buffers
+                            .get(source.as_str())
+                            .is_none_or(|&v| bytes > v as u64)
+                        || buffers
+                            .get(destination.as_str())
+                            .is_none_or(|&v| bytes > v as u64)
+                    {
+                        return Err("Model exchange exceeds its buffers".into());
+                    }
                 }
                 if let Instruction::W4 {
                     rows,

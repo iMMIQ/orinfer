@@ -21,7 +21,11 @@ pub(super) fn validate_instructions(instructions: &[Instruction]) -> Result<()> 
                     return Err("ACL branch join requires a switched branch".into());
                 }
             }
-            Instruction::Reduce { .. } | Instruction::Gather { .. } if stack.contains(&false) => {
+            Instruction::Reduce { .. }
+            | Instruction::Gather { .. }
+            | Instruction::Exchange { .. }
+                if stack.contains(&false) =>
+            {
                 return Err("HCCL collectives remain on the main branch".into());
             }
             Instruction::Embed { .. }
@@ -91,8 +95,10 @@ pub(super) fn validate(ops: &[SegmentOp]) -> Result<Vec<usize>> {
                 }
             }
             _ => {
-                if matches!(op, SegmentOp::Reduce { .. } | SegmentOp::Gather { .. })
-                    && stack.iter().any(|frame| !frame.main)
+                if matches!(
+                    op,
+                    SegmentOp::Reduce { .. } | SegmentOp::Gather { .. } | SegmentOp::Exchange(_)
+                ) && stack.iter().any(|frame| !frame.main)
                 {
                     return Err("HCCL cannot run on an auxiliary branch".into());
                 }
@@ -111,6 +117,7 @@ pub(super) fn validate(ops: &[SegmentOp]) -> Result<Vec<usize>> {
                         destination,
                         ..
                     } => vec![(source.clone(), false), (destination.clone(), true)],
+                    SegmentOp::Exchange(exchange) => exchange.branch_accesses(),
                     SegmentOp::W4(plan) => plan.branch_accesses(),
                     _ => unreachable!(),
                 };

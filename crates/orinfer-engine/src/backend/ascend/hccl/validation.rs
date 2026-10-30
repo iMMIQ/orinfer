@@ -24,6 +24,7 @@ struct Rank {
     all_gather_verified: bool,
     all_to_all_v_verified: bool,
     reduce_scatter_graph_verified: bool,
+    all_to_all_graph_verified: bool,
     initialize_ms: f64,
 }
 
@@ -93,7 +94,7 @@ pub fn run(devices: &[u32]) -> Result<Report> {
     })?;
     Ok(Report {
         ranks,
-        scope: "Native HCCL AllReduce, AllGather, ReduceScatter with changed-input Graph replay and variable-count AlltoAllV across device contexts; no model execution",
+        scope: "Native HCCL AllReduce, AllGather, ReduceScatter with changed-input Graph replay and variable-count plus changed-input BF16/I32 AlltoAllV Graph replay across device contexts; no model execution",
     })
 }
 fn count(source: u32, destination: u32) -> u64 {
@@ -168,6 +169,7 @@ fn validate_rank(session: &Session, root: &RootInfo, rank: u32, device: u32) -> 
         return Err(format!("HCCL AlltoAllV mismatch on rank {rank}"));
     }
     comm.check_async_error()?;
+    validate_exchange_graph(session, &comm, rank)?;
     validate_scatter(session, &comm, rank)?;
     Ok(Rank {
         rank,
@@ -176,8 +178,88 @@ fn validate_rank(session: &Session, root: &RootInfo, rank: u32, device: u32) -> 
         all_gather_verified: true,
         all_to_all_v_verified: true,
         reduce_scatter_graph_verified: true,
+        all_to_all_graph_verified: true,
         initialize_ms,
     })
+}
+
+fn validate_exchange_graph(session: &Session, comm: &Communicator, rank: u32) -> Result<()> {
+    use crate::backend::ascend::graph::Graph;
+    let peers = comm.ranks() as usize;
+    for element in [Element::Bfloat16, Element::Int32] {
+        for rows in [1usize, 9, 513, 2048] {
+            let count = rows.div_ceil(peers) * 4096;
+            let bytes = count * peers * element.bytes() as usize;
+            let source = session.allocate(bytes)?;
+            let destination = session.allocate(bytes)?;
+            let operation = comm.prepare_exchange(
+                session,
+                &source,
+                &destination,
+                Counts::new(vec![count as u64; peers])?,
+                Counts::new(vec![count as u64; peers])?,
+                element,
+            )?;
+            upload_large(
+                session,
+                &source,
+                &exchange_input(rank, peers, count, 0, element),
+            )?;
+            operation.enqueue(session)?.wait()?;
+            // SAFETY: The graph owns the validated operation, including the
+            // count arrays, communicator and buffers used by every replay.
+            let graph = unsafe {
+                Graph::capture(session, Box::new(operation.clone()), |stream| {
+                    operation.execute_on_stream(stream)
+                })
+            }?;
+            drop(operation);
+            for phase in 1..=3 {
+                upload_large(
+                    session,
+                    &source,
+                    &exchange_input(rank, peers, count, phase, element),
+                )?;
+                session.fill(&destination, 0)?.wait()?;
+                graph.enqueue(session)?.wait()?;
+                let expected = (0..peers)
+                    .flat_map(|source_rank| {
+                        let input =
+                            exchange_input(source_rank as u32, peers, count, phase, element);
+                        let start = rank as usize * count * element.bytes() as usize;
+                        input[start..start + count * element.bytes() as usize].to_vec()
+                    })
+                    .collect::<Vec<_>>();
+                if read_large(session, &destination)? != expected {
+                    return Err(format!(
+                        "AlltoAllV {element:?} Graph mismatch rank {rank}, rows {rows}, phase {phase}"
+                    ));
+                }
+            }
+            comm.check_async_error()?;
+        }
+    }
+    Ok(())
+}
+fn exchange_input(rank: u32, peers: usize, count: usize, phase: u32, element: Element) -> Vec<u8> {
+    let mut values = Vec::with_capacity(count * peers * element.bytes() as usize);
+    for peer in 0..peers {
+        for index in 0..count {
+            let bits = rank
+                .wrapping_mul(1013904223)
+                .wrapping_add(peer as u32 * 1664525)
+                .wrapping_add(index as u32 * 131)
+                .wrapping_add(phase * 747796405);
+            match element {
+                Element::Bfloat16 => {
+                    let v = half::bf16::from_f32(((bits >> 16) % 2048) as f32 / 8. - 128.);
+                    values.extend_from_slice(&v.to_bits().to_le_bytes());
+                }
+                _ => values.extend_from_slice(&bits.to_le_bytes()),
+            }
+        }
+    }
+    values
 }
 
 fn scatter_input(rank: u32, elements: usize, step: u32, element: Element) -> Vec<u8> {

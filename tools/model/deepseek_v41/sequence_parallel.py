@@ -36,7 +36,7 @@ def external_reads(program, candidates, descriptor):
                 if name in live and port["access"] in ("read", "read_write")
             )
             live.difference_update(name for name, port in ports if port["access"] != "read")
-        elif step["op"] in ("gather", "reduce"):
+        elif step["op"] in ("gather", "reduce", "exchange"):
             if step["source"] in live:
                 required.add(step["source"])
             live.discard(step["destination"])

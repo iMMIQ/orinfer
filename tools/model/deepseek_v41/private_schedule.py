@@ -145,7 +145,7 @@ def reusable_long_gathers(rank, contract, describe):
                     for a in spec["parameters"]["_owner_access"]
                     if a["write"]
                 )
-        elif step["op"] in ("embed", "gather", "reduce"):
+        elif step["op"] in ("embed", "gather", "reduce", "exchange"):
             writes = {step["destination"]}
         elif step["op"] == "w4":
             writes = {step["buffers"][-1], step["workspace"]}

@@ -880,6 +880,69 @@ fn collective_completion_retains_communicator_and_validates_byte_units() {
 }
 
 #[test]
+fn captured_exchange_owns_counts_buffers_and_communicator_through_last_fence() {
+    use super::hccl::{Communicator, Counts, Element, RootInfo};
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let root = RootInfo::fixture(&session, &fixture._dir.path().join("libacl-fixture.so")).unwrap();
+    let comm = Communicator::join(&session, &root, 0).unwrap();
+    let source = session.allocate(16).unwrap();
+    let destination = session.allocate(16).unwrap();
+    assert!(
+        comm.prepare_exchange(
+            &session,
+            &source,
+            &source,
+            Counts::new(vec![4]).unwrap(),
+            Counts::new(vec![4]).unwrap(),
+            Element::Float32
+        )
+        .is_err()
+    );
+    assert!(
+        comm.prepare_exchange(
+            &session,
+            &source,
+            &destination,
+            Counts::new(vec![5]).unwrap(),
+            Counts::new(vec![4]).unwrap(),
+            Element::Float32
+        )
+        .is_err()
+    );
+    let operation = comm
+        .prepare_exchange(
+            &session,
+            &source,
+            &destination,
+            Counts::new(vec![4]).unwrap(),
+            Counts::new(vec![4]).unwrap(),
+            Element::Float32,
+        )
+        .unwrap();
+    // SAFETY: The prepared exchange validates all bindings and this graph owns
+    // its count arrays, buffers and communicator until the last replay fence.
+    let graph = unsafe {
+        super::graph::Graph::capture(&session, Box::new(operation.clone()), |stream| {
+            operation.execute_on_stream(stream)
+        })
+    }
+    .unwrap();
+    drop((operation, comm, root, source, destination));
+    assert_eq!(session.allocated_bytes(), 32);
+    assert_eq!(fixture.counter(8), 1);
+    let completion = graph.enqueue(&session).unwrap();
+    drop(graph);
+    assert_eq!(session.allocated_bytes(), 32);
+    assert_eq!(fixture.counter(8), 1);
+    completion.wait().unwrap();
+    assert_eq!(session.allocated_bytes(), 0);
+    assert_eq!(fixture.counter(8), 0);
+    drop((completion, session));
+    fixture.assert_clean();
+}
+
+#[test]
 fn reduce_scatter_checks_rank_extents_types_and_completion_ownership() {
     use super::hccl::{Communicator, Element, RootInfo};
     let mut fixture = Fixture::new();

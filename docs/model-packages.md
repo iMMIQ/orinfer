@@ -544,3 +544,15 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 ```
 
 该构建器对完整动态 prefill 行域使用同一套 INT8 indexer 和 TopK 工厂，各卡计算间隔分配的查询行，回收每条查询的 512 个 INT32 索引并恢复全局行序。共享 `Rows` 派生每个原 owner 的紧凑行数和偏移；`partitioned_tables` 声明指针表／work 表的分片步长，行列的 `row_partition` 声明物理容量。没有选中行的 owner 保留原槽位并使用空 work guard；私有 key、scale、KV 和压缩状态继续按原 owner 绑定。Graph 身份包含有序的 owner 行数布局，原地址表仍随 owner、真实行数和输出角色更新。构建器验证物理范围并裁掉失效的指针表、列和工作区；decode 使用原绑定。全局 TopK value 消费者需要显式回收契约，当前入口拒绝这类输入计划。 `validate_sharded_indexer --baseline BASELINE --plan PARTITIONED --output OUTPUT` 对照已发布的原算子链，覆盖不同私有 key、完整有效分数、TopK 值／索引、精确 tie、空 owner 分片、尾部和改变输入后的 Graph replay；`--rows` 可指定检查的全局查询行数。实际集合通信与请求状态由完整模型及 prefix 恢复验收。
+
+完整 attention 可继续沿用查询分片，并复用现有 Cube QK、softmax、PV 和私有 KV gather 工厂：
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.query_attention \
+  --plan QUERY_PARTITIONED_PLAN --output artifacts/a2-query-attention \
+  --min-rows 512 --pv-tile-d 256 --compile-workers 4
+```
+
+该变换要求 TP8 和已经启用查询分片的私有计划。大行数 packet 先通过 AlltoAllV 将每卡的全部查询／8 个头换为间隔分配的查询／64 个头，复用本地 TopK 和按 owner 绑定的 KV；PV 后进行反向交换，恢复原始行序与头分片，再执行原有位置变换、gate 和输出投影。短 packet 与 decode 沿用输入计划。各 owner 的 KV 更新仍覆盖全部输入行，私有列通过显式物理视图表达分片容量，尾部补零仅覆盖无效查询。共享计算体保持 K128 累加和 BF16 概率／输出边界。
+
+原生 `exchange` 指令以每个 peer 的元素数声明均匀 AlltoAllV，支持动态行表达式。捕获的操作持有通信器、源／目标 buffer 和稳定地址的 host counts；集合通信沿主 stream 顺序执行，资源保留到最后一个完成事件。`validate_attention_heads` 验证共享多头计算体；`validate_query_layout --help` 提供已发布移动算子的尾部、头序及改变输入后的 Graph 验证入口。架构验收完成后的配置调优按分阶段检查约定复用这些结果。

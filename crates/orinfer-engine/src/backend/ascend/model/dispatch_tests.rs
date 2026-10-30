@@ -1,5 +1,5 @@
 use super::{
-    Element, Instruction, Packet, bounded_rows, gather_element, validate_dispatch,
+    Element, Instruction, Packet, bounded_rows, branches, gather_element, validate_dispatch,
     validate_row_ranges,
 };
 
@@ -161,6 +161,37 @@ fn collective_and_local_kernel_contracts_are_backward_compatible() {
             ..
         }
     ));
+    let exchange: Instruction = serde_json::from_value(serde_json::json!({
+        "op": "exchange", "source": "a", "destination": "b", "elements": 16,
+        "fp32": false
+    }))
+    .unwrap();
+    assert!(matches!(
+        &exchange,
+        Instruction::Exchange {
+            int32: false,
+            fixed_rows: false,
+            ..
+        }
+    ));
+    assert!(
+        branches::validate_instructions(&[
+            Instruction::Fork,
+            exchange.clone(),
+            Instruction::Switch,
+            Instruction::Join
+        ])
+        .is_err()
+    );
+    assert!(
+        branches::validate_instructions(&[
+            Instruction::Fork,
+            Instruction::Switch,
+            exchange,
+            Instruction::Join
+        ])
+        .is_ok()
+    );
     let old: Instruction = serde_json::from_value(serde_json::json!({
         "op": "kernel", "manifest": "kernel.json", "buffers": []
     }))
