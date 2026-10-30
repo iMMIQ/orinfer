@@ -545,6 +545,8 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 
 该构建器对完整动态 prefill 行域使用同一套 INT8 indexer 和 TopK 工厂，各卡计算间隔分配的查询行，回收每条查询的 512 个 INT32 索引并恢复全局行序。共享 `Rows` 派生每个原 owner 的紧凑行数和偏移；`partitioned_tables` 声明指针表／work 表的分片步长，行列的 `row_partition` 声明物理容量。没有选中行的 owner 保留原槽位并使用空 work guard；私有 key、scale、KV 和压缩状态继续按原 owner 绑定。Graph 身份包含有序的 owner 行数布局，原地址表仍随 owner、真实行数和输出角色更新。构建器验证物理范围并裁掉失效的指针表、列和工作区；decode 使用原绑定。全局 TopK value 消费者需要显式回收契约，当前入口拒绝这类输入计划。 `validate_sharded_indexer --baseline BASELINE --plan PARTITIONED --output OUTPUT` 对照已发布的原算子链，覆盖不同私有 key、完整有效分数、TopK 值／索引、精确 tie、空 owner 分片、尾部和改变输入后的 Graph replay；`--rows` 可指定检查的全局查询行数。实际集合通信与请求状态由完整模型及 prefix 恢复验收。
 
+私有查询分片构建在输入未声明 `direct_sum` 时默认启用直接累加：沿原有 32 头 FP32 顺序读取 UB 分数行，减少逐头临时复制。输入中显式声明的配置继续保留。已有包可用 `private_schedule --operator indexer_cube.causal_logits --parameters '{"direct_sum":true}'` 复用同一计算体；默认只替换 prefill，decode 沿用原资产。索引权重使用合并后的头／维度缩放因子，在 FP16 舍入后参与逐头累加；独立参考保持这一边界，包括 FP16 次正规数的中点舍入。
+
 完整 attention 可继续沿用查询分片，并复用现有 Cube QK、softmax、PV 和私有 KV gather 工厂：
 
 ```bash

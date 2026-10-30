@@ -163,6 +163,7 @@ def build_private(plan, output, workers=4):
                 if geometry not in index_templates:
                     args = {k: v for k, v in p.items() if not k.startswith("_")}
                     args["rows"] = count
+                    args.setdefault("direct_sum", True)
                     function = indexer_cube.causal_logits(**dict(args, rows=row_count(count, True)))
                     tensors = [
                         function.buffer_map[param]

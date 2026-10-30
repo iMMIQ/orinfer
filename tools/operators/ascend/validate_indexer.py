@@ -7,6 +7,27 @@ from pathlib import Path
 from tools.build.files import atomic_json
 
 
+def check_reference_scale():
+    """FP16 halfway cases with independently known even subnormal results."""
+    import torch
+    from tools.model.deepseek_v41.validate import reference
+
+    weights = torch.zeros((2, 32), dtype=torch.bfloat16)
+    weights[:, 0] = torch.tensor([129, -191]) * 2**-19
+    values = [
+        torch.ones((2, 32, 128), dtype=torch.int8),
+        torch.ones((2, 32), dtype=torch.float16),
+        torch.ones((1, 128), dtype=torch.int8),
+        torch.ones((1,), dtype=torch.float16),
+        weights,
+        torch.zeros((2, 1), dtype=torch.int32),
+    ]
+    expected = (torch.tensor([64, -96]) * (128 * 2**-24)).reshape(2, 1)
+    torch.testing.assert_close(
+        reference("index_quantized", values, {})[0], expected, atol=0, rtol=0
+    )
+
+
 def selection_check(capacity, length, root):
     """Compare the actual TopK chain with poisoned and canonical score padding."""
     import torch
@@ -137,6 +158,7 @@ def main():
     from tools.operators.ascend.build import compile_kernel, operand
     from tools.operators.ascend.indexer_cube import causal_logits
 
+    check_reference_scale()
     torch.manual_seed(20261002)
     torch.set_num_threads(4)
     if not args.compile_only:

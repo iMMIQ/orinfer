@@ -57,7 +57,9 @@ def reference(kind, inputs, parameters):
         dot = torch.einsum("bhd,bsd->bhs", query.float(), gathered).clamp_min(0)
         dot *= qs.float()[:, :, None]
         dot *= ks[ids.clamp(0, keys.shape[0] - 1).long()].float()[:, None, :]
-        w = (weights.float() * 128**-0.5 * 32**-0.5).half().float()
+        # The primitive applies one combined head/dimension scale before FP16.
+        # Two FP32 multiplications can move subnormal halfway values across a tie.
+        w = (weights.float() * (128**-0.5 * 32**-0.5)).half().float()
         total = torch.zeros(ids.shape)
         for head in range(32):
             total += dot[:, head] * w[:, head, None]
