@@ -1,8 +1,9 @@
-"""Build an explicit approximate decoder-SWA replay experiment from native plans.
+"""Build decoder SWA bounded replay from native A2 plans.
 
-The complete source layer 20 runs before compaction. The existing non-SP row
-template supplies layers 21..39 and the head; shared compressed KV/index keys
-stay complete. Production promotion requires independent quality acceptance.
+The complete source layer 20 runs before compaction. Owner-row plans reuse the
+shared dynamic templates for each retained suffix; the legacy single-owner
+experiment takes its non-SP tail from --tail-template. This is an approximate
+state policy with separate model-quality acceptance.
 """
 
 import argparse
@@ -21,11 +22,23 @@ from tools.model.row_contract import expression
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--tail-template", type=Path, required=True)
+    parser.add_argument("--tail-template", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--keep", type=int, default=140)
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=140,
+        help="Retained decoder rows per owner (128..512 for owner-row plans)",
+    )
     parser.add_argument("--compile-workers", type=int, default=4)
     args = parser.parse_args()
+    if json.loads(args.plan.read_text()).get("batch"):
+        from tools.model.deepseek_v41.decoder_rows import build
+
+        print(json.dumps(build(args.plan, args.output, args.keep, args.compile_workers)))
+        return
+    if args.tail_template is None:
+        parser.error("The legacy single-owner experiment requires --tail-template")
     if any(
         p.parent.resolve() != args.plan.parent.resolve() for p in (args.tail_template, args.output)
     ):

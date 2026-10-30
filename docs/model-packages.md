@@ -388,6 +388,18 @@ prefill 使用一个 SWA 和一个压缩 KV 的共享 BF16 工作区，仅解码
 
 `tools.model.deepseek_v41.decoder_replay --plan PLAN --tail-template INT8_PLAN --keep 140 --output REPLAY_PLAN` 生成近似 decoder SWA 后缀重放实验。第 20 层（从零编号）的完整共享 compressed KV 和 index K 先写入，再收集跨边界状态、保留绝对位置并压缩查询行；后续层复用未做 SP 的动态行模板。原生 `limit_rows` 边界同时限制后续算子、集合通信、W4 以及输出头的容量与真实行数，需使用匹配版本的 Rust CLI。重放区间不包含被截掉的 SWA 前缀；未截短的小片段继续读取已有历史。该计划改变 decoder 状态，质量验收必须覆盖固定 teacher 历史、长上下文、不同分块、请求重置和后续 decode。`tools.operators.ascend.validate_decoder_replay --plan REPLAY_PLAN --output REPORT` 检查边界两侧行数、完整数据搬运、位置、窗口掩码与改变参数后的 Graph replay。上述实验均保留原计划，按真实完整请求质量和 TPS 选择部署实现。
 
+当前原生多 owner 计划通过同一入口构建 bounded replay 包：
+
+```bash
+uv run --locked python -m tools.model.deepseek_v41.decoder_replay \
+  --plan SHARED_ROWS_PLAN --keep 128 --output artifacts/a2-decoder-replay
+```
+
+输出为 `a2-decoder-replay/package/model.json`，可交给下文的原生服务打包入口。`--keep` 支持 128–512，未指定时沿用 140；关闭投机时可显式选择 128。0–20 层处理完整 packet 并写完共享 compressed KV/index key，21–39 层按每个 owner 的 `min(本片段行数, keep)` 执行，保留原绝对位置及各 owner 的输出末行。序列分片和 query 分片分别使用连续／交错映射，投影、MoE、KV codec 及 attention 继续使用现有动态算子。未发生裁剪时跳过边界搬运；发生裁剪后首次 attention 重新准备长 KV 工作区。
+
+被裁剪片段的 decoder SWA 限定在保留后缀内；短片段继续读取其既有历史。该策略改变模型近似状态，执行包身份固定保留长度与行布局，prefix 快照保存完整共享 KV、压缩环及各层末窗口的实际状态；公共 HTTP、原生入口及后续 decode 读取同一策略。持久 KV 仍为 group-64 INT8／FP16 scale，owner arena 大小保持原契约。完整计算与 bounded replay 应分别记录性能和质量；单流旧实验的 `--tail-template` 入口继续保留。
+
+
 `tools.model.deepseek_v41.sequence_parallel --decoder-tail --plan REPLAY_PLAN --output TAIL_SP_PLAN` 为截短后的 decoder 复用相同的 TP8 私有行模板；构建 replay 时的 `--keep` 必须能被 8 整除，例如 128。跨边界的 residual 与 collapsed 输入先映射到各 rank 的有效行分片，再沿原有集合通信边界执行；`--reduce-scatter` 同时为后缀启用 ReduceScatter。随后可用 `tools.model.deepseek_v41.reduce_scatter` 转换完整前缀中的集合通信，保留各部分独立验收的计划。
 
 上述工具可通过 `run.sh --without-devices` 离线编译。`tools.operators.ascend.validate_sharded_indexer --baseline PLAN --plan PLAN_SHARDED --output DIR` 在设备上逐卡比较原始分数、TopK、填充行和索引重排，以独立参考抽查分数，并验证修改输入后的 Graph replay。完整请求另用 `bench-ascend` 验证分块、缓存状态、输出与 TPS。

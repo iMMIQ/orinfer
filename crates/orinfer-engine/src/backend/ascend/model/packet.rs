@@ -28,6 +28,27 @@ pub(super) struct Coordinates {
     pub ring: String,
     pub premix: String,
 }
+impl Coordinates {
+    pub(super) fn names(&self) -> [&str; 15] {
+        [
+            &self.base_cos,
+            &self.base_sin,
+            &self.long_cos,
+            &self.long_sin,
+            &self.source_cos,
+            &self.source_sin,
+            &self.slots,
+            &self.c2_slots,
+            &self.swa_indices,
+            &self.c1_indices,
+            &self.c2_indices,
+            &self.c1_lengths,
+            &self.c2_lengths,
+            &self.ring,
+            &self.premix,
+        ]
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Best {
     pub value: f32,
@@ -69,6 +90,16 @@ impl Worker {
         base: usize,
         rows: usize,
         offset: usize,
+    ) -> Result<()> {
+        self.coordinate_at_bounded(names, base, rows, offset, None)
+    }
+    pub(super) fn coordinate_at_bounded(
+        &self,
+        names: &Coordinates,
+        base: usize,
+        rows: usize,
+        offset: usize,
+        minimum: Option<usize>,
     ) -> Result<()> {
         if rows == 0 || base.checked_add(rows).is_none_or(|end| end > self.capacity) {
             return Err("Packet exceeds model context capacity".into());
@@ -122,7 +153,9 @@ impl Worker {
         let mut mix = vec![0f32; rows * 8];
         for row in 0..rows {
             let position = base + row;
-            for (lane, previous) in (position.saturating_sub(127)..=position).enumerate() {
+            for (lane, previous) in
+                (position.saturating_sub(127).max(minimum.unwrap_or(0))..=position).enumerate()
+            {
                 swa[row * 128 + lane] = previous as i32;
             }
             metadata[row * 8..row * 8 + 6].copy_from_slice(&[
@@ -147,6 +180,12 @@ impl Worker {
             (2, &names.c2_indices, &names.c2_lengths),
         ] {
             if names.device_indices {
+                if minimum.is_some() {
+                    let lens = (0..rows)
+                        .map(|row| ((base + row + 1) / ratio) as i32)
+                        .collect::<Vec<_>>();
+                    put(&mut inputs, lengths, &ints(&lens))?;
+                }
                 continue;
             }
             let capacity = self.capacity / ratio;

@@ -132,6 +132,20 @@ Attention 保留 16-token 块的 FP32 打分、在线 softmax 和逐块累积，
 
 六类私有状态算子通过直接对照及改变地址后的 Graph replay，包含融合 attention；原五类另覆盖 128 owner。`RUST_TEST_THREADS=1 make check` 通过。这些对照验证请求隔离、分块状态及相对原量化实现的计算一致性，官方 BF16/FP8 的质量验收独立执行；这些原生计划现已通过实验性 provider 接入公共服务。用法见 [A2 原生多请求 batch](model-packages.md#a2-原生多请求-batch)。
 
+## DSv4.1 A2 多 owner bounded replay（2026-10-30）
+
+完整 40 层 W4A8、TP8 910B3、262144 上下文容量，持久 KV 为 group-64 INT8／FP16 scale。0–20 层处理全部输入，21–39 层逐 owner 保留当前片段最后 128 行；短片段保留实际行数与既有历史。复用同一动态行、投影、MoE、selected attention 和行搬运工厂，连续序列分片与交错 query 分片分别映射。该策略使用近似 decoder 状态，单列于完整计算基线。
+
+默认高性能通信、关闭投机与跨请求 prefix 复用，固定同源输入及 8 个 teacher-forced decode 帧。每项先预热；2K／2049 记录四轮、取后三轮均值，B32×17 取两轮均值。prefill 计时包含首输出，排除加载、Graph 准备、准入和重置。
+
+| 场景 | 完整计算基线 TPS | bounded replay TPS | 变化 |
+| --- | ---: | ---: | ---: |
+| 单请求 2048 | 4776.35 | 6866.28 | +43.76% |
+| 单请求 2049，2048 分块 | 4498.23 | 6353.13 | +41.24% |
+| B32，每请求 17 | 3358.04 | 3269.76 | −2.63% |
+
+单流固定历史 decode 为 50.10／49.45 tokens/s，B32 aggregate decode 为 261.39 tokens/s。owner 私有分配与完整计算包相同。边界搬运在单请求与混合长度、rank 0／7、改输入后的 Graph replay 中逐值一致。复现通信下，混合 owner 换序／释放复用的 16 个完整词表位置逐位一致；17／129／2049／8193 prefix 在 owner 重映射恢复后完整 logits 一致。正常服务保持默认通信；其跨 batch／重排的概率差异仍需独立质量验收，复现模式的状态对照不替代官方模型质量验收。
+
 ## 六模型统一基准（2026-10-21）
 
 README 的六模型表格使用本节固定英译中请求的统一基准。MTP 收益随任务与接受率变化。全部运行在本机 Jetson AGX Orin 64GB，使用 Rust release 完整请求状态机、`decode_only`、greedy、seed `20261002`，关闭 thinking 和 prefix cache。单流自适应 MTP 最多 3 草稿，多流由基准自动切换为 `mtp_drafts=0`。

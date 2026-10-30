@@ -8,6 +8,7 @@ mod branches;
 mod dispatch_tests;
 mod packet;
 pub(crate) mod provider;
+mod replay;
 mod row_contract;
 mod state;
 mod team;
@@ -96,6 +97,8 @@ struct Packet {
     #[serde(default)]
     max_rows: Option<usize>,
     coordinates: packet::Coordinates,
+    #[serde(default)]
+    decoder_coordinates: Option<packet::Coordinates>,
     body: Vec<Instruction>,
     head: Vec<Instruction>,
     reset: Vec<String>,
@@ -132,6 +135,12 @@ enum Instruction {
     LimitRows {
         rows: usize,
     },
+    /// Select each owner's bounded suffix, preserving the packet capacity.
+    DecoderRows {
+        keep: usize,
+        prepare: usize,
+        select: usize,
+    },
     Gather {
         source: String,
         destination: String,
@@ -161,6 +170,8 @@ enum Instruction {
     },
     Kernel {
         manifest: String,
+        #[serde(default)]
+        uncompacted_manifest: Option<String>,
         buffers: Vec<String>,
         #[serde(default)]
         fixed_rows: Option<usize>,
@@ -803,6 +814,19 @@ impl Worker {
         let (mut capacity, actual) = extent;
         let mut active_rows = actual;
         branches::validate_instructions(instructions)?;
+        let boundary = replay::Boundary::find(instructions)?;
+        let decoder_layout = boundary
+            .as_ref()
+            .map(|b| {
+                layout
+                    .ok_or("Decoder rows require an owner layout")?
+                    .suffix(b.keep)
+            })
+            .transpose()?;
+        let clipped = decoder_layout
+            .as_ref()
+            .is_some_and(|l| l.rows.total < actual);
+        let mut current_layout = layout;
         let mut steps = vec![];
         let mut pending: Vec<SegmentOp> = vec![];
         let mut fork_count = 0;
@@ -818,7 +842,10 @@ impl Worker {
             })
             .flatten()
             .collect();
-        for instruction in instructions {
+        for (index, instruction) in instructions.iter().enumerate() {
+            if !clipped && boundary.as_ref().is_some_and(|b| b.skip(index)) {
+                continue;
+            }
             let scaled = |n: usize| -> Result<usize> {
                 if capacity == 0 || !n.is_multiple_of(capacity) {
                     return Err("Packet row expression differs from capacity".into());
@@ -828,6 +855,11 @@ impl Worker {
                     .ok_or_else(|| "Packet row extent overflow".into())
             };
             match instruction {
+                Instruction::DecoderRows { .. } => {
+                    current_layout = decoder_layout.as_ref();
+                    active_rows = current_layout.ok_or("Missing decoder layout")?.rows.total;
+                    continue;
+                }
                 Instruction::LimitRows { rows } => {
                     active_rows = bounded_rows(active_rows, capacity, *rows)?;
                     capacity = *rows;
@@ -863,7 +895,7 @@ impl Worker {
                         name: name.clone(),
                         buffer: {
                             let b = get(&self.buffers, buffer)?;
-                            if layout.is_some() {
+                            if current_layout.is_some() {
                                 b.slice(0, b.bytes() / capacity * active_rows)?
                             } else {
                                 b
@@ -875,6 +907,7 @@ impl Worker {
             }
             if let Instruction::Kernel {
                 manifest,
+                uncompacted_manifest,
                 buffers,
                 fixed_rows,
                 row_expression,
@@ -888,7 +921,7 @@ impl Worker {
                         .ok_or("Missing batch runtime")?
                         .contract
                         .work_items(
-                            layout.ok_or("Owner kernel needs batch layout")?,
+                            current_layout.ok_or("Owner kernel needs batch layout")?,
                             grid,
                             &buffers[0],
                             self.rank as usize,
@@ -896,7 +929,7 @@ impl Worker {
                         .len()
                         .div_ceil(2)
                 } else if *owners {
-                    layout
+                    current_layout
                         .ok_or("Head kernel needs batch layout")?
                         .outputs
                         .len()
@@ -907,6 +940,11 @@ impl Worker {
                         *fixed_rows,
                         row_expression.as_ref(),
                     )?
+                };
+                let manifest = if clipped {
+                    manifest
+                } else {
+                    uncompacted_manifest.as_ref().unwrap_or(manifest)
                 };
                 let manifest = self
                     .row_selections
@@ -1237,6 +1275,7 @@ impl Worker {
                 },
                 Instruction::Snapshot { .. }
                 | Instruction::LimitRows { .. }
+                | Instruction::DecoderRows { .. }
                 | Instruction::Fork
                 | Instruction::Switch
                 | Instruction::Join
@@ -1390,9 +1429,18 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
         .flat_map(|r| &r.packets)
         .flat_map(|p| p.body.iter().chain(&p.head))
         .filter_map(|i| match i {
-            Instruction::Kernel { manifest, .. } => Some(manifest.clone()),
+            Instruction::Kernel {
+                manifest,
+                uncompacted_manifest,
+                ..
+            } => Some(
+                [Some(manifest.clone()), uncompacted_manifest.clone()]
+                    .into_iter()
+                    .flatten(),
+            ),
             _ => None,
         })
+        .flatten()
         .collect();
     let mut names = used.clone();
     for (slot, variants) in &model.row_selections {
@@ -1492,28 +1540,17 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
             return Err("TP ranks have different row contracts".into());
         }
         for packet in &rank.packets {
-            let coordinates = &packet.coordinates;
-            if [
-                &coordinates.base_cos,
-                &coordinates.base_sin,
-                &coordinates.long_cos,
-                &coordinates.long_sin,
-                &coordinates.source_cos,
-                &coordinates.source_sin,
-                &coordinates.slots,
-                &coordinates.c2_slots,
-                &coordinates.swa_indices,
-                &coordinates.c1_indices,
-                &coordinates.c2_indices,
-                &coordinates.c1_lengths,
-                &coordinates.c2_lengths,
-                &coordinates.ring,
-                &coordinates.premix,
-            ]
-            .iter()
-            .any(|name| !buffers.contains_key(name.as_str()))
+            replay::validate_packet(packet, model.batch.as_ref())?;
+            for coordinates in
+                std::iter::once(&packet.coordinates).chain(packet.decoder_coordinates.as_ref())
             {
-                return Err("Packet coordinate buffer is not defined".into());
+                if coordinates
+                    .names()
+                    .iter()
+                    .any(|name| !buffers.contains_key(*name))
+                {
+                    return Err("Packet coordinate buffer is not defined".into());
+                }
             }
             branches::validate_instructions(&packet.body)?;
             branches::validate_instructions(&packet.head)?;
@@ -1549,6 +1586,7 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                 }
                 if let Instruction::Kernel {
                     manifest,
+                    uncompacted_manifest,
                     buffers: bindings,
                     fixed_rows,
                     row_expression,
@@ -1557,6 +1595,9 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                 } = instruction
                 {
                     let spec = &kernels[manifest];
+                    if let Some(fallback) = uncompacted_manifest {
+                        replay::validate_fallback(spec, &kernels[fallback])?;
+                    }
                     let expected = if owner_work.is_some() {
                         4096
                     } else if *owners {

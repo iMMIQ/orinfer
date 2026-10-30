@@ -30,6 +30,7 @@ pub(super) fn validate_instructions(instructions: &[Instruction]) -> Result<()> 
             }
             Instruction::Embed { .. }
             | Instruction::LimitRows { .. }
+            | Instruction::DecoderRows { .. }
             | Instruction::Lookup { .. }
             | Instruction::Route { .. }
             | Instruction::Snapshot { .. }

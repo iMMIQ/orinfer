@@ -29,7 +29,8 @@ def referenced_buffers(rank, batch=None):
         used.update(batch["work"])
         used.update((batch["active"], batch["endpoints"]))
     for packet in rank["packets"]:
-        used.update(v for v in packet["coordinates"].values() if isinstance(v, str))
+        for coordinates in [packet["coordinates"], packet.get("decoder_coordinates", {})]:
+            used.update(v for v in coordinates.values() if isinstance(v, str))
         used.update(packet["reset"])
         used.update(packet[k] for k in ("best_value", "best_index", "logits") if packet.get(k))
         for step in packet["body"] + packet["head"]:
@@ -94,11 +95,13 @@ def compact_buffers(model, *, owner_tables=False):
         used = referenced_buffers(rank, model.get("batch"))
         rank["buffers"] = [b for b in rank["buffers"] if b["name"] in used]
     used = {
-        s["manifest"]
+        name
         for r in model["ranks"]
         for p in r["packets"]
         for s in p["body"] + p["head"]
         if s["op"] == "kernel"
+        for name in [s["manifest"], s.get("uncompacted_manifest")]
+        if name is not None
     }
     if "row_selections" in model:
         selections = model["row_selections"]
@@ -357,11 +360,17 @@ def publish_package(model, base, destination):
         for packet in rank["packets"]:
             for step in packet["body"] + packet["head"]:
                 if step["op"] == "kernel":
-                    path = Path(step["manifest"])
-                    assets.add(str(path))
-                    assets.add(
-                        str(path.parent / json.loads((base / path).read_text())["library"]["file"])
-                    )
+                    for name in [step["manifest"], step.get("uncompacted_manifest")]:
+                        if name is None:
+                            continue
+                        path = Path(name)
+                        assets.add(str(path))
+                        assets.add(
+                            str(
+                                path.parent
+                                / json.loads((base / path).read_text())["library"]["file"]
+                            )
+                        )
     for variants in model.get("row_selections", {}).values():
         for variant in variants:
             for name in variant["kernels"]:

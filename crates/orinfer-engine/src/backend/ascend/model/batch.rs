@@ -19,6 +19,8 @@ pub(super) struct Column {
     pub decode: Option<bool>,
     #[serde(default)]
     pub row_partition: Option<usize>,
+    #[serde(default)]
+    pub decoder: bool,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +41,8 @@ pub(super) struct Contract {
     pub prefill_quantum: Option<usize>,
     #[serde(default)]
     pub state: Vec<super::state::StateLayout>,
+    #[serde(default)]
+    pub decoder_replay: Option<super::replay::Contract>,
 }
 impl Contract {
     pub(super) fn token_capacity(&self, table: &str, rows: usize) -> Result<usize> {
@@ -55,6 +59,13 @@ impl Contract {
         name: &str,
         rank: usize,
     ) -> Result<Vec<[i32; 2]>> {
+        let decoder = self
+            .decoder_replay
+            .as_ref()
+            .filter(|r| r.tables.contains(name))
+            .map(|r| layout.suffix(r.keep))
+            .transpose()?;
+        let layout = decoder.as_ref().unwrap_or(layout);
         let range = self.work_ranges.get(name);
         if let Some(&stride) = self.partitioned_tables.get(name) {
             let view = layout.rows.partition(stride, rank % stride)?;
@@ -193,6 +204,69 @@ impl Layout {
             outputs,
             decode,
         })
+    }
+    pub(super) fn suffix(&self, keep: usize) -> Result<Self> {
+        if self.decode || !(128..=512).contains(&keep) {
+            return Err("Invalid decoder bounded replay layout".into());
+        }
+        Self::new(
+            self.segments
+                .iter()
+                .map(|s| BatchSegment {
+                    slot: s.slot,
+                    tokens: s.tokens.min(keep),
+                })
+                .collect(),
+            self.outputs.clone(),
+            false,
+            self.rows.total,
+            self.segments.len(),
+        )
+    }
+    pub(super) fn suffix_map(
+        &self,
+        keep: usize,
+        source: usize,
+        destination: usize,
+        rank: usize,
+        contiguous: bool,
+    ) -> Result<Vec<i32>> {
+        if self.decode
+            || !(128..=512).contains(&keep)
+            || source == 0
+            || destination == 0
+            || rank >= destination
+        {
+            return Err("Invalid decoder row map partition".into());
+        }
+        let mut selected = vec![];
+        for (i, segment) in self.segments.iter().enumerate() {
+            let end = self.rows.starts[i] + segment.tokens;
+            selected.extend(end - segment.tokens.min(keep)..end);
+        }
+        let width = selected.len().div_ceil(destination);
+        let selected = if contiguous {
+            selected
+                .into_iter()
+                .skip(rank * width)
+                .take(width)
+                .collect::<Vec<_>>()
+        } else {
+            selected
+                .into_iter()
+                .skip(rank)
+                .step_by(destination)
+                .collect::<Vec<_>>()
+        };
+        let mut result = selected
+            .into_iter()
+            .map(|index| {
+                i32::try_from(index % source * self.rows.total.div_ceil(source) + index / source)
+                    .map_err(|_| "Decoder row map overflow".into())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        result.resize(width, -1);
+        Ok(result)
     }
     fn key(&self) -> Key {
         let mut lengths = self.segments.iter().map(|s| s.tokens).collect::<Vec<_>>();
@@ -476,20 +550,35 @@ impl Worker {
             .tables
             .get(&(packet.batch_decode, packet.min_rows))
             .ok_or("Missing packet table usage")?;
+        let decoder = runtime
+            .contract
+            .decoder_replay
+            .as_ref()
+            .filter(|_| !layout.decode)
+            .map(|r| layout.suffix(r.keep))
+            .transpose()?;
         let mut aligned = BTreeMap::new();
-        aligned.insert((1, 1), layout.rows.partition(1, 0)?);
+        aligned.insert((false, 1, 1), layout.rows.partition(1, 0)?);
+        if let Some(l) = &decoder {
+            aligned.insert((true, 1, 1), l.rows.partition(1, 0)?);
+        }
         for (index, column) in runtime.contract.columns.iter().enumerate() {
             if used.columns[index] && column.row_bytes.is_some() {
                 let stride = column.row_partition.unwrap_or(1);
                 let alignment = column.row_alignment;
                 if let std::collections::btree_map::Entry::Vacant(entry) =
-                    aligned.entry((stride, 1))
+                    aligned.entry((column.decoder, stride, 1))
                 {
-                    entry.insert(layout.rows.partition(stride, self.rank as usize % stride)?);
+                    let rows = if column.decoder {
+                        &decoder.as_ref().ok_or("Missing decoder rows")?.rows
+                    } else {
+                        &layout.rows
+                    };
+                    entry.insert(rows.partition(stride, self.rank as usize % stride)?);
                 }
-                if alignment > 1 && !aligned.contains_key(&(stride, alignment)) {
-                    let view = aligned[&(stride, 1)].aligned(alignment)?;
-                    aligned.insert((stride, alignment), view);
+                if alignment > 1 && !aligned.contains_key(&(column.decoder, stride, alignment)) {
+                    let view = aligned[&(column.decoder, stride, 1)].aligned(alignment)?;
+                    aligned.insert((column.decoder, stride, alignment), view);
                 }
             }
         }
@@ -502,29 +591,32 @@ impl Worker {
                 .ok_or("Owner must be admitted before capture")?;
             values.extend_from_slice(&(segment.tokens as u64).to_le_bytes());
             for (index, column) in runtime.contract.columns.iter().enumerate() {
-                let buffer = if !used.columns[index]
-                    || column.decode.is_some_and(|d| d != layout.decode)
-                {
-                    None
-                } else if let Some(stride) = column.row_bytes {
-                    let view = &aligned[&(column.row_partition.unwrap_or(1), column.row_alignment)];
-                    if view.lengths[lane] == 0 {
+                let buffer =
+                    if !used.columns[index] || column.decode.is_some_and(|d| d != layout.decode) {
                         None
+                    } else if let Some(stride) = column.row_bytes {
+                        let view = &aligned[&(
+                            column.decoder,
+                            column.row_partition.unwrap_or(1),
+                            column.row_alignment,
+                        )];
+                        if view.lengths[lane] == 0 {
+                            None
+                        } else {
+                            Some(
+                                get(&self.buffers, &column.buffer)?.slice(
+                                    view.starts[lane]
+                                        .checked_mul(stride)
+                                        .ok_or("Owner offset overflow")?,
+                                    view.lengths[lane]
+                                        .checked_mul(stride)
+                                        .ok_or("Owner span overflow")?,
+                                )?,
+                            )
+                        }
                     } else {
-                        Some(
-                            get(&self.buffers, &column.buffer)?.slice(
-                                view.starts[lane]
-                                    .checked_mul(stride)
-                                    .ok_or("Owner offset overflow")?,
-                                view.lengths[lane]
-                                    .checked_mul(stride)
-                                    .ok_or("Owner span overflow")?,
-                            )?,
-                        )
-                    }
-                } else {
-                    Some(get(&owner.buffers, &column.buffer)?)
-                };
+                        Some(get(&owner.buffers, &column.buffer)?)
+                    };
                 let address = buffer.as_ref().map_or(0, |b| b.pointer() as usize as u64);
                 values.extend_from_slice(&address.to_le_bytes());
                 if let Some(buffer) = buffer {
@@ -544,14 +636,26 @@ impl Worker {
             }) {
                 continue;
             }
+            let is_decoder = runtime
+                .contract
+                .decoder_replay
+                .as_ref()
+                .is_some_and(|r| r.tables.contains(name));
+            let table_layout = if is_decoder {
+                decoder.as_ref().ok_or("Missing decoder table rows")?
+            } else {
+                layout
+            };
             let mut data = Vec::with_capacity(layout.segments.len() * (mapping.len() + 1) * 8);
             for owner in 0..layout.segments.len() {
                 if let Some(&stride) = runtime.contract.partitioned_tables.get(name) {
                     data.extend_from_slice(
-                        &(aligned[&(stride, 1)].lengths[owner] as u64).to_le_bytes(),
+                        &(aligned[&(is_decoder, stride, 1)].lengths[owner] as u64).to_le_bytes(),
                     );
                 } else {
-                    data.extend_from_slice(&addresses[owner * width]);
+                    data.extend_from_slice(
+                        &(table_layout.segments[owner].tokens as u64).to_le_bytes(),
+                    );
                 }
                 for &column in mapping {
                     data.extend_from_slice(&addresses[owner * width + column + 1]);
@@ -569,11 +673,34 @@ impl Worker {
                 .collect::<Vec<_>>();
             inputs.push((get(&self.buffers, name)?.slice(0, data.len())?, data));
         }
-        let data = layout
+        if let Some(replay) = &runtime.contract.decoder_replay
+            && let Some(selected) = &decoder
+            && selected.rows.total < layout.rows.total
+        {
+            for map in &replay.maps {
+                let data = layout
+                    .suffix_map(
+                        replay.keep,
+                        map.source_partition,
+                        map.destination_partition,
+                        self.rank as usize % map.destination_partition,
+                        map.contiguous,
+                    )?
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>();
+                if !data.is_empty() {
+                    inputs.push((get(&self.buffers, &map.buffer)?.slice(0, data.len())?, data));
+                }
+            }
+        }
+        let output_layout = decoder.as_ref().unwrap_or(layout);
+        let data = output_layout
             .outputs
             .iter()
             .flat_map(|&i| {
-                ((layout.rows.starts[i] + layout.segments[i].tokens - 1) as i32).to_le_bytes()
+                ((output_layout.rows.starts[i] + output_layout.segments[i].tokens - 1) as i32)
+                    .to_le_bytes()
             })
             .collect::<Vec<_>>();
         if !data.is_empty() {
@@ -638,6 +765,30 @@ impl Worker {
                 segment.tokens,
                 layout.rows.starts[i],
             )?;
+            if let Some(names) = &execution.packet.decoder_coordinates {
+                let keep = self
+                    .batch
+                    .as_ref()
+                    .unwrap()
+                    .contract
+                    .decoder_replay
+                    .as_ref()
+                    .ok_or("Missing decoder replay contract")?
+                    .keep;
+                let suffix = layout.suffix(keep)?;
+                let skipped = segment.tokens.saturating_sub(keep);
+                self.coordinate_at_bounded(
+                    names,
+                    history.len() + skipped,
+                    suffix.segments[i].tokens,
+                    suffix.rows.starts[i],
+                    Some(if skipped > 0 {
+                        history.len() + skipped
+                    } else {
+                        0
+                    }),
+                )?;
+            }
             let mut owner_hashes = vec![];
             let mut owner_valid = vec![];
             self.hasher
@@ -776,6 +927,7 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             .iter()
             .map(|b| (b.name.as_str(), b))
             .collect::<BTreeMap<_, _>>();
+        super::replay::validate_contract(c, &buffers, model.ranks.len())?;
         for column in &c.columns {
             let b = buffers
                 .get(column.buffer.as_str())
