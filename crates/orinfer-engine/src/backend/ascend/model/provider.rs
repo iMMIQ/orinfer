@@ -543,9 +543,18 @@ impl Runtime {
             return Err("Foreign or released A2 request".into());
         }
         let has_prefill = requests.iter().any(|r| !r.is_finished() && r.prefilling);
+        let has_decode = requests.iter().any(|r| !r.is_finished() && !r.prefilling);
         let mut budget = if has_prefill {
-            ((options.prefill_budget_ms / 1000. * self.prefill_tokens_per_s) as usize)
-                .clamp(1, self.team.rows)
+            if has_decode {
+                ((options.prefill_budget_ms / 1000. * self.prefill_tokens_per_s) as usize)
+                    .clamp(1, self.team.rows)
+            } else {
+                // With no decoder waiting for its next token, fill the same
+                // native packet instead of buying another weight/collective
+                // pass from a latency-oriented throughput prior. Per-request
+                // checkpoint boundaries below still bound each segment.
+                self.team.rows
+            }
         } else {
             self.team
                 .model
