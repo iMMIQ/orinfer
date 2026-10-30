@@ -394,6 +394,9 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False):
         decoder_state = {
             f"cache.swa.{layer}{suffix}" for layer in range(21, 40) for suffix in ("", ".scale")
         }
+        contract["decoder_replay"]["decoder_state"] = [
+            s for s in contract["state"] if s["buffer"] in decoder_state
+        ]
         contract["state"] = [s for s in contract["state"] if s["buffer"] not in decoder_state]
     with ProcessPoolExecutor(
         max_workers=workers, mp_context=multiprocessing.get_context("spawn")

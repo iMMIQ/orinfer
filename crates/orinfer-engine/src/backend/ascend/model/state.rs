@@ -75,15 +75,28 @@ impl Worker {
         runtime.owners.remove(&id).ok_or("Unknown A2 owner")?;
         Ok(())
     }
-    pub(super) fn save_owner(&self, id: usize) -> Result<Snapshot> {
+    pub(super) fn save_owner(&self, id: usize, complete: bool) -> Result<Snapshot> {
         let runtime = self.batch.as_ref().ok_or("Missing A2 batch runtime")?;
         if runtime.contract.state.is_empty() {
             return Err("A2 package does not declare persistent state".into());
         }
         let Owner { buffers, history } = runtime.owners.get(&id).ok_or("Unknown A2 owner")?;
+        let decoder = runtime
+            .contract
+            .decoder_replay
+            .as_ref()
+            .filter(|r| complete && r.final_prompt_only && !r.decoder_state.is_empty());
+        if complete && decoder.is_none() {
+            return Err("A2 package does not declare complete-prompt decoder state".into());
+        }
         let mut spans = vec![];
         let mut bytes = 0usize;
-        for layout in &runtime.contract.state {
+        for layout in runtime
+            .contract
+            .state
+            .iter()
+            .chain(decoder.into_iter().flat_map(|r| &r.decoder_state))
+        {
             let source = get(buffers, &layout.buffer)?;
             for span in layout.spans(history.len(), source.bytes())? {
                 bytes = bytes

@@ -1045,7 +1045,11 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             return Err("Duplicate private state role".into());
         }
         let mut state_roles = BTreeSet::new();
-        for state in &c.state {
+        for state in c
+            .state
+            .iter()
+            .chain(c.decoder_replay.iter().flat_map(|r| &r.decoder_state))
+        {
             if !state_roles.insert(&state.buffer) || !c.private.contains(&state.buffer) {
                 return Err("Snapshot state must name unique owner-private buffers".into());
             }

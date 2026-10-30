@@ -22,8 +22,15 @@ pub(super) enum Command {
     Invalidate(Layout),
     Prepare(Layout),
     Forward(Layout, Vec<Vec<u32>>, bool),
-    Save { owner: usize, snapshot: u64 },
-    Restore { owner: usize, snapshot: u64 },
+    Save {
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    },
+    Restore {
+        owner: usize,
+        snapshot: u64,
+    },
     Evict(u64),
     Memory,
     RoutingGroups(bool),
@@ -185,13 +192,15 @@ impl Team {
                                     )
                                 })
                             }
-                            Command::Save { owner, snapshot } => {
-                                worker.save_owner(owner).map(|saved| {
-                                    let bytes = saved.bytes();
-                                    snapshots.insert(snapshot, saved);
-                                    Reply::Bytes(bytes)
-                                })
-                            }
+                            Command::Save {
+                                owner,
+                                snapshot,
+                                complete,
+                            } => worker.save_owner(owner, complete).map(|saved| {
+                                let bytes = saved.bytes();
+                                snapshots.insert(snapshot, saved);
+                                Reply::Bytes(bytes)
+                            }),
                             Command::Restore { owner, snapshot } => snapshots
                                 .get(&snapshot)
                                 .ok_or_else(|| "Missing A2 prefix snapshot".into())
@@ -561,6 +570,7 @@ mod state_tests {
             team.exchange(Command::Save {
                 owner: 17,
                 snapshot: length as u64,
+                complete: false,
             })
             .unwrap();
             let expected = forward(17, vec![13, 17, 23], true);
@@ -626,6 +636,7 @@ mod state_tests {
             team.exchange(Command::Save {
                 owner: 17,
                 snapshot: length as u64,
+                complete: false,
             })
             .unwrap();
             let tail = (0..128).map(|i| (i * 13 + 17) as u32).collect::<Vec<_>>();
@@ -639,12 +650,49 @@ mod state_tests {
             })
             .unwrap();
             let mut actual = forward(91, tail.clone(), true, false);
+            let complete = !contract
+                .decoder_replay
+                .as_ref()
+                .unwrap()
+                .decoder_state
+                .is_empty();
+            let complete_id = (1u64 << 32) + length as u64;
+            if complete {
+                team.exchange(Command::Save {
+                    owner: 91,
+                    snapshot: complete_id,
+                    complete: true,
+                })
+                .unwrap();
+            }
             actual.extend(forward(91, vec![13], true, true));
             for (a, b) in actual.iter().zip(&expected) {
                 assert_eq!(
                     a.logits, b.logits,
                     "prompt cache {length}, final/decode logits"
                 );
+            }
+            if complete {
+                team.exchange(Command::Admit(vec![92])).unwrap();
+                team.exchange(Command::Restore {
+                    owner: 92,
+                    snapshot: complete_id,
+                })
+                .unwrap();
+                let resumed = forward(92, vec![13], true, true);
+                assert_eq!(
+                    resumed[0].logits, actual[1].logits,
+                    "complete prompt {length}: consumer SWA must survive restore"
+                );
+                for token in [17, 23] {
+                    let expected = forward(91, vec![token], true, true);
+                    let resumed = forward(92, vec![token], true, true);
+                    assert_eq!(
+                        expected[0].logits, resumed[0].logits,
+                        "complete prompt {length}, decode {token}"
+                    );
+                }
+                team.exchange(Command::Evict(complete_id)).unwrap();
             }
             for chunk in input.chunks(team.rows) {
                 forward(

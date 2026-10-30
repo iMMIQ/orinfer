@@ -11,6 +11,9 @@ pub(super) struct Contract {
     /// Rebuild decoder state only in the final prompt window.
     #[serde(default)]
     pub final_prompt_only: bool,
+    /// Consumer state needed to resume an identical, completed prompt.
+    #[serde(default)]
+    pub decoder_state: Vec<super::state::StateLayout>,
     pub tables: BTreeSet<String>,
     pub maps: Vec<RowMap>,
 }
@@ -121,6 +124,7 @@ pub(super) fn validate_contract(
         return Ok(());
     };
     if !(128..=512).contains(&replay.keep)
+        || !replay.decoder_state.is_empty() && !replay.final_prompt_only
         || replay.maps.is_empty()
         || replay.tables.is_empty()
         || replay
