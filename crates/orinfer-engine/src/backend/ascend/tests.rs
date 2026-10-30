@@ -407,6 +407,74 @@ fn packet_completion_retains_graphs_and_fences_partial_submission_errors() {
 }
 
 #[test]
+fn completion_cache_waits_for_the_last_ticket_and_reuses_fenced_generations() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let buffer = session.allocate(4).unwrap();
+    let first = session.upload(&buffer, 0, &[1; 4]).unwrap();
+    first.wait().unwrap();
+    session.reap().unwrap();
+    let second = session.upload(&buffer, 0, &[2; 4]).unwrap();
+    assert_eq!(
+        fixture.counter(10),
+        2,
+        "a live Ticket retains its generation"
+    );
+    assert!(first.is_ready().unwrap());
+    assert!(!second.is_ready().unwrap());
+    second.wait().unwrap();
+    drop((first, second));
+    session.reap().unwrap();
+    let created = fixture.counter(10);
+    for value in 3..35 {
+        let ticket = session.upload(&buffer, 0, &[value; 4]).unwrap();
+        assert!(
+            !ticket.is_ready().unwrap(),
+            "a fresh record resets readiness"
+        );
+        ticket.wait().unwrap();
+        assert_eq!(session.download(&buffer, 0, 4).unwrap(), [value; 4]);
+        drop(ticket);
+        session.reap().unwrap();
+    }
+    assert_eq!(fixture.counter(10), created, "completed events are reused");
+    drop((buffer, session));
+    fixture.assert_clean();
+}
+
+#[test]
+fn completion_cache_is_bounded_and_context_entry_preserves_the_previous_owner() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let tickets = (0..300)
+        .map(|_| {
+            // SAFETY: Empty submissions have no raw operands or external storage.
+            unsafe { session.submit_compute(vec![], Box::new(()), |_| Ok(())) }.unwrap()
+        })
+        .collect::<Vec<_>>();
+    session.synchronize().unwrap();
+    drop(tickets);
+    session.reap().unwrap();
+    assert_eq!(
+        fixture.counter(2),
+        256,
+        "idle completion handles stay bounded"
+    );
+    let other = fixture.session();
+    let changes = fixture.counter(11);
+    session.memory_info().unwrap();
+    assert_eq!(fixture.counter(11), changes, "current context needs no set");
+    other.memory_info().unwrap();
+    assert_eq!(
+        fixture.counter(11),
+        changes + 2,
+        "foreign context is restored"
+    );
+    drop((other, session));
+    fixture.assert_clean();
+}
+
+#[test]
 fn pending_record_is_not_completed_by_an_empty_waiter_set() {
     let mut fixture = Fixture::new();
     let session = fixture.session();

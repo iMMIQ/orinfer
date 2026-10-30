@@ -50,6 +50,9 @@ pub(super) struct Context {
     device_bytes: Cell<usize>,
     pinned_bytes: Cell<usize>,
     poisoned: Cell<bool>,
+    // Only retired completion generations enter this context-local cache.
+    // Raw handles avoid an Rc cycle back into their owning context.
+    completion_events: RefCell<Vec<Handle>>,
 }
 
 pub(super) struct Current<'a> {
@@ -68,12 +71,14 @@ impl Context {
     }
     pub fn enter(&self) -> Result<Current<'_>> {
         let previous = self.api.current()?;
-        // SAFETY: Retained ACL library, live writable output and owned context.
-        unsafe {
-            check(
-                (self.api.set_context)(self.handle),
-                "set current ACL context",
-            )?;
+        if previous != self.handle {
+            // SAFETY: Retained ACL library and owned context.
+            unsafe {
+                check(
+                    (self.api.set_context)(self.handle),
+                    "set current ACL context",
+                )?;
+            }
         }
         Ok(Current {
             context: self,
@@ -119,6 +124,10 @@ impl Drop for Context {
             (self.api.get_context)(&mut previous);
             if !self.handle.is_null() {
                 (self.api.set_context)(self.handle);
+            }
+            for event in self.completion_events.get_mut().drain(..) {
+                // Every cached event was fenced and lost its last Ticket/waiter.
+                (self.api.destroy_event)(event);
             }
             for stream in [self.transfer, self.compute] {
                 if !stream.is_null() {
@@ -274,6 +283,17 @@ impl Drop for Completion {
             std::mem::forget(Rc::clone(&self.context));
             return;
         }
+        // Drop runs only after all Ticket clones, pending references and queued
+        // compute waiters release this generation. Keep its hard-fenced event
+        // for a later record; capture events have separate ownership and flags.
+        const MAX_IDLE_COMPLETIONS: usize = 256;
+        if !self.context.poisoned.get() {
+            let mut idle = self.context.completion_events.borrow_mut();
+            if idle.len() < MAX_IDLE_COMPLETIONS {
+                idle.push(self.event);
+                return;
+            }
+        }
         if let Ok(_current) = self.context.enter() {
             // SAFETY: Completed event has no outstanding storage dependencies.
             unsafe {
@@ -329,6 +349,7 @@ impl Session {
             device_bytes: Cell::new(0),
             pinned_bytes: Cell::new(0),
             poisoned: Cell::new(false),
+            completion_events: RefCell::new(vec![]),
         };
         let previous = api.current()?;
         // SAFETY: Valid device index and live output slots. Only successful
@@ -569,12 +590,15 @@ impl Session {
     ) -> Result<Ticket> {
         self.context.ready()?;
         let _current = self.context.enter()?;
-        let mut event = ptr::null_mut();
-        check(
-            // SAFETY: ACL_EVENT_SYNC=1 supports host synchronization; output is live.
-            unsafe { (self.context.api.create_event)(&mut event, 1) },
-            "create ACL completion",
-        )?;
+        let cached = self.context.completion_events.borrow_mut().pop();
+        let mut event = cached.unwrap_or(ptr::null_mut());
+        if event.is_null() {
+            check(
+                // SAFETY: ACL_EVENT_SYNC=1 supports host synchronization; output is live.
+                unsafe { (self.context.api.create_event)(&mut event, 1) },
+                "create ACL completion",
+            )?;
+        }
         let result = enqueue(stream).and_then(|()| {
             check(
                 // SAFETY: Event and stream belong to this context, and retained

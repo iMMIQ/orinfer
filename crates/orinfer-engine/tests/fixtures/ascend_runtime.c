@@ -6,7 +6,7 @@
 typedef struct { void *dst; const void *src; size_t n; int value, kind; void *stream; void *event; } Job;
 typedef struct { void *stream; int ready, capture_supported; } Event;
 static Job jobs[1024];
-static int count, counters[10], failure, stream_creates, capturing;
+static int count, counters[12], failure, stream_creates, capturing;
 static void *current;
 static char aot_contract[4096];
 void test_kernel_contract(const char *text) {
@@ -48,7 +48,7 @@ const char *aclrtGetSocName(void) { return "Ascend910B3"; }
 int aclrtCreateContext(void **p,int device) { *p=malloc(1);*(uint8_t*)*p=(uint8_t)device;current=*p;counters[4]++;return 0; }
 int aclrtDestroyContext(void *p) { if(current==p)current=NULL;free(p);counters[4]--;return 0; }
 int aclrtGetCurrentContext(void **p) { *p=current;return current?0:107002; }
-int aclrtSetCurrentContext(void *p) { current=p;return 0; }
+int aclrtSetCurrentContext(void *p) { current=p;counters[11]++;return 0; }
 int aclrtCreateStream(void **p) {
     if(failure==5 && ++stream_creates==2){*p=(void*)1;return 7;}
     *p=malloc(1);counters[3]++;return 0;
@@ -58,7 +58,7 @@ int aclrtSynchronizeStreamWithTimeout(void *s,int timeout) { (void)timeout;retur
 int aclrtCreateEventWithFlag(void **p,uint32_t flag) {
     if(flag!=1)return 7;
     if(failure==13 && counters[2]>0)return 7;
-    *p=calloc(1,sizeof(Event));counters[2]++;return 0;
+    *p=calloc(1,sizeof(Event));counters[2]++;counters[10]++;return 0;
 }
 int aclrtDestroyEvent(void *p) { free(p);counters[2]--;return 0; }
 int aclrtCreateEventExWithFlag(void **p,uint32_t flag) {
@@ -70,6 +70,7 @@ int aclrtRecordEvent(void *p,void *s) {
     if(failure==4)return 7;
     if(capturing && !((Event*)p)->capture_supported)return 207000;
     ((Event*)p)->stream=s;
+    ((Event*)p)->ready=0;
     jobs[count++]=(Job){.kind=3,.stream=s,.event=p};return 0;
 }
 /* With no waiters, wait-status can complete while the record is pending. */
