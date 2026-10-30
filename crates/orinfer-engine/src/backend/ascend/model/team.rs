@@ -26,6 +26,7 @@ pub(super) enum Command {
     Restore { owner: usize, snapshot: u64 },
     Evict(u64),
     Memory,
+    RoutingGroups(bool),
     Stop,
 }
 pub(super) enum Reply {
@@ -33,6 +34,12 @@ pub(super) enum Reply {
     Cached(bool),
     Outputs(Vec<Output>),
     Bytes(usize),
+    RoutingGroups(Vec<RoutingGroup>),
+}
+#[derive(serde::Serialize)]
+pub(super) struct RoutingGroup {
+    pub buffer: String,
+    pub counts: Vec<i64>,
 }
 #[derive(Clone)]
 pub(super) struct Output {
@@ -198,6 +205,9 @@ impl Team {
                                 .session
                                 .memory_info()
                                 .map(|(free, _)| Reply::Bytes(free)),
+                            Command::RoutingGroups(decode) => {
+                                worker.routing_groups(decode).map(Reply::RoutingGroups)
+                            }
                         };
                         let failed = result.is_err();
                         if let Err(error) = &result {
@@ -258,6 +268,54 @@ impl Team {
             .into_iter()
             .reduce(|a, b| if maximum { a.max(b) } else { a.min(b) })
             .ok_or_else(|| "Empty A2 team".into())
+    }
+}
+
+impl Worker {
+    /// Benchmark diagnostics read completed groups on their owning worker.
+    /// The online request path never sends this command.
+    fn routing_groups(&self, decode: bool) -> Result<Vec<RoutingGroup>> {
+        let mut groups = BTreeMap::new();
+        for packet in self
+            .packet_templates
+            .iter()
+            .filter(|p| p.batch_decode == decode)
+        {
+            for step in &packet.body {
+                if let super::Instruction::W4 {
+                    experts,
+                    groups: Some(name),
+                    ..
+                } = step
+                    && groups.insert(name, *experts).is_some_and(|n| n != *experts)
+                {
+                    return Err("Routing group expert counts differ across consumers".into());
+                }
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(name, experts)| {
+                let buffer = super::get(&self.buffers, name)?;
+                if experts.checked_mul(8) != Some(buffer.bytes()) {
+                    return Err("Routing group buffer extent differs from its W4 contract".into());
+                }
+                let bytes = self.session.download(&buffer, 0, buffer.bytes())?;
+                let counts = bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| i64::from_le_bytes(*b))
+                    .collect::<Vec<_>>();
+                if counts.iter().any(|&n| n < 0) {
+                    return Err("Routing group contains a negative count".into());
+                }
+                Ok(RoutingGroup {
+                    buffer: name.clone(),
+                    counts,
+                })
+            })
+            .collect()
     }
 }
 impl Drop for Team {

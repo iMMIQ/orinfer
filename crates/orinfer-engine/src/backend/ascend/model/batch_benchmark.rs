@@ -31,6 +31,9 @@ struct Case {
     compare_whole_prompt: bool,
     #[serde(default = "one")]
     repeats: usize,
+    /// Collect only during the untimed preparation pass, after each forward.
+    #[serde(default)]
+    record_routing: bool,
 }
 fn one() -> usize {
     1
@@ -66,7 +69,17 @@ pub struct Report {
     load_s: f64,
     requests: Vec<Measurement>,
     preparations: Vec<Preparation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    routing: Vec<RoutingSample>,
     scope: &'static str,
+}
+#[derive(Serialize)]
+struct RoutingSample {
+    name: String,
+    frame: usize,
+    decode: bool,
+    rows: usize,
+    ranks: Vec<Vec<super::team::RoutingGroup>>,
 }
 #[derive(Serialize)]
 struct Measurement {
@@ -381,11 +394,14 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
         }
     }
     let team = Team::load(plan, model_dir)?;
+    let logits_directory =
+        std::env::var_os("ORINFER_A2_BATCH_LOGITS_DIR").map(std::path::PathBuf::from);
     let load_s = team.load_s;
     eprintln!("A2 shared batch model loaded in {load_s:.3}s");
     (|| {
         let mut measurements = vec![];
         let mut preparations = vec![];
+        let mut routing = vec![];
         for case in &inputs.cases {
             let ids = case
                 .frames
@@ -415,13 +431,12 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                         f,
                         if f.decode { owners } else { capacity },
                         owners,
-                        case.compare_serial && repeat == 0,
+                        (case.compare_serial || logits_directory.is_some()) && repeat == 0,
                     )?;
                     if repeat == 0
-                        && case.compare_serial
-                        && let Some(directory) = std::env::var_os("ORINFER_A2_BATCH_LOGITS_DIR")
+                        && let Some(directory) = logits_directory.as_deref()
                     {
-                        let directory = Path::new(&directory).join(&case.name);
+                        let directory = directory.join(&case.name);
                         std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
                         for value in &out {
                             let bytes = value
@@ -438,6 +453,23 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                     }
                     preparation_s += prepare;
                     timings.record(f, out.len(), elapsed);
+                    if repeat == 0 && case.record_routing {
+                        let ranks = team
+                            .exchange(Command::RoutingGroups(f.decode))?
+                            .into_iter()
+                            .map(|reply| match reply {
+                                super::team::Reply::RoutingGroups(groups) => Ok(groups),
+                                _ => Err("Invalid routing diagnostic reply".into()),
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        routing.push(RoutingSample {
+                            name: case.name.clone(),
+                            frame: index,
+                            decode: f.decode,
+                            rows: f.requests.iter().map(|r| r.tokens.len()).sum(),
+                            ranks,
+                        });
+                    }
                     for output in &out {
                         last_outputs.insert(output.owner, output.clone());
                     }
@@ -592,6 +624,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
             load_s,
             requests: measurements,
             preparations,
+            routing,
             scope: "Complete shared-row native TP8 requests with owner-private INT8 KV; warm forward timings exclude compilation, Graph preparation, admission and reset; preparation is reported separately",
         })
     })()
