@@ -15,6 +15,7 @@ def partition_rows(
     repeat_last=False,
     dynamic_count=False,
     all_partitions=False,
+    tile_columns=256,
 ):
     """Pack interleaved rows; pad data with zero or repeat the last source row.
 
@@ -25,10 +26,12 @@ def partition_rows(
         raise ValueError("Invalid interleaved row partition")
     if all_partitions and first != 0:
         raise ValueError("All-partition packing starts at partition zero")
+    if tile_columns < 1 or tile_columns > 8192 or tile_columns & (tile_columns - 1):
+        raise ValueError("Movement column tile must be a power of two in 1..8192")
     if dynamic_count:
         count = T.ceildiv(rows, stride)
     total = count * (stride if all_partitions else 1)
-    block = math.gcd(width, 256)
+    block = math.gcd(width, tile_columns)
     blocks = width // block
 
     @T.prim_func
@@ -67,13 +70,17 @@ def partition_rows(
     return main
 
 
-def interleave_rows(rows, count, width, ranks=8, dtype="int32", dynamic_count=False):
+def interleave_rows(
+    rows, count, width, ranks=8, dtype="int32", dynamic_count=False, tile_columns=256
+):
     """Restore global row order after gathering equal interleaved partitions."""
     if min(count, width, ranks) < 1:
         raise ValueError("Invalid interleaved gather geometry")
+    if tile_columns < 1 or tile_columns > 8192 or tile_columns & (tile_columns - 1):
+        raise ValueError("Movement column tile must be a power of two in 1..8192")
     if dynamic_count:
         count = T.ceildiv(rows, ranks)
-    block = math.gcd(width, 256)
+    block = math.gcd(width, tile_columns)
     blocks = width // block
 
     @T.prim_func

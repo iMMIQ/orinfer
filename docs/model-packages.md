@@ -314,6 +314,17 @@ bash tools/operators/ascend/run.sh python3 \
 
 Graph 按计算家族、片段长度集合与输出数缓存，地址表和位置在 replay 前更新。捕获期间关闭私有状态访问；完成事件持有实际请求 buffer。请求状态复用公共对齐 arena 布局，额外请求的私有状态各使用一块原生分配，避免小张量独立分配的页池开销。Graph 缓存同时受实际空闲显存约束；各 rank 在捕获前统一探测缓存，任一 rank 未命中时全体失效并重建该形状。首次准入、重置、捕获和首轮 forward 的成本保留在 `preparations`，`request_s` 另包含本轮重置与准备。私有 scratch 采用声明的物理行补齐规则；Engram AllGather 复用 `gather_columns` 还原行布局。上下文使用包内固定容量，跨包扩容和公共服务接入另行实现。该入口使用完整 decoder；近似后缀重放仍通过单请求实验入口选择。
 
+query/head 交换的宽 BF16 行重排可通过现有 `memory.partition_rows` 和 `memory.interleave_rows` 的 `tile_columns` 参数调优。离线工具比较 256/1024/4096 列连续搬运，共用原来的动态行、rank 排列及补齐语义；每种几何只发布一个配置。选择器汇总 1、32、511、512 和容量边界的实际测量，要求各采样点相对原配置回退不超过 10%。测量前后检查逐元素相等、未使用行和改变输入后的 Graph replay；一个 Graph 内重复调用以摊薄主机 replay 开销，结果按每次搬运报告。编译及测量缓存包含算子、编译器、设备、共享测量组件和选择器身份。
+
+```bash
+bash tools/operators/ascend/run.sh python3 \
+  -m tools.model.deepseek_v41.tune_movement \
+  --plan artifacts/ascend-model/router-sharded/package/model.json \
+  --output artifacts/ascend-model/movement-tuned
+```
+
+最终计划位于 `movement-tuned/package/model.json`，只引用被选择的算子；候选及逐行测量留在离线输出目录。权重、KV 状态和 decode 执行程序继续复用输入包。
+
 
 `tools.model.deepseek_v41.quantize_kv --plan BF16_PLAN --output INT8_PLAN` 将尚未量化 KV 的 DSv4.1 TP8 原生计划转换为 INT8 缓存，输出与输入共用资产目录。40 层 SWA 和四个共享压缩 KV bank 均按每 64 个值使用一个 FP16 scale，512 维每行共 528 字节。写入按实际存储的 FP16 scale 做对称舍入，整数范围为 −127..127；scale 下限为 FP16 最小正数，上限为 65504。零组写零，`-1` 位置跳过写入，其他越界位置设置错误标志。压缩器的 FP32 ring 状态和索引器现有 INT8 格式保持各自的契约。
 
