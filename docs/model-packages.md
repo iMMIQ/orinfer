@@ -405,6 +405,10 @@ uv run --locked python -m tools.model.deepseek_v41.decoder_replay \
 
 `--source-kv-boundary` 将行选择边界提前到第 20 层共享 KV/index key 写完之后。构建器先闭合 mHC 系数分支，再选择跨边界的 residual、归一化输入、mHC 系数和 Q-A 整数输入；Q-B、query RoPE、索引查询、attention 及 FFN 复用原算子，仅处理保留行。第 20 层的 SWA 写入仍覆盖完整输入，选中 query 使用该层完整 SWA 历史；21–39 层保持原有 bounded replay 策略。首次 attention 直接准备所选行的长 KV 工作区，后续同源消费者复用它。中间 producer packet 在共享写入处结束，普通 decode 的执行计划与 owner 私有状态布局保持相同。该选项使用现有动态行选择及 TileLang 算子，执行包声明独立的共享写入边界，加载时检查其位置与分支闭合。
 
+`tools.model.deepseek_v41.local_indexer --plan OWNER_PLAN --output artifacts/a2-local-indexer` 为已有 TP8 query 分片前移索引器的输入分片。默认处理 `min_rows >= 512` 的 packet family：先按 rank 选取 Q-A 的 INT8 值、FP32 scale、hidden 和 RoPE 坐标，再调用原有投影、RoPE、量化及 weights projection，将结果直接写入原索引器地址表。各 rank 处理 `ceil(实际 token 行数 / 8)` 行，量化在同一算子内展开 32 个 head；真实 owner 行的 INT8 query、FP16 scale 和 BF16 weights 保持原始舍入边界。未分配给 owner 的尾部不参与索引评分。小行数 family、普通 decode、KV 与请求状态契约保持相同。
+
+构建器通过 `--query-tile-m` 选择同源整数投影 tile，默认 128；动态表达式和 AOT 描述显式区分 token 行与 head 行，scale 常量复用共享只读资产的有界视图。`tools.operators.ascend.validate_local_indexer --baseline BASE_PLAN --plan LOCAL_PLAN --model-dir CHECKPOINT --output DIR` 使用真实权重比较有效 query 行，在 rank 0/7 验证非对齐尾部、改输入后的 Graph replay，并测量完整前处理链。完整请求与 Mini 继续单独验收。
+
 新构建的最终窗口包另行声明 `decoder_state`，用于完整 prompt 检查点。服务在目标头完成、采样开始前保存 producer 状态、decoder SWA 和未处理的目标 logits；后者计入缓存预算。完全相同的 token 输入命中有效目标头时，恢复全部状态并按当前请求的 seed、采样参数、logprob 和约束处理首 token，随后沿用普通 decode；首 token 复用无需模型 forward。混合请求中的其他 owner 仍正常执行，同一请求每轮只提交一次输出。扩展或改变输入时继续遵守普通 prefix 的回退窗口，重新构建新的 decoder 窗口。旧包缺少该声明时沿用原策略；关闭 prefix cache 同时关闭完整头缓存。这里复用公共 prefix 索引的 `logits_valid` 契约，执行包的算子、行选择和 owner 常驻分配保持相同。
 
 完全命中且只请求 1 个输出时，服务直接使用缓存的原始 logits，准入和完成均无需分配、恢复或释放 NPU owner。逻辑请求仍受活跃数限制，采样和约束保持请求私有；取消与完成只回收逻辑槽位。需要更多输出的请求继续分配 owner 并恢复完整状态。这个范围明确的路径可避免并发单输出命中为 KV 分配显存而淘汰正在使用的缓存。

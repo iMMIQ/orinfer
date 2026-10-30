@@ -13,6 +13,78 @@ from tools.model.deepseek_v41.sequence_parallel import external_reads
 from tools.model.deepseek_v41.private_schedule import reusable_long_gathers, select_schedule
 
 
+class LocalIndexerChainTests(unittest.TestCase):
+    def fixture(self):
+        kinds = [
+            "dense.projection",
+            "model_ops.partial_rope",
+            "vector.quantize",
+            "dense.projection",
+        ] + ["memory.partition_rows"] * 3
+        bindings = [
+            ["qa", "w.layers.2.attn.indexer.wq_b.weight", "scale", "ws", "query", "scratch"],
+            ["query", "cos", "sin", "rotated"],
+            ["rotated", "quantized", "query_scale"],
+            [
+                "hidden",
+                "w.layers.2.attn.indexer.weights_proj.weight",
+                "one",
+                "one",
+                "weights",
+                "scratch",
+            ],
+            ["quantized", "local_query"],
+            ["query_scale", "local_scale"],
+            ["weights", "local_weights"],
+        ]
+        steps = [dict(op="kernel", manifest=str(i), buffers=b) for i, b in enumerate(bindings)]
+        return steps, lambda step: dict(op=kinds[int(step["manifest"])])
+
+    def test_only_a_complete_projection_to_partition_chain_is_selected(self):
+        from tools.model.deepseek_v41.local_indexer import query_chain
+
+        steps, describe = self.fixture()
+        self.assertEqual(query_chain(steps, 0, describe), steps)
+        self.assertIsNone(query_chain(steps, 1, describe))
+        with self.assertRaisesRegex(ValueError, "complete indexer"):
+            query_chain(steps[:-1], 0, describe)
+
+    def test_mismatched_partition_consumer_is_rejected(self):
+        from tools.model.deepseek_v41.local_indexer import query_chain
+
+        steps, describe = self.fixture()
+        steps[-1]["buffers"][0] = "another_hidden"
+        with self.assertRaisesRegex(ValueError, "intermediate buffers"):
+            query_chain(steps, 0, describe)
+
+
+class LocalIndexerLivenessTests(unittest.TestCase):
+    def test_direct_and_owner_alias_readers_cannot_be_removed(self):
+        from tools.model.deepseek_v41.local_indexer import check_query_liveness
+
+        definitions = {"view": dict(view=dict(parent="query", offset=0))}
+        contract = dict(pointers=dict(p=[0]), columns=[dict(buffer="view")])
+        for owned in [False, True]:
+            step = dict(op="kernel", buffers=["work", "p"] if owned else ["view"])
+            if owned:
+                step["owner_work"] = {}
+            spec = (
+                dict(parameters=dict(_owner_access=[dict(column=0, write=False)]))
+                if owned
+                else dict(operands=[dict(access="read")])
+            )
+            with self.assertRaisesRegex(ValueError, "still has a reader"):
+                check_query_liveness([step], ["query"], lambda _: spec, contract, definitions)
+
+    def test_next_producer_can_overwrite_a_dead_query_buffer(self):
+        from tools.model.deepseek_v41.local_indexer import check_query_liveness
+
+        steps = [dict(op="kernel", buffers=["query"], access=a) for a in ["write", "read"]]
+        check_query_liveness(
+            steps, ["query"], lambda s: dict(operands=[dict(access=s["access"])]), {}, {}
+        )
+
+
 class ProducerBoundaryTests(unittest.TestCase):
     def fixture(self):
         from tools.model.deepseek_v41.decoder_boundary import source_boundary
