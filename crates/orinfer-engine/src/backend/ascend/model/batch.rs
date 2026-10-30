@@ -688,8 +688,14 @@ impl Worker {
                 self.phases.templates.1,
                 self.phases.branches.1,
                 self.phases.dependencies.1,
+                self.phases.table_build_s,
+                self.phases.table_upload_s,
+                self.phases.template_paths_s,
+                self.phases.kernel_geometry_s,
             );
             self.reserve_batch_memory(3 << 30, "Graph preparation")?;
+            let reserve_s = started.elapsed().as_secs_f64();
+            let packet_started = std::time::Instant::now();
             let packet = self
                 .packet_templates
                 .iter()
@@ -700,6 +706,8 @@ impl Worker {
                 })
                 .cloned()
                 .ok_or("Missing batch family")?;
+            let packet_s = packet_started.elapsed().as_secs_f64();
+            let guard_started = std::time::Instant::now();
             // Every indirect state access checks this stream-ordered word.
             // Capturing a new shape cannot overwrite live KV or C2 rings.
             super::upload(
@@ -707,11 +715,15 @@ impl Worker {
                 &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
                 &0i32.to_le_bytes(),
             )?;
+            let guard_s = guard_started.elapsed().as_secs_f64();
+            let tables_started = std::time::Instant::now();
             self.update_batch_tables(layout, &packet)?;
+            let tables_s = tables_started.elapsed().as_secs_f64();
             if layout.rows.total > packet.rows {
                 return Err("Batch exceeds its family row capacity".into());
             }
             let base = self.package.clone();
+            let compile_started = std::time::Instant::now();
             let (body, head) = if let Some(previous) = &previous {
                 (
                     self.capture_steps(&previous.body)?,
@@ -740,6 +752,7 @@ impl Worker {
                 };
                 (body, head)
             };
+            let compile_s = compile_started.elapsed().as_secs_f64();
             self.batch.as_mut().unwrap().cache.insert(
                 key.clone(),
                 Rc::new(Execution {
@@ -766,6 +779,13 @@ impl Worker {
                         "template_s": self.phases.templates.1-before.4,
                         "branch_s": self.phases.branches.1-before.5,
                         "dependency_s": self.phases.dependencies.1-before.6,
+                        "reserve_s": reserve_s, "packet_s": packet_s,
+                        "guard_s": guard_s, "tables_s": tables_s,
+                        "table_build_s": self.phases.table_build_s-before.7,
+                        "table_upload_s": self.phases.table_upload_s-before.8,
+                        "compile_s": compile_s,
+                        "template_paths_s": self.phases.template_paths_s-before.9,
+                        "kernel_geometry_s": self.phases.kernel_geometry_s-before.10,
                     })
                 );
             }
@@ -792,6 +812,7 @@ impl Worker {
         {
             return Ok(bound.retained.clone());
         }
+        let build_started = std::time::Instant::now();
         let used = runtime
             .tables
             .get(&(packet.batch_decode, packet.min_rows))
@@ -955,7 +976,10 @@ impl Worker {
                 data,
             ));
         }
+        self.phases.table_build_s += build_started.elapsed().as_secs_f64();
+        let upload_started = std::time::Instant::now();
         self.session.upload_inputs(&inputs)?.wait()?;
+        self.phases.table_upload_s += upload_started.elapsed().as_secs_f64();
         self.batch.as_mut().unwrap().bound_tables = Some(BoundTables {
             key,
             retained: retained.clone(),

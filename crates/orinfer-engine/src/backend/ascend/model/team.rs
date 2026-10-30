@@ -618,6 +618,62 @@ mod state_tests {
     use super::*;
     use orinfer_model_sdk::architecture::BatchSegment;
     #[test]
+    #[ignore = "Offline preparation-stage probe; needs the real A2 package"]
+    fn measure_packet_preparation_stages() {
+        use super::super::replay::Role;
+        use std::os::fd::AsRawFd;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open("artifacts/gpu-experiment.lock")
+            .unwrap();
+        assert_eq!(
+            // SAFETY: The owned descriptor outlives all native resources.
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("ORINFER_A2_STATE_MODEL").unwrap());
+        let descriptor: serde_json::Value =
+            crate::model::read(&directory.join("cache/model.json")).unwrap();
+        let plan = directory
+            .join("cache/packages")
+            .join(descriptor["execution_package"].as_str().unwrap())
+            .join("model.json");
+        let team = Team::load(&plan, &directory).unwrap();
+        team.exchange(Command::Admit(vec![7, 17])).unwrap();
+        for (lengths, roles) in [
+            (vec![128], vec![Role::Final]),
+            (vec![2048], vec![Role::Final]),
+            (vec![1, 799], vec![Role::Continue, Role::Producer]),
+            (vec![128], vec![Role::Final]),
+        ] {
+            let mut l = Layout::new(
+                lengths
+                    .iter()
+                    .zip([7, 17])
+                    .map(|(&tokens, slot)| BatchSegment { tokens, slot })
+                    .collect(),
+                roles
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| (*r != Role::Producer).then_some(i))
+                    .collect(),
+                false,
+                team.rows,
+                32,
+            )
+            .unwrap();
+            l.decoder_roles = roles;
+            team.exchange(Command::Invalidate(l.clone())).unwrap();
+            team.exchange(Command::Prepare(l, false)).unwrap();
+        }
+        drop(team);
+        drop(lock);
+    }
+    #[test]
     #[ignore = "Offline release-mode TP8 timing probe; needs the real A2 package"]
     // Reject only an explicitly selected debug probe, not the debug build.
     #[allow(clippy::assertions_on_constants)]

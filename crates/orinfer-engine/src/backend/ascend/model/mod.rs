@@ -434,6 +434,7 @@ struct Worker {
     capacity: usize,
     rank: u32,
     templates: BTreeMap<PathBuf, Rc<Template>>,
+    template_aliases: BTreeMap<PathBuf, BTreeMap<String, Rc<Template>>>,
     phases: LoadPhases,
     steps: BTreeMap<usize, packet::StepStats>,
     batch: Option<batch::Runtime>,
@@ -484,6 +485,10 @@ struct LoadPhases {
     captures: (usize, f64),
     branches: (usize, f64),
     dependencies: (usize, f64),
+    table_build_s: f64,
+    table_upload_s: f64,
+    template_paths_s: f64,
+    kernel_geometry_s: f64,
 }
 
 fn wait_in_flight(tickets: &mut VecDeque<Ticket>) -> Result<()> {
@@ -803,6 +808,7 @@ impl Worker {
             capacity: model.capacity,
             rank: rank.rank,
             templates: BTreeMap::new(),
+            template_aliases: BTreeMap::new(),
             phases,
             steps: BTreeMap::new(),
             batch: model.batch.as_ref().map(|contract| {
@@ -998,6 +1004,7 @@ impl Worker {
                 owners,
             } = instruction
             {
+                let geometry_started = Instant::now();
                 let rows = if let Some(grid) = owner_work {
                     self.batch
                         .as_ref()
@@ -1033,23 +1040,14 @@ impl Worker {
                     .row_selections
                     .get(manifest)
                     .and_then(|variants| variants.iter().find(|v| v.accepts(rows)))
-                    .map_or(manifest.as_str(), |v| v.kernels[0].as_str());
+                    .map_or(manifest.as_str(), |v| v.kernels[0].as_str())
+                    .to_owned();
                 let mut operands = buffers
                     .iter()
                     .map(|n| self.row_buffer(n, active_rows))
                     .collect::<Result<Vec<_>>>()?;
-                let path = resolve_file(base, manifest)?;
-                let template = match self.templates.get(&path) {
-                    Some(template) => Rc::clone(template),
-                    None => {
-                        let t = Instant::now();
-                        let template = Template::load(&self.session, &path)?;
-                        self.phases.templates.0 += 1;
-                        self.phases.templates.1 += t.elapsed().as_secs_f64();
-                        self.templates.insert(path, Rc::clone(&template));
-                        template
-                    }
-                };
+                self.phases.kernel_geometry_s += geometry_started.elapsed().as_secs_f64();
+                let template = self.template(base, &manifest)?;
                 let t = Instant::now();
                 for (buffer, operand) in operands.iter_mut().zip(&template.spec().operands) {
                     if operand.access == super::kernels::Access::Scratch {
@@ -1381,6 +1379,38 @@ impl Worker {
             self.capture_pending(&mut pending, &mut steps, capture)?;
         }
         Ok(steps)
+    }
+
+    /// Package assets are immutable for the worker's lifetime. Resolve each
+    /// package-local name once, while retaining canonical-path deduplication
+    /// and the first load's identity/ABI checks.
+    fn template(&mut self, base: &Path, manifest: &str) -> Result<Rc<Template>> {
+        if let Some(template) = self
+            .template_aliases
+            .get(base)
+            .and_then(|a| a.get(manifest))
+        {
+            return Ok(Rc::clone(template));
+        }
+        let started = Instant::now();
+        let path = resolve_file(base, manifest)?;
+        self.phases.template_paths_s += started.elapsed().as_secs_f64();
+        let template = match self.templates.get(&path) {
+            Some(template) => Rc::clone(template),
+            None => {
+                let started = Instant::now();
+                let template = Template::load(&self.session, &path)?;
+                self.phases.templates.0 += 1;
+                self.phases.templates.1 += started.elapsed().as_secs_f64();
+                self.templates.insert(path, Rc::clone(&template));
+                template
+            }
+        };
+        self.template_aliases
+            .entry(base.to_path_buf())
+            .or_default()
+            .insert(manifest.to_owned(), Rc::clone(&template));
+        Ok(template)
     }
 
     fn check_reduce(
