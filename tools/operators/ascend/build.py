@@ -16,6 +16,7 @@ import tilelang
 from tilelang.jit.adapter.libgen import LibraryGenerator
 
 from tools.build.files import atomic_json, file_hash, source_hash
+from tools.build.elf import strip_library
 from tools.operators.ascend.vector_launch import lower_independent_cube, lower_independent_vector
 from tools.operators.ascend.rows import bounded_grid, split_resources
 from tools.operators.ascend.scalar_cache import lower_scalar_cache
@@ -161,7 +162,13 @@ def compile_kernel(
         sources += [ROOT / str(name) for name in function.attrs["orinfer.component_sources"]]
     identity = {
         "source_sha256": source_hash(
-            ROOT, sources + [ROOT / "tools/build/files.py", ROOT / "kernels/model/rows.py"]
+            ROOT,
+            sources
+            + [
+                ROOT / "tools/build/files.py",
+                ROOT / "tools/build/elf.py",
+                ROOT / "kernels/model/rows.py",
+            ],
         ),
         "compiler": compiler,
         "target": {
@@ -282,6 +289,7 @@ extern "C" int32_t orinfer_ascend_kernel_v{version}(void* const* args, uint64_t 
         stage = Path(temporary) / "package"
         stage.mkdir()
         shutil.copyfile(generator.get_lib_path(), stage / "kernel.so")
+        strip_library(stage / "kernel.so")
         (stage / "kernel.cpp").write_text(source)
         manifest = {
             "schema_version": 1,

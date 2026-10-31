@@ -89,6 +89,44 @@ fn assert_empty(cache: &Path) {
 }
 
 #[test]
+fn native_a2_installation_checks_plan_identity_before_publishing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let source = root.join("native");
+    fs::create_dir(&source).unwrap();
+    let identity = json!({"file":"unused", "sha256":"0".repeat(64)});
+    let plan = serde_json::to_vec(&json!({
+        "schema_version":1, "config":identity, "index":identity, "engram":identity,
+        "capacity":128, "layers":1, "ranks":[], "rope":{}
+    }))
+    .unwrap();
+    fs::write(source.join("model.json"), &plan).unwrap();
+    for (index, digest) in ["0".repeat(64), sha256(&plan)].into_iter().enumerate() {
+        fs::write(
+            source.join("package.json"),
+            serde_json::to_vec(&json!({
+                "schema_version":1, "backend":"ascend",
+                "plan":{"file":"model.json", "sha256":digest}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let package = reseal(&source);
+        let path = root.join(format!("native-{index}.tar.xz"));
+        archive(&package, &path, true);
+        let cache = root.join("installed");
+        let error = install(&path, &cache).unwrap_err();
+        assert!(error.contains(if index == 0 {
+            "sha256 mismatch"
+        } else {
+            "40-layer TP8"
+        }));
+        assert_empty(&cache);
+        fs::rename(package, &source).unwrap();
+    }
+}
+
+#[test]
 fn roundtrip_xz_and_gzip_and_duplicate_install() {
     for xz in [true, false] {
         let temp = tempfile::tempdir().unwrap();

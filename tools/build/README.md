@@ -64,13 +64,15 @@ make check-gpu MODEL=/path/to/prepared-model OUTPUT=artifacts/check-gpu/new-run
 提交源码、更新 workspace 版本并建立指向该提交的 annotated tag 后，运行：
 
 ```bash
-uv run --locked python -m tools.release.package --version v0.2.2 \
+uv run --locked python -m tools.release.package --version v0.3.0 \
   --operators /path/to/qwen3_5-execution.tar.xz \
   --operators /path/to/flash-next-execution.tar.xz \
-  --output artifacts/releases/v0.2.2
+  --output artifacts/releases/v0.3.0
 ```
 
-默认仅生成和校验产物。工具要求工作区干净，使用 `Cargo.lock` 构建，验证 aarch64/版本，打包完整源码、许可证、依赖声明、模型打包工具和架构契约，并逐个验证原生执行包及实际库身份。引擎、执行包和随附的源码归档统一使用 XZ 压缩（`.tar.xz`，preset 6）；输入旧 `.tar.gz` 执行包会经过验证并重新执行 XZ 压缩。资产名称取自架构规格 ID、计算策略、GPU 目标和版本，例如 `orinfer-exec-qwen35-2b-a8-sm87-v0.2.2.tar.xz`。规格 ID 由 `configs/architecture-contract.json` 中的配置签名选择器识别；`a8` 对应 `int8_quality` 混合精度策略。每种规格分别发布，重复规格与策略会阻止发布；`RELEASE.json` 保留完整包 digest 和架构规格 ID；完整离线工具及 Flash Next 文档随包提供。权重通过模型仓库单独发布。部署使用 Rust CLI 的 `orinfer package install` 安装执行包；详见[安装说明](../../docs/model-packages.md#安装执行包)。
+默认仅生成和校验产物。工具要求工作区干净，使用 `Cargo.lock` 构建，验证 aarch64/版本，打包完整源码、许可证、依赖声明、模型打包工具和架构契约，并逐个验证原生执行包及实际库身份。引擎、执行包和随附的源码归档统一使用 XZ 压缩（`.tar.xz`，preset 6）；输入旧 `.tar.gz` 执行包会经过验证并重新执行 XZ 压缩。资产名称取自架构规格 ID、计算策略、GPU 目标和版本，例如 `orinfer-exec-qwen35-2b-a8-sm87-v0.3.0.tar.xz`。规格 ID 由 `configs/architecture-contract.json` 中的配置签名选择器识别；`a8` 对应 `int8_quality` 混合精度策略。每种规格分别发布，重复规格与策略会阻止发布；`RELEASE.json` 保留完整包 digest 和架构规格 ID；完整离线工具及 Flash Next 文档随包提供。权重通过模型仓库单独发布。部署使用 Rust CLI 的 `orinfer package install` 安装执行包；详见[安装说明](../../docs/model-packages.md#安装执行包)。
+
+A2 的 `--operators` 直接接受经 `tools.model.deepseek_v41.publication` 整理的 digest 目录；发布器生成原生 A2 `.tar.xz`，用本轮构建的 Rust CLI 执行安装验收后再发布。该过程不加载模型权重或创建 NPU context。
 
 从 0.1.2 起，引擎使用包含 `.so` 与 cubin 的 schema 1 原生执行包。0.1.1 及更早格式的模型需通过当前构建工具重新发布。当前原生格式的模型可以用[执行库更新工具](../../docs/model-packages.md)生成新目录，保留权重和 kernel 资产。
 

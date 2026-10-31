@@ -31,6 +31,23 @@ class ReleaseTests(unittest.TestCase):
 
 
 class ExecutionAssetsTests(unittest.TestCase):
+    def test_native_a2_directory_has_its_own_release_asset_and_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            raw = json.dumps(dict(schema_version=1, backend="ascend", plan={})).encode()
+            root = cache / hashlib.sha256(raw).hexdigest()
+            root.mkdir()
+            (root / "package.json").write_bytes(raw)
+            assets = execution_assets([root], cache / "unused", Path("/bin/false"), "v0.3.0")
+            self.assertEqual(
+                assets[0]["metadata"]["file"],
+                "orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.0.tar.xz",
+            )
+            self.assertEqual(assets[0]["metadata"]["digest"], root.name)
+            (root / "package.json").write_bytes(raw + b" ")
+            with self.assertRaisesRegex(ValueError, "digest-named"):
+                execution_assets([root], cache / "unused", Path("/bin/false"), "v0.3.0")
+
     def test_encoder_assets_use_their_pinned_configuration_shapes(self):
         cases = [
             (

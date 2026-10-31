@@ -622,7 +622,14 @@ A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 own
 
 `--length-input` 让同一索引 Cube 工厂读取每行的有效前缀长度，按 owner 内单调递增的位置决定实际 key tile 数，写入有效 score 前缀。TopK 使用相同长度屏蔽其余容量，完整有效候选与原有归约顺序保持一致。此模式以长度向量替代稠密因果索引矩阵，同时适用于 decode 和 prefill。`--gather-slots` 选择同一 INT8 gather 工厂每次转换的槽位数。可重复提供 `--reuse-cache /path/to/compiled/cache`，复用完整编译对象；编译器仍校验对象身份和库哈希。
 
-当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样及 prefix 恢复。工具定义／工具调用、媒体、MTP、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的实验性原生计划封装，由上述 Python 发布器生成；`validate-model` 在 CPU 上校验此封装的配置、前端、执行计划、算子库、RoPE 和全部发布分片；分片内容依据 `release-manifest.json` 每个文件扫描一次。通用模型 cdylib C ABI 打包及 `package install` 尚未接通此封装。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
+当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样及 prefix 恢复。工具定义／工具调用、媒体、MTP、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的原生计划封装。v0.3.0 的 `package install` 在 CPU 上校验并原子安装该执行包；`validate-model` 另行校验配置、前端和全部发布权重分片，分片内容依据 `release-manifest.json` 每个文件扫描一次。正常服务加载不计算资产内容 SHA256。A2 模型通过原生 provider 接入公共运行时，模型计划尚未迁移到通用模型 cdylib C ABI。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
+
+发布阶段使用 `python -m tools.model.deepseek_v41.publication --source PACKAGE_DIR --output-cache OUTPUT_CACHE` 整理已有执行包。导出与整理共用引用收集流程，只保留计划引用的算子与资产，并保留许可证；算子库移除静态符号表，逐库比较所有运行时段及设备代码字节；计划采用紧凑 JSON，重新固定库与包身份，权重 payload 保持原样。安装 v0.3.0 的 A2 包：
+
+```bash
+orinfer package install orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.0.tar.xz
+orinfer validate-model /path/to/prepared-model
+```
 
 `GET /metrics` 导出请求排队、首 token 前、解码、结束处理的 wall time histogram，以及运行／等待请求数和原生计算／计划准备累计时间。统计从前处理完成、请求进入 worker 队列开始，准入／恢复计入排队阶段；前处理与网络需结合客户端 TTFT 分析。阶段包含调度等待，不能相加解释成独占 GPU 时间。Chat 请求的 `ignore_eos:true` 保持指定生成上限，适用于固定输出长度回放。
 

@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import struct
+import subprocess
 import tempfile
 import unittest
 
@@ -12,6 +13,8 @@ from tools.model.deepseek_v41.export_release import Export, verify_release
 from tools.model.deepseek_v41.pack_host_release import HostRecordRelease
 from tools.model.safetensors_source import local_header
 from tools.build.files import file_hash
+from tools.build.elf import runtime_sections
+from tools.model.deepseek_v41.publication import publish_execution
 
 
 def write_tensors(path, tensors):
@@ -36,6 +39,58 @@ def read_tensor(root, index, name):
 
 
 class ReleaseExportTests(unittest.TestCase):
+    def test_execution_publication_strips_symbols_preserves_runtime_and_prunes_assets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            (source / "op").mkdir(parents=True)
+            (source / "licenses").mkdir()
+            (source / "licenses/LICENSE").write_text("required attribution")
+            code = root / "kernel.c"
+            code.write_text("int published(int x) { return x + 1; }\n")
+            library = source / "op/kernel.so"
+            subprocess.run(["cc", "-shared", "-fPIC", str(code), "-o", str(library)], check=True)
+            original = library.read_bytes()
+            spec = dict(library=dict(file="kernel.so", sha256=file_hash(library)))
+            (source / "op/kernel.json").write_text(json.dumps(spec))
+            (source / "engram.json").write_text("{}")
+            (source / "unused.bin").write_bytes(b"retired experiment")
+            model = dict(
+                engram=dict(file="engram.json"),
+                rope={},
+                ranks=[
+                    dict(
+                        buffers=[],
+                        packets=[
+                            dict(body=[dict(op="kernel", manifest="op/kernel.json")], head=[])
+                        ],
+                    )
+                ],
+            )
+            (source / "model.json").write_text(json.dumps(model, indent=2))
+            (source / "package.json").write_text(
+                json.dumps(
+                    dict(
+                        schema_version=1,
+                        backend="ascend",
+                        plan=dict(file="model.json", sha256=file_hash(source / "model.json")),
+                    )
+                )
+            )
+            output = publish_execution(source, root / "cache")
+            self.assertEqual(library.read_bytes(), original)
+            self.assertEqual(runtime_sections(library), runtime_sections(output / "op/kernel.so"))
+            self.assertLess((output / "op/kernel.so").stat().st_size, len(original))
+            self.assertEqual(file_hash(output / "package.json"), output.name)
+            saved = json.loads((output / "op/kernel.json").read_text())
+            self.assertEqual(saved["library"]["sha256"], file_hash(output / "op/kernel.so"))
+            self.assertEqual(json.loads((output / "model.json").read_text()), model)
+            self.assertLess(
+                (output / "model.json").stat().st_size, (source / "model.json").stat().st_size
+            )
+            self.assertFalse((output / "unused.bin").exists())
+            self.assertEqual((output / "licenses/LICENSE").read_text(), "required attribution")
+
     def test_roundtrip_keeps_physical_banks_and_global_host_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

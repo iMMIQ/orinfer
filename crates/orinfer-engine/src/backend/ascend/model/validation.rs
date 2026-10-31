@@ -137,6 +137,26 @@ fn verify_assets(model: &Model, base: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Installation verifies native assets without model weights or a CANN context.
+pub(crate) fn validate_package(root: &Path, package: &provider::Package) -> Result<()> {
+    if package.schema_version != 1 || package.backend != "ascend" {
+        return Err("Invalid native A2 execution package".into());
+    }
+    let model: Model =
+        serde_json::from_slice(&read_identity(root, &package.plan)?).map_err(|e| e.to_string())?;
+    if model.schema_version != 1
+        || model.layers != 40
+        || model.ranks.len() != 8
+        || !(128..=262144).contains(&model.capacity)
+        || !model.capacity.is_multiple_of(32)
+        || !(4..=4096).contains(&model.packet_cache_capacity)
+    {
+        return Err("Expected complete 40-layer TP8 A2 plan".into());
+    }
+    super::plan::preflight(&model, root)?;
+    verify_assets(&model, root)
+}
+
 pub(crate) fn validate(path: &Path) -> Result<ValidationReport> {
     let start = Instant::now();
     let descriptor = crate::model::resolve_manifest(path)?;

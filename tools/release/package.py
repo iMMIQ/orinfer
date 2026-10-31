@@ -71,6 +71,9 @@ def execution_asset_identity(package, tag):
     """Resolve a readable architecture specification from the package contract."""
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.-]+)?", tag):
         raise ValueError("Unsafe release tag")
+    if package.get("backend") == "ascend":
+        specification = "deepseek-v41-flash-1017"
+        return f"orinfer-exec-{specification}-w4a8-ascend910b-{tag}.tar.xz", specification
     fields = [package[k] for k in ("architecture", "compute_policy", "target")]
     if any(not isinstance(f, str) or not re.fullmatch(r"[a-z0-9_]+", f) for f in fields):
         raise ValueError("Unsafe execution package asset identity")
@@ -102,6 +105,31 @@ def execution_assets(archives, cache, binary, tag):
     names = set()
     for archive_path in archives:
         archive_path = archive_path.resolve(strict=True)
+        if archive_path.is_dir():
+            root = archive_path
+            package = json.loads((root / "package.json").read_text())
+            if package.get("backend") != "ascend" or file_hash(root / "package.json") != root.name:
+                raise ValueError("Expected a digest-named native A2 execution directory")
+            if package.get("schema_version") != 1:
+                raise ValueError("Unsupported native A2 execution schema")
+            name, specification = execution_asset_identity(package, tag)
+            if name in names:
+                raise ValueError("Duplicate execution package asset in release")
+            names.add(name)
+            assets.append(
+                dict(
+                    directory=root,
+                    metadata=dict(
+                        file=name,
+                        digest=root.name,
+                        architecture="deepseek_v41",
+                        architecture_id=specification,
+                        compute_policy="w4a8",
+                        target="ascend910b",
+                    ),
+                )
+            )
+            continue
         digest = install(archive_path, cache)
         root = cache / digest
         package = json.loads((root / "package.json").read_text())
@@ -216,6 +244,16 @@ def build(args):
         archive(bundle, output / f"{bundle.name}.tar.xz", epoch)
         for package in packages:
             archive(package["directory"], output / package["metadata"]["file"], epoch)
+            if package["metadata"].get("target") == "ascend910b":
+                # The release binary validates schema, native ABI and every A2 asset.
+                command(
+                    str(binary),
+                    "package",
+                    "install",
+                    str(output / package["metadata"]["file"]),
+                    "--cache",
+                    str(Path(temp) / "a2-install-cache"),
+                )
     assets = sorted(output.glob("*.tar.xz"))
     (output / "SHA256SUMS").write_text(
         "".join(f"{file_hash(path)}  {path.name}\n" for path in assets)
@@ -266,7 +304,7 @@ def main():
         type=Path,
         action="append",
         required=True,
-        help="Native execution package archive; repeat for each architecture/policy",
+        help="Execution archive or native A2 package directory; repeat for each architecture/policy",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--notes", type=Path)

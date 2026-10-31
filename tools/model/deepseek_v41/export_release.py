@@ -386,35 +386,9 @@ class Export:
         self.model["index"] = dict(file=index.name, sha256=file_hash(index))
         target = self.execution_output / ".building"
         target.mkdir(parents=True)
-        needed = {self.model["engram"]["file"]} | {v["file"] for v in self.model["rope"].values()}
-        for rank in self.model["ranks"]:
-            for packet in rank["packets"]:
-                for step in packet["body"] + packet["head"]:
-                    if step["op"] == "kernel":
-                        for name in [step["manifest"], step.get("uncompacted_manifest")]:
-                            if name:
-                                needed.add(name)
-                                spec = json.loads((self.package / name).read_text())
-                                needed.add(str(Path(name).parent / spec["library"]["file"]))
-        for choices in self.model.get("row_selections", {}).values():
-            for choice in choices:
-                for name in choice["kernels"]:
-                    needed.add(name)
-                    spec = json.loads((self.package / name).read_text())
-                    needed.add(str(Path(name).parent / spec["library"]["file"]))
-        for name in needed:
-            dst = target / name
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(self.package / name, dst)
-        atomic_json(target / "model.json", self.model)
-        atomic_json(
-            target / "package.json",
-            dict(
-                schema_version=1,
-                backend="ascend",
-                plan=dict(file="model.json", sha256=file_hash(target / "model.json")),
-            ),
-        )
+        from tools.model.deepseek_v41.publication import prepare_execution
+
+        prepare_execution(self.model, self.package, target)
         digest = file_hash(target / "package.json")
         target.rename(target.with_name(digest))
         desc = json.loads((self.source / "cache/model.json").read_text())

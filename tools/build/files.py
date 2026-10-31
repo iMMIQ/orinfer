@@ -27,12 +27,18 @@ def write_json(path, data):
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
-def atomic_json(path, data):
+def atomic_json(path, data, *, compact=False):
     path = Path(path)
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
         temporary = Path(stream.name)
         try:
-            json.dump(data, stream, indent=2, ensure_ascii=False)
+            json.dump(
+                data,
+                stream,
+                indent=None if compact else 2,
+                separators=(",", ":") if compact else None,
+                ensure_ascii=False,
+            )
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())

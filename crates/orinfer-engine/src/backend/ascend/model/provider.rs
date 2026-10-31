@@ -40,10 +40,10 @@ pub(super) struct Metadata {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Package {
-    pub(super) schema_version: u32,
-    pub(super) backend: String,
-    pub(super) plan: FileIdentity,
+pub(crate) struct Package {
+    pub(crate) schema_version: u32,
+    pub(crate) backend: String,
+    pub(crate) plan: FileIdentity,
 }
 struct Snapshot {
     id: u64,
