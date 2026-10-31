@@ -100,9 +100,14 @@ impl RowPlan {
     }
 }
 
-struct Plane {
+struct Part {
     file: File,
     start: usize,
+    first_byte: usize,
+    bytes: usize,
+}
+struct Plane {
+    parts: Vec<Part>,
     row_bytes: usize,
     rows: usize,
     resident: Option<(usize, Vec<u8>)>,
@@ -123,33 +128,76 @@ impl Plane {
         let start = 8 + header + info.data_offsets.0;
         drop(mapping);
         Ok(Self {
-            file,
-            start,
+            parts: vec![Part {
+                file,
+                start,
+                first_byte: 0,
+                bytes: rows * row_bytes,
+            }],
             row_bytes,
             rows,
             resident: None,
         })
     }
+    fn open_parts(sources: &[(std::path::PathBuf, String)], dtype: Dtype) -> Result<Self> {
+        let mut result: Option<Self> = None;
+        for (path, name) in sources {
+            let mut plane = Self::open(path, name, dtype)?;
+            if let Some(total) = &mut result {
+                if total.row_bytes != plane.row_bytes {
+                    return Err("Host-row shard strides differ".into());
+                }
+                plane.parts[0].first_byte = total
+                    .rows
+                    .checked_mul(total.row_bytes)
+                    .ok_or("Host-row shard offset overflow")?;
+                total.rows = total
+                    .rows
+                    .checked_add(plane.rows)
+                    .ok_or("Host-row count overflow")?;
+                total.parts.append(&mut plane.parts);
+            } else {
+                result = Some(plane);
+            }
+        }
+        result.ok_or_else(|| "Empty host-row shard list".into())
+    }
+    fn read_bytes(&self, mut offset: usize, mut target: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        while !target.is_empty() {
+            let index = self
+                .parts
+                .partition_point(|p| p.first_byte <= offset)
+                .checked_sub(1)
+                .ok_or("Host-row offset outside shards")?;
+            let part = &self.parts[index];
+            let local = offset - part.first_byte;
+            if local >= part.bytes {
+                return Err("Host-row extent outside shards".into());
+            }
+            let count = target.len().min(part.bytes - local);
+            part.file
+                .read_exact_at(&mut target[..count], (part.start + local) as u64)
+                .map_err(|e| e.to_string())?;
+            offset += count;
+            target = &mut target[count..];
+        }
+        Ok(())
+    }
     fn load_rows(&mut self, first: usize, rows: usize) -> Result<()> {
         use rayon::prelude::*;
-        use std::os::unix::fs::FileExt;
         let bytes = rows
             .checked_mul(self.row_bytes)
             .ok_or("Resident host table extent overflow")?;
         let offset = first
             .checked_mul(self.row_bytes)
-            .and_then(|v| self.start.checked_add(v))
             .ok_or("Resident host table offset overflow")?;
         let mut data = Vec::new();
         data.try_reserve_exact(bytes).map_err(|e| e.to_string())?;
         data.resize(bytes, 0);
         data.par_chunks_mut(32 << 20)
             .enumerate()
-            .try_for_each(|(chunk, target)| {
-                self.file
-                    .read_exact_at(target, (offset + chunk * (32 << 20)) as u64)
-                    .map_err(|e| e.to_string())
-            })?;
+            .try_for_each(|(chunk, target)| self.read_bytes(offset + chunk * (32 << 20), target))?;
         self.resident = Some((first, data));
         Ok(())
     }
@@ -158,7 +206,6 @@ impl Plane {
     /// multi-hundred-GiB table, while positional reads resolve through the
     /// ARC without that contention.
     fn read_row_at(&self, row: usize, target: &mut [u8]) -> Result<()> {
-        use std::os::unix::fs::FileExt;
         if target.len() != self.row_bytes {
             return Err("Host-row read target extent differs".into());
         }
@@ -173,10 +220,10 @@ impl Plane {
             target.copy_from_slice(source);
             return Ok(());
         }
-        let begin = self.start + row * self.row_bytes;
-        self.file
-            .read_exact_at(target, begin as u64)
-            .map_err(|e| e.to_string())
+        let begin = row
+            .checked_mul(self.row_bytes)
+            .ok_or("Host-row offset overflow")?;
+        self.read_bytes(begin, target)
     }
 }
 
@@ -307,8 +354,19 @@ impl Int8Rows {
         scale_tensor: &str,
         shard: Shard,
     ) -> Result<Self> {
-        let weight = Plane::open(weight, weight_tensor, Dtype::I8)?;
-        let scale = Plane::open(scale, scale_tensor, Dtype::F32)?;
+        Self::open_sharded(
+            &[(weight.to_owned(), weight_tensor.to_owned())],
+            &[(scale.to_owned(), scale_tensor.to_owned())],
+            shard,
+        )
+    }
+    pub(crate) fn open_sharded(
+        weight: &[(std::path::PathBuf, String)],
+        scale: &[(std::path::PathBuf, String)],
+        shard: Shard,
+    ) -> Result<Self> {
+        let weight = Plane::open_parts(weight, Dtype::I8)?;
+        let scale = Plane::open_parts(scale, Dtype::F32)?;
         if weight.rows != scale.rows
             || weight.row_bytes % 32 != 0
             || scale.row_bytes != weight.row_bytes / 32 * 4
@@ -459,30 +517,86 @@ mod tests {
         use std::os::unix::fs::FileExt;
         let rows = (64 << 20) + 17;
         let mut plane = Plane {
-            file: tempfile::tempfile().unwrap(),
-            start: 7,
+            parts: vec![Part {
+                file: tempfile::tempfile().unwrap(),
+                start: 7,
+                first_byte: 0,
+                bytes: rows + 3,
+            }],
             row_bytes: 1,
             rows: rows + 3,
             resident: None,
         };
-        plane
+        plane.parts[0]
             .file
-            .set_len((plane.start + plane.rows) as u64)
+            .set_len((plane.parts[0].start + plane.rows) as u64)
             .unwrap();
         let positions = [0, (32 << 20) - 1, 32 << 20, (64 << 20) - 1, rows - 1];
         for (i, position) in positions.into_iter().enumerate() {
-            plane
+            plane.parts[0]
                 .file
                 .write_all_at(&[i as u8 + 1], (10 + position) as u64)
                 .unwrap();
         }
         plane.load_rows(3, rows).unwrap();
-        plane.file.set_len(0).unwrap();
+        plane.parts[0].file.set_len(0).unwrap();
         for (i, position) in positions.into_iter().enumerate() {
             let mut actual = [0];
             plane.read_row_at(3 + position, &mut actual).unwrap();
             assert_eq!(actual, [i as u8 + 1]);
         }
+    }
+    #[test]
+    fn segmented_tables_preserve_global_ids_and_resident_crossings() {
+        use safetensors::tensor::{TensorView, serialize};
+        let dir = tempfile::tempdir().unwrap();
+        let mut weights = vec![];
+        let mut scales = vec![];
+        for (part, first, rows) in [(0, 0, 3), (1, 3, 5)] {
+            let w: Vec<u8> = (first * 32..(first + rows) * 32).map(|i| i as u8).collect();
+            let scale: Vec<u8> = (first..first + rows)
+                .flat_map(|i| (i as f32 + 0.5).to_le_bytes())
+                .collect();
+            let path = dir.path().join(format!("{part}.safetensors"));
+            std::fs::write(
+                &path,
+                serialize(
+                    [
+                        ("w", TensorView::new(Dtype::I8, vec![rows, 32], &w).unwrap()),
+                        (
+                            "s",
+                            TensorView::new(Dtype::F32, vec![rows, 1], &scale).unwrap(),
+                        ),
+                    ],
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            weights.push((path.clone(), "w".to_owned()));
+            scales.push((path, "s".to_owned()));
+        }
+        let rows = Int8Rows::open_sharded(&weights, &scales, Shard { first: 1, rows: 6 }).unwrap();
+        let ids = [6, 2, 3, 1, 3];
+        let mut expected = vec![];
+        rows.gather_into(&ids, &mut expected, 180).unwrap();
+        for (&id, bytes) in ids.iter().zip(expected.as_chunks::<36>().0) {
+            assert_eq!(bytes[0], (id * 32) as u8);
+            assert_eq!(&bytes[32..], &(id as f32 + 0.5).to_le_bytes());
+        }
+        let budget = rows.required_resident_bytes().unwrap();
+        let resident = rows.into_resident(budget).unwrap();
+        for (path, _) in &weights {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        }
+        let mut actual = vec![];
+        resident.gather_into(&ids, &mut actual, 180).unwrap();
+        assert_eq!(actual, expected);
     }
     #[test]
     fn stable_deduplication_preserves_query_order_and_empty_ranks() {

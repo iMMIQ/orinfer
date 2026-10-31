@@ -15,6 +15,8 @@ pub(crate) mod checkpoint;
 #[derive(Deserialize)]
 struct Index {
     weight_map: BTreeMap<String, String>,
+    #[serde(default)]
+    row_shards: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug)]

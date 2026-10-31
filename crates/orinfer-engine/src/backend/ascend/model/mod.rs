@@ -80,6 +80,15 @@ struct Definition {
     weight: Option<weights::Weight>,
     data: Option<FileIdentity>,
     prepared_weight: Option<String>,
+    prepared_tensor: Option<PreparedTensor>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedTensor {
+    name: String,
+    dtype: String,
+    shape: Vec<usize>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -519,20 +528,31 @@ fn upload(session: &Session, buffer: &Buffer, data: &[u8]) -> Result<()> {
 /// Streams a prepared weight file without materializing it in host memory;
 /// storage reads overlap device DMA instead of preceding it.
 fn upload_file(session: &Session, buffer: &Buffer, path: &Path, bytes: usize) -> Result<()> {
-    use std::io::Read;
-    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
     if !metadata.is_file() || metadata.len() != bytes as u64 {
         return Err("Prepared weight metadata differs".into());
     }
-    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut staging = vec![0u8; CHUNK];
+    upload_file_range(session, buffer, &file, 0, bytes)
+}
+fn upload_file_range(
+    session: &Session,
+    buffer: &Buffer,
+    file: &std::fs::File,
+    source_offset: usize,
+    bytes: usize,
+) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    if bytes != buffer.bytes() || source_offset.checked_add(bytes).is_none() {
+        return Err("Prepared tensor range differs".into());
+    }
+    let mut staging = vec![0u8; CHUNK.min(bytes)];
     let mut tickets = VecDeque::new();
     let mut offset = 0;
     while offset < bytes {
         let want = CHUNK.min(bytes - offset);
-        file.read_exact(&mut staging[..want])
+        file.read_exact_at(&mut staging[..want], (source_offset + offset) as u64)
             .map_err(|e| e.to_string())?;
-        // The session copies staging into pinned storage before returning.
         tickets.push_back(session.upload(buffer, offset, &staging[..want])?);
         offset += want;
         if tickets.len() > DEPTH {
@@ -673,6 +693,7 @@ impl Worker {
             ));
         }
         let mut fills: Vec<Ticket> = Vec::new();
+        let mut prepared_files = BTreeMap::new();
         for definition in rank.buffers {
             if buffers.contains_key(&definition.name) || definition.bytes == 0 {
                 return Err("Duplicate/empty model buffer".into());
@@ -681,6 +702,7 @@ impl Worker {
                 if definition.weight.is_some()
                     || definition.data.is_some()
                     || definition.prepared_weight.is_some()
+                    || definition.prepared_tensor.is_some()
                 {
                     return Err("Model view cannot own weight data".into());
                 }
@@ -700,6 +722,26 @@ impl Worker {
                     if verify {
                         verify_file_upload(&session, &buffer, &path, &definition.name)?;
                     }
+                } else if let Some(tensor) = definition.prepared_tensor {
+                    let source = checkpoint.source(&tensor.name, &tensor.dtype, &tensor.shape)?;
+                    if source.bytes != definition.bytes {
+                        return Err("Prepared tensor byte extent differs".into());
+                    }
+                    let t = Instant::now();
+                    let file = match prepared_files.entry(source.path.clone()) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => entry
+                            .insert(std::fs::File::open(&source.path).map_err(|e| e.to_string())?),
+                    };
+                    upload_file_range(&session, &buffer, file, source.offset, source.bytes)?;
+                    if verify {
+                        use std::os::unix::fs::FileExt;
+                        verify_upload(&session, &buffer, &definition.name, |chunk, out| {
+                            file.read_exact_at(out, (source.offset + chunk * CHUNK) as u64)
+                                .map_err(|e| e.to_string())
+                        })?;
+                    }
+                    phases.prepared.add(source.bytes, t.elapsed().as_secs_f64());
                 } else if let Some(weight) = definition.weight {
                     let t = Instant::now();
                     let data = weights::load(&mut checkpoint, &weight)?;
@@ -742,11 +784,9 @@ impl Worker {
                     let prefix = format!("layers.{}.engram.embed", layer.layer);
                     stores.insert(
                         layer.layer,
-                        Int8Rows::open(
-                            &checkpoint.path(&format!("{prefix}.weight"))?,
-                            &format!("{prefix}.weight"),
-                            &checkpoint.path(&format!("{prefix}.scale"))?,
-                            &format!("{prefix}.scale"),
+                        Int8Rows::open_sharded(
+                            &checkpoint.row_sources(&format!("{prefix}.weight"))?,
+                            &checkpoint.row_sources(&format!("{prefix}.scale"))?,
                             Shard {
                                 first: 0,
                                 rows: layer.rows,
@@ -1578,6 +1618,18 @@ fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf, HashLayou
         return Err("Engram/tokenizer identity differs".into());
     }
     preflight(&model, &base)?;
+    let mut checkpoint = Checkpoint::open(model_dir, &model.index.file)?;
+    let mut checked = std::collections::BTreeSet::new();
+    for definition in model.ranks.iter().flat_map(|r| &r.buffers) {
+        if let Some(tensor) = &definition.prepared_tensor
+            && checked.insert((&tensor.name, &tensor.dtype, &tensor.shape, definition.bytes))
+        {
+            let source = checkpoint.source(&tensor.name, &tensor.dtype, &tensor.shape)?;
+            if source.bytes != definition.bytes {
+                return Err("Prepared tensor byte extent differs".into());
+            }
+        }
+    }
     model.graph_launches = batch::graph_launches(&model);
     Ok((model, base, layout))
 }
@@ -1669,9 +1721,17 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                     || definition.weight.is_some()
                     || definition.data.is_some()
                     || definition.prepared_weight.is_some()
+                    || definition.prepared_tensor.is_some()
                 {
                     return Err("Invalid model tensor view".into());
                 }
+            }
+            let sources = usize::from(definition.weight.is_some())
+                + usize::from(definition.data.is_some())
+                + usize::from(definition.prepared_weight.is_some())
+                + usize::from(definition.prepared_tensor.is_some());
+            if sources > 1 {
+                return Err("Model buffer has multiple weight sources".into());
             }
             buffers.insert(definition.name.clone(), definition.bytes);
             if let Some(file) = &definition.prepared_weight {

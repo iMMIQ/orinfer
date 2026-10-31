@@ -307,3 +307,31 @@ fn tuned_w4_reuses_capacity_only_for_device_routing() {
     assert!(w4_plan_rows(12288, 6, Some(16), true, true).is_err());
     assert!(w4_plan_rows(12288, 6, Some(0), true, false).is_err());
 }
+
+#[test]
+#[ignore = "Needs an exported release and an explicit external execution cache; metadata only"]
+fn published_weights_resolve_external_execution_without_bundled_assets() {
+    let root = std::path::PathBuf::from(std::env::var_os("ORINFER_A2_RELEASE_TEST_ROOT").unwrap());
+    assert!(!root.join("cache/packages").exists());
+    let descriptor: serde_json::Value = crate::model::read(&root.join("cache/model.json")).unwrap();
+    let digest = descriptor["execution_package"].as_str().unwrap();
+    let package = crate::operators::resolve(&root.join("cache"), digest).unwrap();
+    assert!(!package.starts_with(&root));
+    let bytes = std::fs::read(package.join("package.json")).unwrap();
+    assert_eq!(crate::artifact::sha256(&bytes), digest);
+    let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let plan = package.join(data["plan"]["file"].as_str().unwrap());
+    assert_eq!(
+        crate::artifact::sha256(&std::fs::read(&plan).unwrap()),
+        data["plan"]["sha256"].as_str().unwrap()
+    );
+    // The production loader performs this entire check before creating any
+    // session: compiled assets, row programs and every physical tensor binding.
+    let (model, _, _) = super::load_spec(&plan, &root).unwrap();
+    assert_eq!(model.layers, 40);
+    assert_eq!(model.ranks.len(), 8);
+    println!(
+        "External A2 execution package and physical tensor bindings verified: {}",
+        package.display()
+    );
+}

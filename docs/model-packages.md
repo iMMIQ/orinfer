@@ -201,6 +201,8 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 调优读取真实 checkpoint 投影权重，检查候选数值、尾部和改变输入后的 Graph replay，发布同目录的 `model-tuned.json`；随后对选中的计划执行 `prepare` 和完整请求验收。调优只发生在离线工具中，完整请求 TPS 仍由 `bench-ascend` 测量。
 
+`tools.model.deepseek_v41.export_release --source SERVICE --output RELEASE --execution-output EXECUTION_CACHE --attribution CHECKPOINT` 将已验收的 A2 服务导出为原生物理布局 safetensors。GPU bank 按 rank 和连续四层分片，共享参数及 CPU embedding 单独保存；Engram 按层、哈希头和半头连续行段分片，标准索引的 `row_shards` 扩展保持原全局行号。每片最大 4 GiB，导出前可用 `--plan-only` 查看文件规划。剩余矩阵切片、BF16→FP32、padding 与通道乘积在离线物化；执行计划以 `prepared_tensor` 声明张量名、物理 dtype 和 shape，加载时按容器范围读取并复用文件句柄。权重目录只保留数据、索引与前端资产；算子和执行计划单独发布到 `EXECUTION_CACHE`，运行时通过 `ORINFER_EXECUTION_CACHE` 查找 digest。原始 checkpoint 留在离线归档。导出目录的 `export-state.json` 与 `release-manifest.json` 记录完成状态及文件／张量校验和；该格式使用支持分片主机表和 prepared_tensor 的 orinfer 引擎。
+
 `tools.model.deepseek_v41.w4_capacity --plan PLAN --package-output DIR --expected-expert-rows N` 将已测量的 CANN 每专家行数提示写入 W4 指令。执行器以固定容量和地址复用 repeatable ACLNN 计划，实际计算范围继续由设备路由计数决定。该转换要求独立分配的操作数和设备路由；旧计划继续使用实际行数描述。提示需按真实矩阵、均匀和偏斜路由测量，再验收完整请求和 Mini；小 tile 与集中路由之间存在性能取舍。该参数不改变整数精度或权重表示。
 
 `tools.model.deepseek_v41.tune_auxiliary` 接受同样的 `--plan`、`--model-dir` 和 `--output`，离线选择 mHC post/pre 的列块与 FP32 分解投影的行块。后者读取计划中已准备的真实 BF16 分量，候选保持原 K 累加顺序；所有候选检查逐元素一致、尾部及改变输入后的 Graph replay。输出计划名增加 `-aux-tuned`。两种调优缓存均固定当前源码、编译器、设备、测量长度和真实权重身份，并校验被选库的内容。

@@ -1229,6 +1229,7 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             if b.weight.is_some()
                 || b.data.is_some()
                 || b.prepared_weight.is_some()
+                || b.prepared_tensor.is_some()
                 || column.row_bytes == Some(0)
                 || !column.row_alignment.is_power_of_two()
                 || column.row_alignment > 256
@@ -1274,6 +1275,7 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             if b.weight.is_some()
                 || b.data.is_some()
                 || b.prepared_weight.is_some()
+                || b.prepared_tensor.is_some()
                 || b.view
                     .as_ref()
                     .is_some_and(|v| !parents.contains(&v.parent))

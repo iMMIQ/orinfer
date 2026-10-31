@@ -46,6 +46,35 @@ impl Checkpoint {
             .ok_or_else(|| format!("Checkpoint tensor missing: {name}"))?;
         resolve_file(&self.base, file)
     }
+    /// Ordered contiguous row shards retain the logical table's original IDs.
+    pub fn row_sources(&self, name: &str) -> Result<Vec<(PathBuf, String)>> {
+        let names = self.index.row_shards.get(name);
+        let parts = names.cloned().unwrap_or_else(|| vec![name.to_owned()]);
+        let unique: std::collections::BTreeSet<_> = parts.iter().collect();
+        if parts.is_empty() || unique.len() != parts.len() {
+            return Err("Empty or duplicate host-row shards".into());
+        }
+        parts.into_iter().map(|n| Ok((self.path(&n)?, n))).collect()
+    }
+    pub fn source(
+        &mut self,
+        name: &str,
+        dtype: &str,
+        shape: &[usize],
+    ) -> Result<super::TensorSource> {
+        let tensor = self.read(name)?;
+        if format!("{:?}", tensor.dtype) != dtype || tensor.shape != shape {
+            return Err(format!("{name}: prepared tensor dtype/shape differs"));
+        }
+        let file = &self.index.weight_map[name];
+        let shard = &self.shards[file];
+        let (start, end) = shard.metadata.info(name).unwrap().data_offsets;
+        Ok(super::TensorSource {
+            path: shard.path.clone(),
+            offset: shard.data_start + start,
+            bytes: end - start,
+        })
+    }
     pub fn file_tensor(&mut self, file: &str, name: &str) -> Result<Tensor<'_>> {
         if !self.shards.contains_key(file) {
             let path = resolve_file(&self.base, file)?;
@@ -76,5 +105,46 @@ impl Checkpoint {
             shape: &info.shape,
             data: &shard.mapping[shard.data_start + start..shard.data_start + end],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn packed_sources_validate_header_identity_and_indexed_row_parts() {
+        use safetensors::tensor::{TensorView, serialize};
+        let dir = tempfile::tempdir().unwrap();
+        let payload = [1u8, 2, 3, 4];
+        std::fs::write(
+            dir.path().join("a.safetensors"),
+            serialize(
+                [
+                    (
+                        "a",
+                        TensorView::new(Dtype::I8, vec![2, 2], &payload).unwrap(),
+                    ),
+                    (
+                        "b",
+                        TensorView::new(Dtype::I8, vec![2, 2], &payload).unwrap(),
+                    ),
+                ],
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("index.json"), br#"{"weight_map":{"a":"a.safetensors","b":"a.safetensors"},"row_shards":{"table":["a","b"]}}"#).unwrap();
+        let mut checkpoint = Checkpoint::open(dir.path(), "index.json").unwrap();
+        let source = checkpoint.source("a", "I8", &[2, 2]).unwrap();
+        let bytes = std::fs::read(&source.path).unwrap();
+        assert_eq!(&bytes[source.offset..source.offset + source.bytes], payload);
+        assert!(checkpoint.source("a", "U8", &[2, 2]).is_err());
+        assert!(checkpoint.source("a", "I8", &[4]).is_err());
+        let parts = checkpoint.row_sources("table").unwrap();
+        assert_eq!(
+            parts.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
     }
 }
