@@ -669,8 +669,8 @@ pub(super) fn worker(
                             Err(error) => {
                                 let failure =
                                     orinfer_engine::error::EngineError::take(error.clone(), false);
-                                let unavailable =
-                                    failure.kind == orinfer_engine::error::ErrorKind::Capacity;
+                                let unavailable = failure.is_fatal()
+                                    || failure.kind == orinfer_engine::error::ErrorKind::Capacity;
                                 if failure.is_fatal() {
                                     lifecycle.fail(failure);
                                 }
@@ -689,8 +689,8 @@ pub(super) fn worker(
                     Err(error) => {
                         let failure =
                             orinfer_engine::error::EngineError::take(error.clone(), false);
-                        let unavailable =
-                            failure.kind == orinfer_engine::error::ErrorKind::Capacity;
+                        let unavailable = failure.is_fatal()
+                            || failure.kind == orinfer_engine::error::ErrorKind::Capacity;
                         if failure.is_fatal() {
                             lifecycle.fail(failure);
                         }
@@ -814,7 +814,7 @@ pub(super) fn worker(
     {
         let _ = job
             .events
-            .try_send(ModelEvent::Failed("GPU worker stopped".into()));
+            .try_send(ModelEvent::Unavailable("GPU worker stopped".into()));
     }
     for mut a in active.drain(..) {
         if lifecycle.name() != "failed"
@@ -826,7 +826,7 @@ pub(super) fn worker(
             .mailbox
             .job
             .events
-            .try_send(ModelEvent::Failed("GPU worker stopped".into()));
+            .try_send(ModelEvent::Unavailable("GPU worker stopped".into()));
     }
     for mailbox in &mut completed {
         mailbox.flush();

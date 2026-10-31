@@ -6,6 +6,7 @@ pub(crate) mod defaults;
 mod grammar;
 mod image;
 mod lifecycle;
+mod listener;
 mod metrics;
 mod output;
 mod preparation;
@@ -114,6 +115,9 @@ pub fn run(settings: Settings) -> Result<()> {
 }
 async fn serve(settings: Settings) -> Result<()> {
     let started = Instant::now();
+    let (listener, _socket_path) = listener::bind(&settings.listen)
+        .await
+        .map_err(|error| format!("Listener bind failed: {error}"))?;
     let worker = startup::start(&settings).await?;
     let state = worker.state.clone();
     let shutdown = Arc::clone(&worker.shutdown);
@@ -149,21 +153,6 @@ async fn serve(settings: Settings) -> Result<()> {
             request_id,
         ))
         .with_state(state);
-    let (tcp, unix) = if let Some(path) = settings.listen.strip_prefix("unix:") {
-        (
-            None,
-            Some(tokio::net::UnixListener::bind(path).map_err(|e| e.to_string())?),
-        )
-    } else {
-        (
-            Some(
-                tokio::net::TcpListener::bind(&settings.listen)
-                    .await
-                    .map_err(|e| e.to_string())?,
-            ),
-            None,
-        )
-    };
     eprintln!(
         "API READY http://{}/v1; context {context}; continuous_batching=true, max_active={}, queue 128; startup={:.3}s",
         settings.listen,
@@ -186,16 +175,15 @@ async fn serve(settings: Settings) -> Result<()> {
             signal_shutdown.store(true, Ordering::Relaxed);
             signal_draining.notify_one();
         };
-        let server = if let Some(listener) = tcp {
-            axum::serve(listener, router)
+        let server = match listener {
+            listener::Listener::Tcp(listener) => axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown)
                 .into_future()
-                .boxed()
-        } else {
-            axum::serve(unix.unwrap(), router)
+                .boxed(),
+            listener::Listener::Unix(listener) => axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown)
                 .into_future()
-                .boxed()
+                .boxed(),
         };
         tokio::pin!(server);
         tokio::select! {
@@ -422,7 +410,7 @@ async fn completions(
             mpsc::error::TrySendError::Full(_) => {
                 error(StatusCode::TOO_MANY_REQUESTS, "Request queue is full")
             }
-            _ => error(StatusCode::INTERNAL_SERVER_ERROR, "GPU worker unavailable"),
+            _ => error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker unavailable"),
         };
     }
     if stream {
@@ -454,7 +442,7 @@ async fn completions(
                 ModelEvent::Chunk(_) => {}
             }
         }
-        error(StatusCode::INTERNAL_SERVER_ERROR, "GPU worker disconnected")
+        error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker disconnected")
     }
 }
 fn retain_output_memory(response: Response, memory: Arc<preparation::Lease>) -> Response {

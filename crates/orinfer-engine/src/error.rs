@@ -25,6 +25,17 @@ thread_local! {
     static DRIVER_FAILURE: RefCell<Option<i32>> = const { RefCell::new(None) };
     static ASCEND_FAILURE: Cell<Option<i32>> = const { Cell::new(None) };
     static CAPACITY_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static FORWARDED_FAILURE: RefCell<Option<EngineError>> = const { RefCell::new(None) };
+}
+/// Preserve the initiating device failure across a worker-thread reply.
+pub(crate) fn forward(error: EngineError) -> String {
+    let message = error.message.clone();
+    FORWARDED_FAILURE.with(|value| {
+        if value.borrow().is_none() {
+            *value.borrow_mut() = Some(error);
+        }
+    });
+    message
 }
 pub(crate) fn record_cuda(code: i32) {
     DRIVER_FAILURE.with(|v| {
@@ -49,6 +60,13 @@ impl EngineError {
         let cuda_code = DRIVER_FAILURE.with(|v| v.borrow_mut().take());
         let capacity = CAPACITY_FAILURE.with(|v| v.replace(false));
         let ascend_code = ASCEND_FAILURE.with(|v| v.replace(None));
+        if let Some(mut error) = FORWARDED_FAILURE.with(|v| v.borrow_mut().take()) {
+            error.message = message;
+            if invariant && !error.is_fatal() {
+                error.kind = ErrorKind::Invariant;
+            }
+            return error;
+        }
         let kind = match cuda_code {
             Some(2) => ErrorKind::OutOfMemory,
             Some(_) => ErrorKind::Cuda,
@@ -81,6 +99,25 @@ impl std::error::Error for EngineError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_device_error_crosses_threads_and_cleanup_does_not_replace_it() {
+        let error = std::thread::spawn(|| {
+            record_ascend(507015);
+            EngineError::take("rank failed".into(), true)
+        })
+        .join()
+        .unwrap();
+        let message = forward(error);
+        record_cuda(700);
+        let received = EngineError::take(message, false);
+        assert_eq!(received.kind, ErrorKind::Ascend);
+        assert_eq!(received.ascend_code, Some(507015));
+        assert!(received.is_fatal());
+        assert_eq!(
+            EngineError::take("next".into(), false).kind,
+            ErrorKind::Request
+        );
+    }
     #[test]
     fn ascend_failures_retire_workers_and_keep_the_initiating_code() {
         record_ascend(507015);

@@ -266,6 +266,16 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 
 `/health` 显示 starting/ready/draining/failed，并提供调度、准入、缓存恢复和 Graph 统计。GPU worker 故障时返回 503；CUDA 或内部状态故障后需要重启服务。统计和真实 API 性能测量见[性能工具](../tools/bench/README.md)。
 
+HTTP 在加载模型前绑定监听地址，端口被占用时立即退出；模型和预热完成后开始处理 HTTP。就绪探针使用 `/health` 的 HTTP 200，TCP 连通只表示监听地址已绑定。A2 全量常驻 CPU 表的启动可能需要数分钟，部署时为启动探针预留足够时间，例如 600 秒。正常退出及启动失败会清理本服务创建的 Unix socket；已有 socket 绑定失败时保留原文件。
+
+A2 rank 的命令使用一个共同的等待期限，`ORINFER_A2_COMMAND_TIMEOUT_MS` 默认 `30000`，支持 `1..1800000` 毫秒，同时设置 ACL 同步等待期限；初始模型加载单独允许 1800 秒。rank 驱动错误、线程退出或命令超时会使当前 TP 团队失效，保留首个故障的类型和驱动错误码，后续请求无法继续使用该团队。服务故障后由进程管理器重启；调整命令期限时也应相应配置 HTTP 和停机期限。
+
+A2 HTTP/JSONL 使用 `ASCEND_COREDUMP_SIGNAL=none`，由服务处理 SIGINT/SIGTERM 并回收资源。`serve`、`worker` 和 `batch` CLI 在创建线程前默认设置该值；直接调用 Rust API 时在进程启动环境中设置。A2 检测到缺失或冲突配置时在创建 GPU worker 前报错。[CANN 环境变量说明](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/800alpha002/apiref/envref/CANN%E7%A4%BE%E5%8C%BA%E7%89%88%208.0.0.alpha002%20%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F%E5%8F%82%E8%80%83%2001.pdf)说明了 trace 与业务信号捕获冲突时的配置；此设置关闭 CANN trace 的信号堆栈文件，Rust 错误报告及系统 core dump 配置继续生效。SIGINT/SIGTERM 会中断未完成请求，按 `--drain-timeout-ms` 等待 HTTP 响应及 worker 回收。
+
+A2 停机时，常驻 CPU 表等待所有读取者释放后回收，与 rank 和 bootstrap 原生资源的销毁重叠；两者完成后释放 GPU 锁。全量常驻大 CPU 表的部署使用 `--drain-timeout-ms 120000`，为内存释放和驱动清理保留余量，外部进程管理器的强制退出期限应大于此值。
+
+若启动或停机错误返回时仍有模型 worker 存活，CLI 记录错误后以退出码 1 直接终止进程，跳过会与原生线程竞争的第三方退出钩子，由操作系统回收进程资源。正常退出仍等待模型和 CPU 表完成销毁。Rust API 的 `has_live_model_workers()` 可供嵌入调用方判断后台资源是否仍在回收。
+
 启动默认校验配置、执行库、kernel 身份，以及权重和 CPU 表的 safetensors 结构、dtype、shape、布局和偏移边界，跳过大体积权重的 SHA256 扫描。`serve`、`run-model` 和 `score-model` 添加 `--verify-weights` 可校验加载的权重内容；`validate-model` 始终完整校验模型权重。检测结构合法但数值受损的权重需开启完整内容校验。
 
 HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU worker 上创建和释放；两者成功并核对前端 hash 与词表后才就绪。`WORKER READY` 分别记录前端、模型与并行准备总耗时，`API READY` 的 `startup` 包含前端和 HTTP 初始化。`LOAD STAGES` 提供 CUDA 初始化、buffer 分配、权重流水线等待和算子资产准备计时；`kernel_assets_s` 包含在 `module_load_bind_s` 中，权重等待计时包含在 `weight_upload_s` 中；总耗时按外层计时读取。完整进程到首输出的测量见[性能工具](../tools/bench/README.md)。

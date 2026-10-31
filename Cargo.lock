@@ -1770,6 +1770,7 @@ name = "orinfer-cli"
 version = "0.2.2"
 dependencies = [
  "clap",
+ "libc",
  "orinfer-api",
  "orinfer-engine",
  "serde",

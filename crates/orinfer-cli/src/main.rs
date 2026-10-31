@@ -751,6 +751,15 @@ fn batch_overrides(
     });
     values
 }
+fn exit_with_unfinished_workers(pending: bool) {
+    if pending {
+        // SAFETY: An API error returned while native teardown is still live.
+        // Running CANN process-exit hooks concurrently can double-free native
+        // state. _exit terminates this standalone process without those hooks;
+        // the OS reclaims its threads, accelerator handles and GPU lease.
+        unsafe { libc::_exit(1) };
+    }
+}
 fn main() -> ExitCode {
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
@@ -760,16 +769,51 @@ fn main() -> ExitCode {
             &args.inference,
         );
     }
+    if matches!(
+        &cli.command,
+        Some(Command::Serve(_) | Command::Worker(_) | Command::Batch(_))
+    ) && std::env::var_os("ASCEND_COREDUMP_SIGNAL").is_none()
+    {
+        // SAFETY: main has not started runtime, preprocessing or accelerator
+        // threads. CANN trace handlers otherwise preempt graceful shutdown.
+        unsafe { std::env::set_var("ASCEND_COREDUMP_SIGNAL", "none") };
+    }
     match execute(cli.command.unwrap_or(Command::Info), &cli.data_dir) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
+            exit_with_unfinished_workers(orinfer_api::has_live_model_workers());
             ExitCode::FAILURE
         }
     }
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unfinished_native_worker_exit_bypasses_process_destructors() {
+        const CHILD: &str = "ORINFER_TEST_UNFINISHED_NATIVE_WORKER";
+        if std::env::var_os(CHILD).is_some() {
+            extern "C" fn conflicting_destructor() {
+                // SAFETY: Test-only process exit callback; no resources escape.
+                unsafe { libc::_exit(77) };
+            }
+            // SAFETY: Static C callback remains valid through process exit.
+            assert_eq!(unsafe { libc::atexit(conflicting_destructor) }, 0);
+            super::exit_with_unfinished_workers(true);
+            panic!("Emergency exit returned");
+        }
+        super::exit_with_unfinished_workers(false);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::unfinished_native_worker_exit_bypasses_process_destructors",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+    }
     #[test]
     fn backend_inventory_and_graph_alias_are_typed() {
         let Some(Command::Devices { backend }) =

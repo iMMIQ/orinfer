@@ -1,5 +1,26 @@
 //! Shared model loading and GPU worker lifecycle for HTTP and offline jobs.
 use super::*;
+use std::sync::atomic::AtomicUsize;
+
+static LIVE_MODEL_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Native resources can still be live after an API startup/drain deadline.
+/// Standalone runners must avoid native process exit hooks in this state.
+pub fn has_live_model_workers() -> bool {
+    LIVE_MODEL_WORKERS.load(Ordering::Acquire) != 0
+}
+struct WorkerLifetime;
+impl WorkerLifetime {
+    fn new() -> Self {
+        LIVE_MODEL_WORKERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+impl Drop for WorkerLifetime {
+    fn drop(&mut self) {
+        LIVE_MODEL_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub(super) struct Worker {
     pub state: Service,
@@ -21,6 +42,16 @@ impl Worker {
 }
 
 pub(super) async fn start(settings: &Settings) -> Result<Worker> {
+    let descriptor: Value = serde_json::from_slice(
+        &std::fs::read(settings.model_dir.join("cache/model.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    validate_shutdown_environment(
+        descriptor["metadata"]["target"]
+            .as_str()
+            .unwrap_or_default(),
+        std::env::var_os("ASCEND_COREDUMP_SIGNAL").as_deref(),
+    )?;
     let started = Instant::now();
     let settings = settings.clone();
     let default_request_params = Arc::new(settings.default_request_params.clone());
@@ -39,9 +70,13 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
     let worker_activity = Arc::clone(&activity);
     let worker_lifecycle = Arc::clone(&lifecycle);
     let limits = settings.limits;
+    let worker_lifetime = WorkerLifetime::new();
     let worker = std::thread::Builder::new()
         .name("orinfer-gpu".into())
         .spawn(move || {
+            // Declared before model ownership; cleared only after native
+            // destruction, including error and panic cleanup, has completed.
+            let _worker_lifetime = worker_lifetime;
             let _ = worker_lifecycle.supervise(|| {
                 let initialize = || -> Result<_> {
                     let ((worker_codec, frontend_s), loaded) = load_parallel(
@@ -71,7 +106,6 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                 };
                 match initialize() {
                     Ok((mut loaded, context, vision, worker_codec)) => {
-                        worker_lifecycle.ready();
                         // The first user request would otherwise pay lease
                         // mapping, packet plans and module loading: measured
                         // ~0.6s of extra first-prompt TTFT on Flash Next.
@@ -94,6 +128,7 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                             "WARMUP READY after {:.3}s",
                             warm_started.elapsed().as_secs_f64()
                         );
+                        worker_lifecycle.ready();
                         let mtp_drafts = loaded.model.mtp_drafts();
                         let ready = (context, vision, mtp_drafts, Arc::clone(&worker_codec));
                         if ready_sender.send(Ok(ready)).is_ok() {
@@ -165,6 +200,13 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
         shutdown,
         handle: worker,
     })
+}
+
+fn validate_shutdown_environment(target: &str, capture: Option<&std::ffi::OsStr>) -> Result<()> {
+    if target == "ascend910b" && capture != Some(std::ffi::OsStr::new("none")) {
+        return Err("A2 service requires ASCEND_COREDUMP_SIGNAL=none before process startup: CANN trace signal handlers bypass graceful shutdown".into());
+    }
+    Ok(())
 }
 
 // Fields drop in declaration order, including when frontend preparation fails:
@@ -257,6 +299,41 @@ pub(crate) fn load_parallel<T: Send, U>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_liveness_covers_native_resource_destruction() {
+        use std::sync::mpsc;
+        struct NativeDrop(mpsc::Sender<()>, mpsc::Receiver<()>);
+        impl Drop for NativeDrop {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv().unwrap();
+            }
+        }
+        let (entered, destroyed) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let lifetime = WorkerLifetime::new();
+        let worker = std::thread::spawn(move || {
+            let _lifetime = lifetime;
+            let _native = NativeDrop(entered, gate);
+        });
+        destroyed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(has_live_model_workers());
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(!has_live_model_workers());
+    }
+    #[test]
+    fn a2_signal_capture_conflicts_fail_before_worker_start() {
+        use std::ffi::OsStr;
+        assert!(validate_shutdown_environment("ascend910b", Some(OsStr::new("none"))).is_ok());
+        for capture in [None, Some(OsStr::new("all")), Some(OsStr::new(""))] {
+            let error = validate_shutdown_environment("ascend910b", capture).unwrap_err();
+            assert!(error.contains("ASCEND_COREDUMP_SIGNAL=none"));
+        }
+        assert!(validate_shutdown_environment("cuda", None).is_ok());
+    }
 
     #[test]
     fn frontend_overlaps_model_load_and_model_stays_on_owner() {

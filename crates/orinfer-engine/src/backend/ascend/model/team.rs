@@ -8,7 +8,10 @@ use super::{
     batch::{CacheState, Layout},
     load_spec,
 };
-use crate::artifact::Result;
+use crate::{artifact::Result, error::EngineError};
+mod channel;
+mod host_release;
+use channel::{Peer, Transport, reply_channel};
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -60,19 +63,16 @@ pub(super) struct Output {
     pub value: f32,
     pub logits: Vec<f32>,
 }
-struct Peer {
-    send: mpsc::Sender<Command>,
-    receive: mpsc::Receiver<Result<Reply>>,
-}
 pub(super) struct Team {
-    peers: Vec<Peer>,
+    peers: Transport,
     handles: Vec<JoinHandle<()>>,
     pub model: Arc<Model>,
     pub load_s: f64,
     pub rows: usize,
     pub owner_bytes: usize,
     // Drop worker contexts and communication groups before the bootstrap context.
-    _bootstrap: Session,
+    _bootstrap: Option<Session>,
+    host_tables: Option<Arc<SharedTables>>,
 }
 impl Team {
     pub fn load(plan: &Path, model_dir: &Path) -> Result<Self> {
@@ -97,6 +97,11 @@ impl Team {
             .map(|p| p.rows)
             .max()
             .ok_or("Missing A2 prefill rows")?;
+        let timeout = channel::command_timeout(
+            std::env::var("ORINFER_A2_COMMAND_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        )?;
         let ranks = std::mem::take(&mut model.ranks);
         let cpus = affinity::from_env(ranks.len())?;
         let started = Instant::now();
@@ -105,24 +110,25 @@ impl Team {
         let shared = Arc::new(SharedTables::new());
         let model = Arc::new(model);
         let mut team = Self {
-            peers: vec![],
+            peers: Transport::new(timeout),
             handles: vec![],
             model: Arc::clone(&model),
             load_s: 0.,
             rows,
             owner_bytes,
-            _bootstrap: bootstrap,
+            _bootstrap: Some(bootstrap),
+            host_tables: Some(shared),
         };
         for rank in ranks {
             let cpus = cpus.as_ref().map(|v| v[rank.rank as usize].clone());
             let root = root.clone();
-            let shared = Arc::clone(&shared);
+            let shared = Arc::clone(team.host_tables.as_ref().unwrap());
             let model = Arc::clone(&model);
             let package = package.clone();
             let layout = layout.clone();
             let model_dir = model_dir.to_owned();
             let (send, commands) = mpsc::channel();
-            let (reply, receive) = mpsc::channel();
+            let (reply, receive) = reply_channel();
             let index = rank.rank;
             let handle = std::thread::Builder::new()
                 .name(format!("orinfer-a2-{index}"))
@@ -137,7 +143,7 @@ impl Team {
                                 Limits {
                                     device_bytes: 58 << 30,
                                     pinned_bytes: 64 << 20,
-                                    timeout_ms: 30000,
+                                    timeout_ms: timeout.as_millis() as i32,
                                 },
                             )?,
                             &root,
@@ -150,10 +156,13 @@ impl Team {
                             &shared,
                         )
                     })();
+                    // Keep the table owner on Team, rather than extending its
+                    // lifetime through the rank closure's native destructors.
+                    drop(shared);
                     let mut worker = match result {
                         Ok(worker) => worker,
                         Err(error) => {
-                            let _ = reply.send(Err(error));
+                            let _ = reply.send(Err(EngineError::take(error, true)));
                             return;
                         }
                     };
@@ -241,6 +250,7 @@ impl Team {
                                 worker.routing_groups(decode).map(Reply::RoutingGroups)
                             }
                         };
+                        let result = result.map_err(|error| EngineError::take(error, true));
                         let failed = result.is_err();
                         if let Err(error) = &result {
                             eprintln!("A2 rank {index}: {error}");
@@ -255,10 +265,9 @@ impl Team {
             team.handles.push(handle);
             team.peers.push(Peer { send, receive });
         }
-        for peer in &team.peers {
-            peer.receive
-                .recv_timeout(Duration::from_secs(1800))
-                .map_err(|error| format!("A2 load: {error}"))??;
+        let ready = team.peers.receive(Duration::from_secs(1800))?;
+        if ready.iter().any(|reply| !matches!(reply, Reply::Ready)) {
+            return Err("Invalid A2 startup reply".into());
         }
         team.load_s = started.elapsed().as_secs_f64();
         Ok(team)
@@ -377,36 +386,33 @@ impl Worker {
 }
 impl Drop for Team {
     fn drop(&mut self) {
-        for peer in &self.peers {
+        for peer in self.peers.iter() {
             let _ = peer.send.send(Command::Stop);
         }
+        let host_release = self.host_tables.take().and_then(host_release::start);
         for handle in self.handles.drain(..) {
             if handle.join().is_err() {
                 eprintln!("A2 worker panicked during teardown");
             }
         }
+        // CPU table reclamation owns no ACL/HCCL state and overlaps both rank
+        // teardown and the final bootstrap context. Join before releasing the
+        // model owner's GPU lock or returning from destruction.
+        drop(self._bootstrap.take());
+        if let Some(handle) = host_release
+            && handle.join().is_err()
+        {
+            eprintln!("CPU table release thread panicked during teardown");
+        }
     }
 }
 
-fn exchange(peers: &[Peer], command: Command) -> Result<Vec<Reply>> {
-    for peer in peers {
-        peer.send
-            .send(command.clone())
-            .map_err(|error| error.to_string())?;
-    }
-    let results = peers
-        .iter()
-        .map(|peer| {
-            peer.receive
-                .recv_timeout(Duration::from_secs(1800))
-                .map_err(|error| format!("A2 worker: {error}"))?
-        })
-        .collect::<Vec<_>>();
-    results.into_iter().collect()
+fn exchange(peers: &Transport, command: Command) -> Result<Vec<Reply>> {
+    peers.exchange(command)
 }
 
 fn forward(
-    peers: &[Peer],
+    peers: &Transport,
     layout: Layout,
     tokens: Vec<Vec<u32>>,
     full: bool,
@@ -438,7 +444,7 @@ fn preparation(states: &[CacheState], decode: bool) -> Result<(bool, bool)> {
 }
 
 fn forward_with(
-    peers: &[Peer],
+    peers: &Transport,
     layout: Layout,
     tokens: Vec<Vec<u32>>,
     full: bool,
@@ -461,20 +467,9 @@ fn forward_with(
     let prepare_s = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let command = Command::Forward(layout, tokens, full);
-    for peer in peers {
-        peer.send
-            .send(command.clone())
-            .map_err(|error| error.to_string())?;
-    }
+    peers.send(command)?;
     maintenance();
-    let results = peers
-        .iter()
-        .map(|peer| {
-            peer.receive
-                .recv_timeout(Duration::from_secs(1800))
-                .map_err(|error| format!("A2 forward: {error}"))?
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let results = peers.collect()?;
     let ranks = results
         .into_iter()
         .map(|reply| match reply {
@@ -483,6 +478,9 @@ fn forward_with(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut outputs = ranks.first().cloned().ok_or("Missing A2 TP output")?;
+    if ranks.iter().any(|rank| rank.len() != outputs.len()) {
+        return Err("A2 TP output count differs".into());
+    }
     for (i, output) in outputs.iter_mut().enumerate() {
         output.logits.clear();
         for rank in &ranks {
@@ -551,12 +549,12 @@ mod tests {
             [CacheState::Missing, CacheState::Missing],
         ] {
             std::thread::scope(|scope| {
-                let mut peers = vec![];
+                let mut peers = Transport::new(Duration::from_secs(5));
                 let mut maintained = vec![];
                 let (recapture, capture) = preparation(&statuses, false).unwrap();
                 for hit in statuses {
                     let (send, commands) = mpsc::channel();
-                    let (reply, receive) = mpsc::channel();
+                    let (reply, receive) = reply_channel();
                     let (maintenance, completed) = mpsc::channel();
                     maintained.push(maintenance);
                     peers.push(Peer { send, receive });

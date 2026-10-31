@@ -10,3 +10,4 @@ mod test_fixtures;
 pub use config::{BatchConfig, BatchOrder, PreprocessingLimits, ServerConfig};
 pub use server::batch::{BatchReport, run as run_batch};
 pub use server::run;
+pub use server::startup::has_live_model_workers;
