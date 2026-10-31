@@ -1,10 +1,12 @@
-"""Choose one shared head tile for native selected attention using published AOT controls."""
+"""Tune the shared native selected-attention schedule against its published baseline."""
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 import ctypes
+from itertools import product
 import json
+import math
 import multiprocessing
 from pathlib import Path
 
@@ -13,6 +15,24 @@ from tools.model.deepseek_v41.batch import compile_task, DTYPES
 from tools.model.deepseek_v41.assembly import publish_package, validate_rows
 from tools.model.row_selection import guarded_winner
 from tools.model.tuning import read_record, record_path
+
+
+def attention_configs(parameters):
+    """Retain the published schedule when tuning the softmax head tile."""
+    return {"baseline": {}} | {
+        f"head-{tile}": dict(softmax_heads=tile)
+        for tile in (1, 4, 8)
+        if tile != parameters.get("softmax_heads", 1)
+    }
+
+
+def select_schedule(records, minimum_gain=0.02):
+    """Require a useful aggregate gain and bound every measured row's regression."""
+    selected = guarded_winner(records, reference="baseline", maximum_regression=0.1)
+    ratio = math.exp(
+        sum(math.log(s["times"][selected] / s["times"]["baseline"]) for s in records) / len(records)
+    )
+    return selected if ratio < 1 - minimum_gain else "baseline"
 
 
 def attention_groups(model, base, minimum):
@@ -33,7 +53,7 @@ def attention_groups(model, base, minimum):
     return groups
 
 
-def compile_plan(plan, output, workers, minimum):
+def compile_plan(plan, output, workers, minimum, model_dir=None):
     from tools.operators.ascend.attention_fused import selected_int8
     from tools.operators.ascend.geometry import physical_shapes
 
@@ -43,13 +63,11 @@ def compile_plan(plan, output, workers, minimum):
         if json.loads((base / "model.json").read_text()) != model:
             raise ValueError("Attention tuning input changed")
     else:
-        validate_rows(model, plan.parent)
+        validate_rows(model, plan.parent, model_dir=model_dir)
         publish_package(model, plan.parent, base)
     groups, tasks = [], []
     for name, spec in attention_groups(model, base, minimum).items():
         p = spec["parameters"]
-        if p.get("softmax_heads", 1) != 1:
-            raise ValueError("Require the published one-head baseline")
         arguments = {k: v for k, v in p.items() if not k.startswith("_")}
         function = selected_int8(**arguments)
         tensors = [function.buffer_map[v] for v in function.params if v in function.buffer_map]
@@ -57,17 +75,19 @@ def compile_plan(plan, output, workers, minimum):
             dict(name=t.name, dtype=DTYPES[str(t.dtype)], shape=shape)
             for t, shape in zip(tensors, physical_shapes(function, arguments["rows"]), strict=True)
         ]
-        group = dict(baseline=name, operands=operands, candidates={"1": name})
+        group = dict(baseline=name, operands=operands, candidates={"baseline": name})
         groups.append(group)
         aliases = list(p["_owner_aliases"])
         metadata = {k: v for k, v in p.items() if k.startswith("_owner_")}
         metadata["_owner_source_sha256"] = file_hash(Path(selected_int8.__code__.co_filename))
-        for tile in (4, 8):
+        for label, updates in attention_configs(p).items():
+            if label == "baseline":
+                continue
             task = dict(
-                key=f"{len(groups) - 1}:{tile}",
+                key=f"{len(groups) - 1}:{label}",
                 module="tools.operators.ascend.attention_fused",
                 name="selected_int8",
-                arguments=dict(arguments, softmax_heads=tile),
+                arguments=dict(arguments, **updates),
                 specs=deepcopy(spec["operands"]),
                 capacity=p["_owner_token_capacity"],
                 dynamic=dict(rows=1),
@@ -97,7 +117,7 @@ def compile_plan(plan, output, workers, minimum):
     return report
 
 
-def select_plan(plan, output, device, minimum):
+def select_plan(plan, output, device, minimum, model_dir=None):
     import torch
     import torch_npu
     from tools.model.deepseek_v41.tune import npu_benchmark
@@ -115,6 +135,7 @@ def select_plan(plan, output, device, minimum):
     groups = compiled["groups"]
     configs = sorted(set.intersection(*(set(g["candidates"]) for g in groups)))
     identity = dict(
+        selection_contract=4,
         kernels={
             name: json.loads((base / name).read_text())
             for g in groups
@@ -124,10 +145,12 @@ def select_plan(plan, output, device, minimum):
         torch=torch.__version__,
         torch_npu=torch_npu.__version__,
         rows=[1, 17, 64, 68, 128, 256],
+        patterns=["random", "contiguous"],
         configs=configs,
         seed=20261002,
         calls_per_replay=4,
         maximum_regression=0.1,
+        minimum_gain=0.02,
         helpers={
             str(p): file_hash(p)
             for p in [
@@ -184,6 +207,7 @@ def select_plan(plan, output, device, minimum):
                 else:
                     data = (torch.randn(shape, dtype=torch.float32, device="npu") * 0.5).to(kind)
                 inputs[name] = data
+            random_swa_indices = inputs["swa_indices"].clone()
             active = torch.ones(1, dtype=torch.int32, device="npu")
             work = torch.empty((8192, 2), dtype=torch.int32, device="npu")
             for config in sorted(legal_configs):
@@ -217,7 +241,16 @@ def select_plan(plan, output, device, minimum):
                 )
                 calls[config] = (entry, pointers)
 
-            for rows in identity["rows"]:
+            for rows, pattern in product(identity["rows"], identity["patterns"]):
+                if pattern == "random":
+                    inputs["swa_indices"].copy_(random_swa_indices)
+                else:
+                    storage = p.get("swa_storage_rows") or p["capacity"]
+                    positions = torch.arange(capacity, device="npu")[:, None] * 17 + storage - 64
+                    positions %= max(1, p["capacity"] - 127)
+                    offsets = torch.arange(128, device="npu")[None, :]
+                    inputs["swa_indices"].copy_((positions + offsets).int())
+                    inputs["swa_indices"][6::7] = -1
                 for values in states.values():
                     addresses = [rows] + [values[name].data_ptr() for name in owned]
                     values["table"][0].copy_(torch.tensor(addresses, dtype=torch.int64))
@@ -246,17 +279,18 @@ def select_plan(plan, output, device, minimum):
                             try:
                                 torch.testing.assert_close(
                                     values[name][:rows],
-                                    states["1"][name][:rows],
+                                    states["baseline"][name][:rows],
                                     rtol=0,
                                     atol=0,
-                                    msg=f"Attention head tile {config}: {name}",
+                                    msg=f"Attention schedule {config}: {name}",
                                 )
                             except AssertionError as error:
-                                if config == "1":
+                                if config == "baseline":
                                     raise
                                 invalid[config] = dict(
                                     geometry=group["baseline"],
                                     rows=rows,
+                                    pattern=pattern,
                                     port=name,
                                     reason=str(error),
                                 )
@@ -299,21 +333,24 @@ def select_plan(plan, output, device, minimum):
                     times[config] = timing["median_ms"] / identity["calls_per_replay"]
                     graphs[config] = graph
                 check()
-                saved = states["1"]["output"][:rows].clone()
+                saved = states["baseline"]["output"][:rows].clone()
                 inputs["query"].neg_()
                 inputs["sink"].add_(0.125)
                 inputs["swa_scales"].mul_(0.5)
+                inputs["long_scales"].mul_(0.5)
                 for graph in graphs.values():
                     graph.replay()
                 check()
-                assert not torch.equal(saved, states["1"]["output"][:rows]), (
+                assert not torch.equal(saved, states["baseline"]["output"][:rows]), (
                     "Graph ignored changed attention inputs"
                 )
                 for graph in graphs.values():
                     graph.reset()
                 row = dict(
                     geometry=p,
+                    baseline_manifest=group["baseline"],
                     rows=rows,
+                    pattern=pattern,
                     times=times,
                     exact_probability=True,
                     exact_output=True,
@@ -329,7 +366,7 @@ def select_plan(plan, output, device, minimum):
             calls = states = values = graphs = inputs = None
             torch.npu.synchronize()
             torch.npu.empty_cache()
-        selected = guarded_winner(records, reference="1", maximum_regression=0.1)
+        selected = select_schedule(records)
         result = dict(identity=identity, measurements=records, selected=selected, rejected=rejected)
         atomic_json(record, result)
     selected = result["selected"]
@@ -341,7 +378,7 @@ def select_plan(plan, output, device, minimum):
             for step in packet["body"]:
                 if step.get("manifest") in replacements:
                     step["manifest"] = replacements[step["manifest"]]
-    validate_rows(model, base)
+    validate_rows(model, base, model_dir=model_dir)
     assets = publish_package(model, base, output / "package")
     report = dict(
         selected=selected,
@@ -361,15 +398,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--device", type=int, default=7)
     parser.add_argument("--compile-workers", type=int, default=2)
     parser.add_argument("--min-rows", type=int, default=512)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     if args.compile_only:
-        report = compile_plan(args.plan, args.output, args.compile_workers, args.min_rows)
+        report = compile_plan(
+            args.plan,
+            args.output,
+            args.compile_workers,
+            args.min_rows,
+            args.model_dir,
+        )
     else:
-        report = select_plan(args.plan, args.output, args.device, args.min_rows)
+        report = select_plan(args.plan, args.output, args.device, args.min_rows, args.model_dir)
     print(json.dumps(report), flush=True)
 
 
