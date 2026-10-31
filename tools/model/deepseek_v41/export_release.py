@@ -46,6 +46,43 @@ NUMPY = {
 }
 
 
+def physical_contract(rank, package, specs=None):
+    """Read immutable tensor geometry from the same public operator bindings."""
+    specs = {} if specs is None else specs
+    buffers = {b["name"]: b for b in rank["buffers"]}
+    physical = {}
+    for packet in rank["packets"]:
+        for step in packet["body"] + packet["head"]:
+            if step["op"] == "w4":
+                e, k, n = step["experts"], step["input"], step["output"]
+                packed = (
+                    [e, k // 64, n // 16, 16, 32]
+                    if step.get("weight_layout") == "transposed_nz"
+                    else [e, k, n // 2]
+                )
+                for name, dtype, shape in zip(
+                    step["buffers"][1:4],
+                    ["I8", "U64", "F32"],
+                    [packed, [e, 1, n], [e, n]],
+                    strict=True,
+                ):
+                    physical[name] = dtype, shape
+            elif step["op"] == "kernel":
+                for path in [step["manifest"], step.get("uncompacted_manifest")]:
+                    if path is None:
+                        continue
+                    if path not in specs:
+                        specs[path] = json.loads((package / path).read_text())
+                    for name, port in zip(step["buffers"], specs[path]["operands"], strict=True):
+                        shape, dtype = port["shape"], DTYPES[port["dtype"]]
+                        if (
+                            all(type(d) is int and d > 0 for d in shape)
+                            and math.prod(shape) * SIZES[dtype] == buffers[name]["bytes"]
+                        ):
+                            physical.setdefault(name, (dtype, shape))
+    return physical
+
+
 class Export:
     def __init__(
         self, source, output, attribution=None, execution_output=None, source_execution=None
@@ -94,34 +131,7 @@ class Export:
     def plan(self):
         specs = {}
         for rank in self.model["ranks"]:
-            bs = {b["name"]: b for b in rank["buffers"]}
-            physical = {}
-            for packet in rank["packets"]:
-                for step in packet["body"] + packet["head"]:
-                    if step["op"] == "w4":
-                        e, k, n = step["experts"], step["input"], step["output"]
-                        for name, dtype, shape in zip(
-                            step["buffers"][1:4],
-                            ["I8", "U64", "F32"],
-                            [[e, k, n // 2], [e, 1, n], [e, n]],
-                            strict=True,
-                        ):
-                            physical[name] = dtype, shape
-                    elif step["op"] == "kernel":
-                        for path in [step["manifest"], step.get("uncompacted_manifest")]:
-                            if path is None:
-                                continue
-                            if path not in specs:
-                                specs[path] = json.loads((self.package / path).read_text())
-                            for name, port in zip(
-                                step["buffers"], specs[path]["operands"], strict=True
-                            ):
-                                shape, dtype = port["shape"], DTYPES[port["dtype"]]
-                                if (
-                                    all(type(d) is int and d > 0 for d in shape)
-                                    and math.prod(shape) * SIZES[dtype] == bs[name]["bytes"]
-                                ):
-                                    physical.setdefault(name, (dtype, shape))
+            physical = physical_contract(rank, self.package, specs)
             for b in rank["buffers"]:
                 if "prepared_weight" in b:
                     key = "bank:" + b["prepared_weight"]

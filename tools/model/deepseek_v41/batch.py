@@ -8,6 +8,7 @@ same-source indirect wrapper. No checkpoint payload is transformed online.
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
+from contextlib import nullcontext
 import importlib
 import inspect
 import json
@@ -75,6 +76,7 @@ def build(
     shared_attention=False,
     reduce_scatter=False,
     fused_attention=False,
+    compiler=None,
 ):
     from kernels.model.rows import row_count
     from tools.operators.ascend.build import operand
@@ -660,10 +662,10 @@ def build(
         flush=True,
     )
     atomic_json(output.with_suffix(".build.json"), dict(model=model, tasks=list(tasks.values())))
-    return compile_contract(model, list(tasks.values()), base, output, workers)
+    return compile_contract(model, list(tasks.values()), base, output, workers, compiler=compiler)
 
 
-def compile_contract(model, tasks, base, output, workers):
+def compile_contract(model, tasks, base, output, workers, *, compiler=None):
     for task in tasks:
         if "metadata" in task:
             module = importlib.import_module(task["module"])
@@ -672,8 +674,12 @@ def compile_contract(model, tasks, base, output, workers):
                 Path(inspect.getfile(factory))
             ):
                 raise ValueError("Owner primitive source changed; reconstruct the batch contract")
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+    with (
+        nullcontext(compiler)
+        if compiler is not None
+        else ProcessPoolExecutor(
+            max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+        )
     ) as pool:
         compiled = dict(pool.map(compile_task, ((t, base) for t in tasks)))
     for rank in model["ranks"]:

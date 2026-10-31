@@ -32,6 +32,9 @@ pub(super) enum Command {
     Invalidate(Layout),
     Prepare(Layout, bool),
     Forward(Layout, Vec<Vec<u32>>, bool),
+    BeginVerification(Vec<usize>),
+    RollbackVerification(Vec<(usize, usize)>),
+    EndVerification,
     Save {
         owner: usize,
         snapshot: u64,
@@ -79,12 +82,20 @@ pub(super) struct Team {
     pub model: Arc<Model>,
     pub load_s: f64,
     pub rows: usize,
+    pub draft_capacity: usize,
     // Drop worker contexts and communication groups before the bootstrap context.
     _bootstrap: Option<Session>,
     host_tables: Option<Arc<SharedTables>>,
 }
 impl Team {
     pub fn load(plan: &Path, model_dir: &Path) -> Result<Self> {
+        Self::load_with_drafts(plan, model_dir, None)
+    }
+    pub fn load_with_drafts(
+        plan: &Path,
+        model_dir: &Path,
+        requested: Option<usize>,
+    ) -> Result<Self> {
         let model_dir = model_dir
             .canonicalize()
             .map_err(|error| error.to_string())?;
@@ -92,10 +103,20 @@ impl Team {
         if model.batch.is_none() {
             return Err("A2 service requires a native rows plan".into());
         }
+        let draft_capacity = model.ranks[0]
+            .packets
+            .iter()
+            .filter(|p| p.role == super::PacketRole::Draft)
+            .filter_map(|p| p.coordinates.draft_block)
+            .max()
+            .unwrap_or(0);
+        if requested.is_some_and(|limit| limit > draft_capacity) {
+            return Err("Requested A2 drafts exceed the execution package capacity".into());
+        }
         let rows = model.ranks[0]
             .packets
             .iter()
-            .filter(|p| !p.batch_decode)
+            .filter(|p| p.role == super::PacketRole::Target && !p.batch_decode)
             .map(|p| p.rows)
             .max()
             .ok_or("Missing A2 prefill rows")?;
@@ -117,6 +138,7 @@ impl Team {
             model: Arc::clone(&model),
             load_s: 0.,
             rows,
+            draft_capacity,
             _bootstrap: Some(bootstrap),
             host_tables: Some(shared),
         };
@@ -172,9 +194,38 @@ impl Team {
                     }
                     let mut snapshots = BTreeMap::new();
                     let mut lineage = BTreeMap::new();
+                    let mut journal = BTreeMap::new();
+                    let mut journal_pool = BTreeMap::new();
                     while let Ok(command) = commands.recv() {
                         let result = match command {
                             Command::Stop => break,
+                            Command::BeginVerification(owners) => {
+                                journal.clear();
+                                owners
+                                    .into_iter()
+                                    .try_for_each(|id| {
+                                        journal.insert(
+                                            id,
+                                            worker.save_mutable(id, journal_pool.remove(&id))?,
+                                        );
+                                        Ok(())
+                                    })
+                                    .map(|_| Reply::Ready)
+                            }
+                            Command::RollbackVerification(owners) => owners
+                                .into_iter()
+                                .try_for_each(|(id, keep)| {
+                                    worker.restore_mutable(
+                                        id,
+                                        journal.get(&id).ok_or("Missing DSpark state journal")?,
+                                        keep,
+                                    )
+                                })
+                                .map(|_| Reply::Ready),
+                            Command::EndVerification => {
+                                journal_pool.append(&mut journal);
+                                Ok(Reply::Ready)
+                            }
                             Command::Budget(requirement) => worker
                                 .available_memory()
                                 .map(|m| Reply::Capacity(requirement.fits(m.0, m.1))),
@@ -202,15 +253,21 @@ impl Team {
                             Command::Reset(ids) => ids
                                 .into_iter()
                                 .try_for_each(|id| {
+                                    journal_pool.remove(&id);
+                                    journal.remove(&id);
                                     lineage.remove(&id);
                                     worker.reset_owner(id)
                                 })
                                 .map(|_| Reply::Ready),
                             Command::Release(None) => {
+                                journal_pool.clear();
+                                journal.clear();
                                 lineage.clear();
                                 worker.release_owners().map(|_| Reply::Ready)
                             }
                             Command::Release(Some(owner)) => {
+                                journal_pool.remove(&owner);
+                                journal.remove(&owner);
                                 lineage.remove(&owner);
                                 worker.release_owner(owner).map(|_| Reply::Ready)
                             }
@@ -408,7 +465,7 @@ impl Worker {
         for packet in self
             .packet_templates
             .iter()
-            .filter(|p| p.batch_decode == decode)
+            .filter(|p| p.role == super::PacketRole::Target && p.batch_decode == decode)
         {
             for step in &packet.body {
                 if let super::Instruction::W4 {
@@ -486,7 +543,8 @@ fn forward(
 /// class to direct. Successful uses are counted on every rank; promotion waits
 /// for the slowest rank. Offline TP8 measurements put prefill amortization at
 /// 8–20 uses (0.31–0.46 s capture versus 24–41 ms saved per execution).
-fn preparation(states: &[CacheState], decode: bool) -> Result<(bool, bool)> {
+/// Draft/verification are repeated decode steps and promote after one use.
+fn preparation(states: &[CacheState], repeated: bool) -> Result<(bool, bool)> {
     if states.is_empty() {
         return Err("Missing A2 TP cache states".into());
     }
@@ -497,7 +555,7 @@ fn preparation(states: &[CacheState], decode: bool) -> Result<(bool, bool)> {
     if graphs > 0 {
         return Ok((graphs != states.len(), true));
     }
-    let required = if decode { 1 } else { 8 };
+    let required = if repeated { 1 } else { 8 };
     Ok((
         false,
         states
@@ -523,13 +581,17 @@ fn forward_with(
             _ => Err("Invalid A2 cache state reply".to_string()),
         })
         .collect::<Result<Vec<_>>>()?;
-    let (invalidate, capture) = preparation(&states, layout.decode)?;
+    let repeated = layout.decode
+        || layout.role == super::PacketRole::Draft
+        || layout.outputs.len() > layout.segments.len();
+    let (invalidate, capture) = preparation(&states, repeated)?;
     if invalidate {
         exchange(peers, Command::Invalidate(layout.clone()))?;
     }
     exchange(peers, Command::Prepare(layout.clone(), capture))?;
     let prepare_s = started.elapsed().as_secs_f64();
     let started = Instant::now();
+    let replicated = layout.role == super::PacketRole::Draft;
     let command = Command::Forward(layout, tokens, full);
     peers.send(command)?;
     maintenance();
@@ -551,6 +613,9 @@ fn forward_with(
             let value = rank.get(i).ok_or("A2 TP output count differs")?;
             if value.owner != output.owner {
                 return Err("A2 TP output owner differs".into());
+            }
+            if replicated && value.token != output.token {
+                return Err("DSpark TP proposal pools disagree".into());
             }
             if value.value > output.value
                 || value.value == output.value && value.token < output.token

@@ -95,6 +95,17 @@ class Builder:
         self.dynamic = False
         self.model_dir = model_dir
         self.model_index = None
+        self.expert_count = 384
+        self.experts_per_token = 6
+        self.layer_namespace = "layers"
+        self.layer_offset = 0
+        self.layer_ids = tuple(range(40))
+        self.final_norm_name = "norm.weight"
+        self.all_head_rows = False
+        self.compressed_coordinates = True
+
+    def layer_name(self, layer):
+        return f"{self.layer_namespace}.{layer - self.layer_offset}"
 
     def float_weight(self, weight, n, k):
         """Prepare finite FP32 weights as three BF16 residual planes offline."""
@@ -363,7 +374,11 @@ class Builder:
         self.kernel(
             model_ops,
             "swiglu_packed_quant_active" if active_counts else "swiglu_packed_quant",
-            {"rows": rows, "width": width},
+            {
+                "rows": rows,
+                "width": width,
+                **({"selected": self.experts_per_token} if active_counts else {}),
+            },
             [
                 ("packed", packed, "bf16", (rows, 2 * width), "read"),
                 ("out", out, "i8", (rows, width), "write"),
@@ -523,7 +538,7 @@ class Builder:
         )
         return out
 
-    def select(self, scores, length, lengths, output="selected", rows=None):
+    def select(self, scores, length, lengths, output="selected", rows=None, output_count=512):
         rows = self.rows if rows is None else rows
         sources = (length + 4095) // 4096
         candidates = self.temp(f"select.local.{length}.{rows}", (rows, sources, 1024), "f32")
@@ -552,23 +567,23 @@ class Builder:
                 ],
             )
             candidates, sources = merged, groups
-        indices = self.temp(output, (rows, 512), "i32")
-        values = self.temp(output + ".values", (rows, 512), "f32")
+        indices = self.temp(output, (rows, output_count), "i32")
+        values = self.temp(output + ".values", (rows, output_count), "f32")
         self.kernel(
             topk,
             "finalize",
-            {"rows": rows},
+            {"rows": rows, **({"output_count": output_count} if output_count != 512 else {})},
             [
                 ("candidates", candidates, "f32", (rows, 1024), "read"),
-                ("indices", indices, "i32", (rows, 512), "write"),
-                ("values", values, "f32", (rows, 512), "write"),
+                ("indices", indices, "i32", (rows, output_count), "write"),
+                ("values", values, "f32", (rows, output_count), "write"),
             ],
         )
         return indices, values
 
     def hc(self, current, incoming, layer, sublayer):
         rows = self.rows
-        prefix = f"layers.{layer}.hc_{sublayer}"
+        prefix = f"{self.layer_name(layer)}.hc_{sublayer}"
         fn = self.pad(prefix + "_fn", (32, 20480))
         base = self.pad(prefix + "_base", (32,))
         scale = self.pad(prefix + "_scale", (8,))
@@ -661,7 +676,7 @@ class Builder:
 
     def engram(self, hidden, layer):
         rows = self.rows
-        prefix = f"layers.{layer}.engram"
+        prefix = f"{self.layer_name(layer)}.engram"
         values = self.temp("engram.values", (rows * 24, 256), "i8")
         scales = self.temp("engram.scales", (rows * 24, 8), "f32")
         mask = self.temp("engram.mask", (rows,), "i8")
@@ -777,7 +792,7 @@ class Builder:
         return out
 
     def attention_kv(self, quant, scales, layer, cosine, sine, slots):
-        prefix = f"layers.{layer}.attn"
+        prefix = f"{self.layer_name(layer)}.attn"
         kv = self.w8(quant, scales, prefix + ".wkv", 512, 5120, "kv")
         kv, _ = self.norm(
             kv, self.matrix(prefix + ".kv_norm.weight", "f32", 512, 1), 512, "kv.normalized"
@@ -869,7 +884,7 @@ class Builder:
 
     def attention(self, x, layer, coordinates, reset):
         rows, capacity = self.rows, self.capacity
-        prefix = f"layers.{layer}.attn"
+        prefix = f"{self.layer_name(layer)}.attn"
         compressed = layer >= 2
         cosine = coordinates["long_cos" if compressed else "base_cos"]
         sine = coordinates["long_sin" if compressed else "base_sin"]
@@ -1114,6 +1129,11 @@ class Builder:
                         ("out", attended, "bf16", (rows, 8, 512), "write"),
                     ],
                 )
+        return self.attention_output(attended, layer, cosine, sine)
+
+    def attention_output(self, attended, layer, cosine, sine):
+        rows = self.rows
+        prefix = f"{self.layer_name(layer)}.attn"
         attended = self.rope(attended, 8, 512, cosine, sine, "attention.inverse_rope", inverse=True)
         oa = self.projection(
             attended,
@@ -1142,7 +1162,7 @@ class Builder:
         return reduced
 
     def shared_expert(self, quant, scale, layer):
-        prefix = f"layers.{layer}.ffn.shared_experts"
+        prefix = f"{self.layer_name(layer)}.ffn.shared_experts"
         if not self.strategy.shared_tp:
             gate = self.w8(quant, scale, prefix + ".w1", 2304, 5120, "shared.gate")
             up = self.w8(quant, scale, prefix + ".w3", 2304, 5120, "shared.up")
@@ -1174,25 +1194,28 @@ class Builder:
 
     def ffn(self, x, precise, layer):
         rows = self.rows
-        prefix = f"layers.{layer}.ffn"
+        experts_n = self.expert_count
+        local = experts_n // 8
+        selected = self.experts_per_token
+        prefix = f"{self.layer_name(layer)}.ffn"
         router = self.fp32(
             precise,
-            self.matrix(prefix + ".gate.weight", "bf16", 384, 5120, float32=True),
-            384,
+            self.matrix(prefix + ".gate.weight", "bf16", experts_n, 5120, float32=True),
+            experts_n,
             5120,
             "router.logits",
             "f32",
         )
         indices = self.temp("router.indices", (rows, 8), "i32")
         weights = self.temp("router.weights", (rows, 8), "f32")
-        bias = self.matrix(prefix + ".gate.bias", "f32", 384, 1)
+        bias = self.matrix(prefix + ".gate.bias", "f32", experts_n, 1)
         self.kernel(
             routing,
             "route",
-            {"rows": rows},
+            {"rows": rows, "experts": experts_n, "selected": selected},
             [
-                ("logits", router, "f32", (rows, 384), "read"),
-                ("bias", bias, "f32", (384,), "read"),
+                ("logits", router, "f32", (rows, experts_n), "read"),
+                ("bias", bias, "f32", (experts_n,), "read"),
                 ("indices", indices, "i32", (rows, 8), "write"),
                 ("weights", weights, "f32", (rows, 8), "write"),
             ],
@@ -1203,36 +1226,36 @@ class Builder:
         shared = self.shared_expert(quant, scale, layer)
         if self.strategy.parallel:
             self.steps.append({"op": "switch"})
-        expert_rows = rows * 6
+        expert_rows = rows * selected
         gather = self.temp("expert.gather", (expert_rows,), "i32")
         restore = self.temp("expert.restore", (rows, 8), "i32")
-        counts = self.temp(f"L{layer}.counts", (48,), "i64")
+        counts = self.temp(f"L{layer}.counts", (local,), "i64")
         route_errors = self.temp("route.errors", (rows + 1,), "i32")
         up_name, down_name = f"{self.prefix}L{layer}.up", f"{self.prefix}L{layer}.down"
         if self.dynamic and self.strategy.parallel_regroup:
             chunks = (rows + 31) // 32
-            positions = self.temp("route.positions", (48, chunks, 256), "i32")
-            chunk_counts = self.temp("route.chunk_counts", (48, chunks), "i32")
-            offsets = self.temp("route.offsets", (48, chunks), "i32")
+            positions = self.temp("route.positions", (local, chunks, 256), "i32")
+            chunk_counts = self.temp("route.chunk_counts", (local, chunks), "i32")
+            offsets = self.temp("route.offsets", (local, chunks), "i32")
             contracts = {
                 "indices": (indices, "i32", (rows, 8)),
                 "gather": (gather, "i32", (expert_rows,)),
                 "restore": (restore, "i32", (rows, 8)),
                 "errors": (route_errors, "i32", (rows + 1,)),
-                "positions": (positions, "i32", (48, chunks, 256)),
-                "counts": (chunk_counts, "i32", (48, chunks)),
-                "offsets": (offsets, "i32", (48, chunks)),
-                "groups": (counts, "i64", (48,)),
+                "positions": (positions, "i32", (local, chunks, 256)),
+                "counts": (chunk_counts, "i32", (local, chunks)),
+                "offsets": (offsets, "i32", (local, chunks)),
+                "groups": (counts, "i64", (local,)),
             }
             for name, parameters, accesses in (
                 (
                     "clear",
-                    {"experts": 384},
+                    {"experts": experts_n, "selected": selected},
                     {"indices": "read", "gather": "write", "restore": "write", "errors": "write"},
                 ),
                 (
                     "local",
-                    {"base": self.rank * 48},
+                    {"base": self.rank * local, "experts": local, "selected": selected},
                     {"indices": "read", "positions": "write", "counts": "write"},
                 ),
                 (
@@ -1252,14 +1275,14 @@ class Builder:
                 ),
                 (
                     "restore",
-                    {"base": self.rank * 48},
+                    {"base": self.rank * local, "experts": local, "selected": selected},
                     {"indices": "read", "offsets": "read", "restore": "write"},
                 ),
             ):
                 self.kernel(
                     routing_parallel,
                     name,
-                    {"rows": rows, **parameters},
+                    {"rows": rows, "experts": local, "selected": selected, **parameters},
                     [(key, *contracts[key], access) for key, access in accesses.items()],
                 )
         else:
@@ -1268,17 +1291,17 @@ class Builder:
                 "regroup",
                 {
                     "rows": rows,
-                    "experts": 384,
-                    "local": 48,
-                    "selected": 6,
-                    "base": self.rank * 48,
+                    "experts": experts_n,
+                    "local": local,
+                    "selected": selected,
+                    "base": self.rank * local,
                     "pad_last": False,
                 },
                 [
                     ("indices", indices, "i32", (rows, 8), "read"),
                     ("gather", gather, "i32", (expert_rows,), "write"),
                     ("restore", restore, "i32", (rows, 8), "write"),
-                    ("counts", counts, "i64", (48,), "write"),
+                    ("counts", counts, "i64", (local,), "write"),
                     ("errors", route_errors, "i32", (rows + 1,), "write"),
                 ],
             )
@@ -1325,7 +1348,8 @@ class Builder:
                 ],
             )
         experts = [
-            f"{prefix}.experts.{expert}" for expert in range(self.rank * 48, (self.rank + 1) * 48)
+            f"{prefix}.experts.{expert}"
+            for expert in range(self.rank * local, (self.rank + 1) * local)
         ]
         packed_output = self.temp("expert.packed", (expert_rows, 4608))
         expert_output = self.temp("expert.output", (expert_rows, 5120))
@@ -1337,9 +1361,9 @@ class Builder:
         ]:
             planes = []
             for plane, shape, dtype in [
-                ("packed", (48, k, n // 2), "i8"),
-                ("scale", (48, 1, n), "u64"),
-                ("assist", (48, n), "f32"),
+                ("packed", (local, k, n // 2), "i8"),
+                ("scale", (local, 1, n), "u64"),
+                ("assist", (local, n), "f32"),
             ]:
                 planes.append(
                     self.buffer(
@@ -1364,7 +1388,7 @@ class Builder:
                 "rows": expert_rows,
                 "input": 5120,
                 "output": 4608,
-                "experts": 48,
+                "experts": local,
                 "buffers": [gathered, *definitions[0][3], gathered_scale, packed_output],
                 "workspace": workspace,
                 "groups": counts,
@@ -1386,7 +1410,7 @@ class Builder:
                 "rows": expert_rows,
                 "input": 2304,
                 "output": 5120,
-                "experts": 48,
+                "experts": local,
                 "buffers": [down8, *definitions[1][3], down_scale, expert_output],
                 "workspace": workspace,
                 "groups": counts,
@@ -1400,7 +1424,13 @@ class Builder:
         self.kernel(
             moe,
             "combine",
-            {"rows": rows, "expert_rows": expert_rows, "width": 5120, "output_dtype": "float32"},
+            {
+                "rows": rows,
+                "expert_rows": expert_rows,
+                "width": 5120,
+                "selected": selected,
+                "output_dtype": "float32",
+            },
             [
                 ("experts", expert_output, "bf16", (expert_rows, 5120), "read"),
                 ("shared", zeros, "bf16", (rows, 5120), "read"),
@@ -1468,7 +1498,7 @@ class Builder:
         ]:
             coordinates[name] = self.temp(name, shape, "i32")
         incoming = coordinates["premix"] = self.temp("pre.a", (rows, 8), "f32")
-        if dynamic:
+        if dynamic and self.compressed_coordinates:
             coordinates["device_indices"] = True
             for ratio in (1, 2):
                 self.kernel(
@@ -1500,7 +1530,7 @@ class Builder:
             ],
         )
         reset = []
-        for layer in range(40):
+        for layer in self.layer_ids:
             if layer in (1, 14):
                 current = self.engram(current, layer)
                 self.ready_collapsed = None
@@ -1508,7 +1538,7 @@ class Builder:
                 x, next_mix, post, combination = self.hc(current, incoming, layer, sublayer)
                 x, precise = self.norm(
                     x,
-                    self.matrix(f"layers.{layer}.{sublayer}_norm.weight", "f32", 5120, 1),
+                    self.matrix(f"{self.layer_name(layer)}.{sublayer}_norm.weight", "f32", 5120, 1),
                     5120,
                     "norm." + sublayer,
                 )
@@ -1543,9 +1573,11 @@ class Builder:
                 ],
             )
         normalized, _ = self.norm(
-            collapsed, self.matrix("norm.weight", "f32", 5120, 1), 5120, "final.norm"
+            collapsed, self.matrix(self.final_norm_name, "f32", 5120, 1), 5120, "final.norm"
         )
-        if dynamic:
+        if self.all_head_rows:
+            last = normalized
+        elif dynamic:
             last = self.temp("final.last", (1, 5120))
             self.kernel(
                 memory,
@@ -1569,10 +1601,9 @@ class Builder:
             16160,
             5120,
             "logits",
-            rows=1,
+            rows=rows if self.all_head_rows else 1,
         )
-        length = self.asset("vocab_length", np.array([16160], dtype="<i4"), "i32")
-        indices, values = self.select(logits, 16160, length, "head.selected", rows=1)
+        indices, values = self.head_outputs(logits, rows if self.all_head_rows else 1, collapsed)
         return {
             "rows": rows,
             "logits": logits,
@@ -1585,6 +1616,10 @@ class Builder:
             "best_index": indices,
             "vocab_first": self.rank * 16160,
         }
+
+    def head_outputs(self, logits, rows, hidden):
+        length = self.asset("vocab_length", np.full(rows, 16160, dtype="<i4"), "i32")
+        return self.select(logits, 16160, length, "head.selected", rows=rows)
 
 
 def rope_tables(output, capacity):

@@ -19,7 +19,77 @@ pub(super) struct StateLayout {
     #[serde(default)]
     pub append_only: bool,
 }
+
+/// Logical read history inside an append-only physical ring or ring page.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AppendWindow {
+    pub offset: usize,
+    pub row_bytes: usize,
+    pub rows: usize,
+    pub history: usize,
+}
+impl AppendWindow {
+    pub(super) fn overwritten_spans(
+        &self,
+        tokens: usize,
+        steps: usize,
+        bytes: usize,
+    ) -> Result<Vec<Range<usize>>> {
+        if self.row_bytes == 0
+            || self.rows == 0
+            || self.history > self.rows
+            || steps == 0
+            || steps > self.rows
+            || self
+                .rows
+                .checked_mul(self.row_bytes)
+                .and_then(|n| n.checked_add(self.offset))
+                .is_none_or(|n| n > bytes)
+        {
+            return Err("Invalid verification append window".into());
+        }
+        if self.rows - steps >= self.history {
+            return Ok(vec![]);
+        }
+        let first = tokens % self.rows;
+        let left = steps.min(self.rows - first);
+        let mut spans = Vec::with_capacity(2);
+        spans.push(
+            self.offset + first * self.row_bytes..self.offset + (first + left) * self.row_bytes,
+        );
+        if steps > left {
+            spans.push(self.offset..self.offset + (steps - left) * self.row_bytes);
+        }
+        Ok(spans)
+    }
+}
 impl StateLayout {
+    fn overwritten_spans(
+        &self,
+        tokens: usize,
+        steps: usize,
+        bytes: usize,
+    ) -> Result<Vec<Range<usize>>> {
+        self.spans(tokens, bytes)?;
+        if self.append_only || self.tokens_per_row > 0 && !self.circular {
+            return Ok(vec![]);
+        }
+        if self.tokens_per_row == 0 {
+            return Ok(std::iter::once(0..bytes).collect());
+        }
+        let rows = bytes / self.row_bytes;
+        if self.tokens_per_row != 1 || steps == 0 || steps > rows {
+            return Err("Invalid verification journal window".into());
+        }
+        AppendWindow {
+            offset: 0,
+            row_bytes: self.row_bytes,
+            rows,
+            history: self.window.unwrap_or(rows),
+        }
+        .overwritten_spans(tokens, steps, bytes)
+    }
     pub(super) fn spans(&self, tokens: usize, bytes: usize) -> Result<Vec<Range<usize>>> {
         if self.row_bytes == 0
             || !bytes.is_multiple_of(self.row_bytes)
@@ -72,6 +142,12 @@ struct Piece {
 pub(super) struct Snapshot {
     history: Vec<u32>,
     pieces: Vec<Piece>,
+}
+pub(super) struct Journal {
+    history: usize,
+    pieces: Vec<Piece>,
+    bank: Buffer,
+    circular: BTreeMap<String, usize>,
 }
 type PendingCopy = (String, Buffer, Range<usize>, usize);
 struct CapturePlan {
@@ -301,6 +377,124 @@ impl Worker {
         let owner = runtime.owners.get_mut(&id).ok_or("Unknown A2 owner")?;
         snapshot.restore_into(&self.session, &owner.buffers)?;
         owner.history.clone_from(&snapshot.history);
+        runtime.bound_tables = None;
+        Ok(())
+    }
+
+    /// Verification only overwrites windows and recurrent rings. Closed linear
+    /// KV rows keep their bytes and become invisible when history is restored.
+    pub(super) fn save_mutable(&mut self, id: usize, previous: Option<Journal>) -> Result<Journal> {
+        let (owner, layouts) = self.snapshot_state(id, true)?;
+        let history = owner.history.len();
+        let mut pending = vec![];
+        let mut bytes = 0usize;
+        let mut circular = BTreeMap::new();
+        for layout in layouts {
+            let source = get(&owner.buffers, &layout.buffer)?;
+            let window = self
+                .batch
+                .as_ref()
+                .unwrap()
+                .contract
+                .verification_windows
+                .get(&layout.buffer);
+            let spans = if let Some(window) = window {
+                window.overwritten_spans(history, 6, source.bytes())?
+            } else {
+                layout.overwritten_spans(history, 6, source.bytes())?
+            };
+            if !spans.is_empty() && (layout.circular || window.is_some()) {
+                circular.insert(
+                    layout.buffer.clone(),
+                    window.map_or(layout.row_bytes, |w| w.row_bytes),
+                );
+            }
+            for span in spans {
+                bytes = bytes.checked_add(255).ok_or("Journal alignment overflow")? / 256 * 256;
+                pending.push((layout.buffer.clone(), source.clone(), span.clone(), bytes));
+                bytes = bytes
+                    .checked_add(span.len())
+                    .ok_or("Journal size overflow")?;
+            }
+        }
+        let bytes = bytes.checked_add(255).ok_or("Journal size overflow")?;
+        let bank = if let Some(saved) = previous.filter(|saved| saved.bank.bytes() >= bytes) {
+            saved.bank
+        } else {
+            self.reserve_batch_memory(
+                super::memory::Requirement::snapshot(bytes)?,
+                "DSpark state journal",
+            )?;
+            self.session.allocate(bytes)?
+        };
+        let address = bank.pointer() as usize;
+        let base = address.div_ceil(256) * 256 - address;
+        let mut pieces = vec![];
+        let mut copies = vec![];
+        for (name, source, span, offset) in pending {
+            let buffer = bank.slice(base + offset, span.len())?;
+            copies.push((source, span.start, buffer.clone(), 0, span.len()));
+            pieces.push(Piece {
+                name,
+                offset: span.start,
+                buffer,
+                bank_id: 0,
+                bank_bytes: bank.bytes(),
+            });
+        }
+        self.session.copy_many(&copies)?.wait()?;
+        Ok(Journal {
+            history,
+            pieces,
+            bank,
+            circular,
+        })
+    }
+
+    pub(super) fn restore_mutable(
+        &mut self,
+        id: usize,
+        snapshot: &Journal,
+        keep: usize,
+    ) -> Result<()> {
+        if !(1..=6).contains(&keep) {
+            return Err("Invalid DSpark accepted input count".into());
+        }
+        let runtime = self.batch.as_mut().ok_or("Missing A2 batch runtime")?;
+        let owner = runtime.owners.get_mut(&id).ok_or("Unknown A2 owner")?;
+        let mut remaining = snapshot
+            .circular
+            .iter()
+            .map(|(name, stride)| (name.clone(), keep * stride))
+            .collect::<BTreeMap<_, _>>();
+        let mut copies = vec![];
+        for piece in &snapshot.pieces {
+            let skip = remaining.get_mut(&piece.name).map_or(0, |left| {
+                let count = (*left).min(piece.buffer.bytes());
+                *left -= count;
+                count
+            });
+            if skip < piece.buffer.bytes() {
+                copies.push((
+                    piece.buffer.clone(),
+                    skip,
+                    get(&owner.buffers, &piece.name)?,
+                    piece.offset + skip,
+                    piece.buffer.bytes() - skip,
+                ));
+            }
+        }
+        if !copies.is_empty() {
+            self.session.copy_many(&copies)?.wait()?;
+        }
+        let confirmed = snapshot
+            .history
+            .checked_add(keep)
+            .ok_or("Verification history overflow")?;
+        if owner.history.len() < confirmed {
+            return Err("Verification history precedes journal".into());
+        }
+        owner.history.truncate(confirmed);
         runtime.bound_tables = None;
         Ok(())
     }
@@ -621,5 +815,71 @@ mod tests {
         assert!(layout.spans(8, 0).is_err());
         layout.tokens_per_row = 0;
         assert_eq!(layout.spans(999, 128).unwrap(), vec![0..128]);
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    #[test]
+    fn verification_journal_covers_only_overwritten_slots_across_wraps() {
+        let layout = StateLayout {
+            buffer: "swa".into(),
+            row_bytes: 16,
+            tokens_per_row: 1,
+            window: Some(128),
+            circular: true,
+            append_only: false,
+        };
+        for start in [0, 1, 122, 123, 126, 127, 128, 2047, 262138] {
+            let spans = layout.overwritten_spans(start, 6, 128 * 16).unwrap();
+            assert_eq!(spans.iter().map(|s| s.len()).sum::<usize>(), 6 * 16);
+            let rows = spans
+                .into_iter()
+                .flat_map(|s| (s.start / 16)..(s.end / 16))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows,
+                (start..start + 6).map(|p| p % 128).collect::<Vec<_>>()
+            );
+        }
+        let mut linear = layout.clone();
+        linear.circular = false;
+        assert!(
+            linear
+                .overwritten_spans(120, 6, 128 * 16)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            layout
+                .overwritten_spans(2047, 6, 4096 * 16)
+                .unwrap()
+                .is_empty()
+        );
+        let c2 = AppendWindow {
+            offset: 32 * 4096,
+            row_bytes: 4096,
+            rows: 32,
+            history: 1,
+        };
+        for start in [0, 31, 32, 2047, 2048, 2049] {
+            assert!(
+                c2.overwritten_spans(start, 6, 64 * 4096)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let recurrent = StateLayout {
+            tokens_per_row: 0,
+            window: None,
+            circular: false,
+            ..layout
+        };
+        assert_eq!(
+            recurrent.overwritten_spans(2049, 6, 4096).unwrap(),
+            vec![0..4096]
+        );
     }
 }

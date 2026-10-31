@@ -36,7 +36,9 @@ def decode_row(cache, scales, index, q, half_values, values, half_scales, scale,
     decode_values(q, half_values, values, half_scales, scale, broadcast, y, 8)
 
 
-def _scatter(rows, table_rows, reference_bf16=False, logical_capacity=0, staging_rows=0):
+def _scatter(
+    rows, table_rows, reference_bf16=False, logical_capacity=0, staging_rows=0, retain_tail=False
+):
     """Round against the published FP16 scale before storing a unique cache row.
 
     ``-1`` skips a row; other invalid indices set the existing error flag. The
@@ -94,7 +96,11 @@ def _scatter(rows, table_rows, reference_bf16=False, logical_capacity=0, staging
                             T.pipe_barrier("ALL")
                 source_index = indices[row]
                 index = source_index % table_rows if logical_capacity else source_index
-                if source_index >= 0 and source_index < (logical_capacity or table_rows):
+                if (
+                    source_index >= 0
+                    and source_index < (logical_capacity or table_rows)
+                    and (not retain_tail or row >= rows - table_rows)
+                ):
                     T.copy(source[row, :, :], xb)
                     T.tile.cast(x, xb, "CAST_NONE", 512)
                     T.tile.min(x, x, 8319008.0)
@@ -169,8 +175,8 @@ def _scatter(rows, table_rows, reference_bf16=False, logical_capacity=0, staging
     return main
 
 
-def scatter(rows, table_rows, reference_bf16=False, logical_capacity=0):
-    return _scatter(rows, table_rows, reference_bf16, logical_capacity)
+def scatter(rows, table_rows, reference_bf16=False, logical_capacity=0, retain_tail=False):
+    return _scatter(rows, table_rows, reference_bf16, logical_capacity, retain_tail=retain_tail)
 
 
 def scatter_staged(rows, table_rows, logical_capacity):
@@ -371,6 +377,7 @@ def gather_attention(
     tile_slots=1,
     bulk_store=False,
     reuse_long=False,
+    long_selected=512,
 ):
     """Gather cache rows and decode groups using one shared quantization body.
 
@@ -381,7 +388,7 @@ def gather_attention(
     offline plan must prove their inputs and owner layout have not changed
     since a complete gather in this packet; only the SWA slots are updated.
     """
-    selected = 640 if compressed else 128
+    selected = 128 + long_selected if compressed else 128
     if reuse_long and not compressed:
         raise ValueError("Long KV reuse requires compressed attention")
     storage = swa_storage_rows or capacity
@@ -399,7 +406,7 @@ def gather_attention(
         long_kv: T.Tensor((compressed_capacity, 8, 64), "int8"),
         long_scales: T.Tensor((compressed_capacity, 8), "float16"),
         swa_indices: T.Tensor((rows, 128), "int32"),
-        long_indices: T.Tensor((rows, 512), "int32"),
+        long_indices: T.Tensor((rows, long_selected), "int32"),
         out: T.Tensor((rows, selected, 512), "bfloat16"),
         mask: T.Tensor((rows, selected), "int32"),
     ):

@@ -504,7 +504,7 @@ def swiglu_packed_quant(rows, width, limit=10.0):
     return main
 
 
-def swiglu_packed_quant_active(rows, width, limit=10.0):
+def swiglu_packed_quant_active(rows, width, limit=10.0, selected=6):
     """Apply the shared arithmetic to the routed prefix, with a GPU-owned bound.
 
     The routing prefix scan writes its live count after the token error rows.
@@ -515,8 +515,8 @@ def swiglu_packed_quant_active(rows, width, limit=10.0):
     tir = tvm.tir
     function = swiglu_packed_quant(rows, width, limit)
     handle = tir.Var("active_counts_handle", "handle")
-    counts = tir.decl_buffer((rows // 6 + 1,), "int32", name="active_counts")
-    active = tir.Max(0, tir.Min(rows, tir.BufferLoad(counts, [rows // 6])))
+    counts = tir.decl_buffer((rows // selected + 1,), "int32", name="active_counts")
+    active = tir.Max(0, tir.Min(rows, tir.BufferLoad(counts, [rows // selected])))
     guarded = 0
 
     def guard(node):
@@ -612,5 +612,23 @@ def split(rows, left, right):
                     T.copy(a, first[row, start : start + block])
                 else:
                     T.copy(a, second[row, start - left : start - left + block])
+
+    return main
+
+
+def block_first(rows, block_size=5):
+    """Select each fixed-size packet's anchor without a host round trip."""
+
+    @T.prim_func
+    def main(
+        source: T.Tensor((rows * block_size,), "int32"),
+        out: T.Tensor((rows,), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            data = T.alloc_ub((8,), "int32")
+            row = cid * 2 + vid
+            if row < rows:
+                T.copy(source[row * block_size : row * block_size + 1], data[:1])
+                T.copy(data[:1], out[row : row + 1])
 
     return main

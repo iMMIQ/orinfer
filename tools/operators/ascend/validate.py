@@ -40,6 +40,10 @@ EXACT_OPS = {
 
 
 def reference(kind, inputs, parameters):
+    from tools.operators.ascend import dspark_fixtures
+
+    if kind in dspark_fixtures.NAMES:
+        return dspark_fixtures.reference(kind, inputs, parameters)
     if kind == "mhc_post_pre":
         layer, residual, post, combination, mix = inputs
         updated = reference("mhc_post", [layer, residual, post, combination], parameters)[0]
@@ -344,6 +348,9 @@ def reference(kind, inputs, parameters):
 
 
 def cases(rows, width, index_length=8192, attention_selected=32, select_k=512):
+    from tools.operators.ascend import dspark_fixtures
+
+    yield from dspark_fixtures.cases(rows)
     eps = 1e-20
     yield (
         "rms_norm",
@@ -925,6 +932,12 @@ def main():
         "--only",
         nargs="+",
         choices=(
+            "mean_sections",
+            "confidence",
+            "block_first",
+            "reduce_rank_best",
+            "scatter_tail",
+            "add_bias_argmax",
             "rms_norm",
             "mhc_post_pre",
             "gather_quantized_rows",

@@ -11,7 +11,16 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", type=int, default=7)
-    p.add_argument("--base", type=int, default=144, choices=range(0, 384, 48))
+    p.add_argument("--base", type=int, default=144)
+    p.add_argument("--experts", type=int, default=48)
+    p.add_argument("--selected", type=int, default=6)
+    p.add_argument("--routed-experts", type=int, default=384)
+    p.add_argument(
+        "--rows",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 16, 17, 31, 32, 33, 127, 128, 129, 511, 2048, 2049],
+    )
     p.add_argument("--compile-only", action="store_true")
     p.add_argument("--vector-prefix", action="store_true")
     args = p.parse_args()
@@ -25,20 +34,26 @@ def main():
     torch.manual_seed(20261002)
     if not args.compile_only:
         torch.npu.set_device(args.device)
-    capacity, experts, base = 2049, 48, args.base
+    capacity, experts, base, selected = max(args.rows), args.experts, args.base, args.selected
+    if (
+        not 1 <= selected <= 8
+        or not 1 <= experts <= 128
+        or not 0 <= base <= args.routed_experts - experts
+    ):
+        p.error("Invalid routed expert geometry")
     chunks = (capacity + 31) // 32
     device = "cpu" if args.compile_only else "npu"
     ids = torch.empty((capacity, 8), dtype=torch.int32, device=device)
-    gather = torch.empty(capacity * 6 + 8, dtype=torch.int32, device=device)
+    gather = torch.empty(capacity * selected + 8, dtype=torch.int32, device=device)
     restore = torch.empty((capacity + 1, 8), dtype=torch.int32, device=device)
-    groups = torch.empty(49, dtype=torch.int64, device=device)
+    groups = torch.empty(experts + 1, dtype=torch.int64, device=device)
     errors = torch.empty(capacity + 2, dtype=torch.int32, device=device)
     positions = torch.empty((experts * chunks * 256,), dtype=torch.int32, device=device)
     counts = torch.empty((experts * chunks,), dtype=torch.int32, device=device)
     offsets = torch.empty_like(counts)
     specs = {
         "indices": operand("indices", "i32", [capacity, 8]),
-        "gather": operand("gather", "i32", [capacity * 6], "write"),
+        "gather": operand("gather", "i32", [capacity * selected], "write"),
         "restore": operand("restore", "i32", [capacity, 8], "write"),
         "errors": operand("errors", "i32", [capacity + 1], "read_write"),
         "positions": operand("positions", "i32", [experts, chunks, 256], "read_write"),
@@ -59,7 +74,7 @@ def main():
     libraries, calls = [], []
     m = row_count(capacity, True)
     for name, params, names in [
-        ("clear", dict(experts=384), ["indices", "gather", "restore", "errors"]),
+        ("clear", dict(experts=args.routed_experts), ["indices", "gather", "restore", "errors"]),
         ("local", dict(base=base, experts=experts), ["indices", "positions", "counts"]),
         (
             "prefix",
@@ -69,6 +84,7 @@ def main():
         ("pack", dict(experts=experts), ["positions", "counts", "offsets", "gather"]),
         ("restore", dict(base=base, experts=experts), ["indices", "offsets", "restore"]),
     ]:
+        params["selected"] = selected
         path = compile_kernel(
             getattr(ops, name)(m, **params),
             "routing_parallel." + name,
@@ -95,18 +111,18 @@ def main():
     if args.compile_only:
         return
     reports = []
-    for rows in (1, 2, 4, 16, 17, 31, 32, 33, 127, 128, 129, 511, 2048, 2049):
+    for rows in args.rows:
         for kind in ("random", "duplicates", "empty", "invalid"):
-            original = torch.randint(0, 384, (rows, 8), dtype=torch.int32)
+            original = torch.randint(0, args.routed_experts, (rows, 8), dtype=torch.int32)
             if kind == "duplicates":
-                original[:, :6] = base + 3
+                original[:, :selected] = base + 3
             elif kind == "empty":
-                original[:, :6] = 48 if base == 0 else 0
+                original[:, :selected] = experts if base == 0 else 0
             elif kind == "invalid":
                 original[0, 0] = -1
-                original[-1, 5] = 384
+                original[-1, selected - 1] = args.routed_experts
             # Padded lanes must never create work.
-            original[:, 6:] = base
+            original[:, selected:] = base
             ids[:rows].copy_(original)
             for t in (gather, restore, groups, errors):
                 t.fill_(17)
@@ -120,12 +136,12 @@ def main():
 
             def check():
                 torch.npu.synchronize()
-                want_g = torch.full((rows * 6,), -1, dtype=torch.int32)
+                want_g = torch.full((rows * selected,), -1, dtype=torch.int32)
                 want_r = torch.full((rows, 8), -1, dtype=torch.int32)
                 want_c = torch.zeros(experts, dtype=torch.int64)
                 cursor = 0
                 for expert in range(experts):
-                    matches = (original[:, :6] == base + expert).nonzero().tolist()
+                    matches = (original[:, :selected] == base + expert).nonzero().tolist()
                     want_c[expert] = len(matches)
                     for row, lane in matches:
                         want_g[cursor] = row

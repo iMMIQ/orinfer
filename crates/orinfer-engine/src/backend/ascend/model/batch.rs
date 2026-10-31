@@ -14,6 +14,8 @@ use std::{
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Column {
+    #[serde(default)]
+    pub role: super::PacketRole,
     pub buffer: String,
     pub row_bytes: Option<usize>,
     pub row_alignment: usize,
@@ -27,6 +29,8 @@ pub(super) struct Column {
 #[serde(deny_unknown_fields)]
 pub(super) struct Contract {
     pub owners: usize,
+    #[serde(default)]
+    pub output_capacity: usize,
     pub columns: Vec<Column>,
     pub private: Vec<String>,
     pub pointers: BTreeMap<String, Vec<usize>>,
@@ -43,9 +47,18 @@ pub(super) struct Contract {
     #[serde(default)]
     pub state: Vec<super::state::StateLayout>,
     #[serde(default)]
+    pub verification_windows: BTreeMap<String, super::state::AppendWindow>,
+    #[serde(default)]
     pub decoder_replay: Option<super::replay::Contract>,
 }
 impl Contract {
+    pub(super) fn output_capacity(&self) -> usize {
+        if self.output_capacity == 0 {
+            self.owners
+        } else {
+            self.output_capacity
+        }
+    }
     pub(super) fn token_capacity(&self, table: &str, rows: usize) -> Result<usize> {
         match self.partitioned_tables.get(table) {
             None => Ok(rows),
@@ -63,7 +76,11 @@ impl Contract {
         let decoder = self
             .decoder_replay
             .as_ref()
-            .filter(|r| r.tables.contains(name))
+            .filter(|r| {
+                layout.role == super::PacketRole::Target
+                    && !layout.decode
+                    && r.tables.contains(name)
+            })
             .map(|r| layout.decoder(r.keep, r.final_prompt_only))
             .transpose()?;
         let layout = decoder.as_ref().unwrap_or(layout);
@@ -110,7 +127,7 @@ pub(super) enum CacheState {
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Key {
-    family: (bool, usize),
+    family: (super::PacketRole, bool, usize),
     rows: usize,
     decoder_rows: Option<usize>,
     outputs: usize,
@@ -118,6 +135,7 @@ pub(super) struct Key {
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct WorkLaunch {
+    role: super::PacketRole,
     grid: RowExpression,
     range: Option<(usize, usize)>,
     partition: usize,
@@ -125,9 +143,10 @@ pub(super) struct WorkLaunch {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TableKey {
-    family: (bool, usize),
+    family: (super::PacketRole, bool, usize),
     segments: Vec<(usize, usize)>,
     outputs: Vec<usize>,
+    output_positions: Vec<usize>,
     decoder_roles: Vec<super::replay::Role>,
 }
 pub(super) struct BoundTables {
@@ -140,8 +159,8 @@ pub(super) struct Runtime {
     cache: BTreeMap<Key, Rc<Execution>>,
     lru: VecDeque<Key>,
     capacity: usize,
-    tables: BTreeMap<(bool, usize), TableUse>,
-    families: Vec<(bool, usize)>,
+    tables: BTreeMap<(super::PacketRole, bool, usize), TableUse>,
+    families: Vec<(super::PacketRole, bool, usize)>,
     launches: BTreeSet<WorkLaunch>,
     pub(super) bound_tables: Option<BoundTables>,
 }
@@ -153,13 +172,23 @@ struct TableUse {
 }
 impl Runtime {
     fn key(&self, layout: &Layout) -> Result<Key> {
+        match layout.role {
+            super::PacketRole::Draft
+                if layout.segments.iter().any(|s| s.tokens != 5)
+                    || layout.outputs.len() != layout.rows.total =>
+            {
+                return Err("DSpark requires complete five-position owner blocks".into());
+            }
+            _ => {}
+        }
         let (family, _) = self
             .families
             .iter()
             .find_map(|family| {
                 let used = &self.tables[family];
-                (family.0 == layout.decode
-                    && family.1 <= layout.rows.total
+                (family.0 == layout.role
+                    && family.1 == layout.decode
+                    && family.2 <= layout.rows.total
                     && layout.rows.total <= used.max_rows)
                     .then_some((*family, used))
             })
@@ -194,7 +223,7 @@ impl Runtime {
                     }
                 }
             }
-            tables.insert((packet.batch_decode, packet.min_rows), used);
+            tables.insert((packet.role, packet.batch_decode, packet.min_rows), used);
         }
         Self {
             contract,
@@ -205,7 +234,7 @@ impl Runtime {
             tables,
             families: packets
                 .iter()
-                .map(|p| (p.batch_decode, p.min_rows))
+                .map(|p| (p.role, p.batch_decode, p.min_rows))
                 .collect(),
             launches: launches.clone(),
             bound_tables: None,
@@ -214,9 +243,11 @@ impl Runtime {
 }
 #[derive(Clone)]
 pub(super) struct Layout {
+    pub role: super::PacketRole,
     pub segments: Vec<BatchSegment>,
     pub rows: Rows,
     pub outputs: Vec<usize>,
+    pub output_positions: Vec<usize>,
     pub decode: bool,
     pub decoder_roles: Vec<super::replay::Role>,
 }
@@ -247,12 +278,30 @@ impl Layout {
             })
             .collect();
         Ok(Self {
+            role: super::PacketRole::Target,
+            output_positions: outputs.iter().map(|&i| segments[i].tokens - 1).collect(),
             segments,
             rows,
             outputs,
             decode,
             decoder_roles,
         })
+    }
+    /// Verification shares the target body and head; only endpoint selection changes.
+    pub(super) fn verification(
+        segments: Vec<BatchSegment>,
+        capacity: usize,
+        owners: usize,
+    ) -> Result<Self> {
+        let mut view = Self::new(segments, vec![], false, capacity, owners)?;
+        for (i, segment) in view.segments.iter().enumerate() {
+            for position in 0..segment.tokens {
+                view.outputs.push(i);
+                view.output_positions.push(position);
+            }
+            view.decoder_roles[i] = super::replay::Role::Continue;
+        }
+        Ok(view)
     }
     pub(super) fn decoder(&self, keep: usize, final_prompt_only: bool) -> Result<Self> {
         if !final_prompt_only {
@@ -291,6 +340,7 @@ impl Layout {
         for (s, n) in view.segments.iter_mut().zip(selected.lengths) {
             s.tokens = n;
         }
+        view.remap_endpoints(self)?;
         if view.outputs.iter().any(|&i| view.segments[i].tokens == 0) {
             return Err("Output owner has no decoder rows".into());
         }
@@ -300,19 +350,25 @@ impl Layout {
         if self.decode || !(128..=512).contains(&keep) {
             return Err("Invalid decoder bounded replay layout".into());
         }
-        Self::new(
-            self.segments
-                .iter()
-                .map(|s| BatchSegment {
-                    slot: s.slot,
-                    tokens: s.tokens.min(keep),
-                })
-                .collect(),
-            self.outputs.clone(),
-            false,
+        let mut view = self.clone();
+        for segment in &mut view.segments {
+            segment.tokens = segment.tokens.min(keep);
+        }
+        view.rows = Rows::packet(
+            &view.segments,
+            self.segments.iter().map(|s| s.slot + 1).max().unwrap_or(1),
             self.rows.total,
-            self.segments.len(),
-        )
+        )?;
+        view.remap_endpoints(self)?;
+        Ok(view)
+    }
+    fn remap_endpoints(&mut self, source: &Self) -> Result<()> {
+        for (&owner, position) in self.outputs.iter().zip(&mut self.output_positions) {
+            *position = position
+                .checked_sub(source.segments[owner].tokens - self.segments[owner].tokens)
+                .ok_or("Verification output precedes the retained decoder window")?;
+        }
+        Ok(())
     }
     pub(super) fn row_map(
         &self,
@@ -366,9 +422,10 @@ impl Layout {
     }
     fn table_key(&self, min_rows: usize) -> TableKey {
         TableKey {
-            family: (self.decode, min_rows),
+            family: (self.role, self.decode, min_rows),
             segments: self.segments.iter().map(|s| (s.slot, s.tokens)).collect(),
             outputs: self.outputs.clone(),
+            output_positions: self.output_positions.clone(),
             decoder_roles: self.decoder_roles.clone(),
         }
     }
@@ -395,6 +452,7 @@ pub(super) fn graph_launches(model: &super::Model) -> BTreeSet<WorkLaunch> {
                     } = step
                     {
                         launches.insert(WorkLaunch {
+                            role: packet.role,
                             grid: grid.clone(),
                             range: contract
                                 .work_ranges
@@ -424,18 +482,24 @@ pub(super) fn graph_launches(model: &super::Model) -> BTreeSet<WorkLaunch> {
 fn shape_key(
     contract: &Contract,
     layout: &Layout,
-    family: (bool, usize),
+    family: (super::PacketRole, bool, usize),
     launches: &BTreeSet<WorkLaunch>,
 ) -> Result<Key> {
+    if layout.outputs.len() > contract.output_capacity() {
+        return Err("Output rows exceed the published head capacity".into());
+    }
     let decoder = contract
         .decoder_replay
         .as_ref()
-        .filter(|_| !layout.decode)
+        .filter(|_| layout.role == super::PacketRole::Target && !layout.decode)
         .map(|r| layout.decoder(r.keep, r.final_prompt_only))
         .transpose()?;
     let mut partitions = BTreeMap::new();
     let mut work_rows = Vec::with_capacity(launches.iter().map(|l| l.partition).sum());
     for launch in launches {
+        if launch.role != layout.role {
+            continue;
+        }
         if launch.decoder && decoder.as_ref().is_none_or(|d| d.rows.total == 0) {
             continue;
         }
@@ -575,7 +639,8 @@ impl Worker {
                 .packet_templates
                 .iter()
                 .find(|p| {
-                    p.batch_decode == layout.decode
+                    p.role == layout.role
+                        && p.batch_decode == layout.decode
                         && p.min_rows <= layout.rows.total
                         && layout.rows.total <= p.dispatch_max()
                 })
@@ -690,13 +755,13 @@ impl Worker {
         let build_started = std::time::Instant::now();
         let used = runtime
             .tables
-            .get(&(packet.batch_decode, packet.min_rows))
+            .get(&(packet.role, packet.batch_decode, packet.min_rows))
             .ok_or("Missing packet table usage")?;
         let decoder = runtime
             .contract
             .decoder_replay
             .as_ref()
-            .filter(|_| !layout.decode)
+            .filter(|_| layout.role == super::PacketRole::Target && !layout.decode)
             .map(|r| layout.decoder(r.keep, r.final_prompt_only))
             .transpose()?;
         let mut aligned = BTreeMap::new();
@@ -709,18 +774,21 @@ impl Worker {
                 let stride = column.row_partition.unwrap_or(1);
                 let alignment = column.row_alignment;
                 if let std::collections::btree_map::Entry::Vacant(entry) =
-                    aligned.entry((column.decoder, stride, 1))
+                    aligned.entry((column.decoder && !layout.decode, stride, 1))
                 {
-                    let rows = if column.decoder {
+                    let rows = if column.decoder && !layout.decode {
                         &decoder.as_ref().ok_or("Missing decoder rows")?.rows
                     } else {
                         &layout.rows
                     };
                     entry.insert(rows.partition(stride, self.rank as usize % stride)?);
                 }
-                if alignment > 1 && !aligned.contains_key(&(column.decoder, stride, alignment)) {
-                    let view = aligned[&(column.decoder, stride, 1)].aligned(alignment)?;
-                    aligned.insert((column.decoder, stride, alignment), view);
+                if alignment > 1
+                    && !aligned.contains_key(&(column.decoder && !layout.decode, stride, alignment))
+                {
+                    let view = aligned[&(column.decoder && !layout.decode, stride, 1)]
+                        .aligned(alignment)?;
+                    aligned.insert((column.decoder && !layout.decode, stride, alignment), view);
                 }
             }
         }
@@ -733,32 +801,31 @@ impl Worker {
                 .ok_or("Owner must be admitted before capture")?;
             values.extend_from_slice(&(segment.tokens as u64).to_le_bytes());
             for (index, column) in runtime.contract.columns.iter().enumerate() {
-                let buffer =
-                    if !used.columns[index] || column.decode.is_some_and(|d| d != layout.decode) {
+                let buffer = if !used.columns[index] {
+                    None
+                } else if let Some(stride) = column.row_bytes {
+                    let view = &aligned[&(
+                        column.decoder && !layout.decode,
+                        column.row_partition.unwrap_or(1),
+                        column.row_alignment,
+                    )];
+                    if view.lengths[lane] == 0 {
                         None
-                    } else if let Some(stride) = column.row_bytes {
-                        let view = &aligned[&(
-                            column.decoder,
-                            column.row_partition.unwrap_or(1),
-                            column.row_alignment,
-                        )];
-                        if view.lengths[lane] == 0 {
-                            None
-                        } else {
-                            Some(
-                                get(&self.buffers, &column.buffer)?.slice(
-                                    view.starts[lane]
-                                        .checked_mul(stride)
-                                        .ok_or("Owner offset overflow")?,
-                                    view.lengths[lane]
-                                        .checked_mul(stride)
-                                        .ok_or("Owner span overflow")?,
-                                )?,
-                            )
-                        }
                     } else {
-                        Some(get(&owner.buffers, &column.buffer)?)
-                    };
+                        Some(
+                            get(&self.buffers, &column.buffer)?.slice(
+                                view.starts[lane]
+                                    .checked_mul(stride)
+                                    .ok_or("Owner offset overflow")?,
+                                view.lengths[lane]
+                                    .checked_mul(stride)
+                                    .ok_or("Owner span overflow")?,
+                            )?,
+                        )
+                    }
+                } else {
+                    Some(get(&owner.buffers, &column.buffer)?)
+                };
                 let address = buffer.as_ref().map_or(0, |b| b.pointer() as usize as u64);
                 values.extend_from_slice(&address.to_le_bytes());
                 if let Some(buffer) = buffer {
@@ -771,18 +838,11 @@ impl Worker {
         let mut inputs = vec![];
         for name in &used.pointers {
             let mapping = &runtime.contract.pointers[name];
-            if mapping.iter().any(|&c| {
-                runtime.contract.columns[c]
-                    .decode
-                    .is_some_and(|d| d != layout.decode)
-            }) {
-                continue;
-            }
             let is_decoder = runtime
                 .contract
                 .decoder_replay
                 .as_ref()
-                .is_some_and(|r| r.tables.contains(name));
+                .is_some_and(|r| !layout.decode && r.tables.contains(name));
             let table_layout = if is_decoder {
                 decoder.as_ref().ok_or("Missing decoder table rows")?
             } else {
@@ -840,9 +900,9 @@ impl Worker {
         let data = output_layout
             .outputs
             .iter()
-            .flat_map(|&i| {
-                ((output_layout.rows.starts[i] + output_layout.segments[i].tokens - 1) as i32)
-                    .to_le_bytes()
+            .zip(&output_layout.output_positions)
+            .flat_map(|(&i, &position)| {
+                ((output_layout.rows.starts[i] + position) as i32).to_le_bytes()
             })
             .collect::<Vec<_>>();
         if !data.is_empty() {
@@ -961,11 +1021,18 @@ impl Worker {
             valid.extend(owner_valid);
             joined.extend_from_slice(input);
         }
-        super::upload(
-            &self.session,
-            &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
-            &1i32.to_le_bytes(),
-        )?;
+        let mut inputs = vec![(
+            get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
+            1i32.to_le_bytes().to_vec(),
+        )];
+        if let Some(name) = &execution.packet.coordinates.input_ids {
+            let bytes = joined
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>();
+            inputs.push((get(&self.buffers, name)?.slice(0, bytes.len())?, bytes));
+        }
+        self.session.upload_inputs(&inputs)?;
         if let Some(trace) = std::env::var_os("ORINFER_A2_BATCH_TRACE") {
             let name = layout
                 .segments
@@ -1006,7 +1073,14 @@ impl Worker {
         if !layout.outputs.is_empty() {
             let count = layout.outputs.len();
             let values = self.session.download(
-                &get(&self.buffers, &execution.packet.best_value)?,
+                &get(
+                    &self.buffers,
+                    execution
+                        .packet
+                        .confidence
+                        .as_ref()
+                        .unwrap_or(&execution.packet.best_value),
+                )?,
                 0,
                 count * 4,
             )?;
@@ -1036,7 +1110,12 @@ impl Worker {
             for (i, &lane) in layout.outputs.iter().enumerate() {
                 let value = f32::from_le_bytes(values[i * 4..i * 4 + 4].try_into().unwrap());
                 let index = i32::from_le_bytes(indices[i * 4..i * 4 + 4].try_into().unwrap());
-                if !value.is_finite() || !(0..16160).contains(&index) {
+                let vocabulary = if execution.packet.replicated_output {
+                    129280
+                } else {
+                    16160
+                };
+                if !value.is_finite() || !(0..vocabulary).contains(&index) {
                     return Err("Invalid batched output".into());
                 }
                 let probs = logits.as_ref().map_or(vec![], |b| {
@@ -1057,7 +1136,12 @@ impl Worker {
                 ));
             }
         }
-        for (segment, input) in layout.segments.iter().zip(tokens) {
+        for (segment, input) in layout
+            .segments
+            .iter()
+            .zip(tokens)
+            .filter(|_| layout.role == super::PacketRole::Target)
+        {
             self.batch
                 .as_mut()
                 .unwrap()
@@ -1143,6 +1227,12 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             state.spans(model.capacity, buffer.bytes)?;
         }
         let mut parents = std::collections::BTreeSet::new();
+        for (name, window) in &c.verification_windows {
+            if !state_roles.contains(name) {
+                return Err("Verification window must name persistent owner state".into());
+            }
+            window.overwritten_spans(0, 6, buffers[name.as_str()].bytes)?;
+        }
         for name in &c.private {
             let b = buffers
                 .get(name.as_str())
@@ -1159,15 +1249,24 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             }
             parents.insert(name.clone());
         }
-        if rank.packets.iter().filter(|p| p.batch_decode).count() != 1
-            || rank.packets.iter().all(|p| p.batch_decode)
+        if rank
+            .packets
+            .iter()
+            .filter(|p| p.role == super::PacketRole::Target && p.batch_decode)
+            .count()
+            != 1
+            || rank
+                .packets
+                .iter()
+                .filter(|p| p.role == super::PacketRole::Target)
+                .all(|p| p.batch_decode)
         {
             return Err("Batch requires one decode and complete prefill dispatch".into());
         }
         let prefill = rank
             .packets
             .iter()
-            .filter(|p| !p.batch_decode)
+            .filter(|p| p.role == super::PacketRole::Target && !p.batch_decode)
             .collect::<Vec<_>>();
         let capacity = prefill[0].rows;
         super::validate_row_ranges(&prefill, 1, Some(capacity))?;
@@ -1181,8 +1280,8 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
                     let p = rank
                         .packets
                         .iter()
-                        .find(|p| p.batch_decode == decode)
-                        .unwrap();
+                        .find(|p| p.role == column.role && p.batch_decode == decode)
+                        .ok_or("Missing owner column packet family")?;
                     if p.rows
                         .div_ceil(column.row_partition.unwrap_or(1))
                         .checked_add(c.owners * (column.row_alignment - 1))
@@ -1209,7 +1308,9 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
         }) {
             return Err("Invalid owner-local work selection".into());
         }
-        if buffers.get(c.endpoints.as_str()).map(|b| b.bytes) != Some(c.owners * 4) {
+        if c.output_capacity() < c.owners
+            || buffers.get(c.endpoints.as_str()).map(|b| b.bytes) != Some(c.output_capacity() * 4)
+        {
             return Err("Invalid owner output endpoints".into());
         }
         if c.pointers.is_empty() || buffers.get(c.active.as_str()).map(|b| b.bytes) != Some(4) {
@@ -1232,6 +1333,16 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             }
         }
         for p in &rank.packets {
+            if p.role == super::PacketRole::Draft
+                && (p.rows != c.owners * 5
+                    || p.coordinates.draft_block != Some(5)
+                    || p.coordinates.input_ids.is_none()
+                    || !p.replicated_output
+                    || p.confidence.is_none()
+                    || p.vocab_first != 0)
+            {
+                return Err("Invalid DSpark draft packet contract".into());
+            }
             if p.min_rows == 0
                 || p.min_rows > p.dispatch_max()
                 || p.dispatch_max() > p.rows

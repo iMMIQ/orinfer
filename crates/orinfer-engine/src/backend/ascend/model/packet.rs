@@ -11,6 +11,10 @@ use std::{fs, path::Path, rc::Rc, time::Instant};
 #[serde(deny_unknown_fields)]
 pub(super) struct Coordinates {
     #[serde(default)]
+    pub draft_block: Option<usize>,
+    #[serde(default)]
+    pub input_ids: Option<String>,
+    #[serde(default)]
     pub device_indices: bool,
     pub base_cos: String,
     pub base_sin: String,
@@ -51,6 +55,7 @@ impl Coordinates {
             &self.premix,
         ];
         names.extend(self.source_swa_indices.as_deref());
+        names.extend(self.input_ids.as_deref());
         names
     }
 }
@@ -157,7 +162,15 @@ impl Worker {
         }
         let slots = (base..base + rows).map(|p| p as i32).collect::<Vec<_>>();
         let c2_slots = (base..base + rows)
-            .map(|p| if p % 2 == 1 { (p / 2) as i32 } else { -1 })
+            .map(|p| {
+                if names.draft_block.is_some() {
+                    (p - base) as i32
+                } else if p % 2 == 1 {
+                    (p / 2) as i32
+                } else {
+                    -1
+                }
+            })
             .collect::<Vec<_>>();
         put(&mut inputs, &names.slots, &ints(&slots))?;
         put(&mut inputs, &names.c2_slots, &ints(&c2_slots))?;
@@ -166,10 +179,18 @@ impl Worker {
         let mut mix = vec![0f32; rows * 8];
         for row in 0..rows {
             let position = base + row;
-            for (lane, previous) in
-                (position.saturating_sub(127).max(minimum.unwrap_or(0))..=position).enumerate()
+            for (lane, previous) in (if names.draft_block.is_some() {
+                base.saturating_sub(128)..base
+            } else {
+                position.saturating_sub(127).max(minimum.unwrap_or(0))..position + 1
+            })
+            .enumerate()
             {
-                swa[row * 128 + lane] = previous as i32;
+                swa[row * 128 + lane] = if names.draft_block.is_some() {
+                    (previous % 128) as i32
+                } else {
+                    previous as i32
+                };
             }
             metadata[row * 8..row * 8 + 6].copy_from_slice(&[
                 position as i32,
@@ -203,6 +224,23 @@ impl Worker {
             (1, &names.c1_indices, &names.c1_lengths),
             (2, &names.c2_indices, &names.c2_lengths),
         ] {
+            if let Some(block) = names.draft_block {
+                if block != 5 || rows != block {
+                    return Err(
+                        "DSpark coordinates require one complete five-row owner block".into(),
+                    );
+                }
+                let capacity = 128 / ratio;
+                let mut ids = vec![-1; rows * capacity];
+                for row in 0..rows {
+                    for lane in 0..block {
+                        ids[row * capacity + lane] = lane as i32;
+                    }
+                }
+                put(&mut inputs, indices, &ints(&ids))?;
+                put(&mut inputs, lengths, &ints(&vec![block as i32; rows]))?;
+                continue;
+            }
             if names.device_indices {
                 if minimum.is_some() {
                     let lens = (0..rows)
@@ -386,11 +424,12 @@ impl Worker {
             let input = match step {
                 Step::Embed {
                     destination,
+                    tensor,
                     first_column,
                     columns,
                 } => Some((
                     destination,
-                    self.embedding(tokens, *first_column, *columns)?,
+                    self.embedding(tensor, tokens, *first_column, *columns)?,
                 )),
                 _ => None,
             };
@@ -675,10 +714,11 @@ impl Worker {
             }
             Step::Embed {
                 destination,
+                tensor,
                 first_column,
                 columns,
             } => {
-                let values = self.embedding(tokens, *first_column, *columns)?;
+                let values = self.embedding(tensor, tokens, *first_column, *columns)?;
                 self.session
                     .upload_inputs(&[(destination.slice(0, values.len())?, values)])?;
             }
@@ -708,9 +748,15 @@ impl Worker {
         }
         Ok(())
     }
-    fn embedding(&mut self, tokens: &[u32], first: usize, columns: usize) -> Result<Vec<u8>> {
+    fn embedding(
+        &mut self,
+        tensor: &str,
+        tokens: &[u32],
+        first: usize,
+        columns: usize,
+    ) -> Result<Vec<u8>> {
         let span = embedding_span(first, columns)?;
-        let embedding = self.checkpoint.read("embed.weight")?;
+        let embedding = self.checkpoint.read(tensor)?;
         if embedding.dtype != Dtype::BF16 || embedding.shape != [129280, 5120] {
             return Err("Embedding checkpoint layout differs".into());
         }
@@ -804,6 +850,13 @@ mod tests {
                 ..
             }
         ));
+        let draft: Instruction = serde_json::from_str(
+            r#"{"op":"embed","destination":"x","tensor":"mtp.0.embed.weight"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(draft, Instruction::Embed { tensor, .. } if tensor == "mtp.0.embed.weight")
+        );
     }
 
     #[test]

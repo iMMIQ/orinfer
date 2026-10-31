@@ -93,6 +93,7 @@ def main():
     parser.add_argument("--model", default="deepseek-v41-flash-1017-w4a8")
     parser.add_argument("--service-pid", type=int, required=True)
     parser.add_argument("--wall-limit", type=int, default=900)
+    parser.add_argument("--mtp-drafts", type=int, default=0, help="Expected service draft limit")
     args = parser.parse_args()
     if not 60 <= args.wall_limit <= 1200:
         parser.error("Mini diagnostics require a 60..1200 second wall limit")
@@ -100,8 +101,13 @@ def main():
     health = json.loads(fetch(args.url + "/health"))
     if health["status"] != "ready" or health["model"] != args.model:
         raise ValueError("The selected service is not ready for this model")
-    if health["max_context"] < 262144 or health["mtp"]["enabled"]:
-        raise ValueError("Require 262K context with speculation disabled")
+    if (
+        health["max_context"] < 262144
+        or args.mtp_drafts < 0
+        or health["mtp"]["max_drafts"] != args.mtp_drafts
+        or health["mtp"]["enabled"] != (args.mtp_drafts > 0)
+    ):
+        raise ValueError("Require 262K context and the selected --mtp-drafts limit")
     if health["active_requests"] or health["queued_requests"]:
         raise ValueError("Start the Mini replay with an idle service")
     process = Path("/proc") / str(args.service_pid)
@@ -160,6 +166,7 @@ def main():
             started_at=datetime.datetime.now().astimezone().isoformat(),
             command=invocation,
             wall_limit_s=args.wall_limit,
+            mtp_drafts=args.mtp_drafts,
             service_pid=args.service_pid,
             service_command=service_command,
             service_environment=service_environment,

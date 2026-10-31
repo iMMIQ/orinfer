@@ -20,7 +20,13 @@ fn contract() -> Contract {
     .unwrap()
 }
 fn key(layout: &Layout) -> Key {
-    shape_key(&contract(), layout, (layout.decode, 1), &BTreeSet::new()).unwrap()
+    shape_key(
+        &contract(),
+        layout,
+        (layout.role, layout.decode, 1),
+        &BTreeSet::new(),
+    )
+    .unwrap()
 }
 #[test]
 fn launch_identity_matches_the_compilers_owner_work_extents() {
@@ -46,6 +52,7 @@ fn launch_identity_matches_the_compilers_owner_work_extents() {
     ] {
         let mut layout = layout(lengths, &[7, 17]).unwrap();
         layout.outputs = vec![1];
+        layout.output_positions = vec![layout.segments[1].tokens - 1];
         layout.decoder_roles = vec![
             super::super::replay::Role::Producer,
             super::super::replay::Role::Final,
@@ -73,13 +80,20 @@ fn launch_identity_matches_the_compilers_owner_work_extents() {
                             .insert("w".into(), WorkRange { min_rows, max_rows });
                     }
                     let launches = [WorkLaunch {
+                        role: super::super::PacketRole::Target,
                         grid: grid.clone(),
                         range,
                         partition,
                         decoder,
                     }]
                     .into();
-                    let key = shape_key(&contract, &layout, (false, 1), &launches).unwrap();
+                    let key = shape_key(
+                        &contract,
+                        &layout,
+                        (super::super::PacketRole::Target, false, 1),
+                        &launches,
+                    )
+                    .unwrap();
                     let expected = (0..partition)
                         .map(|rank| {
                             contract
@@ -110,6 +124,7 @@ fn partitioned_work_keeps_original_owner_and_graph_order() {
     assert_eq!(contract.token_capacity("w", 2047).unwrap(), 256);
     assert_eq!(contract.token_capacity("original", 2048).unwrap(), 2048);
     let launches = [WorkLaunch {
+        role: super::super::PacketRole::Target,
         grid: RowExpression::Constant { value: 64 },
         range: None,
         partition: 8,
@@ -117,13 +132,37 @@ fn partitioned_work_keeps_original_owner_and_graph_order() {
     }]
     .into();
     assert_ne!(
-        shape_key(&contract, &a, (false, 1), &launches).unwrap(),
-        shape_key(&contract, &b, (false, 1), &launches).unwrap()
+        shape_key(
+            &contract,
+            &a,
+            (super::super::PacketRole::Target, false, 1),
+            &launches
+        )
+        .unwrap(),
+        shape_key(
+            &contract,
+            &b,
+            (super::super::PacketRole::Target, false, 1),
+            &launches
+        )
+        .unwrap()
     );
     let reordered_ids = layout(&[1, 15], &[33, 91]).unwrap();
     assert_eq!(
-        shape_key(&contract, &a, (false, 1), &launches).unwrap(),
-        shape_key(&contract, &reordered_ids, (false, 1), &launches).unwrap()
+        shape_key(
+            &contract,
+            &a,
+            (super::super::PacketRole::Target, false, 1),
+            &launches
+        )
+        .unwrap(),
+        shape_key(
+            &contract,
+            &reordered_ids,
+            (super::super::PacketRole::Target, false, 1),
+            &launches
+        )
+        .unwrap()
     );
     let grid: RowExpression =
         serde_json::from_value(serde_json::json!({"op":"constant","value":64})).unwrap();
@@ -240,4 +279,35 @@ fn scheduling_quantum_is_independent_of_attention_work_selection() {
     assert_eq!(contract.preferred_span(), 256);
     contract.work_ranges.clear();
     assert_eq!(contract.preferred_span(), 256);
+}
+
+#[test]
+fn verification_uses_every_position_and_keeps_reverse_owner_endpoints() {
+    let segments = vec![
+        BatchSegment {
+            slot: 29,
+            tokens: 6,
+        },
+        BatchSegment { slot: 7, tokens: 2 },
+    ];
+    let view = Layout::verification(segments, 192, 32).unwrap();
+    assert_eq!(view.outputs, [0, 0, 0, 0, 0, 0, 1, 1]);
+    assert_eq!(view.output_positions, [0, 1, 2, 3, 4, 5, 0, 1]);
+    let clipped = view.decoder(128, true).unwrap();
+    assert_eq!(view.output_positions, clipped.output_positions);
+    let mut contract = contract();
+    contract.output_capacity = 192;
+    let family = (view.role, view.decode, 1);
+    let target = shape_key(&contract, &view, family, &BTreeSet::new()).unwrap();
+    let mut draft = view.clone();
+    draft.role = super::super::PacketRole::Draft;
+    assert_ne!(
+        target,
+        shape_key(&contract, &draft, (draft.role, false, 1), &BTreeSet::new()).unwrap()
+    );
+    let mut endpoints = view.clone();
+    endpoints.output_positions[0] = 1;
+    assert_ne!(endpoints.table_key(1), view.table_key(1));
+    contract.output_capacity = 7;
+    assert!(shape_key(&contract, &view, family, &BTreeSet::new()).is_err());
 }

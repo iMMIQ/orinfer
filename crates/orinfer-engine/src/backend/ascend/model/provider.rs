@@ -5,6 +5,7 @@ use super::{
     team::{Command, Output, Team},
 };
 mod budget;
+mod dspark;
 use crate::{
     artifact::{FileIdentity, Result, resolve_file},
     model::{GenerationInput, StepOutput},
@@ -87,6 +88,9 @@ pub(crate) struct Runtime {
     next_snapshot: u64,
     hints: Vec<usize>,
     prefill_tokens_per_s: f64,
+    draft_limit: usize,
+    speculation_policy: dspark::Policy,
+    speculation: crate::mtp::Statistics,
 }
 pub(crate) struct Request {
     owner: u64,
@@ -222,8 +226,8 @@ impl Runtime {
         if options.resident_experts != crate::execution::ResidentExperts::Full {
             return Err("Native A2 serving requires full resident experts".into());
         }
-        if options.mtp_drafts.is_some_and(|n| n > 0) || options.prompt_lookup {
-            return Err("A2 native service currently supports target generation with MTP and prompt lookup disabled".into());
+        if options.prompt_lookup {
+            return Err("A2 native service does not enable prompt lookup".into());
         }
         let descriptor = crate::model::resolve_manifest(path)?;
         let cache_root = descriptor.parent().ok_or("Missing A2 cache root")?;
@@ -244,7 +248,12 @@ impl Runtime {
         if package.schema_version != 1 || package.backend != "ascend" {
             return Err("Invalid native A2 execution package".into());
         }
-        let team = Team::load(&resolve_file(&package_root, &package.plan.file)?, root)?;
+        let team = Team::load_with_drafts(
+            &resolve_file(&package_root, &package.plan.file)?,
+            root,
+            options.mtp_drafts,
+        )?;
+        let draft_limit = options.mtp_drafts.unwrap_or(team.draft_capacity);
         if team.model.capacity != model.metadata.max_context
             || team.model.batch.as_ref().unwrap().state.is_empty()
         {
@@ -271,6 +280,9 @@ impl Runtime {
             next_snapshot: 0,
             hints: vec![],
             prefill_tokens_per_s: 4000.,
+            draft_limit,
+            speculation_policy: Default::default(),
+            speculation: Default::default(),
         })
     }
     pub fn expert_cache_statistics(&self) -> Option<crate::execution::ExpertCacheStatistics> {
@@ -292,7 +304,7 @@ impl Runtime {
         self.team.model.capacity
     }
     pub fn mtp_drafts(&self) -> usize {
-        0
+        self.draft_limit
     }
     pub fn vocab(&self) -> usize {
         129280
@@ -301,7 +313,7 @@ impl Runtime {
         None
     }
     pub fn speculation_statistics(&self) -> Option<&crate::mtp::Statistics> {
-        None
+        (self.draft_limit > 0).then_some(&self.speculation)
     }
     pub fn prefix_statistics(&self) -> &crate::prefix::Statistics {
         &self.prefix
@@ -699,6 +711,16 @@ impl Runtime {
         if requests.iter().any(|r| r.owner != self.owner || r.released) {
             return Err("Foreign or released A2 request".into());
         }
+        if self.draft_limit > 0
+            && requests
+                .iter()
+                .any(|r| !r.is_finished() && !r.prefilling && r.ready_output.is_none())
+            && requests
+                .iter()
+                .all(|r| r.is_finished() || (!r.prefilling && r.ready_output.is_none()))
+        {
+            return self.advance_dspark(requests, options, maintenance);
+        }
         let has_prefill = requests
             .iter()
             .any(|r| !r.is_finished() && r.ready_output.is_none() && r.prefilling);
@@ -851,6 +873,9 @@ impl Runtime {
             if prefill_requests < batch {
                 self.statistics.mixed_iterations += 1;
             }
+        }
+        if prefill_rows == 0 {
+            self.speculation_policy.baseline(batch, full, seconds);
         }
         let mut steps = vec![];
         for (i, count) in selected {

@@ -122,6 +122,9 @@ impl Worker {
         Ok(())
     }
     pub(in crate::backend::ascend::model) fn grow_batch(&mut self, layout: &Layout) -> Result<()> {
+        if layout.role == super::super::PacketRole::Draft {
+            return Ok(());
+        }
         for segment in &layout.segments {
             let owner = self
                 .batch
@@ -158,7 +161,11 @@ impl Worker {
         }
         Ok(tables_released)
     }
-    pub(super) fn reserve_batch_memory(&mut self, needed: Requirement, stage: &str) -> Result<()> {
+    pub(in crate::backend::ascend::model) fn reserve_batch_memory(
+        &mut self,
+        needed: Requirement,
+        stage: &str,
+    ) -> Result<()> {
         let (device, session) = self.available_memory()?;
         if needed.fits(device, session) {
             return Ok(());

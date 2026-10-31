@@ -150,18 +150,20 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
         if rank
             .packets
             .iter()
-            .map(|p| (p.rows, p.min_rows, p.max_rows))
+            .map(|p| (p.role, p.rows, p.min_rows, p.max_rows))
             .collect::<Vec<_>>()
             != model.ranks[0]
                 .packets
                 .iter()
-                .map(|p| (p.rows, p.min_rows, p.max_rows))
+                .map(|p| (p.role, p.rows, p.min_rows, p.max_rows))
                 .collect::<Vec<_>>()
         {
             return Err("TP ranks have different row contracts".into());
         }
         for packet in &rank.packets {
-            replay::validate_packet(packet, model.batch.as_ref())?;
+            if packet.role == PacketRole::Target {
+                replay::validate_packet(packet, model.batch.as_ref())?;
+            }
             for coordinates in
                 std::iter::once(&packet.coordinates).chain(packet.decoder_coordinates.as_ref())
             {
@@ -200,8 +202,12 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                     }
                 })
                 .collect::<std::collections::BTreeSet<_>>();
-            if layers != (0..40).map(|i| format!("layer{i:02}")).collect() {
-                return Err("A2 execution packet does not cover all 40 layers".into());
+            let expected = match packet.role {
+                PacketRole::Target => 0..40,
+                PacketRole::Draft => 40..43,
+            };
+            if layers != expected.map(|i| format!("layer{i:02}")).collect() {
+                return Err("A2 execution packet does not cover its declared layers".into());
             }
             let mut current_capacity = packet.rows;
             for instruction in packet.body.iter().chain(&packet.head) {
@@ -209,6 +215,7 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                     destination,
                     first_column,
                     columns,
+                    ..
                 } = instruction
                 {
                     let span = packet::embedding_span(*first_column, *columns)?;
@@ -240,11 +247,15 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                     let expected = if owner_work.is_some() {
                         4096
                     } else if *owners {
-                        model
+                        let contract = model
                             .batch
                             .as_ref()
-                            .ok_or("Owner head requires batch contract")?
-                            .owners
+                            .ok_or("Owner head requires batch contract")?;
+                        if packet.batch_decode {
+                            contract.owners
+                        } else {
+                            contract.output_capacity()
+                        }
                     } else {
                         row_contract::kernel_rows(
                             current_capacity,
@@ -400,8 +411,12 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                     ..
                 } = instruction
                 {
-                    if *experts != 48
-                        || *rows != current_capacity * 6
+                    let (routed_experts, selected) = match packet.role {
+                        PacketRole::Target => (384, 6),
+                        PacketRole::Draft => (128, 3),
+                    };
+                    if *experts != routed_experts / model.ranks.len()
+                        || *rows != current_capacity * selected
                         || !input.is_multiple_of(256)
                         || !output.is_multiple_of(32)
                     {

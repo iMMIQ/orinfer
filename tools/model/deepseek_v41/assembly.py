@@ -19,9 +19,36 @@ from tools.build.files import atomic_json, file_hash, source_hash
 from tools.model.row_contract import resolve
 
 
-def unit_scale_manifests(model, base):
+def unit_scale_manifests(model, base, model_dir=None):
     """Require immutable FP32 ones at every binding of a BF16 projection."""
     eligible, rejected, descriptions, constants = set(), set(), {}, {}
+    index, headers = None, {}
+
+    def payload(definition):
+        nonlocal index
+        if definition.get("data"):
+            return (base / definition["data"]["file"]).read_bytes()
+        tensor = definition.get("prepared_tensor")
+        if tensor is None or model_dir is None or tensor["dtype"] != "F32":
+            return None
+        if index is None:
+            index = json.loads((Path(model_dir) / model["index"]["file"]).read_text())["weight_map"]
+        path = Path(model_dir) / index[tensor["name"]]
+        if path not in headers:
+            from tools.model.safetensors_source import local_header
+
+            headers[path] = local_header(path)
+        start, header = headers[path]
+        item = header[tensor["name"]]
+        if (item["dtype"], item["shape"]) != (tensor["dtype"], tensor["shape"]):
+            return None
+        begin, end = item["data_offsets"]
+        if end - begin != definition["bytes"]:
+            return None
+        with path.open("rb") as source:
+            source.seek(start + begin)
+            return source.read(end - begin)
+
     for rank in model["ranks"]:
         definitions = {b["name"]: b for b in rank["buffers"]}
         for packet in rank["packets"]:
@@ -47,17 +74,15 @@ def unit_scale_manifests(model, base):
                     eligible.add(name)
                     for buffer in step["buffers"][2:4]:
                         definition = definitions[buffer]
-                        if not definition.get("data") or any(
-                            k in definition for k in ("view", "weight", "prepared_weight")
-                        ):
+                        if any(k in definition for k in ("view", "weight", "prepared_weight")):
                             rejected.add(name)
                             continue
-                        file = base / definition["data"]["file"]
-                        identity = (file, definition["bytes"])
+                        identity = json.dumps(definition, sort_keys=True)
                         if identity not in constants:
-                            data = file.read_bytes()
+                            data = payload(definition)
                             constants[identity] = (
-                                len(data) == definition["bytes"]
+                                data is not None
+                                and len(data) == definition["bytes"]
                                 and len(data) > 0
                                 and len(data) % 4 == 0
                                 and all(x == (1.0,) for x in struct.iter_unpack("<f", data))
@@ -120,7 +145,9 @@ def referenced_buffers(rank, batch=None):
         for coordinates in [packet["coordinates"], packet.get("decoder_coordinates", {})]:
             used.update(v for v in coordinates.values() if isinstance(v, str))
         used.update(packet["reset"])
-        used.update(packet[k] for k in ("best_value", "best_index", "logits") if packet.get(k))
+        used.update(
+            packet[k] for k in ("best_value", "best_index", "logits", "confidence") if packet.get(k)
+        )
         for step in packet["body"] + packet["head"]:
             used.update(step.get("buffers", []))
             for key in (
@@ -256,7 +283,7 @@ def canonical(model):
     return compact_buffers(model)
 
 
-def validate_rows(model, base):
+def validate_rows(model, base, *, model_dir=None):
     """Offline full-domain arithmetic and physical span checks, deduplicated."""
     expressions, specs = {}, {}
     unit_scales = None
@@ -277,7 +304,7 @@ def validate_rows(model, base):
         nonlocal unit_scales
         if spec_for(path)["parameters"].get("unit_scale", False):
             if unit_scales is None:
-                unit_scales = unit_scale_manifests(model, base)
+                unit_scales = unit_scale_manifests(model, base, model_dir)
             if path not in unit_scales:
                 raise ValueError(
                     "Direct BF16 output requires immutable unit scales at every binding"
@@ -345,7 +372,10 @@ def validate_rows(model, base):
             if column.get("decode") not in (True, False):
                 raise ValueError("Owner row column requires a family")
             family = next(
-                p for p in rank["packets"] if p.get("batch_decode", False) == column["decode"]
+                p
+                for p in rank["packets"]
+                if p.get("batch_decode", False) == column["decode"]
+                and p.get("role", "target") == column.get("role", "target")
             )
             stride = column.get("row_partition", 1)
             if stride < 1:
@@ -377,7 +407,9 @@ def validate_rows(model, base):
                                 if operand.get("access") == "scratch"
                                 else buffers[name] != expected
                             ):
-                                raise ValueError("Kernel physical operand differs: " + name)
+                                raise ValueError(
+                                    f"Kernel physical operand differs: {name}; {path}; {buffers[name]} != {expected}"
+                                )
                         for variant in model.get("row_selections", {}).get(path, []):
                             for name, operand in zip(
                                 step["buffers"],
@@ -413,7 +445,11 @@ def validate_rows(model, base):
                                         "Owner token capacity differs from its row partition"
                                     )
                         elif step.get("owners"):
-                            bound = model["batch"]["owners"]
+                            bound = (
+                                model["batch"]["owners"]
+                                if packet.get("batch_decode")
+                                else model["batch"].get("output_capacity", model["batch"]["owners"])
+                            )
                         if "row_expression" in step:
                             if "fixed_rows" in step:
                                 raise ValueError("Ambiguous kernel row contract")

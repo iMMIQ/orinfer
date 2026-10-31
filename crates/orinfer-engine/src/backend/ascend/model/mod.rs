@@ -112,6 +112,8 @@ struct View {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Packet {
+    #[serde(default)]
+    role: PacketRole,
     rows: usize,
     #[serde(default)]
     min_rows: usize,
@@ -129,6 +131,18 @@ struct Packet {
     vocab_first: u32,
     #[serde(default)]
     batch_decode: bool,
+    #[serde(default)]
+    replicated_output: bool,
+    #[serde(default)]
+    confidence: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum PacketRole {
+    #[default]
+    Target,
+    Draft,
 }
 impl Packet {
     fn dispatch_max(&self) -> usize {
@@ -147,6 +161,9 @@ impl Packet {
 }
 fn embedding_width() -> usize {
     5120
+}
+fn embedding_tensor() -> String {
+    "embed.weight".into()
 }
 
 #[derive(Clone, Deserialize)]
@@ -242,6 +259,8 @@ enum Instruction {
     },
     Embed {
         destination: String,
+        #[serde(default = "embedding_tensor")]
+        tensor: String,
         #[serde(default)]
         first_column: usize,
         #[serde(default = "embedding_width")]
@@ -272,6 +291,7 @@ enum Step {
     },
     Embed {
         destination: Buffer,
+        tensor: String,
         first_column: usize,
         columns: usize,
     },
@@ -1010,10 +1030,12 @@ impl Worker {
                 },
                 Instruction::Embed {
                     destination,
+                    tensor,
                     first_column,
                     columns,
                 } => Step::Embed {
                     destination: get(&self.buffers, destination)?,
+                    tensor: tensor.clone(),
                     first_column: *first_column,
                     columns: *columns,
                 },

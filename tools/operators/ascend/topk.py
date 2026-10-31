@@ -7,6 +7,105 @@ K candidates; no stage sorts the complete long-context row in UB.
 import tilelang.language as T
 
 
+def add_bias_argmax(rows, vocab, vocab_first=0, block_size=5, step=0, tile=2048):
+    """Retain conditional logits and emit one exact candidate per vocabulary tile."""
+    parts = T.ceildiv(vocab, tile)
+
+    @T.prim_func
+    def main(
+        base: T.Tensor((rows * block_size, vocab), "float32"),
+        bias: T.Tensor((rows, vocab), "float32"),
+        proposals: T.Tensor((rows * block_size, vocab), "float32"),
+        packed: T.Tensor((parts, rows, 2), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(rows * parts, 2), is_npu=True) as (cid, vid):
+            a = T.alloc_ub((1, tile), "float32")
+            b = T.alloc_ub((1, tile), "float32")
+            indices = T.alloc_ub((1, tile), "float32")
+            mask = T.alloc_ub((tile // 8,), "uint8")
+            maximum = T.alloc_ub((1, 1), "float32")
+            minimum = T.alloc_ub((1, 1), "float32")
+            pair = T.alloc_ub((1, 8), "float32")
+            index = cid * 2 + vid
+            row, part = index // parts, index % parts
+            begin = part * tile
+            live = T.min(tile, vocab - begin)
+            if row < rows:
+                T.tile.fill(a, -T.infinity("float32"))
+                T.tile.fill(b, 0.0)
+                T.copy(
+                    base[
+                        row * block_size + step : row * block_size + step + 1, begin : begin + live
+                    ],
+                    a[:, :live],
+                )
+                T.copy(bias[row : row + 1, begin : begin + live], b[:, :live])
+                T.tile.add(a, a, b)
+                T.copy(
+                    a[:, :live],
+                    proposals[
+                        row * block_size + step : row * block_size + step + 1, begin : begin + live
+                    ],
+                )
+                T.tile.createvecindex(indices, T.float32(0.0))
+                T.tile.compare(mask, indices, T.cast(live, "float32"), "LT")
+                T.tile.select(a, mask, a, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
+                T.reduce_max(a, maximum, dim=1)
+                T.tile.add(indices, indices, T.cast(vocab_first + begin, "float32"))
+                T.tile.compare(mask, a, maximum[0, 0], "EQ")
+                T.tile.select(
+                    indices,
+                    mask,
+                    indices,
+                    T.cast(vocab_first + vocab, "float32"),
+                    "VSEL_TENSOR_SCALAR_MODE",
+                )
+                T.reduce_min(indices, minimum, dim=1)
+                pair[0, 0] = maximum[0, 0]
+                pair[0, 1] = minimum[0, 0]
+                T.copy(pair[:, :2], packed[part, row : row + 1, :])
+                T.pipe_barrier("ALL")
+
+    return main
+
+
+def reduce_rank_best(rows, ranks=8, block_size=5, step=0, rank_parts=1, rank_vocab=0):
+    """Choose a global candidate with stable smallest-token tie breaking."""
+
+    @T.prim_func
+    def main(
+        packed: T.Tensor((ranks, rows, 2), "float32"),
+        previous: T.Tensor((rows,), "int32"),
+        tokens: T.Tensor((rows * block_size,), "int32"),
+        values: T.Tensor((rows * block_size,), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            pairs = T.alloc_ub((ranks, 8), "float32")
+            best = T.alloc_ub((8,), "int32")
+            token = T.alloc_ub((8,), "int32")
+            score = T.alloc_ub((8,), "float32")
+            row = cid * 2 + vid
+            if row < rows:
+                for rank in T.serial(ranks):
+                    T.copy(packed[rank, row : row + 1, :], pairs[rank : rank + 1, :2])
+                    pairs[rank, 1] = pairs[rank, 1] + T.cast(
+                        rank // rank_parts * rank_vocab, "float32"
+                    )
+                best[0] = 0
+                for rank in T.serial(1, ranks):
+                    if pairs[rank, 0] > pairs[best[0], 0] or (
+                        pairs[rank, 0] == pairs[best[0], 0] and pairs[rank, 1] < pairs[best[0], 1]
+                    ):
+                        best[0] = rank
+                token[0] = T.cast(pairs[best[0], 1], "int32")
+                score[0] = pairs[best[0], 0]
+                T.copy(token[:1], previous[row : row + 1])
+                T.copy(token[:1], tokens[row * block_size + step : row * block_size + step + 1])
+                T.copy(score[:1], values[row * block_size + step : row * block_size + step + 1])
+
+    return main
+
+
 @T.macro
 def select_chunk(
     x,

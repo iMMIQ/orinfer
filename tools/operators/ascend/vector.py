@@ -16,6 +16,75 @@ from tools.operators.ascend.vector_math import (
 )
 
 
+def mean_sections(rows, width=5120, branches=4, sections=3, section=0):
+    """Capture one HC-mean feature into a shared, row-major feature packet."""
+
+    @T.prim_func
+    def main(
+        residual: T.Tensor((rows, branches, width), "bfloat16"),
+        features: T.Tensor((rows, sections, width), "bfloat16"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            half = T.alloc_ub((1, width), "bfloat16")
+            value = T.alloc_ub((1, width), "float32")
+            total = T.alloc_ub((1, width), "float32")
+            row = cid * 2 + vid
+            if row < rows:
+                T.tile.fill(total, 0.0)
+                for branch in T.serial(branches):
+                    T.copy(residual[row, branch : branch + 1, :], half)
+                    T.tile.cast(value, half, "CAST_NONE", width)
+                    T.tile.add(total, total, value)
+                T.tile.mul(total, total, 1.0 / branches)
+                T.tile.cast(half, total, "CAST_RINT", width)
+                T.copy(half, features[row, section : section + 1, :])
+
+    return main
+
+
+def confidence(rows, width=5120, rank=256, block_size=5, step=0):
+    """FP32 confidence from pre-norm draft hidden and the previous-token embedding."""
+    size = width + rank
+
+    @T.prim_func
+    def main(
+        hidden: T.Tensor((rows * block_size, width), "bfloat16"),
+        embedding: T.Tensor((rows, rank), "bfloat16"),
+        weight: T.Tensor((size,), "float32"),
+        probabilities: T.Tensor((rows * block_size,), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            half = T.alloc_ub((1, size), "bfloat16")
+            value = T.alloc_ub((1, size), "float32")
+            w = T.alloc_ub((1, size), "float32")
+            total = T.alloc_ub((1, 1), "float32")
+            one = T.alloc_ub((1, 1), "float32")
+            result = T.alloc_ub((1, 1), "float32")
+            row = cid * 2 + vid
+            if row < rows:
+                T.copy(
+                    hidden[row * block_size + step : row * block_size + step + 1, :],
+                    half[:, :width],
+                )
+                T.copy(embedding[row : row + 1, :], half[:, width:])
+                T.copy(weight[:], w[0, :])
+                T.tile.cast(value, half, "CAST_NONE", size)
+                T.tile.mul(value, value, w)
+                T.reduce_sum(value, total, dim=1)
+                T.tile.mul(total, total, -1.0)
+                T.tile.min(total, total, 80.0)
+                T.tile.exp(total, total)
+                T.tile.add(total, total, 1.0)
+                T.tile.fill(one, 1.0)
+                T.tile.div(result, one, total)
+                T.copy(
+                    result[:, :1],
+                    probabilities[row * block_size + step : row * block_size + step + 1],
+                )
+
+    return main
+
+
 def rms_norm(rows, width, eps=1e-20):
     @T.prim_func
     def main(

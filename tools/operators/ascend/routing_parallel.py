@@ -39,8 +39,8 @@ def clear(rows, experts=384, selected=6):
 
 
 def local(rows, base=0, experts=48, selected=6, chunk=32):
-    if selected != 6 or chunk != 32:
-        raise ValueError("Parallel regroup currently uses 32-token chunks and six routes")
+    if not 1 <= selected <= 8 or chunk != 32:
+        raise ValueError("Parallel regroup requires 1–8 routes and 32-token chunks")
     chunks = T.ceildiv(rows, chunk)
     width = chunk * 8
 
@@ -138,9 +138,14 @@ def prefix(rows, experts=48, selected=6, chunk=32, pad_last=False, scan_rows=0):
 
 
 def _vector_prefix(rows, experts, selected, chunk, pad_last, scan_rows):
-    """Exact bounded scan; each nonnegative routing count is at most six per token."""
-    if not 1 <= scan_rows <= 4096 or experts != 48 or selected != 6 or chunk != 32:
-        raise ValueError("Vector regroup scan requires E48/top6/chunk32 and at most 4096 rows")
+    """Exact bounded scan over the model's local experts and selected routes."""
+    if (
+        not 1 <= scan_rows <= 4096
+        or not 1 <= experts <= 128
+        or not 1 <= selected <= 8
+        or chunk != 32
+    ):
+        raise ValueError("Vector regroup scan requires E1–128/top1–8/chunk32 and at most 4096 rows")
     chunks = T.ceildiv(rows, chunk)
     width = ((experts * ((scan_rows + chunk - 1) // chunk) + 63) // 64) * 64
     steps = (width - 1).bit_length()

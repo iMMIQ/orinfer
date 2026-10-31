@@ -173,6 +173,18 @@ pub struct Distribution {
     ordered: Vec<(u32, f64)>,
 }
 impl Distribution {
+    /// A deterministic proposer is an exact point mass, including when its
+    /// verifier uses stochastic sampling and positive-residual correction.
+    pub fn point_mass(token: u32, vocab: usize) -> Result<Self, String> {
+        if vocab == 0 || token as usize >= vocab {
+            return Err("Proposal token exceeds vocabulary".into());
+        }
+        Ok(Self {
+            probabilities: None,
+            vocab,
+            ordered: vec![(token, 1.0)],
+        })
+    }
     pub fn from_logits(logits: &[f32], history: &[u32], options: &Options) -> Result<Self, String> {
         Self::from_masked(logits, history, options, None)
     }
@@ -581,5 +593,27 @@ mod tests {
             assert_eq!(actual.to_bits(), expected.to_bits());
             assert!((0.0..1.0).contains(&actual));
         }
+    }
+}
+
+#[cfg(test)]
+mod point_mass_tests {
+    use super::*;
+    #[test]
+    fn deterministic_proposal_retains_exact_residual_sampling() {
+        let q = Distribution::point_mass(1, 3).unwrap();
+        assert_eq!(q.probability(1), 1.0);
+        assert_eq!(q.probability(0), 0.0);
+        assert!(Distribution::point_mass(3, 3).is_err());
+        let p = Distribution::from_logits(
+            &[0.2f32.ln(), 0.3f32.ln(), 0.5f32.ln()],
+            &[],
+            &Options::default(),
+        )
+        .unwrap();
+        let residual = p.residual(&q).unwrap();
+        assert_eq!(residual.probability(1), 0.0);
+        assert!((residual.probability(0) - 2.0 / 7.0).abs() < 1e-6);
+        assert!((residual.probability(2) - 5.0 / 7.0).abs() < 1e-6);
     }
 }
