@@ -17,7 +17,7 @@ mod weights;
 use super::{
     hccl::{Communicator, Counts, Element, Exchange, RootInfo},
     kernels::{Kernel, Template},
-    operators::{GroupedInputs, GroupedShape, GroupedW4A8},
+    operators::{GroupedConfig, GroupedInputs, GroupedShape, GroupedW4A8, W4Layout},
     runtime::{Buffer, Limits, Session, Ticket},
 };
 use crate::{
@@ -221,6 +221,8 @@ enum Instruction {
         groups: Option<String>,
         #[serde(default)]
         expected_expert_rows: Option<usize>,
+        #[serde(default)]
+        weight_layout: W4Layout,
     },
     Route {
         indices: String,
@@ -409,6 +411,7 @@ struct W4Key {
     groups: Option<usize>,
     workspace: usize,
     expected_expert_rows: Option<usize>,
+    weight_layout: W4Layout,
 }
 type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
 
@@ -782,17 +785,20 @@ impl Worker {
                 let mut stores = BTreeMap::new();
                 for layer in &layout.layers {
                     let prefix = format!("layers.{}.engram.embed", layer.layer);
-                    stores.insert(
-                        layer.layer,
+                    let shard = Shard {
+                        first: 0,
+                        rows: layer.rows,
+                    };
+                    let store = if let Some(records) = checkpoint.row_records(&prefix)? {
+                        Int8Rows::open_records(&records, shard)?
+                    } else {
                         Int8Rows::open_sharded(
                             &checkpoint.row_sources(&format!("{prefix}.weight"))?,
                             &checkpoint.row_sources(&format!("{prefix}.scale"))?,
-                            Shard {
-                                first: 0,
-                                rows: layer.rows,
-                            },
-                        )?,
-                    );
+                            shard,
+                        )?
+                    };
+                    stores.insert(layer.layer, store);
                 }
                 let mut resident_budget = host_memory_budget("ORINFER_A2_HOST_TABLE_MIB", 0)?;
                 let resident = resident_budget != 0;
@@ -1276,6 +1282,7 @@ impl Worker {
                 workspace,
                 groups,
                 expected_expert_rows,
+                weight_layout,
             } = instruction
             {
                 let mut b = buffers
@@ -1318,12 +1325,13 @@ impl Worker {
                     groups: counts.as_ref().map(|b| b.pointer() as usize),
                     workspace: shared_workspace.pointer() as usize,
                     expected_expert_rows: *expected_expert_rows,
+                    weight_layout: *weight_layout,
                 };
                 let plan = if let Some(plan) = self.w4.get(&key).and_then(Weak::upgrade) {
                     plan
                 } else {
                     let t = Instant::now();
-                    let plan = Rc::new(GroupedW4A8::prepare_with_workspace_hint(
+                    let plan = Rc::new(GroupedW4A8::prepare_with_config(
                         &self.session,
                         GroupedShape {
                             rows,
@@ -1342,7 +1350,10 @@ impl Worker {
                         },
                         Some(&shared_workspace),
                         counts.as_ref(),
-                        *expected_expert_rows,
+                        GroupedConfig {
+                            expected_rows: *expected_expert_rows,
+                            weight_layout: *weight_layout,
+                        },
                     )?);
                     self.phases.aclnn.0 += 1;
                     self.phases.aclnn.1 += t.elapsed().as_secs_f64();
@@ -1997,6 +2008,7 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                     workspace,
                     groups,
                     expected_expert_rows,
+                    weight_layout,
                     ..
                 } = instruction
                 {
@@ -2029,6 +2041,22 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                     {
                         return Err("Capacity W4 operands require dedicated allocations".into());
                     }
+                    let packed_shape = match weight_layout {
+                        W4Layout::Nd => vec![*experts, *input, output / 2],
+                        W4Layout::TransposedNz => {
+                            vec![*experts, input / 64, output / 16, 16, 32]
+                        }
+                    };
+                    let packed = rank.buffers.iter().find(|b| b.name == bindings[1]);
+                    if packed.is_none_or(|b| {
+                        b.prepared_tensor
+                            .as_ref()
+                            .map_or(*weight_layout != W4Layout::Nd, |t| {
+                                t.dtype != "I8" || t.shape != packed_shape
+                            })
+                    }) {
+                        return Err("W4 prepared tensor differs from its physical layout".into());
+                    }
                     let extents = [
                         rows * input,
                         experts * input * output / 2,
@@ -2041,9 +2069,14 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                         .iter()
                         .zip(extents)
                         .any(|(name, bytes)| buffers.get(name).copied() != Some(bytes))
-                        || buffers
-                            .get(workspace)
-                            .is_none_or(|&bytes| bytes < 100663808)
+                        || buffers.get(workspace).is_none_or(|&bytes| {
+                            bytes
+                                < if *weight_layout == W4Layout::Nd {
+                                    100663808
+                                } else {
+                                    1
+                                }
+                        })
                         || groups
                             .as_ref()
                             .is_some_and(|name| buffers.get(name).copied() != Some(experts * 8))

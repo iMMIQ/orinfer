@@ -150,6 +150,16 @@ impl Tensor {
         dtype: i32,
         bits: usize,
     ) -> Result<Self> {
+        Self::with_storage(api, buffer, shape, dtype, bits, None)
+    }
+    fn with_storage(
+        api: &Rc<Api>,
+        buffer: &Buffer,
+        shape: &[usize],
+        dtype: i32,
+        bits: usize,
+        storage: Option<(&[usize], i32)>,
+    ) -> Result<Self> {
         let elements = shape
             .iter()
             .try_fold(1usize, |n, &d| n.checked_mul(d).filter(|_| d > 0))
@@ -162,6 +172,18 @@ impl Tensor {
         if bytes != buffer.bytes() {
             return Err("ACL tensor shape/dtype differs from buffer extent".into());
         }
+        let (storage_shape, format) = storage.unwrap_or((shape, 2));
+        let storage_elements = storage_shape
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d).filter(|_| d > 0))
+            .ok_or("Empty/overflowing ACL storage shape")?;
+        if storage_elements != elements {
+            return Err("ACL physical storage differs from logical element count".into());
+        }
+        let storage_dims: Vec<i64> = storage_shape
+            .iter()
+            .map(|&n| i64::try_from(n).map_err(|_| "ACL storage dimension overflow"))
+            .collect::<std::result::Result<_, _>>()?;
         let dims: Vec<i64> = shape
             .iter()
             .map(|&d| i64::try_from(d).map_err(|_| "ACL tensor dimension overflow"))
@@ -172,7 +194,7 @@ impl Tensor {
                 .checked_mul(dims[i + 1])
                 .ok_or("ACL tensor stride overflow")?;
         }
-        // SAFETY: Checked contiguous ND layout spans this retained allocation.
+        // SAFETY: Checked logical and physical geometry span this retained allocation.
         // ACL copies the metadata arrays; device backing remains owned by Tensor.
         let handle = unsafe {
             (api.create_tensor)(
@@ -181,9 +203,9 @@ impl Tensor {
                 dtype,
                 stride.as_ptr(),
                 0,
-                2,
-                dims.as_ptr(),
-                dims.len() as u64,
+                format,
+                storage_dims.as_ptr(),
+                storage_dims.len() as u64,
                 buffer.pointer(),
             )
         };
@@ -251,12 +273,12 @@ struct IntArray {
     _values: Box<[i64; 2]>,
 }
 impl IntArray {
-    fn new(api: &Rc<Api>, expected_rows: usize) -> Result<Self> {
+    fn new(api: &Rc<Api>, expected_rows: usize, transposed_nz: bool) -> Result<Self> {
         let expected = i64::try_from(expected_rows)
             .ok()
             .filter(|&n| n > 0)
             .ok_or("Invalid grouped matmul expert row estimate")?;
-        let values = Box::new([expected, 0]);
+        let values = Box::new([expected, i64::from(transposed_nz)]);
         // SAFETY: Stable owned values and the metadata library outlive the
         // array, executor and every captured invocation that retains Prepared.
         let handle = unsafe { (api.create_int_array)(values.as_ptr(), 2) };
@@ -279,8 +301,23 @@ impl Drop for IntArray {
     }
 }
 
-/// ND packed signed INT4 weights [experts,K,N], per-channel UINT64 dequant
+/// Physical W4 bank layout, shared by all dynamic row counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum W4Layout {
+    #[default]
+    Nd,
+    TransposedNz,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GroupedConfig {
+    pub expected_rows: Option<usize>,
+    pub weight_layout: W4Layout,
+}
+
+/// Signed INT4 weights with logical shape [experts,K,N], per-channel UINT64 dequant
 /// scales [experts,1,N], FP32 assist [experts,N], token scales [M], BF16 output.
+/// GroupedConfig selects ND bytes or offline transposed-NZ packed storage.
 #[derive(Clone, Copy, Debug)]
 pub struct GroupedShape {
     pub rows: usize,
@@ -397,6 +434,28 @@ impl GroupedW4A8 {
         groups: Option<&Buffer>,
         expected_rows: Option<usize>,
     ) -> Result<Self> {
+        Self::prepare_with_config(
+            session,
+            shape,
+            ends,
+            input,
+            workspace,
+            groups,
+            GroupedConfig {
+                expected_rows,
+                ..GroupedConfig::default()
+            },
+        )
+    }
+    pub fn prepare_with_config(
+        session: &Session,
+        shape: GroupedShape,
+        ends: &[i64],
+        input: GroupedInputs<'_>,
+        workspace: Option<&Buffer>,
+        groups: Option<&Buffer>,
+        config: GroupedConfig,
+    ) -> Result<Self> {
         shape.validate(ends)?;
         let buffers = [
             input.activation,
@@ -439,9 +498,24 @@ impl GroupedW4A8 {
             output: n,
             experts: e,
         } = shape;
+        let transposed_nz = config.weight_layout == W4Layout::TransposedNz;
+        let weight = if transposed_nz {
+            // V5 keeps the logical [E,K,N] view and its contiguous strides.
+            // Its tuning flag interprets the separate physical INT4 NZ shape.
+            Tensor::with_storage(
+                &api,
+                input.weight,
+                &[e, k, n],
+                29,
+                4,
+                Some((&[e, k / 64, n / 16, 16, 64], 29)),
+            )?
+        } else {
+            Tensor::new(&api, input.weight, &[e, k, n], 29, 4)?
+        };
         let descriptors = [
             Tensor::new(&api, input.activation, &[m, k], 2, 8)?,
-            Tensor::new(&api, input.weight, &[e, k, n], 29, 4)?,
+            weight,
             Tensor::new(&api, input.weight_scale, &[e, 1, n], 10, 64)?,
             Tensor::new(&api, input.assist, &[e, n], 0, 32)?,
             Tensor::new(&api, input.token_scale, &[m], 0, 32)?,
@@ -465,10 +539,15 @@ impl GroupedW4A8 {
             }
         };
         let groups = Tensor::new(&api, &group_buffer, &[e], 9, 64)?;
-        let tuning = expected_rows.map(|n| IntArray::new(&api, n)).transpose()?;
+        let expected = config
+            .expected_rows
+            .or_else(|| transposed_nz.then_some((m / e).max(1)));
+        let tuning = expected
+            .map(|n| IntArray::new(&api, n, transposed_nz))
+            .transpose()?;
         let (mut workspace_bytes, mut executor) = (0u64, ptr::null_mut());
         check(
-            // SAFETY: Public aclnnGroupedMatmulV5 ABI. ND layouts and same-session
+            // SAFETY: Public aclnnGroupedMatmulV5 ABI. Physical layouts and same-session
             // backing were validated. Group rows are per-expert counts.
             unsafe {
                 (api.prepare)(
@@ -535,7 +614,11 @@ impl GroupedW4A8 {
         if prepared.workspace_bytes > 0 {
             if let Some(workspace) = workspace {
                 if workspace.bytes() < prepared.workspace_bytes {
-                    return Err("Shared ACLNN workspace is too small".into());
+                    return Err(format!(
+                        "Shared ACLNN workspace {} bytes is smaller than required {} bytes",
+                        workspace.bytes(),
+                        prepared.workspace_bytes
+                    ));
                 }
                 prepared.workspace = Some(workspace.clone());
             } else {

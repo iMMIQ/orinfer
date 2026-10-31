@@ -47,7 +47,9 @@ NUMPY = {
 
 
 class Export:
-    def __init__(self, source, output, attribution=None, execution_output=None):
+    def __init__(
+        self, source, output, attribution=None, execution_output=None, source_execution=None
+    ):
         self.source, self.output = Path(source).resolve(), Path(output).resolve()
         self.execution_output = Path(execution_output).resolve() if execution_output else None
         if self.execution_output and (
@@ -57,7 +59,10 @@ class Export:
             raise ValueError("Weights and execution output directories must be separate")
         self.attribution = Path(attribution).resolve() if attribution else self.source
         descriptor = json.loads((self.source / "cache/model.json").read_text())
-        self.package = self.source / "cache/packages" / descriptor["execution_package"]
+        source_cache = (
+            Path(source_execution) if source_execution else self.source / "cache/packages"
+        )
+        self.package = source_cache / descriptor["execution_package"]
         self.model = deepcopy(json.loads((self.package / "model.json").read_text()))
         self.old_index = json.loads((self.source / self.model["index"]["file"]).read_text())
         self.headers, self.entries, self.groups = {}, {}, defaultdict(list)
@@ -368,6 +373,8 @@ class Export:
             shutil.copyfile(self.source / name, self.output / name)
         for name in ["LICENSE", "README.md"]:
             path = self.source / name
+            if name == "README.md" and (self.source / "SOURCE-README.md").exists():
+                path = self.source / "SOURCE-README.md"
             if not path.exists():
                 path = self.attribution / name
             if path.exists():
@@ -501,6 +508,21 @@ def verify_release(output, workers=4, execution_output=None):
             s["shape"][1:] != shape[1:] or s["dtype"] != expected_dtype for s in specs
         ):
             raise ValueError("Host-row shards do not cover the logical table")
+    for prefix, records in index.get("row_records", {}).items():
+        parts = records["parts"]
+        if records["format"] != "i8-f32-g32-v1" or not parts or len(set(parts)) != len(parts):
+            raise ValueError("Invalid host-row records")
+        values = logical_shapes[prefix + ".weight"]
+        scales = logical_shapes[prefix + ".scale"]
+        if values[1] % 32 or scales != [values[0], values[1] // 32]:
+            raise ValueError("Host record logical value/scale shapes differ")
+        if any(prefix + suffix in index["row_shards"] for suffix in (".weight", ".scale")):
+            raise ValueError("Ambiguous split and packed host records")
+        specs = [headers[index["weight_map"][n]][n] for n in parts]
+        if sum(s["shape"][0] for s in specs) != values[0] or any(
+            s["dtype"] != "U8" or s["shape"][1:] != [values[1] + scales[1] * 4] for s in specs
+        ):
+            raise ValueError("Host records do not cover their logical table")
     proof = dict(
         phase="verified_pending_load",
         files=len(headers),

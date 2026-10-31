@@ -203,6 +203,12 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 `tools.model.deepseek_v41.export_release --source SERVICE --output RELEASE --execution-output EXECUTION_CACHE --attribution CHECKPOINT` 将已验收的 A2 服务导出为原生物理布局 safetensors。GPU bank 按 rank 和连续四层分片，共享参数及 CPU embedding 单独保存；Engram 按层、哈希头和半头连续行段分片，标准索引的 `row_shards` 扩展保持原全局行号。每片最大 4 GiB，导出前可用 `--plan-only` 查看文件规划。剩余矩阵切片、BF16→FP32、padding 与通道乘积在离线物化；执行计划以 `prepared_tensor` 声明张量名、物理 dtype 和 shape，加载时按容器范围读取并复用文件句柄。权重目录只保留数据、索引与前端资产；算子和执行计划单独发布到 `EXECUTION_CACHE`，运行时通过 `ORINFER_EXECUTION_CACHE` 查找 digest。原始 checkpoint 留在离线归档。导出目录的 `export-state.json` 与 `release-manifest.json` 记录完成状态及文件／张量校验和；该格式使用支持分片主机表和 prepared_tensor 的 orinfer 引擎。
 
+`tools.model.deepseek_v41.prepack_release --source RELEASE --source-execution EXECUTION_CACHE --output NZ_WEIGHTS --execution-output NZ_EXECUTION_CACHE` 将已导出的 ND 权重转换为 A2 transposed-NZ。INT4 元素先转置再重打包，物理字节 shape 为 `[E,K/64,N/16,16,32]`；scale、assist 和通道顺序保持不变。所有 batch 读取同一份 W4 bank，加载时直接上传该布局。匹配执行包通过 `weight_layout=transposed_nz` 声明布局并保持 ACL 的逻辑 `[E,K,N]` 视图。转换器限定于已测量的 TP8、48 专家、两类专家矩阵及 hint16；其他几何报错。80 个 GPU 分片重写，98 个未变分片以硬链接复用，源权重目录应保持只读。`--plan-only` 只列出转换范围。权重与执行输出目录必须分离；在线校验物理 dtype、shape 与容器边界，不执行转置。
+
+`tools.model.deepseek_v41.pack_host_release --source NZ_WEIGHTS --source-execution NZ_EXECUTION_CACHE --output PACKED_WEIGHTS --execution-output PACKED_EXECUTION_CACHE` 继续合并 Engram 的行内数据。每行将原 INT8 值与 group-32 FP32 scale 连续存为具名 U8 tensor，不增加行 padding；索引的 `row_records` 以 `i8-f32-g32-v1` 固定格式及全局行分片顺序。共享主机表、按行缓存和请求 packet 继续使用相同接口，文件读取和全量常驻各只需一次行读取／拷贝。96 个主机分片重写，其余 82 个分片复用。两种转换均保留原目录作为对照，输出需要匹配支持该布局的引擎及独立执行包。
+
+
+
 `tools.model.deepseek_v41.w4_capacity --plan PLAN --package-output DIR --expected-expert-rows N` 将已测量的 CANN 每专家行数提示写入 W4 指令。执行器以固定容量和地址复用 repeatable ACLNN 计划，实际计算范围继续由设备路由计数决定。该转换要求独立分配的操作数和设备路由；旧计划继续使用实际行数描述。提示需按真实矩阵、均匀和偏斜路由测量，再验收完整请求和 Mini；小 tile 与集中路由之间存在性能取舍。该参数不改变整数精度或权重表示。
 
 `tools.model.deepseek_v41.tune_auxiliary` 接受同样的 `--plan`、`--model-dir` 和 `--output`，离线选择 mHC post/pre 的列块与 FP32 分解投影的行块。后者读取计划中已准备的真实 BF16 分量，候选保持原 K 累加顺序；所有候选检查逐元素一致、尾部及改变输入后的 Graph replay。输出计划名增加 `-aux-tuned`。两种调优缓存均固定当前源码、编译器、设备、测量长度和真实权重身份，并校验被选库的内容。

@@ -9,6 +9,7 @@ import unittest
 import numpy as np
 
 from tools.model.deepseek_v41.export_release import Export, verify_release
+from tools.model.deepseek_v41.pack_host_release import HostRecordRelease
 from tools.model.safetensors_source import local_header
 from tools.build.files import file_hash
 
@@ -50,6 +51,7 @@ class ReleaseExportTests(unittest.TestCase):
                 (source / name).write_text("{}")
             (source / "chat_template.jinja").write_text("chat")
             (source / "LICENSE").write_text("fixture license")
+            (source / "SOURCE-README.md").write_text("original model attribution")
             (source / "cache/model.json").write_text(
                 json.dumps(dict(schema_version=1, execution_package="pinned"))
             )
@@ -143,7 +145,16 @@ class ReleaseExportTests(unittest.TestCase):
                 ],
             )
             (package / "model.json").write_text(json.dumps(model))
-            exporter = Export(source, output, execution_output=root / "execution").plan()
+            source_execution = root / "source-execution"
+            source_execution.mkdir()
+            package.rename(source_execution / "pinned")
+            package = source_execution / "pinned"
+            exporter = Export(
+                source,
+                output,
+                execution_output=root / "execution",
+                source_execution=source_execution,
+            ).plan()
             exporter.export(2)
             index = json.loads((output / "model.safetensors.index.json").read_text())
             descriptor = json.loads((output / "cache/model.json").read_text())
@@ -178,6 +189,32 @@ class ReleaseExportTests(unittest.TestCase):
             self.assertFalse(any(output.rglob("*.so")))
             self.assertFalse((output / "original.safetensors").exists())
             self.assertEqual((output / "LICENSE").read_text(), "fixture license")
+            packed = root / "records"
+            packed_execution = root / "records-execution"
+            packer = HostRecordRelease(
+                output,
+                packed,
+                source_execution=root / "execution",
+                execution_output=packed_execution,
+            ).plan()
+            packer.export(2)
+            packed_index = json.loads((packed / "model.safetensors.index.json").read_text())
+            self.assertFalse(packed_index["row_shards"])
+            parts = packed_index["row_records"]["layers.1.engram.embed"]["parts"]
+            actual = b"".join(read_tensor(packed, packed_index, n) for n in parts)
+            expected = b"".join(
+                weights[i * 32 : (i + 1) * 32] + scales[i * 4 : (i + 1) * 4] for i in range(12)
+            )
+            self.assertEqual(actual, expected)
+            self.assertEqual(verify_release(packed, 2, packed_execution)["prepared_bindings"], 6)
+            for group in packer.groups:
+                if group not in packer.rewrite_groups:
+                    self.assertEqual((packed / group).stat().st_ino, (output / group).stat().st_ino)
+            self.assertFalse((packed / "cache/packages").exists())
+            self.assertFalse(any(packed.rglob("*.so")))
+            self.assertEqual(
+                (packed / "SOURCE-README.md").read_text(), "original model attribution"
+            )
 
 
 if __name__ == "__main__":

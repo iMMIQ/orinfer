@@ -229,10 +229,13 @@ impl Plane {
 
 /// Exact byte-preserving INT8 rows plus FP32 group scales, read positionally.
 pub struct Int8Rows {
-    weight: Plane,
-    scale: Plane,
+    storage: RowStorage,
     shard: Shard,
     row_bytes: usize,
+}
+enum RowStorage {
+    Split(Plane, Plane),
+    Records(Plane),
 }
 
 /// Replicated device workers share one immutable row packet. Keep only the
@@ -382,8 +385,28 @@ impl Int8Rows {
             .checked_add(scale.row_bytes)
             .ok_or("Host row packet size overflow")?;
         Ok(Self {
-            weight,
-            scale,
+            storage: RowStorage::Split(weight, scale),
+            shard,
+            row_bytes,
+        })
+    }
+    /// Offline records contain exact INT8 group-32 values followed by FP32 scales.
+    pub(crate) fn open_records(
+        sources: &[(std::path::PathBuf, String)],
+        shard: Shard,
+    ) -> Result<Self> {
+        let records = Plane::open_parts(sources, Dtype::U8)?;
+        if !records.row_bytes.is_multiple_of(36)
+            || shard
+                .first
+                .checked_add(shard.rows)
+                .is_none_or(|end| end > records.rows as u64)
+        {
+            return Err("Host INT8 record/shard geometry differs".into());
+        }
+        let row_bytes = records.row_bytes;
+        Ok(Self {
+            storage: RowStorage::Records(records),
             shard,
             row_bytes,
         })
@@ -400,12 +423,17 @@ impl Int8Rows {
             .ok_or_else(|| "Resident host table budget overflow".into())
     }
     pub fn resident_bytes(&self) -> usize {
-        match (&self.weight.resident, &self.scale.resident) {
-            (Some((_, weight)), Some((_, scale))) => {
-                weight.capacity() + scale.capacity() + 4096 + std::mem::size_of::<Self>()
-            }
-            _ => 0,
-        }
+        let payload = match &self.storage {
+            RowStorage::Split(weight, scale) => match (&weight.resident, &scale.resident) {
+                (Some((_, weight)), Some((_, scale))) => weight.capacity() + scale.capacity(),
+                _ => return 0,
+            },
+            RowStorage::Records(records) => match &records.resident {
+                Some((_, data)) => data.capacity(),
+                None => return 0,
+            },
+        };
+        payload + 4096 + std::mem::size_of::<Self>()
     }
     /// Read the immutable shard once at startup. Both planes keep their exact
     /// checkpoint bytes; shared workers retain this one owner through Arc.
@@ -422,8 +450,13 @@ impl Int8Rows {
         }
         let first = usize::try_from(self.shard.first).map_err(|_| "Host shard offset overflow")?;
         let rows = usize::try_from(self.shard.rows).map_err(|_| "Host shard extent overflow")?;
-        self.weight.load_rows(first, rows)?;
-        self.scale.load_rows(first, rows)?;
+        match &mut self.storage {
+            RowStorage::Split(weight, scale) => {
+                weight.load_rows(first, rows)?;
+                scale.load_rows(first, rows)?;
+            }
+            RowStorage::Records(records) => records.load_rows(first, rows)?,
+        }
         if self.resident_bytes() > budget {
             return Err("Resident host table allocation exceeds its budget".into());
         }
@@ -464,7 +497,6 @@ impl Int8Rows {
         }
         out.clear();
         out.resize(bytes, 0);
-        let weight_bytes = self.weight.row_bytes;
         let mut hits = vec![false; unique.len()];
         for (index, &row) in unique.iter().enumerate() {
             if let Some(data) = cache.as_deref_mut().and_then(|cache| cache.get(row)) {
@@ -480,9 +512,14 @@ impl Int8Rows {
                     return Ok(());
                 }
                 let row = usize::try_from(unique[index]).map_err(|_| "Host row offset overflow")?;
-                let (values, scales) = packet.split_at_mut(weight_bytes);
-                self.weight.read_row_at(row, values)?;
-                self.scale.read_row_at(row, scales)
+                match &self.storage {
+                    RowStorage::Split(weight, scale) => {
+                        let (values, scales) = packet.split_at_mut(weight.row_bytes);
+                        weight.read_row_at(row, values)?;
+                        scale.read_row_at(row, scales)
+                    }
+                    RowStorage::Records(records) => records.read_row_at(row, packet),
+                }
             });
         result?;
         if let Some(cache) = cache {
@@ -597,6 +634,69 @@ mod tests {
         let mut actual = vec![];
         resident.gather_into(&ids, &mut actual, 180).unwrap();
         assert_eq!(actual, expected);
+    }
+    #[test]
+    fn packed_records_preserve_queries_shard_edges_and_resident_lifetime() {
+        use safetensors::tensor::{TensorView, serialize};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sources = vec![];
+        let mut expected_rows = vec![];
+        for (part, first, rows) in [(0, 0, 3), (1, 3, 5)] {
+            let mut records = vec![];
+            for row in first..first + rows {
+                let mut packet: Vec<u8> = (row * 64..(row + 1) * 64).map(|i| i as u8).collect();
+                packet.extend((row as f32 + 0.5).to_le_bytes());
+                packet.extend((-0.0f32).to_le_bytes());
+                records.extend(&packet);
+                expected_rows.push(packet);
+            }
+            let path = dir.path().join(format!("{part}.safetensors"));
+            std::fs::write(
+                &path,
+                serialize(
+                    [(
+                        "record",
+                        TensorView::new(Dtype::U8, vec![rows, 72], &records).unwrap(),
+                    )],
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            sources.push((path, "record".to_owned()));
+        }
+        let store = Int8Rows::open_records(&sources, Shard { first: 1, rows: 6 }).unwrap();
+        let ids = [6, 2, 3, 1, 3];
+        let expected: Vec<u8> = ids
+            .iter()
+            .flat_map(|&id| expected_rows[id as usize].clone())
+            .collect();
+        let mut actual = vec![];
+        store
+            .gather_into(&ids, &mut actual, expected.len())
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            store
+                .gather_into(&[0], &mut actual, expected.len())
+                .is_err()
+        );
+        assert_eq!(actual, expected);
+        let budget = store.required_resident_bytes().unwrap();
+        let resident = store.into_resident(budget).unwrap();
+        assert!(resident.resident_bytes() <= budget);
+        for (path, _) in &sources {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        }
+        let shared = SharedInt8Rows::new(resident);
+        assert_eq!(&*shared.gather(&ids, expected.len()).unwrap(), &expected);
+        assert_eq!(&*shared.gather(&ids, expected.len()).unwrap(), &expected);
+        assert_eq!(shared.statistics().unwrap().packet_hits, 1);
     }
     #[test]
     fn stable_deduplication_preserves_query_order_and_empty_ranks() {

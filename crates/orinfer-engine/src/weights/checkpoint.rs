@@ -56,6 +56,30 @@ impl Checkpoint {
         }
         parts.into_iter().map(|n| Ok((self.path(&n)?, n))).collect()
     }
+    /// Packed records preserve the two logical host planes in one physical row.
+    pub fn row_records(&self, prefix: &str) -> Result<Option<Vec<(PathBuf, String)>>> {
+        let Some(records) = self.index.row_records.get(prefix) else {
+            return Ok(None);
+        };
+        let unique: std::collections::BTreeSet<_> = records.parts.iter().collect();
+        if records.format != "i8-f32-g32-v1"
+            || records.parts.is_empty()
+            || unique.len() != records.parts.len()
+            || ["weight", "scale"].iter().any(|suffix| {
+                let name = format!("{prefix}.{suffix}");
+                self.index.row_shards.contains_key(&name)
+                    || self.index.weight_map.contains_key(&name)
+            })
+        {
+            return Err("Invalid or ambiguous host-row record layout".into());
+        }
+        records
+            .parts
+            .iter()
+            .map(|n| Ok((self.path(n)?, n.clone())))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
     pub fn source(
         &mut self,
         name: &str,
