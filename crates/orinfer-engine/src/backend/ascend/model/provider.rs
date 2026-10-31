@@ -6,6 +6,7 @@ use super::{
 };
 mod budget;
 mod dspark;
+mod packet;
 use crate::{
     artifact::{FileIdentity, Result, resolve_file},
     model::{GenerationInput, StepOutput},
@@ -715,136 +716,22 @@ impl Runtime {
             && requests
                 .iter()
                 .any(|r| !r.is_finished() && !r.prefilling && r.ready_output.is_none())
-            && requests
-                .iter()
-                .all(|r| r.is_finished() || (!r.prefilling && r.ready_output.is_none()))
         {
             return self.advance_dspark(requests, options, maintenance);
         }
-        let has_prefill = requests
-            .iter()
-            .any(|r| !r.is_finished() && r.ready_output.is_none() && r.prefilling);
-        let has_decode = requests
-            .iter()
-            .any(|r| !r.is_finished() && r.ready_output.is_none() && !r.prefilling);
-        let mut budget = if has_prefill {
-            if has_decode {
-                ((options.prefill_budget_ms / 1000. * self.prefill_tokens_per_s) as usize)
-                    .clamp(1, self.team.rows)
-            } else {
-                // With no decoder waiting for its next token, fill the same
-                // native packet instead of buying another weight/collective
-                // pass from a latency-oriented throughput prior. Per-request
-                // checkpoint boundaries below still bound each segment.
-                self.team.rows
-            }
-        } else {
-            self.team
-                .model
-                .batch
-                .as_ref()
-                .unwrap()
-                .owners
-                .min(options.max_batch_tokens)
-        };
-        let mut segments = vec![];
-        let mut tokens = vec![];
-        let mut outputs = vec![];
-        let mut selected = vec![];
-        let keep = self.final_decoder_window();
-        // Existing decode rows precede bounded prefill work in a shared packet.
-        for prefill in [false, true] {
-            for (i, request) in requests.iter().enumerate() {
-                if budget == 0
-                    || request.is_finished()
-                    || request.ready_output.is_some()
-                    || request.prefilling != prefill
-                {
-                    continue;
-                }
-                let count = if prefill {
-                    let next = 4096 - request.offset % 4096;
-                    let left = request.input.len() - request.offset;
-                    // A soft latency budget may expand for the first atomic
-                    // final window. Other owners defer until the next packet.
-                    let limit = if keep > 0 && left <= keep && segments.is_empty() {
-                        budget.max(left)
-                    } else {
-                        budget
-                    };
-                    let limit = if keep > 0 && left <= keep {
-                        limit
-                    } else {
-                        limit.min(next)
-                    };
-                    let Some(count) = super::replay::prompt_rows(
-                        left,
-                        limit,
-                        keep,
-                        request.input.len() > self.team.rows,
-                    ) else {
-                        continue;
-                    };
-                    count
-                } else {
-                    1
-                };
-                let values = if prefill {
-                    request.input[request.offset..request.offset + count].to_vec()
-                } else {
-                    vec![*request.history.last().ok_or("Missing A2 decode input")?]
-                };
-                if !prefill || request.offset + count == request.input.len() {
-                    outputs.push(segments.len());
-                }
-                segments.push(BatchSegment {
-                    slot: request.slot,
-                    tokens: count,
-                });
-                tokens.push(values);
-                selected.push((i, count));
-                budget = budget.saturating_sub(count);
-            }
-        }
-        if segments.is_empty() {
+        let Some(packet::Selection {
+            layout,
+            tokens,
+            selected,
+            full,
+            batch,
+            prefill_rows,
+            prefill_requests,
+        }) = self.select_packet(requests, options, None)?
+        else {
             maintenance();
             return cached_outputs(requests);
-        }
-        let complete_cache = self.complete_prompt_cache();
-        let full = selected.iter().any(|&(i, count)| {
-            let r = &requests[i];
-            r.needs_logits()
-                || complete_cache
-                    && r.prefilling
-                    && r.cache_prompt
-                    && r.offset + count == r.input.len()
-        });
-        let batch = segments.len();
-        let prefill_rows = selected
-            .iter()
-            .filter(|&&(i, _)| requests[i].prefilling)
-            .map(|&(_, count)| count)
-            .sum::<usize>();
-        let prefill_requests = selected
-            .iter()
-            .filter(|&&(i, _)| requests[i].prefilling)
-            .count();
-        let mut layout = Layout::new(
-            segments,
-            outputs,
-            !has_prefill,
-            if has_prefill {
-                self.team.rows
-            } else {
-                self.team.model.batch.as_ref().unwrap().owners
-            },
-            self.team.model.batch.as_ref().unwrap().owners,
-        )?;
-        for (lane, &(i, _)) in selected.iter().enumerate() {
-            if !requests[i].prefilling {
-                layout.decoder_roles[lane] = super::replay::Role::Continue;
-            }
-        }
+        };
         if self.team.needs_preparation(&layout)?
             && !memory::ensure_budget(self, memory::Requirement::workspace())?
         {
@@ -874,9 +761,23 @@ impl Runtime {
                 self.statistics.mixed_iterations += 1;
             }
         }
-        if prefill_rows == 0 {
-            self.speculation_policy.baseline(batch, full, seconds);
+        let decoders = batch - prefill_requests;
+        if decoders > 0 {
+            self.speculation_policy
+                .baseline(decoders, full, prefill_rows > 0, seconds);
         }
+        let mut steps = self.commit_packet(requests, selected, &values)?;
+        steps.extend(cached_outputs(requests)?);
+        Ok(steps)
+    }
+    fn commit_packet(
+        &mut self,
+        requests: &mut [&mut Request],
+        selected: Vec<(usize, usize)>,
+        values: &[Output],
+    ) -> Result<Vec<StepOutput>> {
+        let complete_cache = self.complete_prompt_cache();
+        let keep = self.final_decoder_window();
         let mut steps = vec![];
         for (i, count) in selected {
             let request = &mut requests[i];
@@ -904,7 +805,6 @@ impl Runtime {
                 self.store(request, None)?;
             }
         }
-        steps.extend(cached_outputs(requests)?);
         Ok(steps)
     }
     pub fn finish_request(&mut self, request: &mut Request, cache: bool) -> Result<()> {

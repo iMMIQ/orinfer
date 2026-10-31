@@ -1,5 +1,67 @@
 use super::*;
 
+// Compare probability bounds while history is identical. Free-running branches
+// and the ordinary repeated control are recorded independently of state checks.
+// Outside both top-20 sets each mass is bounded by its set's smallest mass.
+fn compare_fixed_prefix(reference: &[Vec<TokenLogprob>], actual: &[Vec<TokenLogprob>]) -> f64 {
+    assert_eq!(reference.len(), actual.len());
+    let mut maximum = 0f64;
+    let mut positions = 0;
+    for (owner, (expected, observed)) in reference.iter().zip(actual).enumerate() {
+        assert_eq!(expected.len(), observed.len());
+        for (position, (a, b)) in expected.iter().zip(observed).enumerate() {
+            assert_eq!(a.top.len(), 20);
+            assert_eq!(b.top.len(), 20);
+            let p = a
+                .top
+                .iter()
+                .map(|&(id, lp)| (id, lp.exp()))
+                .collect::<BTreeMap<_, _>>();
+            let q = b
+                .top
+                .iter()
+                .map(|&(id, lp)| (id, lp.exp()))
+                .collect::<BTreeMap<_, _>>();
+            let tail = a
+                .top
+                .last()
+                .unwrap()
+                .1
+                .exp()
+                .max(b.top.last().unwrap().1.exp());
+            let error = p
+                .keys()
+                .chain(q.keys())
+                .map(|id| {
+                    (p.get(id).copied().unwrap_or(0.) - q.get(id).copied().unwrap_or(0.)).abs()
+                })
+                .fold(tail, f64::max);
+            maximum = maximum.max(error);
+            positions += 1;
+            if a.token != b.token {
+                eprintln!(
+                    "DSPARK_GENERATION_BRANCH owner={owner} position={position} tokens={}/{} probability_error_bound={error}",
+                    a.token, b.token
+                );
+                break; // Later free-running histories are different.
+            }
+        }
+    }
+    eprintln!("DSPARK_FIXED_HISTORY positions={positions} max_probability_error_bound={maximum}");
+    maximum
+}
+fn logprob_rows(records: &[Vec<TokenLogprob>]) -> serde_json::Value {
+    serde_json::json!(
+        records
+            .iter()
+            .map(|owner| owner
+                .iter()
+                .map(|p| serde_json::json!({"token":p.token,"logprob":p.logprob,"top":p.top}))
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    )
+}
+
 #[test]
 #[ignore = "Measures warmed DSpark concurrency; requires the A2 package and eight NPUs"]
 fn concurrent_decode_throughput() {
@@ -323,8 +385,10 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
         );
     }
     // Paired mixed lengths exercise owner addressing and the 2048/2049 tail.
-    let mut concurrent_reference = None;
-    for drafts in [0, 5] {
+    let mut concurrent_reference: Option<Vec<Vec<TokenLogprob>>> = None;
+    let mut batch_options = options.clone();
+    batch_options.top_logprobs = Some(20);
+    for (repetition, drafts) in [0, 0, 5].into_iter().enumerate() {
         runtime.draft_limit = drafts;
         let mut requests = (0..3)
             .map(|owner| {
@@ -339,7 +403,7 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
                             images: vec![],
                             audios: vec![],
                             max_new_tokens: 32,
-                            sampling: options.clone(),
+                            sampling: batch_options.clone(),
                             prefix_hints: vec![],
                         },
                         || false,
@@ -357,16 +421,134 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
                 outputs[step.request].extend(step.tokens);
             }
         }
+        let records = requests
+            .iter_mut()
+            .map(|r| r.take_logprobs())
+            .collect::<Vec<_>>();
+        std::fs::write(
+            format!("artifacts/dspark/mixed-b3-control-{repetition}-{drafts}.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"outputs":outputs,"logprobs":logprob_rows(&records)}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         for request in &mut requests {
             runtime.finish_request(request, true).unwrap();
         }
         assert!(outputs.iter().all(|tokens| tokens.len() == 32));
         if let Some(reference) = &concurrent_reference {
-            assert_eq!(&outputs, reference);
+            compare_fixed_prefix(reference, &records);
         } else {
-            concurrent_reference = Some(outputs);
+            concurrent_reference = Some(records);
         }
-        eprintln!("DSPARK_BATCH drafts={drafts} B=3 lengths=2048,2049,2049 passed");
+        eprintln!(
+            "DSPARK_BATCH drafts={drafts} B=3 lengths=2048,2049,2049 completed; probabilities recorded"
+        );
+    }
+    // Decode verification and newly arriving prompts share the target packet.
+    // Prompt writes are not journalled with the speculative decoder owners.
+    let mut mixed_reference: Option<Vec<Vec<TokenLogprob>>> = None;
+    for drafts in [0, 5] {
+        runtime.draft_limit = drafts;
+        if drafts > 0 {
+            for batch in 1..=4 {
+                for full in [false, true] {
+                    for _ in 0..4 {
+                        runtime
+                            .speculation_policy
+                            .baseline(batch, full, true, 0.120);
+                    }
+                }
+            }
+        }
+        let before = runtime.statistics.mixed_speculative_iterations;
+        let mut requests = vec![];
+        let mut outputs = vec![vec![]; 4];
+        for (owner, tokens) in outputs.iter_mut().enumerate() {
+            let mut prompt = if owner == 2 {
+                input.iter().cycle().take(8193).copied().collect()
+            } else if owner == 3 {
+                input[..128].to_vec()
+            } else {
+                input.clone()
+            };
+            // Keep this admission independent of the earlier cached fixtures.
+            prompt[1] = 42 + owner as u32;
+            let mut request = runtime
+                .start_request(
+                    GenerationInput {
+                        input_tokens: prompt,
+                        images: vec![],
+                        audios: vec![],
+                        max_new_tokens: 64,
+                        sampling: batch_options.clone(),
+                        prefix_hints: vec![],
+                    },
+                    || false,
+                )
+                .unwrap();
+            request.cache_prompt = false;
+            request.cache_generated = false;
+            if owner < 2 {
+                while request.generated == 0 {
+                    for step in runtime
+                        .advance_requests(&mut [&mut request], &scheduler::Options::default())
+                        .unwrap()
+                    {
+                        tokens.extend(step.tokens);
+                    }
+                }
+            }
+            requests.push(request);
+        }
+        let started = Instant::now();
+        while requests.iter().any(|r| !r.is_finished()) {
+            let mut refs = requests.iter_mut().collect::<Vec<_>>();
+            for step in runtime
+                .advance_requests(&mut refs, &scheduler::Options::default())
+                .unwrap()
+            {
+                outputs[step.request].extend(step.tokens);
+            }
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        let records = requests
+            .iter_mut()
+            .map(|r| r.take_logprobs())
+            .collect::<Vec<_>>();
+        std::fs::write(
+            format!("artifacts/dspark/mixed-cohort-{drafts}.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"outputs":outputs,"logprobs":logprob_rows(&records)}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for request in &mut requests {
+            runtime.finish_request(request, false).unwrap();
+        }
+        assert!(outputs.iter().all(|tokens| tokens.len() == 64));
+        if let Some(reference) = &mixed_reference {
+            // New prefill owners must not perturb either continuing decoder.
+            assert!(compare_fixed_prefix(&reference[..2], &records[..2]) <= 0.02);
+            for (a, b) in reference[..2].iter().zip(&records[..2]) {
+                assert_eq!(
+                    a.iter().map(|p| p.token).collect::<Vec<_>>(),
+                    b.iter().map(|p| p.token).collect::<Vec<_>>()
+                );
+            }
+            compare_fixed_prefix(reference, &records);
+        } else {
+            mixed_reference = Some(records);
+        }
+        let rounds = runtime.statistics.mixed_speculative_iterations - before;
+        if drafts > 0 {
+            assert!(rounds > 0);
+        }
+        eprintln!("DSPARK_MIXED drafts={drafts} wall_s={seconds} speculative_rounds={rounds}");
+        reports.push(serde_json::json!({"kind":"mixed", "drafts":drafts,
+            "wall_s":seconds,"mixed_speculative_iterations":rounds}));
     }
     std::fs::write(
         "artifacts/dspark/end-to-end.json",

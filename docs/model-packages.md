@@ -628,7 +628,7 @@ A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 own
 
 DSpark 包复用 target 的动态行验证程序和整数投影。三个 draft 层一次计算五个位置，Markov head 依次生成候选。Ascend checkpoint 的 target 使用 QuaRot 坐标，draft 使用独立的原始坐标 embedding 与输出头；main_proj 已离线包含 target 坐标到 draft 坐标的变换。target 37／38／39 层的 attention 输入按 HC 分支取均值；token 分片从真实局部 residual 收集三个特征段，再用一次 AllGather 恢复原行序，投影后更新各 owner 的 draft SWA。Markov 加偏置与分块 argmax 融合，8 卡交换小候选。draft KV 使用 group-64 INT8 和 FP16 scale，窗口为 128。验证返回每个位置的 target 输出；提交保留已接受的写入，并恢复被拒绝候选覆盖的有效窗口槽位。C2 的 32 槽环只读取相邻历史位置，通过逻辑长度保留正确前缀。
 
-`--mtp-drafts 1..5` 设置上限，`0` 使用普通 decode；匹配 DSpark 包的默认上限为 5。DSpark 用于纯 decode 轮次；混合轮次沿用公共 prefill 调度。draft 和逐位置验证沿用 decode 的 Graph 提升时机。策略分别记录并发与完整 logits 模式的热态成本，根据已完成轮次的接受率、较早的置信度和实测时间选择 0–5 个候选，并遵守 `--max-speculative-tokens` 验证行预算。当前 proposer 对 Markov 分数取确定性候选；采样、惩罚和约束请求复用 target 的拒绝采样与正残差纠偏，q 使用该确定性候选的点质量分布。
+`--mtp-drafts 1..5` 设置上限，`0` 使用普通 decode；匹配 DSpark 包的默认上限为 5。DSpark 支持纯 decode 及混合 prefill／验证轮次。公共 packet 选择器先为 decoder 预留验证行，再将剩余 token 预算分配给 prefill，保留 checkpoint 与末尾窗口边界；decoder 返回所有验证位置，完成 prefill 的 owner 只返回末位置。journal 只保护 decoder owner，新输入的状态按公共提交流程保存。draft 与纯验证沿用 decode 的 Graph 提升时机，混合轮次保留 prefill 的捕获摊销门槛。策略分别记录并发、完整 logits 及混合模式的热态成本，根据已完成轮次的接受率、较早的置信度和实测时间选择 0–5 个候选，并遵守 `--max-speculative-tokens` 验证行预算。当前 proposer 对 Markov 分数取确定性候选；采样、惩罚和约束请求复用 target 的拒绝采样与正残差纠偏，q 使用该确定性候选的点质量分布。
 
 离线输入是已发布的 target 模型、对应执行包和包含 `mtp.*` 的 Ascend 转换 checkpoint。构建复用公共 A2 算子与 owner 包装器；导出只增加三个 draft 层的 rank 分片与共享分片，原 target 分片保持字节并复用硬链接。W4 转置 NZ、norm 的 FP32 展开和全部物理 tensor 均在离线完成。权重与执行包写入不同目录：
 
@@ -666,7 +666,7 @@ A2 的 Engram CPU 行表使用共 2 GiB 的跨 packet 行缓存，由各 rank �
 
 主机内存充足时，可用 `ORINFER_A2_HOST_TABLE_MIB` 设置 Engram 完整常驻预算，例如 DSv4.1 当前 INT8 表使用 `212000` MiB。非零预算须容纳全部表及分配元数据，不足时在分配前报错；启动通过现有 Rayon 工作池按 32 MiB 块读取各表，rank 共享唯一常驻副本，后续行读取直接复制内存字节，并关闭重复的行缓存。该模式额外使用约 206 GiB 主机内存，读取成本计入模型启动时间，原生统计的 `resident_bytes` 报告实际保留量。默认 `0` 保持文件读取与有界行缓存；表常驻和行缓存均保留原始 INT8／FP32 字节，设备 staging 沿用已有边界。
 
-`python3 -m tools.bench.agentx_mini --help` 提供固定 Mini-Weka 短测入口：保留原始 16 个窗口、64 个 profiling 请求、并发 16、seed 42、180 秒 profiling 和每 lane 一次 warmup，记录输入哈希、服务二进制、A2 主机预算与 HCCL 参数、健康状态及 metrics。计时区间内通过 `/proc/status` 采样 RSS，PSS 在启动回放前单独记录，并保存采样耗时及进程 I/O、CPU 计数。默认要求关闭投机；DSpark 短测显式传入 `--mtp-drafts 5` 并校验服务配置。默认总时限 900 秒，到时终止本轮客户端并保留诊断；中断结果不能作为通过的短测分数。该入口连接已运行服务，不部署后端或修改设备设置。
+`python3 -m tools.bench.agentx_mini --help` 提供固定 Mini-Weka 短测入口：保留原始 16 个窗口、64 个 profiling 请求、并发 16、seed 42、180 秒 profiling 和每 lane 一次 warmup，记录输入哈希、服务二进制、A2 主机预算与 HCCL 参数、健康状态及 metrics。计时区间内通过 `/proc/status` 采样 RSS，PSS 在启动回放前单独记录，并保存采样耗时及进程 I/O、CPU 计数。默认要求关闭投机；DSpark 短测显式传入 `--mtp-drafts 5` 并校验服务配置。代码 agent 的 thinking 回放使用 `--enable-thinking`，输入身份及该开关写入 provenance；与同样开启 thinking 的基线比较。默认总时限 900 秒，到时终止本轮客户端并保留诊断；中断结果不能作为通过的短测分数。该入口连接已运行服务，不部署后端或修改设备设置。
 
 私有算子的离线调度重建可直接复用已编译计划：
 

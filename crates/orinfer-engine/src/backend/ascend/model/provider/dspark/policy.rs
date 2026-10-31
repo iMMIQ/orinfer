@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 #[derive(Default)]
 pub(in crate::backend::ascend::model::provider) struct Policy {
-    curves: BTreeMap<(usize, bool), Curve>,
+    curves: BTreeMap<(usize, bool, bool), Curve>,
 }
 struct Curve {
     baseline: f64,
@@ -49,16 +49,16 @@ fn update_cost(old: &mut f64, sample: f64, initialized: bool) {
     }
 }
 impl Policy {
-    pub fn baseline(&mut self, batch: usize, full: bool, seconds: f64) {
+    pub fn baseline(&mut self, batch: usize, full: bool, mixed: bool, seconds: f64) {
         if !seconds.is_finite() || seconds <= 0. {
             return;
         }
-        let curve = self.curves.entry((batch, full)).or_default();
+        let curve = self.curves.entry((batch, full, mixed)).or_default();
         update_cost(&mut curve.baseline, seconds, curve.baseline_samples > 0);
         curve.baseline_samples += 1;
     }
-    pub fn select(&mut self, batch: usize, full: bool, maximum: usize) -> usize {
-        let curve = self.curves.entry((batch, full)).or_default();
+    pub fn select(&mut self, batch: usize, full: bool, mixed: bool, maximum: usize) -> usize {
+        let curve = self.curves.entry((batch, full, mixed)).or_default();
         curve.ticks += 1;
         if curve.baseline_samples < 4 {
             return 0;
@@ -96,11 +96,12 @@ impl Policy {
         &mut self,
         batch: usize,
         full: bool,
+        mixed: bool,
         timing: [f64; 3],
         counts: &[(usize, usize)],
         confidence: [f64; 5],
     ) {
-        let curve = self.curves.entry((batch, full)).or_default();
+        let curve = self.curves.entry((batch, full, mixed)).or_default();
         let proposed = counts.iter().map(|p| p.0).sum::<usize>() as f64 / batch as f64;
         if proposed <= 0. {
             return;
@@ -141,21 +142,22 @@ mod tests {
     fn measured(confidence: [f64; 5], counts: &[(usize, usize)], timing: [f64; 3]) -> Policy {
         let mut p = Policy::default();
         for _ in 0..4 {
-            p.baseline(1, false, 0.020);
+            p.baseline(1, false, false, 0.020);
         }
         for _ in 0..16 {
-            p.observe(1, false, timing, counts, confidence);
+            p.observe(1, false, false, timing, counts, confidence);
         }
         p
     }
     #[test]
     fn profitable_blocks_stay_enabled_and_unprofitable_sampling_falls_back() {
         let mut fast = measured([0.9; 5], &[(5, 5)], [0.003, 0.025, 0.001]);
-        assert_eq!(fast.select(1, false, 5), 5);
+        assert_eq!(fast.select(1, false, false, 5), 5);
+        assert_eq!(fast.select(1, false, true, 5), 0); // Independent mixed cost.
         let mut slow = measured([0.01; 5], &[(5, 0)], [0.010, 0.040, 0.003]);
-        assert_eq!(slow.select(1, false, 5), 0);
-        assert_eq!(fast.select(1, true, 5), 0); // Independent full-logits cost.
-        assert_eq!(fast.select(32, false, 5), 0); // Independent concurrency.
+        assert_eq!(slow.select(1, false, false, 5), 0);
+        assert_eq!(fast.select(1, true, false, 5), 0); // Independent full-logits cost.
+        assert_eq!(fast.select(32, false, false, 5), 0); // Independent concurrency.
     }
     #[test]
     fn cheap_prefix_wins_when_later_proposals_rarely_accept() {
@@ -164,13 +166,13 @@ mod tests {
             &[(5, 1)],
             [0.003, 0.030, 0.001],
         );
-        assert_eq!(p.select(1, false, 5), 1);
+        assert_eq!(p.select(1, false, false, 5), 1);
     }
     #[test]
     fn graph_cost_replaces_cold_direct_cost() {
         let mut p = measured([0.99; 5], &[(5, 5)], [0.025, 0.200, 0.001]);
-        assert_eq!(p.select(1, false, 5), 0);
-        p.observe(1, false, [0.007, 0.036, 0.001], &[(5, 5)], [0.99; 5]);
-        assert_eq!(p.select(1, false, 5), 5);
+        assert_eq!(p.select(1, false, false, 5), 0);
+        p.observe(1, false, false, [0.007, 0.036, 0.001], &[(5, 5)], [0.99; 5]);
+        assert_eq!(p.select(1, false, false, 5), 5);
     }
 }

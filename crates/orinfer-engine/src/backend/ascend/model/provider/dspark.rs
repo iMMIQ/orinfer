@@ -11,16 +11,17 @@ impl Runtime {
         maintenance: impl FnOnce(),
     ) -> Result<Vec<StepOutput>> {
         let owners = self.team.model.batch.as_ref().unwrap().owners;
-        let batch = requests
+        let baseline = self
+            .select_packet(requests, options, None)?
+            .ok_or("Missing DSpark decoder packet")?;
+        let mixed = baseline.prefill_rows > 0;
+        let full = baseline.full;
+        let batch = baseline
+            .selected
             .iter()
-            .filter(|r| !r.is_finished() && !r.prefilling && r.ready_output.is_none())
+            .filter(|&&(i, _)| !requests[i].prefilling)
             .count()
             .min(owners.min(options.max_batch_tokens));
-        let full = requests
-            .iter()
-            .filter(|r| !r.is_finished() && !r.prefilling && r.ready_output.is_none())
-            .take(owners.min(options.max_batch_tokens))
-            .any(|r| r.needs_logits());
         let capacity = if options.max_speculative_tokens == 0 {
             self.draft_limit
         } else {
@@ -28,11 +29,12 @@ impl Runtime {
                 .saturating_sub(1)
                 .min(self.draft_limit)
         };
-        let draft_limit = self.speculation_policy.select(batch, full, capacity);
-        let selected = requests
+        let draft_limit = self.speculation_policy.select(batch, full, mixed, capacity);
+        let selected = baseline
+            .selected
             .iter()
-            .enumerate()
-            .filter(|(_, r)| !r.is_finished() && !r.prefilling && r.ready_output.is_none())
+            .map(|&(i, _)| (i, &requests[i]))
+            .filter(|(_, r)| !r.prefilling)
             .take(owners.min(options.max_batch_tokens))
             .map(|(i, r)| {
                 (
@@ -84,8 +86,7 @@ impl Runtime {
             return Err("Insufficient DSpark graph workspace".into());
         }
         let (proposals, draft_s, draft_prepare) = self.team.forward(draft, inputs, false)?;
-        let mut segments = vec![];
-        let mut inputs = vec![];
+        let mut inputs = BTreeMap::new();
         let mut draft_tokens = vec![];
         for &(i, count) in &selected {
             let request = &requests[i];
@@ -100,11 +101,7 @@ impl Runtime {
             }
             let mut values = vec![*request.history.last().unwrap()];
             values.extend_from_slice(&tokens);
-            segments.push(BatchSegment {
-                slot: request.slot,
-                tokens: values.len(),
-            });
-            inputs.push(values);
+            inputs.insert(i, values);
             draft_tokens.push(tokens);
         }
         let journal = selected
@@ -115,10 +112,25 @@ impl Runtime {
         let started = Instant::now();
         self.team.exchange(Command::BeginVerification(journal))?;
         let save_s = started.elapsed().as_secs_f64();
-        let layout = Layout::verification(segments, self.team.rows, owners)?;
-        let full = selected.iter().any(|&(i, _)| requests[i].needs_logits());
+        let packet::Selection {
+            layout,
+            tokens: inputs,
+            selected: packet_requests,
+            full: packet_full,
+            batch: packet_batch,
+            prefill_rows,
+            prefill_requests,
+        } = self
+            .select_packet(requests, options, Some(&inputs))?
+            .ok_or("Missing DSpark verification packet")?;
+        if self.team.needs_preparation(&layout)?
+            && !memory::ensure_budget(self, memory::Requirement::workspace())?
+        {
+            return Err("Insufficient DSpark verification workspace".into());
+        }
         let (verified, verify_s, verify_prepare) =
-            self.team.forward_with(layout, inputs, full, maintenance)?;
+            self.team
+                .forward_with(layout, inputs, full || packet_full, maintenance)?;
         let started = Instant::now();
         let mut counts = vec![];
         let mut steps = vec![];
@@ -228,6 +240,7 @@ impl Runtime {
         self.speculation_policy.observe(
             selected.len(),
             full,
+            mixed,
             [draft_s, verify_s + sampling_s, restore_s],
             &counts,
             confidence,
@@ -241,6 +254,11 @@ impl Runtime {
         self.speculation.draft_s += draft_s;
         self.speculation.verification_s += verify_s;
         self.speculation.restore_s += restore_s;
+        let prefill = packet_requests
+            .into_iter()
+            .filter(|&(i, _)| requests[i].prefilling)
+            .collect();
+        steps.extend(self.commit_packet(requests, prefill, &verified)?);
         self.statistics.iterations += 1;
         self.statistics.speculative_iterations += 1;
         self.statistics.compute_s += draft_s + verify_s + restore_s;
@@ -248,8 +266,27 @@ impl Runtime {
         *self
             .statistics
             .batch_histogram
-            .entry(selected.len())
+            .entry(packet_batch)
             .or_default() += 1;
+        if prefill_rows > 0 {
+            self.statistics.mixed_iterations += 1;
+            self.statistics.mixed_speculative_iterations += 1;
+            self.statistics.bounded_prefill_iterations += 1;
+            *self
+                .statistics
+                .prefill_chunk_histogram
+                .entry(prefill_rows)
+                .or_default() += 1;
+            *self
+                .statistics
+                .prefill_batch_histogram
+                .entry(prefill_requests)
+                .or_default() += 1;
+            self.statistics.max_bounded_prefill_s = self
+                .statistics
+                .max_bounded_prefill_s
+                .max(draft_s + verify_s + restore_s);
+        }
         steps.extend(cached_outputs(requests)?);
         Ok(steps)
     }

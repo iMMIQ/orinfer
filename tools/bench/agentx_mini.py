@@ -66,7 +66,10 @@ def command(args):
         "--request-timeout-seconds",
         "1800",
         "--extra-inputs",
-        '{"temperature":0}',
+        json.dumps(
+            dict(temperature=0, **({"enable_thinking": True} if args.enable_thinking else {})),
+            separators=(",", ":"),
+        ),
         "--export-level",
         "records",
         "--server-metrics-formats",
@@ -94,6 +97,9 @@ def main():
     parser.add_argument("--service-pid", type=int, required=True)
     parser.add_argument("--wall-limit", type=int, default=900)
     parser.add_argument("--mtp-drafts", type=int, default=0, help="Expected service draft limit")
+    parser.add_argument(
+        "--enable-thinking", action="store_true", help="Enable thinking for all replay requests"
+    )
     args = parser.parse_args()
     if not 60 <= args.wall_limit <= 1200:
         parser.error("Mini diagnostics require a 60..1200 second wall limit")
@@ -167,6 +173,7 @@ def main():
             command=invocation,
             wall_limit_s=args.wall_limit,
             mtp_drafts=args.mtp_drafts,
+            enable_thinking=args.enable_thinking,
             service_pid=args.service_pid,
             service_command=service_command,
             service_environment=service_environment,

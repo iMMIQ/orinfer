@@ -583,7 +583,11 @@ fn forward_with(
         .collect::<Result<Vec<_>>>()?;
     let repeated = layout.decode
         || layout.role == super::PacketRole::Draft
-        || layout.outputs.len() > layout.segments.len();
+        || layout.outputs.len() > layout.segments.len()
+            && layout
+                .decoder_roles
+                .iter()
+                .all(|r| *r == super::replay::Role::Continue);
     let (invalidate, capture) = preparation(&states, repeated)?;
     if invalidate {
         exchange(peers, Command::Invalidate(layout.clone()))?;
