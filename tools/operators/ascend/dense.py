@@ -6,8 +6,18 @@ import tilelang.language as T
 
 
 def projection(
-    rows, output, reduction, integer=False, block_k=128, tile_n=64, tile_m=16, pipeline_stages=0
+    rows,
+    output,
+    reduction,
+    integer=False,
+    block_k=128,
+    tile_n=64,
+    tile_m=16,
+    pipeline_stages=0,
+    unit_scale=False,
 ):
+    if integer and unit_scale:
+        raise ValueError("Direct BF16 output requires a BF16 projection with unit scales")
     alignment = 32 if integer else 128
     if (isinstance(rows, int) and rows < 1) or output % 32 or reduction % alignment:
         raise ValueError("A2 projection requires positive rows and aligned N/K")
@@ -65,43 +75,62 @@ def projection(
                         w,
                     )
                     T.gemm_v0(a, w, c, transpose_B=True, init=(k == 0))
-                T.copy(
-                    c,
-                    workspace[bm * block_m : (bm + 1) * block_m, bn * block_n : (bn + 1) * block_n],
-                )
-                T.set_cross_flag("FIX", 0)
-                T.wait_cross_flag(1)
-            with T.Scope("V"):
-                raw = T.alloc_ub((vector_m, block_n), accum_dtype)
-                accumulator = T.alloc_ub((vector_m, block_n), "float32")
-                sa = T.alloc_ub((vector_m, 1), "float32")
-                sw = T.alloc_ub((1, block_n), "float32")
-                broadcast = T.alloc_ub((vector_m, block_n), "float32")
-                y = T.alloc_ub((vector_m, block_n), "bfloat16")
-                start = bm * block_m + vid * vector_m
-                T.wait_cross_flag(0)
-                if start < rows:
-                    valid = T.min(vector_m, rows - start)
+                if unit_scale:
                     T.copy(
-                        workspace[start : start + vector_m, bn * block_n : (bn + 1) * block_n], raw
+                        c,
+                        out[
+                            bm * block_m : bm * block_m + valid_rows,
+                            bn * block_n : (bn + 1) * block_n,
+                        ],
                     )
-                    if integer:
-                        T.tile.cast(accumulator, raw, "CAST_RINT", vector_m * block_n)
-                    else:
-                        T.copy(raw, accumulator)
-                    T.tile.fill(sa, 0.0)
-                    T.copy(token_scale[start : start + valid], sa[:valid, :])
-                    T.copy(channel_scale[bn * block_n : (bn + 1) * block_n], sw)
-                    T.tile.broadcast(broadcast, sa)
-                    T.tile.mul(accumulator, accumulator, broadcast)
-                    T.tile.broadcast(broadcast, sw)
-                    T.tile.mul(accumulator, accumulator, broadcast)
-                    T.tile.cast(y, accumulator, "CAST_RINT", vector_m * block_n)
+                    # The bounded dynamic grid reuses L0C for its next tile.
+                    T.pipe_barrier("FIX")
+                else:
                     T.copy(
-                        y[:valid, :], out[start : start + valid, bn * block_n : (bn + 1) * block_n]
+                        c,
+                        workspace[
+                            bm * block_m : (bm + 1) * block_m,
+                            bn * block_n : (bn + 1) * block_n,
+                        ],
                     )
-                T.set_cross_flag("MTE3", 1)
+                    T.set_cross_flag("FIX", 0)
+                    T.wait_cross_flag(1)
+            if not unit_scale:
+                with T.Scope("V"):
+                    raw = T.alloc_ub((vector_m, block_n), accum_dtype)
+                    accumulator = T.alloc_ub((vector_m, block_n), "float32")
+                    sa = T.alloc_ub((vector_m, 1), "float32")
+                    sw = T.alloc_ub((1, block_n), "float32")
+                    broadcast = T.alloc_ub((vector_m, block_n), "float32")
+                    y = T.alloc_ub((vector_m, block_n), "bfloat16")
+                    start = bm * block_m + vid * vector_m
+                    T.wait_cross_flag(0)
+                    if start < rows:
+                        valid = T.min(vector_m, rows - start)
+                        T.copy(
+                            workspace[start : start + vector_m, bn * block_n : (bn + 1) * block_n],
+                            raw,
+                        )
+                        if integer:
+                            T.tile.cast(accumulator, raw, "CAST_RINT", vector_m * block_n)
+                        else:
+                            T.copy(raw, accumulator)
+                        T.tile.fill(sa, 0.0)
+                        T.copy(token_scale[start : start + valid], sa[:valid, :])
+                        T.copy(channel_scale[bn * block_n : (bn + 1) * block_n], sw)
+                        T.tile.broadcast(broadcast, sa)
+                        T.tile.mul(accumulator, accumulator, broadcast)
+                        T.tile.broadcast(broadcast, sw)
+                        T.tile.mul(accumulator, accumulator, broadcast)
+                        T.tile.cast(y, accumulator, "CAST_RINT", vector_m * block_n)
+                        T.copy(
+                            y[:valid, :],
+                            out[start : start + valid, bn * block_n : (bn + 1) * block_n],
+                        )
+                    T.set_cross_flag("MTE3", 1)
 
+    if unit_scale:
+        return main
     return main.with_attr("orinfer.coupled_resources", True).with_attr(
         "orinfer.explicit_cross_sync", True
     )

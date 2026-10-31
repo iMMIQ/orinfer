@@ -1,6 +1,80 @@
 import unittest
+import json
+import struct
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import numpy as np
 from tools.model.deepseek_v41.floating import bf16_parts
+from tools.model.deepseek_v41.converge import unit_scale_manifests
+
+
+class ProjectionScaleTests(unittest.TestCase):
+    def test_every_rank_binding_must_have_immutable_unit_scales(self):
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / "kernel.json").write_text(
+                json.dumps(dict(op="dense.projection", parameters=dict(integer=False)))
+            )
+            (base / "ones.bin").write_bytes(struct.pack("<ff", 1.0, 1.0))
+            (base / "other.bin").write_bytes(struct.pack("<ff", 1.0, 0.0))
+            model = dict(
+                ranks=[
+                    dict(
+                        buffers=[
+                            dict(name=n, bytes=8, data=dict(file="ones.bin"))
+                            for n in ["token", "channel"]
+                        ],
+                        packets=[
+                            dict(
+                                body=[
+                                    dict(
+                                        op="kernel",
+                                        manifest="kernel.json",
+                                        buffers=["x", "w", "token", "channel", "out", "scratch"],
+                                    )
+                                ],
+                                head=[],
+                            )
+                        ],
+                    )
+                    for _ in range(2)
+                ]
+            )
+            self.assertEqual(unit_scale_manifests(model, base), {"kernel.json"})
+            bad = model["ranks"][1]["buffers"][0]
+            bad["data"]["file"] = "other.bin"
+            self.assertFalse(unit_scale_manifests(model, base))
+            bad["data"]["file"] = "ones.bin"
+            bad["view"] = dict(parent="mutable", offset=0)
+            self.assertFalse(unit_scale_manifests(model, base))
+
+    def test_truncated_unit_scale_assets_do_not_enable_fixpipe(self):
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / "kernel.json").write_text(
+                json.dumps(dict(op="dense.projection", parameters=dict(integer=False)))
+            )
+            (base / "ones.bin").write_bytes(struct.pack("<f", 1.0))
+            model = dict(
+                ranks=[
+                    dict(
+                        buffers=[dict(name="scale", bytes=8, data=dict(file="ones.bin"))],
+                        packets=[
+                            dict(
+                                body=[
+                                    dict(
+                                        op="kernel",
+                                        manifest="kernel.json",
+                                        buffers=["x", "w", "scale", "scale", "out", "scratch"],
+                                    )
+                                ],
+                                head=[],
+                            )
+                        ],
+                    )
+                ]
+            )
+            self.assertFalse(unit_scale_manifests(model, base))
 
 
 class FloatingPartsTests(unittest.TestCase):

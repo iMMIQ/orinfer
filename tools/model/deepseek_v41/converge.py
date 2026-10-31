@@ -10,12 +10,61 @@ from copy import deepcopy
 import importlib
 import json
 import math
+import struct
 from pathlib import Path
 import sys
 import tempfile
 
 from tools.build.files import atomic_json, file_hash, source_hash
 from tools.model.row_contract import resolve
+
+
+def unit_scale_manifests(model, base):
+    """Require immutable FP32 ones at every binding of a BF16 projection."""
+    eligible, rejected, descriptions, constants = set(), set(), {}, {}
+    for rank in model["ranks"]:
+        definitions = {b["name"]: b for b in rank["buffers"]}
+        for packet in rank["packets"]:
+            for step in packet["body"] + packet["head"]:
+                if step["op"] != "kernel":
+                    continue
+                names = [step.get(key) for key in ("manifest", "uncompacted_manifest")]
+                names.extend(
+                    name
+                    for variant in model.get("row_selections", {}).get(step["manifest"], [])
+                    for name in variant["kernels"]
+                )
+                for name in names:
+                    if name is None:
+                        continue
+                    if name not in descriptions:
+                        descriptions[name] = json.loads((base / name).read_text())
+                    spec = descriptions[name]
+                    if spec.get("op") != "dense.projection" or spec["parameters"].get(
+                        "integer", False
+                    ):
+                        continue
+                    eligible.add(name)
+                    for buffer in step["buffers"][2:4]:
+                        definition = definitions[buffer]
+                        if not definition.get("data") or any(
+                            k in definition for k in ("view", "weight", "prepared_weight")
+                        ):
+                            rejected.add(name)
+                            continue
+                        file = base / definition["data"]["file"]
+                        identity = (file, definition["bytes"])
+                        if identity not in constants:
+                            data = file.read_bytes()
+                            constants[identity] = (
+                                len(data) == definition["bytes"]
+                                and len(data) > 0
+                                and len(data) % 4 == 0
+                                and all(x == (1.0,) for x in struct.iter_unpack("<f", data))
+                            )
+                        if not constants[identity]:
+                            rejected.add(name)
+    return eligible - rejected
 
 
 def check_intermediate_liveness(program, candidates, describe, contract, definitions):
@@ -210,6 +259,7 @@ def canonical(model):
 def validate_rows(model, base):
     """Offline full-domain arithmetic and physical span checks, deduplicated."""
     expressions, specs = {}, {}
+    unit_scales = None
     sizes = dict(i8=1, u8=1, f16=2, bf16=2, f32=4, i32=4, i64=8, u64=8)
 
     def values(expr, capacity):
@@ -223,8 +273,19 @@ def validate_rows(model, base):
             specs[path] = json.loads((base / path).read_text())
         return specs[path]
 
+    def check_unit_scales(path):
+        nonlocal unit_scales
+        if spec_for(path)["parameters"].get("unit_scale", False):
+            if unit_scales is None:
+                unit_scales = unit_scale_manifests(model, base)
+            if path not in unit_scales:
+                raise ValueError(
+                    "Direct BF16 output requires immutable unit scales at every binding"
+                )
+
     for slot, variants in model.get("row_selections", {}).items():
         source = spec_for(slot)
+        check_unit_scales(slot)
         previous = 0
         for variant in variants:
             if (
@@ -237,7 +298,8 @@ def validate_rows(model, base):
                 raise ValueError("Invalid local row selection")
             previous = variant["max_rows"]
             replacement = spec_for(variant["kernels"][0])
-            knobs = {"tile_m", "tile_n", "block_k", "pipeline_stages", "_grid_limit"}
+            check_unit_scales(variant["kernels"][0])
+            knobs = {"tile_m", "tile_n", "block_k", "pipeline_stages", "_grid_limit", "unit_scale"}
 
             def math_parameters(spec):
                 return {k: v for k, v in spec["parameters"].items() if k not in knobs}
@@ -303,6 +365,9 @@ def validate_rows(model, base):
                     elif step["op"] == "kernel":
                         path = step["manifest"]
                         spec = spec_for(path)
+                        check_unit_scales(path)
+                        if step.get("uncompacted_manifest") is not None:
+                            check_unit_scales(step["uncompacted_manifest"])
                         if len(step["buffers"]) != len(spec["operands"]):
                             raise ValueError("Kernel pointer count differs")
                         for name, operand in zip(step["buffers"], spec["operands"], strict=True):

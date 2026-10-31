@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
+from tools.model.deepseek_v41.converge import unit_scale_manifests
 from tools.model.row_selection import bounded_choices, guarded_winner, samples
 from tools.model.tuning import compile_candidates, measure, read_record, record_path
 
@@ -100,6 +101,11 @@ def main():
         "--grid-only", action="store_true", help="Measure same-source 64/128/256 CTA bounds"
     )
     search.add_argument("--pipeline-only", action="store_true")
+    search.add_argument(
+        "--bf16-output",
+        action="store_true",
+        help="Compare shared BF16 Vector and direct Fixpipe output after verifying unit scales",
+    )
     search.add_argument("--joint", action="store_true", help="Joint M/N/K/pipeline candidates")
     search.add_argument(
         "--wide-integer",
@@ -127,6 +133,7 @@ def main():
     selections = model.setdefault("row_selections", {})
     index = json.loads((args.model_dir / model["index"]["file"]).read_text())["weight_map"]
     definitions = {b["name"]: b for b in model["ranks"][0]["buffers"]}
+    unit_scales = unit_scale_manifests(model, base) if args.bf16_output else set()
     groups = {}
     for packet in model["ranks"][0]["packets"]:
         if args.decode_only and not packet.get("batch_decode", False):
@@ -136,6 +143,8 @@ def main():
                 continue
             manifest = json.loads((base / step["manifest"]).read_text())
             if manifest["op"] == "dense.projection" and "_row_capacity" in manifest["parameters"]:
+                if args.bf16_output and step["manifest"] not in unit_scales:
+                    continue
                 if (
                     args.geometry
                     and [manifest["parameters"]["output"], manifest["parameters"]["reduction"]]
@@ -185,6 +194,9 @@ def main():
             else None
         )
         configs = projection_configs(parameters, args.pipeline_only, args.wide_integer, args.joint)
+        if args.bf16_output:
+            current = parameters.get("unit_scale", False)
+            configs = [dict(configs[0], unit_scale=unit) for unit in (current, not current)]
         if args.grid_only:
             configs = [
                 dict(configs[0], grid_limit=g) for g in dict.fromkeys((grid_limit, 64, 128, 256))
@@ -230,6 +242,7 @@ def main():
             scale_sha256=file_hash_bytes(channel) if channel is not None else None,
             scale=scaling,
             tuner_sha256=file_hash(Path(__file__)),
+            convergence_sha256=file_hash(Path(__file__).with_name("converge.py")),
             geometry_sha256=file_hash(Path(__file__).parents[2] / "operators/ascend/geometry.py"),
             selection_sha256=file_hash(Path(__file__).parents[1] / "row_selection.py"),
         )
@@ -397,7 +410,9 @@ def main():
         for packet in rank["packets"]:
             for step in packet["body"] + packet["head"]:
                 if step["op"] == "kernel":
-                    step["manifest"] = replacements.get(step["manifest"], step["manifest"])
+                    for key in ("manifest", "uncompacted_manifest"):
+                        if step.get(key) is not None:
+                            step[key] = replacements.get(step[key], step[key])
     from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
 
     model = compact_buffers(model)

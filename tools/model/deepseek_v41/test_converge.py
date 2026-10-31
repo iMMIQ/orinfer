@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -1023,6 +1024,69 @@ class ConvergenceTests(unittest.TestCase):
                 (root / "local.json").write_text(json.dumps(invalid))
                 with self.subTest(key=key), self.assertRaises(ValueError):
                     validate_rows(model, root)
+
+    def test_direct_bf16_output_requires_unit_scales_for_defaults_and_local_choices(self):
+        import struct
+
+        shapes = [(256, 128), (32, 128), (256,), (32,), (256, 32), (256, 32)]
+        names = ["x", "weight", "token", "channel", "out", "scratch"]
+        dtypes = ["bf16", "bf16", "f32", "f32", "bf16", "f32"]
+        definitions = [
+            dict(name=name, bytes=math.prod(shape) * (2 if dtype == "bf16" else 4))
+            for name, shape, dtype in zip(names, shapes, dtypes, strict=True)
+        ]
+        source = dict(
+            op="dense.projection",
+            parameters=dict(rows=256, output=32, reduction=128, integer=False, _row_capacity=256),
+            source_sha256="factory",
+            compiler={"version": "pinned"},
+            operands=[
+                dict(
+                    name=name,
+                    shape=list(shape),
+                    dtype=dtype,
+                    access="write" if name == "out" else "scratch" if name == "scratch" else "read",
+                )
+                for name, shape, dtype in zip(names, shapes, dtypes, strict=True)
+            ],
+        )
+        model = dict(
+            ranks=[
+                dict(
+                    buffers=definitions,
+                    packets=[
+                        dict(
+                            rows=256,
+                            body=[dict(op="kernel", manifest="kernel.json", buffers=names)],
+                            head=[],
+                        )
+                    ],
+                )
+            ],
+            row_selections={
+                "kernel.json": [dict(min_rows=1, max_rows=128, kernels=["local.json"])]
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for i in (2, 3):
+                file = names[i] + ".bin"
+                definitions[i]["data"] = dict(file=file)
+                (root / file).write_bytes(struct.pack("<f", 1.0) * shapes[i][0])
+            replacement = deepcopy(source)
+            replacement["parameters"]["unit_scale"] = True
+            (root / "kernel.json").write_text(json.dumps(source))
+            (root / "local.json").write_text(json.dumps(replacement))
+            validate_rows(model, root)
+            (root / "channel.bin").write_bytes(struct.pack("<f", 0.0) * 32)
+            with self.assertRaisesRegex(ValueError, "unit scales"):
+                validate_rows(model, root)
+            model["row_selections"] = {}
+            (root / "kernel.json").write_text(json.dumps(replacement))
+            with self.assertRaisesRegex(ValueError, "unit scales"):
+                validate_rows(model, root)
+            (root / "channel.bin").write_bytes(struct.pack("<f", 1.0) * 32)
+            validate_rows(model, root)
 
 
 if __name__ == "__main__":
