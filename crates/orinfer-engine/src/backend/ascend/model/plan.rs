@@ -150,12 +150,30 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
         if rank
             .packets
             .iter()
-            .map(|p| (p.role, p.rows, p.min_rows, p.max_rows))
+            .map(|p| {
+                (
+                    p.role,
+                    p.rows,
+                    p.min_rows,
+                    p.max_rows,
+                    p.coordinates.draft_block,
+                    p.draft_stride,
+                )
+            })
             .collect::<Vec<_>>()
             != model.ranks[0]
                 .packets
                 .iter()
-                .map(|p| (p.role, p.rows, p.min_rows, p.max_rows))
+                .map(|p| {
+                    (
+                        p.role,
+                        p.rows,
+                        p.min_rows,
+                        p.max_rows,
+                        p.coordinates.draft_block,
+                        p.draft_stride,
+                    )
+                })
                 .collect::<Vec<_>>()
         {
             return Err("TP ranks have different row contracts".into());
@@ -251,7 +269,7 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                             .batch
                             .as_ref()
                             .ok_or("Owner head requires batch contract")?;
-                        if packet.batch_decode {
+                        if packet.batch_decode || packet.draft_stride.is_some() {
                             contract.owners
                         } else {
                             contract.output_capacity()
@@ -365,10 +383,20 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                     ..
                 } = instruction
                 {
+                    let capacity =
+                        if matches!(instruction, Instruction::Gather { owners: true, .. }) {
+                            model
+                                .batch
+                                .as_ref()
+                                .ok_or("Owner gather requires batch contract")?
+                                .owners
+                        } else {
+                            current_capacity
+                        };
                     row_contract::elements(
                         usize::try_from(*elements).map_err(|_| "Collective count overflow")?,
-                        current_capacity,
-                        current_capacity,
+                        capacity,
+                        capacity,
                         *fixed_rows,
                         elements_expression.as_ref(),
                     )?;

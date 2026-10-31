@@ -1,6 +1,6 @@
 //! Typed service configuration; argument parsing belongs to the CLI.
 use orinfer_engine::{
-    execution::{CudaGraphMode, ResidentExperts},
+    execution::{CudaGraphMode, MAX_MTP_DRAFTS, ResidentExperts},
     scheduler,
 };
 use std::path::PathBuf;
@@ -118,8 +118,8 @@ impl ServerConfig {
         if self.model.is_empty() {
             return Err("Model ID cannot be empty".into());
         }
-        if self.mtp_drafts.is_some_and(|n| n > 7) {
-            return Err("MTP drafts must be auto or 0..7".into());
+        if self.mtp_drafts.is_some_and(|n| n > MAX_MTP_DRAFTS) {
+            return Err("MTP drafts must be auto or 0..31".into());
         }
         if self.resident_experts == ResidentExperts::Count(0) {
             return Err("Resident expert count must be positive".into());
@@ -169,7 +169,9 @@ mod tests {
         config.resident_experts = ResidentExperts::Count(0);
         assert!(config.validate().is_err());
         config.resident_experts = ResidentExperts::Full;
-        config.mtp_drafts = Some(8);
+        config.mtp_drafts = Some(16);
+        config.validate().unwrap();
+        config.mtp_drafts = Some(MAX_MTP_DRAFTS + 1);
         assert!(config.validate().is_err());
         config.mtp_drafts = None;
         config.scheduler.max_active = 129;

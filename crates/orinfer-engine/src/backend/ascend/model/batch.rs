@@ -59,6 +59,9 @@ impl Contract {
             self.output_capacity
         }
     }
+    pub(super) fn draft_capacity(&self) -> usize {
+        (self.output_capacity() / self.owners).saturating_sub(1)
+    }
     pub(super) fn token_capacity(&self, table: &str, rows: usize) -> Result<usize> {
         match self.partitioned_tables.get(table) {
             None => Ok(rows),
@@ -166,21 +169,14 @@ pub(super) struct Runtime {
 }
 struct TableUse {
     max_rows: usize,
+    draft_block: Option<usize>,
+    draft_stride: Option<usize>,
     pointers: BTreeSet<String>,
     work: BTreeSet<String>,
     columns: Vec<bool>,
 }
 impl Runtime {
     fn key(&self, layout: &Layout) -> Result<Key> {
-        match layout.role {
-            super::PacketRole::Draft
-                if layout.segments.iter().any(|s| s.tokens != 5)
-                    || layout.outputs.len() != layout.rows.total =>
-            {
-                return Err("DSpark requires complete five-position owner blocks".into());
-            }
-            _ => {}
-        }
         let (family, _) = self
             .families
             .iter()
@@ -188,6 +184,16 @@ impl Runtime {
                 let used = &self.tables[family];
                 (family.0 == layout.role
                     && family.1 == layout.decode
+                    && (layout.role != super::PacketRole::Draft
+                        || used.draft_block.is_some_and(|block| {
+                            layout.segments.iter().all(|s| s.tokens == block)
+                                && layout.outputs.len()
+                                    == if used.draft_stride.is_some() {
+                                        layout.segments.len()
+                                    } else {
+                                        layout.rows.total
+                                    }
+                        }))
                     && family.2 <= layout.rows.total
                     && layout.rows.total <= used.max_rows)
                     .then_some((*family, used))
@@ -205,6 +211,8 @@ impl Runtime {
         for packet in packets {
             let mut used = TableUse {
                 max_rows: packet.dispatch_max(),
+                draft_block: packet.coordinates.draft_block,
+                draft_stride: packet.draft_stride,
                 pointers: BTreeSet::new(),
                 work: BTreeSet::new(),
                 columns: vec![false; contract.columns.len()],
@@ -641,8 +649,7 @@ impl Worker {
                 .find(|p| {
                     p.role == layout.role
                         && p.batch_decode == layout.decode
-                        && p.min_rows <= layout.rows.total
-                        && layout.rows.total <= p.dispatch_max()
+                        && p.min_rows == key.family.2
                 })
                 .cloned()
                 .ok_or("Missing batch family")?;
@@ -1071,7 +1078,12 @@ impl Worker {
         }
         let mut output = vec![];
         if !layout.outputs.is_empty() {
-            let count = layout.outputs.len();
+            let count = execution
+                .packet
+                .draft_stride
+                .map_or(layout.outputs.len(), |stride| {
+                    layout.segments.len() * stride
+                });
             let values = self.session.download(
                 &get(
                     &self.buffers,
@@ -1107,7 +1119,24 @@ impl Worker {
             } else {
                 None
             };
-            for (i, &lane) in layout.outputs.iter().enumerate() {
+            let outputs = if let Some(stride) = execution.packet.draft_stride {
+                layout
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(lane, segment)| {
+                        (0..segment.tokens).map(move |position| (lane * stride + position, lane))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                layout
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &lane)| (i, lane))
+                    .collect()
+            };
+            for (i, lane) in outputs {
                 let value = f32::from_le_bytes(values[i * 4..i * 4 + 4].try_into().unwrap());
                 let index = i32::from_le_bytes(indices[i * 4..i * 4 + 4].try_into().unwrap());
                 let vocabulary = if execution.packet.replicated_output {
@@ -1231,7 +1260,7 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             if !state_roles.contains(name) {
                 return Err("Verification window must name persistent owner state".into());
             }
-            window.overwritten_spans(0, 6, buffers[name.as_str()].bytes)?;
+            window.overwritten_spans(0, c.draft_capacity() + 1, buffers[name.as_str()].bytes)?;
         }
         for name in &c.private {
             let b = buffers
@@ -1334,9 +1363,15 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
         }
         for p in &rank.packets {
             if p.role == super::PacketRole::Draft
-                && (p.rows != c.owners * 5
-                    || p.coordinates.draft_block != Some(5)
-                    || p.coordinates.input_ids.is_none()
+                && (p.coordinates.draft_block.is_none_or(|block| {
+                    !(1..=crate::execution::MAX_MTP_DRAFTS).contains(&block)
+                        || p.dispatch_max() != c.owners * block
+                        || c.output_capacity() < c.owners * (block + 1)
+                        || p.draft_stride
+                            .is_some_and(|stride| stride < block || p.rows != c.owners * stride)
+                        || p.draft_stride.is_none() && p.rows != c.owners * block
+                        || p.draft_stride.is_some() && p.min_rows != block
+                }) || p.coordinates.input_ids.is_none()
                     || !p.replicated_output
                     || p.confidence.is_none()
                     || p.vocab_first != 0)

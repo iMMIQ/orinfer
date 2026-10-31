@@ -90,7 +90,7 @@ fn concurrent_decode_throughput() {
     let mut runtime = Runtime::load(
         &model,
         crate::execution::LoadOptions {
-            mtp_drafts: Some(5),
+            mtp_drafts: None,
             prefix_cache_bytes: 0,
             ..Default::default()
         },
@@ -100,10 +100,29 @@ fn concurrent_decode_throughput() {
         temperature: 0.,
         ..Default::default()
     };
+    let cases = |name: &str, default: &str| {
+        std::env::var(name)
+            .unwrap_or_else(|_| default.into())
+            .split(',')
+            .map(|v| v.parse::<usize>().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let batches = cases("ORINFER_A2_DSPARK_BATCHES", "1,2,4,8,16,32");
+    let depths = cases("ORINFER_A2_DSPARK_DEPTHS", "0,5,0,5");
+    assert!(
+        batches
+            .iter()
+            .all(|&b| (1..=runtime.team.model.batch.as_ref().unwrap().owners).contains(&b))
+    );
+    assert!(
+        depths
+            .iter()
+            .all(|&d| d <= runtime.team.draft_blocks.last().copied().unwrap_or(0))
+    );
     let mut reports = vec![];
-    for batch in [1, 2, 4, 8, 16, 32] {
+    for batch in batches {
         let mut expected = None;
-        for (round, drafts) in [0, 5, 0, 5].into_iter().enumerate() {
+        for (round, &drafts) in depths.iter().enumerate() {
             runtime.draft_limit = drafts;
             let mut requests = vec![];
             let mut outputs = vec![vec![]; batch];
@@ -164,7 +183,7 @@ fn concurrent_decode_throughput() {
                 expected = Some(outputs);
             }
             let report = serde_json::json!({
-                "batch": batch, "drafts": drafts, "warm": round >= 2,
+                "batch": batch, "drafts": drafts, "warm": round >= depths.len().div_ceil(2),
                 "prompt_tokens_per_request": input.len(), "output_tokens_per_request": 64,
                 "decode_tokens": batch * 63, "decode_s": seconds,
                 "aggregate_decode_tps": (batch * 63) as f64 / seconds,
@@ -204,19 +223,21 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
     let mut runtime = Runtime::load(
         &model,
         crate::execution::LoadOptions {
-            mtp_drafts: Some(5),
+            mtp_drafts: None,
             prefix_cache_bytes: 2 << 30,
             ..Default::default()
         },
     )
     .unwrap();
+    let maximum = runtime.team.draft_blocks.last().copied().unwrap_or(0);
+    let verification_rows = maximum + 1;
     let options = crate::sampling::Options {
         temperature: 0.,
         ..Default::default()
     };
     let mut expected = None;
     let mut reports = vec![];
-    for drafts in [0, 5, 0, 5] {
+    for drafts in [0, maximum, 0, maximum] {
         runtime.draft_limit = drafts;
         let mut tokens = vec![];
         let mut first = None;
@@ -309,7 +330,7 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
             complete: true,
         })
         .unwrap();
-    for keep in 1..=6 {
+    for keep in 1..=verification_rows {
         runtime
             .team
             .exchange(Command::Restore {
@@ -319,17 +340,20 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
             .unwrap();
         runtime
             .team
-            .exchange(Command::BeginVerification(vec![slot]))
+            .exchange(Command::BeginVerification(vec![(slot, verification_rows)]))
             .unwrap();
         let verify = Layout::verification(
-            vec![BatchSegment { slot, tokens: 6 }],
+            vec![BatchSegment {
+                slot,
+                tokens: verification_rows,
+            }],
             runtime.team.rows,
             owners,
         )
         .unwrap();
         runtime
             .team
-            .forward(verify, vec![expected[..6].to_vec()], false)
+            .forward(verify, vec![expected[..verification_rows].to_vec()], false)
             .unwrap();
         runtime
             .team
@@ -356,9 +380,9 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
     }
     runtime.team.exchange(Command::Evict(u64::MAX)).unwrap();
     runtime.finish_request(&mut request, false).unwrap();
-    eprintln!("DSPARK_STATE accepted-prefix lengths 1..6 passed");
+    eprintln!("DSPARK_STATE accepted-prefix lengths 1..{verification_rows} passed");
     let mut short_reference = None;
-    for drafts in [0, 5, 0, 5] {
+    for drafts in [0, maximum, 0, maximum] {
         runtime.draft_limit = drafts;
         let before = runtime.speculation.accepted_draft_tokens;
         let mut tokens = vec![];
@@ -388,7 +412,7 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
     let mut concurrent_reference: Option<Vec<Vec<TokenLogprob>>> = None;
     let mut batch_options = options.clone();
     batch_options.top_logprobs = Some(20);
-    for (repetition, drafts) in [0, 0, 5].into_iter().enumerate() {
+    for (repetition, drafts) in [0, 0, maximum].into_iter().enumerate() {
         runtime.draft_limit = drafts;
         let mut requests = (0..3)
             .map(|owner| {
@@ -449,7 +473,7 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
     // Decode verification and newly arriving prompts share the target packet.
     // Prompt writes are not journalled with the speculative decoder owners.
     let mut mixed_reference: Option<Vec<Vec<TokenLogprob>>> = None;
-    for drafts in [0, 5] {
+    for drafts in [0, maximum] {
         runtime.draft_limit = drafts;
         if drafts > 0 {
             for batch in 1..=4 {

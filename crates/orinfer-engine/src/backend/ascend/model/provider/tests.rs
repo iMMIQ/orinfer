@@ -61,6 +61,7 @@ fn request(output: Arc<Output>, sampling: crate::sampling::Options) -> Request {
         released: false,
         sampling,
         decoder: Default::default(),
+        draft_feedback: Default::default(),
         prefix: Default::default(),
         mtp: Default::default(),
         last_output: Instant::now(),

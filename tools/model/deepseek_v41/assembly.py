@@ -447,7 +447,7 @@ def validate_rows(model, base, *, model_dir=None):
                         elif step.get("owners"):
                             bound = (
                                 model["batch"]["owners"]
-                                if packet.get("batch_decode")
+                                if packet.get("batch_decode") or packet.get("draft_stride")
                                 else model["batch"].get("output_capacity", model["batch"]["owners"])
                             )
                         if "row_expression" in step:
@@ -463,13 +463,14 @@ def validate_rows(model, base, *, model_dir=None):
                             raise ValueError("Kernel row capacity differs")
                     elif step["op"] in ("gather", "reduce", "exchange"):
                         count = step["elements"]
+                        domain = contract["owners"] if step.get("owners") else capacity
                         if "elements_expression" in step:
                             if step.get("fixed_rows"):
                                 raise ValueError("Ambiguous collective row contract")
-                            live = values(step["elements_expression"], capacity)
+                            live = values(step["elements_expression"], domain)
                             if live[-1] != count or min(live) < 1 or max(live) > count:
                                 raise ValueError("Collective row capacity differs")
-                        elif not step.get("fixed_rows") and count % capacity:
+                        elif not step.get("fixed_rows") and count % domain:
                             raise ValueError("Unbounded collective extent")
                         if step.get("fp32") and step.get("int32"):
                             raise ValueError("Ambiguous collective dtype")

@@ -225,9 +225,9 @@ impl Worker {
             (2, &names.c2_indices, &names.c2_lengths),
         ] {
             if let Some(block) = names.draft_block {
-                if block != 5 || rows != block {
+                if !(1..=crate::execution::MAX_MTP_DRAFTS).contains(&block) || rows != block {
                     return Err(
-                        "DSpark coordinates require one complete five-row owner block".into(),
+                        "DSpark coordinates require one complete declared owner block".into(),
                     );
                 }
                 let capacity = 128 / ratio;

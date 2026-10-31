@@ -16,11 +16,86 @@ import numpy as np
 
 from tools.build.files import atomic_json
 
-BLOCK = 5
+DEFAULT_BLOCK = 5
+MAX_BLOCK = 31
 LAYERS = (37, 38, 39)
 
 
-def builder_class():
+def write_constant(path, data):
+    # Construction may hard-link a published parent; never overwrite its assets.
+    if path.exists():
+        if path.read_bytes() != data:
+            raise ValueError("Existing immutable draft constant differs")
+    else:
+        path.write_bytes(data)
+
+
+def validate_block_size(block_size):
+    # Target C2 keeps 32 rows, including the verifier's anchor input.
+    if not 1 <= block_size <= MAX_BLOCK:
+        raise ValueError(f"DSpark block size must be within 1..{MAX_BLOCK}")
+
+
+def remove_draft(model):
+    """Drop the replaceable draft; retain the target and its warmed state."""
+    model["batch"]["private"] = [
+        name for name in model["batch"]["private"] if not name.startswith("dspark.draft.")
+    ]
+    for rank in model["ranks"]:
+        rank["packets"] = [p for p in rank["packets"] if p.get("role") != "draft"]
+        rank["buffers"] = [b for b in rank["buffers"] if not b["name"].startswith("dspark.draft.")]
+
+
+def reuse_prepared_draft(model, old_ranks):
+    """Bind immutable banks by semantic name; no payload read or W4 conversion."""
+    for rank, old in zip(model["ranks"], old_ranks, strict=True):
+        if rank["rank"] != old["rank"]:
+            raise ValueError("Draft tensor-parallel rank identity differs")
+        prior = {b["name"]: b for b in old["buffers"]}
+        banks = {
+            prior[step["buffers"][1]]["prepared_tensor"]["name"]: (
+                step["experts"],
+                step["input"],
+                step["output"],
+                step.get("weight_layout"),
+            )
+            for packet in old["packets"]
+            for step in packet["body"]
+            if step["op"] == "w4"
+        }
+        for definition in rank["buffers"]:
+            if not any(k in definition for k in ("weight", "prepared_weight")):
+                continue
+            suffix = "." + definition["name"]
+            candidates = [
+                b
+                for b in old["buffers"]
+                if b["name"].endswith(suffix)
+                and b.get("prepared_tensor")
+                and b["bytes"] == definition["bytes"]
+            ]
+            identities = {json.dumps(b["prepared_tensor"], sort_keys=True) for b in candidates}
+            if len(identities) != 1:
+                raise ValueError(
+                    "Cannot reuse a unique physical draft tensor: " + definition["name"]
+                )
+            definition.pop("weight", None)
+            definition.pop("prepared_weight", None)
+            definition["prepared_tensor"] = deepcopy(candidates[0]["prepared_tensor"])
+        for packet in rank["packets"]:
+            for step in packet["body"]:
+                if step["op"] == "w4":
+                    bank = next(b for b in rank["buffers"] if b["name"] == step["buffers"][1])
+                    expected = (step["experts"], step["input"], step["output"], "transposed_nz")
+                    if banks.get(bank["prepared_tensor"]["name"]) != expected:
+                        raise ValueError("Physical draft W4 geometry/layout differs")
+                    step["weight_layout"] = "transposed_nz"
+                    workspace = next(b for b in rank["buffers"] if b["name"] == step["workspace"])
+                    workspace["bytes"] = 320 << 20
+
+
+def builder_class(block_size=DEFAULT_BLOCK):
+    validate_block_size(block_size)
     # TileLang/Torch belong to the offline Ascend compiler environment.
     from tools.model.deepseek_v41.build import Builder, Strategy
     from tools.operators.ascend import attention_cube, kv_int8, memory, model_ops, topk, vector
@@ -159,12 +234,14 @@ def builder_class():
             return self.attention_output(attended, layer, cosine, sine)
 
         def head_outputs(self, logits, rows, hidden):
-            owners = rows // BLOCK
+            owners = rows // block_size
             self.rows = owners
             axis = dict(
                 op="divide",
-                lhs=dict(op="add", lhs=dict(op="rows"), rhs=dict(op="constant", value=BLOCK - 1)),
-                rhs=dict(op="constant", value=BLOCK),
+                lhs=dict(
+                    op="add", lhs=dict(op="rows"), rhs=dict(op="constant", value=block_size - 1)
+                ),
+                rhs=dict(op="constant", value=block_size),
             )
             begin = len(self.steps)
             ids = self.buffer("draft.input_ids", (rows,), "i32")
@@ -175,7 +252,7 @@ def builder_class():
             self.kernel(
                 model_ops,
                 "block_first",
-                dict(rows=owners),
+                dict(rows=owners, block_size=block_size),
                 [
                     ("source", ids, "i32", (rows,), "read"),
                     ("out", previous, "i32", (owners,), "write"),
@@ -195,7 +272,7 @@ def builder_class():
             cw = self.matrix("mtp.2.confidence_head.proj.weight", "bf16", 1, 5376, float32=True)
             proposals = self.temp("markov.proposals", (rows, 16160), "f32")
             parts = 8
-            for step in range(BLOCK):
+            for step in range(block_size):
                 self.kernel(
                     memory,
                     "gather_rows",
@@ -212,7 +289,7 @@ def builder_class():
                 self.kernel(
                     topk,
                     "add_bias_argmax",
-                    dict(rows=owners, vocab=16160, step=step),
+                    dict(rows=owners, vocab=16160, step=step, block_size=block_size),
                     [
                         ("base", logits, "f32", (rows, 16160), "read"),
                         ("bias", bias, "f32", (owners, 16160), "read"),
@@ -223,7 +300,7 @@ def builder_class():
                 self.kernel(
                     vector,
                     "confidence",
-                    dict(rows=owners, step=step),
+                    dict(rows=owners, step=step, block_size=block_size),
                     [
                         ("hidden", hidden, "bf16", (rows, 5120), "read"),
                         ("embedding", embedding, "bf16", (owners, 256), "read"),
@@ -248,7 +325,12 @@ def builder_class():
                     topk,
                     "reduce_rank_best",
                     dict(
-                        rows=owners, step=step, ranks=8 * parts, rank_parts=parts, rank_vocab=16160
+                        rows=owners,
+                        step=step,
+                        ranks=8 * parts,
+                        rank_parts=parts,
+                        rank_vocab=16160,
+                        block_size=block_size,
                     ),
                     [
                         ("packed", all_ranks, "f32", (8 * parts, owners, 2), "read"),
@@ -350,14 +432,15 @@ def rename_contract(model, prefix, role):
     return model
 
 
-def build(base_plan, checkpoint, output, workers, base_model=None):
+def build(base_plan, checkpoint, output, workers, base_model=None, block_size=DEFAULT_BLOCK):
+    validate_block_size(block_size)
     with ProcessPoolExecutor(
         max_workers=workers, mp_context=multiprocessing.get_context("spawn")
     ) as compiler:
-        return _build(base_plan, checkpoint, output, workers, compiler, base_model)
+        return _build(base_plan, checkpoint, output, workers, compiler, base_model, block_size)
 
 
-def _build(base_plan, checkpoint, output, workers, compiler, base_model):
+def _build(base_plan, checkpoint, output, workers, compiler, base_model, block_size):
     import os
     from tools.model.deepseek_v41 import prepare
     from tools.model.deepseek_v41.assembly import validate_rows
@@ -373,7 +456,11 @@ def _build(base_plan, checkpoint, output, workers, compiler, base_model):
                 os.link(path, dest)
     target = json.loads(base_plan.read_text())
     owners = target["batch"]["owners"]
-    Draft, Strategy = builder_class()
+    existing = any(p.get("role") == "draft" for p in target["ranks"][0]["packets"])
+    old_ranks = deepcopy(target["ranks"]) if existing else None
+    if existing:
+        remove_draft(target)
+    Draft, Strategy = builder_class(block_size)
     strategy = Strategy(
         shared_tp=True,
         cube_attention=True,
@@ -386,11 +473,14 @@ def _build(base_plan, checkpoint, output, workers, compiler, base_model):
         vector_prefix=True,
     )
     templates = {}
-    for name, rows in (
-        ("warm_decode", owners),
-        ("warm", target["ranks"][0]["packets"][1]["rows"]),
-        ("draft", owners * BLOCK),
-    ):
+    shapes = [("draft", owners * block_size)]
+    if not existing:
+        shapes = [
+            ("warm_decode", owners),
+            ("warm", target["ranks"][0]["packets"][1]["rows"]),
+            *shapes,
+        ]
+    for name, rows in shapes:
         model = {
             k: deepcopy(v)
             for k, v in target.items()
@@ -412,7 +502,7 @@ def _build(base_plan, checkpoint, output, workers, compiler, base_model):
                 packet["body"].extend(packet["head"])
                 packet["head"] = []
                 packet["coordinates"].update(
-                    draft_block=BLOCK, input_ids=b.draft_output["input_ids"]
+                    draft_block=block_size, input_ids=b.draft_output["input_ids"]
                 )
                 packet.update({k: v for k, v in b.draft_output.items() if k != "input_ids"})
                 packet["replicated_output"] = True
@@ -495,17 +585,37 @@ def _build(base_plan, checkpoint, output, workers, compiler, base_model):
             model, builders, kernels, root, name, workers, owners, rows, compiler
         )
         print(f"DSpark {name} shared rows ready", flush=True)
-    # W4/INT8 shared banks use the existing bounded checkpoint converter.
-    for name, model in templates.items():
-        raw, prepared = root / (name + "-weights.json"), root / (name + "-prepared.json")
-        atomic_json(raw, model)
-        prepare.prepare(raw, checkpoint, prepared, workers)
-        templates[name] = json.loads(prepared.read_text())
-    prepack(templates["draft"], root)
-    merge(target, templates, root, workers, compiler)
+    if existing:
+        reuse_prepared_draft(templates["draft"], old_ranks)
+    else:
+        # Prepare new weight packages once; block-capacity rebuilds reuse them.
+        for name, model in templates.items():
+            raw, prepared = root / (name + "-weights.json"), root / (name + "-prepared.json")
+            atomic_json(raw, model)
+            prepare.prepare(raw, checkpoint, prepared, workers)
+            templates[name] = json.loads(prepared.read_text())
+        prepack(templates["draft"], root)
+    merge(target, templates, root, workers, compiler, block_size, seed_target=not existing)
+    converge_draft_blocks(target, root, workers, compiler)
+    if existing:
+        from tools.model.deepseek_v41.assembly import compact_buffers
+
+        compact_buffers(target, owner_tables=True)
 
     validate_rows(target, root, model_dir=base_model)
     atomic_json(output, target)
+    if existing:
+        from tools.build.files import file_hash
+
+        atomic_json(
+            root / "package.json",
+            dict(
+                schema_version=1,
+                backend="ascend",
+                plan=dict(file=output.name, sha256=file_hash(output)),
+            ),
+            compact=True,
+        )
 
 
 def prepack(model, root):
@@ -535,7 +645,8 @@ def prepack(model, root):
                 buffers[instruction["workspace"]]["bytes"] = 320 << 20
 
 
-def compose(base_plan, output, workers, base_model=None):
+def compose(base_plan, output, workers, base_model=None, block_size=DEFAULT_BLOCK):
+    validate_block_size(block_size)
     from tools.model.deepseek_v41.assembly import validate_rows
 
     root = output.parent
@@ -548,13 +659,16 @@ def compose(base_plan, output, workers, base_model=None):
         max_workers=workers, mp_context=multiprocessing.get_context("spawn")
     ) as compiler:
         prepack(templates["draft"], root)
-        merge(target, templates, root, workers, compiler)
+        merge(target, templates, root, workers, compiler, block_size)
+        converge_draft_blocks(target, root, workers, compiler)
         atomic_json(output.with_name("dspark-candidate.json"), target)
         validate_rows(target, root, model_dir=base_model)
         atomic_json(output, target)
 
 
-def merge(target, templates, root, workers, compiler):
+def merge(
+    target, templates, root, workers, compiler, block_size=DEFAULT_BLOCK, *, seed_target=True
+):
 
     contract = target["batch"]
     persistent = set()
@@ -597,6 +711,11 @@ def merge(target, templates, root, workers, compiler):
                 for b in rank["buffers"]
                 if b.get("weight")
             }
+            prepared = {
+                json.dumps(b["prepared_tensor"], sort_keys=True): b["name"]
+                for b in rank["buffers"]
+                if b.get("prepared_tensor")
+            }
             names = {}
             for definition in extra["buffers"]:
                 old = definition["name"]
@@ -611,6 +730,10 @@ def merge(target, templates, root, workers, compiler):
                         and original_name in existing
                     ):
                         new = original_name
+                if definition.get("prepared_tensor"):
+                    new = prepared.get(
+                        json.dumps(definition["prepared_tensor"], sort_keys=True), new
+                    )
                 names[old] = new
                 if new not in existing:
                     definition["name"] = new
@@ -666,7 +789,7 @@ def merge(target, templates, root, workers, compiler):
                 if column["buffer"] in coordinate_names:
                     column["buffer"] = coordinate_names[column["buffer"]]
         # Every rank has the same coordinate names and column order.
-    for name in sorted(persistent):
+    for name in sorted(persistent) if seed_target else ():
         layout = dict(
             buffer=name,
             row_bytes=16 if name.endswith(".scale") else 512,
@@ -679,8 +802,139 @@ def merge(target, templates, root, workers, compiler):
         f"cache.ring.{layer}": dict(offset=32 * 1024 * 4, row_bytes=1024 * 4, rows=32, history=1)
         for layer in (2, 8, 14)
     }
-    converge_captures(target, root, workers, compiler)
-    expand_head(target, root, workers, compiler)
+    if seed_target:
+        converge_captures(target, root, workers, compiler)
+    expand_head(target, root, workers, compiler, block_size)
+
+
+def converge_draft_blocks(model, root, workers, compiler=None):
+    """Publish short aliases of one dynamic body and one Markov stride.
+
+    The noise/attention packet uses the actual block length. Packing only at
+    the Markov boundary preserves the checkpoint's short-block behavior while
+    all block lengths reuse the same projection and attention libraries.
+    """
+    from tools.model.deepseek_v41.build import compile_task
+    from tools.operators.ascend.build import operand
+
+    owners, tasks = model["batch"]["owners"], {}
+    for rank in model["ranks"]:
+        packets = [p for p in rank["packets"] if p.get("role") == "draft"]
+        if not packets or all(p.get("draft_stride") for p in packets):
+            continue
+        if len(packets) != 1:
+            raise ValueError("Expected one unconverged draft template")
+        source = packets[0]
+        stride = source["coordinates"]["draft_block"]
+        rows = source["rows"]
+        if rows != owners * stride:
+            raise ValueError("Draft capacity differs from owner stride")
+        specs = {}
+
+        def spec(step):
+            path = step["manifest"]
+            if path not in specs:
+                specs[path] = json.loads((root / path).read_text())
+            return specs[path]
+
+        start = next(
+            i
+            for i, s in enumerate(source["body"])
+            if s["op"] == "kernel" and spec(s)["op"] == "model_ops.block_first"
+        )
+        body, chain = source["body"][:start], deepcopy(source["body"][start:])
+        endpoints = "dspark.draft.markov.endpoints"
+        rank["buffers"].append(
+            dict(
+                name=endpoints,
+                bytes=owners * 4,
+                view=dict(parent=model["batch"]["endpoints"], offset=0),
+            )
+        )
+        packed = {}
+        for op, width, dtype, compiler_dtype in (
+            ("model_ops.block_first", 1, "i32", "int32"),
+            ("topk.add_bias_argmax", 16160, "f32", "float32"),
+            ("vector.confidence", 5120, "bf16", "bfloat16"),
+        ):
+            instruction = next(s for s in chain if s["op"] == "kernel" and spec(s)["op"] == op)
+            buffer = instruction["buffers"][0]
+            destination = buffer + ".markov_stride"
+            packed[buffer] = destination
+            rank["buffers"].append(
+                dict(name=destination, bytes=rows * width * {"i32": 4, "f32": 4, "bf16": 2}[dtype])
+            )
+            key = f"@draft-pad-{width}-{dtype}"
+            tasks[key] = dict(
+                placeholder=key,
+                module="tools.operators.ascend.memory",
+                name="pad_blocks",
+                arguments=dict(
+                    rows=owners,
+                    table_rows=rows,
+                    block_size=stride,
+                    width=width,
+                    dtype=compiler_dtype,
+                ),
+                specs=[
+                    operand("source", dtype, (rows, width)),
+                    operand("endpoints", "i32", (owners,)),
+                    operand("out", dtype, (rows, width), "write"),
+                ],
+                row_capacity=owners,
+                dynamic_arguments=dict(rows=1),
+            )
+            body.append(
+                dict(
+                    op="kernel", manifest=key, buffers=[buffer, endpoints, destination], owners=True
+                )
+            )
+        groups, current = [], []
+        for instruction in chain:
+            if instruction["op"] == "kernel":
+                instruction.pop("row_expression", None)
+                instruction["owners"] = True
+                if spec(instruction)["op"] in (
+                    "model_ops.block_first",
+                    "topk.add_bias_argmax",
+                    "vector.confidence",
+                ):
+                    instruction["buffers"][0] = packed[instruction["buffers"][0]]
+            elif instruction["op"] == "gather":
+                instruction["owners"] = True
+                instruction["elements_expression"] = dict(
+                    op="multiply",
+                    lhs=dict(op="rows"),
+                    rhs=dict(op="constant", value=instruction["elements"] // owners),
+                )
+            current.append(instruction)
+            if instruction["op"] == "kernel" and spec(instruction)["op"] == "topk.reduce_rank_best":
+                groups.append(current)
+                current = []
+        if current or len(groups) != stride:
+            raise ValueError("Incomplete Markov step boundaries")
+        rank["packets"].remove(source)
+        for block in sorted({min(5, stride), min(8, stride), stride}):
+            packet = deepcopy(source)
+            packet.update(min_rows=block, max_rows=owners * block, draft_stride=stride)
+            packet["coordinates"]["draft_block"] = block
+            packet["body"] = deepcopy(body + [s for group in groups[:block] for s in group])
+            rank["packets"].append(packet)
+    if not tasks:
+        return
+    with (
+        nullcontext(compiler)
+        if compiler is not None
+        else ProcessPoolExecutor(
+            max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+        )
+    ) as pool:
+        paths = dict(pool.map(compile_task, ((t, root) for t in tasks.values())))
+    for rank in model["ranks"]:
+        for packet in rank["packets"]:
+            for instruction in packet["body"]:
+                if instruction.get("manifest") in paths:
+                    instruction["manifest"] = paths[instruction["manifest"]]
 
 
 def converge_captures(model, root, workers, compiler=None):
@@ -753,12 +1007,13 @@ def converge_captures(model, root, workers, compiler=None):
                         step["manifest"] = paths[step["manifest"]]
 
 
-def expand_head(model, root, workers, compiler=None):
+def expand_head(model, root, workers, compiler=None, block_size=DEFAULT_BLOCK):
     from tools.build.files import file_hash
     from tools.model.deepseek_v41.build import compile_task, kernel_rebuild_task
 
     owners = model["batch"]["owners"]
-    capacity = owners * (BLOCK + 1)
+    capacity = owners * (block_size + 1)
+    previous = model["batch"].get("output_capacity", owners)
     model["batch"]["output_capacity"] = capacity
     tasks = {}
     for rank in model["ranks"]:
@@ -769,9 +1024,10 @@ def expand_head(model, root, workers, compiler=None):
             name: name + ".decode" for name in (model["batch"]["endpoints"], "batch.head.errors")
         }
         for parent, view in views.items():
-            rank["buffers"].append(
-                dict(name=view, bytes=owners * 4, view=dict(parent=parent, offset=0))
-            )
+            if view not in buffers:
+                definition = dict(name=view, bytes=owners * 4, view=dict(parent=parent, offset=0))
+                rank["buffers"].append(definition)
+                buffers[view] = definition
         for packet in rank["packets"]:
             if packet.get("batch_decode"):
                 for instruction in packet["head"]:
@@ -789,28 +1045,28 @@ def expand_head(model, root, workers, compiler=None):
                 task["row_capacity"] = capacity
                 for operand, name in zip(task["specs"], instruction["buffers"], strict=True):
                     definition = buffers[name]
-                    if operand["shape"][0] != owners or definition.get("weight"):
+                    if operand["shape"][0] != previous or definition.get("weight"):
                         continue
                     operand["shape"][0] = capacity
                     if definition.get("prepared_tensor"):
                         if spec["op"] != "topk.local" or operand["name"] != "lengths":
                             raise ValueError("Cannot resize an immutable head matrix")
-                        path = root / "data" / (name + "-dspark-constant.bin")
-                        path.write_bytes(np.full(capacity, 16160, dtype="<i4").tobytes())
+                        path = root / "data" / (name + f"-dspark-constant-{capacity}.bin")
+                        write_constant(path, np.full(capacity, 16160, dtype="<i4").tobytes())
                         definition.pop("prepared_tensor")
                         definition["data"] = dict(
                             file=str(path.relative_to(root)), sha256=file_hash(path)
                         )
                     if name in resized:
                         continue
-                    definition["bytes"] = definition["bytes"] // owners * capacity
+                    definition["bytes"] = definition["bytes"] // previous * capacity
                     resized.add(name)
                     if definition.get("data"):
                         original = (root / definition["data"]["file"]).read_bytes()
                         if len(original) == definition["bytes"]:
                             continue
-                        path = root / "data" / (name + "-dspark-head.bin")
-                        path.write_bytes(original[: len(original) // owners] * capacity)
+                        path = root / "data" / (name + f"-dspark-head-{capacity}.bin")
+                        write_constant(path, original[: len(original) // previous] * capacity)
                         definition["data"] = dict(
                             file=str(path.relative_to(root)), sha256=file_hash(path)
                         )
@@ -843,12 +1099,20 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK)
     parser.add_argument("--compose-only", action="store_true")
     args = parser.parse_args()
     if args.compose_only:
-        compose(args.base_plan, args.output, args.workers, args.base_model)
+        compose(args.base_plan, args.output, args.workers, args.base_model, args.block_size)
     else:
-        build(args.base_plan, args.checkpoint, args.output, args.workers, args.base_model)
+        build(
+            args.base_plan,
+            args.checkpoint,
+            args.output,
+            args.workers,
+            args.base_model,
+            args.block_size,
+        )
 
 
 if __name__ == "__main__":

@@ -229,7 +229,7 @@ struct InferenceArgs {
     gpu_lock: PathBuf,
     #[command(flatten)]
     load: LoadArgs,
-    /// auto adapts up to the package default; 0 disables MTP; 1..7 caps drafts.
+    /// auto adapts up to the package default; 0 disables MTP; 1..31 caps drafts within package capacity.
     #[arg(long, value_name = "N", default_value = "auto")]
     mtp_drafts: MtpDrafts,
     /// Snapshot cache budget in MiB; 0 disables reuse.
@@ -1019,7 +1019,7 @@ mod tests {
             &["--cuda-graph"][..],
             &["--cuda-graph", "on"],
             &["--verify-weights=false"],
-            &["--mtp-drafts", "8"],
+            &["--mtp-drafts", "32"],
             &["--unknown", "off"],
             &["--prefix-cache-mib", "1.5"],
             &["--listen", "a", "--listen", "b"],

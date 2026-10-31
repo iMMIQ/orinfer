@@ -17,7 +17,7 @@ The shared runtime separates device execution from scheduling, model semantics a
 - [JSONL offline inference](docs/batch.md): continuous batching, incremental output and resumable jobs through the Rust CLI.
 - E8P Q4A8/W8 mixed weights for Qwen3_5 models; E8P Q2 experts and Q4/W8 projections for Flash Next. Sensitive paths retain BF16/FP16/FP32.
 - Chunked prefill, isolated request state, prefix cache, INT8 KV and model-configured context up to 256K tokens.
-- Adaptive native MTP chooses draft depth from measured cost and acceptance. `--mtp-drafts 1..7` sets the upper bound, `0` disables it, and `auto` uses the package limit.
+- Adaptive native MTP chooses draft depth from measured cost and acceptance. `--mtp-drafts 1..31` sets an upper bound within the execution package capacity, `0` disables it, and `auto` uses the package default.
 - CUDA Graph modes: `decode_only` (default), `full` and `off`.
 
 ## Quick start

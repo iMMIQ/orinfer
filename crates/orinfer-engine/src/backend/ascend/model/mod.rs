@@ -135,6 +135,9 @@ struct Packet {
     replicated_output: bool,
     #[serde(default)]
     confidence: Option<String>,
+    /// Physical output stride of a shared-capacity draft template.
+    #[serde(default)]
+    draft_stride: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -196,6 +199,8 @@ enum Instruction {
         elements_expression: Option<RowExpression>,
         #[serde(default)]
         trace_only: bool,
+        #[serde(default)]
+        owners: bool,
     },
     Exchange {
         source: String,
@@ -822,6 +827,7 @@ impl Worker {
                 fixed_rows,
                 trace_only,
                 elements_expression,
+                owners,
             } = instruction
             {
                 if *trace_only && !self.snapshots {
@@ -833,9 +839,24 @@ impl Worker {
                 self.session.require(&source)?;
                 self.session.require(&destination)?;
                 let count = usize::try_from(*elements).map_err(|_| "Gather size overflow")?;
+                let (actual, capacity) = if *owners {
+                    (
+                        current_layout
+                            .ok_or("Owner gather needs batch layout")?
+                            .outputs
+                            .len(),
+                        self.batch
+                            .as_ref()
+                            .ok_or("Owner gather needs batch contract")?
+                            .contract
+                            .owners,
+                    )
+                } else {
+                    (active_rows, capacity)
+                };
                 let elements = row_contract::elements(
                     count,
-                    active_rows,
+                    actual,
                     capacity,
                     *fixed_rows,
                     elements_expression.as_ref(),

@@ -108,6 +108,7 @@ pub(crate) struct Request {
     decoder: Decoder,
     prefix: crate::prefix::Statistics,
     mtp: crate::mtp::Statistics,
+    draft_feedback: dspark::Feedback,
     last_output: Instant,
     ready_output: Option<Arc<Output>>,
     cache_prompt: bool,
@@ -254,7 +255,9 @@ impl Runtime {
             root,
             options.mtp_drafts,
         )?;
-        let draft_limit = options.mtp_drafts.unwrap_or(team.draft_capacity);
+        let draft_limit = options
+            .mtp_drafts
+            .unwrap_or_else(|| team.draft_blocks.first().copied().unwrap_or(0));
         if team.model.capacity != model.metadata.max_context
             || team.model.batch.as_ref().unwrap().state.is_empty()
         {
@@ -568,6 +571,7 @@ impl Runtime {
             decoder: Default::default(),
             prefix,
             mtp: Default::default(),
+            draft_feedback: Default::default(),
             last_output: Instant::now(),
             ready_output,
             cache_prompt: true,

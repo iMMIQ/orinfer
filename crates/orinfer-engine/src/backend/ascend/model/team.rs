@@ -32,7 +32,7 @@ pub(super) enum Command {
     Invalidate(Layout),
     Prepare(Layout, bool),
     Forward(Layout, Vec<Vec<u32>>, bool),
-    BeginVerification(Vec<usize>),
+    BeginVerification(Vec<(usize, usize)>),
     RollbackVerification(Vec<(usize, usize)>),
     EndVerification,
     Save {
@@ -82,7 +82,8 @@ pub(super) struct Team {
     pub model: Arc<Model>,
     pub load_s: f64,
     pub rows: usize,
-    pub draft_capacity: usize,
+    pub draft_blocks: Vec<usize>,
+    pub strided_draft: bool,
     // Drop worker contexts and communication groups before the bootstrap context.
     _bootstrap: Option<Session>,
     host_tables: Option<Arc<SharedTables>>,
@@ -113,6 +114,18 @@ impl Team {
         if requested.is_some_and(|limit| limit > draft_capacity) {
             return Err("Requested A2 drafts exceed the execution package capacity".into());
         }
+        let mut draft_blocks = model.ranks[0]
+            .packets
+            .iter()
+            .filter(|p| p.role == super::PacketRole::Draft)
+            .filter_map(|p| p.coordinates.draft_block)
+            .collect::<Vec<_>>();
+        draft_blocks.sort_unstable();
+        draft_blocks.dedup();
+        let strided_draft = model.ranks[0]
+            .packets
+            .iter()
+            .any(|p| p.draft_stride.is_some());
         let rows = model.ranks[0]
             .packets
             .iter()
@@ -138,7 +151,8 @@ impl Team {
             model: Arc::clone(&model),
             load_s: 0.,
             rows,
-            draft_capacity,
+            draft_blocks,
+            strided_draft,
             _bootstrap: Some(bootstrap),
             host_tables: Some(shared),
         };
@@ -203,10 +217,14 @@ impl Team {
                                 journal.clear();
                                 owners
                                     .into_iter()
-                                    .try_for_each(|id| {
+                                    .try_for_each(|(id, rows)| {
                                         journal.insert(
                                             id,
-                                            worker.save_mutable(id, journal_pool.remove(&id))?,
+                                            worker.save_mutable(
+                                                id,
+                                                rows,
+                                                journal_pool.remove(&id),
+                                            )?,
                                         );
                                         Ok(())
                                     })

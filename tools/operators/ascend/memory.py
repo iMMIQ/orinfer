@@ -5,6 +5,36 @@ import math
 import tilelang.language as T
 
 
+def pad_blocks(rows, table_rows, block_size, width, dtype="bfloat16"):
+    """Pack live owner prefixes into one fixed-stride Markov workspace.
+
+    Endpoints describe the actual compact packet. Only live rows are written;
+    the packet's active Markov chain never reads the remaining padding.
+    """
+    if min(table_rows, block_size, width) < 1 or dtype not in ("bfloat16", "float32", "int32"):
+        raise ValueError("Invalid owner block geometry")
+
+    @T.prim_func
+    def main(
+        source: T.Tensor((table_rows, width), dtype),
+        endpoints: T.Tensor((rows,), "int32"),
+        out: T.Tensor((rows * block_size, width), dtype),
+    ):
+        with T.Kernel(T.ceildiv(rows * block_size, 2), is_npu=True) as (cid, vid):
+            data = T.alloc_ub((max(8, width),), dtype)
+            index = cid * 2 + vid
+            owner, position = index // block_size, index % block_size
+            if owner < rows:
+                end = endpoints[owner]
+                start = T.if_then_else(owner > 0, endpoints[T.max(0, owner - 1)] + 1, 0)
+                if start >= 0 and end >= start and end < table_rows:
+                    if position <= end - start and position < block_size:
+                        T.copy(source[start + position, :], data[:width])
+                        T.copy(data[:width], out[index, :])
+
+    return main
+
+
 def partition_rows(
     rows,
     count,

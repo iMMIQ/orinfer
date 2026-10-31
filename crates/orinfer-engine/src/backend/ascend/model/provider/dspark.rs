@@ -1,7 +1,7 @@
 //! DSpark shares target verification and commits only confirmed state.
 use super::*;
 mod policy;
-pub(super) use policy::Policy;
+pub(super) use policy::{Budget, Feedback, Policy};
 
 impl Runtime {
     pub(super) fn advance_dspark(
@@ -16,41 +16,57 @@ impl Runtime {
             .ok_or("Missing DSpark decoder packet")?;
         let mixed = baseline.prefill_rows > 0;
         let full = baseline.full;
-        let batch = baseline
+        let indices = baseline
             .selected
             .iter()
             .filter(|&&(i, _)| !requests[i].prefilling)
-            .count()
-            .min(owners.min(options.max_batch_tokens));
-        let capacity = if options.max_speculative_tokens == 0 {
-            self.draft_limit
-        } else {
-            (options.max_speculative_tokens / batch.max(1))
-                .saturating_sub(1)
-                .min(self.draft_limit)
-        };
-        let draft_limit = self.speculation_policy.select(batch, full, mixed, capacity);
-        let selected = baseline
-            .selected
-            .iter()
-            .map(|&(i, _)| (i, &requests[i]))
-            .filter(|(_, r)| !r.prefilling)
             .take(owners.min(options.max_batch_tokens))
-            .map(|(i, r)| {
-                (
-                    i,
-                    if r.history.len() + 4 <= self.team.model.capacity {
-                        if r.limit - r.generated > draft_limit {
-                            draft_limit.min(self.team.model.capacity - r.history.len())
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    },
-                )
+            .map(|&(i, _)| i)
+            .collect::<Vec<_>>();
+        let uniform = self.draft_limit <= self.team.draft_blocks[0];
+        let maxima = indices
+            .iter()
+            .map(|&i| {
+                let r = &requests[i];
+                if uniform && r.limit - r.generated <= self.draft_limit {
+                    return 0;
+                }
+                let remaining = self.team.model.capacity.saturating_sub(r.history.len());
+                let physical = self
+                    .team
+                    .draft_blocks
+                    .iter()
+                    .copied()
+                    .filter(|&block| block - 1 <= remaining)
+                    .max()
+                    .unwrap_or(0);
+                self.draft_limit
+                    .min(r.limit.saturating_sub(r.generated + 1))
+                    .min(remaining)
+                    .min(physical)
             })
             .collect::<Vec<_>>();
+        let feedback = indices
+            .iter()
+            .map(|&i| &requests[i].draft_feedback)
+            .collect::<Vec<_>>();
+        let depths = self.speculation_policy.select_requests(
+            full,
+            mixed,
+            Budget {
+                rows: options.max_speculative_tokens,
+                uniform,
+                remaining: indices
+                    .iter()
+                    .map(|&i| requests[i].limit - requests[i].generated)
+                    .min()
+                    .unwrap_or(0),
+            },
+            &maxima,
+            &feedback,
+            &self.team.draft_blocks,
+        )?;
+        let selected = indices.into_iter().zip(depths).collect::<Vec<_>>();
         *self
             .statistics
             .mtp_depth_histogram
@@ -63,6 +79,14 @@ impl Runtime {
             self.draft_limit = limit;
             return result;
         }
+        let maximum = selected.iter().map(|(_, count)| *count).max().unwrap();
+        let block = self
+            .team
+            .draft_blocks
+            .iter()
+            .copied()
+            .find(|&block| block >= maximum)
+            .ok_or("Missing DSpark block capacity")?;
         let mut segments = vec![];
         let mut inputs = vec![];
         for &(i, count) in &selected {
@@ -72,13 +96,18 @@ impl Runtime {
             let request = &requests[i];
             segments.push(BatchSegment {
                 slot: request.slot,
-                tokens: 5,
+                tokens: block,
             });
-            let mut block = vec![128799; 5];
-            block[0] = *request.history.last().ok_or("Missing DSpark anchor")?;
-            inputs.push(block);
+            let mut values = vec![128799; block];
+            values[0] = *request.history.last().ok_or("Missing DSpark anchor")?;
+            inputs.push(values);
         }
-        let mut draft = Layout::verification(segments, owners * 5, owners)?;
+        let mut draft = if self.team.strided_draft {
+            let outputs = (0..segments.len()).collect();
+            Layout::new(segments, outputs, false, owners * block, owners)?
+        } else {
+            Layout::verification(segments, owners * block, owners)?
+        };
         draft.role = super::super::PacketRole::Draft;
         if self.team.needs_preparation(&draft)?
             && !memory::ensure_budget(self, memory::Requirement::workspace())?
@@ -107,11 +136,8 @@ impl Runtime {
         let journal = selected
             .iter()
             .filter(|(_, n)| *n > 0)
-            .map(|&(i, _)| requests[i].slot)
+            .map(|&(i, count)| (requests[i].slot, count + 1))
             .collect::<Vec<_>>();
-        let started = Instant::now();
-        self.team.exchange(Command::BeginVerification(journal))?;
-        let save_s = started.elapsed().as_secs_f64();
         let packet::Selection {
             layout,
             tokens: inputs,
@@ -128,6 +154,9 @@ impl Runtime {
         {
             return Err("Insufficient DSpark verification workspace".into());
         }
+        let started = Instant::now();
+        self.team.exchange(Command::BeginVerification(journal))?;
+        let save_s = started.elapsed().as_secs_f64();
         let (verified, verify_s, verify_prepare) =
             self.team
                 .forward_with(layout, inputs, full || packet_full, maintenance)?;
@@ -195,6 +224,16 @@ impl Runtime {
             if committed.len() < count + 1 {
                 rollback.push((request.slot, committed.len()));
             }
+            if count > 0 {
+                let confidence = proposals
+                    .iter()
+                    .filter(|p| p.owner == request.slot)
+                    .map(|p| p.value as f64)
+                    .collect::<Vec<_>>();
+                request
+                    .draft_feedback
+                    .observe(&confidence, count, committed.len() - 1, block);
+            }
             counts.push((count, committed.len() - 1));
             *self
                 .statistics
@@ -227,23 +266,31 @@ impl Runtime {
         }
         self.team.exchange(Command::EndVerification)?;
         let restore_s = started.elapsed().as_secs_f64() + save_s;
-        let mut confidence = [0.; 5];
-        for (step, value) in confidence.iter_mut().enumerate() {
-            let scores = proposals
-                .iter()
-                .skip(step)
-                .step_by(5)
-                .map(|p| p.value as f64)
-                .collect::<Vec<_>>();
-            *value = scores.iter().sum::<f64>() / scores.len().max(1) as f64;
-        }
+        let confidence = (0..block)
+            .map(|position| {
+                proposals
+                    .chunks_exact(block)
+                    .map(|owner| owner[position].value as f64)
+                    .sum::<f64>()
+                    / (proposals.len() / block) as f64
+            })
+            .collect::<Vec<_>>();
         self.speculation_policy.observe(
             selected.len(),
-            full,
-            mixed,
-            [draft_s, verify_s + sampling_s, restore_s],
+            (full, mixed, uniform),
+            [
+                draft_s,
+                verify_s + sampling_s
+                    // Charge prompt work displaced by verification to the agent's
+                    // next turn, even when this packet's wall time is unchanged.
+                    + if uniform { 0. } else { baseline.prefill_rows.saturating_sub(prefill_rows) as f64
+                        / self.prefill_tokens_per_s },
+                restore_s,
+                draft_prepare + verify_prepare,
+            ],
             &counts,
-            confidence,
+            block,
+            &confidence,
         );
         self.speculation.rounds += selected.len();
         for &(i, _) in &selected {

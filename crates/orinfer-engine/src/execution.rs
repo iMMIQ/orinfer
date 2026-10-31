@@ -7,6 +7,9 @@ pub use orinfer_device::GraphMode;
 /// Compatibility name for existing callers and serialized load options.
 pub type CudaGraphMode = GraphMode;
 
+/// Public request bound; each execution package validates its supported depths.
+pub const MAX_MTP_DRAFTS: usize = 31;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadOptions {
     /// Routed experts per layer equivalent; finite budgets are shared across banks.
@@ -78,9 +81,9 @@ pub fn parse_mtp_drafts(value: &str) -> Result<Option<usize>> {
     value
         .parse::<usize>()
         .ok()
-        .filter(|&n| n <= 7)
+        .filter(|&n| n <= MAX_MTP_DRAFTS)
         .map(Some)
-        .ok_or_else(|| "MTP drafts must be auto or an integer in 0..7".into())
+        .ok_or_else(|| "MTP drafts must be auto or an integer in 0..31".into())
 }
 
 impl LoadOptions {
@@ -102,8 +105,8 @@ impl LoadOptions {
             disable_mtp(manifest);
             return Ok(());
         }
-        if drafts > 7 {
-            return Err("MTP drafts must be within 0..7".into());
+        if drafts > MAX_MTP_DRAFTS {
+            return Err("MTP drafts must be within 0..31".into());
         }
         let spec = manifest
             .mtp
@@ -347,10 +350,10 @@ mod tests {
             assert!(value.parse::<ResidentExperts>().is_err());
         }
         assert_eq!(parse_mtp_drafts("auto").unwrap(), None);
-        for n in 0..=7 {
+        for n in 0..=MAX_MTP_DRAFTS {
             assert_eq!(parse_mtp_drafts(&n.to_string()).unwrap(), Some(n));
         }
-        for invalid in ["", "-1", "8", "1.5", "AUTO", "18446744073709551615"] {
+        for invalid in ["", "-1", "32", "1.5", "AUTO", "18446744073709551615"] {
             assert!(parse_mtp_drafts(invalid).is_err());
         }
         for workers in [1, 4, 12, 32] {

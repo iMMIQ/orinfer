@@ -145,6 +145,7 @@ pub(super) struct Snapshot {
 }
 pub(super) struct Journal {
     history: usize,
+    rows: usize,
     pieces: Vec<Piece>,
     bank: Buffer,
     circular: BTreeMap<String, usize>,
@@ -383,7 +384,15 @@ impl Worker {
 
     /// Verification only overwrites windows and recurrent rings. Closed linear
     /// KV rows keep their bytes and become invisible when history is restored.
-    pub(super) fn save_mutable(&mut self, id: usize, previous: Option<Journal>) -> Result<Journal> {
+    pub(super) fn save_mutable(
+        &mut self,
+        id: usize,
+        rows: usize,
+        previous: Option<Journal>,
+    ) -> Result<Journal> {
+        if !(1..=crate::execution::MAX_MTP_DRAFTS + 1).contains(&rows) {
+            return Err("Verification rows exceed the C2 ring capacity".into());
+        }
         let (owner, layouts) = self.snapshot_state(id, true)?;
         let history = owner.history.len();
         let mut pending = vec![];
@@ -399,9 +408,9 @@ impl Worker {
                 .verification_windows
                 .get(&layout.buffer);
             let spans = if let Some(window) = window {
-                window.overwritten_spans(history, 6, source.bytes())?
+                window.overwritten_spans(history, rows, source.bytes())?
             } else {
-                layout.overwritten_spans(history, 6, source.bytes())?
+                layout.overwritten_spans(history, rows, source.bytes())?
             };
             if !spans.is_empty() && (layout.circular || window.is_some()) {
                 circular.insert(
@@ -445,6 +454,7 @@ impl Worker {
         self.session.copy_many(&copies)?.wait()?;
         Ok(Journal {
             history,
+            rows,
             pieces,
             bank,
             circular,
@@ -457,7 +467,7 @@ impl Worker {
         snapshot: &Journal,
         keep: usize,
     ) -> Result<()> {
-        if !(1..=6).contains(&keep) {
+        if !(1..=snapshot.rows).contains(&keep) {
             return Err("Invalid DSpark accepted input count".into());
         }
         let runtime = self.batch.as_mut().ok_or("Missing A2 batch runtime")?;
@@ -832,17 +842,19 @@ mod journal_tests {
             circular: true,
             append_only: false,
         };
-        for start in [0, 1, 122, 123, 126, 127, 128, 2047, 262138] {
-            let spans = layout.overwritten_spans(start, 6, 128 * 16).unwrap();
-            assert_eq!(spans.iter().map(|s| s.len()).sum::<usize>(), 6 * 16);
-            let rows = spans
-                .into_iter()
-                .flat_map(|s| (s.start / 16)..(s.end / 16))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                rows,
-                (start..start + 6).map(|p| p % 128).collect::<Vec<_>>()
-            );
+        for count in [1, 6, 9, 17, 32] {
+            for start in [0, 1, 122, 123, 126, 127, 128, 2047, 262138] {
+                let spans = layout.overwritten_spans(start, count, 128 * 16).unwrap();
+                assert_eq!(spans.iter().map(|s| s.len()).sum::<usize>(), count * 16);
+                let rows = spans
+                    .into_iter()
+                    .flat_map(|s| (s.start / 16)..(s.end / 16))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    rows,
+                    (start..start + count).map(|p| p % 128).collect::<Vec<_>>()
+                );
+            }
         }
         let mut linear = layout.clone();
         linear.circular = false;
@@ -865,11 +877,16 @@ mod journal_tests {
             history: 1,
         };
         for start in [0, 31, 32, 2047, 2048, 2049] {
-            assert!(
-                c2.overwritten_spans(start, 6, 64 * 4096)
-                    .unwrap()
-                    .is_empty()
-            );
+            for count in [6, 9, 17, 31] {
+                assert!(
+                    c2.overwritten_spans(start, count, 64 * 4096)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            let spans = c2.overwritten_spans(start, 32, 64 * 4096).unwrap();
+            assert_eq!(spans.iter().map(|s| s.len()).sum::<usize>(), 32 * 4096);
+            assert!(c2.overwritten_spans(start, 33, 64 * 4096).is_err());
         }
         let recurrent = StateLayout {
             tokens_per_row: 0,

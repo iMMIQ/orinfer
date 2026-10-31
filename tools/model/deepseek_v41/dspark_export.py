@@ -32,6 +32,11 @@ class DraftExport(Export):
         self.attribution = self.base_model
         self.package = Path(plan).resolve().parent
         self.model = json.loads(Path(plan).read_text())
+        self.block_size = max(
+            p["coordinates"]["draft_block"]
+            for p in self.model["ranks"][0]["packets"]
+            if p.get("role") == "draft"
+        )
         self.old_index = json.loads((self.source / "model.safetensors.index.json").read_text())
         self.headers, self.entries, self.groups = {}, {}, defaultdict(list)
         self.base_index = json.loads((self.base_model / "model.safetensors.index.json").read_text())
@@ -42,7 +47,7 @@ class DraftExport(Export):
         self.manifest = deepcopy(self.base_manifest)
         self.manifest["dspark"] = dict(
             layers=[40, 41, 42],
-            block_size=5,
+            block_size=self.block_size,
             target_layers=[37, 38, 39],
             kv="int8_group64_fp16_scale",
         )
@@ -138,7 +143,7 @@ class DraftExport(Export):
         atomic_json(
             self.output / "dspark.json",
             dict(
-                block_size=5,
+                block_size=self.block_size,
                 draft_layers=3,
                 draft_sampling="deterministic_markov",
                 verification="target_probability_preserving",
