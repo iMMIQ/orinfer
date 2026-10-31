@@ -201,6 +201,8 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 调优读取真实 checkpoint 投影权重，检查候选数值、尾部和改变输入后的 Graph replay，发布同目录的 `model-tuned.json`；随后对选中的计划执行 `prepare` 和完整请求验收。调优只发生在离线工具中，完整请求 TPS 仍由 `bench-ascend` 测量。
 
+`tools.model.deepseek_v41.w4_capacity --plan PLAN --package-output DIR --expected-expert-rows N` 将已测量的 CANN 每专家行数提示写入 W4 指令。执行器以固定容量和地址复用 repeatable ACLNN 计划，实际计算范围继续由设备路由计数决定。该转换要求独立分配的操作数和设备路由；旧计划继续使用实际行数描述。提示需按真实矩阵、均匀和偏斜路由测量，再验收完整请求和 Mini；小 tile 与集中路由之间存在性能取舍。该参数不改变整数精度或权重表示。
+
 `tools.model.deepseek_v41.tune_auxiliary` 接受同样的 `--plan`、`--model-dir` 和 `--output`，离线选择 mHC post/pre 的列块与 FP32 分解投影的行块。后者读取计划中已准备的真实 BF16 分量，候选保持原 K 累加顺序；所有候选检查逐元素一致、尾部及改变输入后的 Graph replay。输出计划名增加 `-aux-tuned`。两种调优缓存均固定当前源码、编译器、设备、测量长度和真实权重身份，并校验被选库的内容。
 
 这两个调优入口的 `--pipeline-only` 搜索更大的行块与合法的两级／三级 L1 流水线；辅助投影同时选择 HC 方差计算的行块。候选校验 A2 的 L0A、L0B、L0C 与 L1 容量，并保留 K、FP32 归约及输出舍入边界。投影调优也可读取 `prepare` 后的物理 bank，避免在线权重变换。

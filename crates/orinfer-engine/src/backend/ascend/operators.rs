@@ -26,6 +26,7 @@ type CreateTensor = unsafe extern "C" fn(
     Handle,
 ) -> Handle;
 type CreateList = unsafe extern "C" fn(*const Handle, u64) -> Handle;
+type CreateIntArray = unsafe extern "C" fn(*const i64, u64) -> Handle;
 type Destroy = unsafe extern "C" fn(Handle) -> i32;
 type Prepare = unsafe extern "C" fn(
     Handle,
@@ -58,8 +59,10 @@ struct Api {
     _meta_library: Library,
     create_tensor: CreateTensor,
     create_list: CreateList,
+    create_int_array: CreateIntArray,
     destroy_tensor: Destroy,
     destroy_list: Destroy,
+    destroy_int_array: Destroy,
     repeatable: Destroy,
     destroy_executor: Destroy,
     prepare: Prepare,
@@ -103,11 +106,17 @@ impl Api {
                 create_list: *metadata
                     .get(b"aclCreateTensorList\0")
                     .map_err(|e| e.to_string())?,
+                create_int_array: *metadata
+                    .get(b"aclCreateIntArray\0")
+                    .map_err(|e| e.to_string())?,
                 destroy_tensor: *metadata
                     .get(b"aclDestroyTensor\0")
                     .map_err(|e| e.to_string())?,
                 destroy_list: *metadata
                     .get(b"aclDestroyTensorList\0")
+                    .map_err(|e| e.to_string())?,
+                destroy_int_array: *metadata
+                    .get(b"aclDestroyIntArray\0")
                     .map_err(|e| e.to_string())?,
                 repeatable: *metadata
                     .get(b"aclSetAclOpExecutorRepeatable\0")
@@ -236,6 +245,40 @@ impl Drop for TensorList {
     }
 }
 
+struct IntArray {
+    api: Rc<Api>,
+    handle: Handle,
+    _values: Box<[i64; 2]>,
+}
+impl IntArray {
+    fn new(api: &Rc<Api>, expected_rows: usize) -> Result<Self> {
+        let expected = i64::try_from(expected_rows)
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or("Invalid grouped matmul expert row estimate")?;
+        let values = Box::new([expected, 0]);
+        // SAFETY: Stable owned values and the metadata library outlive the
+        // array, executor and every captured invocation that retains Prepared.
+        let handle = unsafe { (api.create_int_array)(values.as_ptr(), 2) };
+        if handle.is_null() {
+            return Err("aclCreateIntArray returned null".into());
+        }
+        Ok(Self {
+            api: Rc::clone(api),
+            handle,
+            _values: values,
+        })
+    }
+}
+impl Drop for IntArray {
+    fn drop(&mut self) {
+        // SAFETY: Sole owner; Prepared is released after all completion fences.
+        unsafe {
+            (self.api.destroy_int_array)(self.handle);
+        }
+    }
+}
+
 /// ND packed signed INT4 weights [experts,K,N], per-channel UINT64 dequant
 /// scales [experts,1,N], FP32 assist [experts,N], token scales [M], BF16 output.
 #[derive(Clone, Copy, Debug)]
@@ -290,6 +333,7 @@ struct Prepared {
     workspace_bytes: usize,
     _lists: Vec<TensorList>,
     _groups: Tensor,
+    _tuning: Option<IntArray>,
 }
 impl Drop for Prepared {
     fn drop(&mut self) {
@@ -339,6 +383,19 @@ impl GroupedW4A8 {
         input: GroupedInputs<'_>,
         workspace: Option<&Buffer>,
         groups: Option<&Buffer>,
+    ) -> Result<Self> {
+        Self::prepare_with_workspace_hint(session, shape, ends, input, workspace, groups, None)
+    }
+    /// A positive expected row count per expert selects CANN's tiling without
+    /// changing tensor capacity or the device-owned live routing partitions.
+    pub fn prepare_with_workspace_hint(
+        session: &Session,
+        shape: GroupedShape,
+        ends: &[i64],
+        input: GroupedInputs<'_>,
+        workspace: Option<&Buffer>,
+        groups: Option<&Buffer>,
+        expected_rows: Option<usize>,
     ) -> Result<Self> {
         shape.validate(ends)?;
         let buffers = [
@@ -408,6 +465,7 @@ impl GroupedW4A8 {
             }
         };
         let groups = Tensor::new(&api, &group_buffer, &[e], 9, 64)?;
+        let tuning = expected_rows.map(|n| IntArray::new(&api, n)).transpose()?;
         let (mut workspace_bytes, mut executor) = (0u64, ptr::null_mut());
         check(
             // SAFETY: Public aclnnGroupedMatmulV5 ABI. ND layouts and same-session
@@ -430,7 +488,7 @@ impl GroupedW4A8 {
                     0,
                     1,
                     0,
-                    ptr::null_mut(),
+                    tuning.as_ref().map_or(ptr::null_mut(), |a| a.handle),
                     lists[5].handle,
                     ptr::null_mut(),
                     ptr::null_mut(),
@@ -449,7 +507,14 @@ impl GroupedW4A8 {
         if status != 0 {
             // The API does not grant destroy ownership when reuse fails. No work
             // was submitted; retain the native plan and libraries until exit.
-            std::mem::forget((lists, groups, api, executor, Rc::clone(&session.context)));
+            std::mem::forget((
+                lists,
+                groups,
+                tuning,
+                api,
+                executor,
+                Rc::clone(&session.context),
+            ));
             return Err(format!(
                 "ACLNN executor reuse unavailable: ACL error {status}"
             ));
@@ -463,6 +528,7 @@ impl GroupedW4A8 {
             workspace_bytes: 0,
             _lists: lists,
             _groups: groups,
+            _tuning: tuning,
         };
         prepared.workspace_bytes =
             usize::try_from(workspace_bytes).map_err(|_| "ACLNN workspace overflow")?;

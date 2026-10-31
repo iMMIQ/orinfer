@@ -8,6 +8,9 @@ use crate::artifact::Result;
 use serde::Serialize;
 use std::{rc::Rc, time::Instant};
 
+#[cfg(test)]
+mod capacity;
+
 #[derive(Serialize)]
 pub struct Report {
     device: u32,

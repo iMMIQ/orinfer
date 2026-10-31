@@ -210,6 +210,8 @@ enum Instruction {
         buffers: [String; 6],
         workspace: String,
         groups: Option<String>,
+        #[serde(default)]
+        expected_expert_rows: Option<usize>,
     },
     Route {
         indices: String,
@@ -397,6 +399,7 @@ struct W4Key {
     pointers: [usize; 6],
     groups: Option<usize>,
     workspace: usize,
+    expected_expert_rows: Option<usize>,
 }
 type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
 
@@ -1232,13 +1235,23 @@ impl Worker {
                 buffers,
                 workspace,
                 groups,
+                expected_expert_rows,
             } = instruction
             {
                 let mut b = buffers
                     .iter()
                     .map(|n| self.row_buffer(n, active_rows))
                     .collect::<Result<Vec<_>>>()?;
-                let rows = scaled(*rows)?;
+                // Device group counts bound actual work. A tuned instruction
+                // keeps its capacity descriptor across row counts; pointers and
+                // the tuning identity still participate in executor reuse.
+                let rows = w4_plan_rows(
+                    *rows,
+                    scaled(*rows)?,
+                    *expected_expert_rows,
+                    groups.is_some(),
+                    routed.contains(name),
+                )?;
                 let input_bytes = rows.checked_mul(*input).ok_or("W4 input extent overflow")?;
                 let output_bytes = rows
                     .checked_mul(*output)
@@ -1264,12 +1277,13 @@ impl Worker {
                     pointers: std::array::from_fn(|i| b[i].pointer() as usize),
                     groups: counts.as_ref().map(|b| b.pointer() as usize),
                     workspace: shared_workspace.pointer() as usize,
+                    expected_expert_rows: *expected_expert_rows,
                 };
                 let plan = if let Some(plan) = self.w4.get(&key).and_then(Weak::upgrade) {
                     plan
                 } else {
                     let t = Instant::now();
-                    let plan = Rc::new(GroupedW4A8::prepare_with_workspace(
+                    let plan = Rc::new(GroupedW4A8::prepare_with_workspace_hint(
                         &self.session,
                         GroupedShape {
                             rows,
@@ -1288,6 +1302,7 @@ impl Worker {
                         },
                         Some(&shared_workspace),
                         counts.as_ref(),
+                        *expected_expert_rows,
                     )?);
                     self.phases.aclnn.0 += 1;
                     self.phases.aclnn.1 += t.elapsed().as_secs_f64();
@@ -1917,9 +1932,11 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                     input,
                     output,
                     experts,
+                    name,
                     buffers: bindings,
                     workspace,
                     groups,
+                    expected_expert_rows,
                     ..
                 } = instruction
                 {
@@ -1929,6 +1946,28 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                         || !output.is_multiple_of(32)
                     {
                         return Err("W4 model geometry differs from the routed packet".into());
+                    }
+                    w4_plan_rows(
+                        *rows,
+                        *rows,
+                        *expected_expert_rows,
+                        groups.is_some(),
+                        packet.body.iter().chain(&packet.head).any(|step| {
+                            matches!(step, Instruction::Route { groups, .. } if groups.contains(name))
+                        }),
+                    )?;
+                    if expected_expert_rows.is_some()
+                        && bindings
+                            .iter()
+                            .chain(groups.iter())
+                            .chain([workspace])
+                            .any(|name| {
+                                rank.buffers
+                                    .iter()
+                                    .any(|b| b.name == *name && b.view.is_some())
+                            })
+                    {
+                        return Err("Capacity W4 operands require dedicated allocations".into());
                     }
                     let extents = [
                         rows * input,
@@ -1964,6 +2003,26 @@ fn gather_element(fp32: bool, int32: bool) -> Result<Element> {
         (false, true) => Ok(Element::Int32),
         (false, false) => Ok(Element::Bfloat16),
         (true, true) => Err("AllGather has conflicting element types".into()),
+    }
+}
+
+fn w4_plan_rows(
+    capacity: usize,
+    actual: usize,
+    hint: Option<usize>,
+    device_groups: bool,
+    host_routed: bool,
+) -> Result<usize> {
+    if hint.is_some_and(|n| n == 0 || i64::try_from(n).is_err()) {
+        return Err("Invalid W4 expert row estimate".into());
+    }
+    if hint.is_some() {
+        if !device_groups || host_routed {
+            return Err("Capacity W4 execution requires device-owned routing counts".into());
+        }
+        Ok(capacity)
+    } else {
+        Ok(actual)
     }
 }
 

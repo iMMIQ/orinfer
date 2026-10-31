@@ -293,3 +293,17 @@ fn collective_and_local_kernel_contracts_are_backward_compatible() {
         }
     ));
 }
+
+#[test]
+fn tuned_w4_reuses_capacity_only_for_device_routing() {
+    use super::w4_plan_rows;
+    assert_eq!(
+        w4_plan_rows(12288, 6, Some(16), true, false).unwrap(),
+        12288
+    );
+    assert_eq!(w4_plan_rows(12288, 6, None, true, false).unwrap(), 6);
+    assert_eq!(w4_plan_rows(12288, 6, None, true, true).unwrap(), 6);
+    assert!(w4_plan_rows(12288, 6, Some(16), false, false).is_err());
+    assert!(w4_plan_rows(12288, 6, Some(16), true, true).is_err());
+    assert!(w4_plan_rows(12288, 6, Some(0), true, false).is_err());
+}
