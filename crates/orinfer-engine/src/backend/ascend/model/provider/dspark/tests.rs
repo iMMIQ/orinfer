@@ -1,6 +1,124 @@
 use super::*;
 
 #[test]
+#[ignore = "Measures warmed DSpark concurrency; requires the A2 package and eight NPUs"]
+fn concurrent_decode_throughput() {
+    use std::os::fd::AsRawFd;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open("artifacts/gpu-experiment.lock")
+        .unwrap();
+    assert_eq!(
+        // SAFETY: the descriptor retains the GPU lock through worker teardown.
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let model = std::path::PathBuf::from(std::env::var_os("ORINFER_A2_DSPARK_MODEL").unwrap());
+    let input: Vec<u32> = crate::model::read(&std::path::PathBuf::from(
+        std::env::var_os("ORINFER_A2_DSPARK_INPUT").unwrap(),
+    ))
+    .unwrap();
+    let output = std::path::PathBuf::from(
+        std::env::var_os("ORINFER_A2_DSPARK_REPORT")
+            .unwrap_or_else(|| "artifacts/dspark/concurrency.json".into()),
+    );
+    let mut runtime = Runtime::load(
+        &model,
+        crate::execution::LoadOptions {
+            mtp_drafts: Some(5),
+            prefix_cache_bytes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let options = crate::sampling::Options {
+        temperature: 0.,
+        ..Default::default()
+    };
+    let mut reports = vec![];
+    for batch in [1, 2, 4, 8, 16, 32] {
+        let mut expected = None;
+        for (round, drafts) in [0, 5, 0, 5].into_iter().enumerate() {
+            runtime.draft_limit = drafts;
+            let mut requests = vec![];
+            let mut outputs = vec![vec![]; batch];
+            // Prefill each owner to its first output before timing the cohort.
+            // Earlier owners stay idle, so all start decode at the same position.
+            for tokens in &mut outputs {
+                let mut request = runtime
+                    .start_request(
+                        GenerationInput {
+                            input_tokens: input.clone(),
+                            images: vec![],
+                            audios: vec![],
+                            max_new_tokens: 64,
+                            sampling: options.clone(),
+                            prefix_hints: vec![],
+                        },
+                        || false,
+                    )
+                    .unwrap();
+                while request.generated == 0 {
+                    for step in runtime
+                        .advance_requests(&mut [&mut request], &scheduler::Options::default())
+                        .unwrap()
+                    {
+                        tokens.extend(step.tokens);
+                    }
+                }
+                assert_eq!(tokens.len(), 1);
+                requests.push(request);
+            }
+            let proposed = runtime.speculation.proposed_tokens;
+            let accepted = runtime.speculation.accepted_draft_tokens;
+            let mut finished_s = vec![None; batch];
+            let started = Instant::now();
+            while requests.iter().any(|r| !r.is_finished()) {
+                let mut refs = requests.iter_mut().collect::<Vec<_>>();
+                for step in runtime
+                    .advance_requests(&mut refs, &scheduler::Options::default())
+                    .unwrap()
+                {
+                    outputs[step.request].extend(step.tokens);
+                }
+                let elapsed = started.elapsed().as_secs_f64();
+                for (request, finished) in requests.iter().zip(&mut finished_s) {
+                    if request.is_finished() {
+                        finished.get_or_insert(elapsed);
+                    }
+                }
+            }
+            let seconds = started.elapsed().as_secs_f64();
+            for request in &mut requests {
+                runtime.finish_request(request, false).unwrap();
+            }
+            assert!(outputs.iter().all(|tokens| tokens.len() == 64));
+            if let Some(reference) = &expected {
+                assert_eq!(&outputs, reference);
+            } else {
+                expected = Some(outputs);
+            }
+            let report = serde_json::json!({
+                "batch": batch, "drafts": drafts, "warm": round >= 2,
+                "prompt_tokens_per_request": input.len(), "output_tokens_per_request": 64,
+                "decode_tokens": batch * 63, "decode_s": seconds,
+                "aggregate_decode_tps": (batch * 63) as f64 / seconds,
+                "per_request_decode_tps": finished_s.into_iter()
+                    .map(|s| 63. / s.unwrap()).collect::<Vec<_>>(),
+                "proposed": runtime.speculation.proposed_tokens - proposed,
+                "accepted": runtime.speculation.accepted_draft_tokens - accepted,
+            });
+            eprintln!("DSPARK_CONCURRENCY {report}");
+            reports.push(report);
+            std::fs::write(&output, serde_json::to_vec_pretty(&reports).unwrap()).unwrap();
+        }
+    }
+}
+
+#[test]
 #[ignore = "Requires the DSpark A2 package and eight NPUs"]
 fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
     use std::os::fd::AsRawFd;
