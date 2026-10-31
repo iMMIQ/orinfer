@@ -1,4 +1,8 @@
 /* CPU-only ACL ABI fixture. Copies remain queued until a stream/event fence. */
+#define _GNU_SOURCE
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,6 +91,53 @@ int aclrtStreamWaitEventWithTimeout(void *s,void *p,int timeout) {
 }
 int aclrtMalloc(void **p,size_t n,int policy) { (void)policy;*p=calloc(1,n);counters[0]++;return 0; }
 int aclrtFree(void *p) { free(p);counters[0]--;return 0; }
+typedef struct { void *pointer; size_t bytes; } VmmExtent;
+typedef struct { int fd; size_t bytes; } VmmPhysical;
+static VmmExtent reservations[128], mappings[128];
+int aclrtMemGetAllocationGranularity(const void *prop,int option,size_t *out) {
+    (void)prop;(void)option;*out=2u<<20;return 0;
+}
+int aclrtReserveMemAddress(void **p,size_t bytes,size_t alignment,void *expected,uint64_t flags) {
+    (void)alignment;(void)expected;(void)flags;
+    for(int i=0;i<128;i++)if(!reservations[i].pointer){
+        *p=mmap(NULL,bytes,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        if(*p==MAP_FAILED)return 7;
+        reservations[i]=(VmmExtent){*p,bytes};counters[0]++;return 0;
+    }
+    return 7;
+}
+int aclrtReleaseMemAddress(void *p) {
+    for(int i=0;i<128;i++)if(reservations[i].pointer==p){
+        if(munmap(p,reservations[i].bytes))return 7;
+        reservations[i]=(VmmExtent){0};counters[0]--;return 0;
+    }
+    return 7;
+}
+int aclrtMallocPhysical(void **out,size_t bytes,const void *prop,uint64_t flags) {
+    (void)prop;(void)flags;if(failure==100)return 7;
+    VmmPhysical *p=malloc(sizeof(*p));if(!p)return 7;
+    p->fd=(int)syscall(SYS_memfd_create,"acl-fixture",0);p->bytes=bytes;
+    if(p->fd<0 || ftruncate(p->fd,bytes)){if(p->fd>=0)close(p->fd);free(p);return 7;}
+    *out=p;counters[0]++;return 0;
+}
+int aclrtFreePhysical(void *handle) {
+    VmmPhysical *p=handle;close(p->fd);free(p);counters[0]--;return 0;
+}
+int aclrtMapMem(void *address,size_t bytes,size_t offset,void *handle,uint64_t flags) {
+    (void)flags;VmmPhysical *p=handle;if(offset+bytes>p->bytes)return 7;
+    for(int i=0;i<128;i++)if(!mappings[i].pointer){
+        if(mmap(address,bytes,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,p->fd,offset)==MAP_FAILED)return 7;
+        mappings[i]=(VmmExtent){address,bytes};return 0;
+    }
+    return 7;
+}
+int aclrtUnmapMem(void *address) {
+    for(int i=0;i<128;i++)if(mappings[i].pointer==address){
+        if(mmap(address,mappings[i].bytes,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==MAP_FAILED)return 7;
+        mappings[i]=(VmmExtent){0};return 0;
+    }
+    return 7;
+}
 int aclrtMallocHost(void **p,size_t n) { *p=calloc(1,n);counters[1]++;counters[9]++;return 0; }
 int aclrtFreeHost(void *p) { free(p);counters[1]--;return 0; }
 int aclrtMemcpyAsync(void *dst,size_t max,const void *src,size_t n,int kind,void *stream) {

@@ -424,6 +424,7 @@ struct W4Key {
 type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
 
 struct Worker {
+    growth: BTreeMap<String, crate::backend::growth::TokenLayout>,
     session: Session,
     comm: Communicator,
     buffers: BTreeMap<String, Buffer>,

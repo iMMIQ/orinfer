@@ -23,6 +23,9 @@ use std::{
 #[derive(Clone)]
 pub(super) enum Command {
     Admit(Vec<usize>),
+    Limit(usize, usize),
+    Grow(Layout),
+    OwnerRequirement(usize, usize),
     Reset(Vec<usize>),
     Release(Option<usize>),
     Cached(Layout),
@@ -56,6 +59,7 @@ pub(super) enum Reply {
     Allocations(BTreeMap<u64, usize>),
     RoutingGroups(Vec<RoutingGroup>),
     Capacity(bool),
+    Requirement(super::memory::Requirement),
 }
 #[derive(serde::Serialize)]
 pub(super) struct RoutingGroup {
@@ -75,7 +79,6 @@ pub(super) struct Team {
     pub model: Arc<Model>,
     pub load_s: f64,
     pub rows: usize,
-    pub owner_allocation: super::memory::Allocation,
     // Drop worker contexts and communication groups before the bootstrap context.
     _bootstrap: Option<Session>,
     host_tables: Option<Arc<SharedTables>>,
@@ -89,26 +92,6 @@ impl Team {
         if model.batch.is_none() {
             return Err("A2 service requires a native rows plan".into());
         }
-        let private = &model.batch.as_ref().unwrap().private;
-        let owner_allocation = model.ranks.iter().try_fold(
-            super::memory::Allocation {
-                bytes: 0,
-                resident: 0,
-            },
-            |maximum, rank| -> Result<_> {
-                let (_, current) = super::memory::owner_layout(
-                    private
-                        .iter()
-                        .filter_map(|name| rank.buffers.iter().find(|b| &b.name == name))
-                        .filter(|b| b.view.is_none())
-                        .map(|b| (b.name.as_str(), b.bytes, 256)),
-                )?;
-                Ok(super::memory::Allocation {
-                    bytes: maximum.bytes.max(current.bytes),
-                    resident: maximum.resident.max(current.resident),
-                })
-            },
-        )?;
         let rows = model.ranks[0]
             .packets
             .iter()
@@ -134,7 +117,6 @@ impl Team {
             model: Arc::clone(&model),
             load_s: 0.,
             rows,
-            owner_allocation,
             _bootstrap: Some(bootstrap),
             host_tables: Some(shared),
         };
@@ -193,11 +175,9 @@ impl Team {
                     while let Ok(command) = commands.recv() {
                         let result = match command {
                             Command::Stop => break,
-                            Command::Budget(requirement) => worker.session.memory_info().map(|m| {
-                                Reply::Capacity(
-                                    requirement.fits(m.0, worker.session.remaining_device_bytes()),
-                                )
-                            }),
+                            Command::Budget(requirement) => worker
+                                .available_memory()
+                                .map(|m| Reply::Capacity(requirement.fits(m.0, m.1))),
                             Command::Reclaim => worker.evict_batch_program().map(Reply::Capacity),
                             Command::PlanSnapshot {
                                 owner,
@@ -210,6 +190,15 @@ impl Team {
                                     .map(Reply::Allocations)
                             }
                             Command::Admit(ids) => worker.admit(&ids).map(|_| Reply::Ready),
+                            Command::Limit(id, tokens) => {
+                                worker.limit_owner(id, tokens).map(|_| Reply::Ready)
+                            }
+                            Command::Grow(layout) => {
+                                worker.grow_batch(&layout).map(|_| Reply::Ready)
+                            }
+                            Command::OwnerRequirement(tokens, reserve) => worker
+                                .owner_requirement(tokens, reserve)
+                                .map(Reply::Requirement),
                             Command::Reset(ids) => ids
                                 .into_iter()
                                 .try_for_each(|id| {
@@ -353,6 +342,30 @@ impl Team {
             .capacities(Command::Budget(requirement))?
             .into_iter()
             .all(|v| v))
+    }
+    pub fn needs_preparation(&self, layout: &Layout) -> Result<bool> {
+        Ok(!self
+            .exchange(Command::Cached(layout.clone()))?
+            .into_iter()
+            .all(|reply| matches!(reply, Reply::Cached(CacheState::Graph))))
+    }
+    pub fn owner_requirement(
+        &self,
+        tokens: usize,
+        reserve: usize,
+    ) -> Result<super::memory::Requirement> {
+        let mut maximum = super::memory::Requirement {
+            device: 0,
+            session: 0,
+        };
+        for reply in self.exchange(Command::OwnerRequirement(tokens, reserve))? {
+            let Reply::Requirement(required) = reply else {
+                return Err("Invalid A2 owner requirement reply".into());
+            };
+            maximum.device = maximum.device.max(required.device);
+            maximum.session = maximum.session.max(required.session);
+        }
+        Ok(maximum)
     }
     pub fn reclaim_programs(&self) -> Result<bool> {
         Ok(self.capacities(Command::Reclaim)?.into_iter().any(|v| v))
@@ -501,6 +514,7 @@ fn forward_with(
     maintenance: impl FnOnce(),
 ) -> Result<(Vec<Output>, f64, f64)> {
     let started = Instant::now();
+    exchange(peers, Command::Grow(layout.clone()))?;
     let cached = exchange(peers, Command::Cached(layout.clone()))?;
     let states = cached
         .into_iter()

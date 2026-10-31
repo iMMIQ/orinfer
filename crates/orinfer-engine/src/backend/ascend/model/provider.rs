@@ -476,9 +476,12 @@ impl Runtime {
         if self.head_only(input) {
             return Ok(true);
         }
-        let needed = memory::Requirement::owners(
-            self.team.owner_allocation,
-            1,
+        let needed = self.team.owner_requirement(
+            input
+                .input_tokens
+                .len()
+                .checked_add(input.max_new_tokens)
+                .ok_or("Owner token budget overflow")?,
             options.memory_reserve_bytes,
         )?;
         memory::ensure_budget(self, needed)
@@ -501,6 +504,14 @@ impl Runtime {
         let resident = !self.head_only(&input);
         if resident {
             self.team.exchange(Command::Admit(vec![slot]))?;
+            self.team.exchange(Command::Limit(
+                slot,
+                input
+                    .input_tokens
+                    .len()
+                    .checked_add(input.max_new_tokens)
+                    .ok_or("Owner token budget overflow")?,
+            ))?;
             self.resident.insert(slot);
         }
         self.active.insert(slot);
@@ -816,6 +827,11 @@ impl Runtime {
             if !requests[i].prefilling {
                 layout.decoder_roles[lane] = super::replay::Role::Continue;
             }
+        }
+        if self.team.needs_preparation(&layout)?
+            && !memory::ensure_budget(self, memory::Requirement::workspace())?
+        {
+            return Err("Insufficient A2 workspace after reclaiming cached state".into());
         }
         let (values, seconds, preparation) =
             self.team.forward_with(layout, tokens, full, maintenance)?;

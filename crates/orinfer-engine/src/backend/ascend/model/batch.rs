@@ -100,6 +100,7 @@ pub(super) struct Access {
 pub(super) struct Owner {
     pub buffers: BTreeMap<String, Buffer>,
     pub history: Vec<u32>,
+    pub limit: Option<usize>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CacheState {

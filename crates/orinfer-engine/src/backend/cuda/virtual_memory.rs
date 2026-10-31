@@ -126,9 +126,12 @@ impl Reservation {
         Ok(extent)
     }
     pub(crate) fn required_extent(&self, tokens: usize) -> Result<usize> {
-        let raw = tokens
-            .checked_mul(self.stride)
-            .ok_or("KV extent overflow")?;
+        let raw = crate::backend::growth::TokenLayout {
+            row_bytes: self.stride,
+            tokens_per_row: 1,
+            capacity_bytes: self.bytes,
+        }
+        .required_bytes(tokens)?;
         round_up(raw, self.granularity)
     }
     pub(crate) fn grow(&mut self, s: &super::Session, tokens: usize) -> Result<()> {

@@ -1,5 +1,49 @@
 //! Shared allocation geometry and pressure policy for owners, snapshots and programs.
 use crate::{artifact::Result, backend::arena::ArenaLayout};
+use std::collections::BTreeMap;
+
+pub(super) fn growth_layouts(
+    contract: &super::batch::Contract,
+    buffers: &[super::Definition],
+) -> Result<BTreeMap<String, crate::backend::growth::TokenLayout>> {
+    let mut growth = BTreeMap::new();
+    for state in contract.state.iter().chain(
+        contract
+            .decoder_replay
+            .iter()
+            .flat_map(|r| &r.decoder_state),
+    ) {
+        if !state.append_only {
+            continue;
+        }
+        let definition = buffers
+            .iter()
+            .find(|b| b.name == state.buffer)
+            .ok_or("Missing growth buffer")?;
+        if !contract.private.contains(&state.buffer)
+            || definition.view.is_some()
+            || definition.weight.is_some()
+            || definition.data.is_some()
+            || definition.prepared_weight.is_some()
+            || definition.prepared_tensor.is_some()
+            || state.tokens_per_row == 0
+            || state.row_bytes == 0
+            || state.circular
+            || state.window.is_some()
+        {
+            return Err("Invalid demand-mapped owner state".into());
+        }
+        growth.insert(
+            state.buffer.clone(),
+            crate::backend::growth::TokenLayout {
+                row_bytes: state.row_bytes,
+                tokens_per_row: state.tokens_per_row,
+                capacity_bytes: definition.bytes,
+            },
+        );
+    }
+    Ok(growth)
+}
 
 pub(super) const DEVICE_WORKSPACE: usize = 3 << 30;
 pub(super) const SESSION_WORKSPACE: usize = 1 << 30;

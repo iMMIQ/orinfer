@@ -1,4 +1,5 @@
 //! Owned CANN resources. Every asynchronous submission retains its storage.
+mod virtual_memory;
 use super::{
     DriverLease, acquire,
     api::{Api, Handle},
@@ -46,6 +47,8 @@ pub(super) struct Context {
     compute: Handle,
     transfer: Handle,
     owner: DeviceOwner,
+    device: u32,
+    vmm: Cell<Option<virtual_memory::Api>>,
     limits: Limits,
     device_bytes: Cell<usize>,
     pinned_bytes: Cell<usize>,
@@ -155,6 +158,7 @@ struct Allocation {
     context: Rc<Context>,
     pointer: Handle,
     bytes: usize,
+    virtual_memory: Option<RefCell<virtual_memory::Reservation>>,
 }
 impl Buffer {
     pub fn bytes(&self) -> usize {
@@ -189,6 +193,9 @@ impl Buffer {
 }
 impl Drop for Allocation {
     fn drop(&mut self) {
+        if self.virtual_memory.is_some() {
+            return;
+        }
         if let Ok(_current) = self.context.enter() {
             // SAFETY: Async users retain Buffer until their completion. This is
             // the last allocation reference; the context remains live.
@@ -345,6 +352,8 @@ impl Session {
             compute: ptr::null_mut(),
             transfer: ptr::null_mut(),
             owner: DeviceOwner::new(Backend::Ascend, device),
+            device,
+            vmm: Cell::new(None),
             limits,
             device_bytes: Cell::new(0),
             pinned_bytes: Cell::new(0),
@@ -475,6 +484,7 @@ impl Session {
                 context: Rc::clone(&self.context),
                 pointer,
                 bytes,
+                virtual_memory: None,
             }),
         })
     }

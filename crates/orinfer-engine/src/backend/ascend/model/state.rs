@@ -231,6 +231,9 @@ impl Worker {
         let runtime = self.batch.as_mut().ok_or("Missing A2 batch runtime")?;
         runtime.bound_tables = None;
         runtime.owners.remove(&id).ok_or("Unknown A2 owner")?;
+        if id == 0 {
+            self.clear_base_growth()?;
+        }
         Ok(())
     }
     fn snapshot_state(&self, id: usize, complete: bool) -> Result<(&Owner, Vec<&StateLayout>)> {
@@ -275,7 +278,12 @@ impl Worker {
         bank_id: u64,
         parent: Option<&Snapshot>,
     ) -> Result<Snapshot> {
-        let (Owner { buffers, history }, layouts) = self.snapshot_state(id, complete)?;
+        let (
+            Owner {
+                buffers, history, ..
+            },
+            layouts,
+        ) = self.snapshot_state(id, complete)?;
         Snapshot::capture(
             &self.session,
             layouts.into_iter(),
@@ -288,6 +296,7 @@ impl Worker {
 
     pub(super) fn restore_owner(&mut self, id: usize, snapshot: &Snapshot) -> Result<()> {
         self.reset_owner(id)?;
+        self.grow_owner(id, snapshot.history.len())?;
         let runtime = self.batch.as_mut().ok_or("Missing A2 batch runtime")?;
         let owner = runtime.owners.get_mut(&id).ok_or("Unknown A2 owner")?;
         snapshot.restore_into(&self.session, &owner.buffers)?;
@@ -301,6 +310,68 @@ impl Worker {
 mod tests {
     use super::*;
     use crate::backend::ascend::tests::Fixture;
+
+    #[test]
+    fn compressed_snapshot_restores_after_crossing_a_physical_page_boundary() {
+        let mut fixture = Fixture::new();
+        let session = fixture.session();
+        let grain = 2 << 20;
+        let source = session.reserve(grain * 2).unwrap();
+        let buffers = BTreeMap::from([("kv".into(), source.clone())]);
+        let layout = StateLayout {
+            buffer: "kv".into(),
+            row_bytes: 16,
+            tokens_per_row: 2,
+            window: None,
+            circular: false,
+            append_only: true,
+        };
+        session.grow(&source, 32).unwrap();
+        session
+            .upload(&source, 0, &[73; 32])
+            .unwrap()
+            .wait()
+            .unwrap();
+        let parent = Snapshot::capture(
+            &session,
+            std::iter::once(&layout),
+            &buffers,
+            &[9; 4],
+            1,
+            None,
+        )
+        .unwrap();
+        session.grow(&source, grain + 32).unwrap();
+        session
+            .upload(&source, grain, &[91; 32])
+            .unwrap()
+            .wait()
+            .unwrap();
+        let history = vec![9; (grain / 16 + 2) * 2];
+        let child = Snapshot::capture(
+            &session,
+            std::iter::once(&layout),
+            &buffers,
+            &history,
+            2,
+            Some(&parent),
+        )
+        .unwrap();
+        drop(parent);
+        let target = session.reserve(grain * 2).unwrap();
+        session.grow(&target, grain + 32).unwrap();
+        child
+            .restore_into(&session, &BTreeMap::from([("kv".into(), target.clone())]))
+            .unwrap();
+        assert_eq!(session.download(&target, 0, 32).unwrap(), vec![73; 32]);
+        assert_eq!(session.download(&target, grain, 32).unwrap(), vec![91; 32]);
+        drop(child);
+        drop(buffers);
+        drop(source);
+        drop(target);
+        drop(session);
+        fixture.assert_clean();
+    }
 
     #[test]
     fn evicting_a_parent_requires_replanning_the_new_bank() {

@@ -57,6 +57,11 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
                 scope.spawn(move || {
                     assert!(matches!(
                         commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+                        Command::Grow(_)
+                    ));
+                    reply.send(Ok(Reply::Ready)).unwrap();
+                    assert!(matches!(
+                        commands.recv_timeout(Duration::from_secs(5)).unwrap(),
                         Command::Cached(_)
                     ));
                     reply.send(Ok(Reply::Cached(hit))).unwrap();

@@ -2,6 +2,158 @@
 use super::*;
 
 impl Worker {
+    fn fixed_owner_layout(
+        &self,
+    ) -> Result<(
+        crate::backend::arena::ArenaLayout,
+        super::super::memory::Allocation,
+    )> {
+        let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+        let entries = runtime
+            .contract
+            .private
+            .iter()
+            .filter(|n| !self.views.contains_key(*n) && !self.growth.contains_key(*n))
+            .map(|n| Ok((n.as_str(), get(&self.buffers, n)?.bytes(), 256)))
+            .collect::<Result<Vec<_>>>()?;
+        super::super::memory::owner_layout(entries.into_iter())
+    }
+    pub(in crate::backend::ascend::model) fn owner_requirement(
+        &self,
+        tokens: usize,
+        reserve: usize,
+    ) -> Result<super::super::memory::Requirement> {
+        if tokens == 0 || tokens > self.capacity {
+            return Err("Invalid owner token reservation".into());
+        }
+        let (_, allocation) = self.fixed_owner_layout()?;
+        let mut needed = super::super::memory::Requirement::owners(allocation, 1, reserve)?;
+        for (name, layout) in &self.growth {
+            let bytes = get(&self.buffers, name)?.physical_extent(layout.extent(tokens)?)?;
+            needed.device = needed
+                .device
+                .checked_add(bytes)
+                .ok_or("Owner device budget overflow")?;
+            needed.session = needed
+                .session
+                .checked_add(bytes)
+                .ok_or("Owner session budget overflow")?;
+        }
+        Ok(needed)
+    }
+    fn future_bytes(&self, owner: &Owner, tokens: usize) -> Result<usize> {
+        self.growth.iter().try_fold(0usize, |sum, (name, layout)| {
+            sum.checked_add(get(&owner.buffers, name)?.growth_bytes(layout.extent(tokens)?)?)
+                .ok_or_else(|| "Owner future KV budget overflow".into())
+        })
+    }
+    /// Capacity promised to live requests is unavailable to new owners, snapshots and Graph scratch.
+    pub(in crate::backend::ascend::model) fn available_memory(&self) -> Result<(usize, usize)> {
+        let mut held = 0usize;
+        if let Some(runtime) = &self.batch {
+            for owner in runtime.owners.values() {
+                if let Some(tokens) = owner.limit {
+                    held = held
+                        .checked_add(self.future_bytes(owner, tokens)?)
+                        .ok_or("Future KV budget overflow")?;
+                }
+            }
+        }
+        Ok((
+            self.session.memory_info()?.0.saturating_sub(held),
+            self.session.remaining_device_bytes().saturating_sub(held),
+        ))
+    }
+    pub(in crate::backend::ascend::model) fn limit_owner(
+        &mut self,
+        id: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        if tokens == 0 || tokens > self.capacity {
+            return Err("Owner token limit exceeds context".into());
+        }
+        let owner = self
+            .batch
+            .as_ref()
+            .ok_or("Missing batch runtime")?
+            .owners
+            .get(&id)
+            .ok_or("Unknown owner")?;
+        if owner.limit.is_some() {
+            return Err("Owner token budget already reserved".into());
+        }
+        let future = self.future_bytes(owner, tokens)?;
+        self.reserve_batch_memory(
+            super::super::memory::Requirement::snapshot(future)?,
+            "owner KV reservation",
+        )?;
+        self.batch
+            .as_mut()
+            .unwrap()
+            .owners
+            .get_mut(&id)
+            .unwrap()
+            .limit = Some(tokens);
+        Ok(())
+    }
+    pub(in crate::backend::ascend::model) fn grow_owner(
+        &mut self,
+        id: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let owner = self
+            .batch
+            .as_ref()
+            .ok_or("Missing batch runtime")?
+            .owners
+            .get(&id)
+            .ok_or("Unknown owner")?;
+        if owner.limit.is_some_and(|limit| tokens > limit) {
+            return Err("KV growth exceeds admitted token budget".into());
+        }
+        let additional = self.future_bytes(owner, tokens)?;
+        if additional == 0 {
+            return Ok(());
+        }
+        // Mapping an admitted request converts its held capacity to resident
+        // bytes. Existing Graph replay needs no new scratch reservation.
+        if owner.limit.is_none() {
+            self.reserve_batch_memory(
+                super::super::memory::Requirement::snapshot(additional)?,
+                "KV growth",
+            )?;
+        }
+        let owner = self.batch.as_ref().unwrap().owners.get(&id).unwrap();
+        for (name, layout) in &self.growth {
+            self.session
+                .grow(&get(&owner.buffers, name)?, layout.extent(tokens)?)?;
+        }
+        Ok(())
+    }
+    pub(in crate::backend::ascend::model) fn grow_batch(&mut self, layout: &Layout) -> Result<()> {
+        for segment in &layout.segments {
+            let owner = self
+                .batch
+                .as_ref()
+                .ok_or("Missing batch runtime")?
+                .owners
+                .get(&segment.slot)
+                .ok_or("Unknown growth owner")?;
+            let tokens = owner
+                .history
+                .len()
+                .checked_add(segment.tokens)
+                .ok_or("Owner token growth overflow")?;
+            self.grow_owner(segment.slot, tokens)?;
+        }
+        Ok(())
+    }
+    pub(in crate::backend::ascend::model) fn clear_base_growth(&self) -> Result<()> {
+        for name in self.growth.keys() {
+            self.session.release_pages(&get(&self.buffers, name)?)?;
+        }
+        Ok(())
+    }
     pub(in crate::backend::ascend::model) fn evict_batch_program(&mut self) -> Result<bool> {
         self.session.synchronize()?;
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
@@ -20,18 +172,17 @@ impl Worker {
         needed: super::super::memory::Requirement,
         stage: &str,
     ) -> Result<()> {
-        if needed.fits(
-            self.session.memory_info()?.0,
-            self.session.remaining_device_bytes(),
-        ) {
+        let (device, session) = self.available_memory()?;
+        if needed.fits(device, session) {
             return Ok(());
         }
         self.session.synchronize()?;
         let mut evicted = 0;
-        while !needed.fits(
-            self.session.memory_info()?.0,
-            self.session.remaining_device_bytes(),
-        ) {
+        loop {
+            let (device, session) = self.available_memory()?;
+            if needed.fits(device, session) {
+                break;
+            }
             if !self.evict_batch_program()? {
                 return Err(format!(
                     "Insufficient A2 memory for {stage}: device free {}, session free {}, required {needed:?}",
@@ -60,12 +211,7 @@ impl Worker {
             .filter(|id| *id != 0 && !runtime.owners.contains_key(id))
             .collect::<std::collections::BTreeSet<_>>()
             .len();
-        let entries = names
-            .iter()
-            .filter(|n| !self.views.contains_key(*n))
-            .map(|n| Ok((n.as_str(), get(&self.buffers, n)?.bytes(), 256)))
-            .collect::<Result<Vec<_>>>()?;
-        let (arena, allocation) = super::super::memory::owner_layout(entries.into_iter())?;
+        let (arena, allocation) = self.fixed_owner_layout()?;
         let arena_bytes = allocation.bytes;
         let needed = super::super::memory::Requirement::owners(allocation, count, 0)?;
         self.reserve_batch_memory(needed, "owner admission")?;
@@ -97,6 +243,8 @@ impl Worker {
                     get(&self.buffers, name)?
                 } else if let Some((view, bytes)) = self.views.get(name) {
                     get(&buffers, &view.parent)?.slice(view.offset, *bytes)?
+                } else if self.growth.contains_key(name) {
+                    self.session.reserve(get(&self.buffers, name)?.bytes())?
                 } else {
                     bank.as_ref().unwrap().slice(
                         base + arena.offsets[name],
@@ -110,6 +258,7 @@ impl Worker {
                 Owner {
                     buffers,
                     history: vec![],
+                    limit: None,
                 },
             );
             self.reset_owner(id)?;
@@ -140,6 +289,7 @@ impl Worker {
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
         runtime.bound_tables = None;
         runtime.owners.clear();
+        self.clear_base_growth()?;
         Ok(())
     }
 }

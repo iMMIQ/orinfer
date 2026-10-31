@@ -3,6 +3,7 @@ mod arena;
 pub mod ascend;
 pub(crate) mod cuda;
 mod executor;
+mod growth;
 pub(crate) mod report;
 pub(crate) mod snapshot;
 mod values;

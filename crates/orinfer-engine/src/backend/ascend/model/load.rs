@@ -200,6 +200,12 @@ impl Worker {
         }
         let mut fills: Vec<Ticket> = Vec::new();
         let mut prepared_files = BTreeMap::new();
+        let growth = model
+            .batch
+            .as_ref()
+            .map(|contract| super::memory::growth_layouts(contract, &rank.buffers))
+            .transpose()?
+            .unwrap_or_default();
         for definition in rank.buffers {
             if buffers.contains_key(&definition.name) || definition.bytes == 0 {
                 return Err("Duplicate/empty model buffer".into());
@@ -215,7 +221,12 @@ impl Worker {
                 get(&buffers, &view.parent)?.slice(view.offset, definition.bytes)?
             } else {
                 let t = Instant::now();
-                let buffer = session.allocate(definition.bytes)?;
+                let demand = growth.contains_key(&definition.name);
+                let buffer = if demand {
+                    session.reserve(definition.bytes)?
+                } else {
+                    session.allocate(definition.bytes)?
+                };
                 phases.alloc_s += t.elapsed().as_secs_f64();
                 let verify = std::env::var_os("ORINFER_A2_VERIFY_UPLOAD").is_some();
                 if let Some(file) = definition.prepared_weight {
@@ -266,7 +277,7 @@ impl Worker {
                     if verify {
                         verify_data_upload(&session, &buffer, &data, &definition.name)?;
                     }
-                } else {
+                } else if !demand {
                     // Fills are compute-stream ordered before every later use;
                     // deferring their waits keeps the transfer stream busy.
                     let t = Instant::now();
@@ -341,6 +352,7 @@ impl Worker {
             .collect::<Result<_>>()?;
         phases.tables_s = t.elapsed().as_secs_f64();
         let mut worker = Self {
+            growth,
             session,
             comm,
             buffers,
