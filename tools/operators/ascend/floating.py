@@ -58,9 +58,9 @@ def partials(
         raise ValueError("mHC variance requires one BF16 input and 32 output lanes")
     if tile_m not in (16, 32, 64, 128):
         raise ValueError("Floating Cube M tile must be 16, 32, 64 or 128")
-    if tile_n not in (32, 64, 128) or output % tile_n or (variance and tile_n != 32):
-        raise ValueError("Floating output tile must divide N and retain HC lanes")
-    blocks = output // tile_n
+    if tile_n not in (32, 64, 128) or (variance and tile_n != 32):
+        raise ValueError("Floating output tile must be 32/64/128 and retain HC lanes")
+    blocks = (output + tile_n - 1) // tile_n
     loops = reduction // splits // block_k
     iterations = loops if reuse_operand else loops * input_parts * weight_parts
     if pipeline_stages not in (0, 2, 3) or (pipeline_stages and iterations < pipeline_stages):
@@ -76,12 +76,13 @@ def partials(
     def main(
         activation: T.Tensor((input_parts, rows, reduction), "bfloat16"),
         weight: T.Tensor((weight_parts, output, reduction), "bfloat16"),
-        out: T.Tensor((rows, output // 32 * splits * 32), "float32"),
+        out: T.Tensor((rows, blocks * splits * tile_n), "float32"),
     ):
         with T.Kernel(T.ceildiv(rows, tile_m) * blocks * splits, is_npu=True) as (cid, vid):
             split_id = cid % splits
             tile = cid // splits % blocks
             first = cid // (splits * blocks) * tile_m
+            valid_columns = T.min(tile_n, output - tile * tile_n)
             with T.Scope("C"):
                 a = T.alloc_L1((tile_m, block_k), "bfloat16")
                 b = T.alloc_L1((tile_n, block_k), "bfloat16")
@@ -99,20 +100,20 @@ def partials(
                             T.copy(
                                 weight[
                                     0,
-                                    tile * tile_n : (tile + 1) * tile_n,
+                                    tile * tile_n : tile * tile_n + valid_columns,
                                     column : column + block_k,
                                 ],
-                                b,
+                                b[:valid_columns, :],
                             )
                         for plane in T.serial(3):
                             if input_parts == 1:
                                 T.copy(
                                     weight[
                                         plane,
-                                        tile * tile_n : (tile + 1) * tile_n,
+                                        tile * tile_n : tile * tile_n + valid_columns,
                                         column : column + block_k,
                                     ],
-                                    b,
+                                    b[:valid_columns, :],
                                 )
                             else:
                                 T.copy(
@@ -138,9 +139,11 @@ def partials(
                         )
                         T.copy(
                             weight[
-                                wp, tile * tile_n : (tile + 1) * tile_n, column : column + block_k
+                                wp,
+                                tile * tile_n : tile * tile_n + valid_columns,
+                                column : column + block_k,
                             ],
-                            b,
+                            b[:valid_columns, :],
                         )
                         T.gemm_v0(a, b, c, transpose_B=True, init=(step == 0))
                 T.copy(
@@ -230,13 +233,13 @@ def partials(
 
 def reduce_partials(rows, output, tile_n=32, splits=8):
     """Restore the common 32-column/eight-split reduction from wide Cube tiles."""
-    if tile_n not in (32, 64, 128) or output % tile_n or splits != 8:
+    if tile_n not in (32, 64, 128) or output % 32 or splits != 8:
         raise ValueError("Invalid floating partial layout")
     tiles, groups = output // 32, tile_n // 32
 
     @T.prim_func
     def main(
-        partials: T.Tensor((rows, output // tile_n, splits, tile_n), "float32"),
+        partials: T.Tensor((rows, (output + tile_n - 1) // tile_n, splits, tile_n), "float32"),
         out: T.Tensor((rows, output), "float32"),
     ):
         with T.Kernel(T.ceildiv(rows * tiles, 2), is_npu=True) as (cid, vid):

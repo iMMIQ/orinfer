@@ -8,6 +8,7 @@ Only the selected library replaces each geometry in the published model plan.
 import argparse
 import ctypes
 from copy import deepcopy
+from functools import partial
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -236,6 +237,7 @@ def main():
             configs=configs,
             samples=measured,
             maximum_regression=args.maximum_regression,
+            calls_per_replay=16,
             seed=20261002,
             weight=weight,
             weight_sha256=file_hash_bytes(bank),
@@ -358,7 +360,7 @@ def main():
                         max_repetitions=32,
                         change=change,
                         check=check,
-                        benchmark=npu_benchmark,
+                        benchmark=partial(npu_benchmark, calls_per_replay=16),
                     )
                 except AssertionError as error:
                     if i == 0:
@@ -451,13 +453,45 @@ def read_weight(root, index, weight):
     )
 
 
+def read_prepared_bank(root, index, definition, dtype, shape):
+    """Read one released physical tensor, including flattened scale views."""
+    from tools.model.safetensors_source import SIZES, local_header, relative_name
+
+    tensor = definition["prepared_tensor"]
+    kind = {"i8": "I8", "bf16": "BF16", "f32": "F32"}[dtype]
+    path = root / relative_name(index[tensor["name"]])
+    begin, header = local_header(path)
+    actual = header.get(tensor["name"])
+    size = math.prod(shape) * SIZES[kind]
+    if (
+        actual is None
+        or actual["dtype"] != kind
+        or tensor["dtype"] != kind
+        or actual["shape"] != tensor["shape"]
+        or actual["data_offsets"][1] - actual["data_offsets"][0] != size
+        or definition["bytes"] != size
+    ):
+        raise ValueError("Released projection tensor differs from its dtype, shape or byte span")
+    data = bytearray(size)
+    with path.open("rb") as stream:
+        stream.seek(begin + actual["data_offsets"][0])
+        if stream.readinto(data) != size:
+            raise ValueError("Truncated released projection tensor")
+    return data
+
+
 def read_bank(base, root, index, definition, dtype, shape):
-    """Read a logical NT projection bank from either build or prepared plans."""
+    """Read a logical NT bank from checkpoint, prepared files or released tensors."""
     import math
     import torch
 
     if "weight" in definition:
         value = read_weight(root, index, definition["weight"])
+    elif "prepared_tensor" in definition:
+        kind = {"i8": torch.int8, "bf16": torch.bfloat16, "f32": torch.float32}[dtype]
+        value = torch.frombuffer(
+            read_prepared_bank(root, index, definition, dtype, shape), dtype=kind
+        )
     else:
         source = definition.get("prepared_weight") or definition.get("data", {}).get("file")
         if source is None:
@@ -479,16 +513,20 @@ def file_hash_bytes(tensor):
     ).hexdigest()
 
 
-def npu_benchmark(run, repetitions, warmup):
+def npu_benchmark(run, repetitions, warmup, *, calls_per_replay=1):
+    """Time each call, amortizing host submission for independent projections."""
     import statistics
     import torch
 
+    if type(calls_per_replay) is not int or not 1 <= calls_per_replay <= 64:
+        raise ValueError("NPU replay call count must be in 1..64")
     for _ in range(warmup):
         run()
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        run()
+        for _ in range(calls_per_replay):
+            run()
     for _ in range(2):
         graph.replay()
     torch.npu.synchronize()
@@ -499,7 +537,7 @@ def npu_benchmark(run, repetitions, warmup):
         graph.replay()
         end.record()
         end.synchronize()
-        values.append(start.elapsed_time(end))
+        values.append(start.elapsed_time(end) / calls_per_replay)
     return dict(median_ms=statistics.median(values)), graph
 
 
