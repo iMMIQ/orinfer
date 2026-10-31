@@ -134,14 +134,23 @@ pub struct ChatCodec {
 impl ChatCodec {
     pub fn load(directory: &Path) -> Result<Self> {
         let mut assets = std::collections::BTreeMap::new();
-        let mut asset_hashes = std::collections::BTreeMap::new();
+        // These are deployment identities, verified by validate-model before serving.
+        // Standalone tokenizer fixtures need no deployment descriptor.
+        let asset_hashes = match std::fs::read(directory.join("cache/model.json")) {
+            Ok(raw) => {
+                let descriptor: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+                serde_json::from_value(descriptor["frontend_assets"].clone())
+                    .map_err(|e| e.to_string())?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(e) => return Err(e.to_string()),
+        };
         for name in [
             "tokenizer.json",
             "chat_template.jinja",
             "generation_config.json",
         ] {
             let bytes = std::fs::read(directory.join(name)).map_err(|e| e.to_string())?;
-            asset_hashes.insert(name.to_owned(), orinfer_engine::artifact::sha256(&bytes));
             assets.insert(name, bytes);
         }
         let mut tokenizer =

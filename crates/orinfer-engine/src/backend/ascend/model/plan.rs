@@ -14,18 +14,10 @@ pub(super) fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf
     {
         return Err("Expected complete 40-layer TP8 A2 plan with capacity <=262144".into());
     }
-    read_identity(model_dir, &model.config)?;
-    read_identity(model_dir, &model.index)?;
     let layout: HashLayout =
-        serde_json::from_slice(&read_identity(&base, &model.engram)?).map_err(|e| e.to_string())?;
+        serde_json::from_slice(&read_asset(&base, &model.engram)?).map_err(|e| e.to_string())?;
     if layout.config_sha256 != model.config.sha256 {
         return Err("Engram/config identity differs".into());
-    }
-    if crate::artifact::sha256(
-        &std::fs::read(model_dir.join("tokenizer.json")).map_err(|e| e.to_string())?,
-    ) != layout.tokenizer_sha256
-    {
-        return Err("Engram/tokenizer identity differs".into());
     }
     preflight(&model, &base)?;
     let mut checkpoint = Checkpoint::open(model_dir, &model.index.file)?;
@@ -91,10 +83,6 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
         let spec: super::super::kernels::Spec = crate::model::read(&path)?;
         spec.validate()?;
         spec.target.require_host(std::env::consts::ARCH)?;
-        read_identity(
-            path.parent().ok_or("Kernel path has no parent")?,
-            &spec.library,
-        )?;
         kernels.insert(name, spec);
     }
     for (slot, variants) in &model.row_selections {

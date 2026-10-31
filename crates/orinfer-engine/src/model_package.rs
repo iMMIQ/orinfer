@@ -1,4 +1,4 @@
-//! Hash-verified model libraries. The engine owns devices; packages own model plans.
+//! ABI-checked model libraries. The engine owns devices; packages own model plans.
 use crate::{
     artifact::{FileIdentity, Result, read_identity, resolve_file},
     execution::{BufferView, Invocation},
@@ -23,8 +23,17 @@ pub struct ExecutionLibrary {
 
 /// Inspect an explicitly selected native library without creating a model or CUDA context.
 pub(crate) fn inspect_library(path: &Path) -> Result<abi::PackageInfo> {
-    let image = std::fs::read(path).map_err(|e| e.to_string())?;
+    let image = library_header(path)?;
     ModelPackage::open(path, &image)?.describe()
+}
+
+pub(crate) fn library_header(path: &Path) -> Result<[u8; 20]> {
+    use std::io::Read;
+    let mut image = [0; 20];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut image))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(image)
 }
 
 pub(crate) fn validate_library(image: &[u8], host_arch: &str) -> Result<()> {
@@ -86,7 +95,7 @@ impl ModelPackage {
     fn open(path: &Path, image: &[u8]) -> Result<Self> {
         validate_library(image, std::env::consts::ARCH)?;
         // SAFETY: this explicitly selected native library implements the documented
-        // C ABI. The model loader verifies its hash before calling open.
+        // C ABI. Content verification is performed by validate-model.
         let library = unsafe { Library::new(path) }.map_err(|e| format!("Model library: {e}"))?;
         // SAFETY: symbol is the required versioned C entry point, not a Rust ABI.
         let entry =
@@ -142,12 +151,16 @@ impl ModelPackage {
         {
             return Err("Incompatible model package ABI or identity".into());
         }
-        let image = read_identity(base, &spec.library)?;
         let path = resolve_file(base, &spec.library.file)?;
+        let image = if request.verify_weights {
+            read_identity(base, &spec.library)?
+        } else {
+            library_header(&path)?.to_vec()
+        };
         let mut model = Self::open(&path, &image)?;
         // Program preparation also supplies dynamic control lengths; it does
         // not require model-owned CPU weight assets.
-        // SAFETY: hash-verified library; the optional symbol has a versioned C ABI.
+        // SAFETY: explicitly selected, host-checked library; the optional symbol has a versioned C ABI.
         let entry = unsafe {
             model
                 ._library
@@ -242,7 +255,7 @@ impl ModelPackage {
                     .into(),
             );
         }
-        // SAFETY: the selected hash-verified library provides this versioned C entry.
+        // SAFETY: the explicitly selected, host-checked library provides this versioned C entry.
         let entry = unsafe {
             self._library
                 .get::<unsafe extern "C" fn(u32) -> *const abi::plans::Api>(abi::plans::ENTRYPOINT)
@@ -1104,11 +1117,14 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn hash_abi_identity_and_compute_mismatches_fail_before_model_creation() {
+    fn explicit_hash_checks_and_runtime_abi_identity_checks() {
         for mode in 0..4 {
             let (root, mut spec, mut request) = fixture();
             match mode {
-                0 => spec.library.sha256 = "0".repeat(64),
+                0 => {
+                    spec.library.sha256 = "0".repeat(64);
+                    request.verify_weights = true;
+                }
                 1 => spec.abi_version = 99,
                 2 => spec.version = "unexpected".into(),
                 _ => request.compute_policy = "a4_not_supported".into(),
@@ -1116,6 +1132,15 @@ mod tests {
             assert!(ModelPackage::create(&root, &spec, request).is_err());
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn normal_library_loading_leaves_content_verification_to_validate_model() {
+        let (root, mut spec, request) = fixture();
+        spec.library.sha256 = "0".repeat(64);
+        let (model, _) = ModelPackage::create(&root, &spec, request).unwrap();
+        drop(model);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

@@ -79,7 +79,9 @@ fn load_impl(
     if !model.metadata.kernels.is_empty() || !model.metadata.programs.is_empty() {
         return Err("Expected custom model descriptor without embedded kernels or programs".into());
     }
-    validate_frontend_assets(root, &model.frontend_assets)?;
+    if verify_weights {
+        validate_frontend_assets(root, &model.frontend_assets)?;
+    }
     let config_path = resolve_file(root, "config.json")?;
     let config_raw = fs::read(config_path).map_err(|e| e.to_string())?;
     let config: serde_json::Value =
@@ -87,7 +89,7 @@ fn load_impl(
     let kernel_root = operators::resolve(&weights_root, &model.execution_package)?;
     let package_raw =
         fs::read(resolve_file(&kernel_root, "package.json")?).map_err(|e| e.to_string())?;
-    if sha256(&package_raw) != model.execution_package {
+    if verify_weights && sha256(&package_raw) != model.execution_package {
         return Err("Model execution package digest mismatch".into());
     }
     let package: ExecutionPackage = serde_json::from_slice(&package_raw)
@@ -134,8 +136,9 @@ fn load_impl(
     let expert_banks = built.expert_banks;
     validate_dynamic_contracts(&model.metadata, build_bindings)?;
     model.metadata.validate()?;
-    // The descriptor pins the package; configuration also affects generated plans.
-    let fingerprint = sha256(&[raw, package_raw, config_raw].concat());
+    // The declared package identity pins the compiled plan and config signature.
+    // Loading consumes that identity; validate-model verifies its contents.
+    let fingerprint = model.execution_package.clone();
     Ok(PreparedModel {
         plan: model.metadata,
         weights_root,

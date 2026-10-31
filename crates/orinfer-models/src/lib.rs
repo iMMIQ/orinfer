@@ -45,6 +45,9 @@ impl ModelImplementation for Models {
         let native = request.catalog.is_some();
         let build_bindings = request.build_bindings;
         if let Some(catalog) = &request.catalog {
+            if request.verify_weights {
+                bindings::verify(catalog)?;
+            }
             request.kernel_contracts = bindings::kernels(catalog, request.expert_contracts)?;
             request.metadata.dynamic_batch_kernels = bindings::dynamic(catalog)?;
         }

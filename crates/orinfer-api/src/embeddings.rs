@@ -24,7 +24,6 @@ struct Prepared {
 }
 impl Codec {
     fn load(root: &Path) -> Result<Self> {
-        use sha2::{Digest, Sha256};
         let descriptor: Value = serde_json::from_slice(
             &std::fs::read(root.join("cache/model.json")).map_err(|e| e.to_string())?,
         )
@@ -32,17 +31,10 @@ impl Codec {
         let expected: BTreeMap<String, String> =
             serde_json::from_value(descriptor["frontend_assets"].clone())
                 .map_err(|e| e.to_string())?;
-        let mut hashes = BTreeMap::new();
-        for (name, digest) in expected {
-            if Path::new(&name).components().count() != 1 {
+        for name in expected.keys() {
+            if Path::new(name).components().count() != 1 {
                 return Err("Invalid embedding frontend filename".into());
             }
-            let raw = std::fs::read(root.join(&name)).map_err(|e| e.to_string())?;
-            let actual = hex::encode(Sha256::digest(raw));
-            if actual != digest {
-                return Err(format!("Embedding frontend hash mismatch: {name}"));
-            }
-            hashes.insert(name, actual);
         }
         let mut tokenizer =
             Tokenizer::from_file(root.join("tokenizer.json")).map_err(|e| e.to_string())?;
@@ -55,7 +47,7 @@ impl Codec {
         }
         Ok(Self {
             tokenizer,
-            hashes,
+            hashes: expected,
             context: descriptor["metadata"]["max_context"]
                 .as_u64()
                 .ok_or("Missing embedding context")? as usize,

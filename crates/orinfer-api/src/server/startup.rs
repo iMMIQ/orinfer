@@ -88,7 +88,7 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                     )?;
                     let model = &loaded.model;
                     if &worker_codec.asset_hashes != model.frontend_assets() {
-                        return Err("Frontend assets changed while loading model".into());
+                        return Err("Declared frontend identities changed while loading model".into());
                     }
                     if worker_codec.tokenizer.get_vocab_size(true) > model.vocab() {
                         return Err("Tokenizer exceeds model vocabulary".into());

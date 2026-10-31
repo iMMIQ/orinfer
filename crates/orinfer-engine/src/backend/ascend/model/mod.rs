@@ -15,6 +15,7 @@ mod replay;
 mod row_contract;
 mod state;
 mod team;
+pub(crate) mod validation;
 mod weights;
 
 use super::{
@@ -24,7 +25,7 @@ use super::{
     runtime::{Buffer, Limits, Session, Ticket},
 };
 use crate::{
-    artifact::{FileIdentity, Result, read_identity, resolve_file},
+    artifact::{FileIdentity, Result, read_asset, resolve_file},
     host_rows::{Int8Rows, Shard, SharedInt8Rows},
     weights::checkpoint::Checkpoint,
 };
@@ -1048,7 +1049,7 @@ impl Worker {
 
     /// Package assets are immutable for the worker's lifetime. Resolve each
     /// package-local name once, while retaining canonical-path deduplication
-    /// and the first load's identity/ABI checks.
+    /// and the first load's ABI checks.
     fn template(&mut self, base: &Path, manifest: &str) -> Result<Rc<Template>> {
         if let Some(template) = self
             .template_aliases

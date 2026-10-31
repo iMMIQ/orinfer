@@ -525,7 +525,7 @@ orinfer validate-model /path/to/new-model
 
 默认安装位置与运行时一致：优先 `ORINFER_EXECUTION_CACHE`，其次 `$XDG_CACHE_HOME/orinfer/packages`，最后 `~/.cache/orinfer/packages`。`--cache /path/to/packages` 只改变本次安装位置；自定义位置需要同时为后续运行设置 `ORINFER_EXECUTION_CACHE`。
 
-`plan-model` 会在 CPU 加载原生执行库并生成计划；`validate-model` 还完整校验权重、CPU 表和全部 kernel 文件，均在 CPU 上执行。在线启动默认只检查大体积权重和 CPU 表的结构，`--verify-weights` 开启完整内容校验；配置签名仍校验，前端资源、CPU 资产元数据、执行库和 kernel 身份仍校验 hash。JSON 创建请求的可选 `verify_weights` 字段由模型库处理 CPU 表，C ABI v1 和 schema 1 保持兼容；更新执行库后即可使用新的 CPU 表加载行为。
+`plan-model` 会在 CPU 加载原生执行库并生成计划；`validate-model` 还完整校验权重、CPU 表和全部 kernel 文件，均在 CPU 上执行。在线启动检查配置签名、原生 ABI、权重和 CPU 表的结构，不计算资产内容 SHA256；完整内容校验使用独立的 `validate-model`。CUDA 保留 `--verify-weights` 作为显式启动校验选项。JSON 创建请求的可选 `verify_weights` 字段由模型库处理 CPU 表，C ABI v1 和 schema 1 保持兼容；更新执行库后即可使用新的 CPU 表加载行为。
 
 ### 安装已发布的 v0.1.3
 
@@ -622,7 +622,7 @@ A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 own
 
 `--length-input` 让同一索引 Cube 工厂读取每行的有效前缀长度，按 owner 内单调递增的位置决定实际 key tile 数，写入有效 score 前缀。TopK 使用相同长度屏蔽其余容量，完整有效候选与原有归约顺序保持一致。此模式以长度向量替代稠密因果索引矩阵，同时适用于 decode 和 prefill。`--gather-slots` 选择同一 INT8 gather 工厂每次转换的槽位数。可重复提供 `--reuse-cache /path/to/compiled/cache`，复用完整编译对象；编译器仍校验对象身份和库哈希。
 
-当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样及 prefix 恢复。工具定义／工具调用、媒体、MTP、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的实验性原生计划封装，由上述 Python 发布器生成；通用模型 cdylib C ABI 打包、`package install` 和 `validate-model` 尚未接通此封装。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
+当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样及 prefix 恢复。工具定义／工具调用、媒体、MTP、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的实验性原生计划封装，由上述 Python 发布器生成；`validate-model` 在 CPU 上校验此封装的配置、前端、执行计划、算子库、RoPE 和全部发布分片；分片内容依据 `release-manifest.json` 每个文件扫描一次。通用模型 cdylib C ABI 打包及 `package install` 尚未接通此封装。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
 
 `GET /metrics` 导出请求排队、首 token 前、解码、结束处理的 wall time histogram，以及运行／等待请求数和原生计算／计划准备累计时间。统计从前处理完成、请求进入 worker 队列开始，准入／恢复计入排队阶段；前处理与网络需结合客户端 TTFT 分析。阶段包含调度等待，不能相加解释成独占 GPU 时间。Chat 请求的 `ignore_eos:true` 保持指定生成上限，适用于固定输出长度回放。
 

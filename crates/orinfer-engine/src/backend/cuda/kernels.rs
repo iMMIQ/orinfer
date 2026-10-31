@@ -1,4 +1,4 @@
-//! Verified AOT assets with thread-affine, on-demand CUDA function resolution.
+//! AOT assets with thread-affine, on-demand CUDA function resolution.
 use super::{Kernel, Session, check, sys};
 use crate::artifact::Result;
 use std::{collections::BTreeMap, ffi::CString, path::Path, ptr};
@@ -75,7 +75,7 @@ impl Catalog {
         let mut shared = BTreeMap::new();
         let mut reader = crate::artifact::AssetReader::default();
         for spec in kernels {
-            // Validate ALL assets now, even when driver loading is deferred.
+            // Keep declared identity conflicts separate from payload verification.
             for identity in [&spec.module, &spec.source, &spec.host_abi] {
                 if let Some(hash) = verified.get(&identity.key()) {
                     if hash != &identity.sha256 {
@@ -83,8 +83,8 @@ impl Catalog {
                     }
                     continue;
                 }
-                let image = reader.read(base, identity)?;
                 if identity.key() == spec.module.key() {
+                    let image = reader.read_unverified(base, identity)?;
                     if !image.starts_with(b"\x7fELF") {
                         return Err("Expected cubin ELF".into());
                     }

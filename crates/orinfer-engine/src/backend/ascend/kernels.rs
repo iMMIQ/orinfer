@@ -4,7 +4,7 @@ use super::{
     check,
     runtime::{Buffer, Context, Session, Ticket},
 };
-use crate::artifact::{Dtype, FileIdentity, Result, read_identity, resolve_file};
+use crate::artifact::{Dtype, FileIdentity, Result, resolve_file};
 use libloading::Library;
 use orinfer_device::{Backend, Target};
 use serde::{Deserialize, Serialize};
@@ -133,8 +133,8 @@ enum Launch {
     Rows(RowEntry),
 }
 
-/// One hash-verified AOT library with its validated manifest. Loading, hash
-/// and ABI checks happen once per unique manifest; instances only bind
+/// One ABI-checked AOT library with its validated manifest. Loading and ABI
+/// checks happen once per unique manifest; instances only bind
 /// operand tables against this shared code.
 pub struct Template {
     path: PathBuf,
@@ -149,9 +149,14 @@ impl Template {
         let spec: Spec = crate::model::read(&manifest)?;
         spec.validate()?;
         spec.target.require_host(std::env::consts::ARCH)?;
-        let image = read_identity(base, &spec.library)?;
-        crate::model_package::validate_library(&image, &spec.target.host_arch)?;
         let path = resolve_file(base, &spec.library.file)?;
+        if spec.library.tensor.is_some() {
+            return Err("A2 kernel library must be a standalone file".into());
+        }
+        crate::model_package::validate_library(
+            &crate::model_package::library_header(&path)?,
+            &spec.target.host_arch,
+        )?;
         let _current = session.context.enter()?;
         let soc = super::inventory(&session.context.driver)?
             .soc
@@ -159,12 +164,12 @@ impl Template {
         if !soc.starts_with("Ascend910B") {
             return Err(format!("A2 kernel cannot execute on {soc}"));
         }
-        // SAFETY: Explicitly selected, hash/host-verified AOT code. Loading occurs
+        // SAFETY: Explicitly selected, host/ABI-checked AOT code. Loading occurs
         // in the owning context; the library remains live until its last fence.
         let library =
             unsafe { Library::new(path) }.map_err(|e| format!("A2 kernel library: {e}"))?;
         // SAFETY: The versioned entry returns a static NUL-terminated descriptor
-        // in this hash-verified library. Metadata is checked before any launch.
+        // in this explicitly selected library. Metadata is checked before any launch.
         let descriptor = unsafe {
             let entry = library
                 .get::<unsafe extern "C" fn() -> *const c_char>(b"orinfer_ascend_kernel_spec_v1\0")
@@ -221,7 +226,7 @@ struct Bound {
 }
 impl Bound {
     fn launch(&self, stream: Handle) -> Result<()> {
-        // SAFETY: The hash-verified library implements pointer-table ABI v1.
+        // SAFETY: The ABI-checked library implements pointer-table ABI v1.
         // Metadata, extents, session ownership and aliases were checked on bind;
         // Bound retains every allocation, native code and context to the fence.
         check(

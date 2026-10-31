@@ -141,6 +141,21 @@ pub(crate) struct AssetReader {
 }
 impl AssetReader {
     pub(crate) fn read(&mut self, base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
+        let data = self.read_unverified(base, id)?;
+        let actual = sha256(&data);
+        if actual != id.sha256 {
+            return Err(format!(
+                "{}: sha256 mismatch (expected {}, got {actual}, {} bytes)",
+                id.file,
+                id.sha256,
+                data.len()
+            ));
+        }
+        Ok(data)
+    }
+
+    /// Runtime loading checks containers and ranges; validate-model checks content.
+    pub(crate) fn read_unverified(&mut self, base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
         if id.sha256.len() != 64
             || !id
                 .sha256
@@ -174,21 +189,16 @@ impl AssetReader {
         } else {
             fs::read(&canonical).map_err(|e| format!("{}: {e}", id.file))?
         };
-        let actual = sha256(&data);
-        if actual != id.sha256 {
-            return Err(format!(
-                "{}: sha256 mismatch (expected {}, got {actual}, {} bytes)",
-                canonical.display(),
-                id.sha256,
-                data.len()
-            ));
-        }
         Ok(data)
     }
 }
 
 pub(crate) fn read_identity(base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
     AssetReader::default().read(base, id)
+}
+
+pub(crate) fn read_asset(base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
+    AssetReader::default().read_unverified(base, id)
 }
 
 pub(crate) fn resolve_file(base: &Path, file: &str) -> Result<std::path::PathBuf> {
@@ -349,8 +359,10 @@ mod tests {
         };
         assert_eq!(read_identity(&base, &id).unwrap(), [1, 2, 3]);
         id.sha256 = sha256(&[1, 2, 4]);
+        assert_eq!(read_asset(&base, &id).unwrap(), [1, 2, 3]);
         assert!(read_identity(&base, &id).is_err());
         id.file = "../data.bin".into();
+        assert!(read_asset(&base, &id).is_err());
         assert!(read_identity(&base, &id).is_err());
         fs::remove_dir_all(dir).unwrap();
     }

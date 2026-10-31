@@ -30,8 +30,17 @@ pub(crate) fn kernel_arguments(name: &str) -> Result<Vec<crate::artifact::Argume
 }
 
 fn check(catalog: &Catalog) -> Result<()> {
-    use sha2::{Digest, Sha256};
     catalog.validate()?;
+    if catalog.binding_signature != generated::SIGNATURE || generated::REGISTRY.templates.is_empty()
+    {
+        return Err("Kernel catalog does not match this native binding registry; rebuild the execution package".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn verify(catalog: &Catalog) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    check(catalog)?;
     let mut value = serde_json::to_value(catalog).map_err(|e| e.to_string())?;
     value
         .as_object_mut()
@@ -40,10 +49,6 @@ fn check(catalog: &Catalog) -> Result<()> {
     let raw = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
     if hex::encode(Sha256::digest(raw)) != generated::CATALOG_ID {
         return Err("Compiled catalog identity differs from native role registry".into());
-    }
-    if catalog.binding_signature != generated::SIGNATURE || generated::REGISTRY.templates.is_empty()
-    {
-        return Err("Kernel catalog does not match this native binding registry; rebuild the execution package".into());
     }
     Ok(())
 }

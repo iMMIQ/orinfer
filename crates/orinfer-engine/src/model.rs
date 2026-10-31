@@ -117,6 +117,11 @@ pub fn inspect_execution_library(path: &Path) -> Result<orinfer_model_sdk::abi::
 
 /// Verify all container layouts and payloads without CUDA or resident weight copies.
 pub fn validate_model(path: &Path) -> Result<ValidationReport> {
+    let descriptor = resolve_manifest(path)?;
+    let raw = read(&descriptor)?;
+    if crate::backend::ascend::model::provider::Runtime::recognizes(&raw) {
+        return crate::backend::ascend::model::validation::validate(&descriptor);
+    }
     let start = Instant::now();
     let prepared = crate::loader::load(path, true)?;
     let manifest = &prepared.plan;

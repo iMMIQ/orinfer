@@ -206,7 +206,7 @@ impl Inputs {
         }
         let root = Path::new(root).canonicalize().map_err(|e| e.to_string())?;
         let raw = std::fs::read(path(&root, &identity.file)?).map_err(|e| e.to_string())?;
-        if hex::encode(Sha256::digest(&raw)) != identity.sha256 {
+        if verify_weights && hex::encode(Sha256::digest(&raw)) != identity.sha256 {
             return Err("CPU input metadata hash mismatch".into());
         }
         let assets: Assets = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;

@@ -6,7 +6,7 @@ use super::{
 };
 mod budget;
 use crate::{
-    artifact::{FileIdentity, Result, read_identity, resolve_file, sha256},
+    artifact::{FileIdentity, Result, resolve_file},
     model::{GenerationInput, StepOutput},
     prefix::{Cache, Entry, Media, Resident},
     sampling::{Constraint, Decoder, TokenLogprob},
@@ -23,27 +23,27 @@ use std::{
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Descriptor {
-    schema_version: u32,
-    architecture: String,
-    compute_policy: String,
-    execution_package: String,
-    frontend_assets: BTreeMap<String, String>,
-    metadata: Metadata,
+pub(super) struct Descriptor {
+    pub(super) schema_version: u32,
+    pub(super) architecture: String,
+    pub(super) compute_policy: String,
+    pub(super) execution_package: String,
+    pub(super) frontend_assets: BTreeMap<String, String>,
+    pub(super) metadata: Metadata,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Metadata {
-    target: String,
-    max_context: usize,
-    vocab: usize,
+pub(super) struct Metadata {
+    pub(super) target: String,
+    pub(super) max_context: usize,
+    pub(super) vocab: usize,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Package {
-    schema_version: u32,
-    backend: String,
-    plan: FileIdentity,
+pub(super) struct Package {
+    pub(super) schema_version: u32,
+    pub(super) backend: String,
+    pub(super) plan: FileIdentity,
 }
 struct Snapshot {
     id: u64,
@@ -237,18 +237,13 @@ impl Runtime {
         {
             return Err("Unsupported native A2 model descriptor".into());
         }
-        crate::loader::validate_frontend_assets(root, &model.frontend_assets)?;
         let package_root = crate::operators::resolve(cache_root, &model.execution_package)?;
         let raw = std::fs::read(resolve_file(&package_root, "package.json")?)
             .map_err(|e| e.to_string())?;
-        if sha256(&raw) != model.execution_package {
-            return Err("A2 execution package digest differs".into());
-        }
         let package: Package = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
         if package.schema_version != 1 || package.backend != "ascend" {
             return Err("Invalid native A2 execution package".into());
         }
-        read_identity(&package_root, &package.plan)?;
         let team = Team::load(&resolve_file(&package_root, &package.plan.file)?, root)?;
         if team.model.capacity != model.metadata.max_context
             || team.model.batch.as_ref().unwrap().state.is_empty()

@@ -178,7 +178,7 @@ impl Worker {
                         .add(definition.bytes, t.elapsed().as_secs_f64());
                 } else if let Some(identity) = definition.data {
                     let t = Instant::now();
-                    let data = read_identity(package, &identity)?;
+                    let data = read_asset(package, &identity)?;
                     upload(&session, &buffer, &data)?;
                     phases.data.add(definition.bytes, t.elapsed().as_secs_f64());
                 } else if !demand {
@@ -253,7 +253,7 @@ impl Worker {
         let rope = model
             .rope
             .iter()
-            .map(|(name, id)| Ok((name.clone(), read_identity(package, id)?)))
+            .map(|(name, id)| Ok((name.clone(), read_asset(package, id)?)))
             .collect::<Result<_>>()?;
         phases.tables_s = t.elapsed().as_secs_f64();
         let mut worker = Self {

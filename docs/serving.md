@@ -14,7 +14,7 @@
 
 模型就绪后、API 对外前，worker 会预热执行一次单 token 请求并输出 `WARMUP READY`。预热把序列租用映射、packet 计划和模块加载移入启动阶段（Flash Next 实测约 0.9s），避免首个用户请求多付同等的首 token 延迟。
 
-执行包中的全部 kernel 资产仍校验 hash；普通文本、配置的 MTP、视觉及小 batch 计划预加载 CUDA 模块，其余计划在首次使用时加载，并在 CUDA Graph 捕获前完成绑定。延迟加载的形状会在首次执行时承担模块加载开销。
+正常加载消费已声明的资产身份，不计算内容 SHA256；`validate-model` 完整校验执行包及 kernel 资产。普通文本、配置的 MTP、视觉及小 batch 计划预加载 CUDA 模块，其余计划在首次使用时加载，并在 CUDA Graph 捕获前完成绑定。延迟加载的形状会在首次执行时承担模块加载开销。
 
 模型准备时封存上述前端文件的 SHA256。需要有意修改时，先确认它们与 checkpoint 的 token 映射和语义一致，再执行 `python3 tools/model/package.py pin-assets MODEL_DIR` 重新封存前端身份；权重保持原样。加载期间应保持模型文件内容稳定。
 
@@ -282,9 +282,9 @@ A2 停机时，常驻 CPU 表等待所有读取者释放后回收，与 rank 和
 
 若启动或停机错误返回时仍有模型 worker 存活，CLI 记录错误后以退出码 1 直接终止进程，跳过会与原生线程竞争的第三方退出钩子，由操作系统回收进程资源。正常退出仍等待模型和 CPU 表完成销毁。Rust API 的 `has_live_model_workers()` 可供嵌入调用方判断后台资源是否仍在回收。
 
-启动默认校验配置、执行库、kernel 身份，以及权重和 CPU 表的 safetensors 结构、dtype、shape、布局和偏移边界，跳过大体积权重的 SHA256 扫描。`serve`、`run-model` 和 `score-model` 添加 `--verify-weights` 可校验加载的权重内容；`validate-model` 始终完整校验模型权重。检测结构合法但数值受损的权重需开启完整内容校验。
+启动默认检查配置签名、执行库和 kernel 的 ABI，以及权重和 CPU 表的 safetensors 结构、dtype、shape、布局和偏移边界，不计算资产内容 SHA256。`serve`、`run-model` 和 `score-model` 添加 `--verify-weights` 可校验加载的权重内容；`validate-model` 始终完整校验模型权重。检测结构合法但数值受损的权重需开启完整内容校验。
 
-HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU worker 上创建和释放；两者成功并核对前端 hash 与词表后才就绪。`WORKER READY` 分别记录前端、模型与并行准备总耗时，`API READY` 的 `startup` 包含前端和 HTTP 初始化。`LOAD STAGES` 提供 CUDA 初始化、buffer 分配、权重流水线等待和算子资产准备计时；`kernel_assets_s` 包含在 `module_load_bind_s` 中，权重等待计时包含在 `weight_upload_s` 中；总耗时按外层计时读取。完整进程到首输出的测量见[性能工具](../tools/bench/README.md)。
+HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU worker 上创建和释放；两者成功并核对声明的前端身份与词表后才就绪。`WORKER READY` 分别记录前端、模型与并行准备总耗时，`API READY` 的 `startup` 包含前端和 HTTP 初始化。`LOAD STAGES` 提供 CUDA 初始化、buffer 分配、权重流水线等待和算子资产准备计时；`kernel_assets_s` 包含在 `module_load_bind_s` 中，权重等待计时包含在 `weight_upload_s` 中；总耗时按外层计时读取。完整进程到首输出的测量见[性能工具](../tools/bench/README.md)。
 
 已加载的只读权重共享一次 CUDA arena 分配，保留各张量的对齐和布局，padding 计入权重与显存统计；请求私有状态、KV 和按需加载的专家保持独立管理。读取线程复用分片文件描述符，按文件偏移调度读取，并与多块异步上传重叠；缓冲区在对应 DMA 完成后复用。启动失败时先完成 CUDA 清理，再释放 GPU 锁。
 
