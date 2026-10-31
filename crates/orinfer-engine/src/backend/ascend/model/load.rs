@@ -256,6 +256,14 @@ impl Worker {
             .map(|(name, id)| Ok((name.clone(), read_asset(package, id)?)))
             .collect::<Result<_>>()?;
         phases.tables_s = t.elapsed().as_secs_f64();
+        let batch = model.batch.as_ref().map(|contract| {
+            batch::Runtime::new(
+                contract.clone(),
+                model.packet_cache_capacity,
+                &rank.packets,
+                &model.graph_launches,
+            )
+        });
         let mut worker = Self {
             growth,
             session,
@@ -267,7 +275,7 @@ impl Worker {
             routed_w4: BTreeMap::new(),
             packets: BTreeMap::new(),
             packet_order: row_contract::PacketLru::new(model.packet_cache_capacity),
-            packet_templates: rank.packets.clone(),
+            packet_templates: rank.packets.into_iter().map(Rc::new).collect(),
             package: package.to_owned(),
             snapshots,
             checkpoint,
@@ -280,19 +288,12 @@ impl Worker {
             template_aliases: BTreeMap::new(),
             phases,
             steps: BTreeMap::new(),
-            batch: model.batch.as_ref().map(|contract| {
-                batch::Runtime::new(
-                    contract.clone(),
-                    model.packet_cache_capacity,
-                    &rank.packets,
-                    &model.graph_launches,
-                )
-            }),
+            batch,
         };
         if model.batch.is_some() {
             return Ok(worker);
         }
-        for packet in rank.packets {
+        for packet in worker.packet_templates.clone() {
             let actual = packet.dispatch_max();
             let body = worker.compile(&packet.body, package, snapshots, (packet.rows, actual))?;
             let head = worker.compile(&packet.head, package, snapshots, (packet.rows, actual))?;

@@ -428,7 +428,7 @@ impl Segment {
     }
 }
 struct Execution {
-    packet: Packet,
+    packet: Rc<Packet>,
     body: Vec<Step>,
     head: Vec<Step>,
     captured: bool,
@@ -460,7 +460,7 @@ struct Worker {
     routed_w4: BTreeMap<String, (usize, Weak<GroupedW4A8>)>,
     packets: BTreeMap<usize, Rc<Execution>>,
     packet_order: row_contract::PacketLru,
-    packet_templates: Vec<Packet>,
+    packet_templates: Vec<Rc<Packet>>,
     package: PathBuf,
     snapshots: bool,
     checkpoint: Checkpoint,
