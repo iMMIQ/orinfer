@@ -167,7 +167,16 @@ def build(args):
     if command("git", "status", "--porcelain", "--untracked-files=normal"):
         raise ValueError("Release requires a clean worktree, including new source files")
     metadata = json.loads(
-        command("cargo", "metadata", "--locked", "--offline", "--format-version", "1")
+        command(
+            "cargo",
+            "metadata",
+            "--locked",
+            "--offline",
+            "--filter-platform",
+            "aarch64-unknown-linux-gnu",
+            "--format-version",
+            "1",
+        )
     )
     version = next(p["version"] for p in metadata["packages"] if p["name"] == "orinfer-cli")
     tag = "v" + version
