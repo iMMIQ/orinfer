@@ -26,7 +26,7 @@ def build_private(plan, output, workers=4):
     from kernels.model.rows import row_count
     from tools.build.files import file_hash
     from tools.model.deepseek_v41.batch import compile_task, DTYPES, SIZES
-    from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+    from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
     from tools.model.deepseek_v41.sequence_parallel import external_reads
     from tools.operators.ascend import indexer_cube, memory
     from tools.operators.ascend.build import operand
@@ -357,10 +357,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--min-rows", type=int)
     parser.add_argument("--compile-workers", type=int, default=4)
-    parser.add_argument("--fixed-capacity", action="store_true")
     args = parser.parse_args()
     if json.loads(args.plan.read_text()).get("batch"):
-        if args.fixed_capacity or args.min_rows not in (None, 1):
+        if args.min_rows not in (None, 1):
             parser.error("Private query partition uses the complete dynamic row domain")
         print(json.dumps(build_private(args.plan, args.output, args.compile_workers)), flush=True)
         return
@@ -430,8 +429,7 @@ def main():
                 dtype=names[dtype],
                 repeat_last=repeat_last,
             )
-            if not args.fixed_capacity:
-                params["dynamic_count"] = True
+            params["dynamic_count"] = True
             manifest = kernel(memory, "partition_rows", params, specs, capacity)
             return output, dict(op="kernel", manifest=manifest, buffers=[source, output])
 
@@ -488,9 +486,8 @@ def main():
                     buffers=[mapping.get(b, b) for b in old["buffers"]],
                     fixed_rows=count,
                 )
-                if not args.fixed_capacity:
-                    instruction.pop("fixed_rows")
-                    instruction["row_expression"] = expression("(m + 7) // 8")
+                instruction.pop("fixed_rows")
+                instruction["row_expression"] = expression("(m + 7) // 8")
                 body.append(instruction)
 
             local_step(step, descriptor)
@@ -521,17 +518,15 @@ def main():
                 int32=True,
                 fixed_rows=True,
             )
-            if not args.fixed_capacity:
-                transport.pop("fixed_rows")
-                transport["elements_expression"] = expression("((m + 7) // 8) * 512")
+            transport.pop("fixed_rows")
+            transport["elements_expression"] = expression("((m + 7) // 8) * 512")
             body.append(transport)
             specs = [
                 operand("source", "i32", [capacity, 512]),
                 operand("out", "i32", [capacity, 512], "write"),
             ]
             params = dict(rows=capacity, count=count, width=512, ranks=8, dtype="int32")
-            if not args.fixed_capacity:
-                params["dynamic_count"] = True
+            params["dynamic_count"] = True
             path = kernel(memory, "interleave_rows", params, specs, capacity)
             body.append(dict(op="kernel", manifest=path, buffers=[gathered, selected]))
         if sources != 8:

@@ -16,7 +16,7 @@ import multiprocessing
 from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
-from tools.model.deepseek_v41.converge import (
+from tools.model.deepseek_v41.assembly import (
     canonical,
     publish_package,
     run_transform,

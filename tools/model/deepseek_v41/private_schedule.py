@@ -16,7 +16,7 @@ from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
 from tools.model.deepseek_v41.batch import DTYPES, SIZES, compile_task
-from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
 from tools.model.row_selection import guarded_winner
 
 

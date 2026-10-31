@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
 from tools.model.row_contract import expression, resolve
 from tools.model.row_selection import aggregate_winner, bounded_choices, guarded_winner
 from tools.model.deepseek_v41.sequence_parallel import external_reads

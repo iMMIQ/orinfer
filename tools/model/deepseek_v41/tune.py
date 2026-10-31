@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
-from tools.model.deepseek_v41.converge import unit_scale_manifests
+from tools.model.deepseek_v41.assembly import unit_scale_manifests
 from tools.model.row_selection import bounded_choices, guarded_winner, samples
 from tools.model.tuning import compile_candidates, measure, read_record, record_path
 
@@ -242,7 +242,7 @@ def main():
             scale_sha256=file_hash_bytes(channel) if channel is not None else None,
             scale=scaling,
             tuner_sha256=file_hash(Path(__file__)),
-            convergence_sha256=file_hash(Path(__file__).with_name("converge.py")),
+            assembly_sha256=file_hash(Path(__file__).with_name("assembly.py")),
             geometry_sha256=file_hash(Path(__file__).parents[2] / "operators/ascend/geometry.py"),
             selection_sha256=file_hash(Path(__file__).parents[1] / "row_selection.py"),
         )
@@ -413,7 +413,7 @@ def main():
                     for key in ("manifest", "uncompacted_manifest"):
                         if step.get(key) is not None:
                             step[key] = replacements.get(step[key], step[key])
-    from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+    from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
 
     model = compact_buffers(model)
     validate_rows(model, base)

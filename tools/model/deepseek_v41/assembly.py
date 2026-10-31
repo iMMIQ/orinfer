@@ -540,7 +540,6 @@ def main():
     parser.add_argument("--shared-attention", action="store_true")
     parser.add_argument("--fused-attention", action="store_true")
     parser.add_argument("--fused-min-rows", type=int, default=512)
-    parser.add_argument("--replay-keep", type=int)
     parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--tune-projections", choices=("off", "local", "all"), default="off")
     parser.add_argument("--model-dir", type=Path)
@@ -556,8 +555,6 @@ def main():
         parser.error("Local projection tuning requires --shared-attention")
     if not 4 <= args.packet_cache_capacity <= 4096:
         parser.error("Packet cache capacity must be in 4..4096")
-    if args.replay_keep is not None and (not 8 <= args.replay_keep <= 512 or args.replay_keep % 8):
-        parser.error("Replay suffix must be divisible by eight, within 8..512")
     base = args.plan.parent
     root = Path(__file__).resolve().parents[3]
     source = source_hash(
@@ -580,7 +577,7 @@ def main():
     import hashlib
 
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
-    prefix = base / (".converge-" + key)
+    prefix = base / (".assembly-" + key)
     reference = prefix.with_name(prefix.name + "-reference.json")
     atomic_json(reference, model)
     current, stages = reference, []
@@ -611,14 +608,6 @@ def main():
                 "256",
                 "--reuse-kv",
             ],
-        )
-    if args.replay_keep:
-        run("decoder_replay", ["--tail-template", str(reference), "--keep", str(args.replay_keep)])
-        run(
-            "sequence_parallel",
-            ["--decoder-tail"]
-            + (["--reduce-scatter"] if args.reduce_scatter else [])
-            + (["--shared-attention"] if args.shared_attention else []),
         )
     if args.tune_projections != "off":
         previous = sys.argv

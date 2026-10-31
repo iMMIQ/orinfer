@@ -9,7 +9,7 @@ import argparse
 import json
 from pathlib import Path
 
-from tools.model.deepseek_v41.converge import publish_package, validate_rows
+from tools.model.deepseek_v41.assembly import publish_package, validate_rows
 
 
 def transform(model, expected_expert_rows):

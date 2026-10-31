@@ -56,14 +56,6 @@ def main():
     parser.add_argument("--min-rows", type=int, default=512)
     parser.add_argument("--reduce-scatter", action="store_true")
     parser.add_argument("--shared-attention", action="store_true")
-    parser.add_argument(
-        "--fixed-capacity", action="store_true", help="Build the legacy capacity-padded reference"
-    )
-    parser.add_argument(
-        "--decoder-tail",
-        action="store_true",
-        help="Shard the compacted decoder rows using the same private-row templates",
-    )
     args = parser.parse_args()
     if args.output.parent.resolve() != args.plan.parent.resolve():
         parser.error("Input and output must share their asset directory")
@@ -103,37 +95,18 @@ def main():
 
     for rank in model["ranks"]:
         definitions = {d["name"]: d for d in rank["buffers"]}
-        replay_packets = []
-        if args.decoder_tail:
-            replay_packets = [
-                p for p in rank["packets"] if any(s["op"] == "limit_rows" for s in p["body"])
-            ]
-            if not replay_packets:
-                raise ValueError("Decoder SP needs compacted packets")
-            packet = deepcopy(replay_packets[-1])
-            boundary = next(i for i, s in enumerate(packet["body"]) if s["op"] == "limit_rows")
-            packet["rows"] = packet["body"][boundary]["rows"]
-            packet["min_rows"] = 2
-            packet.pop("max_rows", None)
-            packet["body"] = packet["body"][boundary + 1 :]
-            packet["head"] = [s for s in packet["head"] if s["op"] != "limit_rows"]
-            for key, source in packet["coordinates"].items():
-                if isinstance(source, str) and f"replay{packet['rows']}." + source in definitions:
-                    packet["coordinates"][key] = f"replay{packet['rows']}." + source
-            packets = [packet]
-        else:
-            packets = [
-                p
-                for p in rank["packets"]
-                if p.get("min_rows", 0) > 0 and p.get("max_rows", p["rows"]) == p["rows"]
-            ]
+        packets = [
+            p
+            for p in rank["packets"]
+            if p.get("min_rows", 0) > 0 and p.get("max_rows", p["rows"]) == p["rows"]
+        ]
         if len(packets) != 1:
             raise ValueError("Expected one selected large-row packet")
         packet = packets[0]
         capacity = packet["rows"]
-        if not args.decoder_tail and not packet["min_rows"] <= args.min_rows <= capacity:
+        if not packet["min_rows"] <= args.min_rows <= capacity:
             raise ValueError("Selected minimum must lie inside the original large packet")
-        if not args.decoder_tail and args.min_rows > packet["min_rows"]:
+        if args.min_rows > packet["min_rows"]:
             fallback = deepcopy(packet)
             fallback["max_rows"] = args.min_rows - 1
             rank["packets"].insert(rank["packets"].index(packet), fallback)
@@ -157,13 +130,12 @@ def main():
 
         def view(source, width, dtype):
             layout = dict(parent=source, offset=rank["rank"] * count * width * SIZES[dtype])
-            if not args.fixed_capacity:
-                layout.update(
-                    row_capacity=capacity,
-                    offset_expression=expression(
-                        f"((m + 7) // 8) * {rank['rank'] * width * SIZES[dtype]}"
-                    ),
-                )
+            layout.update(
+                row_capacity=capacity,
+                offset_expression=expression(
+                    f"((m + 7) // 8) * {rank['rank'] * width * SIZES[dtype]}"
+                ),
+            )
             return temp(
                 "view." + source,
                 count * width * SIZES[dtype],
@@ -178,7 +150,7 @@ def main():
                     capacity=capacity,
                     width=width,
                     dtype=NAMES[dtype],
-                    partitions=0 if args.fixed_capacity else 8,
+                    partitions=8,
                 ),
                 [
                     operand("positions", "i32", [capacity]),
@@ -219,11 +191,10 @@ def main():
                 )
                 transport["elements"] //= 4
                 transport["int32"] = True
-            if not args.fixed_capacity:
-                transport.pop("fixed_rows")
-                transport["elements_expression"] = expression(
-                    f"((m + 7) // 8) * {transport['elements'] // count}"
-                )
+            transport.pop("fixed_rows")
+            transport["elements_expression"] = expression(
+                f"((m + 7) // 8) * {transport['elements'] // count}"
+            )
             if trace:
                 transport["trace_only"] = True
             else:
@@ -260,9 +231,8 @@ def main():
                 buffers=[mapping.get(b, b) for b in step["buffers"]],
                 fixed_rows=count,
             )
-            if not args.fixed_capacity:
-                result.pop("fixed_rows")
-                result["row_expression"] = expression("(m + 7) // 8")
+            result.pop("fixed_rows")
+            result["row_expression"] = expression("(m + 7) // 8")
             return result
 
         norm_gathers = set()
@@ -284,30 +254,6 @@ def main():
         premix = packet["coordinates"]["premix"]
         body.append(zero_tail(premix, 8, "f32"))
         mapping[premix] = view(premix, 8, "f32")
-        if args.decoder_tail:
-            initial = set()
-            written = set()
-            for step in packet["body"]:
-                if step["op"] != "kernel":
-                    continue
-                manifest = descriptor(step)
-                for source, spec in zip(step["buffers"], manifest["operands"], strict=True):
-                    if (
-                        source not in written
-                        and source.endswith((".residual.a", ".residual.b", ".collapsed"))
-                        and spec["access"] in ("read", "read_write")
-                    ):
-                        initial.add(source)
-                written.update(
-                    source
-                    for source, spec in zip(step["buffers"], manifest["operands"], strict=True)
-                    if spec["access"] != "read"
-                )
-            for source in sorted(initial):
-                width = definitions[source]["bytes"] // capacity // 2
-                body.append(zero_tail(source, width, "bf16"))
-                mapping[source] = view(source, width, "bf16")
-                ready.add(source)
         for index, step in enumerate(packet["body"]):
             op = step["op"]
             if op == "embed":
@@ -333,9 +279,8 @@ def main():
                         scatter=True,
                         fixed_rows=True,
                     )
-                    if not args.fixed_capacity:
-                        collective.pop("fixed_rows")
-                        collective["elements_expression"] = expression("((m + 7) // 8) * 5120")
+                    collective.pop("fixed_rows")
+                    collective["elements_expression"] = expression("((m + 7) // 8) * 5120")
                     body.append(collective)
                     ready.discard(destination)
                 else:
@@ -389,7 +334,7 @@ def main():
             if kind == "engram.gate":
                 mapping[buffers[-1]] = view(buffers[-1], 20480, "bf16")
                 ready.add(buffers[-1])
-        if reductions != (38 if args.decoder_tail else 80):
+        if reductions != (80):
             raise ValueError("Expected all 80 body reductions")
         body.append(gather(packet["head"][0]["buffers"][0], "bf16", 5120))
         if args.shared_attention:
@@ -508,15 +453,6 @@ def main():
                 raise ValueError("Shared KV/Qa branches differ from the selected layer count")
             body = shared_body
         packet["body"] = body
-        if args.decoder_tail:
-            for original in replay_packets:
-                boundary = next(
-                    i for i, s in enumerate(original["body"]) if s["op"] == "limit_rows"
-                )
-                if original["body"][boundary]["rows"] != capacity:
-                    raise ValueError("Decoder suffix capacities differ")
-                original["body"] = original["body"][: boundary + 1] + deepcopy(body)
-                original["head"] = [dict(op="limit_rows", rows=capacity)] + deepcopy(packet["head"])
         print(
             dict(
                 rank=rank["rank"],

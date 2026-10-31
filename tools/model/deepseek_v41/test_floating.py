@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import numpy as np
 from tools.model.deepseek_v41.floating import bf16_parts
-from tools.model.deepseek_v41.converge import unit_scale_manifests
+from tools.model.deepseek_v41.assembly import unit_scale_manifests
 
 
 class ProjectionScaleTests(unittest.TestCase):

@@ -17,7 +17,7 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
     from kernels.model.rows import row_count
     from tools.build.files import file_hash
     from tools.model.deepseek_v41.batch import compile_task, DTYPES, SIZES
-    from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+    from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
     from tools.operators.ascend.attention_fused import selected_int8
     from tools.operators.ascend.build import operand
     from tools.operators.ascend.geometry import physical_shapes

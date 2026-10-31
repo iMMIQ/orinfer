@@ -17,7 +17,7 @@ from tools.model.row_contract import expression
 def build(plan, output, workers=4, minimum=512, pv_tile=256, qk_head_tile=16, pv_head_tile=16):
     from kernels.model.rows import row_count
     from tools.model.deepseek_v41.batch import compile_task, DTYPES, SIZES
-    from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+    from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
     from tools.operators.ascend import attention_cube, kv_int8, memory
     from tools.operators.ascend.build import operand
     from tools.operators.ascend.geometry import physical_shapes

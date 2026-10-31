@@ -11,7 +11,7 @@ from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
 from tools.model.deepseek_v41.batch import compile_task
-from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
 
 
 def build(plan, output, workers=4, minimum=512, tile_rows=8):

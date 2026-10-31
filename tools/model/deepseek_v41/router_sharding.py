@@ -14,7 +14,7 @@ import multiprocessing
 from pathlib import Path
 
 from tools.build.files import atomic_json
-from tools.model.deepseek_v41.converge import compact_buffers, publish_package, validate_rows
+from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
 from tools.model.row_contract import expression
 
 

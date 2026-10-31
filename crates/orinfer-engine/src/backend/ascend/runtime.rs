@@ -411,6 +411,12 @@ impl Session {
     pub fn allocated_bytes(&self) -> usize {
         self.context.device_bytes.get()
     }
+    pub fn remaining_device_bytes(&self) -> usize {
+        self.context
+            .limits
+            .device_bytes
+            .saturating_sub(self.allocated_bytes())
+    }
     /// Physical pinned storage, including idle reusable buffers.
     pub fn pinned_bytes(&self) -> usize {
         self.context.pinned_bytes.get()

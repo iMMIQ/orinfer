@@ -270,6 +270,10 @@ HTTP 在加载模型前绑定监听地址，端口被占用时立即退出；模
 
 A2 rank 的命令使用一个共同的等待期限，`ORINFER_A2_COMMAND_TIMEOUT_MS` 默认 `30000`，支持 `1..1800000` 毫秒，同时设置 ACL 同步等待期限；初始模型加载单独允许 1800 秒。rank 驱动错误、线程退出或命令超时会使当前 TP 团队失效，保留首个故障的类型和驱动错误码，后续请求无法继续使用该团队。服务故障后由进程管理器重启；调整命令期限时也应相应配置 HTTP 和停机期限。
 
+A2 DSv4.1 的请求私有 arena 在准入时按模型包的完整上下文容量分配，decode 期间保持容量和地址稳定。当前 262144 上下文包每个 owner 每卡约占 512 MiB，包含 INT8 group-64 KV、FP16 scale、索引状态和私有 workspace；32 个 owner 每卡约占 16 GiB。owner 0 复用启动时分配的缓冲区。prefix 快照和 Graph 缓存另行占用显存，`--prefix-cache-mib` 按同一快照 bank 在各 rank 的最大物理占用计费，共享 bank 去重，CPU 输出也计入缓存预算。
+
+A2 准入同时检查每张卡的物理空闲显存与原生 session 分配余额，并保留执行 workspace；不足时依次回收 prefix 快照和缓存的 Graph 程序，再决定是否排队。快照先规划新增 bank 并检查缓存预算和分配余量，再分配和复制；回收父快照后重新规划，避免把完整复制误算成增量复制。正常容量不足走准入等待；其他进程的显存变化或原生驱动分配失败仍可能使 worker 失效，需要重启服务。
+
 A2 HTTP/JSONL 使用 `ASCEND_COREDUMP_SIGNAL=none`，由服务处理 SIGINT/SIGTERM 并回收资源。`serve`、`worker` 和 `batch` CLI 在创建线程前默认设置该值；直接调用 Rust API 时在进程启动环境中设置。A2 检测到缺失或冲突配置时在创建 GPU worker 前报错。[CANN 环境变量说明](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/800alpha002/apiref/envref/CANN%E7%A4%BE%E5%8C%BA%E7%89%88%208.0.0.alpha002%20%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F%E5%8F%82%E8%80%83%2001.pdf)说明了 trace 与业务信号捕获冲突时的配置；此设置关闭 CANN trace 的信号堆栈文件，Rust 错误报告及系统 core dump 配置继续生效。SIGINT/SIGTERM 会中断未完成请求，按 `--drain-timeout-ms` 等待 HTTP 响应及 worker 回收。
 
 A2 停机时，常驻 CPU 表等待所有读取者释放后回收，与 rank 和 bootstrap 原生资源的销毁重叠；两者完成后释放 GPU 锁。全量常驻大 CPU 表的部署使用 `--drain-timeout-ms 120000`，为内存释放和驱动清理保留余量，外部进程管理器的强制退出期限应大于此值。

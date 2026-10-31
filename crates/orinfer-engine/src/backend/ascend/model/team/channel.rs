@@ -164,9 +164,9 @@ mod tests {
                 let (reply, receive) = reply_channel();
                 transport.push(Peer { send, receive });
                 let delayed = scope.spawn(move || {
-                    assert!(matches!(commands.recv().unwrap(), Command::Memory));
+                    assert!(matches!(commands.recv().unwrap(), Command::Reclaim));
                     gate.recv_timeout(Duration::from_secs(5)).unwrap();
-                    reply.send(Ok(Reply::Bytes(1))).unwrap();
+                    reply.send(Ok(Reply::Capacity(true))).unwrap();
                     assert!(matches!(
                         commands.try_recv(),
                         Err(mpsc::TryRecvError::Empty)
@@ -176,13 +176,13 @@ mod tests {
                 let (reply, receive) = reply_channel();
                 transport.push(Peer { send, receive });
                 scope.spawn(move || {
-                    assert!(matches!(commands.recv().unwrap(), Command::Memory));
+                    assert!(matches!(commands.recv().unwrap(), Command::Reclaim));
                     crate::error::record_ascend(code);
                     reply
                         .send(Err(EngineError::take("rank failure".into(), true)))
                         .unwrap();
                 });
-                let message = transport.exchange(Command::Memory).err().unwrap();
+                let message = transport.exchange(Command::Reclaim).err().unwrap();
                 let error = EngineError::take(message, false);
                 assert_eq!(error.ascend_code, Some(code));
                 assert!(error.is_fatal());
@@ -200,12 +200,12 @@ mod tests {
         let (send, commands) = mpsc::channel();
         let (reply, receive) = reply_channel();
         transport.push(Peer { send, receive });
-        let error = transport.exchange(Command::Memory).err().unwrap();
+        let error = transport.exchange(Command::Reclaim).err().unwrap();
         assert_eq!(EngineError::take(error, false).kind, ErrorKind::Invariant);
-        reply.send(Ok(Reply::Bytes(999))).unwrap();
-        assert!(transport.exchange(Command::Memory).is_err());
+        reply.send(Ok(Reply::Capacity(true))).unwrap();
+        assert!(transport.exchange(Command::Reclaim).is_err());
         assert!(EngineError::take("retired".into(), false).is_fatal());
-        assert!(matches!(commands.try_recv().unwrap(), Command::Memory));
+        assert!(matches!(commands.try_recv().unwrap(), Command::Reclaim));
         assert!(matches!(
             commands.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -227,7 +227,7 @@ mod tests {
                 commands.recv().unwrap();
                 panic!("rank panic");
             });
-            let error = transport.exchange(Command::Memory).err().unwrap();
+            let error = transport.exchange(Command::Reclaim).err().unwrap();
             assert!(error.contains("rank 1"));
             assert!(EngineError::take(error, false).is_fatal());
             assert!(worker.join().is_err());
