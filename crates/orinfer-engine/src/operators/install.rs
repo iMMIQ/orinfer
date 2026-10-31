@@ -4,10 +4,9 @@ use crate::artifact::{AssetReader, Result, sha256};
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
-    ffi::CString,
     fs::{self, File},
     io::{self, BufRead, BufReader, Read},
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::{fd::AsRawFd, unix::fs::PermissionsExt},
     path::{Component, Path, PathBuf},
 };
 
@@ -131,28 +130,31 @@ fn validate(root: &Path, digest: &str) -> Result<()> {
 }
 
 fn rename_new(source: &Path, destination: &Path) -> Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    let destination =
-        CString::new(destination.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    // SAFETY: live NUL-terminated path strings; renameat2 retains neither pointer.
-    let status = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if status != 0 {
+    let directory = File::open(
+        destination
+            .parent()
+            .ok_or("Package cache has no directory")?,
+    )
+    .map_err(|e| e.to_string())?;
+    loop {
+        // SAFETY: the live directory descriptor is retained until publication ends.
+        // An advisory cache lock serializes installers on ext4 and ZFS without
+        // requiring renameat2(RENAME_NOREPLACE) or leaving a lock-file artifact.
+        if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
         let error = io::Error::last_os_error();
-        return Err(if error.kind() == io::ErrorKind::AlreadyExists {
-            "Execution package already installed; existing files were not changed".into()
-        } else {
-            error.to_string()
-        });
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error.to_string());
+        }
     }
-    Ok(())
+    match fs::symlink_metadata(destination) {
+        Ok(_) => Err("Execution package already installed; existing files were not changed".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::rename(source, destination).map_err(|e| e.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[cfg(test)]
