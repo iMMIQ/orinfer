@@ -34,7 +34,7 @@ use orinfer_model_sdk::operators::rows::KernelVariant;
 use serde::Deserialize;
 use std::{
     cell::Cell,
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::{Arc, OnceLock},
@@ -449,11 +449,6 @@ struct Worker {
     steps: BTreeMap<usize, packet::StepStats>,
     batch: Option<batch::Runtime>,
 }
-
-/// Host-to-device chunk and pipeline depth; in-flight pinned memory stays
-/// within the session budget while DMA overlaps the next host copy.
-const CHUNK: usize = 8 << 20;
-const DEPTH: usize = 6;
 
 /// Per-phase cold-start accounting for one rank; every phase is wall time
 /// spent on that rank's load thread.

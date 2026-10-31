@@ -406,7 +406,7 @@ prefill 使用一个 SWA 和一个压缩 KV 的共享 BF16 工作区，仅解码
 当前原生多 owner 计划通过同一入口构建 bounded replay 包：
 
 ```bash
-uv run --locked python -m tools.model.deepseek_v41.decoder_replay \
+uv run --locked python -m tools.model.deepseek_v41.decoder_rows \
   --plan SHARED_ROWS_PLAN --keep 128 --output artifacts/a2-decoder-replay
 ```
 

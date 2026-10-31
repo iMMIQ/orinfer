@@ -1,5 +1,6 @@
 """Bind owner-local bounded decoder rows to existing native A2 arithmetic."""
 
+import argparse
 from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 import hashlib
@@ -494,3 +495,45 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False, source_kv_
     )
     atomic_json(output / "decoder-replay.json", report)
     return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=128,
+        help="Retained decoder rows per owner (128..512 for owner-row plans)",
+    )
+    parser.add_argument("--compile-workers", type=int, default=4)
+    parser.add_argument(
+        "--final-prompt-only",
+        action="store_true",
+        help="Run decoder replay only for the final prompt window; reserve that window on prefix restore",
+    )
+    parser.add_argument(
+        "--source-kv-boundary",
+        action="store_true",
+        help="Select query rows immediately after the last shared KV writes",
+    )
+    args = parser.parse_args()
+    if not json.loads(args.plan.read_text()).get("batch"):
+        parser.error("Decoder replay requires a complete owner-row plan")
+    print(
+        json.dumps(
+            build(
+                args.plan,
+                args.output,
+                args.keep,
+                args.compile_workers,
+                final_prompt_only=args.final_prompt_only,
+                source_kv_boundary=args.source_kv_boundary,
+            )
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

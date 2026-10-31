@@ -1,13 +1,10 @@
 //! Owner arena allocation, release and reclaimable packet program memory.
+use super::super::memory::{self, Allocation, Requirement};
 use super::*;
+use crate::backend::arena::ArenaLayout;
 
 impl Worker {
-    fn fixed_owner_layout(
-        &self,
-    ) -> Result<(
-        crate::backend::arena::ArenaLayout,
-        super::super::memory::Allocation,
-    )> {
+    fn fixed_owner_layout(&self) -> Result<(ArenaLayout, Allocation)> {
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
         let entries = runtime
             .contract
@@ -16,18 +13,18 @@ impl Worker {
             .filter(|n| !self.views.contains_key(*n) && !self.growth.contains_key(*n))
             .map(|n| Ok((n.as_str(), get(&self.buffers, n)?.bytes(), 256)))
             .collect::<Result<Vec<_>>>()?;
-        super::super::memory::owner_layout(entries.into_iter())
+        memory::owner_layout(entries.into_iter())
     }
     pub(in crate::backend::ascend::model) fn owner_requirement(
         &self,
         tokens: usize,
         reserve: usize,
-    ) -> Result<super::super::memory::Requirement> {
+    ) -> Result<Requirement> {
         if tokens == 0 || tokens > self.capacity {
             return Err("Invalid owner token reservation".into());
         }
         let (_, allocation) = self.fixed_owner_layout()?;
-        let mut needed = super::super::memory::Requirement::owners(allocation, 1, reserve)?;
+        let mut needed = Requirement::owners(allocation, 1, reserve)?;
         for (name, layout) in &self.growth {
             let bytes = get(&self.buffers, name)?.physical_extent(layout.extent(tokens)?)?;
             needed.device = needed
@@ -83,10 +80,7 @@ impl Worker {
             return Err("Owner token budget already reserved".into());
         }
         let future = self.future_bytes(owner, tokens)?;
-        self.reserve_batch_memory(
-            super::super::memory::Requirement::snapshot(future)?,
-            "owner KV reservation",
-        )?;
+        self.reserve_batch_memory(Requirement::snapshot(future)?, "owner KV reservation")?;
         self.batch
             .as_mut()
             .unwrap()
@@ -118,10 +112,7 @@ impl Worker {
         // Mapping an admitted request converts its held capacity to resident
         // bytes. Existing Graph replay needs no new scratch reservation.
         if owner.limit.is_none() {
-            self.reserve_batch_memory(
-                super::super::memory::Requirement::snapshot(additional)?,
-                "KV growth",
-            )?;
+            self.reserve_batch_memory(Requirement::snapshot(additional)?, "KV growth")?;
         }
         let owner = self.batch.as_ref().unwrap().owners.get(&id).unwrap();
         for (name, layout) in &self.growth {
@@ -167,11 +158,7 @@ impl Worker {
         }
         Ok(tables_released)
     }
-    pub(super) fn reserve_batch_memory(
-        &mut self,
-        needed: super::super::memory::Requirement,
-        stage: &str,
-    ) -> Result<()> {
+    pub(super) fn reserve_batch_memory(&mut self, needed: Requirement, stage: &str) -> Result<()> {
         let (device, session) = self.available_memory()?;
         if needed.fits(device, session) {
             return Ok(());
@@ -213,7 +200,7 @@ impl Worker {
             .len();
         let (arena, allocation) = self.fixed_owner_layout()?;
         let arena_bytes = allocation.bytes;
-        let needed = super::super::memory::Requirement::owners(allocation, count, 0)?;
+        let needed = Requirement::owners(allocation, count, 0)?;
         self.reserve_batch_memory(needed, "owner admission")?;
         for &id in ids {
             if self.batch.as_ref().unwrap().owners.contains_key(&id) {

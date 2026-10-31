@@ -1,9 +1,11 @@
 //! Prepared physical weight loading and bounded stream-ordered transfers.
 use super::*;
+use std::collections::VecDeque;
 
-fn host_row_cache_budget() -> Result<usize> {
-    host_memory_budget("ORINFER_A2_HOST_ROW_CACHE_MIB", 2048)
-}
+/// In-flight pinned storage stays within the session budget as DMA overlaps host copies.
+const UPLOAD_CHUNK: usize = 8 << 20;
+const UPLOAD_DEPTH: usize = 6;
+
 fn host_memory_budget(name: &str, default_mib: usize) -> Result<usize> {
     let mib = match std::env::var(name) {
         Ok(value) => value
@@ -28,9 +30,9 @@ pub(super) fn upload(session: &Session, buffer: &Buffer, data: &[u8]) -> Result<
         return Err("Model upload byte extent differs".into());
     }
     let mut tickets = VecDeque::new();
-    for (chunk, bytes) in data.chunks(CHUNK).enumerate() {
-        tickets.push_back(session.upload(buffer, chunk * CHUNK, bytes)?);
-        if tickets.len() > DEPTH {
+    for (chunk, bytes) in data.chunks(UPLOAD_CHUNK).enumerate() {
+        tickets.push_back(session.upload(buffer, chunk * UPLOAD_CHUNK, bytes)?);
+        if tickets.len() > UPLOAD_DEPTH {
             tickets.pop_front().unwrap().wait()?;
         }
     }
@@ -39,12 +41,7 @@ pub(super) fn upload(session: &Session, buffer: &Buffer, data: &[u8]) -> Result<
 
 /// Streams a prepared weight file without materializing it in host memory;
 /// storage reads overlap device DMA instead of preceding it.
-pub(super) fn upload_file(
-    session: &Session,
-    buffer: &Buffer,
-    path: &Path,
-    bytes: usize,
-) -> Result<()> {
+fn upload_file(session: &Session, buffer: &Buffer, path: &Path, bytes: usize) -> Result<()> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     if !metadata.is_file() || metadata.len() != bytes as u64 {
@@ -52,7 +49,7 @@ pub(super) fn upload_file(
     }
     upload_file_range(session, buffer, &file, 0, bytes)
 }
-pub(super) fn upload_file_range(
+fn upload_file_range(
     session: &Session,
     buffer: &Buffer,
     file: &std::fs::File,
@@ -63,98 +60,22 @@ pub(super) fn upload_file_range(
     if bytes != buffer.bytes() || source_offset.checked_add(bytes).is_none() {
         return Err("Prepared tensor range differs".into());
     }
-    let mut staging = vec![0u8; CHUNK.min(bytes)];
+    let mut staging = vec![0u8; UPLOAD_CHUNK.min(bytes)];
     let mut tickets = VecDeque::new();
     let mut offset = 0;
     while offset < bytes {
-        let want = CHUNK.min(bytes - offset);
+        let want = UPLOAD_CHUNK.min(bytes - offset);
         file.read_exact_at(&mut staging[..want], (source_offset + offset) as u64)
             .map_err(|e| e.to_string())?;
         tickets.push_back(session.upload(buffer, offset, &staging[..want])?);
         offset += want;
-        if tickets.len() > DEPTH {
+        if tickets.len() > UPLOAD_DEPTH {
             tickets.pop_front().unwrap().wait()?;
         }
     }
     wait_in_flight(&mut tickets)
 }
 
-/// Debug-only integrity check: chunked download and comparison against the
-/// exact bytes that were uploaded. On mismatch, maps nearby device chunks
-/// back to source chunk indices to reveal duplication, swaps or loss.
-pub(super) fn verify_upload(
-    session: &Session,
-    buffer: &Buffer,
-    name: &str,
-    mut source: impl FnMut(usize, &mut [u8]) -> Result<()>,
-) -> Result<()> {
-    let chunks = buffer.bytes().div_ceil(CHUNK);
-    let mut expected = vec![0u8; CHUNK];
-    for index in 0..chunks {
-        let want = CHUNK.min(buffer.bytes() - index * CHUNK);
-        source(index, &mut expected[..want])?;
-        let actual = session.download(buffer, index * CHUNK, want)?;
-        if actual != expected[..want] {
-            let mut first = 0;
-            while first < want && actual[first] == expected[first] {
-                first += 1;
-            }
-            let mut mapping = vec![];
-            for probe in index..(index + 4).min(chunks) {
-                let chunk = session.download(
-                    buffer,
-                    probe * CHUNK,
-                    CHUNK.min(buffer.bytes() - probe * CHUNK),
-                )?;
-                let mut matches = vec![];
-                for candidate in 0..(chunks.min(8)) {
-                    let mut candidate_data = vec![0u8; CHUNK];
-                    let candidate_want = CHUNK.min(buffer.bytes() - candidate * CHUNK);
-                    source(candidate, &mut candidate_data[..candidate_want])?;
-                    if chunk == candidate_data[..candidate_want] {
-                        matches.push(candidate);
-                    }
-                }
-                mapping.push((probe, matches));
-            }
-            return Err(format!(
-                "{name}: upload verification differs at chunk {index} byte {first}, expected {:02x?}, actual {:02x?}, chunk map {mapping:?}",
-                &expected[first..(first + 16).min(want)],
-                &actual[first..(first + 16).min(want)]
-            ));
-        }
-    }
-    eprintln!("A2 verified {name}");
-    Ok(())
-}
-
-pub(super) fn verify_file_upload(
-    session: &Session,
-    buffer: &Buffer,
-    path: &Path,
-    name: &str,
-) -> Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    verify_upload(session, buffer, name, |index, out| {
-        file.seek(SeekFrom::Start((index * CHUNK) as u64))
-            .and_then(|_| file.read_exact(out))
-            .map_err(|e| e.to_string())
-    })
-}
-
-pub(super) fn verify_data_upload(
-    session: &Session,
-    buffer: &Buffer,
-    data: &[u8],
-    name: &str,
-) -> Result<()> {
-    verify_upload(session, buffer, name, |index, out| {
-        let begin = index * CHUNK;
-        out.copy_from_slice(&data[begin..begin + out.len()]);
-        Ok(())
-    })
-}
 impl Worker {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load(
@@ -228,7 +149,6 @@ impl Worker {
                     session.allocate(definition.bytes)?
                 };
                 phases.alloc_s += t.elapsed().as_secs_f64();
-                let verify = std::env::var_os("ORINFER_A2_VERIFY_UPLOAD").is_some();
                 if let Some(file) = definition.prepared_weight {
                     let path = resolve_file(package, &file)?;
                     let t = Instant::now();
@@ -236,9 +156,6 @@ impl Worker {
                     phases
                         .prepared
                         .add(definition.bytes, t.elapsed().as_secs_f64());
-                    if verify {
-                        verify_file_upload(&session, &buffer, &path, &definition.name)?;
-                    }
                 } else if let Some(tensor) = definition.prepared_tensor {
                     let source = checkpoint.source(&tensor.name, &tensor.dtype, &tensor.shape)?;
                     if source.bytes != definition.bytes {
@@ -251,13 +168,6 @@ impl Worker {
                             .insert(std::fs::File::open(&source.path).map_err(|e| e.to_string())?),
                     };
                     upload_file_range(&session, &buffer, file, source.offset, source.bytes)?;
-                    if verify {
-                        use std::os::unix::fs::FileExt;
-                        verify_upload(&session, &buffer, &definition.name, |chunk, out| {
-                            file.read_exact_at(out, (source.offset + chunk * CHUNK) as u64)
-                                .map_err(|e| e.to_string())
-                        })?;
-                    }
                     phases.prepared.add(source.bytes, t.elapsed().as_secs_f64());
                 } else if let Some(weight) = definition.weight {
                     let t = Instant::now();
@@ -266,17 +176,11 @@ impl Worker {
                     phases
                         .matrix
                         .add(definition.bytes, t.elapsed().as_secs_f64());
-                    if verify {
-                        verify_data_upload(&session, &buffer, &data, &definition.name)?;
-                    }
                 } else if let Some(identity) = definition.data {
                     let t = Instant::now();
                     let data = read_identity(package, &identity)?;
                     upload(&session, &buffer, &data)?;
                     phases.data.add(definition.bytes, t.elapsed().as_secs_f64());
-                    if verify {
-                        verify_data_upload(&session, &buffer, &data, &definition.name)?;
-                    }
                 } else if !demand {
                     // Fills are compute-stream ordered before every later use;
                     // deferring their waits keeps the transfer stream busy.
@@ -330,7 +234,8 @@ impl Worker {
                 let table_budget = if resident {
                     0
                 } else {
-                    host_row_cache_budget()? / layout.layers.len().max(1)
+                    host_memory_budget("ORINFER_A2_HOST_ROW_CACHE_MIB", 2048)?
+                        / layout.layers.len().max(1)
                 };
                 let mut tables = BTreeMap::new();
                 for (layer, mut store) in stores {
