@@ -614,6 +614,8 @@ orinfer serve artifacts/models/dsv41-a2-service --model deepseek-v41-flash-1017-
 
 A2 服务在当前没有活跃 decoder 时按执行包的 token 行容量填充 prefill packet；单个请求仍在每 4096 token 的缓存检查点暂停并提交完整状态。有活跃 decoder 时，decode 行优先，混合 packet 继续按 `--prefill-budget-ms` 和原生吞吐估计限制总行数。不同分块长度复用同一个动态 prefill 模板；新的请求与取消在 packet 边界处理。
 
+普通与 DSpark 混合 packet 共用 prefill 排序：按实际未计算后缀估计成本，复用公共等待队列的成本与老化策略，使 prefix 命中后的短续轮优先取得首 token。排序前冻结等待时间；距上次 prefill 进展超过 30 秒的请求按等待时长优先，提交进展后重置其等待时间。decode 与验证行继续优先预留预算，prefill 保留检查点和完整末尾窗口。
+
 A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 owner-work launch 行数缓存。加载时从全部 rank／family 提取共享 launch 描述，把每种分片的全 rank 行数纳入身份，保持各 rank 的复用关系一致；长度策略范围和 decoder 边界同时保留。这些编译参数相同的 owner 长度组合可共享已捕获程序。精确 owner、长度、角色和输出位置继续通过 stream 有序的地址表与 work 表更新。各 rank 在捕获前统一探测缓存，任一未命中时仍全体准备相同请求。`ORINFER_A2_BATCH_PROFILE=1` 输出 rank 0 冷准备的绑定、ACLNN、预热与捕获耗时。
 
 公共多 owner 入口按复用情况晋升 Graph：全局形状首次出现时绑定并直接提交同一套算子，再次命中时全体 rank 预热并捕获原绑定的 segment，后续使用 replay。晋升保留原 kernel、W4 计划、工作区及分支资源；每次实际捕获前仍执行完整 segment 预热。任一 rank 缺少缓存时全体重新从直接执行开始，已有缓存的模式不一致时统一重新捕获。直接提交与 Graph 共用指令顺序和完成事件的资源所有权；未能提交 join 的失败路径先排空辅助 stream，无法确认完成的资源随退休会话隔离。冷准备日志另含 `capture` 和 `promotion` 字段。

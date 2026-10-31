@@ -158,20 +158,22 @@ pub fn select_waiting(requests: &[Waiting]) -> Option<usize> {
     requests
         .iter()
         .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            let old_a = a.age_s >= 30.;
-            let old_b = b.age_s >= 30.;
-            old_b.cmp(&old_a).then_with(|| {
-                if old_a {
-                    b.age_s.total_cmp(&a.age_s)
-                } else {
-                    (a.cost_s() / (1. + a.age_s / 2.))
-                        .total_cmp(&(b.cost_s() / (1. + b.age_s / 2.)))
-                        .then(b.age_s.total_cmp(&a.age_s))
-                }
-            })
-        })
+        .min_by(|(_, a), (_, b)| waiting_order(a, b))
         .map(|(index, _)| index)
+}
+
+pub(crate) fn waiting_order(a: &Waiting, b: &Waiting) -> std::cmp::Ordering {
+    let old_a = a.age_s >= 30.;
+    let old_b = b.age_s >= 30.;
+    old_b.cmp(&old_a).then_with(|| {
+        if old_a {
+            b.age_s.total_cmp(&a.age_s)
+        } else {
+            (a.cost_s() / (1. + a.age_s / 2.))
+                .total_cmp(&(b.cost_s() / (1. + b.age_s / 2.)))
+                .then(b.age_s.total_cmp(&a.age_s))
+        }
+    })
 }
 
 /// Bounded, online output-length estimates. Completion limits are ceilings,

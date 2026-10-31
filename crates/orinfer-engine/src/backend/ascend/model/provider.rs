@@ -110,6 +110,7 @@ pub(crate) struct Request {
     mtp: crate::mtp::Statistics,
     draft_feedback: dspark::Feedback,
     last_output: Instant,
+    last_prefill: Instant,
     ready_output: Option<Arc<Output>>,
     cache_prompt: bool,
     cache_generated: bool,
@@ -573,6 +574,7 @@ impl Runtime {
             mtp: Default::default(),
             draft_feedback: Default::default(),
             last_output: Instant::now(),
+            last_prefill: Instant::now(),
             ready_output,
             cache_prompt: true,
             cache_generated: true,
@@ -787,6 +789,7 @@ impl Runtime {
             let request = &mut requests[i];
             if request.prefilling {
                 request.offset += count;
+                request.last_prefill = Instant::now();
                 self.statistics.prefill_tokens += count;
             } else {
                 self.statistics.decode_tokens += 1;

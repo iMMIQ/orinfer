@@ -65,6 +65,7 @@ fn request(output: Arc<Output>, sampling: crate::sampling::Options) -> Request {
         prefix: Default::default(),
         mtp: Default::default(),
         last_output: Instant::now(),
+        last_prefill: Instant::now(),
         ready_output: Some(output),
         cache_prompt: true,
         cache_generated: true,
@@ -199,4 +200,47 @@ fn constraint_attached_after_cache_restore_controls_the_head() {
     r.set_constraint(Box::new(Fixed)).unwrap();
     assert_eq!(cached_outputs(&mut [&mut r]).unwrap()[0].tokens, vec![1]);
     assert!(r.ready_output.is_none());
+}
+
+#[test]
+fn packet_order_finishes_cached_suffixes_before_cold_prompts_and_keeps_decoders_first() {
+    let mut long = request(output(), Default::default());
+    long.ready_output = None;
+    long.input = vec![7; 40_000];
+    long.offset = 0;
+    let mut suffix = request(output(), Default::default());
+    suffix.ready_output = None;
+    suffix.input = vec![8; 128_000];
+    suffix.offset = 127_740;
+    let mut decoder = request(output(), Default::default());
+    decoder.ready_output = None;
+    decoder.prefilling = false;
+    let mut cached = request(output(), Default::default());
+    assert_eq!(
+        packet::request_order(&[&mut long, &mut suffix, &mut decoder, &mut cached], 4000.),
+        vec![2, 1, 0]
+    );
+}
+
+#[test]
+fn packet_order_promotes_waiting_long_prompt_then_resets_on_progress() {
+    let mut long = request(output(), Default::default());
+    long.ready_output = None;
+    long.input = vec![7; 40_000];
+    long.offset = 0;
+    long.last_prefill = Instant::now() - std::time::Duration::from_secs(31);
+    let mut suffix = request(output(), Default::default());
+    suffix.ready_output = None;
+    suffix.input = vec![8; 128_000];
+    suffix.offset = 127_740;
+    assert_eq!(
+        packet::request_order(&[&mut long, &mut suffix], 4000.),
+        vec![0, 1]
+    );
+    long.offset += 800;
+    long.last_prefill = Instant::now();
+    assert_eq!(
+        packet::request_order(&[&mut long, &mut suffix], 4000.),
+        vec![1, 0]
+    );
 }

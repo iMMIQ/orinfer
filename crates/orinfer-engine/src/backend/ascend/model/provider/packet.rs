@@ -10,6 +10,43 @@ pub(super) struct Selection {
     pub prefill_rows: usize,
     pub prefill_requests: usize,
 }
+
+pub(super) fn request_order(requests: &[&mut Request], tokens_per_s: f64) -> Vec<usize> {
+    // Freeze ages before sorting: the same policy ranks waiting admissions and
+    // active prompt suffixes. Progress resets age, so long prompts can resume.
+    let now = Instant::now();
+    let mut order = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.is_finished() && r.ready_output.is_none())
+        .map(|(i, r)| {
+            let remaining = r.remaining_prefill_tokens();
+            (
+                i,
+                r.prefilling,
+                scheduler::Waiting {
+                    age_s: now.saturating_duration_since(r.last_prefill).as_secs_f64(),
+                    remaining_s: remaining as f64 / tokens_per_s,
+                    restore_s: 0.,
+                    startup_s: 0.,
+                    remaining_tokens: remaining,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    order.sort_unstable_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| {
+                if a.1 {
+                    scheduler::waiting_order(&a.2, &b.2)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then(a.0.cmp(&b.0))
+    });
+    order.into_iter().map(|(i, _, _)| i).collect()
+}
 impl Runtime {
     pub(super) fn select_packet(
         &self,
@@ -53,9 +90,11 @@ impl Runtime {
         let mut outputs = vec![];
         let mut selected = vec![];
         let keep = self.final_decoder_window();
+        let order = request_order(requests, self.prefill_tokens_per_s);
         // Existing decode rows precede bounded prefill work in a shared packet.
         for prefill in [false, true] {
-            for (i, request) in requests.iter().enumerate() {
+            for &i in &order {
+                let request = &requests[i];
                 if budget == 0
                     || request.is_finished()
                     || request.ready_output.is_some()
