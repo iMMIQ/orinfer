@@ -1,5 +1,6 @@
 //! Stable virtual addresses with separately charged, demand-mapped HBM pages.
 use super::*;
+use std::collections::BTreeMap;
 
 #[repr(C)]
 struct Location {
@@ -101,10 +102,10 @@ impl Reservation {
         }
         Ok(extent)
     }
-    fn grow(&mut self, bytes: usize) -> Result<()> {
+    fn map_growth(&mut self, bytes: usize) -> Result<Option<(Handle, usize)>> {
         let extent = self.extent(bytes)?;
         if extent <= self.mapped {
-            return Ok(());
+            return Ok(None);
         }
         self.context.ready()?;
         let additional = extent - self.mapped;
@@ -136,34 +137,21 @@ impl Reservation {
         let page = self.pages.last_mut().unwrap();
         // SAFETY: Offset is inside this retained virtual reservation; allocation has the same extent.
         let pointer = unsafe { self.address.cast::<u8>().add(page.offset).cast() };
-        let result = (|| {
+        let result: Result<()> = (|| {
             check(
                 // SAFETY: Retained aligned reservation and physical handle have identical extents.
                 unsafe { (self.api.map)(pointer, additional, 0, handle, 0) },
                 "map ACL physical pages",
             )?;
             page.mapped = true;
-            check(
-                // SAFETY: Newly mapped writable pages remain owned until this stream is fenced.
-                unsafe {
-                    (self.context.api.memset)(
-                        pointer,
-                        additional,
-                        0,
-                        additional,
-                        self.context.compute,
-                    )
-                },
-                "initialize ACL physical pages",
-            )?;
-            self.context.sync(self.context.compute)
+            Ok(())
         })();
         if result.is_err() {
             self.context.retire();
         }
         result?;
         self.mapped = extent;
-        Ok(())
+        Ok(Some((pointer, additional)))
     }
     fn clear(&mut self) -> Result<()> {
         let _current = self.context.enter()?;
@@ -258,16 +246,86 @@ impl Session {
         })
     }
     /// Prior readers complete before mapping changes; virtual addresses never change.
+    #[cfg(test)]
     pub(crate) fn grow(&self, buffer: &Buffer, bytes: usize) -> Result<()> {
-        self.require(buffer)?;
-        MemoryRange { offset: 0, bytes }.within(buffer.bytes())?;
-        if let Some(memory) = &buffer.allocation.virtual_memory
-            && buffer.growth_bytes(bytes)? != 0
-        {
-            self.synchronize()?;
-            memory.borrow_mut().grow(buffer.offset + bytes)?;
+        self.grow_many(&[(buffer.clone(), bytes)])
+    }
+    /// Map a validated growth set between two fences. All mappings precede
+    /// initialization, and every new byte is zero before returning to a caller.
+    pub(crate) fn grow_many(&self, buffers: &[(Buffer, usize)]) -> Result<()> {
+        let mut growth = BTreeMap::<usize, (Buffer, usize)>::new();
+        for (buffer, bytes) in buffers {
+            self.require(buffer)?;
+            MemoryRange {
+                offset: 0,
+                bytes: *bytes,
+            }
+            .within(buffer.bytes())?;
+            if buffer.growth_bytes(*bytes)? == 0 {
+                continue;
+            }
+            let end = buffer.offset + bytes;
+            growth
+                .entry(Rc::as_ptr(&buffer.allocation) as usize)
+                .and_modify(|(_, extent)| *extent = (*extent).max(end))
+                .or_insert((buffer.clone(), end));
         }
-        Ok(())
+        let additional = growth.values().try_fold(0usize, |sum, (buffer, end)| {
+            let memory = buffer.allocation.virtual_memory.as_ref().unwrap().borrow();
+            sum.checked_add(memory.extent(*end)? - memory.mapped)
+                .ok_or_else(|| "ACL demand growth extent overflow".to_string())
+        })?;
+        if additional == 0 {
+            return Ok(());
+        }
+        // The prior fence can release completion-owned temporary buffers.
+        // Check available capacity after those resources have been retired.
+        self.synchronize()?;
+        if additional > self.remaining_device_bytes() {
+            return Err("ACL demand growth exceeds remaining session budget".into());
+        }
+        let mut spans = Vec::with_capacity(growth.len());
+        for (buffer, end) in growth.values() {
+            let mapped = buffer
+                .allocation
+                .virtual_memory
+                .as_ref()
+                .unwrap()
+                .borrow_mut()
+                .map_growth(*end);
+            match mapped {
+                Ok(Some(span)) => spans.push(span),
+                Ok(None) => (),
+                Err(error) => {
+                    // A partially mapped batch has not been initialized. Retire
+                    // it rather than expose those bytes as committed growth.
+                    if !spans.is_empty() {
+                        self.context.retire();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let result = (|| {
+            let _current = self.context.enter()?;
+            for &(pointer, bytes) in &spans {
+                check(
+                    // SAFETY: Growth retains every mapped reservation through
+                    // this compute-stream initialization and its final fence.
+                    unsafe {
+                        (self.context.api.memset)(pointer, bytes, 0, bytes, self.context.compute)
+                    },
+                    "initialize ACL physical pages",
+                )?;
+            }
+            self.context.sync(self.context.compute)
+        })();
+        if result.is_err() {
+            // A failed fence cannot prove initialization completed. The normal
+            // reservation quarantine retains backing for any in-flight writes.
+            self.context.retire();
+        }
+        result
     }
     pub(crate) fn release_pages(&self, buffer: &Buffer) -> Result<()> {
         self.require(buffer)?;
@@ -363,4 +421,85 @@ mod tests {
         drop(session);
         fixture.assert_clean();
     }
+
+    #[test]
+    fn growth_batch_fences_once_and_keeps_history_and_disjoint_owners() {
+        let mut fixture = Fixture::new();
+        let session = fixture.session();
+        let grain = 2 << 20;
+        let first = session.reserve(grain * 3).unwrap();
+        let second = session.reserve(grain * 3).unwrap();
+        session.grow(&first, 1).unwrap();
+        let pending = session.upload(&first, 0, &[73]).unwrap();
+        let syncs = fixture.counter(12);
+        session
+            .grow_many(&[(first.clone(), grain + 3), (second.clone(), 17)])
+            .unwrap();
+        assert_eq!(fixture.counter(12) - syncs, 3);
+        assert_eq!(session.allocated_bytes(), 3 * grain);
+        assert_eq!(session.download(&first, 0, 1).unwrap(), [73]);
+        assert_eq!(session.download(&first, grain, 3).unwrap(), [0; 3]);
+        assert_eq!(session.download(&second, 0, 17).unwrap(), [0; 17]);
+        session.upload(&second, 0, &[91]).unwrap().wait().unwrap();
+        assert_eq!(session.download(&first, 0, 1).unwrap(), [73]);
+        let syncs = fixture.counter(12);
+        session.grow_many(&[(first.clone(), grain)]).unwrap();
+        assert_eq!(fixture.counter(12), syncs, "warm growth needs no fence");
+        drop((first, second, pending, session));
+        fixture.assert_clean();
+    }
+
+    #[test]
+    fn growth_batch_deduplicates_views_and_validates_the_whole_budget() {
+        let mut fixture = Fixture::new();
+        let session = fixture.session();
+        let grain = 2 << 20;
+        let first = session.reserve(grain * 3).unwrap();
+        let view = first.slice(grain, 17).unwrap();
+        session
+            .grow_many(&[
+                (first.clone(), 1),
+                (view.clone(), 17),
+                (first.clone(), grain),
+            ])
+            .unwrap();
+        assert_eq!(session.allocated_bytes(), 2 * grain);
+        let huge = session.reserve(256 << 20).unwrap();
+        assert!(session.grow_many(&[(huge.clone(), 256 << 20)]).is_err());
+        assert_eq!(session.allocated_bytes(), 2 * grain);
+        let other = fixture.session();
+        let foreign = other.reserve(grain).unwrap();
+        assert!(
+            session
+                .grow_many(&[(huge.clone(), 1), (foreign.clone(), 1)])
+                .is_err()
+        );
+        assert!(
+            session
+                .grow_many(&[(huge.clone(), 1), (first.clone(), 4 * grain)])
+                .is_err()
+        );
+        assert_eq!(session.allocated_bytes(), 2 * grain);
+        drop((first, view, huge, foreign, other, session));
+        fixture.assert_clean();
+    }
+
+    #[test]
+    fn growth_budget_reuses_backing_released_by_the_prior_fence() {
+        let mut fixture = Fixture::new();
+        let session = fixture.session();
+        let buffer = session.reserve(256 << 20).unwrap();
+        let temporary = session.allocate(2 << 20).unwrap();
+        let pending = session.upload(&temporary, 0, &[17]).unwrap();
+        drop(temporary);
+        assert_eq!(session.allocated_bytes(), 2 << 20);
+        session.grow_many(&[(buffer.clone(), 256 << 20)]).unwrap();
+        assert_eq!(session.allocated_bytes(), 256 << 20);
+        assert_eq!(session.download(&buffer, 0, 1).unwrap(), [0]);
+        drop((pending, buffer, session));
+        fixture.assert_clean();
+    }
 }
+
+#[cfg(test)]
+mod device_tests;

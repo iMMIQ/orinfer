@@ -115,11 +115,12 @@ impl Worker {
             self.reserve_batch_memory(Requirement::snapshot(additional)?, "KV growth")?;
         }
         let owner = self.batch.as_ref().unwrap().owners.get(&id).unwrap();
-        for (name, layout) in &self.growth {
-            self.session
-                .grow(&get(&owner.buffers, name)?, layout.extent(tokens)?)?;
-        }
-        Ok(())
+        let growth = self
+            .growth
+            .iter()
+            .map(|(name, layout)| Ok((get(&owner.buffers, name)?, layout.extent(tokens)?)))
+            .collect::<Result<Vec<_>>>()?;
+        self.session.grow_many(&growth)
     }
     pub(in crate::backend::ascend::model) fn grow_batch(&mut self, layout: &Layout) -> Result<()> {
         if layout.role == super::super::PacketRole::Draft {

@@ -10,7 +10,7 @@
 typedef struct { void *dst; const void *src; size_t n; int value, kind; void *stream; void *event; } Job;
 typedef struct { void *stream; int ready, capture_supported; } Event;
 static Job jobs[1024];
-static int count, counters[12], failure, stream_creates, capturing;
+static int count, counters[13], failure, stream_creates, capturing;
 static void *current;
 static char aot_contract[4096];
 void test_kernel_contract(const char *text) {
@@ -63,7 +63,7 @@ int aclrtCreateStream(void **p) {
     *p=malloc(1);counters[3]++;return 0;
 }
 int aclrtDestroyStream(void *p) { free(p);counters[3]--;return 0; }
-int aclrtSynchronizeStreamWithTimeout(void *s,int timeout) { (void)timeout;return flush(s); }
+int aclrtSynchronizeStreamWithTimeout(void *s,int timeout) { (void)timeout;counters[12]++;return flush(s); }
 int aclrtCreateEventWithFlag(void **p,uint32_t flag) {
     if(flag!=1)return 7;
     if(failure==13 && counters[2]>0)return 7;
