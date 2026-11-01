@@ -268,6 +268,10 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 
 A2 启用 DSpark 时，`scheduler_statistics.speculation` 同步发布模型级累计草稿、接受、提交计数及分段耗时。草稿、验证和恢复计时包含设备等待与结果回读，采样计时记录 CPU 验证与提交；各请求日志中的整包耗时不能跨请求直接累加。通过同一健康快照的计数差值分析稳定 decode 窗口。
 
+A2 的自动草稿验证预算保持在 target 首次启用跨 rank 行交换之前；执行包没有行交换时使用 target 容量。草稿深度与聚合验证行数共同决定执行计划，算子调优的行数分段共用该通信预算。`--max-speculative-tokens N` 显式指定其他预算。状态 journal 汇总本包各 owner 的保存或恢复拷贝，通过同一 stream 提交并统一等待完成。
+
+A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和 PV 计算体，支持每 rank 8/16/32/64 个 head，保留 FP32 softmax 与 BF16 probability 边界。`tools.model.deepseek_v41.fuse_attention --selected-int8 --min-rows N` 按实测聚合行数拆分已有 target 执行域，小行数保留原算子；草稿与普通 decode 沿用各自的计划选择。主干全行与 decoder 保留窗口分别绑定 work 表，在线只消费离线生成的计划。
+
 HTTP 在加载模型前绑定监听地址，端口被占用时立即退出；模型和预热完成后开始处理 HTTP。就绪探针使用 `/health` 的 HTTP 200，TCP 连通只表示监听地址已绑定。A2 全量常驻 CPU 表的启动可能需要数分钟，部署时为启动探针预留足够时间，例如 600 秒。正常退出及启动失败会清理本服务创建的 Unix socket；已有 socket 绑定失败时保留原文件。
 
 A2 rank 的命令使用一个共同的等待期限，`ORINFER_A2_COMMAND_TIMEOUT_MS` 默认 `30000`，支持 `1..1800000` 毫秒，同时设置 ACL 同步等待期限；初始模型加载单独允许 1800 秒。rank 驱动错误、线程退出或命令超时会使当前 TP 团队失效，保留首个故障的类型和驱动错误码，后续请求无法继续使用该团队。服务故障后由进程管理器重启；调整命令期限时也应相应配置 HTTP 和停机期限。

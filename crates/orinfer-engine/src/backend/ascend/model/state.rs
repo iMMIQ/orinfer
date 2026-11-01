@@ -668,11 +668,13 @@ impl Worker {
 
     /// Verification only overwrites windows and recurrent rings. Closed linear
     /// KV rows keep their bytes and become invisible when history is restored.
+    /// Append copies; the command submits all owner journals before verification.
     pub(super) fn save_mutable(
         &mut self,
         id: usize,
         rows: usize,
         previous: Option<Journal>,
+        copies: &mut Vec<(Buffer, usize, Buffer, usize, usize)>,
     ) -> Result<Journal> {
         if !(1..=crate::execution::MAX_MTP_DRAFTS + 1).contains(&rows) {
             return Err("Verification rows exceed the C2 ring capacity".into());
@@ -723,7 +725,6 @@ impl Worker {
         let address = bank.pointer() as usize;
         let base = address.div_ceil(256) * 256 - address;
         let mut pieces = vec![];
-        let mut copies = vec![];
         for (name, source, span, offset) in pending {
             let buffer = bank.slice(base + offset, span.len())?;
             copies.push((source, span.start, buffer.clone(), 0, span.len()));
@@ -735,7 +736,6 @@ impl Worker {
                 bank_bytes: bank.bytes(),
             });
         }
-        self.session.copy_many(&copies)?.wait()?;
         Ok(Journal {
             history,
             rows,
@@ -745,11 +745,13 @@ impl Worker {
         })
     }
 
+    /// Append rejected-suffix copies; the command waits once for all owners.
     pub(super) fn restore_mutable(
         &mut self,
         id: usize,
         snapshot: &Journal,
         keep: usize,
+        copies: &mut Vec<(Buffer, usize, Buffer, usize, usize)>,
     ) -> Result<()> {
         if !(1..=snapshot.rows).contains(&keep) {
             return Err("Invalid DSpark accepted input count".into());
@@ -761,7 +763,6 @@ impl Worker {
             .iter()
             .map(|(name, stride)| (name.clone(), keep * stride))
             .collect::<BTreeMap<_, _>>();
-        let mut copies = vec![];
         for piece in &snapshot.pieces {
             let skip = remaining.get_mut(&piece.name).map_or(0, |left| {
                 let count = (*left).min(piece.buffer.bytes());
@@ -777,9 +778,6 @@ impl Worker {
                     piece.buffer.bytes() - skip,
                 ));
             }
-        }
-        if !copies.is_empty() {
-            self.session.copy_many(&copies)?.wait()?;
         }
         let confirmed = snapshot
             .history

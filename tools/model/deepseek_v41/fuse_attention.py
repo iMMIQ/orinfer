@@ -1,4 +1,4 @@
-"""Fuse DSv4.1 prefill attention, including selected INT8 KV preparation."""
+"""Fuse shared DSv4.1 attention, including selected INT8 KV preparation."""
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
@@ -9,7 +9,87 @@ from pathlib import Path
 from tools.build.files import atomic_json
 
 
-def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
+def selected_chain(program, index, describe, contract):
+    """Consume the shared chain and its disjoint, same-output PV schedules."""
+    expected = [
+        "private_rows.kv_int8_gather_attention",
+        "private_rows.attention_cube_qk",
+        "private_rows.attention_cube_softmax",
+        "private_rows.attention_cube_pv",
+    ]
+    chain = program[index : index + 4]
+    specs = [describe(v) for v in chain]
+    if len(specs) != 4 or any(s is None for s in specs) or [s["op"] for s in specs] != expected:
+        raise ValueError("Require the original gather/QK/softmax/PV sequence")
+    first = chain[3]
+    pv = [first]
+    end = index + 4
+    while end < len(program):
+        candidate = program[end]
+        spec = describe(candidate)
+        if spec is None or spec["op"] != expected[3]:
+            break
+        if candidate["buffers"][1:] != first["buffers"][1:] or any(
+            spec["parameters"].get(k) != specs[3]["parameters"].get(k)
+            for k in ("rows", "heads", "selected", "dimension", "_owner_token_capacity")
+        ):
+            raise ValueError("PV schedules must share their physical output and reduction")
+        pv.append(candidate)
+        end += 1
+    capacity = specs[0]["parameters"]["_owner_token_capacity"]
+    ranges = contract.get("work_ranges", {})
+    target = ranges.get(chain[0]["buffers"][0], dict(min_rows=1, max_rows=capacity))
+    intervals = sorted(
+        (r["min_rows"], r["max_rows"])
+        for step in pv
+        for r in [ranges.get(step["buffers"][0], dict(min_rows=1, max_rows=capacity))]
+    )
+    cursor = target["min_rows"]
+    for low, high in intervals:
+        if low != cursor or high < low:
+            raise ValueError("PV owner schedules must cover the gather domain without overlap")
+        cursor = high + 1
+    if cursor != target["max_rows"] + 1:
+        raise ValueError("PV owner schedules do not cover the gather domain")
+    return chain[:3] + pv
+
+
+def selected_work_key(grid, partition, extent, decoder):
+    """Source and bounded-decoder domains coexist within one packet."""
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps([grid, partition, extent, decoder], sort_keys=True).encode()
+    ).hexdigest()[:16]
+
+
+def selected_packet_ranges(packets, minimum):
+    """Keep the measured small-row schedule within the existing target family."""
+    import copy
+
+    if minimum < 1:
+        raise ValueError("Selected attention requires a positive minimum row count")
+    result = []
+    for packet in packets:
+        low = packet.get("min_rows", 1)
+        high = packet.get("max_rows", packet["rows"])
+        if (
+            packet.get("role", "target") == "target"
+            and not packet.get("batch_decode", False)
+            and low < minimum <= high
+        ):
+            small = copy.deepcopy(packet)
+            small["max_rows"] = minimum - 1
+            packet = copy.deepcopy(packet)
+            packet["min_rows"] = minimum
+            result.append(small)
+        result.append(packet)
+    return result
+
+
+def build_selected(
+    plan, output, workers=4, minimum=512, grid_limit=64, softmax_heads=1, model_dir=None
+):
     """Fuse the existing private selected-KV chain without changing its views."""
     import hashlib
     import inspect
@@ -26,7 +106,7 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
     if output.exists() or grid_limit not in (8, 16, 32, 64):
         raise ValueError("Require a new output directory and a supported physical grid")
     model = json.loads(plan.read_text())
-    validate_rows(model, plan.parent)
+    validate_rows(model, plan.parent, model_dir=model_dir)
     base = output / "source"
     publish_package(model, plan.parent, base)
     contract = model["batch"]
@@ -52,6 +132,7 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
         "private_rows.attention_cube_pv",
     ]
     for rank in model["ranks"]:
+        rank["packets"] = selected_packet_ranges(rank["packets"], minimum)
         definitions = {v["name"]: v for v in rank["buffers"]}
 
         def buffer(name, size):
@@ -63,7 +144,7 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
                 raise ValueError("Fused table extent differs")
 
         for packet in rank["packets"]:
-            if packet.get("batch_decode") or packet.get("min_rows", 1) < minimum:
+            if packet.get("min_rows", 1) < minimum:
                 continue
             old, body, index, count = packet["body"], [], 0, 0
             while index < len(old):
@@ -72,17 +153,12 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
                     body.append(old[index])
                     index += 1
                     continue
-                chain = old[index : index + 4]
-                specs = [describe(v) for v in chain]
-                if (
-                    len(specs) != 4
-                    or any(s is None for s in specs)
-                    or [s["op"] for s in specs] != expected
-                ):
-                    raise ValueError("Require the original gather/QK/softmax/PV sequence")
-                g, q, s, p = [column_ids(v) for v in chain]
+                chain = selected_chain(old, index, describe, contract)
+                specs = [describe(v) for v in chain[:4]]
+                g, q, s, p = [column_ids(v) for v in chain[:4]]
                 gp, qp, sp, pp = [v["parameters"] for v in specs]
-                if qp["heads"] != 64:
+                heads = qp["heads"]
+                if heads not in (8, 16, 32, 64):
                     body.append(old[index])
                     index += 1
                     continue
@@ -93,22 +169,20 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
                 ):
                     raise ValueError("Unexpected shared attention inputs")
                 capacities = {v["parameters"]["_owner_token_capacity"] for v in specs}
-                if len(capacities) != 1 or sp["heads"] != 64 or pp["heads"] != 64:
+                if len(capacities) != 1 or sp["heads"] != heads or pp["heads"] != heads:
                     raise ValueError("Attention owner geometries differ")
                 capacity = capacities.pop()
+                partition = contract.get("partitioned_tables", {}).get(chain[0]["buffers"][0])
+                if partition not in (None, peers):
+                    raise ValueError("Unsupported query partitioning")
                 for step in chain:
                     role = step["buffers"][0]
-                    if contract.get("partitioned_tables", {}).get(role) != peers:
+                    if contract.get("partitioned_tables", {}).get(role) != partition:
                         raise ValueError("Selected fusion requires common query partitioning")
-                    extent = contract.get("work_ranges", {}).get(role)
-                    if extent and extent != dict(min_rows=1, max_rows=capacity):
-                        raise ValueError(
-                            "Fuse measured owner schedule ranges before this transform"
-                        )
                 arguments = {
                     k: v for k, v in gp.items() if not k.startswith("_") and k != "bulk_store"
                 }
-                arguments.update(rows=capacity, heads=64)
+                arguments.update(rows=capacity, heads=heads, softmax_heads=softmax_heads)
                 identity = json.dumps(arguments, sort_keys=True)
                 if identity not in prototypes:
                     function = selected_int8(**dict(arguments, rows=row_count(capacity, True)))
@@ -155,7 +229,7 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
                             operand("OwnerWork", "i32", [8192, 2]),
                             operand("OwnerPointers", "u64", [contract["owners"], len(columns) + 1]),
                             operand("PacketActive", "i32", [1]),
-                            operand("sink", "f32", [64]),
+                            operand("sink", "f32", [heads]),
                         ],
                     )
                     tasks[identity] = task
@@ -196,13 +270,29 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
                     ids.append(roles[name])
                 digest = hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]
                 pointer = "batch.selected_attention.pointers." + digest
-                work_digest = hashlib.sha256(
-                    json.dumps([grid, peers], sort_keys=True).encode()
-                ).hexdigest()[:16]
+                replay = contract.get("decoder_replay")
+                decoder = bool(
+                    replay
+                    and any(name in replay["tables"] for v in chain for name in v["buffers"][:2])
+                )
+                work_digest = selected_work_key(
+                    grid,
+                    partition,
+                    contract.get("work_ranges", {}).get(chain[0]["buffers"][0]),
+                    decoder,
+                )
                 work = "batch.selected_attention.work." + work_digest
                 contract["pointers"][pointer] = ids
                 contract["work"][work] = grid
-                contract.setdefault("partitioned_tables", {}).update({pointer: peers, work: peers})
+                if partition is not None:
+                    contract.setdefault("partitioned_tables", {}).update(
+                        {pointer: partition, work: partition}
+                    )
+                extent = contract.get("work_ranges", {}).get(chain[0]["buffers"][0])
+                if extent:
+                    contract.setdefault("work_ranges", {})[work] = dict(extent)
+                if decoder:
+                    replay["tables"] = sorted(set(replay["tables"]) | {work, pointer})
                 buffer(pointer, contract["owners"] * (len(ids) + 1) * 8)
                 buffer(work, 8192 * 2 * 4)
                 body.append(
@@ -213,11 +303,11 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
                         buffers=[work, pointer, contract["active"], chain[2]["buffers"][3]],
                     )
                 )
-                index += 4
+                index += len(chain)
                 count += 1
                 changed += 1
-            if count not in (0, 40):
-                raise ValueError("Fused packet must cover all 40 attention layers")
+            if count not in (0, 3, 40):
+                raise ValueError("Fused packet must cover the complete target or draft layer stack")
             packet["body"] = body
     if not changed:
         raise ValueError("No selected private attention packet matched")
@@ -242,7 +332,12 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
         n: v for n, v in contract.get("work_ranges", {}).items() if n in live_work
     }
     compact_buffers(model, owner_tables=True)
-    validate_rows(model, base)
+    if "decoder_replay" in contract:
+        live = set(contract["work"]) | set(contract["pointers"])
+        contract["decoder_replay"]["tables"] = sorted(
+            set(contract["decoder_replay"]["tables"]) & live
+        )
+    validate_rows(model, base, model_dir=model_dir)
     assets = publish_package(model, base, output / "package")
     report = dict(
         changed_chains=changed,
@@ -258,7 +353,9 @@ def build_selected(plan, output, workers=4, minimum=512, grid_limit=64):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--selected-int8", action="store_true")
+    parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--grid-limit", type=int, choices=(8, 16, 32, 64), default=64)
+    parser.add_argument("--softmax-heads", type=int, choices=(1, 4, 8), default=1)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tile-m", type=int, choices=[16, 32, 64], default=32)
@@ -268,7 +365,7 @@ def main():
         "--min-rows",
         type=int,
         default=2,
-        help="Select packets whose declared minimum row count is at least this value",
+        help="Fuse rows from this measured boundary; retain smaller target rows in the same family",
     )
     parser.add_argument("--compile-workers", type=int, default=3)
     args = parser.parse_args()
@@ -276,7 +373,13 @@ def main():
         print(
             json.dumps(
                 build_selected(
-                    args.plan, args.output, args.compile_workers, args.min_rows, args.grid_limit
+                    args.plan,
+                    args.output,
+                    args.compile_workers,
+                    args.min_rows,
+                    args.grid_limit,
+                    args.softmax_heads,
+                    args.model_dir,
                 )
             )
         )

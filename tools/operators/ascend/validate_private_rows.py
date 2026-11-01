@@ -34,6 +34,8 @@ def main():
     p.add_argument("--benchmark-rows", type=int, nargs="+", help="Measure single-owner PV lengths")
     p.add_argument("--kv-compressed", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--bulk-store", action="store_true")
+    p.add_argument("--long-selected", type=int, choices=(128, 512), default=512)
+    p.add_argument("--softmax-heads", type=int, choices=(1, 4, 8), default=1)
     p.add_argument("--staged-swa", action="store_true")
     p.add_argument(
         "--reuse-long", action="store_true", help="Check full gather then SWA-only reuse"
@@ -147,12 +149,14 @@ def main():
                     tile_slots=tile,
                     reuse_long=a.reuse_long,
                     staged_swa=a.staged_swa,
+                    softmax_heads=a.softmax_heads,
+                    long_selected=a.long_selected,
                 ),
             )
             for compressed in (False, True)
             for tile in a.kv_slot_tiles
             for heads in a.attention_heads
-            if heads in (16, 32, 64)
+            if heads in (8, 16, 32, 64)
         ],
         (attention_prefill, "qk", dict(rows=capacity, capacity=256, compressed=False)),
         (attention_prefill, "pv", dict(rows=capacity, capacity=256, compressed=False)),
@@ -257,7 +261,86 @@ def main():
             fn.restype = ctypes.c_int32
             entries.append((lib, fn))
 
+        reference_pipeline = []
+        if name == "selected_int8" and not a.staged_swa:
+            selected = 128 + params["long_selected"] if params["compressed"] else 128
+            stages = [
+                (
+                    kv_int8,
+                    "gather_attention",
+                    {
+                        k: v
+                        for k, v in reference_params.items()
+                        if k
+                        in (
+                            "rows",
+                            "capacity",
+                            "compressed_capacity",
+                            "compressed",
+                            "swa_storage_rows",
+                            "reuse_long",
+                            "long_selected",
+                        )
+                    },
+                ),
+                (
+                    attention_cube,
+                    "qk",
+                    dict(rows=capacity, heads=params["heads"], selected=selected),
+                ),
+                (
+                    attention_cube,
+                    "softmax",
+                    dict(rows=capacity, heads=params["heads"], selected=selected),
+                ),
+                (
+                    attention_cube,
+                    "pv",
+                    dict(rows=capacity, heads=params["heads"], selected=selected),
+                ),
+            ]
+            mapping = dict(
+                out="kv_workspace",
+                mask="mask_workspace",
+                indices="mask_workspace",
+                kv="kv_workspace",
+                scores="score_workspace",
+                probabilities="probability_workspace",
+                workspace="output_workspace",
+            )
+            names = {t.name: i for i, t in enumerate(tensors)}
+            for mod, op, arguments in stages:
+                primitive = getattr(mod, op)(**dict(arguments, rows=row_count(capacity, True)))
+                operands = [
+                    primitive.buffer_map[v] for v in primitive.params if v in primitive.buffer_map
+                ]
+                slots = [names[mapping.get(t.name, t.name)] for t in operands]
+                path = compile_kernel(
+                    primitive,
+                    mod.__name__.split(".")[-1] + "." + op,
+                    [dict(specs[i], name=t.name) for t, i in zip(operands, slots, strict=True)],
+                    arguments,
+                    a.output / "cache",
+                    row_capacity=capacity,
+                )
+                lib = ctypes.CDLL(str((path.parent / "kernel.so").resolve()))
+                fn = lib.orinfer_ascend_kernel_v2
+                fn.argtypes = entries[0][1].argtypes
+                fn.restype = ctypes.c_int32
+                reference_pipeline.append((lib, fn, slots))
+
         def call(index, values, rows):
+            if index == 0 and reference_pipeline:
+                for _, entry, slots in reference_pipeline:
+                    pointers = (ctypes.c_void_p * len(slots))(
+                        *[values[i].data_ptr() for i in slots]
+                    )
+                    status = entry(
+                        pointers, len(slots), rows, torch.npu.current_stream()._as_parameter_
+                    )
+                    if status:
+                        raise RuntimeError(f"Selected attention reference status {status}")
+                return
             pointers = (ctypes.c_void_p * len(values))(*[x.data_ptr() for x in values])
             status = entries[index][1](
                 pointers, len(values), rows, torch.npu.current_stream()._as_parameter_
@@ -544,6 +627,15 @@ def main():
                             # Padded scratch rows do not carry semantic values.
                             continue
                         actual_cpu, expected_cpu = value.cpu(), want.cpu()
+                        if name == "selected_int8" and tensor.name in (
+                            "score_workspace",
+                            "probability_workspace",
+                            "output_workspace",
+                        ):
+                            # Padded Cube heads have no semantic values. Keep checking
+                            # every live head, including untouched rows after the tail.
+                            actual_cpu = actual_cpu[:, : params["heads"]]
+                            expected_cpu = expected_cpu[:, : params["heads"]]
                         if not torch.equal(actual_cpu, expected_cpu):
                             print(
                                 dict(

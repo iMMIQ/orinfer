@@ -359,6 +359,7 @@ def selected_int8(
     reuse_long=False,
     staged_swa=False,
     softmax_heads=1,
+    long_selected=512,
 ):
     """One paired-core selected-KV gather/QK/softmax/PV invocation per query.
 
@@ -369,12 +370,15 @@ def selected_int8(
     from tools.operators.ascend.attention_cube import softmax_row, softmax_head_tile
     from tools.operators.ascend.kv_int8 import gather_tile
 
-    selected = 640 if compressed else 128
+    selected = 128 + long_selected if compressed else 128
     storage = swa_storage_rows or capacity
-    if heads not in (16, 32, 64) or tile_slots not in (1, 4, 8, 16):
-        raise ValueError("Fused selected attention requires H16/32/64 and legal KV slot tiles")
+    if heads not in (8, 16, 32, 64) or tile_slots not in (1, 4, 8, 16):
+        raise ValueError("Fused selected attention requires H8/16/32/64 and legal KV slot tiles")
     if not 128 <= storage <= capacity or (reuse_long and not compressed):
         raise ValueError("Invalid selected attention cache/reuse geometry")
+    if long_selected not in (128, 512):
+        raise ValueError("Selected long KV must contain128or512slots")
+    padded_heads = (heads + 15) // 16 * 16
     dimension, tile_k, tile_d = 512, 128, 128
     half_heads, decode_groups = heads // 2, tile_slots * 8
     if softmax_heads not in (1, 4, 8) or half_heads % softmax_heads:
@@ -427,12 +431,12 @@ def selected_int8(
             row = cid
             if row < rows:
                 with T.Scope("C"):
-                    query_l1 = T.alloc_L1((heads, dimension), "bfloat16")
+                    query_l1 = T.alloc_L1((padded_heads, dimension), "bfloat16")
                     key_l1 = T.alloc_L1((tile_k, dimension), "bfloat16")
-                    probability_l1 = T.alloc_L1((heads, selected), "bfloat16")
+                    probability_l1 = T.alloc_L1((padded_heads, selected), "bfloat16")
                     value_l1 = T.alloc_L1((selected, tile_d), "bfloat16")
-                    acc = T.alloc_L0C((heads, 128), "float32")
-                    T.copy(query[row, :, :], query_l1)
+                    acc = T.alloc_L0C((padded_heads, 128), "float32")
+                    T.copy(query[row, :, :], query_l1[:heads, :])
                     T.wait_cross_flag(0)
                     for slot in T.serial(selected // tile_k):
                         T.copy(kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :], key_l1)
@@ -440,7 +444,7 @@ def selected_int8(
                         T.copy(acc, score_workspace[row, :, slot * 128 : (slot + 1) * 128])
                     T.set_cross_flag("FIX", 1)
                     T.wait_cross_flag(2)
-                    T.copy(probability_workspace[row, :, :], probability_l1)
+                    T.copy(probability_workspace[row, :heads, :], probability_l1[:heads, :])
                     for d in T.serial(dimension // tile_d):
                         T.copy(kv_workspace[row, :, d * tile_d : (d + 1) * tile_d], value_l1)
                         T.gemm_v0(probability_l1, value_l1, acc, init=True, kL0Size=128)
@@ -584,14 +588,14 @@ def selected_int8(
             long_kv: T.Tensor((compressed_capacity, 8, 64), "int8"),
             long_scales: T.Tensor((compressed_capacity, 8), "float16"),
             swa_indices: T.Tensor((rows, 128), "int32"),
-            long_indices: T.Tensor((rows, 512), "int32"),
+            long_indices: T.Tensor((rows, long_selected), "int32"),
             sink: T.Tensor((heads,), "float32"),
             output: T.Tensor((rows, heads, dimension), "bfloat16"),
             kv_workspace: T.Tensor((rows, selected, dimension), "bfloat16"),
             mask_workspace: T.Tensor((rows, selected), "int32"),
-            score_workspace: T.Tensor((rows, heads, selected), "float32"),
-            probability_workspace: T.Tensor((rows, heads, selected), "bfloat16"),
-            output_workspace: T.Tensor((rows, heads, dimension), "float32"),
+            score_workspace: T.Tensor((rows, padded_heads, selected), "float32"),
+            probability_workspace: T.Tensor((rows, padded_heads, selected), "bfloat16"),
+            output_workspace: T.Tensor((rows, padded_heads, dimension), "float32"),
             staged_swa_cache: T.Tensor((storage, 8, 64), "bfloat16"),
         ):
             run(
@@ -621,14 +625,14 @@ def selected_int8(
             long_kv: T.Tensor((compressed_capacity, 8, 64), "int8"),
             long_scales: T.Tensor((compressed_capacity, 8), "float16"),
             swa_indices: T.Tensor((rows, 128), "int32"),
-            long_indices: T.Tensor((rows, 512), "int32"),
+            long_indices: T.Tensor((rows, long_selected), "int32"),
             sink: T.Tensor((heads,), "float32"),
             output: T.Tensor((rows, heads, dimension), "bfloat16"),
             kv_workspace: T.Tensor((rows, selected, dimension), "bfloat16"),
             mask_workspace: T.Tensor((rows, selected), "int32"),
-            score_workspace: T.Tensor((rows, heads, selected), "float32"),
-            probability_workspace: T.Tensor((rows, heads, selected), "bfloat16"),
-            output_workspace: T.Tensor((rows, heads, dimension), "float32"),
+            score_workspace: T.Tensor((rows, padded_heads, selected), "float32"),
+            probability_workspace: T.Tensor((rows, padded_heads, selected), "bfloat16"),
+            output_workspace: T.Tensor((rows, padded_heads, dimension), "float32"),
         ):
             run(
                 query,

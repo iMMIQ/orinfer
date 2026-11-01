@@ -50,11 +50,18 @@ impl Runtime {
             .iter()
             .map(|&i| &requests[i].draft_feedback)
             .collect::<Vec<_>>();
+        // Keep automatic verification below the first cross-rank row exchange.
+        // Operator tuning may split that communication domain into smaller ranges.
+        let row_budget = if options.max_speculative_tokens == 0 {
+            self.team.verification_rows
+        } else {
+            options.max_speculative_tokens
+        };
         let depths = self.speculation_policy.select_requests(
             full,
             mixed,
             Budget {
-                rows: options.max_speculative_tokens,
+                rows: row_budget,
                 uniform,
                 remaining: indices
                     .iter()

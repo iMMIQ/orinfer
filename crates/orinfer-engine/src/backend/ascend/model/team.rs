@@ -94,6 +94,7 @@ pub(super) struct Team {
     pub model: Arc<Model>,
     pub load_s: f64,
     pub rows: usize,
+    pub verification_rows: usize,
     pub draft_blocks: Vec<usize>,
     pub strided_draft: bool,
     // Drop worker contexts and communication groups before the bootstrap context.
@@ -145,6 +146,18 @@ impl Team {
             .map(|p| p.rows)
             .max()
             .ok_or("Missing A2 prefill rows")?;
+        let verification_rows = model.ranks[0]
+            .packets
+            .iter()
+            .filter(|p| p.role == super::PacketRole::Target && !p.batch_decode)
+            .filter(|p| {
+                p.body
+                    .iter()
+                    .any(|step| matches!(step, super::Instruction::Exchange { .. }))
+            })
+            .map(|p| p.min_rows.saturating_sub(1))
+            .min()
+            .unwrap_or(rows);
         let timeout = channel::command_timeout(
             std::env::var("ORINFER_A2_COMMAND_TIMEOUT_MS")
                 .ok()
@@ -163,6 +176,7 @@ impl Team {
             model: Arc::clone(&model),
             load_s: 0.,
             rows,
+            verification_rows,
             draft_blocks,
             strided_draft,
             _bootstrap: Some(bootstrap),
@@ -229,6 +243,7 @@ impl Team {
                             Command::Stop => break,
                             Command::BeginVerification(owners) => {
                                 journal.clear();
+                                let mut copies = vec![];
                                 owners
                                     .into_iter()
                                     .try_for_each(|(id, rows)| {
@@ -238,22 +253,39 @@ impl Team {
                                                 id,
                                                 rows,
                                                 journal_pool.remove(&id),
+                                                &mut copies,
                                             )?,
                                         );
                                         Ok(())
                                     })
-                                    .map(|_| Reply::Ready)
+                                    .and_then(|_| {
+                                        if !copies.is_empty() {
+                                            worker.session.copy_many(&copies)?.wait()?;
+                                        }
+                                        Ok(Reply::Ready)
+                                    })
                             }
-                            Command::RollbackVerification(owners) => owners
-                                .into_iter()
-                                .try_for_each(|(id, keep)| {
-                                    worker.restore_mutable(
-                                        id,
-                                        journal.get(&id).ok_or("Missing DSpark state journal")?,
-                                        keep,
-                                    )
-                                })
-                                .map(|_| Reply::Ready),
+                            Command::RollbackVerification(owners) => {
+                                let mut copies = vec![];
+                                owners
+                                    .into_iter()
+                                    .try_for_each(|(id, keep)| {
+                                        worker.restore_mutable(
+                                            id,
+                                            journal
+                                                .get(&id)
+                                                .ok_or("Missing DSpark state journal")?,
+                                            keep,
+                                            &mut copies,
+                                        )
+                                    })
+                                    .and_then(|_| {
+                                        if !copies.is_empty() {
+                                            worker.session.copy_many(&copies)?.wait()?;
+                                        }
+                                        Ok(Reply::Ready)
+                                    })
+                            }
                             Command::EndVerification => {
                                 journal_pool.append(&mut journal);
                                 Ok(Reply::Ready)
