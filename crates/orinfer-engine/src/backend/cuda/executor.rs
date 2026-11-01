@@ -169,7 +169,6 @@ pub(crate) struct Executor {
     pub(crate) live_graph_events: std::cell::Cell<Option<[sys::CUevent; 2]>>,
     #[cfg(test)]
     pub(crate) live_graph_ms: RefCell<Vec<f32>>,
-    pub(crate) snapshot_allocations: Vec<std::rc::Rc<super::snapshot::Allocation>>,
     pub(super) live_workspace: Option<(usize, std::rc::Weak<RefCell<super::snapshot::Workspace>>)>,
     pub(crate) workspace_save_s: f64,
     pub(crate) workspace_restore_s: f64,
@@ -791,7 +790,6 @@ impl Executor {
             total_bytes: total,
         };
         let executor = Self {
-            snapshot_allocations: vec![],
             row_kernel_slots: manifest
                 .row_execution
                 .as_ref()

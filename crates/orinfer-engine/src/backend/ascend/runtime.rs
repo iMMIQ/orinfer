@@ -1,4 +1,5 @@
 //! Owned CANN resources. Every asynchronous submission retains its storage.
+mod host_transfer;
 mod virtual_memory;
 use super::{
     DriverLease, acquire,
@@ -646,6 +647,13 @@ impl Session {
     pub fn upload(&self, buffer: &Buffer, offset: usize, data: &[u8]) -> Result<Ticket> {
         self.require(buffer)?;
         let destination = buffer.range(offset, data.len())?;
+        self.make_kv_writable(&[(
+            buffer.clone(),
+            MemoryRange {
+                offset,
+                bytes: data.len(),
+            },
+        )])?;
         self.reap()?;
         let host = self.pinned(data.len())?;
         // SAFETY: The pinned lease is exclusive and spans data.len().
@@ -708,12 +716,24 @@ impl Session {
     /// owns its DMA backing; pressure waits for the oldest submitted upload.
     /// Compute-stream order protects earlier readers of reused device inputs.
     pub(super) fn upload_inputs(&self, inputs: &[(Buffer, Vec<u8>)]) -> Result<Ticket> {
-        let mut bytes = 0usize;
         for (buffer, data) in inputs {
-            self.require(buffer)?;
             if data.len() != buffer.bytes() {
                 return Err("Model input upload byte extent differs".into());
             }
+        }
+        self.upload_regions(
+            &inputs
+                .iter()
+                .map(|(b, d)| (b.clone(), 0, d.as_slice()))
+                .collect::<Vec<_>>(),
+        )
+    }
+    /// Upload borrowed regions in compute order, retaining only bounded pinned slabs.
+    pub(super) fn upload_regions(&self, inputs: &[(Buffer, usize, &[u8])]) -> Result<Ticket> {
+        let mut bytes = 0usize;
+        for (buffer, offset, data) in inputs {
+            self.require(buffer)?;
+            buffer.range(*offset, data.len())?;
             bytes = bytes
                 .checked_add(data.len())
                 .ok_or("Input upload overflow")?;
@@ -721,6 +741,19 @@ impl Session {
         if bytes == 0 {
             return Err("Model input upload is empty".into());
         }
+        let writes = inputs
+            .iter()
+            .map(|(buffer, offset, data)| {
+                (
+                    buffer.clone(),
+                    MemoryRange {
+                        offset: *offset,
+                        bytes: data.len(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        self.make_kv_writable(&writes)?;
         let capacity = (4 << 20).min(self.context.limits.pinned_bytes);
         // Weight loading can leave idle 8 MiB leases. Do not retain that
         // physical capacity for each small input slab queued behind compute.
@@ -735,7 +768,7 @@ impl Session {
             let mut pieces = vec![];
             let mut written = 0;
             while written < size {
-                let (buffer, data) = &inputs[index];
+                let (buffer, destination_offset, data) = &inputs[index];
                 let count = (data.len() - offset).min(size - written);
                 // SAFETY: The exclusive slab and source span were checked;
                 // every caller-owned byte is copied before returning.
@@ -746,7 +779,7 @@ impl Session {
                         count,
                     );
                 }
-                pieces.push((buffer.clone(), offset, written, count));
+                pieces.push((buffer.clone(), destination_offset + offset, written, count));
                 written += count;
                 offset += count;
                 if offset == data.len() {
@@ -821,6 +854,13 @@ impl Session {
     }
     pub fn fill(&self, buffer: &Buffer, value: u8) -> Result<Ticket> {
         self.require(buffer)?;
+        self.make_kv_writable(&[(
+            buffer.clone(),
+            MemoryRange {
+                offset: 0,
+                bytes: buffer.bytes(),
+            },
+        )])?;
         self.submit(
             self.context.compute,
             Retained {
@@ -890,6 +930,19 @@ impl Session {
             spans.push((src, dst, *bytes));
             buffers.extend([source.clone(), destination.clone()]);
         }
+        let writes = copies
+            .iter()
+            .map(|(_, _, b, offset, bytes)| {
+                (
+                    b.clone(),
+                    MemoryRange {
+                        offset: *offset,
+                        bytes: *bytes,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        self.make_kv_writable(&writes)?;
         self.submit(
             self.context.compute,
             Retained {

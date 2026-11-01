@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub(super) struct Context {
-    pub kv: Vec<crate::backend::snapshot::Piece>,
     pub statistics: crate::prefix::Statistics,
 }
 
@@ -98,27 +97,46 @@ impl ModelRuntime {
         input: &[u32],
         images: &[crate::vision::ImageInput],
     ) -> Result<(usize, usize)> {
-        if self.prefix_cache.budget == 0 {
+        if !self.prefix_enabled() {
             return Ok((0, 0));
         }
         let media = self.prefix_media(input, images, &[])?;
         Ok(self.prefix_match_media(input, &media))
     }
     pub(super) fn prefix_match_media(&self, input: &[u32], media: &Media) -> (usize, usize) {
-        if self.prefix_cache.budget == 0 {
+        if !self.prefix_enabled() {
             return (0, 0);
         }
-        self.prefix_cache
-            .match_prefix_by(input, media, |e| {
-                self.prefill_costs
-                    .score(e.tokens.len(), input.len(), e.bytes)
-            })
-            .checkpoint
-            .map(|id| {
-                let entry = &self.prefix_cache.entries[&id];
-                (entry.tokens.len(), entry.bytes)
+        self.prefix_hit(input, media)
+            .map(|(host, id)| {
+                if host {
+                    let e = &self.host_prefix_cache.entries[&id];
+                    (e.tokens.len(), e.bytes)
+                } else {
+                    let e = &self.prefix_cache.entries[&id];
+                    (e.tokens.len(), e.bytes)
+                }
             })
             .unwrap_or((0, 0))
+    }
+    pub(crate) fn prefix_enabled(&self) -> bool {
+        self.prefix_cache.budget > 0 || self.host_prefix_cache.budget > 0
+    }
+    fn prefix_hit(&self, input: &[u32], media: &Media) -> Option<(bool, u64)> {
+        crate::prefix::match_tiers(
+            &self.prefix_cache,
+            &self.host_prefix_cache,
+            input,
+            media,
+            |e| {
+                self.prefill_costs
+                    .score(e.tokens.len(), input.len(), e.bytes)
+            },
+            |e| {
+                self.prefill_costs
+                    .score(e.tokens.len(), input.len(), e.bytes)
+            },
+        )
     }
     pub(super) fn restore_prefix(
         &mut self,
@@ -127,33 +145,41 @@ impl ModelRuntime {
         context: &mut Context,
     ) -> Result<(usize, super::speculation::PrefillWarm)> {
         context.statistics = crate::prefix::Statistics::default();
-        context.kv.clear();
         self.execution.collect_snapshots()?;
-        if self.prefix_cache.budget == 0 {
-            return Ok((0, super::speculation::PrefillWarm::default()));
-        }
         let at = Instant::now();
-        let matched = self.prefix_cache.match_prefix_by(input, media, |e| {
-            self.prefill_costs
-                .score(e.tokens.len(), input.len(), e.bytes)
-        });
+        let hit = self.prefix_hit(input, media);
+        let device_match = self
+            .prefix_cache
+            .match_prefix_by(input, media, |_| None)
+            .matched_tokens;
+        let host_match = self
+            .host_prefix_cache
+            .match_prefix_by(input, media, |_| None)
+            .matched_tokens;
+        context.statistics.matched_tokens = device_match.max(host_match);
         context.statistics.lookup_s = at.elapsed().as_secs_f64();
-        context.statistics.matched_tokens = matched.matched_tokens;
-        let Some(id) = matched.checkpoint else {
+        let Some((host, id)) = hit else {
             return Ok((0, super::speculation::PrefillWarm::default()));
         };
-        let entry = self.prefix_cache.touch(id);
         let at = Instant::now();
-        self.execution.restore_snapshot(&entry.snapshot)?;
-        context.kv.clone_from(&entry.snapshot.kv);
-        context.statistics.cached_tokens = entry.tokens.len();
+        let (tokens, warm, bytes) = if host {
+            let e = self.host_prefix_cache.touch(id);
+            self.execution.restore_host_snapshot(&e.snapshot)?;
+            context.statistics.host_hits += 1;
+            (e.tokens.len(), e.warm_tokens, e.bytes)
+        } else {
+            let e = self.prefix_cache.touch(id);
+            self.execution.restore_snapshot(&e.snapshot)?;
+            (e.tokens.len(), e.warm_tokens, e.bytes)
+        };
+        context.statistics.cached_tokens = tokens;
         context.statistics.restore_s = at.elapsed().as_secs_f64();
         self.prefill_costs
-            .observe_restore(entry.bytes, context.statistics.restore_s);
+            .observe_restore(bytes, context.statistics.restore_s);
         Ok((
-            entry.tokens.len(),
+            tokens,
             super::speculation::PrefillWarm {
-                tokens: entry.warm_tokens,
+                tokens: warm,
                 seconds: 0.0,
             },
         ))
@@ -167,10 +193,17 @@ impl ModelRuntime {
         reused: bool,
     ) -> Result<bool> {
         let bytes = self.prefix_ranges(prefix)?.values().map(|r| r.bytes).sum();
-        Ok(bytes <= self.prefix_cache.budget
-            && self
-                .prefill_costs
-                .admit_with_reuse(prefix, end, bytes, start, checkpoints, reused))
+        Ok(
+            bytes <= self.prefix_cache.budget.max(self.host_prefix_cache.budget)
+                && self.prefill_costs.admit_with_reuse(
+                    prefix,
+                    end,
+                    bytes,
+                    start,
+                    checkpoints,
+                    reused,
+                ),
+        )
     }
     pub(super) fn prefix_ranges(&self, tokens: usize) -> Result<BTreeMap<String, Range>> {
         let m = &self.manifest;
@@ -254,7 +287,7 @@ impl ModelRuntime {
         context: &mut Context,
     ) -> Result<()> {
         let at = Instant::now();
-        if self.prefix_cache.budget != 0
+        if self.prefix_enabled()
             && self.manifest.mtp.is_some()
             && (input.is_empty() || warm_tokens != input.len() - 1)
         {
@@ -264,8 +297,12 @@ impl ModelRuntime {
             e.tokens == input
                 && e.media.common_tokens(media, input.len()) == input.len()
                 && (!logits_valid || e.logits_valid)
+        }) || self.host_prefix_cache.entries.values().any(|e| {
+            e.tokens == input
+                && e.media.common_tokens(media, input.len()) == input.len()
+                && (!logits_valid || e.logits_valid)
         });
-        if self.prefix_cache.budget != 0
+        if self.prefix_enabled()
             && !same
             && self
                 .manifest
@@ -282,7 +319,7 @@ impl ModelRuntime {
             let minimum = ranges.values().try_fold(0usize, |n, r| {
                 n.checked_add(r.bytes).ok_or("Prefix size overflow")
             })?;
-            if minimum > self.prefix_cache.budget {
+            if minimum > self.prefix_cache.budget.max(self.host_prefix_cache.budget) {
                 context.statistics.store_s += at.elapsed().as_secs_f64();
                 self.update_prefix_usage(context);
                 return Ok(());
@@ -293,9 +330,7 @@ impl ModelRuntime {
                 .as_ref()
                 .map(|k| k.buffers.keys().cloned().collect())
                 .unwrap_or_default();
-            let plan = self
-                .execution
-                .plan_snapshot(ranges, &kv_names, &context.kv)?;
+            let plan = self.execution.plan_snapshot(ranges, &kv_names)?;
             let protected = (!logits_valid)
                 .then(|| {
                     self.prefix_cache
@@ -311,6 +346,7 @@ impl ModelRuntime {
                 entry.snapshot.allocations(&mut retained);
             }
             if retained.values().sum::<usize>() + plan.new_bytes > self.prefix_cache.budget {
+                self.store_host_prefix(input, media, warm_tokens, logits_valid, &plan, context)?;
                 context.statistics.store_s += at.elapsed().as_secs_f64();
                 self.update_prefix_usage(context);
                 return Ok(());
@@ -320,22 +356,17 @@ impl ModelRuntime {
             while self.prefix_cache.resident_with(Some(&plan)) + plan.new_bytes
                 > self.prefix_cache.budget
             {
-                let old = self
-                    .prefix_cache
-                    .evict_one_except(protected)
-                    .ok_or("Prefix budget planning failure")?;
-                context.statistics.evictions += 1;
-                self.execution.release_snapshot(old)?;
+                if !self.evict_prefix(protected, Some(context))? {
+                    return Err("Prefix budget planning failure".into());
+                }
             }
             let snapshot = loop {
                 if let Some(s) = self.execution.snapshot(&plan)? {
                     break Some(s);
                 }
-                let Some(old) = self.prefix_cache.evict_one_except(protected) else {
+                if !self.evict_prefix(protected, Some(context))? {
                     break None;
-                };
-                context.statistics.evictions += 1;
-                self.execution.release_snapshot(old)?;
+                }
             };
             if let Some(snapshot) = snapshot {
                 let mut own = BTreeMap::new();
@@ -344,12 +375,9 @@ impl ModelRuntime {
                     while self.prefix_cache.resident_with(Some(&snapshot))
                         > self.prefix_cache.budget
                     {
-                        let old = self
-                            .prefix_cache
-                            .evict_one_except(protected)
-                            .ok_or("Prefix budget accounting failure")?;
-                        context.statistics.evictions += 1;
-                        self.execution.release_snapshot(old)?;
+                        if !self.evict_prefix(protected, Some(context))? {
+                            return Err("Prefix budget accounting failure".into());
+                        }
                     }
                     // Upgrade a head-less endpoint, rather than keeping two states.
                     let obsolete: Vec<_> = self
@@ -366,8 +394,8 @@ impl ModelRuntime {
                         let e = self.prefix_cache.remove(id).expect("known endpoint");
                         self.execution.release_snapshot(e.snapshot)?;
                     }
-                    context.kv.clone_from(&snapshot.kv);
                     let bytes = snapshot.bytes;
+                    self.remove_host_endpoint(input, media);
                     self.prefix_cache.insert(Entry::new(
                         input.to_vec(),
                         media.clone(),
@@ -380,14 +408,137 @@ impl ModelRuntime {
                 } else {
                     self.execution.release_snapshot(snapshot)?;
                 }
+            } else {
+                self.store_host_prefix(input, media, warm_tokens, logits_valid, &plan, context)?;
             }
         }
         context.statistics.store_s += at.elapsed().as_secs_f64();
         self.update_prefix_usage(context);
         Ok(())
     }
+    fn reserve_host_prefix(
+        &mut self,
+        banks: BTreeMap<u64, usize>,
+        extra: usize,
+        metadata: usize,
+        context: &mut Context,
+    ) -> bool {
+        let plan = crate::backend::kv::host::Budget(banks);
+        let total = |base: usize| {
+            base.checked_add(extra)
+                .and_then(|n| n.checked_add(metadata))
+        };
+        let mut own = BTreeMap::new();
+        plan.allocations(&mut own);
+        if total(own.values().sum()).is_none_or(|n| n > self.host_prefix_cache.budget) {
+            return false;
+        }
+        while total(self.host_prefix_cache.resident_with(Some(&plan)))
+            .is_none_or(|n| n > self.host_prefix_cache.budget)
+        {
+            if self.host_prefix_cache.evict_one().is_none() {
+                return false;
+            }
+            context.statistics.host_evictions += 1;
+        }
+        true
+    }
+    fn host_metadata(tokens: usize, banks: usize) -> Result<usize> {
+        tokens
+            .checked_mul(16)
+            .and_then(|n| banks.checked_mul(1024).and_then(|b| n.checked_add(b)))
+            .and_then(|n| n.checked_add(8192))
+            .ok_or_else(|| "Host cache metadata overflow".into())
+    }
+    fn store_host_prefix(
+        &mut self,
+        input: &[u32],
+        media: &Media,
+        warm: usize,
+        logits: bool,
+        plan: &crate::backend::snapshot::Plan,
+        context: &mut Context,
+    ) -> Result<()> {
+        if self.host_prefix_cache.budget == 0 {
+            return Ok(());
+        }
+        let banks = plan.host_banks();
+        let metadata =
+            Self::host_metadata(input.len(), banks.len().max(self.manifest.buffers.len()))?;
+        if !self.reserve_host_prefix(banks, plan.new_bytes, metadata, context) {
+            return Ok(());
+        }
+        let mut snapshot = self.execution.host_snapshot(plan, &mut self.host_kv_pool)?;
+        snapshot.metadata_bytes = metadata;
+        let bytes = snapshot.bytes;
+        self.remove_host_endpoint(input, media);
+        self.host_prefix_cache.insert(Entry::new(
+            input.to_vec(),
+            media.clone(),
+            snapshot,
+            bytes,
+            warm,
+            logits,
+        ));
+        context.statistics.host_stores += 1;
+        context.statistics.checkpoints_stored += 1;
+        Ok(())
+    }
+    fn remove_host_endpoint(&mut self, input: &[u32], media: &Media) {
+        let ids: Vec<_> = self
+            .host_prefix_cache
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                e.tokens == input && e.media.common_tokens(media, input.len()) == input.len()
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            self.host_prefix_cache.remove(id);
+        }
+    }
+    pub(super) fn evict_prefix(
+        &mut self,
+        protected: Option<u64>,
+        context: Option<&mut Context>,
+    ) -> Result<bool> {
+        let Some(entry) = self.prefix_cache.evict_entry_one_except(protected) else {
+            return Ok(false);
+        };
+        let mut local = Context::default();
+        let context = context.unwrap_or(&mut local);
+        if self.host_prefix_cache.budget > 0 {
+            let banks = entry.snapshot.host_banks();
+            let metadata = Self::host_metadata(
+                entry.tokens.len(),
+                banks.len().max(self.manifest.buffers.len()),
+            )?;
+            if self.reserve_host_prefix(banks, 0, metadata, context) {
+                let mut snapshot = self
+                    .execution
+                    .offload_snapshot(&entry.snapshot, &mut self.host_kv_pool)?;
+                snapshot.metadata_bytes = metadata;
+                self.remove_host_endpoint(&entry.tokens, &entry.media);
+                self.host_prefix_cache.insert(Entry::new(
+                    entry.tokens,
+                    entry.media,
+                    snapshot,
+                    entry.bytes,
+                    entry.warm_tokens,
+                    entry.logits_valid,
+                ));
+                context.statistics.host_stores += 1;
+            }
+        }
+        self.execution.release_snapshot(entry.snapshot)?;
+        context.statistics.evictions += 1;
+        Ok(true)
+    }
     fn update_prefix_usage(&self, context: &mut Context) {
         self.prefix_cache.update_statistics(&mut context.statistics);
+        context.statistics.host_resident_bytes = self.host_prefix_cache.bytes;
+        context.statistics.host_entries = self.host_prefix_cache.entries.len();
     }
     pub(super) fn store_decoded_prefix(
         &mut self,
@@ -397,11 +548,7 @@ impl ModelRuntime {
         context: &mut Context,
     ) -> Result<()> {
         let position = self.read_control(&self.manifest.position)? as usize;
-        if self.prefix_cache.budget != 0
-            && !cancelled()
-            && position != 0
-            && position <= history.len()
-        {
+        if self.prefix_enabled() && !cancelled() && position != 0 && position <= history.len() {
             let spec = self.manifest.mtp.clone();
             let warm = if let Some(s) = &spec {
                 // The draft has already consumed the pending token's embedding.
@@ -421,7 +568,6 @@ impl ModelRuntime {
             }
             result?;
         }
-        context.kv.clear();
         self.execution.collect_snapshots()
     }
 }

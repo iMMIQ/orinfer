@@ -40,7 +40,15 @@ impl Worker {
     }
     fn future_bytes(&self, owner: &Owner, tokens: usize) -> Result<usize> {
         self.growth.iter().try_fold(0usize, |sum, (name, layout)| {
-            sum.checked_add(get(&owner.buffers, name)?.growth_bytes(layout.extent(tokens)?)?)
+            let buffer = get(&owner.buffers, name)?;
+            let end = layout.extent(tokens)?;
+            let start = owner.history.len() / layout.tokens_per_row * layout.row_bytes;
+            let cow = buffer.kv_writable_bytes(orinfer_device::MemoryRange {
+                offset: start,
+                bytes: end.saturating_sub(start),
+            })?;
+            sum.checked_add(buffer.growth_bytes(end)?)
+                .and_then(|n| n.checked_add(cow))
                 .ok_or_else(|| "Owner future KV budget overflow".into())
         })
     }
@@ -115,6 +123,43 @@ impl Worker {
             self.reserve_batch_memory(Requirement::snapshot(additional)?, "KV growth")?;
         }
         let owner = self.batch.as_ref().unwrap().owners.get(&id).unwrap();
+        let growth = self
+            .growth
+            .iter()
+            .map(|(name, layout)| Ok((get(&owner.buffers, name)?, layout.extent(tokens)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let writes = self
+            .growth
+            .iter()
+            .map(|(name, layout)| {
+                let start = owner.history.len() / layout.tokens_per_row * layout.row_bytes;
+                Ok((
+                    get(&owner.buffers, name)?,
+                    orinfer_device::MemoryRange {
+                        offset: start,
+                        bytes: layout.extent(tokens)?.saturating_sub(start),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.session.make_kv_writable(&writes)?;
+        self.session.grow_many(&growth)
+    }
+    pub(in crate::backend::ascend::model) fn grow_owner_readonly(
+        &mut self,
+        id: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let owner = self
+            .batch
+            .as_ref()
+            .ok_or("Missing batch runtime")?
+            .owners
+            .get(&id)
+            .ok_or("Unknown owner")?;
+        if owner.limit.is_some_and(|limit| tokens > limit) {
+            return Err("KV restore exceeds admitted budget".into());
+        }
         let growth = self
             .growth
             .iter()

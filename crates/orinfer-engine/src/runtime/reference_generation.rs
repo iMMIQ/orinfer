@@ -25,7 +25,6 @@ impl ModelRuntime {
         );
         self.prefix_statistics = prefix.statistics.clone();
         self.prefix_hints.clear();
-        prefix.kv.clear();
         let cleanup = self.execution.collect_snapshots();
         match outcome {
             Ok(count) => cleanup.map(|()| count),
@@ -79,7 +78,7 @@ impl ModelRuntime {
         }
         let mut checkpoints = std::collections::BTreeSet::new();
         let hints = std::mem::take(&mut self.prefix_hints);
-        if self.prefix_cache.budget != 0 {
+        if self.prefix_enabled() {
             checkpoints.extend((8192..input.len()).step_by(8192));
             for hint in hints.into_iter().filter(|&p| p > offset && p < input.len()) {
                 if self.admit_prefix_checkpoint(hint, input.len(), offset, &checkpoints, false)? {
@@ -210,7 +209,7 @@ impl ModelRuntime {
         if self.read_control(&self.manifest.position)? as usize != input.len() {
             return Err("Prefill position mismatch".into());
         }
-        if self.prefix_cache.budget != 0
+        if self.prefix_enabled()
             && let Some(spec) = &mtp
             && spec.hidden_ring.is_some()
             && warm.tokens < input.len() - 1

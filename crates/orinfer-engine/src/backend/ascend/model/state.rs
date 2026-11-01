@@ -2,8 +2,15 @@
 use super::{Buffer, Worker, batch::Owner, get};
 use crate::artifact::Result;
 use crate::backend::ascend::runtime::Session;
+use crate::backend::{
+    kv,
+    snapshot::{Allocation as SharedAllocation, Piece as SharedPiece},
+};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ops::Range};
+use std::{collections::BTreeMap, ops::Range, rc::Rc};
+mod host;
+pub(super) use crate::backend::kv::host::{HostBuffer, HostPool};
+pub(super) type HostSnapshot = Snapshot<HostBuffer>;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -132,16 +139,16 @@ impl StateLayout {
     }
 }
 #[derive(Clone)]
-struct Piece {
+struct Piece<B = Buffer> {
     name: String,
     offset: usize,
-    buffer: Buffer,
+    buffer: B,
     bank_id: u64,
     bank_bytes: usize,
 }
-pub(super) struct Snapshot {
+pub(super) struct Snapshot<B = DeviceBuffer> {
     history: Vec<u32>,
-    pieces: Vec<Piece>,
+    pieces: Vec<Piece<B>>,
 }
 pub(super) struct Journal {
     history: usize,
@@ -151,12 +158,12 @@ pub(super) struct Journal {
     circular: BTreeMap<String, usize>,
 }
 type PendingCopy = (String, Buffer, Range<usize>, usize);
-struct CapturePlan {
-    pieces: Vec<Piece>,
+struct CapturePlan<B> {
+    pieces: Vec<Piece<B>>,
     pending: Vec<PendingCopy>,
     bytes: usize,
 }
-impl CapturePlan {
+impl<B> CapturePlan<B> {
     fn allocations(&self, bank_id: u64) -> Result<BTreeMap<u64, usize>> {
         let mut banks: BTreeMap<_, _> = self
             .pieces
@@ -168,12 +175,26 @@ impl CapturePlan {
                 .bytes
                 .checked_add(255)
                 .ok_or("Snapshot size overflow")?;
-            banks.insert(bank_id, super::memory::round_pages(bytes)?);
+            banks.insert(
+                kv::checkpoint_id(bank_id)?,
+                super::memory::round_pages(bytes)?,
+            );
         }
         Ok(banks)
     }
 }
-impl Snapshot {
+pub(super) trait StateBytes: Clone {
+    fn bytes(&self) -> usize;
+    fn host_capacity(&self) -> usize {
+        self.bytes()
+    }
+}
+impl StateBytes for Buffer {
+    fn bytes(&self) -> usize {
+        self.bytes()
+    }
+}
+impl<B: StateBytes> Snapshot<B> {
     pub fn allocations(&self) -> BTreeMap<u64, usize> {
         self.pieces
             .iter()
@@ -184,8 +205,8 @@ impl Snapshot {
         layouts: impl Iterator<Item = &'a StateLayout>,
         buffers: &BTreeMap<String, Buffer>,
         history: &[u32],
-        parent: Option<&Snapshot>,
-    ) -> Result<CapturePlan> {
+        parent: Option<&Self>,
+    ) -> Result<CapturePlan<B>> {
         if parent.is_some_and(|p| !history.starts_with(&p.history)) {
             return Err("A2 snapshot parent history diverges".into());
         }
@@ -236,6 +257,82 @@ impl Snapshot {
             bytes,
         })
     }
+}
+#[derive(Clone)]
+pub(super) struct DeviceBuffer {
+    allocation: Rc<SharedAllocation>,
+    source: usize,
+    bytes: usize,
+}
+impl DeviceBuffer {
+    fn native(&self) -> Result<Buffer> {
+        self.allocation
+            .native
+            .as_ref()
+            .and_then(|b| b.downcast_ref::<Buffer>())
+            .ok_or("Foreign A2 snapshot backing")?
+            .slice(self.source, self.bytes)
+    }
+    fn shared_piece(&self, name: &str, offset: usize) -> SharedPiece {
+        SharedPiece {
+            allocation: self.allocation.clone(),
+            name: name.to_owned(),
+            range: crate::backend::snapshot::Range {
+                offset,
+                bytes: self.bytes,
+            },
+            source: self.source,
+        }
+    }
+}
+impl StateBytes for DeviceBuffer {
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+    fn host_capacity(&self) -> usize {
+        self.allocation.used
+    }
+}
+impl Snapshot {
+    fn plan_device<'a>(
+        layouts: impl Iterator<Item = &'a StateLayout>,
+        buffers: &BTreeMap<String, Buffer>,
+        history: &[u32],
+        parent: Option<&Self>,
+    ) -> Result<CapturePlan<DeviceBuffer>> {
+        let layouts = layouts.collect::<Vec<_>>();
+        let mut plan = Self::plan(
+            layouts
+                .iter()
+                .copied()
+                .filter(|l| !l.append_only || !buffers[&l.buffer].demand_mapped()),
+            buffers,
+            history,
+            parent,
+        )?;
+        for layout in layouts
+            .into_iter()
+            .filter(|l| l.append_only && buffers[&l.buffer].demand_mapped())
+        {
+            let source = get(buffers, &layout.buffer)?;
+            for span in layout.spans(history.len(), source.bytes())? {
+                for (allocation, range, offset) in source.kv_preview(span.end)? {
+                    plan.pieces.push(Piece {
+                        name: layout.buffer.clone(),
+                        offset: range.offset,
+                        bank_id: allocation.id,
+                        bank_bytes: allocation.bytes,
+                        buffer: DeviceBuffer {
+                            allocation,
+                            source: offset,
+                            bytes: range.bytes,
+                        },
+                    });
+                }
+            }
+        }
+        Ok(plan)
+    }
     fn capture<'a>(
         session: &Session,
         layouts: impl Iterator<Item = &'a StateLayout>,
@@ -244,55 +341,107 @@ impl Snapshot {
         bank_id: u64,
         parent: Option<&Snapshot>,
     ) -> Result<Self> {
+        let layouts = layouts.collect::<Vec<_>>();
         let CapturePlan {
-            mut pieces,
             pending,
             bytes,
-        } = Self::plan(layouts, buffers, history, parent)?;
+            pieces: planned,
+        } = Self::plan_device(layouts.iter().copied(), buffers, history, parent)?;
+        let mut pieces = planned
+            .into_iter()
+            .filter(|p| p.buffer.allocation.handle.is_none())
+            .collect::<Vec<_>>();
         if !pending.is_empty() {
-            let bank = session.allocate(
-                bytes
-                    .checked_add(255)
-                    .ok_or("Snapshot alignment overflow")?,
-            )?;
-            let address = bank.pointer() as usize;
-            let base = address
-                .checked_add(255)
-                .ok_or("Snapshot address overflow")?
-                / 256
-                * 256
-                - address;
-            let bank_bytes = bank.bytes().div_ceil(2 << 20) * (2 << 20);
+            let bank = session.allocate(bytes.checked_add(255).ok_or("Snapshot size overflow")?)?;
+            let base = (bank.pointer() as usize).div_ceil(256) * 256 - bank.pointer() as usize;
+            let allocation = session.snapshot_allocation(&bank, kv::checkpoint_id(bank_id)?)?;
             let mut copies = vec![];
             for (name, source, span, offset) in pending {
-                let buffer = bank.slice(base + offset, span.len())?;
-                copies.push((source, span.start, buffer.clone(), 0, span.len()));
+                copies.push((source, span.start, bank.clone(), base + offset, span.len()));
                 pieces.push(Piece {
                     name,
                     offset: span.start,
-                    buffer,
-                    bank_id,
-                    bank_bytes,
+                    bank_id: allocation.id,
+                    bank_bytes: allocation.bytes,
+                    buffer: DeviceBuffer {
+                        allocation: allocation.clone(),
+                        source: base + offset,
+                        bytes: span.len(),
+                    },
                 });
             }
             session.copy_many(&copies)?.wait()?;
+        }
+        session.synchronize()?;
+        for layout in layouts
+            .into_iter()
+            .filter(|l| l.append_only && buffers[&l.buffer].demand_mapped())
+        {
+            let source = get(buffers, &layout.buffer)?;
+            for span in layout.spans(history.len(), source.bytes())? {
+                for (allocation, range, offset) in session.publish_kv(&source, span.end)? {
+                    pieces.push(Piece {
+                        name: layout.buffer.clone(),
+                        offset: range.offset,
+                        bank_id: allocation.id,
+                        bank_bytes: allocation.bytes,
+                        buffer: DeviceBuffer {
+                            allocation,
+                            source: offset,
+                            bytes: range.bytes,
+                        },
+                    });
+                }
+            }
         }
         Ok(Self {
             history: history.to_vec(),
             pieces,
         })
     }
+    pub fn host_allocations(&self) -> BTreeMap<u64, usize> {
+        self.pieces
+            .iter()
+            .map(|p| (p.bank_id, p.buffer.host_capacity()))
+            .collect()
+    }
+    fn restore_kv(&self, session: &Session, buffers: &BTreeMap<String, Buffer>) -> Result<()> {
+        let mut groups = BTreeMap::<&str, Vec<SharedPiece>>::new();
+        for piece in &self.pieces {
+            if piece.buffer.allocation.handle.is_some() {
+                groups
+                    .entry(&piece.name)
+                    .or_default()
+                    .push(piece.buffer.shared_piece(&piece.name, piece.offset));
+            }
+        }
+        session.synchronize()?;
+        for (name, pieces) in groups {
+            session.restore_kv(&get(buffers, name)?, &pieces)?;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
     fn restore_into(&self, session: &Session, buffers: &BTreeMap<String, Buffer>) -> Result<()> {
+        self.restore_kv(session, buffers)?;
+        self.restore_mutable_into(session, buffers)
+    }
+    fn restore_mutable_into(
+        &self,
+        session: &Session,
+        buffers: &BTreeMap<String, Buffer>,
+    ) -> Result<()> {
         let copies = self
             .pieces
             .iter()
-            .map(|piece| {
+            .filter(|p| p.buffer.allocation.handle.is_none())
+            .map(|p| {
                 Ok((
-                    piece.buffer.clone(),
+                    p.buffer.native()?,
                     0,
-                    get(buffers, &piece.name)?,
-                    piece.offset,
-                    piece.buffer.bytes(),
+                    get(buffers, &p.name)?,
+                    p.offset,
+                    p.buffer.bytes(),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -345,7 +494,7 @@ impl Worker {
         parent: Option<&Snapshot>,
     ) -> Result<BTreeMap<u64, usize>> {
         let (owner, layouts) = self.snapshot_state(id, complete)?;
-        Snapshot::plan(layouts.into_iter(), &owner.buffers, &owner.history, parent)?
+        Snapshot::plan_device(layouts.into_iter(), &owner.buffers, &owner.history, parent)?
             .allocations(bank_id)
     }
     pub(super) fn save_owner(
@@ -373,10 +522,17 @@ impl Worker {
 
     pub(super) fn restore_owner(&mut self, id: usize, snapshot: &Snapshot) -> Result<()> {
         self.reset_owner(id)?;
-        self.grow_owner(id, snapshot.history.len())?;
+        {
+            let runtime = self.batch.as_ref().ok_or("Missing A2 runtime")?;
+            snapshot.restore_kv(
+                &self.session,
+                &runtime.owners.get(&id).ok_or("Unknown owner")?.buffers,
+            )?;
+        }
+        self.grow_owner_readonly(id, snapshot.history.len())?;
         let runtime = self.batch.as_mut().ok_or("Missing A2 batch runtime")?;
         let owner = runtime.owners.get_mut(&id).ok_or("Unknown A2 owner")?;
-        snapshot.restore_into(&self.session, &owner.buffers)?;
+        snapshot.restore_mutable_into(&self.session, &owner.buffers)?;
         owner.history.clone_from(&snapshot.history);
         runtime.bound_tables = None;
         Ok(())
@@ -600,7 +756,7 @@ mod tests {
         )
         .unwrap();
         let before = session.allocated_bytes();
-        let child = Snapshot::plan(
+        let child = Snapshot::<DeviceBuffer>::plan(
             std::iter::once(&layout),
             &buffers,
             &[0, 1, 2, 3, 4, 5, 6, 7],
@@ -609,10 +765,15 @@ mod tests {
         .unwrap();
         assert_eq!(session.allocated_bytes(), before);
         assert_eq!(child.bytes, 32);
-        assert!(child.allocations(2).unwrap().contains_key(&1));
+        assert!(
+            child
+                .allocations(2)
+                .unwrap()
+                .contains_key(&kv::checkpoint_id(1).unwrap())
+        );
         drop(child);
         drop(parent);
-        let replanned = Snapshot::plan(
+        let replanned = Snapshot::<DeviceBuffer>::plan(
             std::iter::once(&layout),
             &buffers,
             &[0, 1, 2, 3, 4, 5, 6, 7],
@@ -691,10 +852,11 @@ mod tests {
                 .unwrap();
             let history = (0..length as u32).collect::<Vec<_>>();
             let before_plan = session.allocated_bytes();
-            let planned = Snapshot::plan(layouts.iter(), &buffers, &history, parent.as_ref())
-                .unwrap()
-                .allocations(index as u64 + 1)
-                .unwrap();
+            let planned =
+                Snapshot::<DeviceBuffer>::plan(layouts.iter(), &buffers, &history, parent.as_ref())
+                    .unwrap()
+                    .allocations(index as u64 + 1)
+                    .unwrap();
             assert_eq!(
                 session.allocated_bytes(),
                 before_plan,
@@ -716,14 +878,14 @@ mod tests {
                 .filter(|p| p.name == "kv")
                 .collect::<Vec<_>>();
             assert_eq!(kv_pieces.len(), index + 1);
-            assert_eq!(kv_pieces[0].bank_id, 1);
+            assert_eq!(kv_pieces[0].bank_id, kv::checkpoint_id(1).unwrap());
             assert_eq!(kv_pieces.last().unwrap().offset, [0, 16, 32][index]);
             assert!(
                 saved
                     .pieces
                     .iter()
                     .filter(|p| p.name != "kv")
-                    .all(|p| p.bank_id == index as u64 + 1)
+                    .all(|p| p.bank_id == kv::checkpoint_id(index as u64 + 1).unwrap())
             );
             assert!(
                 Snapshot::capture(

@@ -26,6 +26,7 @@ pub(super) struct Transfers {
     next: usize,
     readback: *mut c_void,
     readback_pending: bool,
+    readback_capacity: usize,
 }
 impl Transfers {
     pub(super) fn upload(
@@ -126,10 +127,27 @@ impl Transfers {
         regions: &[(u64, usize)],
         output: &mut [u8],
     ) -> Result<()> {
+        self.readback_with_limit(stream, regions, output, READBACK_BYTES)
+    }
+    pub(super) fn bulk_readback(
+        &mut self,
+        stream: sys::CUstream,
+        regions: &[(u64, usize)],
+        output: &mut [u8],
+    ) -> Result<()> {
+        self.readback_with_limit(stream, regions, output, 4 << 20)
+    }
+    fn readback_with_limit(
+        &mut self,
+        stream: sys::CUstream,
+        regions: &[(u64, usize)],
+        output: &mut [u8],
+        limit: usize,
+    ) -> Result<()> {
         let bytes = regions.iter().try_fold(0usize, |sum, (_, n)| {
             sum.checked_add(*n).ok_or("Control readback size overflow")
         })?;
-        if bytes != output.len() || bytes > READBACK_BYTES {
+        if bytes != output.len() || bytes > limit {
             return Err("Control readback exceeds pinned buffer".into());
         }
         if bytes == 0 {
@@ -142,11 +160,20 @@ impl Transfers {
             if self.readback_pending {
                 check(sys::cuStreamSynchronize(stream), "recover control readback")?;
             }
+            if self.readback_capacity < bytes && !self.readback.is_null() {
+                check(
+                    sys::cuMemFreeHost(self.readback),
+                    "resize KV readback staging",
+                )?;
+                self.readback = ptr::null_mut();
+                self.readback_capacity = 0;
+            }
             if self.readback.is_null() {
                 check(
-                    sys::cuMemHostAlloc(&mut self.readback, READBACK_BYTES, 0),
+                    sys::cuMemHostAlloc(&mut self.readback, limit, 0),
                     "allocate control readback",
                 )?;
+                self.readback_capacity = limit;
             }
             self.readback_pending = true;
             let mut offset = 0;

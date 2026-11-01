@@ -45,6 +45,18 @@ pub(super) enum Command {
         snapshot: u64,
     },
     Evict(u64),
+    Offload(u64),
+    PlanOffload(u64),
+    SaveHost {
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    },
+    PlanHost {
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    },
     Budget(super::memory::Requirement),
     Reclaim,
     PlanSnapshot {
@@ -208,6 +220,8 @@ impl Team {
                     }
                     let mut snapshots = BTreeMap::new();
                     let mut lineage = BTreeMap::new();
+                    let mut host_snapshots = BTreeMap::new();
+                    let mut host_pool = super::state::HostPool::default();
                     let mut journal = BTreeMap::new();
                     let mut journal_pool = BTreeMap::new();
                     while let Ok(command) = commands.recv() {
@@ -258,6 +272,60 @@ impl Team {
                                     .plan_owner_snapshot(owner, complete, snapshot, parent)
                                     .map(Reply::Allocations)
                             }
+                            Command::PlanHost {
+                                owner,
+                                snapshot,
+                                complete,
+                            } => {
+                                let parent =
+                                    lineage.get(&owner).and_then(|id| host_snapshots.get(id));
+                                worker
+                                    .plan_host_snapshot(owner, complete, snapshot, parent)
+                                    .map(Reply::Allocations)
+                            }
+                            Command::SaveHost {
+                                owner,
+                                snapshot,
+                                complete,
+                            } => {
+                                let parent =
+                                    lineage.get(&owner).and_then(|id| host_snapshots.get(id));
+                                worker
+                                    .save_host_snapshot(
+                                        owner,
+                                        complete,
+                                        snapshot,
+                                        parent,
+                                        &mut host_pool,
+                                    )
+                                    .map(|saved| {
+                                        let allocations = saved.allocations();
+                                        host_snapshots.insert(snapshot, saved);
+                                        lineage.insert(owner, snapshot);
+                                        Reply::Allocations(allocations)
+                                    })
+                            }
+                            Command::PlanOffload(id) => snapshots
+                                .get(&id)
+                                .ok_or_else(|| "Missing A2 offload plan".into())
+                                .map(|s: &super::state::Snapshot| {
+                                    Reply::Allocations(s.host_allocations())
+                                }),
+                            Command::Offload(id) => snapshots
+                                .get(&id)
+                                .ok_or_else(|| "Missing A2 offload snapshot".into())
+                                .and_then(|saved| {
+                                    super::state::HostSnapshot::offload(
+                                        &worker.session,
+                                        saved,
+                                        &mut host_pool,
+                                    )
+                                })
+                                .map(|saved| {
+                                    host_snapshots.insert(id, saved);
+                                    snapshots.remove(&id);
+                                    Reply::Ready
+                                }),
                             Command::Admit(ids) => worker.admit(&ids).map(|_| Reply::Ready),
                             Command::Limit(id, tokens) => {
                                 worker.limit_owner(id, tokens).map(|_| Reply::Ready)
@@ -328,16 +396,22 @@ impl Team {
                                         Reply::Allocations(allocations)
                                     })
                             }
-                            Command::Restore { owner, snapshot } => snapshots
-                                .get(&snapshot)
-                                .ok_or_else(|| "Missing A2 prefix snapshot".into())
-                                .and_then(|saved| worker.restore_owner(owner, saved))
-                                .map(|_| {
+                            Command::Restore { owner, snapshot } => {
+                                let restored = if let Some(saved) = snapshots.get(&snapshot) {
+                                    worker.restore_owner(owner, saved)
+                                } else if let Some(saved) = host_snapshots.get(&snapshot) {
+                                    worker.restore_host_snapshot(owner, saved)
+                                } else {
+                                    Err("Missing A2 prefix snapshot".into())
+                                };
+                                restored.map(|_| {
                                     lineage.insert(owner, snapshot);
                                     Reply::Ready
-                                }),
+                                })
+                            }
                             Command::Evict(snapshot) => {
                                 snapshots.remove(&snapshot);
+                                host_snapshots.remove(&snapshot);
                                 lineage.retain(|_, id| *id != snapshot);
                                 Ok(Reply::Ready)
                             }
@@ -388,6 +462,33 @@ impl Team {
         forward_with(&self.peers, layout, tokens, full, maintenance)
     }
 
+    pub fn offload_allocations(&self, id: u64) -> Result<BTreeMap<u64, usize>> {
+        self.allocations(Command::PlanOffload(id))
+    }
+    pub fn ranks(&self) -> usize {
+        self.peers.iter().count()
+    }
+    pub fn host_allocations(
+        &self,
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+        plan: bool,
+    ) -> Result<BTreeMap<u64, usize>> {
+        self.allocations(if plan {
+            Command::PlanHost {
+                owner,
+                snapshot,
+                complete,
+            }
+        } else {
+            Command::SaveHost {
+                owner,
+                snapshot,
+                complete,
+            }
+        })
+    }
     pub fn snapshot_allocations(
         &self,
         owner: usize,
@@ -456,13 +557,25 @@ impl Team {
     }
     fn allocations(&self, command: Command) -> Result<BTreeMap<u64, usize>> {
         let mut result: Option<BTreeMap<u64, usize>> = None;
-        for reply in self.exchange(command)? {
+        for (rank, reply) in self.exchange(command)?.into_iter().enumerate() {
             let Reply::Allocations(allocations) = reply else {
                 return Err("Invalid A2 snapshot allocation reply".into());
             };
             if let Some(combined) = &mut result {
                 if !combined.keys().eq(allocations.keys()) {
-                    return Err("TP snapshot allocation lineage differs".into());
+                    let missing = combined
+                        .keys()
+                        .filter(|k| !allocations.contains_key(k))
+                        .take(8)
+                        .collect::<Vec<_>>();
+                    let extra = allocations
+                        .keys()
+                        .filter(|k| !combined.contains_key(k))
+                        .take(8)
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "TP snapshot allocation lineage differs on rank {rank}: missing {missing:?}, extra {extra:?}"
+                    ));
                 }
                 for (id, bytes) in allocations {
                     *combined.get_mut(&id).unwrap() = combined[&id].max(bytes);

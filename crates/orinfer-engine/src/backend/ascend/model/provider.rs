@@ -6,6 +6,7 @@ use super::{
 };
 mod budget;
 mod dspark;
+mod offload;
 mod packet;
 use crate::{
     artifact::{FileIdentity, Result, resolve_file},
@@ -51,6 +52,7 @@ struct Snapshot {
     id: u64,
     banks: BTreeMap<u64, usize>,
     output: Option<Arc<Output>>,
+    host_overhead: usize,
 }
 impl Resident for Snapshot {
     fn allocations(&self, out: &mut BTreeMap<u64, usize>) {
@@ -59,14 +61,17 @@ impl Resident for Snapshot {
         for (&id, &bytes) in &self.banks {
             out.insert(id * 2, bytes);
         }
-        if let Some(output) = &self.output {
-            out.insert(
-                self.id * 2 + 1,
-                output.logits.len() * 4 + std::mem::size_of::<Output>(),
-            );
+        let overhead = self.host_overhead
+            + self
+                .output
+                .as_ref()
+                .map_or(0, |o| o.logits.len() * 4 + std::mem::size_of::<Output>());
+        if overhead != 0 {
+            out.insert(self.id * 2 + 1, overhead);
         }
     }
 }
+#[cfg(test)]
 fn matched(cache: &Cache<Snapshot>, input: &[u32], reserve: usize) -> Option<u64> {
     cache
         .match_prefix_by(input, &Media::default(), |entry| {
@@ -80,6 +85,7 @@ pub(crate) struct Runtime {
     team: Team,
     pub frontend_assets: BTreeMap<String, String>,
     cache: Cache<Snapshot>,
+    host_cache: Cache<Snapshot>,
     prefix: crate::prefix::Statistics,
     statistics: scheduler::Statistics,
     active: BTreeSet<usize>,
@@ -272,10 +278,12 @@ impl Runtime {
             team.model.capacity,
             team.rows
         );
+        let host_budget = options.kv_offload_bytes / team.ranks();
         Ok(Self {
             team,
             frontend_assets: model.frontend_assets,
             cache: Cache::new(options.prefix_cache_bytes),
+            host_cache: Cache::new(host_budget),
             prefix: Default::default(),
             statistics: Default::default(),
             active: Default::default(),
@@ -324,13 +332,10 @@ impl Runtime {
         &self.prefix
     }
     pub fn prefix_cache_enabled(&self) -> bool {
-        self.cache.budget > 0
+        self.cache.budget > 0 || self.host_cache.budget > 0
     }
     pub fn set_prefix_cache_hints(&mut self, hints: Vec<usize>) {
         self.hints = hints;
-    }
-    fn matched(&self, input: &[u32]) -> Option<u64> {
-        matched(&self.cache, input, self.final_decoder_window())
     }
     fn final_decoder_window(&self) -> usize {
         self.team
@@ -342,7 +347,7 @@ impl Runtime {
             .map_or(0, |r| r.keep)
     }
     fn complete_prompt_cache(&self) -> bool {
-        self.cache.budget > 0
+        self.prefix_cache_enabled()
             && self
                 .team
                 .model
@@ -359,7 +364,7 @@ impl Runtime {
         self.require_text(images, &[])?;
         Ok(self
             .matched(input)
-            .map_or(0, |id| self.cache.entries[&id].tokens.len()))
+            .map_or(0, |hit| self.entry(hit).tokens.len()))
     }
     fn require_text(
         &self,
@@ -440,19 +445,9 @@ impl Runtime {
     fn head_only(&self, input: &GenerationInput) -> bool {
         input.max_new_tokens == 1
             && self.matched(&input.input_tokens).is_some_and(|id| {
-                self.cache.entries[&id].tokens.len() == input.input_tokens.len()
-                    && self.cache.entries[&id].snapshot.output.is_some()
+                self.entry(id).tokens.len() == input.input_tokens.len()
+                    && self.entry(id).snapshot.output.is_some()
             })
-    }
-    fn evict(&mut self) -> Result<bool> {
-        if let Some(snapshot) = self.cache.evict_one() {
-            self.team.exchange(Command::Evict(snapshot.id))?;
-            self.prefix.evictions += 1;
-            self.cache.update_statistics(&mut self.prefix);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
     pub fn can_admit(
         &mut self,
@@ -531,7 +526,14 @@ impl Runtime {
         let mut offset = 0;
         let mut ready_output = None;
         if let Some(id) = self.matched(&input.input_tokens) {
-            let entry = self.cache.touch(id);
+            let entry = if id.0 {
+                self.host_cache.touch(id.1)
+            } else {
+                self.cache.touch(id.1)
+            };
+            if id.0 {
+                prefix.host_hits += 1;
+            }
             let at = Instant::now();
             if resident {
                 let restored = self.team.exchange(Command::Restore {
@@ -581,7 +583,7 @@ impl Runtime {
         })
     }
     fn store(&mut self, request: &mut Request, output: Option<&Output>) -> Result<()> {
-        if self.cache.budget == 0 || !self.resident.contains(&request.slot) {
+        if !self.prefix_cache_enabled() || !self.resident.contains(&request.slot) {
             return Ok(());
         }
         let count = if request.prefilling {
@@ -590,9 +592,14 @@ impl Runtime {
             request.history.len().saturating_sub(1)
         };
         if count == 0
-            || self.cache.entries.values().any(|e| {
-                e.tokens == request.history[..count] && (output.is_none() || e.logits_valid)
-            })
+            || self
+                .cache
+                .entries
+                .values()
+                .chain(self.host_cache.entries.values())
+                .any(|e| {
+                    e.tokens == request.history[..count] && (output.is_none() || e.logits_valid)
+                })
         {
             return Ok(());
         }
@@ -603,71 +610,116 @@ impl Runtime {
         self.next_snapshot = self
             .next_snapshot
             .checked_add(1)
-            .filter(|&id| id <= u64::MAX / 2)
+            .filter(|&id| id <= u64::MAX / 4)
             .ok_or("A2 snapshot identity overflow")?;
         let id = self.next_snapshot;
         let head = output.cloned().map(Arc::new);
+        let mut host = self.cache.budget == 0;
         let (snapshot, bytes) = loop {
             // Eviction can remove the owner's parent lineage. Re-plan after
             // every reclamation, before allocating or committing any new bank.
-            let banks = self
-                .team
-                .plan_snapshot_allocations(request.slot, id, output.is_some())?;
-            let incoming = banks.get(&id).copied().unwrap_or(0);
+            let banks = if host {
+                self.team
+                    .host_allocations(request.slot, id, output.is_some(), true)?
+            } else {
+                self.team
+                    .plan_snapshot_allocations(request.slot, id, output.is_some())?
+            };
+            let incoming = banks
+                .get(&crate::backend::kv::checkpoint_id(id)?)
+                .copied()
+                .unwrap_or(0);
             let device_bytes = banks.values().try_fold(0usize, |sum, bytes| {
                 sum.checked_add(*bytes)
                     .ok_or("Snapshot accounting overflow")
             })?;
+            let host_overhead = if host {
+                self.host_overhead(count, banks.len())?
+            } else {
+                0
+            };
             let bytes = device_bytes
+                .checked_add(host_overhead)
+                .ok_or("Host snapshot accounting overflow")?
                 .checked_add(
                     output.map_or(0, |o| o.logits.len() * 4 + std::mem::size_of::<Output>()),
                 )
                 .ok_or("Snapshot size overflow")?;
-            if bytes > self.cache.budget {
+            let budget = if host {
+                self.host_cache.budget
+            } else {
+                self.cache.budget
+            };
+            if bytes > budget {
+                if !host && self.host_cache.budget > 0 {
+                    host = true;
+                    continue;
+                }
                 return Ok(());
             }
             let snapshot = Snapshot {
                 id,
                 banks,
                 output: head.clone(),
+                host_overhead,
             };
-            if self.cache.resident_with(Some(&snapshot)) > self.cache.budget {
-                if !self.evict()? {
+            let cache = if host { &self.host_cache } else { &self.cache };
+            if cache.resident_with(Some(&snapshot)) > budget {
+                if !(if host {
+                    self.evict_host()?
+                } else {
+                    self.evict()?
+                }) {
                     return Ok(());
                 }
                 continue;
             }
-            if incoming != 0
+            if !host
+                && incoming != 0
                 && !self
                     .team
                     .has_budget(memory::Requirement::snapshot(incoming)?)?
             {
                 if !memory::reclaim_one(self)? {
+                    if self.host_cache.budget > 0 {
+                        host = true;
+                        continue;
+                    }
                     return Ok(());
                 }
                 continue;
             }
-            let actual = self
-                .team
-                .snapshot_allocations(request.slot, id, output.is_some())?;
+            let actual = if host {
+                self.team
+                    .host_allocations(request.slot, id, output.is_some(), false)?
+            } else {
+                self.team
+                    .snapshot_allocations(request.slot, id, output.is_some())?
+            };
             if actual != snapshot.banks {
                 return Err("A2 snapshot allocation differs from its reserved plan".into());
             }
             break (snapshot, bytes);
         };
-        // Upgrade a producer-only endpoint instead of retaining duplicate KV.
-        let obsolete = self
-            .cache
-            .entries
-            .iter()
-            .filter(|(_, e)| e.tokens == request.history[..count])
-            .map(|(&id, _)| id)
-            .collect::<Vec<_>>();
-        for old in obsolete {
-            let entry = self.cache.remove(old).ok_or("Missing upgraded A2 prefix")?;
-            self.team.exchange(Command::Evict(entry.snapshot.id))?;
+        // Upgrade endpoints across both tiers after the new snapshot is complete.
+        for cache in [&mut self.cache, &mut self.host_cache] {
+            let obsolete = cache
+                .entries
+                .iter()
+                .filter(|(_, e)| e.tokens == request.history[..count])
+                .map(|(&id, _)| id)
+                .collect::<Vec<_>>();
+            for old in obsolete {
+                let entry = cache.remove(old).ok_or("Missing upgraded A2 prefix")?;
+                self.team.exchange(Command::Evict(entry.snapshot.id))?;
+            }
         }
-        self.cache.insert(Entry::new(
+        let cache = if host {
+            &mut self.host_cache
+        } else {
+            &mut self.cache
+        };
+        cache.insert(Entry::new(
             request.history[..count].to_vec(),
             Media::default(),
             snapshot,
@@ -675,10 +727,23 @@ impl Runtime {
             0,
             output.is_some(),
         ));
+        if host {
+            request.prefix.host_stores += 1;
+        }
         request.prefix.store_s += at.elapsed().as_secs_f64();
         request.prefix.checkpoints_stored += 1;
-        self.cache.update_statistics(&mut request.prefix);
-        self.cache.update_statistics(&mut self.prefix);
+        offload::update_statistics(
+            &self.cache,
+            &self.host_cache,
+            self.team.ranks(),
+            &mut request.prefix,
+        );
+        offload::update_statistics(
+            &self.cache,
+            &self.host_cache,
+            self.team.ranks(),
+            &mut self.prefix,
+        );
         Ok(())
     }
     pub fn share_prefill_checkpoint(
@@ -827,9 +892,19 @@ impl Runtime {
         self.release_resident(request.slot)?;
         self.active.remove(&request.slot);
         request.released = true;
-        self.cache.update_statistics(&mut request.prefix);
+        offload::update_statistics(
+            &self.cache,
+            &self.host_cache,
+            self.team.ranks(),
+            &mut request.prefix,
+        );
         self.prefix = request.prefix.clone();
-        self.cache.update_statistics(&mut self.prefix);
+        offload::update_statistics(
+            &self.cache,
+            &self.host_cache,
+            self.team.ranks(),
+            &mut self.prefix,
+        );
         Ok(())
     }
     pub fn generate(

@@ -169,9 +169,7 @@ fn validate_mtp_packet_graph_reuse() {
                                     (name, crate::backend::snapshot::Range { offset: 0, bytes })
                                 })
                                 .collect();
-                            let plan =
-                                m.execution
-                                    .plan_snapshot(ranges, &Default::default(), &[])?;
+                            let plan = m.execution.plan_snapshot(ranges, &Default::default())?;
                             m.execution
                                 .snapshot(&plan)?
                                 .ok_or("Insufficient snapshot memory".into())

@@ -294,7 +294,7 @@ impl Model {
     }
     pub fn prefix_cache_enabled(&self) -> bool {
         match &self.0 {
-            Implementation::Cuda(inner) => inner.prefix_cache_limit > 0,
+            Implementation::Cuda(inner) => inner.prefix_enabled(),
             Implementation::Ascend(inner) => inner.prefix_cache_enabled(),
         }
     }

@@ -246,6 +246,7 @@ fn load_model(settings: &Settings) -> Result<LoadedModel> {
             load_workers: settings.load_workers,
             resident_experts: settings.resident_experts,
             prefix_cache_bytes: settings.prefix_cache_bytes,
+            kv_offload_bytes: settings.kv_offload_bytes,
             mtp_drafts: settings.mtp_drafts,
             prompt_lookup: settings.prompt_lookup,
         },

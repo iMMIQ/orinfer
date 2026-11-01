@@ -15,6 +15,12 @@ pub struct Statistics {
     pub entries: usize,
     pub evictions: usize,
     pub checkpoints_stored: usize,
+    /// CPU tier, summed across all tensor-parallel workers.
+    pub host_resident_bytes: usize,
+    pub host_entries: usize,
+    pub host_hits: usize,
+    pub host_stores: usize,
+    pub host_evictions: usize,
 }
 
 /// Image identities are scoped to the first affected token, not the request.
@@ -276,6 +282,10 @@ impl<T: Resident> Cache<T> {
     /// A generated endpoint must not evict the prompt that makes repeating
     /// that request useful. General memory admission may still evict any entry.
     pub fn evict_one_except(&mut self, protected: Option<u64>) -> Option<T> {
+        self.evict_entry_one_except(protected).map(|e| e.snapshot)
+    }
+    /// Move an endpoint between storage tiers without losing its token identity.
+    pub fn evict_entry_one_except(&mut self, protected: Option<u64>) -> Option<Entry<T>> {
         let mut references: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
         for e in self.entries.values() {
             let mut own = BTreeMap::new();
@@ -305,7 +315,7 @@ impl<T: Resident> Cache<T> {
                 utility(a).total_cmp(&utility(b)).then(a.used.cmp(&b.used))
             })
             .map(|(&id, _)| id)?;
-        Some(self.remove(victim).expect("selected victim").snapshot)
+        self.remove(victim)
     }
     pub fn insert(&mut self, mut entry: Entry<T>) -> u64 {
         self.clock += 1;
@@ -328,6 +338,28 @@ impl<T: Resident> Cache<T> {
     }
 }
 
+/// Device wins an equal token prefix. Model adapters supply state-validity and
+/// compute/transfer cost scores; neither tree needs device-specific policies.
+pub(crate) fn match_tiers<D: Resident, H: Resident>(
+    device: &Cache<D>,
+    host: &Cache<H>,
+    tokens: &[u32],
+    media: &Media,
+    device_score: impl Fn(&Entry<D>) -> Option<f64>,
+    host_score: impl Fn(&Entry<H>) -> Option<f64>,
+) -> Option<(bool, u64)> {
+    let d = device
+        .match_prefix_by(tokens, media, device_score)
+        .checkpoint;
+    let h = host.match_prefix_by(tokens, media, host_score).checkpoint;
+    match (d, h) {
+        (Some(d), Some(h)) if host.entries[&h].tokens.len() > device.entries[&d].tokens.len() => {
+            Some((true, h))
+        }
+        (Some(d), _) => Some((false, d)),
+        (_, h) => h.map(|id| (true, id)),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

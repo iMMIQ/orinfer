@@ -182,6 +182,8 @@ pub(crate) struct Session {
     pub(crate) virtual_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) workspace_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) expert_buffers: std::cell::RefCell<virtual_memory::Reservations>,
+    pub(crate) snapshot_allocations:
+        std::cell::RefCell<Vec<std::rc::Rc<super::snapshot::Allocation>>>,
     pub(crate) prefix_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) modules: std::cell::RefCell<Vec<sys::CUmodule>>,
     pub(crate) events: Vec<sys::CUevent>,
@@ -207,6 +209,7 @@ impl Session {
             workspace_buffers: Default::default(),
             expert_buffers: Default::default(),
             prefix_buffers: Default::default(),
+            snapshot_allocations: Default::default(),
             modules: Default::default(),
             events: vec![],
             graph: ptr::null_mut(),

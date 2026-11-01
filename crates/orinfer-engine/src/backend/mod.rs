@@ -4,6 +4,7 @@ pub mod ascend;
 pub(crate) mod cuda;
 mod executor;
 mod growth;
+pub(crate) mod kv;
 pub(crate) mod report;
 pub(crate) mod snapshot;
 mod values;

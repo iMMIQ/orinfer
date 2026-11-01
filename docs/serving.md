@@ -276,6 +276,14 @@ A2 DSv4.1 将请求私有状态按存活范围分配：有界 SWA/C2 状态和�
 
 A2 准入按请求的实际输入长度与声明的输出上限保留后续 KV 增长额度，物理页仍随执行进度映射。尚未映射的额度同时从物理显存和 session 余额中扣除，供新请求、prefix 快照和 Graph workspace 统一检查，避免已接收请求后续增长时与缓存争抢同一份空间。`--prefix-cache-mib` 按同一快照 bank 在各 rank 的最大物理占用计费，共享 bank 去重，CPU 输出也计入缓存预算。
 
+`serve`、`worker` 和 `batch` 可通过 `--kv-offload-mib 65536` 启用总计 64 GiB 的 CPU prefix 状态缓存，默认 `0` 关闭。CUDA 使用单 worker 的全局预算；A2 在所有 TP rank 之间划分。按共享 bank 的实际容量去重，并预留历史、索引和输出头等元数据。内存按需分配；pinned DMA 缓冲另受原生 session 的既有上限约束。`--prefix-cache-mib` 控制每张卡上的设备缓存；设置为 `0` 时可以直接保存到 CPU 层。
+
+CUDA 与 A2 共用物理页身份、引用、发布、写时复制、CPU bank 和设备副本目录。prefix 缓存与活动请求引用同一份不可变 KV 物理分配，发布缓存及设备命中通过映射复用，保持请求虚拟地址和已有 Graph 地址稳定。续写共享分配前执行写时复制，只保存已提交字节；新的未提交后缀清零。SWA、循环窗口、压缩残留和 MTP 等可变状态按模型声明单独保存，恢复完整状态后继续执行。物理分配粒度由设备原生 API 决定；预算按完整物理容量计费，CPU backing 只保留有效字节。
+
+设备缓存淘汰时，预算允许的快照移到 CPU；CPU 层满时按现有缓存效用策略回收。查询两层合法前缀，同长时优先设备。CPU bank 用弱引用跟踪设备副本：活动请求仍引用设备页时直接复用，设备页已回收时上传一次并供后续命中共享。CPU 共享 bank 保留各 rank 自己的数据，已经保存的不可变切片直接复用，仅传输缺失范围；传输通过有界 pinned 分块，完成事件持有 DMA 的全部原生资源。卸载和恢复在调度边界完成，活动请求的计算与 KV 保留在设备上，准入同时保留后续增长及共享尾页复制所需额度。
+
+请求完成日志中的 `host_resident_bytes` 是 CPU 层计费字节，A2 为所有 rank 合计，含保守元数据预留；`host_entries`、`host_hits`、`host_stores` 和 `host_evictions` 记录 CPU 层行为，恢复耗时计入 `restore_s`。设计参考 SGLang [radix cache](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py) 的共享页与活动引用，以及 [HiCache](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/cache_controller.py)、vLLM [KV offloading](https://github.com/vllm-project/vllm/blob/main/docs/features/kv_offloading_usage.md) 的分层存储与传输完成约束。公共管理代码复用布局和所有权规则；各设备仍使用本地物理布局、传输及完成事件。
+
 A2 准入同时检查每张卡的物理空闲显存与原生 session 分配余额，并保留执行 workspace；不足时依次回收 prefix 快照和缓存的 Graph 程序，再决定是否排队。快照先规划新增 bank 并检查缓存预算和分配余量，再分配和复制；回收父快照后重新规划，避免把完整复制误算成增量复制。正常容量不足走准入等待；其他进程的显存变化或原生驱动分配失败仍可能使 worker 失效，需要重启服务。
 
 A2 HTTP/JSONL 使用 `ASCEND_COREDUMP_SIGNAL=none`，由服务处理 SIGINT/SIGTERM 并回收资源。`serve`、`worker` 和 `batch` CLI 在创建线程前默认设置该值；直接调用 Rust API 时在进程启动环境中设置。A2 检测到缺失或冲突配置时在创建 GPU worker 前报错。[CANN 环境变量说明](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/800alpha002/apiref/envref/CANN%E7%A4%BE%E5%8C%BA%E7%89%88%208.0.0.alpha002%20%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F%E5%8F%82%E8%80%83%2001.pdf)说明了 trace 与业务信号捕获冲突时的配置；此设置关闭 CANN trace 的信号堆栈文件，Rust 错误报告及系统 core dump 配置继续生效。SIGINT/SIGTERM 会中断未完成请求，按 `--drain-timeout-ms` 等待 HTTP 响应及 worker 回收。

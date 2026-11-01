@@ -1,14 +1,8 @@
 //! Backend-owned backing for shared prefix extents and private continuation state.
+pub(crate) use super::kv::Allocation;
 use crate::artifact::Result;
 pub(crate) use orinfer_device::MemoryRange as Range;
 use std::{collections::BTreeMap, rc::Rc};
-#[derive(Debug)]
-pub(crate) struct Allocation {
-    pub(super) owner: orinfer_device::DeviceOwner,
-    pub(super) address: u64,
-    pub(super) bytes: usize,
-    pub(super) handle: Option<u64>,
-}
 #[derive(Clone)]
 pub(crate) struct Piece {
     pub(super) allocation: Rc<Allocation>,
@@ -51,17 +45,34 @@ pub(crate) struct Plan {
     pub(super) kv: Vec<Piece>,
     pub new_bytes: usize,
 }
+impl Plan {
+    pub(crate) fn host_banks(&self) -> BTreeMap<u64, usize> {
+        self.kv
+            .iter()
+            .map(|p| (p.allocation.id, p.allocation.used))
+            .collect()
+    }
+}
+impl Snapshot {
+    pub(crate) fn host_banks(&self) -> BTreeMap<u64, usize> {
+        self.state
+            .iter()
+            .chain(&self.kv)
+            .map(|p| (p.allocation.id, p.allocation.used))
+            .collect()
+    }
+}
 impl crate::prefix::Resident for Plan {
     fn allocations(&self, out: &mut BTreeMap<u64, usize>) {
         for p in &self.kv {
-            out.insert(p.allocation.address, p.allocation.bytes);
+            out.insert(p.allocation.id, p.allocation.bytes);
         }
     }
 }
 impl crate::prefix::Resident for Snapshot {
     fn allocations(&self, out: &mut BTreeMap<u64, usize>) {
         for p in self.state.iter().chain(&self.kv) {
-            out.insert(p.allocation.address, p.allocation.bytes);
+            out.insert(p.allocation.id, p.allocation.bytes);
         }
     }
 }
@@ -94,6 +105,9 @@ mod tests {
         assert!(snapshot.require_owner(foreign).is_err());
         snapshot.kv.push(Piece {
             allocation: Rc::new(Allocation {
+                id: 2,
+                used: 4,
+                native: None,
                 owner: foreign,
                 address: 42,
                 bytes: 4,

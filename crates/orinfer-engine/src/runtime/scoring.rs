@@ -163,6 +163,7 @@ impl ModelRuntime {
         // branch can observe the diagnostic policy. All real kernels stay intact.
         self.manifest.mtp = None;
         self.prefix_cache.budget = 0;
+        self.host_prefix_cache.budget = 0;
         let options = crate::sampling::Options {
             temperature: 0.,
             seed: requests.seed,

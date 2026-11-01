@@ -61,6 +61,7 @@ impl BatchConfig {
             mtp_drafts: self.load.mtp_drafts,
             prompt_lookup: self.load.prompt_lookup,
             prefix_cache_bytes: self.load.prefix_cache_bytes,
+            kv_offload_bytes: self.load.kv_offload_bytes,
             scheduler: self.scheduler,
             limits: self.limits,
             ..Default::default()
@@ -83,6 +84,7 @@ pub struct ServerConfig {
     pub mtp_drafts: Option<usize>,
     pub prompt_lookup: bool,
     pub prefix_cache_bytes: usize,
+    pub kv_offload_bytes: usize,
     pub scheduler: scheduler::Options,
     pub limits: PreprocessingLimits,
 }
@@ -101,6 +103,7 @@ impl Default for ServerConfig {
             mtp_drafts: None,
             prompt_lookup: false,
             prefix_cache_bytes: 12usize << 30,
+            kv_offload_bytes: 0,
             scheduler: Default::default(),
             limits: Default::default(),
         }

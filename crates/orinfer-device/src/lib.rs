@@ -168,7 +168,7 @@ impl FromStr for GraphMode {
 }
 
 /// Logical extents do not assume a CUDA or CANN physical mapping granularity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryRange {
     pub offset: usize,
     pub bytes: usize,

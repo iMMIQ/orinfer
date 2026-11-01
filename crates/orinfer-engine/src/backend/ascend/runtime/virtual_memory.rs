@@ -1,5 +1,6 @@
 //! Stable virtual addresses with separately charged, demand-mapped HBM pages.
 use super::*;
+use crate::backend::kv::{self, Allocation as SharedAllocation, Mapping as Page, MappingOps};
 use std::collections::BTreeMap;
 
 #[repr(C)]
@@ -79,12 +80,6 @@ fn aligned(bytes: usize, grain: usize) -> Result<usize> {
         / grain
         * grain)
 }
-struct Page {
-    handle: Handle,
-    offset: usize,
-    bytes: usize,
-    mapped: bool,
-}
 pub(super) struct Reservation {
     context: Rc<Context>,
     api: Api,
@@ -93,6 +88,7 @@ pub(super) struct Reservation {
     grain: usize,
     mapped: usize,
     pages: Vec<Page>,
+    retained: Vec<Rc<SharedAllocation>>,
 }
 impl Reservation {
     fn extent(&self, bytes: usize) -> Result<usize> {
@@ -119,6 +115,7 @@ impl Reservation {
             return Err("ACL demand growth exceeds remaining session budget".into());
         }
         let _current = self.context.enter()?;
+        let id = kv::allocation_id()?;
         let mut handle = ptr::null_mut();
         check(
             // SAFETY: Current owned device, aligned extent and live handle output.
@@ -129,10 +126,12 @@ impl Reservation {
             .device_bytes
             .set(self.context.device_bytes.get() + additional);
         self.pages.push(Page {
-            handle,
+            id,
             offset: self.mapped,
             bytes: additional,
+            handle: handle as usize as u64,
             mapped: false,
+            shared: None,
         });
         let page = self.pages.last_mut().unwrap();
         // SAFETY: Offset is inside this retained virtual reservation; allocation has the same extent.
@@ -155,29 +154,37 @@ impl Reservation {
     }
     fn clear(&mut self) -> Result<()> {
         let _current = self.context.enter()?;
-        while let Some(page) = self.pages.last_mut() {
-            // SAFETY: Every recorded page is wholly inside this retained reservation.
-            let pointer = unsafe { self.address.cast::<u8>().add(page.offset).cast() };
-            if page.mapped {
+        let sizes = self
+            .pages
+            .iter()
+            .map(|p| (p.handle, p.bytes))
+            .collect::<BTreeMap<_, _>>();
+        let result = kv::release_mappings(
+            &mut self.pages,
+            &mut self.retained,
+            |page| {
                 check(
-                    // SAFETY: Prior users are fenced, or the final Buffer/Graph owner has dropped.
-                    unsafe { (self.api.unmap)(pointer) },
-                    "unmap ACL physical pages",
+                    // SAFETY: Prior accesses completed and this is an owned mapped extent.
+                    unsafe { (self.api.unmap)(self.address.cast::<u8>().add(page.offset).cast()) },
+                    "unmap ACL KV alias",
+                )
+            },
+            |handle| {
+                check(
+                    // SAFETY: The last owned mapping has been detached; shared handles are skipped by the common core.
+                    unsafe { (self.api.free)(handle as usize as Handle) },
+                    "free ACL KV physical allocation",
                 )?;
-                page.mapped = false;
-            }
-            check(
-                // SAFETY: The owned physical handle has no remaining virtual mapping.
-                unsafe { (self.api.free)(page.handle) },
-                "free ACL physical pages",
-            )?;
-            self.context
-                .device_bytes
-                .set(self.context.device_bytes.get() - page.bytes);
-            self.pages.pop();
+                self.context
+                    .device_bytes
+                    .set(self.context.device_bytes.get() - sizes[&handle]);
+                Ok(())
+            },
+        );
+        if result.is_ok() {
+            self.mapped = 0;
         }
-        self.mapped = 0;
-        Ok(())
+        result
     }
 }
 impl Drop for Reservation {
@@ -233,6 +240,7 @@ impl Session {
             grain,
             mapped: 0,
             pages: vec![],
+            retained: vec![],
         };
         Ok(Buffer {
             offset: 0,
@@ -248,12 +256,16 @@ impl Session {
     /// Prior readers complete before mapping changes; virtual addresses never change.
     #[cfg(test)]
     pub(crate) fn grow(&self, buffer: &Buffer, bytes: usize) -> Result<()> {
+        self.make_kv_writable(&[(buffer.clone(), MemoryRange { offset: 0, bytes })])?;
         self.grow_many(&[(buffer.clone(), bytes)])
     }
     /// Map a validated growth set between two fences. All mappings precede
     /// initialization, and every new byte is zero before returning to a caller.
     pub(crate) fn grow_many(&self, buffers: &[(Buffer, usize)]) -> Result<()> {
-        let mut growth = BTreeMap::<usize, (Buffer, usize)>::new();
+        // Deduplicate aliases by native identity, but assign logical pages in
+        // caller order. CPU allocation addresses differ across TP workers.
+        let mut indices = BTreeMap::<usize, usize>::new();
+        let mut growth = Vec::<(Buffer, usize)>::new();
         for (buffer, bytes) in buffers {
             self.require(buffer)?;
             MemoryRange {
@@ -265,12 +277,15 @@ impl Session {
                 continue;
             }
             let end = buffer.offset + bytes;
-            growth
+            let index = *indices
                 .entry(Rc::as_ptr(&buffer.allocation) as usize)
-                .and_modify(|(_, extent)| *extent = (*extent).max(end))
-                .or_insert((buffer.clone(), end));
+                .or_insert_with(|| {
+                    growth.push((buffer.clone(), end));
+                    growth.len() - 1
+                });
+            growth[index].1 = growth[index].1.max(end);
         }
-        let additional = growth.values().try_fold(0usize, |sum, (buffer, end)| {
+        let additional = growth.iter().try_fold(0usize, |sum, (buffer, end)| {
             let memory = buffer.allocation.virtual_memory.as_ref().unwrap().borrow();
             sum.checked_add(memory.extent(*end)? - memory.mapped)
                 .ok_or_else(|| "ACL demand growth extent overflow".to_string())
@@ -285,7 +300,7 @@ impl Session {
             return Err("ACL demand growth exceeds remaining session budget".into());
         }
         let mut spans = Vec::with_capacity(growth.len());
-        for (buffer, end) in growth.values() {
+        for (buffer, end) in &growth {
             let mapped = buffer
                 .allocation
                 .virtual_memory
@@ -450,6 +465,30 @@ mod tests {
     }
 
     #[test]
+    fn logical_page_identity_follows_caller_order_across_native_address_orders() {
+        let mut fixture = Fixture::new();
+        let session = fixture.session();
+        let grain = 2 << 20;
+        let mut buffers = (0..4)
+            .map(|_| session.reserve(grain * 2).unwrap())
+            .collect::<Vec<_>>();
+        buffers.sort_by_key(|b| std::cmp::Reverse(std::rc::Rc::as_ptr(&b.allocation) as usize));
+        let mut requests = buffers.iter().cloned().map(|b| (b, 17)).collect::<Vec<_>>();
+        requests.push((buffers[0].slice(grain, 3).unwrap(), 3));
+        session.grow_many(&requests).unwrap();
+        let ids = buffers
+            .iter()
+            .map(|b| b.kv_preview(17).unwrap()[0].0.id)
+            .collect::<Vec<_>>();
+        assert!(
+            ids.windows(2).all(|ids| ids[1] == ids[0] + 2),
+            "TP logical allocation order must be independent of native addresses: {ids:?}"
+        );
+        assert_eq!(session.allocated_bytes(), 5 * grain);
+        drop((requests, buffers, session));
+        fixture.assert_clean();
+    }
+    #[test]
     fn growth_batch_deduplicates_views_and_validates_the_whole_budget() {
         let mut fixture = Fixture::new();
         let session = fixture.session();
@@ -503,3 +542,452 @@ mod tests {
 
 #[cfg(test)]
 mod device_tests;
+
+/// CANN resource operations for the shared KV mapping state machine.
+struct Ops<'a> {
+    session: &'a Session,
+    api: Api,
+    address: Handle,
+    pending: RefCell<BTreeMap<u64, usize>>,
+}
+impl MappingOps for Ops<'_> {
+    fn allocate(&self, bytes: usize) -> Result<u64> {
+        self.session.context.ready()?;
+        if bytes > self.session.remaining_device_bytes() {
+            return Err("KV COW exceeds remaining A2 budget".into());
+        }
+        let mut handle = ptr::null_mut();
+        check(
+            // SAFETY: Live context, physical extent and writable handle output.
+            unsafe {
+                (self.api.allocate)(&mut handle, bytes, &properties(&self.session.context), 0)
+            },
+            "allocate ACL KV COW",
+        )?;
+        self.session
+            .context
+            .device_bytes
+            .set(self.session.allocated_bytes() + bytes);
+        let handle = handle as usize as u64;
+        self.pending.borrow_mut().insert(handle, bytes);
+        Ok(handle)
+    }
+    fn release(&self, handle: u64) -> Result<()> {
+        check(
+            // SAFETY: This unpublished physical handle has no remaining mapping.
+            unsafe { (self.api.free)(handle as usize as Handle) },
+            "rollback ACL KV COW",
+        )?;
+        let bytes = self
+            .pending
+            .borrow_mut()
+            .remove(&handle)
+            .ok_or("Unknown A2 COW allocation")?;
+        self.session
+            .context
+            .device_bytes
+            .set(self.session.allocated_bytes() - bytes);
+        Ok(())
+    }
+    fn map(&self, offset: usize, bytes: usize, handle: u64, _shared: bool) -> Result<()> {
+        check(
+            // SAFETY: The shared core validated the owned reservation and complete physical extent.
+            unsafe {
+                (self.api.map)(
+                    self.address.cast::<u8>().add(offset).cast(),
+                    bytes,
+                    0,
+                    handle as usize as Handle,
+                    0,
+                )
+            },
+            "map ACL KV allocation",
+        )
+    }
+    fn unmap(&self, offset: usize, _bytes: usize) -> Result<()> {
+        check(
+            // SAFETY: Caller fenced prior users; offset is an existing mapped extent.
+            unsafe { (self.api.unmap)(self.address.cast::<u8>().add(offset).cast()) },
+            "unmap ACL KV allocation",
+        )
+    }
+    fn zero(&self, offset: usize, bytes: usize) -> Result<()> {
+        check(
+            // SAFETY: New writable backing and live compute stream, retained through the batch fence.
+            unsafe {
+                (self.session.context.api.memset)(
+                    self.address.cast::<u8>().add(offset).cast(),
+                    bytes,
+                    0,
+                    bytes,
+                    self.session.context.compute,
+                )
+            },
+            "initialize ACL KV COW",
+        )
+    }
+    fn copy(&self, offset: usize, source: &SharedAllocation, bytes: usize) -> Result<()> {
+        source.owner.require(self.session.context.owner)?;
+        check(
+            // SAFETY: Valid immutable source prefix and new destination; common state retains source backing.
+            unsafe {
+                (self.session.context.api.memcpy)(
+                    self.address.cast::<u8>().add(offset).cast(),
+                    bytes,
+                    source.address as usize as Handle,
+                    bytes,
+                    3,
+                    self.session.context.compute,
+                )
+            },
+            "copy ACL KV private tail",
+        )
+    }
+    fn complete(&self) -> Result<bool> {
+        Ok(false)
+    }
+    fn publish(&self, page: &Page, used: usize) -> Result<Rc<SharedAllocation>> {
+        let canonical = self.session.reserve(page.bytes)?;
+        {
+            let mut memory = canonical
+                .allocation
+                .virtual_memory
+                .as_ref()
+                .unwrap()
+                .borrow_mut();
+            check(
+                // SAFETY: New reserved VA, borrowed complete physical allocation. No extra HBM is allocated.
+                unsafe {
+                    (memory.api.map)(
+                        memory.address,
+                        page.bytes,
+                        0,
+                        page.handle as usize as Handle,
+                        0,
+                    )
+                },
+                "publish ACL KV alias",
+            )?;
+            memory.pages.push(Page {
+                id: page.id,
+                offset: 0,
+                bytes: page.bytes,
+                handle: page.handle,
+                mapped: true,
+                shared: None,
+            });
+            memory.mapped = page.bytes;
+        }
+        Ok(Rc::new(SharedAllocation {
+            owner: self.session.context.owner,
+            id: page.id,
+            address: canonical.pointer() as usize as u64,
+            bytes: page.bytes,
+            used,
+            handle: Some(page.handle),
+            native: Some(Rc::new(canonical)),
+        }))
+    }
+}
+impl Buffer {
+    pub(in crate::backend::ascend) fn demand_mapped(&self) -> bool {
+        self.offset == 0 && self.allocation.virtual_memory.is_some()
+    }
+    pub(in crate::backend::ascend) fn kv_preview(
+        &self,
+        bytes: usize,
+    ) -> Result<Vec<kv::Published>> {
+        MemoryRange { offset: 0, bytes }.within(self.bytes)?;
+        if self.offset != 0 {
+            return Err("Shared KV publication requires a root buffer".into());
+        }
+        let memory = self
+            .allocation
+            .virtual_memory
+            .as_ref()
+            .ok_or("KV buffer is not demand mapped")?
+            .borrow();
+        kv::preview(
+            &memory.pages,
+            self.allocation.context.owner,
+            self.pointer() as usize as u64,
+            MemoryRange { offset: 0, bytes },
+        )
+    }
+    pub(in crate::backend::ascend) fn kv_writable_bytes(
+        &self,
+        range: MemoryRange,
+    ) -> Result<usize> {
+        range.within(self.bytes)?;
+        if let Some(memory) = &self.allocation.virtual_memory {
+            kv::writable_bytes(
+                &memory.borrow().pages,
+                MemoryRange {
+                    offset: self.offset + range.offset,
+                    bytes: range.bytes,
+                },
+            )
+        } else {
+            Ok(0)
+        }
+    }
+}
+impl Session {
+    pub(in crate::backend::ascend) fn publish_kv(
+        &self,
+        buffer: &Buffer,
+        bytes: usize,
+    ) -> Result<Vec<kv::Published>> {
+        self.require(buffer)?;
+        buffer.kv_preview(bytes)?;
+        let _current = self.context.enter()?;
+        let mut memory = buffer
+            .allocation
+            .virtual_memory
+            .as_ref()
+            .unwrap()
+            .borrow_mut();
+        let ops = Ops {
+            session: self,
+            api: memory.api,
+            address: memory.address,
+            pending: Default::default(),
+        };
+        let result = kv::publish(&mut memory.pages, MemoryRange { offset: 0, bytes }, &ops);
+        if result.is_err() {
+            self.context.retire();
+        }
+        result
+    }
+    /// One producer fence and one completion fence cover every private tail copy.
+    pub(in crate::backend::ascend) fn make_kv_writable(
+        &self,
+        writes: &[(Buffer, MemoryRange)],
+    ) -> Result<()> {
+        let mut needed = false;
+        for (buffer, range) in writes {
+            self.require(buffer)?;
+            needed |= buffer.kv_writable_bytes(*range)? > 0;
+        }
+        if !needed {
+            return Ok(());
+        }
+        self.synchronize()?;
+        let _current = self.context.enter()?;
+        let result = (|| {
+            for (buffer, range) in writes {
+                let Some(memory) = &buffer.allocation.virtual_memory else {
+                    continue;
+                };
+                let mut memory = memory.borrow_mut();
+                let ops = Ops {
+                    session: self,
+                    api: memory.api,
+                    address: memory.address,
+                    pending: Default::default(),
+                };
+                let Reservation {
+                    pages, retained, ..
+                } = &mut *memory;
+                kv::make_writable(
+                    pages,
+                    retained,
+                    MemoryRange {
+                        offset: buffer.offset + range.offset,
+                        bytes: range.bytes,
+                    },
+                    &ops,
+                )?;
+            }
+            self.context.sync(self.context.compute)?;
+            for (buffer, _) in writes {
+                if let Some(memory) = &buffer.allocation.virtual_memory {
+                    memory.borrow_mut().retained.clear();
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.context.retire();
+        }
+        result
+    }
+    pub(in crate::backend::ascend) fn restore_kv(
+        &self,
+        buffer: &Buffer,
+        pieces: &[crate::backend::snapshot::Piece],
+    ) -> Result<()> {
+        self.require(buffer)?;
+        if buffer.offset != 0 {
+            return Err("Shared KV restore requires a root buffer".into());
+        }
+        let _current = self.context.enter()?;
+        let mut memory = buffer
+            .allocation
+            .virtual_memory
+            .as_ref()
+            .ok_or("Missing KV reservation")?
+            .borrow_mut();
+        for piece in pieces {
+            piece.allocation.owner.require(self.context.owner)?;
+            kv::alias_offset(
+                &piece.allocation,
+                piece.range,
+                piece.source,
+                memory.grain,
+                memory.bytes,
+            )
+            .ok_or("Invalid A2 KV alias")?;
+        }
+        memory.clear()?;
+        for piece in pieces {
+            let offset = kv::alias_offset(
+                &piece.allocation,
+                piece.range,
+                piece.source,
+                memory.grain,
+                memory.bytes,
+            )
+            .unwrap();
+            if offset != memory.mapped {
+                return Err("Noncontiguous shared A2 KV mappings".into());
+            }
+            memory.pages.push(Page {
+                id: piece.allocation.id,
+                offset,
+                bytes: piece.allocation.bytes,
+                handle: piece.allocation.handle.unwrap(),
+                mapped: false,
+                shared: Some(piece.allocation.clone()),
+            });
+            let index = memory.pages.len() - 1;
+            // SAFETY: Validated full physical extent, retained immutable allocation and owned target VA.
+            let result = check(
+                // SAFETY: This owned context retains the checked native handle and allocation.
+                unsafe {
+                    (memory.api.map)(
+                        memory.address.cast::<u8>().add(offset).cast(),
+                        piece.allocation.bytes,
+                        0,
+                        piece.allocation.handle.unwrap() as usize as Handle,
+                        0,
+                    )
+                },
+                "restore shared ACL KV mapping",
+            );
+            if result.is_err() {
+                self.context.retire();
+            }
+            result?;
+            memory.pages[index].mapped = true;
+            memory.mapped += piece.allocation.bytes;
+        }
+        Ok(())
+    }
+}
+
+impl Session {
+    pub(in crate::backend::ascend) fn snapshot_allocation(
+        &self,
+        buffer: &Buffer,
+        id: u64,
+    ) -> Result<Rc<SharedAllocation>> {
+        self.require(buffer)?;
+        Ok(Rc::new(SharedAllocation {
+            owner: self.context.owner,
+            id,
+            address: buffer.pointer() as usize as u64,
+            bytes: aligned(buffer.bytes(), 2 << 20)?,
+            used: buffer.bytes(),
+            handle: None,
+            native: Some(Rc::new(buffer.clone())),
+        }))
+    }
+}
+
+impl Session {
+    /// Re-residency preserves the logical page identity. Native allocations and
+    /// aliases are implementation details and do not consume new logical IDs.
+    pub(in crate::backend::ascend) fn host_kv(
+        &self,
+        bank: &crate::backend::kv::host::HostBank,
+    ) -> Result<Rc<SharedAllocation>> {
+        if let Some(allocation) = bank.resident(self.context.owner)? {
+            return Ok(allocation);
+        }
+        let descriptor = bank.descriptor().ok_or("Missing host KV descriptor")?;
+        descriptor.owner.require(self.context.owner)?;
+        if !descriptor.paged || descriptor.bytes > self.remaining_device_bytes() {
+            return Err("Invalid or unreserved host KV materialization".into());
+        }
+        let canonical = self.reserve(descriptor.bytes)?;
+        {
+            let _current = self.context.enter()?;
+            let mut memory = canonical
+                .allocation
+                .virtual_memory
+                .as_ref()
+                .unwrap()
+                .borrow_mut();
+            let mut handle = ptr::null_mut();
+            check(
+                // SAFETY: Valid physical capacity and live handle output.
+                unsafe {
+                    (memory.api.allocate)(
+                        &mut handle,
+                        descriptor.bytes,
+                        &properties(&self.context),
+                        0,
+                    )
+                },
+                "restore CPU KV backing",
+            )?;
+            self.context
+                .device_bytes
+                .set(self.allocated_bytes() + descriptor.bytes);
+            memory.pages.push(Page {
+                id: descriptor.id,
+                offset: 0,
+                bytes: descriptor.bytes,
+                handle: handle as usize as u64,
+                mapped: false,
+                shared: None,
+            });
+            // SAFETY: New owned canonical VA and complete retained physical allocation.
+            let result = check(
+                // SAFETY: This owned context retains the checked native handle and allocation.
+                unsafe { (memory.api.map)(memory.address, descriptor.bytes, 0, handle, 0) },
+                "map restored CPU KV",
+            );
+            if result.is_err() {
+                self.context.retire();
+            }
+            result?;
+            memory.pages[0].mapped = true;
+            memory.mapped = descriptor.bytes;
+        }
+        self.fill(&canonical, 0)?;
+        self.upload_regions(&[(canonical.clone(), 0, &bank.bytes.borrow())])?
+            .wait()?;
+        let allocation = Rc::new(SharedAllocation {
+            owner: self.context.owner,
+            id: descriptor.id,
+            address: canonical.pointer() as usize as u64,
+            bytes: descriptor.bytes,
+            used: descriptor.used,
+            handle: Some(
+                canonical
+                    .allocation
+                    .virtual_memory
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .pages[0]
+                    .handle,
+            ),
+            native: Some(Rc::new(canonical.clone())),
+        });
+        bank.remember(&allocation)?;
+        Ok(allocation)
+    }
+}

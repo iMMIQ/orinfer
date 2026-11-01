@@ -73,7 +73,7 @@ pub fn run(config: BatchConfig) -> Result<BatchReport> {
                 {
                     tokio::select! {
                         result = planning::prepare(&mut input, &worker.state, &defaults,
-                            config.load.prefix_cache_bytes > 0, &mut report) => result?,
+                            config.load.prefix_cache_bytes > 0 || config.load.kv_offload_bytes > 0, &mut report) => result?,
                         _ = shutdown_signal() => { report.interrupted = true; return Ok(()); }
                     }
                 }

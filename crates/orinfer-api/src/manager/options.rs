@@ -11,6 +11,7 @@ pub struct WorkerOptions {
     pub mtp_drafts: String,
     pub resident_experts: String,
     pub prefix_cache_mib: usize,
+    pub kv_offload_mib: usize,
     pub max_active_requests: usize,
     pub max_batch_tokens: usize,
     pub max_speculative_tokens: usize,
@@ -31,6 +32,7 @@ impl Default for WorkerOptions {
             mtp_drafts: "auto".into(),
             resident_experts: "full".into(),
             prefix_cache_mib: 12288,
+            kv_offload_mib: 0,
             max_active_requests: 32,
             max_batch_tokens: 128,
             max_speculative_tokens: 0,
@@ -55,6 +57,7 @@ impl WorkerOptions {
                 .map_or_else(|| "auto".into(), |n| n.to_string()),
             resident_experts: settings.resident_experts.to_string(),
             prefix_cache_mib: settings.prefix_cache_bytes >> 20,
+            kv_offload_mib: settings.kv_offload_bytes >> 20,
             max_active_requests: settings.scheduler.max_active,
             max_batch_tokens: settings.scheduler.max_batch_tokens,
             max_speculative_tokens: settings.scheduler.max_speculative_tokens,
@@ -80,6 +83,10 @@ impl WorkerOptions {
                 .prefix_cache_mib
                 .checked_mul(1 << 20)
                 .ok_or("Prefix budget overflow")?,
+            kv_offload_bytes: self
+                .kv_offload_mib
+                .checked_mul(1 << 20)
+                .ok_or("CPU offload budget overflow")?,
             load_workers: self.load_workers,
             verify_weights: self.verify_weights,
             prompt_lookup: self.prompt_lookup,
@@ -112,6 +119,8 @@ impl WorkerOptions {
             self.mtp_drafts.clone(),
             "--resident-experts".into(),
             self.resident_experts.clone(),
+            "--kv-offload-mib".into(),
+            self.kv_offload_mib.to_string(),
             "--prefix-cache-mib".into(),
             self.prefix_cache_mib.to_string(),
             "--max-active-requests".into(),

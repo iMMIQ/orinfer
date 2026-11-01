@@ -1,5 +1,6 @@
 //! CUDA VMM ownership: graph pointers stay fixed while physical slabs grow.
 use super::{Driver, Result, Session, check, sys};
+use crate::backend::kv::{self, Mapping as Slab, MappingOps};
 use std::{collections::BTreeMap, rc::Rc};
 
 use sys::{CUmemAccessDesc as AccessDesc, CUmemAllocationProp as AllocationProp};
@@ -12,6 +13,7 @@ pub(crate) struct Reservation {
     pub mapped: usize,
     slabs: Vec<Slab>,
     poisoned: bool,
+    retained: Vec<Rc<crate::backend::snapshot::Allocation>>,
 }
 impl Reservation {
     /// Map one sparse weight page. Payload initialization belongs to the uploader.
@@ -39,6 +41,7 @@ impl Reservation {
             )?;
         }
         self.slabs.push(Slab {
+            id: kv::allocation_id()?,
             offset,
             bytes: self.granularity,
             handle,
@@ -115,6 +118,7 @@ impl Reservation {
                 mapped: 0,
                 slabs: vec![],
                 poisoned: false,
+                retained: vec![],
             })
         }
     }
@@ -159,6 +163,7 @@ impl Reservation {
             location: prop.location,
             flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
         };
+        let id = kv::allocation_id()?;
         let mut handle = 0;
         // SAFETY: Session owns the context/stream; each successful create is
         // immediately recorded before any fallible map/access/initialization.
@@ -169,6 +174,7 @@ impl Reservation {
             )?;
         }
         let mut slab = Slab {
+            id,
             offset,
             bytes,
             handle,
@@ -207,6 +213,7 @@ impl Reservation {
         self.mapped = extent;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn allocation_handle(&self) -> Result<u64> {
         match self.slabs.as_slice() {
             [slab] if slab.offset == 0 && slab.bytes == self.mapped && slab.shared.is_none() => {
@@ -239,6 +246,7 @@ impl Reservation {
             return Err("Invalid shared prefix mapping".into());
         }
         self.slabs.push(Slab {
+            id: allocation.id,
             offset,
             bytes,
             handle,
@@ -272,85 +280,76 @@ impl Reservation {
         Ok(())
     }
     pub(crate) fn writable_bytes(&self, start: usize, bytes: usize) -> Result<usize> {
-        let end = start.checked_add(bytes).ok_or("KV write extent overflow")?;
-        self.slabs
-            .iter()
-            .filter(|p| p.shared.is_some() && overlaps(start, end, p.offset, p.bytes))
-            .try_fold(0usize, |sum, p| {
-                sum.checked_add(p.bytes)
-                    .ok_or("KV COW budget overflow".into())
-            })
+        kv::writable_bytes(
+            &self.slabs,
+            crate::backend::snapshot::Range {
+                offset: start,
+                bytes,
+            },
+        )
     }
-    /// Complete the caller's stream before replacing mappings. Graph VAs stay stable.
     pub(crate) fn make_writable(&mut self, s: &Session, start: usize, bytes: usize) -> Result<()> {
         if self.poisoned {
             return Err("KV reservation is quarantined".into());
         }
-        let end = start.checked_add(bytes).ok_or("KV write extent overflow")?;
-        for slab in &mut self.slabs {
-            if !overlaps(start, end, slab.offset, slab.bytes) {
-                continue;
-            }
-            let Some(source) = slab.shared.clone() else {
-                continue;
-            };
-            let mut handle = 0;
-            // SAFETY: Owner synchronized consumers; preserve the immutable source until copy finishes.
-            unsafe {
-                check(
-                    sys::cuMemCreate(&mut handle, slab.bytes, &properties(s.device), 0),
-                    "create private prefix copy",
-                )?;
-                if let Err(error) = unsafe_unmap(&s.driver, self.address, slab) {
-                    // The new handle has never been mapped. Keep it owned if release fails.
-                    if unsafe_release(&s.driver, handle).is_err() {
-                        self.slabs.push(Slab {
-                            offset: self.bytes,
-                            bytes: 0,
-                            handle,
-                            mapped: false,
-                            shared: None,
-                        });
-                    }
-                    self.poisoned = true;
-                    return Err(error);
-                }
-                // The shared handle belongs to the snapshot registry, not this alias.
-                slab.handle = handle;
-                slab.shared = None;
-                slab.mapped = false;
-                let address = self.address + slab.offset as u64;
-                let result = (|| {
-                    check(
-                        sys::cuMemMap(address, slab.bytes, 0, handle, 0),
-                        "map private prefix copy",
-                    )?;
-                    slab.mapped = true;
-                    let access = AccessDesc {
-                        location: properties(s.device).location,
-                        flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
-                    };
-                    check(
-                        sys::cuMemSetAccess(address, slab.bytes, &access, 1),
-                        "private prefix copy access",
-                    )?;
-                    check(
-                        sys::cuMemcpyDtoDAsync_v2(address, source.address, slab.bytes, s.stream),
-                        "copy immutable prefix before write",
-                    )?;
-                    check(sys::cuStreamSynchronize(s.stream), "finish prefix COW")
-                })();
-                if result.is_err() {
-                    self.poisoned = true;
-                }
-                result?;
-            }
+        let result = kv::make_writable(
+            &mut self.slabs,
+            &mut self.retained,
+            crate::backend::snapshot::Range {
+                offset: start,
+                bytes,
+            },
+            &Ops {
+                session: s,
+                address: self.address,
+            },
+        );
+        if result.is_err() {
+            self.poisoned = true;
         }
-        Ok(())
+        result
+    }
+    pub(crate) fn preview(
+        &self,
+        owner: orinfer_device::DeviceOwner,
+        range: crate::backend::snapshot::Range,
+    ) -> Result<
+        Vec<(
+            Rc<crate::backend::snapshot::Allocation>,
+            crate::backend::snapshot::Range,
+            usize,
+        )>,
+    > {
+        kv::preview(&self.slabs, owner, self.address, range)
+    }
+    pub(crate) fn publish(
+        &mut self,
+        s: &Session,
+        range: crate::backend::snapshot::Range,
+    ) -> Result<
+        Vec<(
+            Rc<crate::backend::snapshot::Allocation>,
+            crate::backend::snapshot::Range,
+            usize,
+        )>,
+    > {
+        let result = kv::publish(
+            &mut self.slabs,
+            range,
+            &Ops {
+                session: s,
+                address: self.address,
+            },
+        );
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
     pub(crate) fn release_slabs(&mut self, driver: &Driver) -> Result<()> {
-        let result = release_owned(
+        let result = kv::release_mappings(
             &mut self.slabs,
+            &mut self.retained,
             |slab| unsafe_unmap(driver, self.address, slab),
             |handle| unsafe_release(driver, handle),
         );
@@ -366,14 +365,7 @@ impl Reservation {
         !self.slabs.is_empty()
     }
 }
-#[derive(Debug)]
-struct Slab {
-    offset: usize,
-    bytes: usize,
-    handle: u64,
-    mapped: bool,
-    shared: Option<Rc<super::snapshot::Allocation>>,
-}
+#[cfg(test)]
 fn overlaps(start: usize, end: usize, offset: usize, bytes: usize) -> bool {
     start < end && start < offset.saturating_add(bytes) && offset < end
 }
@@ -392,31 +384,10 @@ fn unsafe_release(_driver: &Driver, handle: u64) -> Result<()> {
 }
 fn release_owned(
     slabs: &mut Vec<Slab>,
-    mut unmap: impl FnMut(&Slab) -> Result<()>,
-    mut release: impl FnMut(u64) -> Result<()>,
+    unmap: impl FnMut(&Slab) -> Result<()>,
+    release: impl FnMut(u64) -> Result<()>,
 ) -> Result<()> {
-    let mut errors = vec![];
-    slabs.retain_mut(|slab| {
-        if slab.mapped {
-            if let Err(e) = unmap(slab) {
-                errors.push(e);
-                return true;
-            }
-            slab.mapped = false;
-        }
-        if slab.shared.is_none()
-            && let Err(e) = release(slab.handle)
-        {
-            errors.push(e);
-            return true;
-        }
-        false
-    });
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
+    kv::release_mappings(slabs, &mut vec![], unmap, release)
 }
 fn properties(device: i32) -> AllocationProp {
     AllocationProp {
@@ -446,18 +417,219 @@ fn round_up(bytes: usize, granularity: usize) -> Result<usize> {
 }
 pub(crate) type Reservations = BTreeMap<String, Reservation>;
 
+/// CUDA calls only; allocation identities and COW/publication rules live in kv.
+struct Ops<'a> {
+    session: &'a Session,
+    address: u64,
+}
+impl MappingOps for Ops<'_> {
+    fn allocate(&self, bytes: usize) -> Result<u64> {
+        let mut handle = 0;
+        // SAFETY: Current session and valid physical allocation output.
+        unsafe {
+            check(
+                sys::cuMemCreate(&mut handle, bytes, &properties(self.session.device), 0),
+                "create KV physical allocation",
+            )?;
+        }
+        Ok(handle)
+    }
+    fn release(&self, handle: u64) -> Result<()> {
+        unsafe_release(&self.session.driver, handle)
+    }
+    fn map(&self, offset: usize, bytes: usize, handle: u64, _shared: bool) -> Result<()> {
+        // SAFETY: Caller validated and owns the virtual extent and physical handle.
+        unsafe {
+            check(
+                sys::cuMemMap(self.address + offset as u64, bytes, 0, handle, 0),
+                "map KV allocation",
+            )
+        }
+    }
+    fn access(&self, offset: usize, bytes: usize, shared: bool) -> Result<()> {
+        let access = AccessDesc {
+            location: properties(self.session.device).location,
+            flags: if shared {
+                sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READ
+            } else {
+                sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+            },
+        };
+        // SAFETY: This owned mapping has the validated extent.
+        unsafe {
+            check(
+                sys::cuMemSetAccess(self.address + offset as u64, bytes, &access, 1),
+                "KV access",
+            )
+        }
+    }
+    fn unmap(&self, offset: usize, bytes: usize) -> Result<()> {
+        // SAFETY: Caller fenced all previous users of this live mapping.
+        unsafe {
+            check(
+                sys::cuMemUnmap(self.address + offset as u64, bytes),
+                "unmap KV allocation",
+            )
+        }
+    }
+    fn zero(&self, offset: usize, bytes: usize) -> Result<()> {
+        // SAFETY: New writable mapping retained through the completion fence.
+        unsafe {
+            check(
+                sys::cuMemsetD8Async(self.address + offset as u64, 0, bytes, self.session.stream),
+                "initialize KV COW",
+            )
+        }
+    }
+    fn copy(
+        &self,
+        offset: usize,
+        source: &crate::backend::snapshot::Allocation,
+        bytes: usize,
+    ) -> Result<()> {
+        source.owner.require(self.session.owner)?;
+        // SAFETY: Valid source prefix, new destination and retained backing.
+        unsafe {
+            check(
+                sys::cuMemcpyDtoDAsync_v2(
+                    self.address + offset as u64,
+                    source.address,
+                    bytes,
+                    self.session.stream,
+                ),
+                "copy KV private tail",
+            )
+        }
+    }
+    fn complete(&self) -> Result<bool> {
+        // SAFETY: Live stream; retained COW sources outlive this fence.
+        unsafe {
+            check(
+                sys::cuStreamSynchronize(self.session.stream),
+                "complete KV COW",
+            )?;
+        }
+        Ok(true)
+    }
+    fn publish(
+        &self,
+        page: &Slab,
+        used: usize,
+    ) -> Result<Rc<crate::backend::snapshot::Allocation>> {
+        let mut canonical = Reservation::reserve(self.session, page.bytes, 1)?;
+        let allocation = Rc::new(crate::backend::snapshot::Allocation {
+            owner: self.session.owner,
+            id: page.id,
+            address: canonical.address,
+            bytes: page.bytes,
+            used,
+            handle: Some(page.handle),
+            native: None,
+        });
+        // Until publication succeeds, this alias borrows the original handle.
+        canonical.slabs.push(Slab {
+            id: page.id,
+            offset: 0,
+            bytes: page.bytes,
+            handle: page.handle,
+            mapped: false,
+            shared: Some(allocation.clone()),
+        });
+        let ops = Ops {
+            session: self.session,
+            address: canonical.address,
+        };
+        let result = ops.map(0, page.bytes, page.handle, true).and_then(|()| {
+            canonical.slabs[0].mapped = true;
+            ops.access(0, page.bytes, true)
+        });
+        let key = canonical.address.to_string();
+        if result.is_ok() {
+            canonical.slabs[0].shared = None;
+            canonical.mapped = page.bytes;
+        }
+        self.session
+            .prefix_buffers
+            .borrow_mut()
+            .insert(key, canonical);
+        result?;
+        self.session
+            .snapshot_allocations
+            .borrow_mut()
+            .push(allocation.clone());
+        Ok(allocation)
+    }
+}
+
+pub(crate) fn restore_host(
+    s: &Session,
+    descriptor: crate::backend::kv::host::Descriptor,
+    bytes: &[u8],
+) -> Result<Rc<crate::backend::snapshot::Allocation>> {
+    descriptor.owner.require(s.owner)?;
+    if bytes.len() != descriptor.used || !descriptor.paged {
+        return Err("Invalid CUDA CPU KV payload".into());
+    }
+    let mut canonical = Reservation::reserve(s, descriptor.bytes, 1)?;
+    let ops = Ops {
+        session: s,
+        address: canonical.address,
+    };
+    let handle = ops.allocate(descriptor.bytes)?;
+    canonical.slabs.push(Slab {
+        id: descriptor.id,
+        offset: 0,
+        bytes: descriptor.bytes,
+        handle,
+        mapped: false,
+        shared: None,
+    });
+    let allocation = Rc::new(crate::backend::snapshot::Allocation {
+        owner: s.owner,
+        id: descriptor.id,
+        address: canonical.address,
+        bytes: descriptor.bytes,
+        used: descriptor.used,
+        handle: Some(handle),
+        native: None,
+    });
+    let result: Result<()> = (|| {
+        ops.map(0, descriptor.bytes, handle, false)?;
+        canonical.slabs[0].mapped = true;
+        ops.access(0, descriptor.bytes, false)?;
+        ops.zero(0, descriptor.bytes)?;
+        s.transfers
+            .borrow_mut()
+            .upload(s.stream, canonical.address, bytes)?;
+        ops.complete()?;
+        ops.access(0, descriptor.bytes, true)?;
+        canonical.mapped = descriptor.bytes;
+        Ok(())
+    })();
+    s.prefix_buffers
+        .borrow_mut()
+        .insert(canonical.address.to_string(), canonical);
+    s.snapshot_allocations.borrow_mut().push(allocation.clone());
+    result?;
+    Ok(allocation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn shared_mapping_cleanup_never_releases_snapshot_owned_handle() {
         let allocation = Rc::new(super::super::snapshot::Allocation {
+            id: crate::backend::kv::allocation_id().unwrap(),
+            used: 8192,
+            native: None,
             owner: orinfer_device::DeviceOwner::new(orinfer_device::Backend::Cuda, 0),
             address: 0,
             bytes: 8192,
             handle: Some(7),
         });
         let mut slabs = vec![Slab {
+            id: kv::allocation_id().unwrap(),
             offset: 0,
             bytes: 8192,
             handle: 7,
@@ -500,6 +672,9 @@ mod tests {
         source.grow_bytes(&s, bytes).unwrap();
         let source_address = source.address;
         let allocation = Rc::new(super::super::snapshot::Allocation {
+            id: crate::backend::kv::allocation_id().unwrap(),
+            used: 8192,
+            native: None,
             owner: s.owner,
             address: source.address,
             bytes,
@@ -583,6 +758,7 @@ mod tests {
     #[test]
     fn cleanup_retries_preserve_mapping_and_handle_ownership() {
         let mut slabs = vec![Slab {
+            id: kv::allocation_id().unwrap(),
             offset: 0,
             bytes: 4096,
             handle: 7,
@@ -740,6 +916,7 @@ mod tests {
             mapped: 0,
             slabs: vec![],
             poisoned: false,
+            retained: vec![],
         };
         assert_eq!(r.extent(1024).unwrap(), 2 << 20);
         assert_eq!(r.extent(1025).unwrap(), 4 << 20);
@@ -753,6 +930,7 @@ mod tests {
             mapped: 0,
             slabs: vec![],
             poisoned: false,
+            retained: vec![],
         };
         assert_eq!(scale.extent(65536).unwrap(), 2 << 20);
         assert_eq!(scale.extent(65537).unwrap(), 4 << 20);

@@ -3,7 +3,7 @@
 use super::cuda::sys;
 use super::report::ExpertCacheStatistics as Statistics;
 pub(crate) use super::report::LoadStats;
-use super::snapshot::{Piece, Plan, Range, Snapshot, Workspace};
+use super::snapshot::{Plan, Range, Snapshot, Workspace};
 use crate::{
     artifact::Result,
     execution::{ExecutionPhase, Invocation, LoadOptions},
@@ -576,10 +576,9 @@ impl Executor {
         &self,
         ranges: BTreeMap<String, Range>,
         kv_names: &BTreeSet<String>,
-        base: &[Piece],
     ) -> Result<Plan> {
         match &self.implementation {
-            Implementation::Cuda(inner) => inner.plan_snapshot(ranges, kv_names, base),
+            Implementation::Cuda(inner) => inner.plan_snapshot(ranges, kv_names),
         }
     }
     pub(crate) fn snapshot(&mut self, plan: &Plan) -> Result<Option<Snapshot>> {
@@ -608,6 +607,32 @@ impl Executor {
     pub(crate) fn restore_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
         match &self.implementation {
             Implementation::Cuda(inner) => inner.restore_snapshot(snapshot),
+        }
+    }
+    pub(crate) fn offload_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        pool: &mut super::kv::host::HostPool,
+    ) -> Result<super::kv::host::HostSnapshot> {
+        match &self.implementation {
+            Implementation::Cuda(inner) => inner.offload_snapshot(snapshot, pool),
+        }
+    }
+    pub(crate) fn host_snapshot(
+        &mut self,
+        plan: &Plan,
+        pool: &mut super::kv::host::HostPool,
+    ) -> Result<super::kv::host::HostSnapshot> {
+        match &mut self.implementation {
+            Implementation::Cuda(inner) => inner.host_snapshot(plan, pool),
+        }
+    }
+    pub(crate) fn restore_host_snapshot(
+        &self,
+        snapshot: &super::kv::host::HostSnapshot,
+    ) -> Result<()> {
+        match &self.implementation {
+            Implementation::Cuda(inner) => inner.restore_host_snapshot(snapshot),
         }
     }
     pub(crate) fn release_snapshot(&mut self, snapshot: Snapshot) -> Result<()> {

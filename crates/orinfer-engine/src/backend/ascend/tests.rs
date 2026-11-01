@@ -38,12 +38,10 @@ impl Fixture {
         }
     }
     pub(super) fn session(&self) -> Session {
-        Session::with_driver(
-            Arc::clone(self.driver.as_ref().unwrap()),
-            0,
-            Limits::default(),
-        )
-        .unwrap()
+        self.session_with_limits(Limits::default())
+    }
+    pub(super) fn session_with_limits(&self, limits: Limits) -> Session {
+        Session::with_driver(Arc::clone(self.driver.as_ref().unwrap()), 0, limits).unwrap()
     }
     pub(super) fn aot(&self) -> (std::path::PathBuf, super::kernels::Spec) {
         use super::kernels::{Access, Operand, Spec};

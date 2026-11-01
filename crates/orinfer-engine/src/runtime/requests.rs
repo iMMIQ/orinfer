@@ -323,7 +323,7 @@ impl ModelRuntime {
         if req.owner != self.owner_id
             || hint.owner != self.owner_id
             || !req.prefilling
-            || self.prefix_cache.budget == 0
+            || !self.prefix_enabled()
         {
             return Ok(false);
         }
@@ -338,7 +338,7 @@ impl ModelRuntime {
             return Ok(false);
         }
         let bytes: usize = self.prefix_ranges(common)?.values().map(|r| r.bytes).sum();
-        if bytes > self.prefix_cache.budget
+        if bytes > self.prefix_cache.budget.max(self.host_prefix_cache.budget)
             || self
                 .prefill_costs
                 .score(common, hint.tokens.len(), bytes)
@@ -467,10 +467,9 @@ impl ModelRuntime {
             return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
         }
         while self.admission_free_bytes()? < needed {
-            let Some(snapshot) = self.prefix_cache.evict_one() else {
+            if !self.evict_prefix(None, None)? {
                 return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
-            };
-            self.execution.release_snapshot(snapshot)?;
+            }
         }
         self.trim_request_cache(options, fixed + prospective, context, sampling)?;
         self.idle_admission_since = None;
@@ -603,9 +602,7 @@ impl ModelRuntime {
             .prefix_cache_limit
             .min(self.prefix_cache.bytes.saturating_add(available));
         while self.prefix_cache.bytes > self.prefix_cache.budget {
-            if let Some(snapshot) = self.prefix_cache.evict_one() {
-                self.execution.release_snapshot(snapshot)?;
-            } else {
+            if !self.evict_prefix(None, None)? {
                 break;
             }
         }
@@ -667,7 +664,7 @@ impl ModelRuntime {
                 warm.seconds += at.elapsed().as_secs_f64();
             }
             let mut checkpoints = BTreeSet::new();
-            if self.prefix_cache.budget != 0 {
+            if self.prefix_enabled() {
                 checkpoints.extend((8192..input.input_tokens.len()).step_by(8192));
                 for hint in input
                     .prefix_hints
@@ -2338,7 +2335,7 @@ impl ModelRuntime {
             return Ok(());
         }
         let stored = self.with_request(req, |model, req| {
-            if cache && req.cache_generated && !req.prefilling && model.prefix_cache.budget != 0 {
+            if cache && req.cache_generated && !req.prefilling && model.prefix_enabled() {
                 let consistent = model.refresh_request_mtp(req, false)?;
                 if consistent {
                     model.store_decoded_prefix(
@@ -2354,7 +2351,6 @@ impl ModelRuntime {
         self.release_prefill_frame(req)?;
         self.execution
             .release_sequence(req.slot, &self.manifest.reset_buffers)?;
-        req.prefix.kv.clear();
         self.reserved_requests.remove(&req.slot);
         req.released = true;
         self.execution.collect_snapshots()?;

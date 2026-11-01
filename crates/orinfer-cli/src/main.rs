@@ -232,9 +232,12 @@ struct InferenceArgs {
     /// auto adapts up to the package default; 0 disables MTP; 1..31 caps drafts within package capacity.
     #[arg(long, value_name = "N", default_value = "auto")]
     mtp_drafts: MtpDrafts,
-    /// Snapshot cache budget in MiB; 0 disables reuse.
+    /// Device prefix-cache budget per device in MiB; 0 disables the device tier.
     #[arg(long = "prefix-cache-mib", value_name = "MIB", default_value_t = ServerConfig::default().prefix_cache_bytes >> 20, value_parser = parse_cache_mib)]
     prefix_cache_bytes: usize,
+    /// Global CPU prefix-state cache in MiB, shared across TP ranks; 0 disables the CPU tier.
+    #[arg(long = "kv-offload-mib", value_name = "MIB", default_value_t = 0, value_parser = parse_cache_mib)]
+    kv_offload_bytes: usize,
     #[arg(long, default_value_t = ServerConfig::default().scheduler.max_active)]
     max_active_requests: usize,
     /// Ordinary decode row budget; mixed prefill may use the package capacity.
@@ -310,6 +313,7 @@ impl From<InferenceArgs> for ServerConfig {
             mtp_drafts: args.mtp_drafts.0,
             prompt_lookup: args.load.prompt_lookup,
             prefix_cache_bytes: args.prefix_cache_bytes,
+            kv_offload_bytes: args.kv_offload_bytes,
             scheduler: orinfer_engine::scheduler::Options {
                 policy: args.scheduler_policy.unwrap_or_default(),
                 max_active: args.max_active_requests,
@@ -364,6 +368,7 @@ impl From<BatchArgs> for BatchConfig {
                 mtp_drafts: config.mtp_drafts,
                 prompt_lookup: config.prompt_lookup,
                 prefix_cache_bytes: config.prefix_cache_bytes,
+                kv_offload_bytes: config.kv_offload_bytes,
             },
         }
     }
@@ -739,6 +744,7 @@ fn batch_overrides(
     .clone();
     let fields = [
         ("prefix_cache_bytes", "prefix_cache_mib"),
+        ("kv_offload_bytes", "kv_offload_mib"),
         ("memory_reserve_bytes", "memory_reserve_mib"),
     ];
     values.retain(|key, _| {
