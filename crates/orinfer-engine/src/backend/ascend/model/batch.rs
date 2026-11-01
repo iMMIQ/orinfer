@@ -595,10 +595,18 @@ fn work_lengths(
     grid: &RowExpression,
     range: Option<&WorkRange>,
 ) -> Result<Vec<[i32; 2]>> {
+    let blocks = lengths
+        .into_iter()
+        .map(|tokens| work_blocks(tokens, grid, range))
+        .collect::<Result<Vec<_>>>()?;
     let mut out = vec![];
-    for (owner, tokens) in lengths.into_iter().enumerate() {
-        for block in 0..work_blocks(tokens, grid, range)? {
-            out.push([owner as i32, block as i32]);
+    // Start the same tile across owners before advancing to the next tile.
+    // Bounded kernels can have many idle CTAs after an owner's first live tile.
+    for block in 0..blocks.iter().copied().max().unwrap_or(0) {
+        for (owner, &count) in blocks.iter().enumerate() {
+            if block < count {
+                out.push([owner as i32, block as i32]);
+            }
         }
     }
     if out.is_empty() {

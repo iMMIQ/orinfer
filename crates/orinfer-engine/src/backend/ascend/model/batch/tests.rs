@@ -230,6 +230,12 @@ fn arbitrary_batch_work_covers_each_logical_owner_tile() {
         let l = layout(&lengths, &ids).unwrap();
         let work = work_items(&l, &grid, None).unwrap();
         assert_eq!(work.len() % 2, 0);
+        assert_eq!(
+            work.iter().take(batch).copied().collect::<Vec<_>>(),
+            (0..batch)
+                .map(|owner| [owner as i32, 0])
+                .collect::<Vec<_>>()
+        );
         for (owner, &q) in lengths.iter().enumerate() {
             let physical = work
                 .iter()
@@ -245,6 +251,22 @@ fn arbitrary_batch_work_covers_each_logical_owner_tile() {
             assert_eq!(logical, (0..3 * q).collect::<Vec<_>>());
         }
     }
+}
+#[test]
+fn interleaved_work_keeps_empty_views_and_odd_padding_isolated() {
+    let grid: RowExpression = serde_json::from_value(serde_json::json!({"op":"rows"})).unwrap();
+    assert_eq!(
+        work_lengths([0, 3, 1, 0, 2], &grid, None).unwrap(),
+        [[1, 0], [2, 0], [4, 0], [1, 1], [4, 1], [1, 2]]
+    );
+    assert_eq!(
+        work_lengths([1, 0, 2], &grid, None).unwrap(),
+        [[0, 0], [2, 0], [2, 1], [-1, 0]]
+    );
+    assert_eq!(
+        work_lengths([0, 0], &grid, None).unwrap(),
+        [[-1, 0], [-1, 0]]
+    );
 }
 #[test]
 fn owner_work_selection_keeps_query_policy_across_mixed_packets() {

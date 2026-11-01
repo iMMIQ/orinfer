@@ -323,7 +323,7 @@ bash tools/operators/ascend/run.sh python3 \
   --package-output artifacts/ascend-model/batch-selected
 ```
 
-随后将 `bench-ascend-batch --plan` 指向 `batch-selected/model.json`。稳定布局的地址表、工作表和输出索引按执行家族、owner 顺序、片段长度和输出位置缓存，准入及释放使缓存失效。主机输入通过最多 4 MiB 的 pinned 分块在 compute stream 上传；预算不足时等待已提交 DMA 的完成事件，再复用缓冲。调用者可在方法返回后释放源数据。
+随后将 `bench-ascend-batch --plan` 指向 `batch-selected/model.json`。稳定布局的地址表、工作表和输出索引按执行家族、owner 顺序、片段长度和输出位置缓存，准入及释放使缓存失效。公共工作表按 CTA 槽位跨 owner 交错排列，让各请求的首个计算 tile 并行执行；每个 owner 的物理 CTA 编号、行数范围及状态地址保持原契约。空分片继续使用禁用哨兵，单 owner 保留原顺序。该工作表同时用于普通、验证、prefill 和 draft 的私有算子。主机输入通过最多 4 MiB 的 pinned 分块在 compute stream 上传；预算不足时等待已提交 DMA 的完成事件，再复用缓冲。调用者可在方法返回后释放源数据。
 
 输入可直接声明不同长度的请求；Rust 按 `chunk_tokens` 预算自动分块，每个请求在最后一个 prefill 片段执行输出头，再合并后续普通 decode：
 
