@@ -418,7 +418,7 @@ def main():
     from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
 
     model = compact_buffers(model)
-    validate_rows(model, base)
+    validate_rows(model, base, model_dir=args.model_dir)
     atomic_json(args.plan.with_name(args.plan.stem + "-tuned.json"), model)
     if args.package_output:
         count = publish_package(model, base, args.package_output)
