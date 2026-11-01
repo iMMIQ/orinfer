@@ -280,7 +280,7 @@ A2 准入按请求的实际输入长度与声明的输出上限保留后续 KV �
 
 CUDA 与 A2 共用物理页身份、引用、发布、写时复制、CPU bank 和设备副本目录。prefix 缓存与活动请求引用同一份完整的不可变 KV 物理分配，发布缓存及设备命中通过映射复用，保持请求虚拟地址和已有 Graph 地址稳定。未满分配的 KV 尾部紧凑保存到端点 bank；同层父检查点仍在缓存时，续存复用其不可变尾部，仅复制新增 KV。每条尾部最多保留 8 个片段，超过后重新紧凑保存，限制复制调用和旧 bank 保留。完整物理分配形成后，裁掉被取代的尾部片段。活动尾部保持可写，恢复时只复制有效尾部字节。续写共享分配前执行写时复制，只保存已提交字节；新的未提交后缀清零。SWA、循环窗口、压缩残留和 MTP 等可变状态按模型声明每次独立保存，恢复完整状态后继续执行。物理分配粒度由设备原生 API 决定；预算按实际引用的完整物理容量去重计费，CPU backing 只保留有效字节。
 
-设备缓存淘汰时，预算允许的快照移到 CPU；CPU 层满时按现有缓存效用策略回收。查询两层合法前缀，同长时优先设备。CPU bank 用弱引用跟踪设备副本：活动请求仍引用设备页时直接复用，设备页已回收时上传一次并供后续命中共享。CPU 共享 bank 保留各 rank 自己的数据，已经保存的不可变切片直接复用，仅传输缺失范围；传输通过有界 pinned 分块，完成事件持有 DMA 的全部原生资源。卸载和恢复在调度边界完成，活动请求的计算与 KV 保留在设备上，准入同时保留后续增长及共享尾页复制所需额度。
+设备缓存淘汰时，预算允许的快照移到 CPU；CPU 层满时按现有缓存效用策略回收。查询两层合法前缀，同长时优先设备。CPU bank 用弱引用跟踪设备副本：活动请求仍引用设备页时直接复用，设备页已回收时上传一次并供后续命中共享。CPU 共享 bank 保留各 rank 自己的数据，以合并的有效字节区间跟踪不可变切片；重叠快照和同批次重叠切片只下载缺失部分。CUDA 与 A2 共用区间去重、设备副本查询及完成后发布逻辑，原生适配器负责分配和搬运。失败的下载不更新有效区间，失败的上传不登记设备副本，可安全重试。传输通过有界 pinned 分块，完成事件持有 DMA 的全部原生资源。卸载和恢复在调度边界完成，活动请求的计算与 KV 保留在设备上，准入同时保留后续增长及共享尾页复制所需额度。
 
 请求完成日志中的 `host_resident_bytes` 是 CPU 层计费字节，A2 为所有 rank 合计，含保守元数据预留；`host_entries`、`host_hits`、`host_stores` 和 `host_evictions` 记录 CPU 层行为，恢复耗时计入 `restore_s`。设计参考 SGLang [radix cache](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py) 的共享页与活动引用，以及 [HiCache](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/cache_controller.py)、vLLM [KV offloading](https://github.com/vllm-project/vllm/blob/main/docs/features/kv_offloading_usage.md) 的分层存储与传输完成约束。公共管理代码复用布局和所有权规则；各设备仍使用本地物理布局、传输及完成事件。
 

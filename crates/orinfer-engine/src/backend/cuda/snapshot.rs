@@ -582,18 +582,9 @@ impl Executor {
         &self,
         bank: &crate::backend::kv::host::HostBank,
     ) -> Result<Rc<Allocation>> {
-        if let Some(allocation) = bank.resident(self.session.owner)? {
-            return Ok(allocation);
-        }
-        let descriptor = bank.descriptor().ok_or("Missing CUDA host KV descriptor")?;
-        descriptor.owner.require(self.session.owner)?;
-        if !descriptor.paged {
-            return Err("Host state is not a shared KV allocation".into());
-        }
-        let allocation =
-            super::virtual_memory::restore_host(&self.session, descriptor, &bank.bytes.borrow())?;
-        bank.remember(&allocation)?;
-        Ok(allocation)
+        bank.materialize(self.session.owner, |descriptor, bytes| {
+            super::virtual_memory::restore_host(&self.session, descriptor, bytes)
+        })
     }
     pub(crate) fn restore_host_snapshot(
         &self,

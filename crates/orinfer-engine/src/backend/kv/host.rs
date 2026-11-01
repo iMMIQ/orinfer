@@ -1,10 +1,6 @@
 //! One bounded CPU-bank and device-replica directory for CUDA and Ascend.
 use super::*;
-use std::{
-    cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
-    rc::Weak,
-};
+use std::{cell::RefCell, collections::BTreeMap, rc::Weak};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Descriptor {
     pub owner: DeviceOwner,
@@ -26,7 +22,8 @@ impl From<&Allocation> for Descriptor {
 }
 pub(crate) struct HostBank {
     pub bytes: RefCell<Vec<u8>>,
-    valid: RefCell<BTreeSet<(usize, usize)>>,
+    // Disjoint, nonadjacent [start, end) intervals, published after DMA completes.
+    valid: RefCell<BTreeMap<usize, usize>>,
     descriptor: RefCell<Option<Descriptor>>,
     device: RefCell<Weak<Allocation>>,
 }
@@ -61,32 +58,88 @@ impl HostBank {
         }
         Ok(self.device.borrow().upgrade())
     }
-    pub fn download<T>(
+    /// The common directory owns lookup and publication; adapters return only
+    /// completed native allocations. Failed transfers never become cache hits.
+    pub fn materialize(
+        &self,
+        owner: DeviceOwner,
+        upload: impl FnOnce(Descriptor, &[u8]) -> Result<Rc<Allocation>>,
+    ) -> Result<Rc<Allocation>> {
+        let descriptor = self.descriptor().ok_or("Missing host KV descriptor")?;
+        descriptor.owner.require(owner)?;
+        if !descriptor.paged {
+            return Err("Host state is not a shared KV allocation".into());
+        }
+        if let Some(allocation) = self.resident(owner)? {
+            return Ok(allocation);
+        }
+        let allocation = upload(descriptor, &self.bytes.borrow())?;
+        self.remember(&allocation)?;
+        Ok(allocation)
+    }
+    pub fn download<T: Clone>(
         &self,
         regions: Vec<(T, usize, usize, usize)>,
         transfer: impl FnOnce(&[(T, usize, usize, usize)], &mut [u8]) -> Result<()>,
     ) -> Result<()> {
-        let missing = regions
-            .into_iter()
-            .filter(|(_, _, offset, bytes)| !self.valid.borrow().contains(&(*offset, *bytes)))
-            .collect::<Vec<_>>();
-        for (_, _, offset, bytes) in &missing {
-            MemoryRange {
-                offset: *offset,
-                bytes: *bytes,
+        let mut valid = self.valid.borrow().clone();
+        let mut missing = vec![];
+        for (source, source_offset, offset, bytes) in regions {
+            MemoryRange { offset, bytes }.within(self.bytes.borrow().len())?;
+            source_offset
+                .checked_add(bytes)
+                .ok_or("Host KV source extent overflow")?;
+            let end = offset + bytes;
+            let mut cursor = offset;
+            let mut append = |start: usize, stop: usize| {
+                missing.push((
+                    source.clone(),
+                    source_offset + (start - offset),
+                    start,
+                    stop - start,
+                ));
+            };
+            let first = valid
+                .range(..=offset)
+                .next_back()
+                .map_or(offset, |(&start, _)| start);
+            for (&start, &stop) in valid.range(first..end) {
+                if stop <= cursor {
+                    continue;
+                }
+                if start > cursor {
+                    append(cursor, start);
+                }
+                cursor = stop.min(end);
             }
-            .within(self.bytes.borrow().len())?;
+            if cursor < end {
+                append(cursor, end);
+            }
+            if bytes != 0 {
+                cover(&mut valid, offset, end);
+            }
         }
         if !missing.is_empty() {
             transfer(&missing, &mut self.bytes.borrow_mut())?;
-            self.valid.borrow_mut().extend(
-                missing
-                    .iter()
-                    .map(|(_, _, offset, bytes)| (*offset, *bytes)),
-            );
+            *self.valid.borrow_mut() = valid;
         }
         Ok(())
     }
+}
+fn cover(valid: &mut BTreeMap<usize, usize>, mut start: usize, mut end: usize) {
+    if let Some((&previous, &stop)) = valid.range(..=start).next_back()
+        && stop >= start
+    {
+        start = previous;
+    }
+    while let Some((&next, &stop)) = valid.range(start..).next() {
+        if next > end {
+            break;
+        }
+        valid.remove(&next);
+        end = end.max(stop);
+    }
+    valid.insert(start, end);
 }
 #[derive(Clone)]
 pub(crate) struct HostBuffer {
@@ -318,8 +371,74 @@ mod tests {
     use crate::prefix::Resident;
 
     #[test]
+    fn overlapping_downloads_copy_only_missing_bytes_and_retry_failed_dma() {
+        let mut pool = HostPool::default();
+        let bank = pool.bank(2, 32).unwrap();
+        let mut copied = vec![];
+        let mut read = |regions: &[(u8, usize, usize, usize)], output: &mut [u8]| {
+            for &(base, source, dest, bytes) in regions {
+                copied.push((source, dest, bytes));
+                for i in 0..bytes {
+                    output[dest + i] = base + (source + i) as u8;
+                }
+            }
+            Ok(())
+        };
+        bank.download(vec![(0, 12, 4, 4), (0, 20, 12, 4)], &mut read)
+            .unwrap();
+        // Different views, including overlap within the same DMA batch, must
+        // retain the source offset after splitting at already-valid intervals.
+        bank.download(vec![(0, 8, 0, 20), (0, 24, 16, 8)], &mut read)
+            .unwrap();
+        bank.download(vec![(0, 10, 2, 20)], &mut read).unwrap();
+        assert_eq!(
+            copied,
+            [
+                (12, 4, 4),
+                (20, 12, 4),
+                (8, 0, 4),
+                (16, 8, 4),
+                (24, 16, 4),
+                (28, 20, 4)
+            ]
+        );
+        assert_eq!(&bank.bytes.borrow()[..24], &(8..32).collect::<Vec<u8>>());
+        assert_eq!(*bank.valid.borrow(), BTreeMap::from([(0, 24)]));
+        assert!(
+            bank.download(vec![(0u8, 32, 24, 8)], |_, output| {
+                output[24] = 99;
+                Err("failed DMA fence".into())
+            })
+            .is_err()
+        );
+        assert_eq!(*bank.valid.borrow(), BTreeMap::from([(0, 24)]));
+        bank.download(vec![(0u8, 32, 24, 8)], |regions, output| {
+            assert_eq!(regions, &[(0, 32, 24, 8)]);
+            output[24..].copy_from_slice(&(32..40).collect::<Vec<u8>>());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*bank.valid.borrow(), BTreeMap::from([(0, 32)]));
+        assert_eq!(&*bank.bytes.borrow(), &(8..40).collect::<Vec<u8>>());
+        for region in [(0u8, 0, 32, 1), (0, usize::MAX, 0, 1)] {
+            assert!(
+                bank.download(vec![region], |_, _| panic!("invalid DMA"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn cpu_capture_preserves_roles_offsets_and_weak_replica_identity() {
-        let owner = DeviceOwner::new(orinfer_device::Backend::Cuda, 0);
+        for backend in [
+            orinfer_device::Backend::Cuda,
+            orinfer_device::Backend::Ascend,
+        ] {
+            capture_lifecycle(backend);
+        }
+    }
+    fn capture_lifecycle(backend: orinfer_device::Backend) {
+        let owner = DeviceOwner::new(backend, 0);
         let kv = Rc::new(Allocation {
             owner,
             id: allocation_id().unwrap(),
@@ -409,23 +528,38 @@ mod tests {
         );
         let materializations = Cell::new(0);
         let materialize = |bank: &HostBank| {
-            if let Some(a) = bank.resident(owner)? {
-                return Ok(a);
-            }
-            materializations.set(materializations.get() + 1);
-            let d = bank.descriptor().unwrap();
-            let a = Rc::new(Allocation {
+            bank.materialize(owner, |d, bytes| {
+                assert_eq!(bytes, &[73; 17]);
+                materializations.set(materializations.get() + 1);
+                Ok(Rc::new(Allocation {
+                    owner,
+                    id: d.id,
+                    address: 1,
+                    bytes: d.bytes,
+                    used: d.used,
+                    handle: Some(10),
+                    native: None,
+                }))
+            })
+        };
+        assert!(
+            bank.materialize(owner, |_, _| Err("failed upload".into()))
+                .is_err()
+        );
+        assert!(bank.resident(owner).unwrap().is_none());
+        assert!(
+            bank.materialize(owner, |d, _| Ok(Rc::new(Allocation {
                 owner,
-                id: d.id,
+                id: d.id + 2,
                 address: 1,
                 bytes: d.bytes,
                 used: d.used,
                 handle: Some(10),
                 native: None,
-            });
-            bank.remember(&a)?;
-            Ok(a)
-        };
+            })))
+            .is_err()
+        );
+        assert!(bank.resident(owner).unwrap().is_none());
         let first = host.restore_shared(owner, materialize).unwrap();
         let second = host.restore_shared(owner, materialize).unwrap();
         assert!(first.state.is_empty());
@@ -434,7 +568,11 @@ mod tests {
             &second.kv[0].allocation
         ));
         assert_eq!(materializations.get(), 1);
-        let foreign = DeviceOwner::new(orinfer_device::Backend::Ascend, 0);
+        let foreign = DeviceOwner::new(backend, 1);
         assert!(host.restore_shared(foreign, materialize).is_err());
+        assert!(
+            bank.materialize(foreign, |_, _| panic!("foreign DMA"))
+                .is_err()
+        );
     }
 }

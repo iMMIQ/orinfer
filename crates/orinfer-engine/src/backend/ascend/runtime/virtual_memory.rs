@@ -912,12 +912,20 @@ impl Session {
         &self,
         bank: &crate::backend::kv::host::HostBank,
     ) -> Result<Rc<SharedAllocation>> {
-        if let Some(allocation) = bank.resident(self.context.owner)? {
-            return Ok(allocation);
-        }
-        let descriptor = bank.descriptor().ok_or("Missing host KV descriptor")?;
+        bank.materialize(self.context.owner, |descriptor, bytes| {
+            self.restore_host_kv(descriptor, bytes)
+        })
+    }
+    fn restore_host_kv(
+        &self,
+        descriptor: crate::backend::kv::host::Descriptor,
+        bytes: &[u8],
+    ) -> Result<Rc<SharedAllocation>> {
         descriptor.owner.require(self.context.owner)?;
-        if !descriptor.paged || descriptor.bytes > self.remaining_device_bytes() {
+        if !descriptor.paged
+            || bytes.len() != descriptor.used
+            || descriptor.bytes > self.remaining_device_bytes()
+        {
             return Err("Invalid or unreserved host KV materialization".into());
         }
         let canonical = self.reserve(descriptor.bytes)?;
@@ -967,7 +975,7 @@ impl Session {
             memory.mapped = descriptor.bytes;
         }
         self.fill(&canonical, 0)?;
-        self.upload_regions(&[(canonical.clone(), 0, &bank.bytes.borrow())])?
+        self.upload_regions(&[(canonical.clone(), 0, bytes)])?
             .wait()?;
         let allocation = Rc::new(SharedAllocation {
             owner: self.context.owner,
@@ -987,7 +995,6 @@ impl Session {
             ),
             native: Some(Rc::new(canonical.clone())),
         });
-        bank.remember(&allocation)?;
         Ok(allocation)
     }
 }
