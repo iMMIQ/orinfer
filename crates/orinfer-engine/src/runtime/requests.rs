@@ -338,7 +338,12 @@ impl ModelRuntime {
             return Ok(false);
         }
         let bytes: usize = self.prefix_ranges(common)?.values().map(|r| r.bytes).sum();
-        if bytes > self.prefix_cache.budget.max(self.host_prefix_cache.budget)
+        if bytes
+            > self
+                .prefix_cache
+                .device
+                .budget
+                .max(self.prefix_cache.host.budget)
             || self
                 .prefill_costs
                 .score(common, hint.tokens.len(), bytes)
@@ -459,7 +464,7 @@ impl ModelRuntime {
         }
         if self
             .admission_free_bytes()?
-            .saturating_add(self.prefix_cache.bytes)
+            .saturating_add(self.prefix_cache.device.bytes)
             < needed
         {
             // Releasing every cache entry still cannot satisfy the outstanding
@@ -598,10 +603,10 @@ impl ModelRuntime {
             .saturating_sub(future)
             .saturating_sub(additional)
             .saturating_sub(options.memory_reserve_bytes);
-        self.prefix_cache.budget = self
+        self.prefix_cache.device.budget = self
             .prefix_cache_limit
-            .min(self.prefix_cache.bytes.saturating_add(available));
-        while self.prefix_cache.bytes > self.prefix_cache.budget {
+            .min(self.prefix_cache.device.bytes.saturating_add(available));
+        while self.prefix_cache.device.bytes > self.prefix_cache.device.budget {
             if !self.evict_prefix(None, None)? {
                 break;
             }

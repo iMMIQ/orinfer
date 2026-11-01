@@ -3,18 +3,13 @@ use super::*;
 type Hit = (bool, u64);
 impl Runtime {
     pub(super) fn matched(&self, input: &[u32]) -> Option<Hit> {
-        matched_tier(
-            &self.cache,
-            &self.host_cache,
-            input,
-            self.final_decoder_window(),
-        )
+        matched_tier(&self.cache, input, self.final_decoder_window())
     }
     pub(super) fn entry(&self, hit: Hit) -> &Entry<Snapshot> {
         if hit.0 {
-            &self.host_cache.entries[&hit.1]
+            &self.cache.host.entries[&hit.1]
         } else {
-            &self.cache.entries[&hit.1]
+            &self.cache.device.entries[&hit.1]
         }
     }
     /// Conservative per-rank reservation covers histories, names, pieces, radix
@@ -45,7 +40,7 @@ impl Runtime {
             .ok_or_else(|| "Host metadata size overflow".into())
     }
     pub(super) fn evict_host(&mut self) -> Result<bool> {
-        if let Some(snapshot) = self.host_cache.evict_one() {
+        if let Some(snapshot) = self.cache.host.evict_one() {
             self.team.exchange(Command::Evict(snapshot.id))?;
             self.prefix.host_evictions += 1;
             Ok(true)
@@ -54,70 +49,62 @@ impl Runtime {
         }
     }
     pub(super) fn evict(&mut self) -> Result<bool> {
-        let Some(mut entry) = self.cache.evict_entry_one_except(None) else {
+        let Some(key) = self.cache.device.victim_except(None) else {
             return Ok(false);
         };
+        let entry = &self.cache.device.entries[&key];
         let id = entry.snapshot.id;
-        let mut offload = false;
-        if self.host_cache.budget > 0 {
-            entry.snapshot.banks = self.team.offload_allocations(id)?;
-            entry.snapshot.host_overhead =
-                self.host_overhead(entry.tokens.len(), entry.snapshot.banks.len())?;
-            let mut allocations = BTreeMap::new();
-            entry.snapshot.allocations(&mut allocations);
-            entry.bytes = allocations.values().sum();
-            if entry.bytes <= self.host_cache.budget {
-                while self.host_cache.resident_with(Some(&entry.snapshot)) > self.host_cache.budget
-                {
+        let mut host_snapshot = None;
+        if self.cache.host.budget > 0 {
+            let banks = self.team.offload_allocations(id)?;
+            let snapshot = Snapshot {
+                id,
+                host_overhead: self.host_overhead(entry.tokens.len(), banks.len())?,
+                banks,
+                output: entry.snapshot.output.clone(),
+            };
+            if self.cache.host.admission(&snapshot, 0) != Admission::TooLarge {
+                while self.cache.host.admission(&snapshot, 0) == Admission::Reclaim {
                     if !self.evict_host()? {
                         break;
                     }
                 }
-                if self.host_cache.resident_with(Some(&entry.snapshot)) <= self.host_cache.budget {
+                if self.cache.host.admission(&snapshot, 0) == Admission::Ready {
                     self.team.exchange(Command::Offload(id))?;
-                    self.host_cache.insert(entry);
-                    self.prefix.host_stores += 1;
-                    offload = true;
+                    host_snapshot = Some(snapshot);
                 }
             }
         }
-        if !offload {
+        if host_snapshot.is_none() {
             self.team.exchange(Command::Evict(id))?;
         }
+        let entry = self
+            .cache
+            .device
+            .remove(key)
+            .ok_or("Missing device prefix")?;
+        if let Some(snapshot) = host_snapshot {
+            let (mut entry, _) = entry.replace_snapshot(snapshot);
+            let mut allocations = BTreeMap::new();
+            entry.snapshot.allocations(&mut allocations);
+            entry.bytes = allocations.values().sum();
+            self.cache.host.insert(entry);
+            self.prefix.host_stores += 1;
+        }
         self.prefix.evictions += 1;
-        update_statistics(
-            &self.cache,
-            &self.host_cache,
-            self.team.ranks(),
-            &mut self.prefix,
-        );
+        self.cache
+            .update_statistics(self.team.ranks(), &mut self.prefix);
         Ok(true)
     }
 }
-fn matched_tier(
-    device: &Cache<Snapshot>,
-    host: &Cache<Snapshot>,
-    input: &[u32],
-    reserve: usize,
-) -> Option<Hit> {
+fn matched_tier(cache: &Tiered<Snapshot, Snapshot>, input: &[u32], reserve: usize) -> Option<Hit> {
     let score = |entry: &Entry<Snapshot>| {
         (entry.tokens.len() <= input.len().saturating_sub(reserve)
             || entry.tokens.len() == input.len() && entry.snapshot.output.is_some())
         .then_some(-(entry.tokens.len() as f64))
     };
-    crate::prefix::match_tiers(device, host, input, &Media::default(), score, score)
+    cache.matched(input, &Media::default(), score, score)
 }
-pub(super) fn update_statistics(
-    device: &Cache<Snapshot>,
-    host: &Cache<Snapshot>,
-    ranks: usize,
-    stats: &mut crate::prefix::Statistics,
-) {
-    device.update_statistics(stats);
-    stats.host_resident_bytes = host.bytes.saturating_mul(ranks);
-    stats.host_entries = host.entries.len();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,30 +125,20 @@ mod tests {
     }
     #[test]
     fn tier_lookup_preserves_decoder_boundary_and_device_ties() {
-        let mut device = Cache::new(256);
-        let mut host = Cache::new(256);
-        device.insert(entry(&[1, 2], 1));
-        host.insert(entry(&[1, 2, 3], 2));
-        assert_eq!(
-            matched_tier(&device, &host, &[1, 2, 3, 4, 5], 2),
-            Some((true, 1))
-        );
-        assert_eq!(
-            matched_tier(&device, &host, &[1, 2, 3, 4], 2),
-            Some((false, 1))
-        );
-        device.insert(entry(&[1, 2, 3], 3));
-        assert_eq!(
-            matched_tier(&device, &host, &[1, 2, 3, 4, 5], 2),
-            Some((false, 2))
-        );
-        let moved = device.evict_entry_one_except(Some(1)).unwrap();
-        host.insert(moved);
+        let mut cache = Tiered::new(256, 256);
+        cache.device.insert(entry(&[1, 2], 1));
+        cache.host.insert(entry(&[1, 2, 3], 2));
+        assert_eq!(matched_tier(&cache, &[1, 2, 3, 4, 5], 2), Some((true, 1)));
+        assert_eq!(matched_tier(&cache, &[1, 2, 3, 4], 2), Some((false, 1)));
+        cache.device.insert(entry(&[1, 2, 3], 3));
+        assert_eq!(matched_tier(&cache, &[1, 2, 3, 4, 5], 2), Some((false, 2)));
+        let moved = cache.device.evict_entry_one_except(Some(1)).unwrap();
+        cache.host.insert(moved);
         let mut stats = crate::prefix::Statistics::default();
-        update_statistics(&device, &host, 8, &mut stats);
+        cache.update_statistics(8, &mut stats);
         assert_eq!(stats.resident_bytes, 80);
         assert_eq!(stats.host_resident_bytes, 160 * 8);
         assert_eq!(stats.host_entries, 2);
-        assert!(host.bytes * 8 <= host.budget * 8);
+        assert!(cache.host.bytes * 8 <= cache.host.budget * 8);
     }
 }

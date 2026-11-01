@@ -273,8 +273,8 @@ fn validate_mtp_partial_prefix() {
             source.input_tokens[checkpoint]
         );
         model.prefix_cache_limit = 0;
-        model.prefix_cache.budget = 0;
-        while let Some(snapshot) = model.prefix_cache.evict_one() {
+        model.prefix_cache.device.budget = 0;
+        while let Some(snapshot) = model.prefix_cache.device.evict_one() {
             model.execution.release_snapshot(snapshot).unwrap();
         }
         let mut cold = model.start_request(input(&branch, 16), &|| false).unwrap();
@@ -291,7 +291,7 @@ fn validate_mtp_partial_prefix() {
         let expected_state = state(&mut model, &mut cold);
         model.finish_request(&mut cold, false).unwrap();
         model.prefix_cache_limit = 2 << 30;
-        model.prefix_cache.budget = 2 << 30;
+        model.prefix_cache.device.budget = 2 << 30;
         let mut populate = model.start_request(input(&source, 16), &|| false).unwrap();
         populate.checkpoints.insert(checkpoint);
         while !populate.is_finished() {
@@ -300,15 +300,17 @@ fn validate_mtp_partial_prefix() {
         model.finish_request(&mut populate, true).unwrap();
         let entry = model
             .prefix_cache
+            .device
             .entries
             .values()
             .find(|e| e.tokens.len() == checkpoint)
             .unwrap_or_else(|| {
                 panic!(
                     "Missing checkpoint {checkpoint}; cache budget {}, entries {:?}",
-                    model.prefix_cache.budget,
+                    model.prefix_cache.device.budget,
                     model
                         .prefix_cache
+                        .device
                         .entries
                         .values()
                         .map(|e| e.tokens.len())
@@ -849,11 +851,11 @@ fn validate_continuous_requests() {
     rows.push(json!({"short_request_arenas":32,"reservation_cleanup":true}));
     // Cold mixed prefill must exercise the new recurrent 32/64/128 profiles,
     // rather than only checking requests whose prompt was restored from cache.
-    for snapshot in model.prefix_cache.clear() {
+    for snapshot in model.prefix_cache.device.clear() {
         model.execution.release_snapshot(snapshot).unwrap();
     }
     model.prefix_cache_limit = 0;
-    model.prefix_cache.budget = 0;
+    model.prefix_cache.device.budget = 0;
     let mtp = model.manifest.mtp.take();
     let mut reference = vec![];
     for source in &fixture.cases {

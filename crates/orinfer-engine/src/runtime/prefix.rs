@@ -111,22 +111,20 @@ impl ModelRuntime {
         self.prefix_hit(input, media)
             .map(|(host, id)| {
                 if host {
-                    let e = &self.host_prefix_cache.entries[&id];
+                    let e = &self.prefix_cache.host.entries[&id];
                     (e.tokens.len(), e.bytes)
                 } else {
-                    let e = &self.prefix_cache.entries[&id];
+                    let e = &self.prefix_cache.device.entries[&id];
                     (e.tokens.len(), e.bytes)
                 }
             })
             .unwrap_or((0, 0))
     }
     pub(crate) fn prefix_enabled(&self) -> bool {
-        self.prefix_cache.budget > 0 || self.host_prefix_cache.budget > 0
+        self.prefix_cache.enabled()
     }
     fn prefix_hit(&self, input: &[u32], media: &Media) -> Option<(bool, u64)> {
-        crate::prefix::match_tiers(
-            &self.prefix_cache,
-            &self.host_prefix_cache,
+        self.prefix_cache.matched(
             input,
             media,
             |e| {
@@ -152,10 +150,12 @@ impl ModelRuntime {
         let hit = self.prefix_hit(input, media);
         let device_match = self
             .prefix_cache
+            .device
             .match_prefix_by(input, media, |_| None)
             .matched_tokens;
         let host_match = self
-            .host_prefix_cache
+            .prefix_cache
+            .host
             .match_prefix_by(input, media, |_| None)
             .matched_tokens;
         context.statistics.matched_tokens = device_match.max(host_match);
@@ -165,12 +165,12 @@ impl ModelRuntime {
         };
         let at = Instant::now();
         let (tokens, warm, bytes) = if host {
-            let e = self.host_prefix_cache.touch(id);
+            let e = self.prefix_cache.host.touch(id);
             self.execution.restore_host_snapshot(&e.snapshot)?;
             context.statistics.host_hits += 1;
             (e.tokens.len(), e.warm_tokens, e.bytes)
         } else {
-            let e = self.prefix_cache.touch(id);
+            let e = self.prefix_cache.device.touch(id);
             self.execution.restore_snapshot(&e.snapshot)?;
             (e.tokens.len(), e.warm_tokens, e.bytes)
         };
@@ -196,17 +196,15 @@ impl ModelRuntime {
         reused: bool,
     ) -> Result<bool> {
         let bytes = self.prefix_ranges(prefix)?.values().map(|r| r.bytes).sum();
-        Ok(
-            bytes <= self.prefix_cache.budget.max(self.host_prefix_cache.budget)
-                && self.prefill_costs.admit_with_reuse(
-                    prefix,
-                    end,
-                    bytes,
-                    start,
-                    checkpoints,
-                    reused,
-                ),
-        )
+        Ok(bytes
+            <= self
+                .prefix_cache
+                .device
+                .budget
+                .max(self.prefix_cache.host.budget)
+            && self
+                .prefill_costs
+                .admit_with_reuse(prefix, end, bytes, start, checkpoints, reused))
     }
     pub(super) fn prefix_ranges(&self, tokens: usize) -> Result<BTreeMap<String, Range>> {
         let m = &self.manifest;
@@ -296,11 +294,11 @@ impl ModelRuntime {
         {
             return Err("Prefix checkpoint must retain exactly P-1 MTP inputs".into());
         }
-        let same = self.prefix_cache.entries.values().any(|e| {
+        let same = self.prefix_cache.device.entries.values().any(|e| {
             e.tokens == input
                 && e.media.common_tokens(media, input.len()) == input.len()
                 && (!logits_valid || e.logits_valid)
-        }) || self.host_prefix_cache.entries.values().any(|e| {
+        }) || self.prefix_cache.host.entries.values().any(|e| {
             e.tokens == input
                 && e.media.common_tokens(media, input.len()) == input.len()
                 && (!logits_valid || e.logits_valid)
@@ -322,7 +320,13 @@ impl ModelRuntime {
             let minimum = ranges.values().try_fold(0usize, |n, r| {
                 n.checked_add(r.bytes).ok_or("Prefix size overflow")
             })?;
-            if minimum > self.prefix_cache.budget.max(self.host_prefix_cache.budget) {
+            if minimum
+                > self
+                    .prefix_cache
+                    .device
+                    .budget
+                    .max(self.prefix_cache.host.budget)
+            {
                 context.statistics.store_s += at.elapsed().as_secs_f64();
                 self.update_prefix_usage(context);
                 return Ok(());
@@ -336,7 +340,7 @@ impl ModelRuntime {
             let parent = context
                 .parent
                 .filter(|(host, _)| !host)
-                .and_then(|(_, id)| self.prefix_cache.entries.get(&id))
+                .and_then(|(_, id)| self.prefix_cache.device.entries.get(&id))
                 .filter(|e| {
                     input.starts_with(&e.tokens)
                         && e.media.common_tokens(media, e.tokens.len()) == e.tokens.len()
@@ -346,6 +350,7 @@ impl ModelRuntime {
             let protected = (!logits_valid)
                 .then(|| {
                     self.prefix_cache
+                        .device
                         .match_prefix_by(input, media, |e| {
                             e.logits_valid.then_some(-(e.tokens.len() as f64))
                         })
@@ -354,10 +359,11 @@ impl ModelRuntime {
                 .flatten();
             let mut retained = BTreeMap::new();
             plan.allocations(&mut retained);
-            if let Some(entry) = protected.and_then(|id| self.prefix_cache.entries.get(&id)) {
+            if let Some(entry) = protected.and_then(|id| self.prefix_cache.device.entries.get(&id))
+            {
                 entry.snapshot.allocations(&mut retained);
             }
-            if retained.values().sum::<usize>() + plan.new_bytes > self.prefix_cache.budget {
+            if retained.values().sum::<usize>() + plan.new_bytes > self.prefix_cache.device.budget {
                 self.store_host_prefix(input, media, warm_tokens, logits_valid, &plan, context)?;
                 context.statistics.store_s += at.elapsed().as_secs_f64();
                 self.update_prefix_usage(context);
@@ -365,8 +371,8 @@ impl ModelRuntime {
             }
             // Reclaim before allocating so capture itself respects the budget,
             // including shared blocks pinned by the pending checkpoint.
-            while self.prefix_cache.resident_with(Some(&plan)) + plan.new_bytes
-                > self.prefix_cache.budget
+            while self.prefix_cache.device.admission(&plan, plan.new_bytes)
+                != crate::prefix::Admission::Ready
             {
                 if !self.evict_prefix(protected, Some(context))? {
                     return Err("Prefix budget planning failure".into());
@@ -383,9 +389,9 @@ impl ModelRuntime {
             if let Some(snapshot) = snapshot {
                 let mut own = BTreeMap::new();
                 snapshot.allocations(&mut own);
-                if own.values().sum::<usize>() <= self.prefix_cache.budget {
-                    while self.prefix_cache.resident_with(Some(&snapshot))
-                        > self.prefix_cache.budget
+                if own.values().sum::<usize>() <= self.prefix_cache.device.budget {
+                    while self.prefix_cache.device.admission(&snapshot, 0)
+                        != crate::prefix::Admission::Ready
                     {
                         if !self.evict_prefix(protected, Some(context))? {
                             return Err("Prefix budget accounting failure".into());
@@ -394,6 +400,7 @@ impl ModelRuntime {
                     // Upgrade a head-less endpoint, rather than keeping two states.
                     let obsolete: Vec<_> = self
                         .prefix_cache
+                        .device
                         .entries
                         .iter()
                         .filter(|(_, e)| {
@@ -403,12 +410,12 @@ impl ModelRuntime {
                         .map(|(&id, _)| id)
                         .collect();
                     for id in obsolete {
-                        let e = self.prefix_cache.remove(id).expect("known endpoint");
+                        let e = self.prefix_cache.device.remove(id).expect("known endpoint");
                         self.execution.release_snapshot(e.snapshot)?;
                     }
                     let bytes = snapshot.bytes;
                     self.remove_host_endpoint(input, media);
-                    let id = self.prefix_cache.insert(Entry::new(
+                    let id = self.prefix_cache.device.insert(Entry::new(
                         input.to_vec(),
                         media.clone(),
                         snapshot,
@@ -437,24 +444,21 @@ impl ModelRuntime {
         context: &mut Context,
     ) -> bool {
         let plan = crate::backend::kv::host::Budget(banks);
-        let total = |base: usize| {
-            base.checked_add(extra)
-                .and_then(|n| n.checked_add(metadata))
-        };
-        let mut own = BTreeMap::new();
-        plan.allocations(&mut own);
-        if total(own.values().sum()).is_none_or(|n| n > self.host_prefix_cache.budget) {
+        let Some(extra) = extra.checked_add(metadata) else {
             return false;
-        }
-        while total(self.host_prefix_cache.resident_with(Some(&plan)))
-            .is_none_or(|n| n > self.host_prefix_cache.budget)
-        {
-            if self.host_prefix_cache.evict_one().is_none() {
-                return false;
+        };
+        loop {
+            match self.prefix_cache.host.admission(&plan, extra) {
+                crate::prefix::Admission::Ready => return true,
+                crate::prefix::Admission::TooLarge => return false,
+                crate::prefix::Admission::Reclaim => {
+                    if self.prefix_cache.host.evict_one().is_none() {
+                        return false;
+                    }
+                    context.statistics.host_evictions += 1;
+                }
             }
-            context.statistics.host_evictions += 1;
         }
-        true
     }
     fn host_metadata(tokens: usize, banks: usize) -> Result<usize> {
         tokens
@@ -472,13 +476,13 @@ impl ModelRuntime {
         plan: &crate::backend::snapshot::Plan,
         context: &mut Context,
     ) -> Result<()> {
-        if self.host_prefix_cache.budget == 0 {
+        if self.prefix_cache.host.budget == 0 {
             return Ok(());
         }
         let parent = context
             .parent
             .filter(|(host, _)| *host)
-            .and_then(|(_, id)| self.host_prefix_cache.entries.get(&id))
+            .and_then(|(_, id)| self.prefix_cache.host.entries.get(&id))
             .filter(|e| {
                 input.starts_with(&e.tokens)
                     && e.media.common_tokens(media, e.tokens.len()) == e.tokens.len()
@@ -497,7 +501,7 @@ impl ModelRuntime {
         snapshot.metadata_bytes = metadata;
         let bytes = snapshot.bytes;
         self.remove_host_endpoint(input, media);
-        let id = self.host_prefix_cache.insert(Entry::new(
+        let id = self.prefix_cache.host.insert(Entry::new(
             input.to_vec(),
             media.clone(),
             snapshot,
@@ -512,7 +516,8 @@ impl ModelRuntime {
     }
     fn remove_host_endpoint(&mut self, input: &[u32], media: &Media) {
         let ids: Vec<_> = self
-            .host_prefix_cache
+            .prefix_cache
+            .host
             .entries
             .iter()
             .filter(|(_, e)| {
@@ -521,7 +526,7 @@ impl ModelRuntime {
             .map(|(&id, _)| id)
             .collect();
         for id in ids {
-            self.host_prefix_cache.remove(id);
+            self.prefix_cache.host.remove(id);
         }
     }
     pub(super) fn evict_prefix(
@@ -529,42 +534,50 @@ impl ModelRuntime {
         protected: Option<u64>,
         context: Option<&mut Context>,
     ) -> Result<bool> {
-        let Some(entry) = self.prefix_cache.evict_entry_one_except(protected) else {
+        let Some(id) = self.prefix_cache.device.victim_except(protected) else {
             return Ok(false);
         };
         let mut local = Context::default();
         let context = context.unwrap_or(&mut local);
-        if self.host_prefix_cache.budget > 0 {
+        let mut host_snapshot = None;
+        if self.prefix_cache.host.budget > 0 {
+            let entry = &self.prefix_cache.device.entries[&id];
             let banks = entry.snapshot.host_banks();
             let metadata = Self::host_metadata(
                 entry.tokens.len(),
                 banks.len().max(self.manifest.buffers.len()),
             )?;
             if self.reserve_host_prefix(banks, 0, metadata, context) {
+                let entry = &self.prefix_cache.device.entries[&id];
                 let mut snapshot = self
                     .execution
                     .offload_snapshot(&entry.snapshot, &mut self.host_kv_pool)?;
                 snapshot.metadata_bytes = metadata;
-                self.remove_host_endpoint(&entry.tokens, &entry.media);
-                self.host_prefix_cache.insert(Entry::new(
-                    entry.tokens,
-                    entry.media,
-                    snapshot,
-                    entry.bytes,
-                    entry.warm_tokens,
-                    entry.logits_valid,
-                ));
-                context.statistics.host_stores += 1;
+                host_snapshot = Some(snapshot);
             }
         }
-        self.execution.release_snapshot(entry.snapshot)?;
+        // Keep the device endpoint indexed until the CPU copy is complete.
+        let entry = self
+            .prefix_cache
+            .device
+            .remove(id)
+            .ok_or("Missing device prefix")?;
+        let source = if let Some(snapshot) = host_snapshot {
+            self.remove_host_endpoint(&entry.tokens, &entry.media);
+            let (entry, source) = entry.replace_snapshot(snapshot);
+            self.prefix_cache.host.insert(entry);
+            context.statistics.host_stores += 1;
+            source
+        } else {
+            entry.snapshot
+        };
+        self.execution.release_snapshot(source)?;
         context.statistics.evictions += 1;
         Ok(true)
     }
     fn update_prefix_usage(&self, context: &mut Context) {
-        self.prefix_cache.update_statistics(&mut context.statistics);
-        context.statistics.host_resident_bytes = self.host_prefix_cache.bytes;
-        context.statistics.host_entries = self.host_prefix_cache.entries.len();
+        self.prefix_cache
+            .update_statistics(1, &mut context.statistics);
     }
     pub(super) fn store_decoded_prefix(
         &mut self,

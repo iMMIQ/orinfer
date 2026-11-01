@@ -1506,7 +1506,7 @@ fn validate_flash_prefix_cache() {
     let options = scheduler::Options::default();
     let mut rows = vec![];
     for source in &fixture.cases {
-        for snapshot in model.prefix_cache.clear() {
+        for snapshot in model.prefix_cache.device.clear() {
             model.execution.release_snapshot(snapshot).unwrap();
         }
         let mut cold = model.start_request(input(source, 4), &|| false).unwrap();
@@ -1560,7 +1560,7 @@ fn validate_flash_prefix_cache() {
             "tokens_equal":true,"committed_state_equal":true}));
         model.finish_request(&mut warm, true).unwrap();
     }
-    for snapshot in model.prefix_cache.clear() {
+    for snapshot in model.prefix_cache.device.clear() {
         model.execution.release_snapshot(snapshot).unwrap();
     }
     model.execution.reclaim_idle_graphs().unwrap();
@@ -1775,7 +1775,7 @@ fn validate_flash_long_generation_reuse() {
         endpoint(&mut model, &fixture.cases[1]);
     assert!(expected_chunks.contains(&4096));
     model.finish_request(&mut reference, false).unwrap();
-    for snapshot in model.prefix_cache.clear() {
+    for snapshot in model.prefix_cache.device.clear() {
         model.execution.release_snapshot(snapshot).unwrap();
     }
     let mut stress = model
@@ -1825,7 +1825,7 @@ fn validate_flash_long_generation_reuse() {
         rows.push(row);
         model.finish_request(&mut request, true).unwrap();
     }
-    for snapshot in model.prefix_cache.clear() {
+    for snapshot in model.prefix_cache.device.clear() {
         model.execution.release_snapshot(snapshot).unwrap();
     }
     model.execution.reclaim_idle_graphs().unwrap();

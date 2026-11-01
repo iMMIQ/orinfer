@@ -282,6 +282,8 @@ CUDA 与 A2 共用物理页身份、引用、发布、写时复制、CPU bank �
 
 设备缓存淘汰时，预算允许的快照移到 CPU；CPU 层满时按现有缓存效用策略回收。查询两层合法前缀，同长时优先设备。CPU bank 用弱引用跟踪设备副本：活动请求仍引用设备页时直接复用，设备页已回收时上传一次并供后续命中共享。CPU 共享 bank 保留各 rank 自己的数据，以合并的有效字节区间跟踪不可变切片；重叠快照和同批次重叠切片只下载缺失部分。CUDA 与 A2 共用区间去重、设备副本查询及完成后发布逻辑，原生适配器负责分配和搬运。失败的下载不更新有效区间，失败的上传不登记设备副本，可安全重试。传输通过有界 pinned 分块，完成事件持有 DMA 的全部原生资源。卸载和恢复在调度边界完成，活动请求的计算与 KV 保留在设备上，准入同时保留后续增长及共享尾页复制所需额度。
 
+两种设备的前缀索引由同一个 Rust 分层控制器管理，统一查询、物理 bank 去重、预算准入及统计。准入区分可直接保存、需要回收和单个计划超限，新增 payload 与元数据一起计费；单个计划超限或字节总和溢出时跳过保存，保留已有缓存。迁移时先选定设备端点，完成 CPU 保存后再移除设备索引，并保留端点的命中历史。设备适配器执行各自的物理映射、搬运和完成同步，模型适配器声明完整的 KV 与持续状态边界。
+
 请求完成日志中的 `host_resident_bytes` 是 CPU 层计费字节，A2 为所有 rank 合计，含保守元数据预留；`host_entries`、`host_hits`、`host_stores` 和 `host_evictions` 记录 CPU 层行为，恢复耗时计入 `restore_s`。设计参考 SGLang [radix cache](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py) 的共享页与活动引用，以及 [HiCache](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/cache_controller.py)、vLLM [KV offloading](https://github.com/vllm-project/vllm/blob/main/docs/features/kv_offloading_usage.md) 的分层存储与传输完成约束。公共管理代码复用布局和所有权规则；各设备仍使用本地物理布局、传输及完成事件。
 
 A2 准入同时检查每张卡的物理空闲显存与原生 session 分配余额，并保留执行 workspace；不足时依次回收 prefix 快照和缓存的 Graph 程序，再决定是否排队。快照先规划新增 bank 并检查缓存预算和分配余量，再分配和复制；回收父快照后重新规划，避免把完整复制误算成增量复制。正常容量不足走准入等待；其他进程的显存变化或原生驱动分配失败仍可能使 worker 失效，需要重启服务。

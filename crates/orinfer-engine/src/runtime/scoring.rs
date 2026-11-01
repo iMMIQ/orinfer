@@ -162,8 +162,8 @@ impl ModelRuntime {
         // This model instance is consumed by scoring; no live request or MTP
         // branch can observe the diagnostic policy. All real kernels stay intact.
         self.manifest.mtp = None;
-        self.prefix_cache.budget = 0;
-        self.host_prefix_cache.budget = 0;
+        self.prefix_cache.device.budget = 0;
+        self.prefix_cache.host.budget = 0;
         let options = crate::sampling::Options {
             temperature: 0.,
             seed: requests.seed,

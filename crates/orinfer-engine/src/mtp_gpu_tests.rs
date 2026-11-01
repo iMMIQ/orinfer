@@ -89,7 +89,7 @@ fn validate_adaptive_prefix_cache() {
     // and the candidate boundaries differ.
     let (cold, _) = run(&mut model, &source[..512], 1);
     let cold_state = complete_prefix_state(&model, 512);
-    for snapshot in model.prefix_cache.clear() {
+    for snapshot in model.prefix_cache.device.clear() {
         model.execution.release_snapshot(snapshot).unwrap();
     }
     run(&mut model, &source[..1], 1);
@@ -100,11 +100,11 @@ fn validate_adaptive_prefix_cache() {
     assert_eq!(model.prefix_statistics.matched_tokens, 26);
     assert_eq!(actual, cold);
     assert_eq!(complete_prefix_state(&model, 512), cold_state);
-    assert_eq!(model.prefix_cache.entries.len(), 3);
+    assert_eq!(model.prefix_cache.device.entries.len(), 3);
     rows.push(
         json!({"case":"unprofitable_short_prefix","ttft_s":ttft,"prefix":model.prefix_statistics}),
     );
-    for snapshot in model.prefix_cache.clear() {
+    for snapshot in model.prefix_cache.device.clear() {
         model.execution.release_snapshot(snapshot).unwrap();
     }
     // The second request discovers a branch; the third can resume at it.
@@ -115,10 +115,10 @@ fn validate_adaptive_prefix_cache() {
     assert_eq!(model.prefix_statistics.matched_tokens, 512);
     let mut branch_b = source[..512].to_vec();
     branch_b.extend([992; 8]);
-    model.prefix_cache.budget = 0;
+    model.prefix_cache.device.budget = 0;
     let (expected, _) = run(&mut model, &branch_b, 8);
     let expected_state = complete_prefix_state(&model, branch_b.len() + 7);
-    model.prefix_cache.budget = 12usize << 30;
+    model.prefix_cache.device.budget = 12usize << 30;
     let (actual, ttft) = run(&mut model, &branch_b, 8);
     assert_eq!(model.prefix_statistics.cached_tokens, 512);
     assert_eq!(expected, actual);
@@ -137,15 +137,15 @@ fn validate_adaptive_prefix_cache() {
     rows.push(
         json!({"case":"generated_continuation","ttft_s":ttft,"prefix":model.prefix_statistics}),
     );
-    model.prefix_cache.budget = 0;
+    model.prefix_cache.device.budget = 0;
     let (cold, _) = run(&mut model, &continuation, 8);
     assert_eq!(cold, cached);
     assert_eq!(state, complete_prefix_state(&model, continuation.len() + 7));
     // Nested checkpoints share GPU KV, not just CPU metadata.
-    for snapshot in model.prefix_cache.clear() {
+    for snapshot in model.prefix_cache.device.clear() {
         model.execution.release_snapshot(snapshot).unwrap();
     }
-    model.prefix_cache.budget = 12usize << 30;
+    model.prefix_cache.device.budget = 12usize << 30;
     let long: Vec<_> = source.iter().copied().cycle().take(32768).collect();
     let (_, ttft) = run(&mut model, &long, 1);
     assert_eq!(model.prefix_statistics.entries, 4);
@@ -155,22 +155,22 @@ fn validate_adaptive_prefix_cache() {
     let (_, ttft) = run(&mut model, &long, 1);
     assert_eq!(model.prefix_statistics.cached_tokens, 32768);
     rows.push(json!({"case":"nested_32k_hit","ttft_s":ttft,"prefix":model.prefix_statistics}));
-    for snapshot in model.prefix_cache.clear() {
+    for snapshot in model.prefix_cache.device.clear() {
         model.execution.release_snapshot(snapshot).unwrap();
     }
-    model.prefix_cache.budget = 350usize << 20;
+    model.prefix_cache.device.budget = 350usize << 20;
     for token in 1000..1006 {
         let mut input = source[..512].to_vec();
         input[0] = token;
         run(&mut model, &input, 1);
-        assert!(model.prefix_cache.bytes <= model.prefix_cache.budget);
+        assert!(model.prefix_cache.device.bytes <= model.prefix_cache.device.budget);
         assert_eq!(
-            model.prefix_cache.bytes,
-            model.prefix_cache.resident_with(None)
+            model.prefix_cache.device.bytes,
+            model.prefix_cache.device.resident_with(None)
         );
         assert_eq!(
             model.execution.snapshot_resident_bytes(),
-            model.prefix_cache.bytes
+            model.prefix_cache.device.bytes
         );
         rows.push(json!({"case":"budget_eviction","prefix":model.prefix_statistics}));
     }
@@ -265,7 +265,7 @@ fn validate_prefix_reuse() {
     };
     let mut rows = vec![];
     for case in &fixture.cases {
-        for snapshot in model.prefix_cache.clear() {
+        for snapshot in model.prefix_cache.device.clear() {
             model.execution.release_snapshot(snapshot).unwrap();
         }
         let options = case.sampling.as_ref().unwrap_or(&defaults);
@@ -277,7 +277,7 @@ fn validate_prefix_reuse() {
             ("populate", 12usize << 30),
             ("hit", 12usize << 30),
         ] {
-            model.prefix_cache.budget = budget;
+            model.prefix_cache.device.budget = budget;
             let at = Instant::now();
             let mut tokens = vec![];
             let mut ttft = 0.0;
@@ -405,7 +405,7 @@ fn validate_prefix_reuse() {
             );
         }
         if case.input_tokens.len() == 8192 && case.images.is_empty() {
-            for snapshot in model.prefix_cache.clear() {
+            for snapshot in model.prefix_cache.device.clear() {
                 model.execution.release_snapshot(snapshot).unwrap();
             }
             let mut extended = case.input_tokens.clone();
@@ -416,6 +416,7 @@ fn validate_prefix_reuse() {
             assert!(
                 model
                     .prefix_cache
+                    .device
                     .entries
                     .values()
                     .any(|e| e.tokens.len() == 8192)
@@ -423,7 +424,7 @@ fn validate_prefix_reuse() {
             let mut branch = case.input_tokens.clone();
             branch.extend_from_slice(&[198; 8]);
             let mut expected = vec![];
-            model.prefix_cache.budget = 0;
+            model.prefix_cache.device.budget = 0;
             model
                 .generate(
                     &branch,
@@ -438,7 +439,7 @@ fn validate_prefix_reuse() {
                 )
                 .unwrap();
             let state = snapshot(&model, branch.len() + 7);
-            model.prefix_cache.budget = 12usize << 30;
+            model.prefix_cache.device.budget = 12usize << 30;
             let mut actual = vec![];
             model
                 .generate(
@@ -463,12 +464,13 @@ fn validate_prefix_reuse() {
             // shorter prefix again, rather than a complete prompt hit.
             let index = model
                 .prefix_cache
+                .device
                 .entries
                 .iter()
                 .find(|(_, e)| e.tokens == branch)
                 .map(|(&id, _)| id)
                 .unwrap();
-            let entry = model.prefix_cache.remove(index).unwrap();
+            let entry = model.prefix_cache.device.remove(index).unwrap();
             model.execution.release_snapshot(entry.snapshot).unwrap();
         }
         if case.images.is_empty() && case.input_tokens.len().is_multiple_of(512) {
@@ -480,7 +482,7 @@ fn validate_prefix_reuse() {
                 let mut expected = None;
                 let mut expected_state = None;
                 for budget in [0, 12usize << 30] {
-                    model.prefix_cache.budget = budget;
+                    model.prefix_cache.device.budget = budget;
                     let mut tokens = vec![];
                     model
                         .generate(

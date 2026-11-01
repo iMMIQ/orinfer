@@ -8,10 +8,12 @@ mod budget;
 mod dspark;
 mod offload;
 mod packet;
+#[cfg(test)]
+use crate::prefix::Cache;
 use crate::{
     artifact::{FileIdentity, Result, resolve_file},
     model::{GenerationInput, StepOutput},
-    prefix::{Cache, Entry, Media, Resident},
+    prefix::{Admission, Entry, Media, Resident, Tiered},
     sampling::{Constraint, Decoder, TokenLogprob},
     scheduler,
 };
@@ -84,8 +86,7 @@ fn matched(cache: &Cache<Snapshot>, input: &[u32], reserve: usize) -> Option<u64
 pub(crate) struct Runtime {
     team: Team,
     pub frontend_assets: BTreeMap<String, String>,
-    cache: Cache<Snapshot>,
-    host_cache: Cache<Snapshot>,
+    cache: Tiered<Snapshot, Snapshot>,
     prefix: crate::prefix::Statistics,
     statistics: scheduler::Statistics,
     active: BTreeSet<usize>,
@@ -282,8 +283,7 @@ impl Runtime {
         Ok(Self {
             team,
             frontend_assets: model.frontend_assets,
-            cache: Cache::new(options.prefix_cache_bytes),
-            host_cache: Cache::new(host_budget),
+            cache: Tiered::new(options.prefix_cache_bytes, host_budget),
             prefix: Default::default(),
             statistics: Default::default(),
             active: Default::default(),
@@ -332,7 +332,7 @@ impl Runtime {
         &self.prefix
     }
     pub fn prefix_cache_enabled(&self) -> bool {
-        self.cache.budget > 0 || self.host_cache.budget > 0
+        self.cache.enabled()
     }
     pub fn set_prefix_cache_hints(&mut self, hints: Vec<usize>) {
         self.hints = hints;
@@ -538,9 +538,9 @@ impl Runtime {
         let lookup_s = at.elapsed().as_secs_f64();
         if let Some(id) = matched {
             let entry = if id.0 {
-                self.host_cache.touch(id.1)
+                self.cache.host.touch(id.1)
             } else {
-                self.cache.touch(id.1)
+                self.cache.device.touch(id.1)
             };
             if id.0 {
                 prefix.host_hits += 1;
@@ -617,9 +617,10 @@ impl Runtime {
         if count == 0
             || self
                 .cache
+                .device
                 .entries
                 .values()
-                .chain(self.host_cache.entries.values())
+                .chain(self.cache.host.entries.values())
                 .any(|e| {
                     e.tokens == request.history[..count] && (output.is_none() || e.logits_valid)
                 })
@@ -637,7 +638,7 @@ impl Runtime {
             .ok_or("A2 snapshot identity overflow")?;
         let id = self.next_snapshot;
         let head = output.cloned().map(Arc::new);
-        let mut host = self.cache.budget == 0;
+        let mut host = self.cache.device.budget == 0;
         let (snapshot, bytes) = loop {
             // Eviction can remove the owner's parent lineage. Re-plan after
             // every reclamation, before allocating or committing any new bank.
@@ -669,12 +670,12 @@ impl Runtime {
                 )
                 .ok_or("Snapshot size overflow")?;
             let budget = if host {
-                self.host_cache.budget
+                self.cache.host.budget
             } else {
-                self.cache.budget
+                self.cache.device.budget
             };
             if bytes > budget {
-                if !host && self.host_cache.budget > 0 {
+                if !host && self.cache.host.budget > 0 {
                     host = true;
                     continue;
                 }
@@ -686,8 +687,12 @@ impl Runtime {
                 output: head.clone(),
                 host_overhead,
             };
-            let cache = if host { &self.host_cache } else { &self.cache };
-            if cache.resident_with(Some(&snapshot)) > budget {
+            let cache = if host {
+                &self.cache.host
+            } else {
+                &self.cache.device
+            };
+            if cache.admission(&snapshot, 0) != Admission::Ready {
                 if !(if host {
                     self.evict_host()?
                 } else {
@@ -704,7 +709,7 @@ impl Runtime {
                     .has_budget(memory::Requirement::snapshot(incoming)?)?
             {
                 if !memory::reclaim_one(self)? {
-                    if self.host_cache.budget > 0 {
+                    if self.cache.host.budget > 0 {
                         host = true;
                         continue;
                     }
@@ -725,7 +730,7 @@ impl Runtime {
             break (snapshot, bytes);
         };
         // Upgrade endpoints across both tiers after the new snapshot is complete.
-        for cache in [&mut self.cache, &mut self.host_cache] {
+        for cache in [&mut self.cache.device, &mut self.cache.host] {
             let obsolete = cache
                 .entries
                 .iter()
@@ -738,9 +743,9 @@ impl Runtime {
             }
         }
         let cache = if host {
-            &mut self.host_cache
+            &mut self.cache.host
         } else {
-            &mut self.cache
+            &mut self.cache.device
         };
         cache.insert(Entry::new(
             request.history[..count].to_vec(),
@@ -755,18 +760,10 @@ impl Runtime {
         }
         request.prefix.store_s += at.elapsed().as_secs_f64();
         request.prefix.checkpoints_stored += 1;
-        offload::update_statistics(
-            &self.cache,
-            &self.host_cache,
-            self.team.ranks(),
-            &mut request.prefix,
-        );
-        offload::update_statistics(
-            &self.cache,
-            &self.host_cache,
-            self.team.ranks(),
-            &mut self.prefix,
-        );
+        self.cache
+            .update_statistics(self.team.ranks(), &mut request.prefix);
+        self.cache
+            .update_statistics(self.team.ranks(), &mut self.prefix);
         Ok(())
     }
     pub fn share_prefill_checkpoint(
@@ -915,19 +912,11 @@ impl Runtime {
         self.release_resident(request.slot)?;
         self.active.remove(&request.slot);
         request.released = true;
-        offload::update_statistics(
-            &self.cache,
-            &self.host_cache,
-            self.team.ranks(),
-            &mut request.prefix,
-        );
+        self.cache
+            .update_statistics(self.team.ranks(), &mut request.prefix);
         self.prefix = request.prefix.clone();
-        offload::update_statistics(
-            &self.cache,
-            &self.host_cache,
-            self.team.ranks(),
-            &mut self.prefix,
-        );
+        self.cache
+            .update_statistics(self.team.ranks(), &mut self.prefix);
         Ok(())
     }
     pub fn generate(

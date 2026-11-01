@@ -1,6 +1,8 @@
 //! Compressed token radix index with exact state endpoints and byte accounting.
+mod tiered;
 use serde::Serialize;
 use std::collections::BTreeMap;
+pub(crate) use tiered::{Admission, Tiered};
 
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct Statistics {
@@ -57,6 +59,22 @@ pub(crate) struct Entry<T> {
     hits: u64,
 }
 impl<T> Entry<T> {
+    /// Preserve reuse history and endpoint identity when changing storage tier.
+    pub fn replace_snapshot<U>(self, snapshot: U) -> (Entry<U>, T) {
+        (
+            Entry {
+                tokens: self.tokens,
+                media: self.media,
+                snapshot,
+                bytes: self.bytes,
+                warm_tokens: self.warm_tokens,
+                logits_valid: self.logits_valid,
+                used: self.used,
+                hits: self.hits,
+            },
+            self.snapshot,
+        )
+    }
     pub fn new(
         tokens: Vec<u32>,
         media: Media,
@@ -286,6 +304,12 @@ impl<T: Resident> Cache<T> {
     }
     /// Move an endpoint between storage tiers without losing its token identity.
     pub fn evict_entry_one_except(&mut self, protected: Option<u64>) -> Option<Entry<T>> {
+        let victim = self.victim_except(protected)?;
+        self.remove(victim)
+    }
+    /// Select without unpublishing the source. Tier transfers commit removal
+    /// only after the adapter reports successful completion.
+    pub fn victim_except(&self, protected: Option<u64>) -> Option<u64> {
         let mut references: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
         for e in self.entries.values() {
             let mut own = BTreeMap::new();
@@ -295,8 +319,7 @@ impl<T: Resident> Cache<T> {
                 r.1 += 1;
             }
         }
-        let victim = self
-            .entries
+        self.entries
             .iter()
             .filter(|(id, _)| Some(**id) != protected)
             .min_by(|(_, a), (_, b)| {
@@ -314,8 +337,7 @@ impl<T: Resident> Cache<T> {
                 };
                 utility(a).total_cmp(&utility(b)).then(a.used.cmp(&b.used))
             })
-            .map(|(&id, _)| id)?;
-        self.remove(victim)
+            .map(|(&id, _)| id)
     }
     pub fn insert(&mut self, mut entry: Entry<T>) -> u64 {
         self.clock += 1;
