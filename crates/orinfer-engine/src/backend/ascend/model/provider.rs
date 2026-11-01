@@ -311,7 +311,9 @@ impl Runtime {
         self.team.rows
     }
     pub fn scheduler_statistics(&self) -> scheduler::Statistics {
-        self.statistics.clone()
+        let mut statistics = self.statistics.clone();
+        statistics.speculation = self.speculation_statistics().cloned();
+        statistics
     }
     pub fn max_context(&self) -> usize {
         self.team.model.capacity

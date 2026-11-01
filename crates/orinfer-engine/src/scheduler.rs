@@ -423,6 +423,9 @@ pub struct Statistics {
     pub batch_inputs_s: f64,
     pub batch_plan_s: f64,
     pub batch_commit_s: f64,
+    /// Model-wide speculative counters, published with this scheduler snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculation: Option<crate::mtp::Statistics>,
     pub batch_execution: BatchExecutionStatistics,
 }
 
