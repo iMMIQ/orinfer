@@ -642,6 +642,8 @@ A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 own
 
 晋升耗时计入再次命中该形状的请求，可能形成一次性的延迟尖峰；性能同时比较完整请求序列与热态吞吐。固定 Mini 短测使用相同源片段和输出长度目标，分别记录 warmup、已完成的 profiling 请求及未完成的回放范围。
 
+`ORINFER_A2_BATCH_PROFILE=1` 同时输出请求启动的 owner 准备、额度预留、prefix 查找及恢复耗时。原生大块填充按至多 4 MiB 分段提交，同一 stream 上的全部分段共享一个完成事件，事件保留完整目标 buffer；视图边界和尾部仍按真实字节数处理。
+
 `--length-input` 让同一索引 Cube 工厂读取每行的有效前缀长度，按 owner 内单调递增的位置决定实际 key tile 数，写入有效 score 前缀。TopK 使用相同长度屏蔽其余容量，完整有效候选与原有归约顺序保持一致。此模式以长度向量替代稠密因果索引矩阵，同时适用于 decode 和 prefill。`--gather-slots` 选择同一 INT8 gather 工厂每次转换的槽位数。可重复提供 `--reuse-cache /path/to/compiled/cache`，复用完整编译对象；编译器仍校验对象身份和库哈希。
 
 当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样、prefix 恢复及匹配执行包的 DSpark。工具定义／工具调用、媒体、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的原生计划封装。v0.3.0 的 `package install` 在 CPU 上校验并原子安装该执行包；`validate-model` 另行校验配置、前端和全部发布权重分片，分片内容依据 `release-manifest.json` 每个文件扫描一次。正常服务加载不计算资产内容 SHA256。A2 模型通过原生 provider 接入公共运行时，模型计划尚未迁移到通用模型 cdylib C ABI。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。

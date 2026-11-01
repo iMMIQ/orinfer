@@ -187,8 +187,8 @@ impl Runtime {
         let uses = self.consecutive_uses(&key).saturating_add(1);
         self.recent.insert(key.family, (key, uses));
     }
-    fn remove(&mut self, key: &Key) {
-        self.cache.remove(key);
+    fn remove(&mut self, key: &Key) -> bool {
+        let removed = self.cache.remove(key).is_some();
         if self
             .recent
             .get(&key.family)
@@ -196,6 +196,7 @@ impl Runtime {
         {
             self.recent.remove(&key.family);
         }
+        removed
     }
     fn key(&self, layout: &Layout) -> Result<Key> {
         let (family, _) = self

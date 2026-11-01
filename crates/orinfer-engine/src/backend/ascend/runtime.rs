@@ -878,19 +878,22 @@ impl Session {
                 _extra: None,
             },
             |stream| {
-                // SAFETY: Entire destination is retained until completion.
-                check(
-                    unsafe {
-                        (self.context.api.memset)(
-                            buffer.pointer(),
-                            buffer.bytes(),
-                            value.into(),
-                            buffer.bytes(),
-                            stream,
-                        )
-                    },
-                    "ACL fill",
-                )
+                // Large ACL memset submissions have a higher per-byte cost.
+                // Keep the same stream order and one completion for all chunks.
+                const CHUNK: usize = 4 << 20;
+                for offset in (0..buffer.bytes()).step_by(CHUNK) {
+                    let bytes = CHUNK.min(buffer.bytes() - offset);
+                    let pointer = buffer.range(offset, bytes)?;
+                    check(
+                        // SAFETY: Each checked slice belongs to the retained
+                        // destination; the final event follows every fill.
+                        unsafe {
+                            (self.context.api.memset)(pointer, bytes, value.into(), bytes, stream)
+                        },
+                        "ACL fill",
+                    )?;
+                }
+                Ok(())
             },
         )
     }

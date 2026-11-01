@@ -763,6 +763,59 @@ fn buffer_can_outlive_session_without_finalizing_its_context() {
     fixture.assert_clean();
 }
 
+fn check_chunked_fill(session: &Session) {
+    let bytes = (8 << 20) + 69;
+    let buffer = session.allocate(bytes).unwrap();
+    session.fill(&buffer, 11).unwrap().wait().unwrap();
+    let view = buffer.slice(17, (8 << 20) + 31).unwrap();
+    let ticket = session.fill(&view, 173).unwrap();
+    drop(view);
+    ticket.wait().unwrap();
+    assert_eq!(session.download(&buffer, 0, 17).unwrap(), [11; 17]);
+    for boundary in [4 << 20, 8 << 20] {
+        assert_eq!(
+            session.download(&buffer, boundary + 13, 8).unwrap(),
+            [173; 8]
+        );
+    }
+    assert_eq!(session.download(&buffer, bytes - 21, 21).unwrap(), [11; 21]);
+    let last = session.fill(&buffer, 0).unwrap();
+    drop((buffer, ticket));
+    last.wait().unwrap();
+    session.synchronize().unwrap();
+    drop(last);
+    assert_eq!(session.allocated_bytes(), 0);
+}
+
+#[test]
+fn large_fills_preserve_view_guards_tails_and_completion_ownership() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    check_chunked_fill(&session);
+    drop(session);
+    fixture.assert_clean();
+}
+
+#[test]
+#[ignore = "Validates chunked fills on the physical A2 device"]
+fn large_fills_preserve_view_guards_tails_and_completion_ownership_on_device() {
+    use std::{fs::OpenOptions, os::fd::AsRawFd};
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open("artifacts/gpu-experiment.lock")
+        .unwrap();
+    assert_eq!(
+        // SAFETY: The retained file owns the hardware lock until session destruction.
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let session = Session::new(0, Limits::default()).unwrap();
+    check_chunked_fill(&session);
+}
+
 #[test]
 fn failed_record_fences_queued_dma_and_failed_creation_rolls_back() {
     let mut fixture = Fixture::new();

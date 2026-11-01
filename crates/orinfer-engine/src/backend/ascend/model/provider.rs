@@ -504,13 +504,20 @@ impl Runtime {
             return Err("A2 request cancelled before admission".into());
         }
         self.reap()?;
+        let reap_s = started.elapsed().as_secs_f64();
         self.require_text(&input.images, &input.audios)?;
         let slot = (0..self.team.model.batch.as_ref().unwrap().owners)
             .find(|slot| !self.active.contains(slot))
             .ok_or("A2 owner capacity exhausted")?;
         let resident = !self.head_only(&input);
+        let setup_s = started.elapsed().as_secs_f64() - reap_s;
+        let mut admit_s = 0.;
+        let mut limit_s = 0.;
         if resident {
+            let at = Instant::now();
             self.team.exchange(Command::Admit(vec![slot]))?;
+            admit_s = at.elapsed().as_secs_f64();
+            let at = Instant::now();
             self.team.exchange(Command::Limit(
                 slot,
                 input
@@ -519,13 +526,17 @@ impl Runtime {
                     .checked_add(input.max_new_tokens)
                     .ok_or("Owner token budget overflow")?,
             ))?;
+            limit_s = at.elapsed().as_secs_f64();
             self.resident.insert(slot);
         }
         self.active.insert(slot);
         let mut prefix = crate::prefix::Statistics::default();
         let mut offset = 0;
         let mut ready_output = None;
-        if let Some(id) = self.matched(&input.input_tokens) {
+        let at = Instant::now();
+        let matched = self.matched(&input.input_tokens);
+        let lookup_s = at.elapsed().as_secs_f64();
+        if let Some(id) = matched {
             let entry = if id.0 {
                 self.host_cache.touch(id.1)
             } else {
@@ -559,6 +570,18 @@ impl Runtime {
         self.statistics.request_start_s += started.elapsed().as_secs_f64();
         self.statistics.prefix_restore_s += prefix.restore_s;
         self.statistics.peak_active = self.statistics.peak_active.max(self.active.len());
+        if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+            eprintln!(
+                "A2 request start {}",
+                serde_json::json!({
+                    "owner": slot, "tokens": input.input_tokens.len(),
+                    "cached_tokens": offset, "resident": resident,
+                    "wall_s": started.elapsed().as_secs_f64(), "reap_s": reap_s,
+                    "setup_s": setup_s, "admit_s": admit_s, "limit_s": limit_s,
+                    "lookup_s": lookup_s, "restore_s": prefix.restore_s,
+                })
+            );
+        }
         Ok(Request {
             owner: self.owner,
             slot,

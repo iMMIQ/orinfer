@@ -199,7 +199,7 @@ impl Worker {
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
         let tables_released = runtime.bound_tables.take().is_some();
         while let Some(key) = runtime.lru.pop_front() {
-            if runtime.cache.remove(&key).is_some() {
+            if runtime.remove(&key) {
                 self.w4.retain(|_, w| w.strong_count() > 0);
                 self.session.synchronize()?;
                 return Ok(true);
