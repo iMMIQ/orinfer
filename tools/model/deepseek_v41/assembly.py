@@ -287,6 +287,33 @@ def canonical(model):
     return compact_buffers(model)
 
 
+def retarget_packet_boundary(model, previous, minimum):
+    """Select adjacent compiled target families without changing their programs."""
+    if any(type(v) is not int or v < 1 for v in (previous, minimum)):
+        raise ValueError("Packet boundaries must be positive integers")
+    result = deepcopy(model)
+    domains = []
+    for rank in result["ranks"]:
+        packets = [
+            p
+            for p in rank["packets"]
+            if p.get("role", "target") == "target" and not p.get("batch_decode")
+        ]
+        left = [p for p in packets if p.get("max_rows", p["rows"]) == previous - 1]
+        right = [p for p in packets if p.get("min_rows", 1) == previous]
+        if len(left) != 1 or len(right) != 1:
+            raise ValueError("Require one adjacent pair of target families on every rank")
+        left, right = left[0], right[0]
+        low, high = left.get("min_rows", 1), right.get("max_rows", right["rows"])
+        if left["rows"] != right["rows"] or not low < minimum <= high:
+            raise ValueError("Boundary must retain two nonempty, equal-capacity families")
+        domains.append((low, high, left["rows"]))
+        left["max_rows"], right["min_rows"] = minimum - 1, minimum
+    if not domains or len(set(domains)) != 1:
+        raise ValueError("Target family domains must match across ranks")
+    return result
+
+
 def validate_rows(model, base, *, model_dir=None):
     """Offline full-domain arithmetic and physical span checks, deduplicated."""
     expressions, specs = {}, {}

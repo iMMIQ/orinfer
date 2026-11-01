@@ -683,7 +683,13 @@ ORINFER_EXECUTION_CACHE="$PWD/artifacts/execution-packages/dspark" \
 
 DSpark 需要本次引擎及配套执行包；v0.3.0 target 包继续使用普通 decode。构建和发布保持 schema 1，正常加载执行结构与范围检查，内容完整性使用独立 `validate-model` 命令。
 
-发布阶段使用 `python -m tools.model.deepseek_v41.publication --source PACKAGE_DIR --output-cache OUTPUT_CACHE` 整理已有执行包。导出与整理共用引用收集流程，只保留计划引用的算子与资产，并保留许可证；算子库移除静态符号表，逐库比较所有运行时段及设备代码字节；计划采用紧凑 JSON，重新固定库与包身份，权重 payload 保持原样。安装 v0.3.0 的 A2 包：
+发布阶段使用 `python -m tools.model.deepseek_v41.publication --source PACKAGE_DIR --output-cache OUTPUT_CACHE` 整理已有执行包。导出与整理共用引用收集流程，只保留计划引用的算子与资产，并保留许可证；算子库移除静态符号表，逐库比较所有运行时段及设备代码字节；计划采用紧凑 JSON，重新固定库与包身份，权重 payload 保持原样。
+
+已有动态 target 家族的选择边界可通过 `--packet-boundary OLD NEW --model-dir MODEL_DIR` 离线调整。例如 `--packet-boundary 512 128` 让原有 query／序列分片模板从 128 个聚合 token 行开始执行。整理器要求各 rank 的两个家族相邻、容量及覆盖范围一致，保留两侧完整程序、算子与请求状态绑定，再校验动态行表达式及物理范围。新包的 digest 需同步写入模型描述。边界按完整请求测量选择；此操作复用已编译的动态算子。
+
+DSpark 自动预算默认止于首个包含跨卡交换的 target 家族之前。调小上述边界后，应显式设置经测量的 `--max-speculative-tokens`；例如 32 路、最多 5 个草稿加 anchor 需要 192 行，使用 `--max-speculative-tokens 192`。该参数只给出总验证行上限，草稿深度继续由自动策略选择。
+
+安装 v0.3.0 的 A2 包：
 
 ```bash
 orinfer package install orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.0.tar.xz

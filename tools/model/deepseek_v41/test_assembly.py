@@ -7,11 +7,70 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
+from tools.model.deepseek_v41.assembly import (
+    compact_buffers,
+    publish_package,
+    retarget_packet_boundary,
+    validate_rows,
+)
 from tools.model.row_contract import expression, resolve
 from tools.model.row_selection import aggregate_winner, bounded_choices, guarded_winner
 from tools.model.deepseek_v41.sequence_parallel import external_reads
 from tools.model.deepseek_v41.private_schedule import reusable_long_gathers, select_schedule
+
+
+class PacketBoundaryTests(unittest.TestCase):
+    def fixture(self):
+        packets = [
+            dict(rows=32, min_rows=1, batch_decode=True),
+            dict(rows=2048, min_rows=1, max_rows=31, body=["short"]),
+            dict(rows=2048, min_rows=32, max_rows=511, body=["head"]),
+            dict(rows=2048, min_rows=512, body=["query"]),
+            dict(rows=512, min_rows=512, role="draft", body=["draft"]),
+        ]
+        return dict(ranks=[dict(rank=i, packets=deepcopy(packets)) for i in range(8)])
+
+    def test_selection_preserves_coverage_programs_and_other_roles(self):
+        original = self.fixture()
+        result = retarget_packet_boundary(original, 512, 128)
+        for rank in result["ranks"]:
+            packets = rank["packets"]
+            for rows in range(1, 2049):
+                matches = [
+                    p
+                    for p in packets
+                    if not p.get("batch_decode")
+                    and p.get("role", "target") == "target"
+                    and p["min_rows"] <= rows <= p.get("max_rows", p["rows"])
+                ]
+                self.assertEqual(len(matches), 1)
+                if rows in (127, 128):
+                    self.assertEqual(matches[0]["body"], ["head" if rows == 127 else "query"])
+            packets[2]["max_rows"], packets[3]["min_rows"] = 511, 512
+        self.assertEqual(result, original)
+        self.assertEqual(original, self.fixture())
+
+    def test_rejects_ambiguous_domains_without_mutating_input(self):
+        for case in ("missing", "capacity", "domain", "duplicate", "empty", "boolean"):
+            model = self.fixture()
+            packets = model["ranks"][-1]["packets"]
+            minimum = 128
+            if case == "missing":
+                packets.pop(3)
+            elif case == "capacity":
+                packets[3]["rows"] = 1024
+            elif case == "domain":
+                packets[3]["max_rows"] = 1024
+            elif case == "duplicate":
+                packets.append(deepcopy(packets[3]))
+            elif case == "empty":
+                minimum = 32
+            else:
+                minimum = True
+            before = deepcopy(model)
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                retarget_packet_boundary(model, 512, minimum)
+            self.assertEqual(model, before)
 
 
 class DeviceEmbeddingTests(unittest.TestCase):
