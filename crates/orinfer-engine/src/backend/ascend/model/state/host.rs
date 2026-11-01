@@ -68,44 +68,15 @@ impl HostSnapshot {
         parent: Option<&Self>,
         pool: &mut HostPool,
     ) -> Result<Self> {
-        let layouts = layouts.collect::<Vec<_>>();
-        let CapturePlan {
-            mut pieces,
-            pending,
-            bytes,
-        } = Self::plan(
-            layouts
-                .iter()
-                .copied()
-                .filter(|l| !l.append_only || !buffers[&l.buffer].demand_mapped()),
-            buffers,
-            history,
-            parent,
-        )?;
-        session.synchronize()?;
-        let mut gpu_pieces = vec![];
-        for layout in layouts
-            .iter()
-            .copied()
-            .filter(|l| l.append_only && buffers[&l.buffer].demand_mapped())
-        {
-            let source = get(buffers, &layout.buffer)?;
-            for span in layout.spans(history.len(), source.bytes())? {
-                for (allocation, range, offset) in session.publish_kv(&source, span.end)? {
-                    gpu_pieces.push(Piece {
-                        name: layout.buffer.clone(),
-                        offset: range.offset,
-                        bank_id: allocation.id,
-                        bank_bytes: allocation.bytes,
-                        buffer: DeviceBuffer {
-                            allocation,
-                            source: offset,
-                            bytes: range.bytes,
-                        },
-                    });
-                }
-            }
-        }
+        let (
+            CapturePlan {
+                mut pieces,
+                pending,
+                bytes,
+            },
+            shared_preview,
+        ) = Self::plan_checkpoint(layouts, buffers, history, parent)?;
+        let gpu_pieces = publish_shared(session, buffers, &shared_preview)?;
         let shared = Self::offload(
             session,
             &Snapshot {
@@ -178,6 +149,13 @@ impl HostSnapshot {
         buffers: &BTreeMap<String, Buffer>,
     ) -> Result<()> {
         self.restore_shared_into(session, buffers)?;
+        grow_restored(
+            session,
+            buffers,
+            self.pieces
+                .iter()
+                .map(|p| (p.name.as_str(), p.offset + p.buffer.bytes)),
+        )?;
         self.restore_mutable_host_into(session, buffers)
     }
     fn restore_mutable_host_into(
@@ -220,11 +198,8 @@ impl Worker {
         parent: Option<&HostSnapshot>,
     ) -> Result<BTreeMap<u64, usize>> {
         let (owner, layouts) = self.snapshot_state(id, complete)?;
-        let plan = HostSnapshot::plan(
-            layouts
-                .iter()
-                .copied()
-                .filter(|l| !l.append_only || !owner.buffers[&l.buffer].demand_mapped()),
+        let (plan, shared) = HostSnapshot::plan_checkpoint(
+            layouts.into_iter(),
             &owner.buffers,
             &owner.history,
             parent,
@@ -240,14 +215,8 @@ impl Worker {
                 plan.bytes.checked_add(255).ok_or("Host plan overflow")?,
             );
         }
-        let kv_plan =
-            Snapshot::plan_device(layouts.into_iter(), &owner.buffers, &owner.history, None)?;
-        for piece in kv_plan
-            .pieces
-            .iter()
-            .filter(|p| p.buffer.allocation.handle.is_some())
-        {
-            banks.insert(piece.bank_id, piece.buffer.host_capacity());
+        for piece in shared {
+            banks.insert(piece.allocation.id, piece.allocation.used);
         }
         Ok(banks)
     }
@@ -314,17 +283,23 @@ mod tests {
             circular: false,
             append_only: true,
         };
-        let buffers = BTreeMap::from([("kv".into(), source.clone())]);
+        let buffers = BTreeMap::<String, _>::from([("kv".into(), source.clone())]);
         let before = session.allocated_bytes();
-        let saved = Snapshot::capture(
-            session,
-            std::iter::once(&layout),
-            &buffers,
-            &[1; 17],
-            1,
-            None,
-        )
-        .unwrap();
+        let (allocation, range, offset) = session.publish_kv(&source, 17).unwrap().remove(0);
+        let saved = Snapshot {
+            history: vec![1; 17],
+            pieces: vec![Piece {
+                name: layout.buffer,
+                offset: range.offset,
+                bank_id: allocation.id,
+                bank_bytes: allocation.bytes,
+                buffer: DeviceBuffer {
+                    allocation,
+                    source: offset,
+                    bytes: range.bytes,
+                },
+            }],
+        };
         assert_eq!(
             session.allocated_bytes(),
             before,
@@ -389,6 +364,149 @@ mod tests {
             "all references release physical memory exactly once"
         );
     }
+    fn compact_checkpoint_lifecycle(session: &Session) {
+        let grain = 2 << 20;
+        let source = session.reserve(grain * 2).unwrap();
+        let ring = session.allocate(64).unwrap();
+        let buffers = BTreeMap::from([
+            ("kv".to_owned(), source.clone()),
+            ("ring".to_owned(), ring.clone()),
+        ]);
+        let layouts = [
+            StateLayout {
+                buffer: "kv".into(),
+                row_bytes: 1,
+                tokens_per_row: 1,
+                window: None,
+                circular: false,
+                append_only: true,
+            },
+            StateLayout {
+                buffer: "ring".into(),
+                row_bytes: 64,
+                tokens_per_row: 0,
+                window: None,
+                circular: false,
+                append_only: false,
+            },
+        ];
+        let mut pool = HostPool::default();
+        for (i, n) in [2048, 2049, grain + 17].into_iter().enumerate() {
+            let value = 71 + i as u8;
+            session.grow_many(&[(source.clone(), n + 1)]).unwrap();
+            session
+                .upload(&source, n - 17, &[value; 17])
+                .unwrap()
+                .wait()
+                .unwrap();
+            session.fill(&ring, value).unwrap().wait().unwrap();
+            let history = vec![1; n];
+            let plan = Snapshot::plan_device(layouts.iter(), &buffers, &history, None).unwrap();
+            assert_eq!(plan.pieces.len(), n / grain);
+            let expected = plan.allocations(i as u64 + 1).unwrap();
+            let private_bytes = plan.bytes + 255;
+            drop(plan);
+            let before = session.allocated_bytes();
+            let saved = Snapshot::capture(
+                session,
+                layouts.iter(),
+                &buffers,
+                &history,
+                i as u64 + 1,
+                None,
+            )
+            .unwrap();
+            assert_eq!(saved.allocations(), expected);
+            assert_eq!(
+                session.allocated_bytes(),
+                before + private_bytes,
+                "all private state and partial KV tails share one compact endpoint bank"
+            );
+            assert_eq!(
+                source
+                    .kv_writable_bytes(orinfer_device::MemoryRange {
+                        offset: n,
+                        bytes: 1
+                    })
+                    .unwrap(),
+                0,
+                "checkpoint publication must not freeze the writable tail"
+            );
+            let after = session.allocated_bytes();
+            session
+                .upload(&source, n, &[value + 1])
+                .unwrap()
+                .wait()
+                .unwrap();
+            session
+                .upload(&source, n - 1, &[value + 2])
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(
+                session.allocated_bytes(),
+                after,
+                "continued tail writes need no COW allocation"
+            );
+            let target = session.reserve(grain * 2).unwrap();
+            let actual = BTreeMap::from([
+                ("kv".to_owned(), target.clone()),
+                ("ring".to_owned(), session.allocate(64).unwrap()),
+            ]);
+            let before = session.allocated_bytes();
+            saved.restore_into(session, &actual).unwrap();
+            assert_eq!(
+                session.allocated_bytes(),
+                before + grain,
+                "full KV pages alias; only the compact tail gets private backing"
+            );
+            assert_eq!(session.download(&target, n - 17, 17).unwrap(), [value; 17]);
+            assert_eq!(session.download(&target, n, 1).unwrap(), [0]);
+            assert_eq!(
+                session.download(&actual["ring"], 0, 64).unwrap(),
+                [value; 64]
+            );
+            let host = HostSnapshot::offload(session, &saved, &mut pool).unwrap();
+            assert!(
+                host.allocations().values().sum::<usize>() <= n + 1024,
+                "CPU backing stores valid full pages and packed state, not physical tail padding"
+            );
+            let before = session.allocated_bytes();
+            let direct = HostSnapshot::capture_host(
+                session,
+                layouts.iter(),
+                &buffers,
+                &history,
+                i as u64 + 100,
+                None,
+                &mut pool,
+            )
+            .unwrap();
+            assert_eq!(
+                session.allocated_bytes(),
+                before,
+                "direct CPU capture needs no device endpoint bank"
+            );
+            direct.restore_host_into(session, &actual).unwrap();
+            assert_eq!(session.download(&target, n - 1, 1).unwrap(), [value + 2]);
+            host.restore_host_into(session, &actual).unwrap();
+            assert_eq!(
+                session.download(&target, n - 17, 17).unwrap(),
+                [value; 17],
+                "CPU and device branches retain the same immutable checkpoint values"
+            );
+        }
+        drop((pool, buffers, source, ring));
+        assert_eq!(session.allocated_bytes(), 0);
+    }
+    #[test]
+    fn compact_checkpoint_keeps_full_pages_shared_and_tails_writable() {
+        let mut fixture = Fixture::new();
+        let session = fixture.session();
+        compact_checkpoint_lifecycle(&session);
+        drop(session);
+        fixture.assert_clean();
+    }
     #[test]
     fn shared_pages_cow_offload_and_resident_reuse() {
         let mut fixture = Fixture::new();
@@ -422,6 +540,7 @@ mod tests {
         )
         .unwrap();
         shared_page_lifecycle(&session);
+        compact_checkpoint_lifecycle(&session);
     }
     #[test]
     fn host_shared_rows_restore_parent_after_child_offload_and_direct_append() {

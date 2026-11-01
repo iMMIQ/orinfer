@@ -306,10 +306,104 @@ pub(crate) fn preview(
     Ok(out)
 }
 
+/// Full native allocations share backing. A partial suffix stays compact in
+/// the endpoint bank, so publishing a checkpoint does not freeze a writable
+/// tail or retain a mostly unused native allocation for every endpoint.
+pub(crate) struct CheckpointRegions {
+    pub shared: Vec<Published>,
+    pub tail: Option<MemoryRange>,
+}
+pub(crate) fn checkpoint_regions(preview: Vec<Published>) -> Result<CheckpointRegions> {
+    let mut shared = vec![];
+    let mut tail: Option<MemoryRange> = None;
+    for (allocation, range, source) in preview {
+        MemoryRange {
+            offset: source,
+            bytes: range.bytes,
+        }
+        .within(allocation.used)?;
+        if tail.is_none() && source == 0 && range.bytes == allocation.bytes {
+            shared.push((allocation, range, source));
+        } else if let Some(tail) = &mut tail {
+            if tail.offset.checked_add(tail.bytes) != Some(range.offset) {
+                return Err("Noncontiguous checkpoint suffix".into());
+            }
+            tail.bytes = tail
+                .bytes
+                .checked_add(range.bytes)
+                .ok_or("Checkpoint suffix overflow")?;
+        } else {
+            tail = Some(range);
+        }
+    }
+    Ok(CheckpointRegions { shared, tail })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::BTreeMap};
+    #[test]
+    fn checkpoint_shares_full_allocations_and_packs_only_the_partial_suffix() {
+        for grain in [64, 2 << 20] {
+            let owner = DeviceOwner::new(orinfer_device::Backend::Ascend, 0);
+            let allocation = |bytes| {
+                Rc::new(Allocation {
+                    owner,
+                    id: 2,
+                    address: 0,
+                    bytes,
+                    used: bytes,
+                    handle: Some(9),
+                    native: None,
+                })
+            };
+            let regions = checkpoint_regions(vec![
+                (
+                    allocation(grain),
+                    MemoryRange {
+                        offset: 0,
+                        bytes: grain,
+                    },
+                    0,
+                ),
+                (
+                    allocation(grain),
+                    MemoryRange {
+                        offset: grain,
+                        bytes: 17,
+                    },
+                    0,
+                ),
+            ])
+            .unwrap();
+            assert_eq!(regions.shared.len(), 1);
+            assert_eq!(regions.tail.unwrap().offset, grain);
+            assert_eq!(regions.tail.unwrap().bytes, 17);
+            let full = checkpoint_regions(vec![(
+                allocation(grain),
+                MemoryRange {
+                    offset: 0,
+                    bytes: grain,
+                },
+                0,
+            )])
+            .unwrap();
+            assert_eq!(full.shared.len(), 1);
+            assert!(full.tail.is_none());
+            let partial = checkpoint_regions(vec![(
+                allocation(grain),
+                MemoryRange {
+                    offset: 0,
+                    bytes: 17,
+                },
+                0,
+            )])
+            .unwrap();
+            assert!(partial.shared.is_empty());
+            assert_eq!(partial.tail.unwrap().bytes, 17);
+        }
+    }
     struct Fake {
         owner: DeviceOwner,
         data: RefCell<BTreeMap<u64, Vec<u8>>>,

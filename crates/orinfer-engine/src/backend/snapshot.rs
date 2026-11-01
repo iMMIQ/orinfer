@@ -41,7 +41,7 @@ impl Workspace {
 pub(crate) struct Plan {
     pub(super) owner: orinfer_device::DeviceOwner,
     pub(super) state: BTreeMap<String, Range>,
-    pub(super) tail: BTreeMap<String, Range>,
+    pub(super) shared: BTreeMap<String, Range>,
     pub(super) kv: Vec<Piece>,
     pub new_bytes: usize,
 }

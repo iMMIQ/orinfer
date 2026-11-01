@@ -164,6 +164,22 @@ struct CapturePlan<B> {
     bytes: usize,
 }
 impl<B> CapturePlan<B> {
+    fn append(&mut self, name: &str, source: Buffer, span: Range<usize>) -> Result<()> {
+        if span.is_empty() {
+            return Ok(());
+        }
+        let offset = self
+            .bytes
+            .checked_add(255)
+            .ok_or("Snapshot alignment overflow")?
+            / 256
+            * 256;
+        self.bytes = offset
+            .checked_add(span.len())
+            .ok_or("Snapshot size overflow")?;
+        self.pending.push((name.to_owned(), source, span, offset));
+        Ok(())
+    }
     fn allocations(&self, bank_id: u64) -> Result<BTreeMap<u64, usize>> {
         let mut banks: BTreeMap<_, _> = self
             .pieces
@@ -210,9 +226,11 @@ impl<B: StateBytes> Snapshot<B> {
         if parent.is_some_and(|p| !history.starts_with(&p.history)) {
             return Err("A2 snapshot parent history diverges".into());
         }
-        let mut pieces = vec![];
-        let mut pending = vec![];
-        let mut bytes = 0usize;
+        let mut plan = CapturePlan {
+            pieces: vec![],
+            pending: vec![],
+            bytes: 0,
+        };
         for layout in layouts {
             let source = get(buffers, &layout.buffer)?;
             for mut span in layout.spans(history.len(), source.bytes())? {
@@ -229,35 +247,100 @@ impl<B: StateBytes> Snapshot<B> {
                             return Err("A2 snapshot parent has noncontiguous closed rows".into());
                         }
                         inherited += piece.buffer.bytes();
-                        pieces.push(piece.clone());
+                        plan.pieces.push(piece.clone());
                     }
                     if inherited != 0 && inherited != end {
                         return Err("A2 snapshot parent does not cover its closed rows".into());
                     }
                     span.start = inherited;
                 }
-                if span.is_empty() {
-                    continue;
-                }
-                bytes = bytes
-                    .checked_add(255)
-                    .ok_or("Snapshot alignment overflow")?
-                    / 256
-                    * 256;
-                let offset = bytes;
-                bytes = bytes
-                    .checked_add(span.len())
-                    .ok_or("Snapshot size overflow")?;
-                pending.push((layout.buffer.clone(), source.clone(), span, offset));
+                plan.append(&layout.buffer, source.clone(), span)?;
             }
         }
-        Ok(CapturePlan {
-            pieces,
-            pending,
-            bytes,
-        })
+        Ok(plan)
     }
 }
+impl<B: StateBytes> Snapshot<B> {
+    fn plan_checkpoint<'a>(
+        layouts: impl Iterator<Item = &'a StateLayout>,
+        buffers: &BTreeMap<String, Buffer>,
+        history: &[u32],
+        parent: Option<&Self>,
+    ) -> Result<(CapturePlan<B>, Vec<SharedPiece>)> {
+        let layouts = layouts.collect::<Vec<_>>();
+        let mut plan = Self::plan(
+            layouts
+                .iter()
+                .copied()
+                .filter(|l| !l.append_only || !buffers[&l.buffer].demand_mapped()),
+            buffers,
+            history,
+            parent,
+        )?;
+        let mut shared = vec![];
+        for layout in layouts
+            .into_iter()
+            .filter(|l| l.append_only && buffers[&l.buffer].demand_mapped())
+        {
+            let source = get(buffers, &layout.buffer)?;
+            for span in layout.spans(history.len(), source.bytes())? {
+                let regions = kv::checkpoint_regions(source.kv_preview(span.end)?)?;
+                if let Some(tail) = regions.tail {
+                    plan.append(
+                        &layout.buffer,
+                        source.clone(),
+                        tail.offset..tail.offset + tail.bytes,
+                    )?;
+                }
+                shared.extend(
+                    regions
+                        .shared
+                        .into_iter()
+                        .map(|(allocation, range, source)| SharedPiece {
+                            allocation,
+                            name: layout.buffer.clone(),
+                            range,
+                            source,
+                        }),
+                );
+            }
+        }
+        Ok((plan, shared))
+    }
+}
+/// Publish exactly the full allocations selected by the common checkpoint plan.
+fn publish_shared(
+    session: &Session,
+    buffers: &BTreeMap<String, Buffer>,
+    preview: &[SharedPiece],
+) -> Result<Vec<Piece<DeviceBuffer>>> {
+    let mut extents = BTreeMap::<&str, usize>::new();
+    for p in preview {
+        extents
+            .entry(&p.name)
+            .and_modify(|end| *end = (*end).max(p.range.offset + p.range.bytes))
+            .or_insert(p.range.offset + p.range.bytes);
+    }
+    session.synchronize()?;
+    let mut pieces = vec![];
+    for (name, end) in extents {
+        for (allocation, range, source) in session.publish_kv(&get(buffers, name)?, end)? {
+            pieces.push(Piece {
+                name: name.to_owned(),
+                offset: range.offset,
+                bank_id: allocation.id,
+                bank_bytes: allocation.bytes,
+                buffer: DeviceBuffer {
+                    allocation,
+                    source,
+                    bytes: range.bytes,
+                },
+            });
+        }
+    }
+    Ok(pieces)
+}
+
 #[derive(Clone)]
 pub(super) struct DeviceBuffer {
     allocation: Rc<SharedAllocation>,
@@ -300,37 +383,18 @@ impl Snapshot {
         history: &[u32],
         parent: Option<&Self>,
     ) -> Result<CapturePlan<DeviceBuffer>> {
-        let layouts = layouts.collect::<Vec<_>>();
-        let mut plan = Self::plan(
-            layouts
-                .iter()
-                .copied()
-                .filter(|l| !l.append_only || !buffers[&l.buffer].demand_mapped()),
-            buffers,
-            history,
-            parent,
-        )?;
-        for layout in layouts
-            .into_iter()
-            .filter(|l| l.append_only && buffers[&l.buffer].demand_mapped())
-        {
-            let source = get(buffers, &layout.buffer)?;
-            for span in layout.spans(history.len(), source.bytes())? {
-                for (allocation, range, offset) in source.kv_preview(span.end)? {
-                    plan.pieces.push(Piece {
-                        name: layout.buffer.clone(),
-                        offset: range.offset,
-                        bank_id: allocation.id,
-                        bank_bytes: allocation.bytes,
-                        buffer: DeviceBuffer {
-                            allocation,
-                            source: offset,
-                            bytes: range.bytes,
-                        },
-                    });
-                }
-            }
-        }
+        let (mut plan, shared) = Self::plan_checkpoint(layouts, buffers, history, parent)?;
+        plan.pieces.extend(shared.into_iter().map(|p| Piece {
+            name: p.name,
+            offset: p.range.offset,
+            bank_id: p.allocation.id,
+            bank_bytes: p.allocation.bytes,
+            buffer: DeviceBuffer {
+                allocation: p.allocation,
+                source: p.source,
+                bytes: p.range.bytes,
+            },
+        }));
         Ok(plan)
     }
     fn capture<'a>(
@@ -347,6 +411,11 @@ impl Snapshot {
             bytes,
             pieces: planned,
         } = Self::plan_device(layouts.iter().copied(), buffers, history, parent)?;
+        let shared = planned
+            .iter()
+            .filter(|p| p.buffer.allocation.handle.is_some())
+            .map(|p| p.buffer.shared_piece(&p.name, p.offset))
+            .collect::<Vec<_>>();
         let mut pieces = planned
             .into_iter()
             .filter(|p| p.buffer.allocation.handle.is_none())
@@ -372,28 +441,7 @@ impl Snapshot {
             }
             session.copy_many(&copies)?.wait()?;
         }
-        session.synchronize()?;
-        for layout in layouts
-            .into_iter()
-            .filter(|l| l.append_only && buffers[&l.buffer].demand_mapped())
-        {
-            let source = get(buffers, &layout.buffer)?;
-            for span in layout.spans(history.len(), source.bytes())? {
-                for (allocation, range, offset) in session.publish_kv(&source, span.end)? {
-                    pieces.push(Piece {
-                        name: layout.buffer.clone(),
-                        offset: range.offset,
-                        bank_id: allocation.id,
-                        bank_bytes: allocation.bytes,
-                        buffer: DeviceBuffer {
-                            allocation,
-                            source: offset,
-                            bytes: range.bytes,
-                        },
-                    });
-                }
-            }
-        }
+        pieces.extend(publish_shared(session, buffers, &shared)?);
         Ok(Self {
             history: history.to_vec(),
             pieces,
@@ -424,7 +472,18 @@ impl Snapshot {
     #[cfg(test)]
     fn restore_into(&self, session: &Session, buffers: &BTreeMap<String, Buffer>) -> Result<()> {
         self.restore_kv(session, buffers)?;
+        self.grow_restored(session, buffers)?;
         self.restore_mutable_into(session, buffers)
+    }
+    #[cfg(test)]
+    fn grow_restored(&self, session: &Session, buffers: &BTreeMap<String, Buffer>) -> Result<()> {
+        grow_restored(
+            session,
+            buffers,
+            self.pieces
+                .iter()
+                .map(|p| (p.name.as_str(), p.offset + p.buffer.bytes())),
+        )
     }
     fn restore_mutable_into(
         &self,
@@ -451,6 +510,29 @@ impl Snapshot {
         Ok(())
     }
 }
+#[cfg(test)]
+fn grow_restored<'a>(
+    session: &Session,
+    buffers: &BTreeMap<String, Buffer>,
+    pieces: impl Iterator<Item = (&'a str, usize)>,
+) -> Result<()> {
+    let mut extents = BTreeMap::<&str, usize>::new();
+    for (name, end) in pieces {
+        if buffers[name].demand_mapped() {
+            extents
+                .entry(name)
+                .and_modify(|n| *n = (*n).max(end))
+                .or_insert(end);
+        }
+    }
+    session.grow_many(
+        &extents
+            .into_iter()
+            .map(|(name, end)| Ok((get(buffers, name)?, end)))
+            .collect::<Result<Vec<_>>>()?,
+    )
+}
+
 impl Worker {
     pub(super) fn release_owner(&mut self, id: usize) -> Result<()> {
         self.session.synchronize()?;

@@ -25,7 +25,7 @@ impl Executor {
         ranges: BTreeMap<String, Range>,
         kv_names: &BTreeSet<String>,
     ) -> Result<Plan> {
-        let (mut state_ranges, mut tail, mut kv) = (BTreeMap::new(), BTreeMap::new(), vec![]);
+        let (mut state_ranges, mut shared, mut kv) = (BTreeMap::new(), BTreeMap::new(), vec![]);
         for (name, range) in ranges {
             range.within(*self.sizes.get(&name).ok_or("Unknown snapshot buffer")?)?;
             if !kv_names.contains(&name) {
@@ -36,7 +36,15 @@ impl Executor {
                 return Err("KV snapshot must start at zero".into());
             }
             if let Some(buffer) = self.session.virtual_buffers.borrow().get(&name) {
-                for (allocation, range, source) in buffer.preview(self.session.owner, range)? {
+                let regions = crate::backend::kv::checkpoint_regions(
+                    buffer.preview(self.session.owner, range)?,
+                )?;
+                if let Some(suffix) = regions.tail {
+                    state_ranges.insert(name.clone(), suffix);
+                }
+                let mut end = 0;
+                for (allocation, range, source) in regions.shared {
+                    end = range.offset + range.bytes;
                     kv.push(Piece {
                         allocation,
                         name: name.clone(),
@@ -44,17 +52,24 @@ impl Executor {
                         source,
                     });
                 }
+                if end > 0 {
+                    shared.insert(
+                        name,
+                        Range {
+                            offset: 0,
+                            bytes: end,
+                        },
+                    );
+                }
             } else {
-                // Non-VMM buffers retain exact byte copies through the same state path.
-                state_ranges.insert(name.clone(), range);
+                state_ranges.insert(name, range);
             }
-            tail.insert(name, range);
         }
         let new_bytes = size(&state_ranges)?;
         Ok(Plan {
             owner: self.session.owner,
             state: state_ranges,
-            tail,
+            shared,
             kv,
             new_bytes,
         })
@@ -66,12 +81,11 @@ impl Executor {
         let Some(state) = self.save_ranges(plan.state.clone())? else {
             return Ok(None);
         };
-        let Some(tail) = self.save_kv_ranges(&plan.tail)? else {
+        let Some(kv) = self.save_kv_ranges(&plan.shared)? else {
             drop(state);
             self.collect_snapshots()?;
             return Ok(None);
         };
-        let kv = tail;
         let bytes = state.iter().chain(&kv).map(|p| p.range.bytes).sum();
         self.sync()?;
         Ok(Some(Snapshot {
@@ -488,7 +502,7 @@ impl Executor {
         self.session.owner.require(plan.owner)?;
         self.sync()?;
         let kv = self
-            .save_kv_ranges(&plan.tail)?
+            .save_kv_ranges(&plan.shared)?
             .ok_or("KV publication failed")?;
         let state = plan
             .state
@@ -553,6 +567,7 @@ impl Executor {
                 bytes: piece.range.bytes,
             }
             .within(self.sizes[&piece.name])?;
+            self.ensure_writable_range(&piece.name, piece.range.offset, piece.range.bytes)?;
             self.session.transfers.borrow_mut().upload(
                 self.session.stream,
                 self.pointers[&piece.name] + piece.range.offset as u64,
