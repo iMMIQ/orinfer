@@ -4,7 +4,7 @@ import struct
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import numpy as np
-from tools.model.deepseek_v41.floating import bf16_parts
+from tools.model.deepseek_v41.floating import bf16_exact, bf16_parts
 from tools.model.deepseek_v41.assembly import unit_scale_manifests
 
 
@@ -78,6 +78,14 @@ class ProjectionScaleTests(unittest.TestCase):
 
 
 class FloatingPartsTests(unittest.TestCase):
+    def test_exact_bf16_packing_preserves_bits_and_rejects_rounding(self):
+        bits = np.array([0, 0x80000000, 0x3F800000, 0xBF7F0000, 0x00010000], dtype="u4")
+        packed = bf16_exact(bits.view("f4"))
+        np.testing.assert_array_equal(packed.astype("u4") << 16, bits)
+        for value in [1.001, np.nan, np.inf, -np.inf, 2.0**-140]:
+            with self.assertRaisesRegex(ValueError, "exact finite BF16"):
+                bf16_exact(np.array([value], dtype="f4"))
+
     def test_three_parts_reconstruct_finite_model_operands_without_mutation(self):
         rng = np.random.default_rng(20261002)
         source = (

@@ -1,4 +1,4 @@
-"""FP32 projection boundaries with exact BF16 operand decomposition on A2."""
+"""FP32 projection boundaries with native or decomposed BF16 operands on A2."""
 
 import math
 import tilelang.language as T
@@ -52,8 +52,9 @@ def partials(
 ):
     if output % 32 or reduction % splits or reduction // splits % block_k:
         raise ValueError("Floating Cube requires aligned output and split reduction tiles")
-    if input_parts not in (1, 3) or weight_parts not in (1, 3) or input_parts * weight_parts != 3:
-        raise ValueError("One FP32 operand must have three BF16 parts")
+    parts = input_parts * weight_parts
+    if input_parts not in (1, 3) or weight_parts not in (1, 3) or parts not in (1, 3):
+        raise ValueError("Use BF16 operands or one FP32 operand with three BF16 parts")
     if variance and (input_parts != 1 or output != 32 or reduction % 256):
         raise ValueError("mHC variance requires one BF16 input and 32 output lanes")
     if tile_m not in (16, 32, 64, 128):
@@ -105,7 +106,7 @@ def partials(
                                 ],
                                 b[:valid_columns, :],
                             )
-                        for plane in T.serial(3):
+                        for plane in T.serial(parts):
                             if input_parts == 1:
                                 T.copy(
                                     weight[
@@ -124,7 +125,7 @@ def partials(
                                 )
                             # One linear index retains the flattened loop's
                             # initialization condition in the pinned compiler.
-                            T.gemm_v0(a, b, c, transpose_B=True, init=(k * 3 + plane == 0))
+                            T.gemm_v0(a, b, c, transpose_B=True, init=(k * parts + plane == 0))
                 else:
                     for step in T.Pipelined(
                         loops * input_parts * weight_parts, num_stages=pipeline_stages

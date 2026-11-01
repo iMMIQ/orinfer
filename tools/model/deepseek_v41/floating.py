@@ -3,6 +3,15 @@
 import numpy as np
 
 
+def bf16_exact(values):
+    """Pack FP32 banks that are exact BF16 widenings, without rounding."""
+    values = np.asarray(values, dtype=np.float32)
+    bits = values.view(np.uint32)
+    if not np.isfinite(values).all() or np.any(bits & 0xFFFF):
+        raise ValueError("Weight bank must contain exact finite BF16 values")
+    return (bits >> 16).astype(np.uint16)
+
+
 def bf16_parts(values):
     residual = np.asarray(values, dtype=np.float32).copy()
     if not np.isfinite(residual).all() or np.abs(residual).max(initial=0) > 1e30:

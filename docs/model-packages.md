@@ -219,6 +219,8 @@ ORINFER_ASCEND_MODEL_ROOT=/data bash tools/operators/ascend/run.sh --without-dev
 
 `--plan-only` 列出转换的 bank、调用与分片数量。权重目录与执行包继续独立发布，服务加载直接读取准备后的物理张量。
 
+同一转换器的 `--markov-bias` 按 checkpoint 的 `dspark_markov_rank` 选择 DSpark Markov 修正投影，只有 FP32 bank 中的每个值均能精确还原为 BF16 时才导出单份 BF16 bank，否则报错。该模式复用同一个 `floating.partials` 计算体与 FP32 八段归约，保留 FP32 bias 输出；其他输出头保持原布局。当前 256 维 Markov bank 的权重字节数减半，普通及非对齐 owner 数使用同一个动态 tile。离线测量选择 `--tile-m` 和 `--tile-n`，并以完整 thinking/code 请求及 Mini agent 短测验收收益。
+
 `tools.model.deepseek_v41.export_release --source SERVICE --output RELEASE --execution-output EXECUTION_CACHE --attribution CHECKPOINT` 将已验收的 A2 服务导出为原生物理布局 safetensors。GPU bank 按 rank 和连续四层分片，共享参数及 CPU embedding 单独保存；Engram 按层、哈希头和半头连续行段分片，标准索引的 `row_shards` 扩展保持原全局行号。每片最大 4 GiB，导出前可用 `--plan-only` 查看文件规划。剩余矩阵切片、BF16→FP32、padding 与通道乘积在离线物化；执行计划以 `prepared_tensor` 声明张量名、物理 dtype 和 shape，加载时按容器范围读取并复用文件句柄。权重目录只保留数据、索引与前端资产；算子和执行计划单独发布到 `EXECUTION_CACHE`，运行时通过 `ORINFER_EXECUTION_CACHE` 查找 digest。原始 checkpoint 留在离线归档。导出目录的 `export-state.json` 与 `release-manifest.json` 记录完成状态及文件／张量校验和；该格式使用支持分片主机表和 prepared_tensor 的 orinfer 引擎。
 
 `tools.model.deepseek_v41.prepack_release --source RELEASE --source-execution EXECUTION_CACHE --output NZ_WEIGHTS --execution-output NZ_EXECUTION_CACHE` 将已导出的 ND 权重转换为 A2 transposed-NZ。INT4 元素先转置再重打包，物理字节 shape 为 `[E,K/64,N/16,16,32]`；scale、assist 和通道顺序保持不变。所有 batch 读取同一份 W4 bank，加载时直接上传该布局。匹配执行包通过 `weight_layout=transposed_nz` 声明布局并保持 ACL 的逻辑 `[E,K,N]` 视图。转换器限定于已测量的 TP8、48 专家、两类专家矩阵及 hint16；其他几何报错。80 个 GPU 分片重写，98 个未变分片以硬链接复用，源权重目录应保持只读。`--plan-only` 只列出转换范围。权重与执行输出目录必须分离；在线校验物理 dtype、shape 与容器边界，不执行转置。

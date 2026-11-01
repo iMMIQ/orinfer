@@ -10,15 +10,18 @@ from tools.model.deepseek_v41.floating_head import HeadRelease, head_calls
 from tools.model.safetensors_source import local_header
 
 
-def fixture(root):
+def fixture(root, reduction=1024, exact=False):
     source, cache = root / "weights", root / "execution"
     package = cache / "original"
     (source / "cache").mkdir(parents=True)
     package.mkdir(parents=True)
     config = dict(model_type="deepseek_v41", text_config=dict(hidden_size=1024, vocab_size=64))
+    config["text_config"]["dspark_markov_rank"] = reduction
     (source / "config.json").write_text(json.dumps(config))
     (source / "cache/model.json").write_text(json.dumps(dict(execution_package="original")))
-    weight = np.linspace(-0.25, 0.25, 64 * 1024, dtype="f4").reshape(64, 1024)
+    weight = np.linspace(-0.25, 0.25, 64 * reduction, dtype="f4").reshape(64, reduction)
+    if exact:
+        weight = (weight.view("u4") & 0xFFFF0000).view("f4")
     save_file(
         {"head": weight, "untouched": np.array([2.0], dtype="f4")}, source / "layer.safetensors"
     )
@@ -39,7 +42,7 @@ def fixture(root):
         dict(
             name="weight",
             bytes=weight.nbytes,
-            prepared_tensor=dict(name="head", dtype="F32", shape=[64, 1024]),
+            prepared_tensor=dict(name="head", dtype="F32", shape=[64, reduction]),
         )
     ]
     packets = []
@@ -49,7 +52,7 @@ def fixture(root):
         for op in ["partials", "reduce"]:
             params = dict(rows=capacity, output=64, _row_capacity=capacity)
             if op == "partials":
-                params.update(reduction=1024, activation_dtype="bfloat16")
+                params.update(reduction=reduction, activation_dtype="bfloat16")
             (package / f"{op}{capacity}.json").write_text(
                 json.dumps(dict(op="dense.fp32_" + op, parameters=params))
             )
@@ -78,6 +81,57 @@ def fixture(root):
 
 
 class FloatingHeadTests(unittest.TestCase):
+    def test_markov_bank_is_packed_once_without_rounding_or_changing_the_target_layout(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, cache, _, _, weight = fixture(root, reduction=256, exact=True)
+            index_path = source / "model.safetensors.index.json"
+            index = json.loads(index_path.read_text())
+            index["metadata"]["fp32_head_layout"] = "bf16-residual3"
+            index_path.write_text(json.dumps(index))
+            job = HeadRelease(
+                source,
+                root / "converted",
+                source_execution=cache,
+                execution_output=root / "new-execution",
+                build_dir=root / "build",
+                markov_bias=True,
+            ).plan()
+            self.assertEqual(len(job.calls), 2)
+            self.assertEqual(job.transforms, {"head": "head.bf16_exact"})
+            self.assertEqual(job.index["metadata"]["fp32_head_layout"], "bf16-residual3")
+            self.assertEqual(job.index["metadata"]["markov_bias_layout"], "bf16-exact")
+            binding = job.model["ranks"][0]["buffers"][0]
+            self.assertEqual(binding["bytes"], weight.size * 2)
+            self.assertEqual(binding["prepared_tensor"]["shape"], [1, 64, 256])
+            job.write_shard("layer.safetensors")
+            target = root / "converted/layer.safetensors"
+            begin, header = local_header(target)
+            entry = header["head.bf16_exact"]
+            self.assertEqual(entry["shape"], [1, 64, 256])
+            with target.open("rb") as stream:
+                stream.seek(begin + entry["data_offsets"][0])
+                raw = stream.read(entry["data_offsets"][1] - entry["data_offsets"][0])
+            restored = (np.frombuffer(raw, dtype="<u2").astype("u4") << 16).reshape(64, 256)
+            np.testing.assert_array_equal(restored, weight.view("u4"))
+            self.assertEqual(header["untouched"]["shape"], [1])
+            self.assertEqual(local_header(source / "layer.safetensors")[1]["head"]["dtype"], "F32")
+
+    def test_markov_export_rejects_weights_that_need_rounding(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, cache, _, _, _ = fixture(root, reduction=256)
+            job = HeadRelease(
+                source,
+                root / "converted",
+                source_execution=cache,
+                execution_output=root / "new-execution",
+                build_dir=root / "build",
+                markov_bias=True,
+            ).plan()
+            with self.assertRaisesRegex(ValueError, "exact finite BF16"):
+                job.write_shard("layer.safetensors")
+
     def test_shared_head_is_converted_once_and_semantic_shard_keeps_other_tensors(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
