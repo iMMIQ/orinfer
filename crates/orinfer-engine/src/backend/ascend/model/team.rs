@@ -101,6 +101,13 @@ pub(super) struct Team {
     _bootstrap: Option<Session>,
     host_tables: Option<Arc<SharedTables>>,
 }
+
+/// Preparation and direct execution are startup costs, not replay observations.
+pub(super) struct Timing {
+    pub seconds: f64,
+    pub preparation: f64,
+    pub replay: bool,
+}
 impl Team {
     pub fn load(plan: &Path, model_dir: &Path) -> Result<Self> {
         Self::load_with_drafts(plan, model_dir, None)
@@ -492,7 +499,7 @@ impl Team {
         tokens: Vec<Vec<u32>>,
         full: bool,
         maintenance: impl FnOnce(),
-    ) -> Result<(Vec<Output>, f64, f64)> {
+    ) -> Result<(Vec<Output>, Timing)> {
         forward_with(&self.peers, layout, tokens, full, maintenance)
     }
 
@@ -702,14 +709,15 @@ fn forward(
     tokens: Vec<Vec<u32>>,
     full: bool,
 ) -> Result<(Vec<Output>, f64, f64)> {
-    forward_with(peers, layout, tokens, full, || {})
+    let (outputs, timing) = forward_with(peers, layout, tokens, full, || {})?;
+    Ok((outputs, timing.seconds, timing.preparation))
 }
 /// Every rank changes execution mode together. Any miss resets the shared
 /// class to direct. Successful uses are counted on every rank; promotion waits
 /// for the slowest rank. Offline TP8 measurements put prefill amortization at
 /// 8–20 uses (0.31–0.46 s capture versus 24–41 ms saved per execution).
-/// Decode/draft/verification promote after two consecutive successful uses in
-/// their family. Alternating shapes still promote after eight total uses.
+/// Decode/draft/verification promote after two successful uses of the shape,
+/// including alternating shapes. Prefill retains its eight-use threshold.
 fn preparation(states: &[CacheState], repeated: bool) -> Result<(bool, bool)> {
     if states.is_empty() {
         return Err("Missing A2 TP cache states".into());
@@ -724,8 +732,8 @@ fn preparation(states: &[CacheState], repeated: bool) -> Result<(bool, bool)> {
     Ok((
         false,
         states.iter().all(|s| {
-            matches!(s, CacheState::Direct { uses, consecutive }
-                if *uses >= 8 || repeated && *consecutive >= 2)
+            matches!(s, CacheState::Direct { uses, .. }
+                if *uses >= if repeated { 2 } else { 8 })
         }),
     ))
 }
@@ -736,7 +744,7 @@ fn forward_with(
     tokens: Vec<Vec<u32>>,
     full: bool,
     maintenance: impl FnOnce(),
-) -> Result<(Vec<Output>, f64, f64)> {
+) -> Result<(Vec<Output>, Timing)> {
     let started = Instant::now();
     let cached = exchange(peers, Command::GrowCached(layout.clone()))?;
     let states = cached
@@ -804,7 +812,14 @@ fn forward_with(
             output.logits.extend_from_slice(&value.logits);
         }
     }
-    Ok((outputs, started.elapsed().as_secs_f64(), prepare_s))
+    Ok((
+        outputs,
+        Timing {
+            seconds: started.elapsed().as_secs_f64(),
+            preparation: prepare_s,
+            replay: capture,
+        },
+    ))
 }
 
 #[cfg(test)]

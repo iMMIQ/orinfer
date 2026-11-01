@@ -1,7 +1,7 @@
 //! DSpark shares target verification and commits only confirmed state.
 use super::*;
 mod policy;
-pub(super) use policy::{Budget, Feedback, Policy};
+pub(super) use policy::{Budget, Costs, Feedback, Policy};
 
 impl Runtime {
     pub(super) fn advance_dspark(
@@ -121,7 +121,9 @@ impl Runtime {
         {
             return Err("Insufficient DSpark graph workspace".into());
         }
-        let (proposals, draft_s, draft_prepare) = self.team.forward(draft, inputs, false)?;
+        let (proposals, draft_timing) = self.team.forward_with(draft, inputs, false, || {})?;
+        let draft_s = draft_timing.seconds;
+        let draft_prepare = draft_timing.preparation;
         let mut inputs = BTreeMap::new();
         let mut draft_tokens = vec![];
         for &(i, count) in &selected {
@@ -164,9 +166,11 @@ impl Runtime {
         let started = Instant::now();
         self.team.exchange(Command::BeginVerification(journal))?;
         let save_s = started.elapsed().as_secs_f64();
-        let (verified, verify_s, verify_prepare) =
+        let (verified, verify_timing) =
             self.team
                 .forward_with(layout, inputs, full || packet_full, maintenance)?;
+        let verify_s = verify_timing.seconds;
+        let verify_prepare = verify_timing.preparation;
         let started = Instant::now();
         let mut counts = vec![];
         let mut steps = vec![];
@@ -285,7 +289,7 @@ impl Runtime {
         self.speculation_policy.observe(
             selected.len(),
             (full, mixed, uniform),
-            [
+            Costs { replay: draft_timing.replay && verify_timing.replay, stages: [
                 draft_s,
                 verify_s + sampling_s
                     // Charge prompt work displaced by verification to the agent's
@@ -294,7 +298,7 @@ impl Runtime {
                         / self.prefill_tokens_per_s },
                 restore_s,
                 draft_prepare + verify_prepare,
-            ],
+            ] },
             &counts,
             block,
             &confidence,

@@ -82,6 +82,7 @@ struct Curve {
 #[derive(Default)]
 struct BlockCurve {
     samples: usize,
+    acceptance_samples: usize,
     draft: f64,
     extra: f64,
     restore: f64,
@@ -90,6 +91,20 @@ struct BlockCurve {
     acceptance: Vec<f64>,
     previous: Vec<f64>,
     older: Vec<f64>,
+}
+
+pub(in crate::backend::ascend::model::provider) struct Costs {
+    pub stages: [f64; 4],
+    pub replay: bool,
+}
+
+impl From<[f64; 4]> for Costs {
+    fn from(stages: [f64; 4]) -> Self {
+        Self {
+            stages,
+            replay: true,
+        }
+    }
 }
 fn update(old: &mut f64, sample: f64, initialized: bool) {
     *old = if initialized {
@@ -314,11 +329,13 @@ impl Policy {
         &mut self,
         batch: usize,
         mode: (bool, bool, bool),
-        timing: [f64; 4],
+        timing: impl Into<Costs>,
         counts: &[(usize, usize)],
         block: usize,
         confidence: &[f64],
     ) {
+        let costs = timing.into();
+        let timing = costs.stages;
         let (full, mixed, uniform) = mode;
         let curve = self.curves.entry((batch, full, mixed)).or_default();
         let positive = counts.iter().filter(|p| p.0 > 0).count();
@@ -340,13 +357,16 @@ impl Policy {
         } else {
             batch as f64 / positive as f64
         };
-        update_cost(&mut curve.draft, timing[0] * scale, curve.samples > 0);
-        update_cost(
-            &mut curve.extra,
-            ((timing[1] - baseline) / proposed).max(0.),
-            curve.samples > 0,
-        );
-        update_cost(&mut curve.restore, timing[2] * scale, curve.samples > 0);
+        if costs.replay {
+            update_cost(&mut curve.draft, timing[0] * scale, curve.samples > 0);
+            update_cost(
+                &mut curve.extra,
+                ((timing[1] - baseline) / proposed).max(0.),
+                curve.samples > 0,
+            );
+            update_cost(&mut curve.restore, timing[2] * scale, curve.samples > 0);
+            curve.samples += 1;
+        }
         let width = counts.iter().map(|p| p.0).max().unwrap_or(0);
         if curve.acceptance.len() < width {
             curve.acceptance.resize(width, 0.7);
@@ -358,11 +378,11 @@ impl Policy {
                 update(
                     &mut curve.acceptance[i],
                     passed as f64 / attempts as f64,
-                    curve.samples > 0,
+                    curve.acceptance_samples > 0,
                 );
             }
         }
-        curve.samples += 1;
+        curve.acceptance_samples += 1;
     }
 }
 
@@ -531,6 +551,29 @@ mod tests {
             slow.select_requests(false, false, budget(0), &[16], &[&f], &[16])
                 .unwrap(),
             [0]
+        );
+    }
+    #[test]
+    fn direct_execution_does_not_disable_a_profitable_replay_curve() {
+        let (mut policy, feedback) = measured(5, 0.99, 5, [0.003, 0.030, 0.001]);
+        for _ in 0..8 {
+            policy.observe(
+                1,
+                (false, false, false),
+                Costs {
+                    stages: [0.250, 2.0, 0.020, 0.5],
+                    replay: false,
+                },
+                &[(5, 5)],
+                5,
+                &[0.99; 5],
+            );
+        }
+        assert_eq!(
+            policy
+                .select_requests(false, false, budget(0), &[5], &[&feedback], &[5])
+                .unwrap(),
+            [5]
         );
     }
     #[test]

@@ -830,8 +830,9 @@ impl Runtime {
         {
             return Err("Insufficient A2 workspace after reclaiming cached state".into());
         }
-        let (values, seconds, preparation) =
-            self.team.forward_with(layout, tokens, full, maintenance)?;
+        let (values, timing) = self.team.forward_with(layout, tokens, full, maintenance)?;
+        let seconds = timing.seconds;
+        let preparation = timing.preparation;
         self.statistics.iterations += 1;
         self.statistics.compute_s += seconds;
         self.statistics.batch_plan_s += preparation;
@@ -855,7 +856,7 @@ impl Runtime {
             }
         }
         let decoders = batch - prefill_requests;
-        if decoders > 0 {
+        if decoders > 0 && timing.replay {
             self.speculation_policy
                 .baseline(decoders, full, prefill_rows > 0, seconds);
         }

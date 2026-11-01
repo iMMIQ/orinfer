@@ -37,11 +37,11 @@ fn promotion_waits_for_successful_uses_on_every_rank() {
         consecutive: 0,
     };
     assert_eq!(
-        preparation(&[alternating(7); 2], true).unwrap(),
+        preparation(&[alternating(1), alternating(2)], true).unwrap(),
         (false, false)
     );
     assert_eq!(
-        preparation(&[alternating(8); 2], true).unwrap(),
+        preparation(&[alternating(2); 2], true).unwrap(),
         (false, true)
     );
     assert_eq!(

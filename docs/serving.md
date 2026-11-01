@@ -268,6 +268,8 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 
 A2 启用 DSpark 时，`scheduler_statistics.speculation` 同步发布模型级累计草稿、接受、提交计数及分段耗时。草稿、验证和恢复计时包含设备等待与结果回读，采样计时记录 CPU 验证与提交；各请求日志中的整包耗时不能跨请求直接累加。通过同一健康快照的计数差值分析稳定 decode 窗口。
 
+A2 普通 decode、草稿和验证形状在所有 rank 累计成功执行两次后统一捕获 Graph，交替出现的形状沿用累计次数；prefill 保持八次阈值。草稿成本模型从实际 Graph replay 学习普通 decode、草稿和验证的稳态成本，直接执行仍更新接受率与准备次数。Graph 准备和直接执行的实际耗时完整计入请求及调度统计。
+
 A2 的自动草稿验证预算保持在 target 首次启用跨 rank 行交换之前；执行包没有行交换时使用 target 容量。草稿深度与聚合验证行数共同决定执行计划，算子调优的行数分段共用该通信预算。`--max-speculative-tokens N` 显式指定其他预算。状态 journal 汇总本包各 owner 的保存或恢复拷贝，通过同一 stream 提交并统一等待完成。
 
 A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和 PV 计算体，支持每 rank 8/16/32/64 个 head，保留 FP32 softmax 与 BF16 probability 边界。`tools.model.deepseek_v41.fuse_attention --selected-int8 --min-rows N` 按实测聚合行数拆分已有 target 执行域，小行数保留原算子；草稿与普通 decode 沿用各自的计划选择。主干全行与 decoder 保留窗口分别绑定 work 表，在线只消费离线生成的计划。
