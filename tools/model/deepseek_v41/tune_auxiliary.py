@@ -2,6 +2,7 @@
 
 import argparse
 import ctypes
+from functools import partial
 import json
 from pathlib import Path
 
@@ -27,7 +28,15 @@ def main():
     parser.add_argument("--mask-only", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
+    parser.add_argument(
+        "--calls-per-replay",
+        type=int,
+        default=16,
+        help="Independent operator calls per Graph; amortize host submission cost",
+    )
     args = parser.parse_args()
+    if not 1 <= args.calls_per_replay <= 64:
+        parser.error("Graph replay call count must be in 1..64")
     if (
         sum(
             (
@@ -241,6 +250,7 @@ def main():
                 parameters=params,
                 configs=configs,
                 samples=sorted({r for r in args.rows if 1 <= r <= capacity}),
+                calls_per_replay=args.calls_per_replay,
                 tuner_sha256=file_hash(Path(__file__)),
                 seed=20261002,
                 reduction_source=file_hash(Path(dense.__file__)),
@@ -446,11 +456,13 @@ def main():
                         check()
                         timing = measure(
                             run,
-                            budget_ms=4,
+                            budget_ms=4 / args.calls_per_replay,
                             max_repetitions=32,
                             change=change,
                             check=check,
-                            benchmark=npu_benchmark,
+                            benchmark=partial(
+                                npu_benchmark, calls_per_replay=args.calls_per_replay
+                            ),
                         )
                     except AssertionError as error:
                         if i == 0:

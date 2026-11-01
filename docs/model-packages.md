@@ -233,6 +233,8 @@ ORINFER_ASCEND_MODEL_ROOT=/data bash tools/operators/ascend/run.sh --without-dev
 
 `tools.model.deepseek_v41.tune_auxiliary` 接受同样的 `--plan`、`--model-dir` 和 `--output`，离线选择 mHC post/pre 的列块与 FP32 分解投影的行块。后者读取计划中已准备的真实 BF16 分量，候选保持原 K 累加顺序；所有候选检查逐元素一致、尾部及改变输入后的 Graph replay。输出计划名增加 `-aux-tuned`。两种调优缓存均固定当前源码、编译器、设备、测量长度和真实权重身份，并校验被选库的内容。
 
+辅助算子的测量 Graph 默认包含 16 次调用，耗时归一到单次调用，摊薄主机提交和计时事件的开销。`--calls-per-replay` 可设置为 1–64，调用次数计入缓存身份；采样重复次数按 Graph 的总成本选择，保持原有的目标测量预算。数值、输出尾部和改变输入后的重放检查继续使用相同契约。
+
 这两个调优入口的 `--pipeline-only` 搜索更大的行块与合法的两级／三级 L1 流水线；辅助投影同时选择 HC 方差计算的行块。候选校验 A2 的 L0A、L0B、L0C 与 L1 容量，并保留 K、FP32 归约及输出舍入边界。投影调优也可读取 `prepare` 后的物理 bank，避免在线权重变换。
 
 整数投影的 `--wide-integer` 比较当前完整配置与 M128/N256 的流水线配置，覆盖输出列数能被 256 整除的 INT8 几何；其余投影沿用输入计划。当前行块、列块、K 块和流水级数共同构成基线，重复调优也保留已有的流水线选择。该选项与 `--pipeline-only` 互斥，选择结果仍需完整模型请求验收。
