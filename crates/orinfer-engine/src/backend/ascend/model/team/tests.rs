@@ -64,11 +64,15 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
         [CacheState::Graph, CacheState::Missing],
         [direct(1), CacheState::Graph],
         [CacheState::Missing, CacheState::Missing],
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|states| [(states, false), (states, true)])
+    {
+        let (statuses, repeated) = statuses;
         std::thread::scope(|scope| {
             let mut peers = Transport::new(Duration::from_secs(5));
             let mut maintained = vec![];
-            let (recapture, capture) = preparation(&statuses, false).unwrap();
+            let (recapture, capture) = preparation(&statuses, repeated).unwrap();
             for hit in statuses {
                 let (send, commands) = mpsc::channel();
                 let (reply, receive) = reply_channel();
@@ -78,12 +82,7 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
                 scope.spawn(move || {
                     assert!(matches!(
                         commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                        Command::Grow(_)
-                    ));
-                    reply.send(Ok(Reply::Ready)).unwrap();
-                    assert!(matches!(
-                        commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                        Command::Cached(_)
+                        Command::GrowCached(_)
                     ));
                     reply.send(Ok(Reply::Cached(hit))).unwrap();
                     if recapture {
@@ -93,14 +92,20 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
                         ));
                         reply.send(Ok(Reply::Ready)).unwrap();
                     }
+                    let cached_prepare = !recapture
+                        && statuses.iter().all(|state| {
+                            matches!(state, CacheState::Graph) == capture
+                        });
+                    if !cached_prepare {
+                        assert!(matches!(
+                            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+                            Command::Prepare(_, mode) if mode == capture
+                        ));
+                        reply.send(Ok(Reply::Ready)).unwrap();
+                    }
                     assert!(matches!(
                         commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                        Command::Prepare(_, mode) if mode == capture
-                    ));
-                    reply.send(Ok(Reply::Ready)).unwrap();
-                    assert!(matches!(
-                        commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                        Command::Forward(_, _, false)
+                        Command::Forward(_, _, false, mode) if mode == cached_prepare.then_some(capture)
                     ));
                     // Workers cannot complete until host maintenance has run.
                     completed.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -110,20 +115,26 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
             let layout = Layout::new(
                 vec![orinfer_model_sdk::architecture::BatchSegment {
                     slot: 17,
-                    tokens: 2,
+                    tokens: if repeated { 1 } else { 2 },
                 }],
                 vec![],
-                false,
+                repeated,
                 8,
                 2,
             )
             .unwrap();
             assert!(
-                forward_with(&peers, layout, vec![vec![0, 1]], false, || {
-                    for maintenance in maintained {
-                        maintenance.send(()).unwrap();
+                forward_with(
+                    &peers,
+                    layout,
+                    vec![vec![0; if repeated { 1 } else { 2 }]],
+                    false,
+                    || {
+                        for maintenance in maintained {
+                            maintenance.send(()).unwrap();
+                        }
                     }
-                })
+                )
                 .unwrap()
                 .0
                 .is_empty()

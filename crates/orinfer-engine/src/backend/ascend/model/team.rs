@@ -24,14 +24,14 @@ use std::{
 pub(super) enum Command {
     Admit(Vec<usize>),
     Limit(usize, usize),
-    Grow(Layout),
+    GrowCached(Layout),
     OwnerRequirement(usize, usize),
     Reset(Vec<usize>),
     Release(Option<usize>),
     Cached(Layout),
     Invalidate(Layout),
     Prepare(Layout, bool),
-    Forward(Layout, Vec<Vec<u32>>, bool),
+    Forward(Layout, Vec<Vec<u32>>, bool, Option<bool>),
     BeginVerification(Vec<(usize, usize)>),
     RollbackVerification(Vec<(usize, usize)>),
     EndVerification,
@@ -330,9 +330,10 @@ impl Team {
                             Command::Limit(id, tokens) => {
                                 worker.limit_owner(id, tokens).map(|_| Reply::Ready)
                             }
-                            Command::Grow(layout) => {
-                                worker.grow_batch(&layout).map(|_| Reply::Ready)
-                            }
+                            Command::GrowCached(layout) => worker
+                                .grow_batch(&layout)
+                                .and_then(|()| worker.batch_cached(&layout))
+                                .map(Reply::Cached),
                             Command::OwnerRequirement(tokens, reserve) => worker
                                 .owner_requirement(tokens, reserve)
                                 .map(Reply::Requirement),
@@ -366,8 +367,10 @@ impl Team {
                             Command::Prepare(layout, capture) => {
                                 worker.prepare_batch(&layout, capture).map(|_| Reply::Ready)
                             }
-                            Command::Forward(layout, tokens, full) => {
-                                worker.forward_batch(&layout, &tokens, full).map(|values| {
+                            Command::Forward(layout, tokens, full, cached) => cached
+                                .map_or(Ok(()), |capture| worker.prepare_batch(&layout, capture))
+                                .and_then(|()| worker.forward_batch(&layout, &tokens, full))
+                                .map(|values| {
                                     Reply::Outputs(
                                         values
                                             .into_iter()
@@ -379,8 +382,7 @@ impl Team {
                                             })
                                             .collect(),
                                     )
-                                })
-                            }
+                                }),
                             Command::Save {
                                 owner,
                                 snapshot,
@@ -704,8 +706,7 @@ fn forward_with(
     maintenance: impl FnOnce(),
 ) -> Result<(Vec<Output>, f64, f64)> {
     let started = Instant::now();
-    exchange(peers, Command::Grow(layout.clone()))?;
-    let cached = exchange(peers, Command::Cached(layout.clone()))?;
+    let cached = exchange(peers, Command::GrowCached(layout.clone()))?;
     let states = cached
         .into_iter()
         .map(|reply| match reply {
@@ -724,11 +725,20 @@ fn forward_with(
     if invalidate {
         exchange(peers, Command::Invalidate(layout.clone()))?;
     }
-    exchange(peers, Command::Prepare(layout.clone(), capture))?;
+    // Only a cache miss or promotion can allocate/capture. Keep its global
+    // preparation barrier; a cache hit only refreshes host-side LRU state and
+    // can do that on the owning worker with the forward command.
+    let cached_prepare = !invalidate
+        && states
+            .iter()
+            .all(|state| matches!(state, CacheState::Graph) == capture);
+    if !cached_prepare {
+        exchange(peers, Command::Prepare(layout.clone(), capture))?;
+    }
     let prepare_s = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let replicated = layout.role == super::PacketRole::Draft;
-    let command = Command::Forward(layout, tokens, full);
+    let command = Command::Forward(layout, tokens, full, cached_prepare.then_some(capture));
     peers.send(command)?;
     maintenance();
     let results = peers.collect()?;
