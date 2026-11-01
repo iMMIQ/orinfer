@@ -100,25 +100,18 @@ pub(super) fn embedding_span(first: usize, columns: usize) -> Result<std::ops::R
 
 impl Worker {
     fn coordinate(&self, names: &Coordinates, base: usize, rows: usize) -> Result<()> {
-        self.coordinate_at(names, base, rows, 0)
+        self.session
+            .upload_inputs(&self.coordinate_inputs(names, base, rows, 0, None)?)?;
+        Ok(())
     }
-    pub(super) fn coordinate_at(
-        &self,
-        names: &Coordinates,
-        base: usize,
-        rows: usize,
-        offset: usize,
-    ) -> Result<()> {
-        self.coordinate_at_bounded(names, base, rows, offset, None)
-    }
-    pub(super) fn coordinate_at_bounded(
+    pub(super) fn coordinate_inputs(
         &self,
         names: &Coordinates,
         base: usize,
         rows: usize,
         offset: usize,
         minimum: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<Vec<(Buffer, Vec<u8>)>> {
         if rows == 0 || base.checked_add(rows).is_none_or(|end| end > self.capacity) {
             return Err("Packet exceeds model context capacity".into());
         }
@@ -263,8 +256,7 @@ impl Worker {
             put(&mut inputs, indices, &ints(&ids))?;
             put(&mut inputs, lengths, &ints(&lens))?;
         }
-        self.session.upload_inputs(&inputs)?;
-        Ok(())
+        Ok(inputs)
     }
     pub(super) fn prepare_rows(&mut self, rows: usize) -> Result<()> {
         if !self.packets.contains_key(&rows) {

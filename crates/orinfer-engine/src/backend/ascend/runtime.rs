@@ -1,5 +1,6 @@
 //! Owned CANN resources. Every asynchronous submission retains its storage.
 mod host_transfer;
+mod input_transfer;
 mod virtual_memory;
 use super::{
     DriverLease, acquire,
@@ -754,6 +755,8 @@ impl Session {
             })
             .collect::<Vec<_>>();
         self.make_kv_writable(&writes)?;
+        let ordered = input_transfer::ordered(inputs);
+        let inputs = &ordered;
         let capacity = (4 << 20).min(self.context.limits.pinned_bytes);
         // Weight loading can leave idle 8 MiB leases. Do not retain that
         // physical capacity for each small input slab queued behind compute.
@@ -779,7 +782,13 @@ impl Session {
                         count,
                     );
                 }
-                pieces.push((buffer.clone(), destination_offset + offset, written, count));
+                input_transfer::append(
+                    &mut pieces,
+                    buffer,
+                    destination_offset + offset,
+                    written,
+                    count,
+                );
                 written += count;
                 offset += count;
                 if offset == data.len() {

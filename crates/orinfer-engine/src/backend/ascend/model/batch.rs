@@ -920,7 +920,9 @@ impl Worker {
         }
         self.phases.table_build_s += build_started.elapsed().as_secs_f64();
         let upload_started = std::time::Instant::now();
-        self.session.upload_inputs(&inputs)?.wait()?;
+        // Both metadata and its consumers use the compute stream. The upload
+        // completion retains the slab and destinations through DMA completion.
+        self.session.upload_inputs(&inputs)?;
         self.phases.table_upload_s += upload_started.elapsed().as_secs_f64();
         self.batch.as_mut().unwrap().bound_tables = Some(BoundTables {
             key,
@@ -969,14 +971,16 @@ impl Worker {
         let mut joined = vec![];
         let mut hashes = vec![];
         let mut valid = vec![];
+        let mut inputs = vec![];
         for (i, (segment, input)) in layout.segments.iter().zip(tokens).enumerate() {
             let history = &self.batch.as_ref().unwrap().owners[&segment.slot].history;
-            self.coordinate_at(
+            inputs.extend(self.coordinate_inputs(
                 &execution.packet.coordinates,
                 history.len(),
                 segment.tokens,
                 layout.rows.starts[i],
-            )?;
+                None,
+            )?);
             if let Some(names) = &execution.packet.decoder_coordinates {
                 let replay = self
                     .batch
@@ -1002,7 +1006,7 @@ impl Worker {
                     );
                 }
                 if count > 0 {
-                    self.coordinate_at_bounded(
+                    inputs.extend(self.coordinate_inputs(
                         names,
                         history.len() + skipped,
                         count,
@@ -1017,7 +1021,7 @@ impl Worker {
                                 0
                             },
                         ),
-                    )?;
+                    )?);
                 }
             }
             let mut owner_hashes = vec![];
@@ -1028,10 +1032,10 @@ impl Worker {
             valid.extend(owner_valid);
             joined.extend_from_slice(input);
         }
-        let mut inputs = vec![(
+        inputs.push((
             get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
             1i32.to_le_bytes().to_vec(),
-        )];
+        ));
         if let Some(name) = &execution.packet.coordinates.input_ids {
             let bytes = joined
                 .iter()
