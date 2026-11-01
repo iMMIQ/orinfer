@@ -71,6 +71,18 @@ fn real_w4_capacity_descriptors_and_live_group_graph() {
     )
     .unwrap();
     assert!(!hints.is_empty());
+    // Explicit capacity/token pairs support offline descriptor tuning. NZ
+    // candidates use the maximum ND descriptor as their numerical reference.
+    let cases: Vec<(usize, Vec<usize>)> = serde_json::from_str(
+        &std::env::var("ORINFER_A2_W4_CAPACITY_CASES")
+            .unwrap_or_else(|_| "[[32,[1,16,32]],[2048,[128,800,2048]]]".into()),
+    )
+    .unwrap();
+    assert!(!cases.is_empty());
+    assert!(cases.iter().all(|(cap, tokens)| {
+        *cap > 0 && *cap <= 2048 && !tokens.is_empty() && tokens.iter().all(|&n| n > 0 && n <= *cap)
+    }));
+    let case_count: usize = cases.iter().map(|(_, tokens)| tokens.len()).sum();
     let distributions: Vec<usize> = serde_json::from_str(
         &std::env::var("ORINFER_A2_W4_CAPACITY_DISTRIBUTIONS").unwrap_or_else(|_| "[48]".into()),
     )
@@ -166,17 +178,17 @@ fn real_w4_capacity_descriptors_and_live_group_graph() {
         };
         session.fill(&activation, 0).unwrap().wait().unwrap();
         for &hint in &hints {
-            for (capacity, tokens) in [(32, vec![1, 16, 32]), (2048, vec![128, 800, 2048])] {
+            for (capacity, tokens) in &cases {
                 let full_rows = capacity * 6;
                 let start = Instant::now();
                 let full = prepare(full_rows, hint, true);
                 let full_prepare_ms = start.elapsed().as_secs_f64() * 1000.;
                 let full_graph = full.capture(&session).unwrap();
-                for tokens in tokens {
+                for &tokens in tokens {
                     let rows = tokens * 6;
                     let start = Instant::now();
                     let exact = prepare(
-                        if nz_dir.is_some() { full_rows } else { rows },
+                        if nz_dir.is_some() { maximum } else { rows },
                         if nz_dir.is_some() { hint } else { None },
                         false,
                     );
@@ -184,7 +196,11 @@ fn real_w4_capacity_descriptors_and_live_group_graph() {
                     let exact_graph = exact.capture(&session).unwrap();
                     let live = rows.div_ceil(8);
                     let mut live_counts = Vec::new();
-                    for pass in 0..if nz_enabled && tokens == 2048 { 4 } else { 3 } {
+                    for pass in 0..if nz_enabled && tokens == *capacity {
+                        4
+                    } else {
+                        3
+                    } {
                         let active = match pass {
                             0 => live,
                             1 => live / 2,
@@ -207,7 +223,10 @@ fn real_w4_capacity_descriptors_and_live_group_graph() {
                             chunk.copy_from_slice(&patterns[(row + pass * 3) % patterns.len()]);
                         }
                         let mut reference = None;
-                        for graph in [&exact_graph, &full_graph] {
+                        for (graph, guard_rows) in [
+                            (&exact_graph, if nz_enabled { maximum } else { rows }),
+                            (&full_graph, full_rows),
+                        ] {
                             upload_bytes(&session, &activation, &source[..full_rows * k]);
                             session.fill(&output, 0xa5).unwrap().wait().unwrap();
                             graph.enqueue(&session).unwrap().wait().unwrap();
@@ -280,7 +299,7 @@ fn real_w4_capacity_descriptors_and_live_group_graph() {
                             }
                             assert!(
                                 session
-                                    .download(&output, full_rows * n * 2, 256)
+                                    .download(&output, guard_rows * n * 2, 256)
                                     .unwrap()
                                     .iter()
                                     .all(|&v| v == 0xa5),
@@ -312,7 +331,7 @@ fn real_w4_capacity_descriptors_and_live_group_graph() {
                         for values in &mut timings {
                             values.sort_by(f64::total_cmp);
                         }
-                        let report = serde_json::json!({"tokens": tokens, "used_experts": used_experts, "transposed_nz": nz_dir.is_some(), "expected_expert_rows": hint, "capacity_tokens": capacity, "live_counts": live_counts, "input": k, "output": n, "exact_prepare_ms": exact_prepare_ms, "capacity_prepare_ms": full_prepare_ms, "capacity_workspace_bytes": full.workspace_bytes(), "exact_graph_ms": timings[0][3], "capacity_graph_ms": timings[1][3], "change_pct": 100. * (timings[1][3] / timings[0][3] - 1.), "changed_input_and_groups_exact": true});
+                        let report = serde_json::json!({"tokens": tokens, "used_experts": used_experts, "transposed_nz": nz_dir.is_some(), "expected_expert_rows": hint, "capacity_tokens": capacity, "reference_capacity_tokens": if nz_enabled { maximum / 6 } else { tokens }, "live_counts": live_counts, "input": k, "output": n, "exact_prepare_ms": exact_prepare_ms, "capacity_prepare_ms": full_prepare_ms, "capacity_workspace_bytes": full.workspace_bytes(), "exact_graph_ms": timings[0][3], "capacity_graph_ms": timings[1][3], "change_pct": 100. * (timings[1][3] / timings[0][3] - 1.), "changed_input_and_groups_exact": true});
                         println!("{report}");
                         reports.push(report);
                     }
@@ -320,7 +339,10 @@ fn real_w4_capacity_descriptors_and_live_group_graph() {
             }
         }
     }
-    assert_eq!(reports.len(), 12 * hints.len() * distributions.len());
+    assert_eq!(
+        reports.len(),
+        2 * case_count * hints.len() * distributions.len()
+    );
     std::fs::write(
         std::env::var_os("ORINFER_A2_W4_CAPACITY_REPORT").unwrap(),
         serde_json::to_vec_pretty(&reports).unwrap(),
