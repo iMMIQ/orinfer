@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from tools.build.files import atomic_json
+from tools.model.deepseek_v41.dspark_state import HISTORY_ROWS
 
 DEFAULT_BLOCK = 5
 MAX_BLOCK = 31
@@ -130,23 +131,24 @@ def builder_class(block_size=DEFAULT_BLOCK):
             )
             kv = self.rope(kv, 1, 512, cosine, sine, "dspark.kv.rope")
             label = f"cache.dspark.{'noise' if noise else 'swa'}.{layer}"
-            cache = self.buffer(label, (128, 8, 64), "i8")
-            scale = self.buffer(label + ".scale", (128, 8), "f16")
+            storage = 128 if noise else HISTORY_ROWS
+            cache = self.buffer(label, (storage, 8, 64), "i8")
+            scale = self.buffer(label + ".scale", (storage, 8), "f16")
             errors = self.temp("dspark.kv.errors", (self.rows,), "i32")
             self.kernel(
                 kv_int8,
                 "scatter",
                 dict(
                     rows=self.rows,
-                    table_rows=128,
+                    table_rows=storage,
                     logical_capacity=0 if noise else self.capacity,
                     retain_tail=not noise,
                 ),
                 [
                     ("source", kv, "bf16", (self.rows, 8, 64), "read"),
                     ("indices", slots, "i32", (self.rows,), "read"),
-                    ("cache", cache, "i8", (128, 8, 64), "read_write"),
-                    ("scales", scale, "f16", (128, 8), "read_write"),
+                    ("cache", cache, "i8", (storage, 8, 64), "read_write"),
+                    ("scales", scale, "f16", (storage, 8), "read_write"),
                     ("errors", errors, "i32", (self.rows,), "write"),
                 ],
             )
@@ -167,8 +169,8 @@ def builder_class(block_size=DEFAULT_BLOCK):
             )
             query = self.w8(qr, qrs, prefix + ".wq_b", 4096, 1280, "q.b", first=self.rank * 4096)
             query = self.rope(query, 8, 512, cosine, sine, "q.rope")
-            swa = self.buffer(f"cache.dspark.swa.{layer}", (128, 8, 64), "i8")
-            scale = self.buffer(swa + ".scale", (128, 8), "f16")
+            swa = self.buffer(f"cache.dspark.swa.{layer}", (HISTORY_ROWS, 8, 64), "i8")
+            scale = self.buffer(swa + ".scale", (HISTORY_ROWS, 8), "f16")
             gathered = self.temp("dspark.attention.gathered", (rows, count, 512))
             mask = self.temp("dspark.attention.mask", (rows, count), "i32")
             self.kernel(
@@ -176,15 +178,16 @@ def builder_class(block_size=DEFAULT_BLOCK):
                 "gather_attention",
                 dict(
                     rows=rows,
-                    capacity=128,
+                    capacity=HISTORY_ROWS,
+                    swa_storage_rows=HISTORY_ROWS,
                     compressed_capacity=128,
                     long_selected=128,
                     tile_slots=8,
                     bulk_store=True,
                 ),
                 [
-                    ("swa", swa, "i8", (128, 8, 64), "read"),
-                    ("swa_scales", scale, "f16", (128, 8), "read"),
+                    ("swa", swa, "i8", (HISTORY_ROWS, 8, 64), "read"),
+                    ("swa_scales", scale, "f16", (HISTORY_ROWS, 8), "read"),
                     ("long_kv", noise, "i8", (128, 8, 64), "read"),
                     ("long_scales", noise_scale, "f16", (128, 8), "read"),
                     ("swa_indices", coordinates["swa_indices"], "i32", (rows, 128), "read"),
@@ -459,6 +462,9 @@ def _build(base_plan, checkpoint, output, workers, compiler, base_model, block_s
     existing = any(p.get("role") == "draft" for p in target["ranks"][0]["packets"])
     old_ranks = deepcopy(target["ranks"]) if existing else None
     if existing:
+        from tools.model.deepseek_v41.dspark_state import resize
+
+        resize(target, root, HISTORY_ROWS, compiler)
         remove_draft(target)
     Draft, Strategy = builder_class(block_size)
     strategy = Strategy(
@@ -495,6 +501,7 @@ def _build(base_plan, checkpoint, output, workers, compiler, base_model, block_s
             )
             if name == "draft":
                 packet = b.packet(rows, dynamic=True)
+                packet["coordinates"]["draft_swa_storage_rows"] = HISTORY_ROWS
                 for instruction in packet["body"]:
                     if instruction["op"] == "embed":
                         instruction["tensor"] = "mtp.0.embed.weight"
@@ -661,6 +668,9 @@ def compose(base_plan, output, workers, base_model=None, block_size=DEFAULT_BLOC
         prepack(templates["draft"], root)
         merge(target, templates, root, workers, compiler, block_size)
         converge_draft_blocks(target, root, workers, compiler)
+        from tools.model.deepseek_v41.dspark_state import resize
+
+        resize(target, root, HISTORY_ROWS, compiler)
         atomic_json(output.with_name("dspark-candidate.json"), target)
         validate_rows(target, root, model_dir=base_model)
         atomic_json(output, target)

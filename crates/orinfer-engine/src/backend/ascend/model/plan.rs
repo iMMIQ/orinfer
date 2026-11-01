@@ -157,6 +157,7 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                     p.min_rows,
                     p.max_rows,
                     p.coordinates.draft_block,
+                    p.coordinates.draft_swa_storage_rows,
                     p.draft_stride,
                 )
             })
@@ -171,6 +172,7 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                         p.min_rows,
                         p.max_rows,
                         p.coordinates.draft_block,
+                        p.coordinates.draft_swa_storage_rows,
                         p.draft_stride,
                     )
                 })
@@ -185,6 +187,7 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
             for coordinates in
                 std::iter::once(&packet.coordinates).chain(packet.decoder_coordinates.as_ref())
             {
+                coordinates.draft_storage_rows()?;
                 if coordinates
                     .names()
                     .iter()

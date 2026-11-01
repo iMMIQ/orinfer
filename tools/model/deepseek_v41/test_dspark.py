@@ -17,6 +17,113 @@ from tools.model.deepseek_v41.dspark import (
     write_constant,
 )
 from tools.model.row_contract import resolve
+from tools.model.deepseek_v41.dspark_state import resize
+
+
+class HistoryStorageTests(unittest.TestCase):
+    def test_history_resize_rebuilds_writers_and_readers_and_preserves_noise(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scatter = dict(
+                op="kv_int8.scatter",
+                parameters=dict(rows=16, table_rows=128, logical_capacity=4096, retain_tail=True),
+                operands=[
+                    dict(name=n, shape=[128, 8, 64] if n == "cache" else [128, 8])
+                    for n in ("source", "indices", "cache", "scales", "errors")
+                ],
+            )
+            gather = dict(
+                op="private_rows.kv_int8_gather_attention",
+                parameters=dict(
+                    rows=16,
+                    capacity=128,
+                    compressed_capacity=128,
+                    _owner_aliases={"swa_owner": "int8", "swa_scales_owner": "float16"},
+                    _owner_access=[dict(column=0, write=False), dict(column=1, write=False)],
+                ),
+                operands=[],
+            )
+            for name, spec in [("scatter", scatter), ("gather", gather)]:
+                (root / (name + ".json")).write_text(json.dumps(spec))
+            state, definitions, columns, pointers, warm, draft = [], [], [], {}, [], []
+            for layer in (40, 41, 42):
+                name = f"cache.dspark.swa.{layer}"
+                for bank, stride in [(name, 512), (name + ".scale", 16)]:
+                    state.append(
+                        dict(
+                            buffer=bank,
+                            row_bytes=stride,
+                            tokens_per_row=1,
+                            window=128,
+                            circular=True,
+                        )
+                    )
+                    definitions.append(dict(name=bank, bytes=128 * stride))
+                    columns.append(dict(buffer=bank))
+                table = f"table{layer}"
+                pointers[table] = [len(columns) - 2, len(columns) - 1]
+                warm.append(
+                    dict(
+                        op="kernel",
+                        manifest="scatter.json",
+                        buffers=["x", "ids", name, name + ".scale", "error"],
+                    )
+                )
+                draft.append(
+                    dict(op="kernel", manifest="gather.json", buffers=["work", table, "active"])
+                )
+            definitions.append(dict(name="cache.dspark.noise.40", bytes=128 * 512))
+            model = dict(
+                batch=dict(
+                    decoder_replay=dict(decoder_state=state), columns=columns, pointers=pointers
+                ),
+                ranks=[
+                    dict(
+                        buffers=definitions,
+                        packets=[
+                            dict(coordinates={}, body=warm, head=[]),
+                            dict(
+                                role="draft", coordinates=dict(draft_block=5), body=draft, head=[]
+                            ),
+                        ],
+                    )
+                ],
+            )
+            tasks = []
+
+            def rebuild(spec, path):
+                return dict(
+                    placeholder=path,
+                    arguments=deepcopy(spec["parameters"]),
+                    specs=deepcopy(spec["operands"]),
+                )
+
+            def compile_task(item):
+                task, _ = item
+                tasks.append(task)
+                return task["placeholder"], task["placeholder"] + ".new"
+
+            compiler = SimpleNamespace(map=lambda fn, items: map(fn, items))
+            fake = SimpleNamespace(compile_task=compile_task, kernel_rebuild_task=rebuild)
+            original = deepcopy(model)
+            with patch.dict(sys.modules, {"tools.model.deepseek_v41.build": fake}):
+                result = resize(model, root, 256, compiler)
+            self.assertEqual(result, dict(storage_rows=256, kernels=2, bindings=6))
+            self.assertEqual(tasks[0]["arguments"]["table_rows"], 256)
+            self.assertEqual(tasks[0]["specs"][2]["shape"], [256, 8, 64])
+            self.assertEqual(tasks[1]["arguments"]["swa_storage_rows"], 256)
+            self.assertEqual(tasks[1]["arguments"]["compressed_capacity"], 128)
+            self.assertEqual(definitions[-1]["bytes"], 128 * 512)
+            self.assertEqual(definitions[0]["bytes"], 256 * 512)
+            self.assertTrue(all(s["window"] == 128 for s in state))
+            self.assertEqual(
+                model["ranks"][0]["packets"][1]["coordinates"]["draft_swa_storage_rows"], 256
+            )
+            bad = original
+            bad["ranks"][0]["packets"][1]["coordinates"]["draft_swa_storage_rows"] = 256
+            with patch.dict(sys.modules, {"tools.model.deepseek_v41.build": fake}):
+                with self.assertRaisesRegex(ValueError, "coordinates differ"):
+                    resize(bad, root, 512, compiler)
 
 
 class CapacityTests(unittest.TestCase):

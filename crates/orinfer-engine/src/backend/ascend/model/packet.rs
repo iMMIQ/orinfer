@@ -12,6 +12,9 @@ use std::{fs, path::Path, rc::Rc, time::Instant};
 pub(super) struct Coordinates {
     #[serde(default)]
     pub draft_block: Option<usize>,
+    /// Physical history ring; its logical attention window remains 128 rows.
+    #[serde(default)]
+    pub draft_swa_storage_rows: Option<usize>,
     #[serde(default)]
     pub input_ids: Option<String>,
     #[serde(default)]
@@ -36,6 +39,16 @@ pub(super) struct Coordinates {
     pub premix: String,
 }
 impl Coordinates {
+    pub(super) fn draft_storage_rows(&self) -> Result<usize> {
+        let rows = self.draft_swa_storage_rows.unwrap_or(128);
+        if !(128..=4096).contains(&rows)
+            || !rows.is_power_of_two()
+            || self.draft_swa_storage_rows.is_some() && self.draft_block.is_none()
+        {
+            return Err("Invalid draft history ring geometry".into());
+        }
+        Ok(rows)
+    }
     pub(super) fn names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = vec![
             &self.base_cos,
@@ -168,6 +181,7 @@ impl Worker {
         put(&mut inputs, &names.slots, &ints(&slots))?;
         put(&mut inputs, &names.c2_slots, &ints(&c2_slots))?;
         let mut swa = vec![-1; rows * 128];
+        let draft_storage = names.draft_storage_rows()?;
         let mut metadata = vec![0; rows * 8];
         let mut mix = vec![0f32; rows * 8];
         for row in 0..rows {
@@ -180,7 +194,7 @@ impl Worker {
             .enumerate()
             {
                 swa[row * 128 + lane] = if names.draft_block.is_some() {
-                    (previous % 128) as i32
+                    (previous % draft_storage) as i32
                 } else {
                     previous as i32
                 };

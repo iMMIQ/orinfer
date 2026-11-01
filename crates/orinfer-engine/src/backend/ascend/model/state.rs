@@ -1121,6 +1121,47 @@ mod journal_tests {
     use super::*;
 
     #[test]
+    fn padded_history_ring_preserves_every_accepted_prefix_without_a_journal() {
+        let layout = StateLayout {
+            buffer: "swa".into(),
+            row_bytes: 4,
+            tokens_per_row: 1,
+            window: Some(128),
+            circular: true,
+            append_only: false,
+        };
+        for start in [0usize, 127, 128, 255, 256, 257, 2047, 262111] {
+            for count in [1usize, 6, 17, 32] {
+                assert!(
+                    layout
+                        .overwritten_spans(start, count, 256 * 4)
+                        .unwrap()
+                        .is_empty()
+                );
+                let mut ring = vec![usize::MAX; 256];
+                for position in start.saturating_sub(128)..start + count {
+                    ring[position % 256] = position;
+                }
+                for keep in 1..=count {
+                    let end = start + keep;
+                    for position in end.saturating_sub(128)..end {
+                        assert_eq!(ring[position % 256], position);
+                    }
+                    assert_eq!(
+                        layout
+                            .spans(end, 256 * 4)
+                            .unwrap()
+                            .iter()
+                            .map(|s| s.len())
+                            .sum::<usize>(),
+                        end.min(128) * 4
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn verification_journal_covers_only_overwritten_slots_across_wraps() {
         let layout = StateLayout {
             buffer: "swa".into(),

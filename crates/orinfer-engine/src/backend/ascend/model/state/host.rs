@@ -272,6 +272,61 @@ impl Worker {
 mod tests {
     use super::*;
     use crate::backend::ascend::tests::Fixture;
+
+    #[test]
+    fn padded_draft_ring_restores_only_live_history_after_rejected_writes() {
+        let mut fixture = Fixture::new();
+        let session = fixture.session();
+        let source = session.allocate(256 * 4).unwrap();
+        let destination = session.allocate(256 * 4).unwrap();
+        let buffers = BTreeMap::from([("swa".into(), source.clone())]);
+        let restored = BTreeMap::from([("swa".into(), destination.clone())]);
+        let layout = StateLayout {
+            buffer: "swa".into(),
+            row_bytes: 4,
+            tokens_per_row: 1,
+            window: Some(128),
+            circular: true,
+            append_only: false,
+        };
+        let mut pool = HostPool::default();
+        for (id, start) in [127usize, 128, 255, 256, 257, 2047].into_iter().enumerate() {
+            let mut bytes = vec![0; 256 * 4];
+            for position in start.saturating_sub(256)..start + 6 {
+                bytes[position % 256 * 4..position % 256 * 4 + 4]
+                    .copy_from_slice(&(position as u32).to_le_bytes());
+            }
+            session.upload(&source, 0, &bytes).unwrap().wait().unwrap();
+            // Three accepted inputs; the last three writes remain outside history.
+            let history = vec![1; start + 3];
+            let saved = Snapshot::capture(
+                &session,
+                std::iter::once(&layout),
+                &buffers,
+                &history,
+                id as u64 + 1,
+                None,
+            )
+            .unwrap();
+            let host = HostSnapshot::offload(&session, &saved, &mut pool).unwrap();
+            session.fill(&destination, 7).unwrap().wait().unwrap();
+            host.restore_host_into(&session, &restored).unwrap();
+            let actual = session.download(&destination, 0, 256 * 4).unwrap();
+            let spans = layout.spans(history.len(), 256 * 4).unwrap();
+            for offset in 0..actual.len() {
+                assert_eq!(
+                    actual[offset],
+                    if spans.iter().any(|s| s.contains(&offset)) {
+                        bytes[offset]
+                    } else {
+                        7
+                    }
+                );
+            }
+        }
+        drop((pool, buffers, restored, source, destination, session));
+        fixture.assert_clean();
+    }
     fn shared_page_lifecycle(session: &Session) {
         let grain = 2 << 20;
         let source = session.reserve(grain * 2).unwrap();
