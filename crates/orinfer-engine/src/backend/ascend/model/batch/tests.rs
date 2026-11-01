@@ -29,6 +29,34 @@ fn key(layout: &Layout) -> Key {
     .unwrap()
 }
 #[test]
+fn successful_shape_streaks_are_family_local_and_reset_on_eviction() {
+    let mut runtime = Runtime::new(contract(), 32, &[], &BTreeSet::new());
+    let a = key(&layout(&[16], &[7]).unwrap());
+    let b = key(&layout(&[17], &[7]).unwrap());
+    let mut draft = a.clone();
+    draft.family.0 = super::super::PacketRole::Draft;
+    assert_eq!(runtime.consecutive_uses(&a), 0);
+    runtime.record_use(a.clone());
+    runtime.record_use(draft.clone());
+    assert_eq!(runtime.consecutive_uses(&a), 1);
+    runtime.record_use(a.clone());
+    assert_eq!(runtime.consecutive_uses(&a), 2);
+    assert_eq!(runtime.consecutive_uses(&draft), 1);
+    runtime.record_use(b.clone());
+    assert_eq!(runtime.consecutive_uses(&a), 0);
+    runtime.record_use(a.clone());
+    runtime.remove(&b);
+    assert_eq!(runtime.consecutive_uses(&a), 1);
+    runtime.remove(&a);
+    assert_eq!(runtime.consecutive_uses(&a), 0);
+    assert_eq!(runtime.consecutive_uses(&draft), 1);
+    for _ in 0..300 {
+        runtime.record_use(a.clone());
+    }
+    assert_eq!(runtime.consecutive_uses(&a), u8::MAX);
+    assert_eq!(runtime.recent.len(), 2);
+}
+#[test]
 fn launch_identity_matches_the_compilers_owner_work_extents() {
     let mut contract = contract();
     contract.decoder_replay = Some(

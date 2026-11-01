@@ -125,7 +125,7 @@ pub(super) struct Owner {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CacheState {
     Missing,
-    Direct(u8),
+    Direct { uses: u8, consecutive: u8 },
     Graph,
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -160,6 +160,7 @@ pub(super) struct Runtime {
     pub contract: Contract,
     pub owners: BTreeMap<usize, Owner>,
     cache: BTreeMap<Key, Rc<Execution>>,
+    recent: BTreeMap<(super::PacketRole, bool, usize), (Key, u8)>,
     lru: VecDeque<Key>,
     capacity: usize,
     tables: BTreeMap<(super::PacketRole, bool, usize), TableUse>,
@@ -176,6 +177,26 @@ struct TableUse {
     columns: Vec<bool>,
 }
 impl Runtime {
+    fn consecutive_uses(&self, key: &Key) -> u8 {
+        self.recent
+            .get(&key.family)
+            .filter(|(previous, _)| previous == key)
+            .map_or(0, |(_, uses)| *uses)
+    }
+    fn record_use(&mut self, key: Key) {
+        let uses = self.consecutive_uses(&key).saturating_add(1);
+        self.recent.insert(key.family, (key, uses));
+    }
+    fn remove(&mut self, key: &Key) {
+        self.cache.remove(key);
+        if self
+            .recent
+            .get(&key.family)
+            .is_some_and(|(last, _)| last == key)
+        {
+            self.recent.remove(&key.family);
+        }
+    }
     fn key(&self, layout: &Layout) -> Result<Key> {
         let (family, _) = self
             .families
@@ -237,6 +258,7 @@ impl Runtime {
             contract,
             owners: BTreeMap::new(),
             cache: BTreeMap::new(),
+            recent: BTreeMap::new(),
             lru: VecDeque::new(),
             capacity,
             tables,
@@ -592,22 +614,23 @@ fn work_lengths(
 impl Worker {
     pub(super) fn batch_cached(&self, layout: &Layout) -> Result<CacheState> {
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
-        Ok(runtime
-            .cache
-            .get(&runtime.key(layout)?)
-            .map_or(CacheState::Missing, |e| {
-                if e.captured {
-                    CacheState::Graph
-                } else {
-                    CacheState::Direct(e.direct_uses.get())
+        let key = runtime.key(layout)?;
+        Ok(runtime.cache.get(&key).map_or(CacheState::Missing, |e| {
+            if e.captured {
+                CacheState::Graph
+            } else {
+                CacheState::Direct {
+                    uses: e.direct_uses.get(),
+                    consecutive: runtime.consecutive_uses(&key),
                 }
-            }))
+            }
+        }))
     }
     pub(super) fn invalidate_batch(&mut self, layout: &Layout) -> Result<()> {
         self.session.synchronize()?;
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
         let key = runtime.key(layout)?;
-        runtime.cache.remove(&key);
+        runtime.remove(&key);
         runtime.lru.retain(|k| k != &key);
         self.w4.retain(|_, w| w.strong_count() > 0);
         self.reserve_batch_memory(
@@ -716,6 +739,9 @@ impl Worker {
                     serde_json::json!({
                         "rows": key.rows, "decode": layout.decode, "capture": capture,
                         "promotion": previous.is_some(),
+                        "family": format!("{:?}", key.family),
+                        "direct_uses": previous.as_ref().map_or(0, |e| e.direct_uses.get()),
+                        "consecutive_uses": self.batch.as_ref().unwrap().consecutive_uses(&key),
                         "owner_lengths": layout.segments.iter().map(|s| s.tokens).collect::<Vec<_>>(),
                         "decoder_rows": key.decoder_rows, "outputs": key.outputs,
                         "work_rows": key.work_rows, "wall_s": started.elapsed().as_secs_f64(),
@@ -742,7 +768,7 @@ impl Worker {
         runtime.lru.push_back(key);
         while runtime.cache.len() > runtime.capacity {
             let old = runtime.lru.pop_front().unwrap();
-            runtime.cache.remove(&old);
+            runtime.remove(&old);
         }
         self.w4.retain(|_, w| w.strong_count() > 0);
         Ok(())
@@ -961,10 +987,11 @@ impl Worker {
             return Err("Batch input differs from row layout".into());
         }
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+        let key = runtime.key(layout)?;
         let execution = Rc::clone(
             runtime
                 .cache
-                .get(&runtime.key(layout)?)
+                .get(&key)
                 .ok_or("Batch must be prepared before forward")?,
         );
         let retained = self.update_batch_tables(layout, &execution.packet)?;
@@ -1189,6 +1216,7 @@ impl Worker {
                 .direct_uses
                 .set(execution.direct_uses.get().saturating_add(1));
         }
+        self.batch.as_mut().unwrap().record_use(key);
         Ok(output)
     }
 }

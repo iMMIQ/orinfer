@@ -1,4 +1,10 @@
 use super::*;
+fn direct(uses: u8) -> CacheState {
+    CacheState::Direct {
+        uses,
+        consecutive: uses,
+    }
+}
 #[test]
 fn promotion_waits_for_successful_uses_on_every_rank() {
     assert!(preparation(&[], false).is_err());
@@ -8,7 +14,7 @@ fn promotion_waits_for_successful_uses_on_every_rank() {
             (true, false)
         );
         assert_eq!(
-            preparation(&[CacheState::Graph, CacheState::Direct(0)], decode).unwrap(),
+            preparation(&[CacheState::Graph, direct(0)], decode).unwrap(),
             (true, true)
         );
         assert_eq!(
@@ -17,19 +23,33 @@ fn promotion_waits_for_successful_uses_on_every_rank() {
         );
     }
     assert_eq!(
-        preparation(&[CacheState::Direct(0), CacheState::Direct(1)], true).unwrap(),
+        preparation(&[direct(0), direct(1)], true).unwrap(),
+        (false, false)
+    );
+    assert_eq!(preparation(&[direct(1); 2], true).unwrap(), (false, false));
+    assert_eq!(
+        preparation(&[direct(1), direct(2)], true).unwrap(),
+        (false, false)
+    );
+    assert_eq!(preparation(&[direct(2); 2], true).unwrap(), (false, true));
+    let alternating = |uses| CacheState::Direct {
+        uses,
+        consecutive: 0,
+    };
+    assert_eq!(
+        preparation(&[alternating(7); 2], true).unwrap(),
         (false, false)
     );
     assert_eq!(
-        preparation(&[CacheState::Direct(1); 2], true).unwrap(),
+        preparation(&[alternating(8); 2], true).unwrap(),
         (false, true)
     );
     assert_eq!(
-        preparation(&[CacheState::Direct(7), CacheState::Direct(8)], false).unwrap(),
+        preparation(&[direct(7), direct(8)], false).unwrap(),
         (false, false)
     );
     assert_eq!(
-        preparation(&[CacheState::Direct(8), CacheState::Direct(9)], false).unwrap(),
+        preparation(&[direct(8), direct(9)], false).unwrap(),
         (false, true)
     );
 }
@@ -37,11 +57,12 @@ fn promotion_waits_for_successful_uses_on_every_rank() {
 fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
     for statuses in [
         [CacheState::Graph, CacheState::Graph],
-        [CacheState::Direct(1), CacheState::Direct(1)],
-        [CacheState::Direct(7), CacheState::Direct(8)],
-        [CacheState::Direct(8), CacheState::Direct(9)],
+        [direct(1), direct(1)],
+        [direct(2), direct(2)],
+        [direct(7), direct(8)],
+        [direct(8), direct(9)],
         [CacheState::Graph, CacheState::Missing],
-        [CacheState::Direct(1), CacheState::Graph],
+        [direct(1), CacheState::Graph],
         [CacheState::Missing, CacheState::Missing],
     ] {
         std::thread::scope(|scope| {

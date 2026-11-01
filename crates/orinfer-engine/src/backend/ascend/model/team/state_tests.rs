@@ -75,7 +75,7 @@ fn graph_launch_identity_reuses_changed_lengths_and_decoder_roles() {
         team.exchange(Command::Cached(partial_a.clone()))
             .unwrap()
             .iter()
-            .all(|r| matches!(r, Reply::Cached(CacheState::Direct(1))))
+            .all(|r| matches!(r, Reply::Cached(CacheState::Direct { uses: 1, .. })))
     );
     assert!(
         team.exchange(Command::Cached(partial_b.clone()))
@@ -91,7 +91,10 @@ fn graph_launch_identity_reuses_changed_lengths_and_decoder_roles() {
         team.exchange(Command::Cached(partial_a.clone()))
             .unwrap()
             .iter()
-            .all(|r| matches!(r, Reply::Cached(CacheState::Direct(_) | CacheState::Graph)))
+            .all(|r| matches!(
+                r,
+                Reply::Cached(CacheState::Direct { .. } | CacheState::Graph)
+            ))
     );
     team.exchange(Command::Reset(vec![7, 17])).unwrap();
     for expected in 2..=8 {
@@ -101,7 +104,7 @@ fn graph_launch_identity_reuses_changed_lengths_and_decoder_roles() {
             team.exchange(Command::Cached(partial_a.clone()))
                 .unwrap()
                 .iter()
-                .all(|r| matches!(r, Reply::Cached(CacheState::Direct(n)) if *n == expected))
+                .all(|r| matches!(r, Reply::Cached(CacheState::Direct { uses: n, .. }) if *n == expected))
         );
         team.exchange(Command::Reset(vec![7, 17])).unwrap();
     }
@@ -144,7 +147,10 @@ fn graph_launch_identity_reuses_changed_lengths_and_decoder_roles() {
             team.exchange(Command::Cached(b.clone()))
                 .unwrap()
                 .iter()
-                .all(|r| matches!(r, Reply::Cached(CacheState::Direct(_) | CacheState::Graph))),
+                .all(|r| matches!(
+                    r,
+                    Reply::Cached(CacheState::Direct { .. } | CacheState::Graph)
+                )),
             "{name} must reuse the captured launches"
         );
         team.exchange(Command::Reset(vec![7, 17])).unwrap();
@@ -182,7 +188,10 @@ fn graph_launch_identity_reuses_changed_lengths_and_decoder_roles() {
         team.exchange(Command::Cached(b.clone()))
             .unwrap()
             .iter()
-            .all(|r| matches!(r, Reply::Cached(CacheState::Direct(_) | CacheState::Graph)))
+            .all(|r| matches!(
+                r,
+                Reply::Cached(CacheState::Direct { .. } | CacheState::Graph)
+            ))
     );
     restore();
     team.exchange(Command::Prepare(b.clone(), true)).unwrap();

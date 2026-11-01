@@ -674,7 +674,8 @@ fn forward(
 /// class to direct. Successful uses are counted on every rank; promotion waits
 /// for the slowest rank. Offline TP8 measurements put prefill amortization at
 /// 8–20 uses (0.31–0.46 s capture versus 24–41 ms saved per execution).
-/// Draft/verification are repeated decode steps and promote after one use.
+/// Decode/draft/verification promote after two consecutive successful uses in
+/// their family. Alternating shapes still promote after eight total uses.
 fn preparation(states: &[CacheState], repeated: bool) -> Result<(bool, bool)> {
     if states.is_empty() {
         return Err("Missing A2 TP cache states".into());
@@ -686,12 +687,12 @@ fn preparation(states: &[CacheState], repeated: bool) -> Result<(bool, bool)> {
     if graphs > 0 {
         return Ok((graphs != states.len(), true));
     }
-    let required = if repeated { 1 } else { 8 };
     Ok((
         false,
-        states
-            .iter()
-            .all(|s| matches!(s, CacheState::Direct(n) if *n >= required)),
+        states.iter().all(|s| {
+            matches!(s, CacheState::Direct { uses, consecutive }
+                if *uses >= 8 || repeated && *consecutive >= 2)
+        }),
     ))
 }
 
