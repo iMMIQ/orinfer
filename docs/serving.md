@@ -272,7 +272,7 @@ A2 rank 的命令使用一个共同的等待期限，`ORINFER_A2_COMMAND_TIMEOUT
 
 A2 的 AOT 原生库由同一 ACL 运行时按路径共享，保留至 ACL 完成退出后再卸载。AscendC 注册的 profiler 回调也在此期间保持有效，覆盖 Graph 回收及 HCCL 后台线程退出。权重、请求状态和 Graph 仍按各自的所有权释放。
 
-A2 每个 packet 在同一 worker 命令内完成 KV 增长和 Graph 缓存探测。全部 rank 已准备好时，LRU 更新随执行命令完成，热路径使用两轮 worker 往返；新形状、缓存分歧和 Graph 晋升仍在统一准备完成后执行，保留各 rank 的 HCCL 顺序和捕获保护。
+A2 每个 packet 在同一 worker 命令内完成 KV 增长和 Graph 缓存探测。全部 rank 已准备好时，LRU 更新随执行命令完成，forward 内部使用两轮 worker 往返；外层 workspace 预算探测单独执行。新形状、缓存分歧和 Graph 晋升仍在统一准备完成后执行，保留各 rank 的 HCCL 顺序和捕获保护。
 
 A2 DSv4.1 将请求私有状态按存活范围分配：有界 SWA/C2 状态和固定 workspace 放入 owner arena；声明为 append-only 的 KV、FP16 scale 和索引保留最大上下文的虚拟地址，物理页按实际执行位置增长。补页在 Graph 准备和执行前完成，已有地址与算子 ABI 保持稳定；prefix 恢复先映射对应的历史范围，再复制状态。同一 owner 的 KV 与索引缓冲区统一校验新增物理字节和区间，在已有访问完成后批量映射，再沿同一 stream 依序清零；全部新增页初始化完成后才返回。共享同一虚拟分配的视图按最大范围去重，保持原有页粒度计费。取消和完成请求后，等待已有访问结束再释放映射；owner 0 保留启动时的固定缓冲区，回收可增长状态的物理页。实际字节数包含设备页粒度和各 buffer 的对齐开销。
 
