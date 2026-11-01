@@ -231,8 +231,8 @@ fn arbitrary_batch_work_covers_each_logical_owner_tile() {
         let work = work_items(&l, &grid, None).unwrap();
         assert_eq!(work.len() % 2, 0);
         assert_eq!(
-            work.iter().take(batch).copied().collect::<Vec<_>>(),
-            (0..batch)
+            work.iter().take(batch.min(64)).copied().collect::<Vec<_>>(),
+            (0..batch.min(64))
                 .map(|owner| [owner as i32, 0])
                 .collect::<Vec<_>>()
         );
@@ -250,6 +250,20 @@ fn arbitrary_batch_work_covers_each_logical_owner_tile() {
             logical.sort_unstable();
             assert_eq!(logical, (0..3 * q).collect::<Vec<_>>());
         }
+    }
+}
+#[test]
+fn bounded_work_distributes_each_owner_across_all_physical_slots() {
+    let grid: RowExpression =
+        serde_json::from_value(serde_json::json!({"op":"constant","value":64})).unwrap();
+    for batch in 1..=128 {
+        let work = work_lengths(vec![1; batch], &grid, None).unwrap();
+        assert_eq!(work.len(), batch * 64);
+        let mut slots = vec![0u64; batch];
+        for (index, &[owner, _]) in work.iter().enumerate() {
+            slots[owner as usize] |= 1u64 << (index % 64);
+        }
+        assert_eq!(slots, vec![u64::MAX; batch]);
     }
 }
 #[test]

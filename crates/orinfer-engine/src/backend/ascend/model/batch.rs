@@ -599,21 +599,46 @@ fn work_lengths(
         .into_iter()
         .map(|tokens| work_blocks(tokens, grid, range))
         .collect::<Result<Vec<_>>>()?;
-    let mut out = vec![];
-    // Start the same tile across owners before advancing to the next tile.
-    // Bounded kernels can have many idle CTAs after an owner's first live tile.
-    for block in 0..blocks.iter().copied().max().unwrap_or(0) {
-        for (owner, &count) in blocks.iter().enumerate() {
-            if block < count {
-                out.push([owner as i32, block as i32]);
-            }
-        }
-    }
-    if out.is_empty() {
+    let mut owners = blocks
+        .into_iter()
+        .enumerate()
+        .filter(|(_, count)| *count > 0)
+        .map(|(owner, count)| (owner, count, 0))
+        .collect::<Vec<_>>();
+    let count = owners.iter().map(|(_, count, _)| count).sum::<usize>();
+    if count == 0 {
         return Ok(vec![[-1, 0], [-1, 0]]);
     }
-    if out.len() > 8192 {
+    if count > 8192 {
         return Err("Owner work table exceeds its capacity".into());
+    }
+    let gcd = |mut a: usize, mut b: usize| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let mut stride = 64;
+    while gcd(stride, owners.len()) != 1 {
+        stride -= 1;
+    }
+    let mut out = Vec::with_capacity(count + count % 2);
+    let mut remaining = count;
+    // Rotate owners across bounded grid slots. With 64 tiles per owner,
+    // the coprime wave stride gives each owner one tile on every grid slot.
+    'waves: for wave in 0..owners.len() {
+        for slot in 0..64 {
+            let index = (slot + wave * stride) % owners.len();
+            let (owner, count, next) = &mut owners[index];
+            if *next < *count {
+                out.push([*owner as i32, *next as i32]);
+                *next += 1;
+                remaining -= 1;
+                if remaining == 0 {
+                    break 'waves;
+                }
+            }
+        }
     }
     if out.len() % 2 != 0 {
         out.push([-1, 0]);
