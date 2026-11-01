@@ -274,6 +274,8 @@ A2 的自动草稿验证预算保持在 target 首次启用跨 rank 行交换之
 
 A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和 PV 计算体，支持每 rank 8/16/32/64 个 head，保留 FP32 softmax 与 BF16 probability 边界。`tools.model.deepseek_v41.fuse_attention --selected-int8 --min-rows N` 按实测聚合行数拆分已有 target 执行域，小行数保留原算子；草稿与普通 decode 沿用各自的计划选择。主干全行与 decoder 保留窗口分别绑定 work 表，在线只消费离线生成的计划。
 
+A2 专家 GMM 可通过 `tools.model.deepseek_v41.expert_fusion` 离线选择已有 target 行数区间，默认 `32..511`。gather 将完整 A8 无损拆成两行 signed INT4，复用发布的 NZ W4 bank 与原生 grouped matmul；GMM 在 FP16 部分积舍入前应用原权重 scale，后处理融合部分积合并、FP32 assist/token scale、BF16 SwiGLU 和 FP32 行量化。`--min-rows`、`--max-rows` 必须覆盖完整的已有 packet 区间；其他 packet、请求状态和权重文件沿用原契约。该计划使用显式 `w4_a4` 指令，需要支持它的引擎。执行包单独发布单位 token scale 常量及临时 workspace，权重包保持原样。
+
 HTTP 在加载模型前绑定监听地址，端口被占用时立即退出；模型和预热完成后开始处理 HTTP。就绪探针使用 `/health` 的 HTTP 200，TCP 连通只表示监听地址已绑定。A2 全量常驻 CPU 表的启动可能需要数分钟，部署时为启动探针预留足够时间，例如 600 秒。正常退出及启动失败会清理本服务创建的 Unix socket；已有 socket 绑定失败时保留原文件。
 
 A2 rank 的命令使用一个共同的等待期限，`ORINFER_A2_COMMAND_TIMEOUT_MS` 默认 `30000`，支持 `1..1800000` 毫秒，同时设置 ACL 同步等待期限；初始模型加载单独允许 1800 秒。rank 驱动错误、线程退出或命令超时会使当前 TP 团队失效，保留首个故障的类型和驱动错误码，后续请求无法继续使用该团队。服务故障后由进程管理器重启；调整命令期限时也应相应配置 HTTP 和停机期限。

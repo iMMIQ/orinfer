@@ -1091,3 +1091,59 @@ class ConvergenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExpertFusionContractTests(unittest.TestCase):
+    def fixture(self):
+        from tools.model.deepseek_v41.expert_fusion import selected_chain
+
+        program = [
+            dict(op="kernel", manifest="g", buffers=["x", "xs", "ids", "input", "scale", "errors"]),
+            dict(
+                op="w4",
+                rows=192,
+                input=5120,
+                output=4608,
+                experts=48,
+                weight_layout="transposed_nz",
+                expected_expert_rows=16,
+                groups="groups",
+                buffers=["input", "weight", "weight_scale", "assist", "scale", "packed"],
+            ),
+            dict(op="kernel", manifest="a", buffers=["packed", "out", "out_scale", "active"]),
+        ]
+        specs = {
+            "g": dict(
+                op="memory.gather_quantized_rows",
+                parameters=dict(rows=192, table_rows=32, width=5120, _row_capacity=32),
+            ),
+            "a": dict(
+                op="model_ops.swiglu_packed_quant_active",
+                parameters=dict(rows=192, width=2304, _row_capacity=32),
+            ),
+        }
+        return selected_chain, program, specs
+
+    def test_requires_same_quantization_boundary_and_dataflow(self):
+        select, program, specs = self.fixture()
+        chain, geometry = select(program, 0, lambda s: specs.get(s.get("manifest")))
+        self.assertEqual(chain, program)
+        self.assertEqual(geometry, (32, 192, 5120, 2304, 48))
+        specs["a"]["parameters"]["limit"] = 8.0
+        with self.assertRaisesRegex(ValueError, "geometry or dataflow"):
+            select(program, 0, lambda s: specs.get(s.get("manifest")))
+        specs["a"]["parameters"]["limit"] = 10.0
+        program[2]["buffers"][0] = "other_projection"
+        with self.assertRaisesRegex(ValueError, "geometry or dataflow"):
+            select(program, 0, lambda s: specs.get(s.get("manifest")))
+
+    def test_rejects_extra_snapshot_and_different_layout(self):
+        select, program, specs = self.fixture()
+        for field, value in [("weight_layout", "nd"), ("groups", None)]:
+            candidate = deepcopy(program)
+            candidate[1][field] = value
+            with self.assertRaisesRegex(ValueError, "shared routed NZ"):
+                select(candidate, 0, lambda s: specs.get(s.get("manifest")))
+        program[0]["snapshot"] = "unrelated"
+        with self.assertRaisesRegex(ValueError, "shared routed NZ"):
+            select(program, 0, lambda s: specs.get(s.get("manifest")))

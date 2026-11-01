@@ -255,6 +255,21 @@ enum Instruction {
         #[serde(default)]
         weight_layout: W4Layout,
     },
+    #[serde(rename = "w4_a4")]
+    W4A4 {
+        name: String,
+        rows: usize,
+        input: usize,
+        output: usize,
+        experts: usize,
+        buffers: [String; 6],
+        workspace: String,
+        groups: Option<String>,
+        #[serde(default)]
+        expected_expert_rows: Option<usize>,
+        #[serde(default)]
+        weight_layout: W4Layout,
+    },
     Route {
         indices: String,
         gather: String,
@@ -446,6 +461,7 @@ struct W4Key {
     workspace: usize,
     expected_expert_rows: Option<usize>,
     weight_layout: W4Layout,
+    split_int4: bool,
 }
 type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
 
@@ -924,8 +940,21 @@ impl Worker {
                 groups,
                 expected_expert_rows,
                 weight_layout,
+            }
+            | Instruction::W4A4 {
+                name,
+                rows,
+                input,
+                output,
+                experts,
+                buffers,
+                workspace,
+                groups,
+                expected_expert_rows,
+                weight_layout,
             } = instruction
             {
+                let split_int4 = matches!(instruction, Instruction::W4A4 { .. });
                 let mut b = buffers
                     .iter()
                     .map(|n| self.row_buffer(n, active_rows))
@@ -940,7 +969,8 @@ impl Worker {
                     groups.is_some(),
                     routed.contains(name),
                 )?;
-                let input_bytes = rows.checked_mul(*input).ok_or("W4 input extent overflow")?;
+                let input_bytes = rows.checked_mul(*input).ok_or("W4 input extent overflow")?
+                    / if split_int4 { 2 } else { 1 };
                 let output_bytes = rows
                     .checked_mul(*output)
                     .and_then(|n| n.checked_mul(2))
@@ -967,12 +997,18 @@ impl Worker {
                     workspace: shared_workspace.pointer() as usize,
                     expected_expert_rows: *expected_expert_rows,
                     weight_layout: *weight_layout,
+                    split_int4,
                 };
                 let plan = if let Some(plan) = self.w4.get(&key).and_then(Weak::upgrade) {
                     plan
                 } else {
                     let t = Instant::now();
-                    let plan = Rc::new(GroupedW4A8::prepare_with_config(
+                    let prepare = if split_int4 {
+                        GroupedW4A8::prepare_split_int4
+                    } else {
+                        GroupedW4A8::prepare_with_config
+                    };
+                    let plan = Rc::new(prepare(
                         &self.session,
                         GroupedShape {
                             rows,
@@ -1081,7 +1117,8 @@ impl Worker {
                 | Instruction::Exchange { .. }
                 | Instruction::Kernel { .. }
                 | Instruction::Reduce { .. }
-                | Instruction::W4 { .. } => unreachable!(),
+                | Instruction::W4 { .. }
+                | Instruction::W4A4 { .. } => unreachable!(),
             });
         }
         if !pending.is_empty() {

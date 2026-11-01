@@ -437,14 +437,34 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                     expected_expert_rows,
                     weight_layout,
                     ..
+                }
+                | Instruction::W4A4 {
+                    rows,
+                    input,
+                    output,
+                    experts,
+                    name,
+                    buffers: bindings,
+                    workspace,
+                    groups,
+                    expected_expert_rows,
+                    weight_layout,
+                    ..
                 } = instruction
                 {
+                    let split_int4 = matches!(instruction, Instruction::W4A4 { .. });
+                    if split_int4 && (*weight_layout != W4Layout::TransposedNz || groups.is_none())
+                    {
+                        return Err(
+                            "Split INT4 requires a transposed NZ bank and device groups".into()
+                        );
+                    }
                     let (routed_experts, selected) = match packet.role {
                         PacketRole::Target => (384, 6),
                         PacketRole::Draft => (128, 3),
                     };
                     if *experts != routed_experts / model.ranks.len()
-                        || *rows != current_capacity * selected
+                        || *rows != current_capacity * selected * if split_int4 { 2 } else { 1 }
                         || !input.is_multiple_of(256)
                         || !output.is_multiple_of(32)
                     {
@@ -489,7 +509,7 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                         return Err("W4 prepared tensor differs from its physical layout".into());
                     }
                     let extents = [
-                        rows * input,
+                        rows * input / if split_int4 { 2 } else { 1 },
                         experts * input * output / 2,
                         experts * output * 8,
                         experts * output * 4,

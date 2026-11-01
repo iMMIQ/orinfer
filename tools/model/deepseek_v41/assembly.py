@@ -121,7 +121,7 @@ def check_intermediate_liveness(program, candidates, describe, contract, definit
             writes.add(root(step["destination"]))
         elif step["op"] == "snapshot":
             reads.add(root(step["buffer"]))
-        elif step["op"] == "w4":
+        elif step["op"] in ("w4", "w4_a4"):
             reads.update(root(n) for n in step["buffers"][:5])
             writes.add(root(step["buffers"][5]))
         if live & reads:

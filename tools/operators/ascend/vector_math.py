@@ -101,3 +101,45 @@ def div_fp32_rows(
     T.tile.sub(residual, residual, product)
     T.tile.div(residual, residual, denominator)
     T.tile.add(destination, destination, residual)
+
+
+@T.macro
+def quantize_bf16_row(source, out, scales, row, width):
+    """Quantize one BF16 row with the shared precise FP32 division boundary."""
+    a = T.alloc_ub((1, width), "float32")
+    absolute = T.alloc_ub((1, width), "float32")
+    maximum = T.alloc_ub((1, 1), "float32")
+    scale = T.alloc_ub((1, 1), "float32")
+    divisor = T.alloc_ub((1, 1), "float32")
+    scale_residual = T.alloc_ub((1, 1), "float32")
+    scale_negative = T.alloc_ub((1, 1), "float32")
+    scale_high = T.alloc_ub((1, 1), "float32")
+    scale_low = T.alloc_ub((1, 1), "float32")
+    scale_tile = T.alloc_ub((1, width), "float32")
+    residual = T.alloc_ub((1, width), "float32")
+    quotient_low = T.alloc_ub((1, width), "float32")
+    product = T.alloc_ub((1, width), "float32")
+    rounded = T.alloc_ub((1, width), "float16")
+    yq = T.alloc_ub((1, width), "int8")
+    T.tile.cast(a, source, "CAST_NONE", width)
+    T.tile.abs(absolute, a)
+    T.reduce_max(absolute, maximum, dim=1)
+    T.tile.max(maximum, maximum, 1e-12)
+    T.tile.fill(divisor, 127.0)
+    div_127_fp32(maximum, divisor, scale, scale_negative, scale_residual)
+    scale_high[0, 0] = T.reinterpret(
+        "float32",
+        T.bitwise_and(T.reinterpret("uint32", scale[0, 0]), T.uint32(4294963200)),
+    )
+    T.tile.sub(scale_low, scale, scale_high)
+    T.tile.broadcast(scale_tile, scale)
+    div_fp32_scalar(
+        a, scale_tile, scale_high, scale_low, a, residual, absolute, quotient_low, product
+    )
+    T.tile.min(a, a, 127.0)
+    T.tile.max(a, a, -127.0)
+    T.tile.round(a, a, width)
+    T.tile.cast(rounded, a, "CAST_RINT", width)
+    T.tile.cast(yq, rounded, "CAST_RINT", width)
+    T.copy(yq, out[row : row + 1, :])
+    T.copy(scale, scales[row : row + 1])

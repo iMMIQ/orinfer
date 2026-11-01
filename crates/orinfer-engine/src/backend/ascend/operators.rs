@@ -160,6 +160,17 @@ impl Tensor {
         bits: usize,
         storage: Option<(&[usize], i32)>,
     ) -> Result<Self> {
+        Self::with_storage_view(api, buffer, shape, dtype, bits, storage, false)
+    }
+    fn with_storage_view(
+        api: &Rc<Api>,
+        buffer: &Buffer,
+        shape: &[usize],
+        dtype: i32,
+        bits: usize,
+        storage: Option<(&[usize], i32)>,
+        transposed: bool,
+    ) -> Result<Self> {
         let elements = shape
             .iter()
             .try_fold(1usize, |n, &d| n.checked_mul(d).filter(|_| d > 0))
@@ -193,6 +204,13 @@ impl Tensor {
             stride[i] = stride[i + 1]
                 .checked_mul(dims[i + 1])
                 .ok_or("ACL tensor stride overflow")?;
+        }
+        if transposed {
+            if dims.len() != 3 {
+                return Err("Transposed grouped weights require three dimensions".into());
+            }
+            stride[1] = 1;
+            stride[2] = dims[1];
         }
         // SAFETY: Checked logical and physical geometry span this retained allocation.
         // ACL copies the metadata arrays; device backing remains owned by Tensor.
@@ -456,6 +474,51 @@ impl GroupedW4A8 {
         groups: Option<&Buffer>,
         config: GroupedConfig,
     ) -> Result<Self> {
+        Self::prepare_config(
+            session,
+            shape,
+            ends,
+            input,
+            workspace,
+            groups,
+            (config, false),
+        )
+    }
+    pub fn prepare_split_int4(
+        session: &Session,
+        shape: GroupedShape,
+        ends: &[i64],
+        input: GroupedInputs<'_>,
+        workspace: Option<&Buffer>,
+        groups: Option<&Buffer>,
+        config: GroupedConfig,
+    ) -> Result<Self> {
+        if config.weight_layout != W4Layout::TransposedNz
+            || !shape.rows.is_multiple_of(2)
+            || ends.iter().any(|n| n % 2 != 0)
+        {
+            return Err("Split INT4 requires paired rows and transposed NZ weights".into());
+        }
+        Self::prepare_config(
+            session,
+            shape,
+            ends,
+            input,
+            workspace,
+            groups,
+            (config, true),
+        )
+    }
+    fn prepare_config(
+        session: &Session,
+        shape: GroupedShape,
+        ends: &[i64],
+        input: GroupedInputs<'_>,
+        workspace: Option<&Buffer>,
+        groups: Option<&Buffer>,
+        options: (GroupedConfig, bool),
+    ) -> Result<Self> {
+        let (config, split_int4) = options;
         shape.validate(ends)?;
         let buffers = [
             input.activation,
@@ -500,26 +563,40 @@ impl GroupedW4A8 {
         } = shape;
         let transposed_nz = config.weight_layout == W4Layout::TransposedNz;
         let weight = if transposed_nz {
-            // V5 keeps the logical [E,K,N] view and its contiguous strides.
-            // Its tuning flag interprets the separate physical INT4 NZ shape.
-            Tensor::with_storage(
+            // A8 uses the logical contiguous view with the V5 NZ tuning flag.
+            // A4 exposes the same immutable NZ bank through transposed
+            // [E,K,N] strides; no payload conversion is performed.
+            Tensor::with_storage_view(
                 &api,
                 input.weight,
                 &[e, k, n],
                 29,
                 4,
                 Some((&[e, k / 64, n / 16, 16, 64], 29)),
+                split_int4,
             )?
         } else {
             Tensor::new(&api, input.weight, &[e, k, n], 29, 4)?
         };
         let descriptors = [
-            Tensor::new(&api, input.activation, &[m, k], 2, 8)?,
+            Tensor::new(
+                &api,
+                input.activation,
+                &[m, k],
+                if split_int4 { 29 } else { 2 },
+                if split_int4 { 4 } else { 8 },
+            )?,
             weight,
             Tensor::new(&api, input.weight_scale, &[e, 1, n], 10, 64)?,
             Tensor::new(&api, input.assist, &[e, n], 0, 32)?,
             Tensor::new(&api, input.token_scale, &[m], 0, 32)?,
-            Tensor::new(&api, input.output, &[m, n], 27, 16)?,
+            Tensor::new(
+                &api,
+                input.output,
+                &[m, n],
+                if split_int4 { 1 } else { 27 },
+                16,
+            )?,
         ];
         let lists = descriptors
             .into_iter()
@@ -553,7 +630,11 @@ impl GroupedW4A8 {
                 (api.prepare)(
                     lists[0].handle,
                     lists[1].handle,
-                    lists[3].handle,
+                    if split_int4 {
+                        ptr::null_mut()
+                    } else {
+                        lists[3].handle
+                    },
                     lists[2].handle,
                     ptr::null_mut(),
                     ptr::null_mut(),
