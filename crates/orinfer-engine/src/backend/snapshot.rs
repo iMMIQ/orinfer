@@ -38,19 +38,73 @@ impl Workspace {
         self.snapshot.bytes
     }
 }
+#[derive(Clone)]
 pub(crate) struct Plan {
     pub(super) owner: orinfer_device::DeviceOwner,
     pub(super) state: BTreeMap<String, Range>,
     pub(super) shared: BTreeMap<String, Range>,
+    pub(super) tails: BTreeMap<String, Range>,
+    pub(super) host_inherited: Vec<super::kv::host::HostPiece>,
     pub(super) kv: Vec<Piece>,
     pub new_bytes: usize,
 }
 impl Plan {
+    pub(crate) fn for_host_parent(
+        &self,
+        parent: Option<&super::kv::host::HostSnapshot>,
+    ) -> Result<Self> {
+        let mut plan = self.clone();
+        let Some(parent) = parent else {
+            return Ok(plan);
+        };
+        self.owner.require(parent.owner)?;
+        if self.kv.iter().any(|p| p.allocation.handle.is_none()) {
+            return Ok(plan);
+        }
+        for (name, tail) in &self.tails {
+            let candidates = parent
+                .state
+                .iter()
+                .chain(&parent.kv)
+                .filter(|p| &p.name == name && !p.data.bank.descriptor().is_some_and(|d| d.paged))
+                .collect::<Vec<_>>();
+            let reuse = super::kv::reuse_tail(*tail, candidates.iter().map(|p| p.range))?;
+            for part in reuse.parts {
+                let p = candidates[part.index];
+                plan.host_inherited.push(super::kv::host::HostPiece {
+                    name: p.name.clone(),
+                    range: part.range,
+                    data: p.data.view(Range {
+                        offset: part.source_offset,
+                        bytes: part.range.bytes,
+                    })?,
+                });
+            }
+            if reuse.missing.bytes > 0 {
+                plan.state.insert(name.clone(), reuse.missing);
+            } else {
+                plan.state.remove(name);
+            }
+        }
+        plan.new_bytes = size(&plan.state)?;
+        Ok(plan)
+    }
     pub(crate) fn host_banks(&self) -> BTreeMap<u64, usize> {
-        self.kv
+        let mut banks = self
+            .kv
             .iter()
             .map(|p| (p.allocation.id, p.allocation.used))
-            .collect()
+            .collect::<BTreeMap<_, _>>();
+        for p in &self.host_inherited {
+            let id = p
+                .data
+                .bank
+                .descriptor()
+                .expect("Saved CPU bank identity")
+                .id;
+            banks.insert(id, p.data.bank.bytes.borrow().len());
+        }
+        banks
     }
 }
 impl Snapshot {
@@ -91,6 +145,113 @@ mod tests {
     use super::*;
     use orinfer_device::{Backend, DeviceOwner};
 
+    #[test]
+    fn cpu_parent_plan_reuses_only_kv_and_accounts_inherited_banks() {
+        let owner = DeviceOwner::new(Backend::Cuda, 0);
+        let allocation = Rc::new(Allocation {
+            owner,
+            id: 2,
+            address: 0,
+            bytes: 20,
+            used: 20,
+            handle: None,
+            native: None,
+        });
+        let state = vec![
+            Piece {
+                allocation: allocation.clone(),
+                name: "kv".into(),
+                range: Range {
+                    offset: 0,
+                    bytes: 16,
+                },
+                source: 0,
+            },
+            Piece {
+                allocation,
+                name: "position".into(),
+                range: Range {
+                    offset: 0,
+                    bytes: 4,
+                },
+                source: 16,
+            },
+        ];
+        let mut pool = super::super::kv::host::HostPool::default();
+        let parent = pool
+            .capture(
+                &Snapshot {
+                    owner,
+                    bytes: 20,
+                    state,
+                    kv: vec![],
+                },
+                |regions, output| {
+                    for (_, _, dest, bytes) in regions {
+                        output[*dest..dest + bytes].fill(73);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let plan = Plan {
+            owner,
+            state: [
+                (
+                    "kv".into(),
+                    Range {
+                        offset: 0,
+                        bytes: 24,
+                    },
+                ),
+                (
+                    "position".into(),
+                    Range {
+                        offset: 0,
+                        bytes: 4,
+                    },
+                ),
+            ]
+            .into(),
+            shared: BTreeMap::new(),
+            tails: [(
+                "kv".into(),
+                Range {
+                    offset: 0,
+                    bytes: 24,
+                },
+            )]
+            .into(),
+            host_inherited: vec![],
+            kv: vec![],
+            new_bytes: 512,
+        };
+        let inherited = plan.for_host_parent(Some(&parent)).unwrap();
+        assert_eq!(inherited.host_inherited.len(), 1);
+        assert_eq!(
+            inherited.host_inherited[0].range,
+            Range {
+                offset: 0,
+                bytes: 16
+            }
+        );
+        assert_eq!(
+            inherited.state["kv"],
+            Range {
+                offset: 16,
+                bytes: 8
+            }
+        );
+        assert_eq!(
+            inherited.state["position"],
+            Range {
+                offset: 0,
+                bytes: 4
+            }
+        );
+        assert_eq!(inherited.host_banks().get(&2), Some(&20));
+        assert_eq!(plan.state["kv"].bytes, 24);
+    }
     #[test]
     fn snapshot_rejects_foreign_session_and_foreign_backing() {
         let owner = DeviceOwner::new(Backend::Cuda, 0);

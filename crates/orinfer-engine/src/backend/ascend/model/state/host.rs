@@ -4,6 +4,12 @@ impl StateBytes for HostBuffer {
     fn bytes(&self) -> usize {
         self.bytes
     }
+    fn view(&self, range: orinfer_device::MemoryRange) -> Result<Self> {
+        self.view(range)
+    }
+    fn paged(&self) -> bool {
+        self.bank.descriptor().is_some_and(|d| d.paged)
+    }
     fn host_capacity(&self) -> usize {
         self.bank.bytes.borrow().len()
     }
@@ -507,6 +513,153 @@ mod tests {
         drop(session);
         fixture.assert_clean();
     }
+    fn incremental_tail_lifecycle(session: &Session) {
+        let grain = 2 << 20;
+        let source = session.reserve(grain * 2).unwrap();
+        session.grow_many(&[(source.clone(), 4096)]).unwrap();
+        session
+            .upload(&source, 0, &[73; 2048])
+            .unwrap()
+            .wait()
+            .unwrap();
+        let ring = session.allocate(64).unwrap();
+        session.fill(&ring, 0).unwrap().wait().unwrap();
+        let layouts = [
+            StateLayout {
+                buffer: "kv".into(),
+                row_bytes: 1,
+                tokens_per_row: 1,
+                window: None,
+                circular: false,
+                append_only: true,
+            },
+            StateLayout {
+                buffer: "ring".into(),
+                row_bytes: 64,
+                tokens_per_row: 0,
+                window: None,
+                circular: false,
+                append_only: false,
+            },
+        ];
+        let buffers = BTreeMap::from([
+            ("kv".to_owned(), source.clone()),
+            ("ring".to_owned(), ring.clone()),
+        ]);
+        let mut pool = HostPool::default();
+        let mut gpu =
+            Snapshot::capture(session, layouts.iter(), &buffers, &[1; 2048], 1, None).unwrap();
+        let mut cpu = HostSnapshot::offload(session, &gpu, &mut pool).unwrap();
+        let target = session.reserve(grain * 2).unwrap();
+        let actual = BTreeMap::from([
+            ("kv".to_owned(), target.clone()),
+            ("ring".to_owned(), session.allocate(64).unwrap()),
+        ]);
+        let mut repacks = 0;
+        for i in 1..=12usize {
+            let n = 2048 + i;
+            session
+                .upload(&source, n - 1, &[i as u8])
+                .unwrap()
+                .wait()
+                .unwrap();
+            session.fill(&ring, i as u8).unwrap().wait().unwrap();
+            let history = vec![1; n];
+            let plan =
+                Snapshot::plan_device(layouts.iter(), &buffers, &history, Some(&gpu)).unwrap();
+            let copy_bytes = plan
+                .pending
+                .iter()
+                .filter(|(name, _, _, _)| name == "kv")
+                .map(|(_, _, span, _)| span.len())
+                .sum::<usize>();
+            assert!(copy_bytes == 1 || copy_bytes == n);
+            repacks += usize::from(copy_bytes == n);
+            let expected = plan.allocations(i as u64 + 1).unwrap();
+            drop(plan);
+            let next = Snapshot::capture(
+                session,
+                layouts.iter(),
+                &buffers,
+                &history,
+                i as u64 + 1,
+                Some(&gpu),
+            )
+            .unwrap();
+            assert_eq!(next.allocations(), expected);
+            assert!(next.pieces.iter().filter(|p| p.name == "kv").count() <= 8);
+            assert!(
+                next.pieces
+                    .iter()
+                    .filter(|p| p.name == "ring")
+                    .all(|p| p.bank_id == kv::checkpoint_id(i as u64 + 1).unwrap())
+            );
+            let (plan, _) =
+                HostSnapshot::plan_checkpoint(layouts.iter(), &buffers, &history, Some(&cpu))
+                    .unwrap();
+            let mut host_expected = plan
+                .pieces
+                .iter()
+                .map(|p| (p.bank_id, p.bank_bytes))
+                .collect::<BTreeMap<_, _>>();
+            host_expected.insert(kv::checkpoint_id(i as u64 + 100).unwrap(), plan.bytes + 255);
+            drop(plan);
+            let before = session.allocated_bytes();
+            let host = HostSnapshot::capture_host(
+                session,
+                layouts.iter(),
+                &buffers,
+                &history,
+                i as u64 + 100,
+                Some(&cpu),
+                &mut pool,
+            )
+            .unwrap();
+            assert_eq!(session.allocated_bytes(), before);
+            assert_eq!(host.allocations(), host_expected);
+            next.restore_into(session, &actual).unwrap();
+            let expected_tail = (1..=i as u8).collect::<Vec<_>>();
+            assert_eq!(session.download(&target, 2048, i).unwrap(), expected_tail);
+            assert_eq!(
+                session.download(&actual["ring"], 0, 64).unwrap(),
+                [i as u8; 64]
+            );
+            host.restore_host_into(session, &actual).unwrap();
+            assert_eq!(session.download(&target, 2048, i).unwrap(), expected_tail);
+            assert_eq!(session.download(&target, 0, 17).unwrap(), [73; 17]);
+            assert_eq!(
+                session.download(&actual["ring"], 0, 64).unwrap(),
+                [i as u8; 64]
+            );
+            gpu = next;
+            cpu = host;
+        }
+        assert!(
+            repacks > 0,
+            "long sparse tails periodically compact rather than retaining an unbounded chain"
+        );
+        let late_parent = HostSnapshot::offload(session, &gpu, &mut pool).unwrap();
+        drop((
+            gpu,
+            cpu,
+            late_parent,
+            pool,
+            buffers,
+            source,
+            ring,
+            actual,
+            target,
+        ));
+        assert_eq!(session.allocated_bytes(), 0);
+    }
+    #[test]
+    fn inherited_tail_views_keep_mutable_state_private_and_repack_long_chains() {
+        let mut fixture = Fixture::new();
+        let session = fixture.session();
+        incremental_tail_lifecycle(&session);
+        drop(session);
+        fixture.assert_clean();
+    }
     #[test]
     fn shared_pages_cow_offload_and_resident_reuse() {
         let mut fixture = Fixture::new();
@@ -541,6 +694,143 @@ mod tests {
         .unwrap();
         shared_page_lifecycle(&session);
         compact_checkpoint_lifecycle(&session);
+        incremental_tail_lifecycle(&session);
+    }
+    #[test]
+    #[ignore = "Measures checkpoint copies on real A2; explicit layout/report env and GPU lock required"]
+    fn incremental_tail_copy_cost_on_device() {
+        use std::{fs::OpenOptions, os::fd::AsRawFd, path::PathBuf, time::Instant};
+        let input = PathBuf::from(std::env::var_os("ORINFER_KV_LAYOUT").unwrap());
+        let output = PathBuf::from(std::env::var_os("ORINFER_KV_REPORT").unwrap());
+        let entries: Vec<(StateLayout, usize)> = crate::model::read(&input).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open("artifacts/gpu-experiment.lock")
+            .unwrap();
+        assert_eq!(
+            // SAFETY: The retained file serializes the device until session destruction.
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let session = Session::new(
+            0,
+            crate::backend::ascend::runtime::Limits {
+                device_bytes: 1 << 30,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut buffers = BTreeMap::new();
+        for (layout, bytes) in &entries {
+            let b = if layout.append_only {
+                session.reserve(*bytes).unwrap()
+            } else {
+                let b = session.allocate(*bytes).unwrap();
+                session.fill(&b, 0).unwrap().wait().unwrap();
+                b
+            };
+            buffers.insert(layout.buffer.clone(), b);
+        }
+        let layouts = entries.iter().map(|(l, _)| l).collect::<Vec<_>>();
+        let growth = |tokens| {
+            entries
+                .iter()
+                .filter(|(l, _)| l.append_only)
+                .map(|(l, bytes)| {
+                    (
+                        buffers[&l.buffer].clone(),
+                        l.spans(tokens, *bytes).unwrap().last().map_or(0, |s| s.end),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let n = 196608;
+        session.grow_many(&growth(n)).unwrap();
+        let parent = Snapshot::capture(
+            &session,
+            layouts.iter().copied(),
+            &buffers,
+            &vec![1; n],
+            1,
+            None,
+        )
+        .unwrap();
+        session.grow_many(&growth(n + 256)).unwrap();
+        let history = vec![1; n + 256];
+        let mut samples = [vec![], vec![]];
+        let mut metrics = vec![];
+        for mode in 0..2 {
+            let base = (mode == 1).then_some(&parent);
+            let plan =
+                Snapshot::plan_device(layouts.iter().copied(), &buffers, &history, base).unwrap();
+            metrics.push(serde_json::json!({
+                "mode":if mode == 0 { "copy_tail" } else { "reuse_parent_tail" },
+                "copy_bytes":plan.bytes,
+                "KV_copy_bytes":plan.pending.iter().filter(|(name, _, _, _)| entries.iter().any(|(l, _)| l.append_only && l.buffer == *name)).map(|(_, _, r, _)| r.len()).sum::<usize>(),
+                "inherited_private_fragments":plan.pieces.iter().filter(|p| p.buffer.allocation.handle.is_none()).count(),
+            }));
+        }
+        for repeat in 0..9 {
+            for step in 0..2 {
+                let mode = (repeat + step) % 2;
+                let base = (mode == 1).then_some(&parent);
+                let at = Instant::now();
+                let snapshot = Snapshot::capture(
+                    &session,
+                    layouts.iter().copied(),
+                    &buffers,
+                    &history,
+                    10 + (repeat * 2 + step) as u64,
+                    base,
+                )
+                .unwrap();
+                if repeat >= 2 {
+                    samples[mode].push(at.elapsed().as_secs_f64());
+                }
+                drop(snapshot);
+            }
+        }
+        for (mode, values) in samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            metrics[mode]["median_s"] = values[values.len() / 2].into();
+            metrics[mode]["samples_s"] = serde_json::to_value(values).unwrap();
+        }
+        let mut pool = HostPool::default();
+        let cpu_parent = HostSnapshot::offload(&session, &parent, &mut pool).unwrap();
+        let mut cpu_samples = [vec![], vec![]];
+        for repeat in 0..9 {
+            for step in 0..2 {
+                let mode = (repeat + step) % 2;
+                let at = Instant::now();
+                let saved = HostSnapshot::capture_host(
+                    &session,
+                    layouts.iter().copied(),
+                    &buffers,
+                    &history,
+                    100 + (repeat * 2 + step) as u64,
+                    (mode == 1).then_some(&cpu_parent),
+                    &mut pool,
+                )
+                .unwrap();
+                if repeat >= 2 {
+                    cpu_samples[mode].push(at.elapsed().as_secs_f64());
+                }
+                drop(saved);
+            }
+        }
+        for (mode, values) in cpu_samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            metrics[mode]["cpu_median_s"] = values[values.len() / 2].into();
+            metrics[mode]["cpu_samples_s"] = serde_json::to_value(values).unwrap();
+        }
+        let report = serde_json::json!({"context":n,"append_tokens":256,"geometry":"real package state, memory operations only; no weights or operators","rows":metrics});
+        std::fs::write(output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        eprintln!("KV_DELTA {report}");
+        drop((cpu_parent, pool, parent, buffers));
+        assert_eq!(session.allocated_bytes(), 0);
     }
     #[test]
     fn host_shared_rows_restore_parent_after_child_offload_and_direct_append() {

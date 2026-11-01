@@ -201,6 +201,10 @@ impl<B> CapturePlan<B> {
 }
 pub(super) trait StateBytes: Clone {
     fn bytes(&self) -> usize;
+    fn view(&self, range: orinfer_device::MemoryRange) -> Result<Self>;
+    fn paged(&self) -> bool {
+        false
+    }
     fn host_capacity(&self) -> usize {
         self.bytes()
     }
@@ -208,6 +212,9 @@ pub(super) trait StateBytes: Clone {
 impl StateBytes for Buffer {
     fn bytes(&self) -> usize {
         self.bytes()
+    }
+    fn view(&self, range: orinfer_device::MemoryRange) -> Result<Self> {
+        self.slice(range.offset, range.bytes)
     }
 }
 impl<B: StateBytes> Snapshot<B> {
@@ -286,10 +293,35 @@ impl<B: StateBytes> Snapshot<B> {
             for span in layout.spans(history.len(), source.bytes())? {
                 let regions = kv::checkpoint_regions(source.kv_preview(span.end)?)?;
                 if let Some(tail) = regions.tail {
+                    let candidates = parent
+                        .into_iter()
+                        .flat_map(|p| &p.pieces)
+                        .filter(|p| p.name == layout.buffer && !p.buffer.paged())
+                        .collect::<Vec<_>>();
+                    let reuse = kv::reuse_tail(
+                        tail,
+                        candidates.iter().map(|p| orinfer_device::MemoryRange {
+                            offset: p.offset,
+                            bytes: p.buffer.bytes(),
+                        }),
+                    )?;
+                    for part in reuse.parts {
+                        let p = candidates[part.index];
+                        plan.pieces.push(Piece {
+                            name: p.name.clone(),
+                            offset: part.range.offset,
+                            buffer: p.buffer.view(orinfer_device::MemoryRange {
+                                offset: part.source_offset,
+                                bytes: part.range.bytes,
+                            })?,
+                            bank_id: p.bank_id,
+                            bank_bytes: p.bank_bytes,
+                        });
+                    }
                     plan.append(
                         &layout.buffer,
                         source.clone(),
-                        tail.offset..tail.offset + tail.bytes,
+                        reuse.missing.offset..reuse.missing.offset + reuse.missing.bytes,
                     )?;
                 }
                 shared.extend(
@@ -371,6 +403,20 @@ impl DeviceBuffer {
 impl StateBytes for DeviceBuffer {
     fn bytes(&self) -> usize {
         self.bytes
+    }
+    fn view(&self, range: orinfer_device::MemoryRange) -> Result<Self> {
+        range.within(self.bytes)?;
+        Ok(Self {
+            allocation: self.allocation.clone(),
+            source: self
+                .source
+                .checked_add(range.offset)
+                .ok_or("Device KV view overflow")?,
+            bytes: range.bytes,
+        })
+    }
+    fn paged(&self) -> bool {
+        self.allocation.handle.is_some()
     }
     fn host_capacity(&self) -> usize {
         self.allocation.used

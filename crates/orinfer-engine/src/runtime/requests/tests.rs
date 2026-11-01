@@ -1113,7 +1113,7 @@ fn validate_flash_mtp() {
             .collect();
         let plan = model
             .execution
-            .plan_snapshot(ranges, &BTreeSet::new())
+            .plan_snapshot(ranges, &BTreeSet::new(), None)
             .unwrap();
         let saved = model.execution.snapshot(&plan).unwrap().unwrap();
         for width in spec.verification_widths() {

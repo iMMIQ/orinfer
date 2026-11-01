@@ -94,6 +94,19 @@ pub(crate) struct HostBuffer {
     pub offset: usize,
     pub bytes: usize,
 }
+impl HostBuffer {
+    pub fn view(&self, range: MemoryRange) -> Result<Self> {
+        range.within(self.bytes)?;
+        Ok(Self {
+            bank: self.bank.clone(),
+            offset: self
+                .offset
+                .checked_add(range.offset)
+                .ok_or("Host KV view overflow")?,
+            bytes: range.bytes,
+        })
+    }
+}
 #[derive(Default)]
 pub(crate) struct HostPool(BTreeMap<u64, Weak<HostBank>>);
 impl HostPool {

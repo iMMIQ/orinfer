@@ -339,10 +339,166 @@ pub(crate) fn checkpoint_regions(preview: Vec<Published>) -> Result<CheckpointRe
     Ok(CheckpointRegions { shared, tail })
 }
 
+/// Bound scatter copies and old-bank retention. Eight pieces cover a 2MiB
+/// key allocation at this A2 model's 4096-token checkpoints; sparser scale
+/// histories periodically repack rather than pinning an unbounded chain.
+const MAX_TAIL_PARTS: usize = 8;
+pub(crate) struct TailPart {
+    pub index: usize,
+    pub range: MemoryRange,
+    pub source_offset: usize,
+}
+pub(crate) struct TailReuse {
+    pub parts: Vec<TailPart>,
+    pub missing: MemoryRange,
+}
+/// Reuse only a contiguous immutable prefix of the requested private suffix.
+/// Indices refer to caller metadata; device and CPU adapters supply bounded views.
+pub(crate) fn reuse_tail(
+    tail: MemoryRange,
+    parent: impl IntoIterator<Item = MemoryRange>,
+) -> Result<TailReuse> {
+    let end = tail
+        .offset
+        .checked_add(tail.bytes)
+        .ok_or("KV suffix overflow")?;
+    let mut ranges = parent
+        .into_iter()
+        .enumerate()
+        .map(|(index, range)| {
+            let stop = range
+                .offset
+                .checked_add(range.bytes)
+                .ok_or("Parent KV suffix overflow")?;
+            Ok((index, range, stop))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ranges.sort_by_key(|(_, range, _)| range.offset);
+    let mut cursor = tail.offset;
+    let mut parts = vec![];
+    for (index, range, stop) in ranges {
+        if cursor == end {
+            break;
+        }
+        if stop <= cursor {
+            continue;
+        }
+        if range.offset > cursor {
+            break;
+        }
+        let next = stop.min(end);
+        parts.push(TailPart {
+            index,
+            range: MemoryRange {
+                offset: cursor,
+                bytes: next - cursor,
+            },
+            source_offset: cursor - range.offset,
+        });
+        cursor = next;
+    }
+    let missing = MemoryRange {
+        offset: cursor,
+        bytes: end - cursor,
+    };
+    if parts.len() + usize::from(missing.bytes != 0) > MAX_TAIL_PARTS {
+        return Ok(TailReuse {
+            parts: vec![],
+            missing: tail,
+        });
+    }
+    Ok(TailReuse { parts, missing })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::BTreeMap};
+    #[test]
+    fn tail_reuse_crops_promoted_prefix_and_bounds_fragment_chains() {
+        let reuse = reuse_tail(
+            MemoryRange {
+                offset: 4,
+                bytes: 16,
+            },
+            [
+                MemoryRange {
+                    offset: 8,
+                    bytes: 8,
+                },
+                MemoryRange {
+                    offset: 0,
+                    bytes: 8,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            reuse
+                .parts
+                .iter()
+                .map(|p| (p.index, p.source_offset, p.range))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    1,
+                    4,
+                    MemoryRange {
+                        offset: 4,
+                        bytes: 4
+                    }
+                ),
+                (
+                    0,
+                    0,
+                    MemoryRange {
+                        offset: 8,
+                        bytes: 8
+                    }
+                ),
+            ]
+        );
+        assert_eq!(
+            reuse.missing,
+            MemoryRange {
+                offset: 16,
+                bytes: 4
+            }
+        );
+        let full = reuse_tail(
+            MemoryRange {
+                offset: 12,
+                bytes: 4,
+            },
+            [MemoryRange {
+                offset: 0,
+                bytes: 16,
+            }],
+        )
+        .unwrap();
+        assert_eq!(full.parts[0].source_offset, 12);
+        assert_eq!(full.missing.bytes, 0);
+        let too_many = reuse_tail(
+            MemoryRange {
+                offset: 0,
+                bytes: 9,
+            },
+            (0..8).map(|offset| MemoryRange { offset, bytes: 1 }),
+        )
+        .unwrap();
+        assert!(too_many.parts.is_empty());
+        assert_eq!(too_many.missing.bytes, 9);
+        assert!(
+            reuse_tail(
+                MemoryRange {
+                    offset: usize::MAX,
+                    bytes: 1
+                },
+                []
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn checkpoint_shares_full_allocations_and_packs_only_the_partial_suffix() {
         for grain in [64, 2 << 20] {

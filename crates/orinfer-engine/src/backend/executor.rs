@@ -576,9 +576,10 @@ impl Executor {
         &self,
         ranges: BTreeMap<String, Range>,
         kv_names: &BTreeSet<String>,
+        base: Option<&Snapshot>,
     ) -> Result<Plan> {
         match &self.implementation {
-            Implementation::Cuda(inner) => inner.plan_snapshot(ranges, kv_names),
+            Implementation::Cuda(inner) => inner.plan_snapshot(ranges, kv_names, base),
         }
     }
     pub(crate) fn snapshot(&mut self, plan: &Plan) -> Result<Option<Snapshot>> {

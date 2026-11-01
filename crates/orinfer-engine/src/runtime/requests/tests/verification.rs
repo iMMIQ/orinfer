@@ -193,8 +193,11 @@ fn validate_joint_target_verification() {
                                             )
                                         })
                                         .collect();
-                                    let plan =
-                                        m.execution.plan_snapshot(ranges, &Default::default())?;
+                                    let plan = m.execution.plan_snapshot(
+                                        ranges,
+                                        &Default::default(),
+                                        None,
+                                    )?;
                                     m.execution
                                         .snapshot(&plan)?
                                         .ok_or("No room for replay state".into())

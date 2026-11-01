@@ -24,7 +24,12 @@ impl Executor {
         &self,
         ranges: BTreeMap<String, Range>,
         kv_names: &BTreeSet<String>,
+        base: Option<&Snapshot>,
     ) -> Result<Plan> {
+        if let Some(base) = base {
+            base.require_owner(self.session.owner)?;
+        }
+        let mut tails = BTreeMap::new();
         let (mut state_ranges, mut shared, mut kv) = (BTreeMap::new(), BTreeMap::new(), vec![]);
         for (name, range) in ranges {
             range.within(*self.sizes.get(&name).ok_or("Unknown snapshot buffer")?)?;
@@ -40,7 +45,29 @@ impl Executor {
                     buffer.preview(self.session.owner, range)?,
                 )?;
                 if let Some(suffix) = regions.tail {
-                    state_ranges.insert(name.clone(), suffix);
+                    tails.insert(name.clone(), suffix);
+                    let candidates = base
+                        .into_iter()
+                        .flat_map(|p| p.state.iter().chain(&p.kv))
+                        .filter(|p| p.name == name && p.allocation.handle.is_none())
+                        .collect::<Vec<_>>();
+                    let reuse =
+                        crate::backend::kv::reuse_tail(suffix, candidates.iter().map(|p| p.range))?;
+                    for part in reuse.parts {
+                        let p = candidates[part.index];
+                        kv.push(Piece {
+                            allocation: p.allocation.clone(),
+                            name: name.clone(),
+                            range: part.range,
+                            source: p
+                                .source
+                                .checked_add(part.source_offset)
+                                .ok_or("KV source overflow")?,
+                        });
+                    }
+                    if reuse.missing.bytes > 0 {
+                        state_ranges.insert(name.clone(), reuse.missing);
+                    }
                 }
                 let mut end = 0;
                 for (allocation, range, source) in regions.shared {
@@ -70,22 +97,33 @@ impl Executor {
             owner: self.session.owner,
             state: state_ranges,
             shared,
+            tails,
+            host_inherited: vec![],
             kv,
             new_bytes,
         })
     }
     pub(crate) fn snapshot(&mut self, plan: &Plan) -> Result<Option<Snapshot>> {
         self.session.owner.require(plan.owner)?;
+        if !plan.host_inherited.is_empty() {
+            return Err("CPU checkpoint plan cannot be captured in device tier".into());
+        }
         self.sync()?;
         self.collect_snapshots()?;
         let Some(state) = self.save_ranges(plan.state.clone())? else {
             return Ok(None);
         };
-        let Some(kv) = self.save_kv_ranges(&plan.shared)? else {
+        let Some(mut kv) = self.save_kv_ranges(&plan.shared)? else {
             drop(state);
             self.collect_snapshots()?;
             return Ok(None);
         };
+        kv.extend(
+            plan.kv
+                .iter()
+                .filter(|p| p.allocation.handle.is_none())
+                .cloned(),
+        );
         let bytes = state.iter().chain(&kv).map(|p| p.range.bytes).sum();
         self.sync()?;
         Ok(Some(Snapshot {
@@ -172,7 +210,7 @@ impl Executor {
         &mut self,
         ranges: BTreeMap<String, Range>,
     ) -> Result<Option<Rc<RefCell<Workspace>>>> {
-        let plan = self.plan_snapshot(ranges, &BTreeSet::new())?;
+        let plan = self.plan_snapshot(ranges, &BTreeSet::new(), None)?;
         self.collect_snapshots()?;
         let Some(state) = self.allocate_ranges(plan.state, false)? else {
             return Ok(None);
@@ -501,9 +539,15 @@ impl Executor {
     ) -> Result<crate::backend::kv::host::HostSnapshot> {
         self.session.owner.require(plan.owner)?;
         self.sync()?;
-        let kv = self
+        let mut kv = self
             .save_kv_ranges(&plan.shared)?
             .ok_or("KV publication failed")?;
+        kv.extend(
+            plan.kv
+                .iter()
+                .filter(|p| p.allocation.handle.is_none())
+                .cloned(),
+        );
         let state = plan
             .state
             .iter()
@@ -522,9 +566,17 @@ impl Executor {
                 }),
             })
             .collect::<Vec<_>>();
-        pool.capture_components(self.session.owner, &kv, &state, |regions, output| {
-            self.read_host_regions(regions, output)
-        })
+        let mut snapshot =
+            pool.capture_components(self.session.owner, &kv, &state, |regions, output| {
+                self.read_host_regions(regions, output)
+            })?;
+        snapshot.bytes += plan
+            .host_inherited
+            .iter()
+            .map(|p| p.range.bytes)
+            .sum::<usize>();
+        snapshot.kv.extend(plan.host_inherited.iter().cloned());
+        Ok(snapshot)
     }
     fn materialize_host_kv(
         &self,

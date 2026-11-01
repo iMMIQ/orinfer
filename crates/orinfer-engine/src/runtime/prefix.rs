@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub(super) struct Context {
+    parent: Option<(bool, u64)>,
     pub statistics: crate::prefix::Statistics,
 }
 
@@ -145,6 +146,7 @@ impl ModelRuntime {
         context: &mut Context,
     ) -> Result<(usize, super::speculation::PrefillWarm)> {
         context.statistics = crate::prefix::Statistics::default();
+        context.parent = None;
         self.execution.collect_snapshots()?;
         let at = Instant::now();
         let hit = self.prefix_hit(input, media);
@@ -172,6 +174,7 @@ impl ModelRuntime {
             self.execution.restore_snapshot(&e.snapshot)?;
             (e.tokens.len(), e.warm_tokens, e.bytes)
         };
+        context.parent = Some((host, id));
         context.statistics.cached_tokens = tokens;
         context.statistics.restore_s = at.elapsed().as_secs_f64();
         self.prefill_costs
@@ -330,7 +333,16 @@ impl ModelRuntime {
                 .as_ref()
                 .map(|k| k.buffers.keys().cloned().collect())
                 .unwrap_or_default();
-            let plan = self.execution.plan_snapshot(ranges, &kv_names)?;
+            let parent = context
+                .parent
+                .filter(|(host, _)| !host)
+                .and_then(|(_, id)| self.prefix_cache.entries.get(&id))
+                .filter(|e| {
+                    input.starts_with(&e.tokens)
+                        && e.media.common_tokens(media, e.tokens.len()) == e.tokens.len()
+                })
+                .map(|e| &e.snapshot);
+            let plan = self.execution.plan_snapshot(ranges, &kv_names, parent)?;
             let protected = (!logits_valid)
                 .then(|| {
                     self.prefix_cache
@@ -396,7 +408,7 @@ impl ModelRuntime {
                     }
                     let bytes = snapshot.bytes;
                     self.remove_host_endpoint(input, media);
-                    self.prefix_cache.insert(Entry::new(
+                    let id = self.prefix_cache.insert(Entry::new(
                         input.to_vec(),
                         media.clone(),
                         snapshot,
@@ -404,6 +416,7 @@ impl ModelRuntime {
                         warm_tokens,
                         logits_valid,
                     ));
+                    context.parent = Some((false, id));
                     context.statistics.checkpoints_stored += 1;
                 } else {
                     self.execution.release_snapshot(snapshot)?;
@@ -462,17 +475,29 @@ impl ModelRuntime {
         if self.host_prefix_cache.budget == 0 {
             return Ok(());
         }
+        let parent = context
+            .parent
+            .filter(|(host, _)| *host)
+            .and_then(|(_, id)| self.host_prefix_cache.entries.get(&id))
+            .filter(|e| {
+                input.starts_with(&e.tokens)
+                    && e.media.common_tokens(media, e.tokens.len()) == e.tokens.len()
+            })
+            .map(|e| &e.snapshot);
+        let plan = plan.for_host_parent(parent)?;
         let banks = plan.host_banks();
         let metadata =
             Self::host_metadata(input.len(), banks.len().max(self.manifest.buffers.len()))?;
         if !self.reserve_host_prefix(banks, plan.new_bytes, metadata, context) {
             return Ok(());
         }
-        let mut snapshot = self.execution.host_snapshot(plan, &mut self.host_kv_pool)?;
+        let mut snapshot = self
+            .execution
+            .host_snapshot(&plan, &mut self.host_kv_pool)?;
         snapshot.metadata_bytes = metadata;
         let bytes = snapshot.bytes;
         self.remove_host_endpoint(input, media);
-        self.host_prefix_cache.insert(Entry::new(
+        let id = self.host_prefix_cache.insert(Entry::new(
             input.to_vec(),
             media.clone(),
             snapshot,
@@ -480,6 +505,7 @@ impl ModelRuntime {
             warm,
             logits,
         ));
+        context.parent = Some((true, id));
         context.statistics.host_stores += 1;
         context.statistics.checkpoints_stored += 1;
         Ok(())
