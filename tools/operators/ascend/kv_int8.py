@@ -21,12 +21,23 @@ def _contiguous_view(buffer, shape):
 
 @T.macro
 def decode_values(q, half_values, values, half_scales, scale, broadcast, y, groups):
-    T.tile.cast(half_values, q, "CAST_NONE", groups * 64)
-    T.tile.cast(values, half_values, "CAST_NONE", groups * 64)
-    T.tile.cast(scale, half_scales, "CAST_NONE", groups)
-    T.tile.broadcast(broadcast, scale)
-    T.tile.mul(values, values, broadcast)
-    T.tile.cast(y, values, "CAST_RINT", groups * 64)
+    if groups > 128:
+        output_groups = _contiguous_view(y, (groups, 64))
+        for part in T.serial(groups // 128):
+            first = part * 128
+            T.tile.cast(half_values, q[first : first + 128, :], "CAST_NONE", 128 * 64)
+            T.tile.cast(values, half_values, "CAST_NONE", 128 * 64)
+            T.tile.cast(scale, half_scales[first : first + 128, :], "CAST_NONE", 128)
+            T.tile.broadcast(broadcast, scale)
+            T.tile.mul(values, values, broadcast)
+            T.tile.cast(output_groups[first : first + 128, :], values, "CAST_RINT", 128 * 64)
+    else:
+        T.tile.cast(half_values, q, "CAST_NONE", groups * 64)
+        T.tile.cast(values, half_values, "CAST_NONE", groups * 64)
+        T.tile.cast(scale, half_scales, "CAST_NONE", groups)
+        T.tile.broadcast(broadcast, scale)
+        T.tile.mul(values, values, broadcast)
+        T.tile.cast(y, values, "CAST_RINT", groups * 64)
 
 
 @T.macro
@@ -261,6 +272,7 @@ def gather_tile(
     staged_swa,
     staged,
     staged_rows,
+    async_gather,
 ):
     if tile_slots == 1 or not bulk_store or staged:
         T.tile.fill(y, 0.0)
@@ -306,6 +318,12 @@ def gather_tile(
         else:
             T.tile.fill(zeros, 0)
             T.tile.fill(half_scales, 0.0)
+    if async_gather:
+        # Reserve a compiler-visible S->MTE2 event pair for this DMA-only
+        # region. Offline lowering removes it and the redundant inner fences;
+        # the full fences around the complete tile remain in the final code.
+        T.pipe_barrier("ALL")
+        T.set_flag("S", "MTE2", 7)
     for lane in T.serial(
         T.if_then_else(contiguous[0] != 0, 0, tile_slots)
         if tile_slots > 1 and bulk_store and not staged
@@ -357,6 +375,9 @@ def gather_tile(
                             groups,
                         )
                     flag[lane] = 0
+    if async_gather:
+        T.wait_flag("S", "MTE2", 7)
+        T.pipe_barrier("ALL")
     if tile_slots > 1 and (not staged or first >= 128):
         decode_values(q, half_values, values, half_scales, scale, broadcast, y, groups)
     if bulk_store:
@@ -378,6 +399,7 @@ def gather_attention(
     bulk_store=False,
     reuse_long=False,
     long_selected=512,
+    async_gather=False,
 ):
     """Gather cache rows and decode groups using one shared quantization body.
 
@@ -394,8 +416,10 @@ def gather_attention(
     storage = swa_storage_rows or capacity
     if storage < 128 or storage > capacity:
         raise ValueError("SWA storage must cover the complete sliding window")
-    if tile_slots not in (1, 4, 8, 16):
+    if tile_slots not in (1, 4, 8, 16, 32):
         raise ValueError("KV slot tiles must fit the A2 UB and divide both selected widths")
+    if async_gather and tile_slots == 1:
+        raise ValueError("Asynchronous gather requires independent multi-slot DMA tiles")
     groups = tile_slots * 8
     tiles = (128 if reuse_long else selected) // tile_slots
 
@@ -413,14 +437,13 @@ def gather_attention(
         with T.Kernel(T.ceildiv(rows * tiles, 2), is_npu=True) as (cid, vid):
             q = T.alloc_ub((groups, 64), "int8")
             zeros = T.alloc_ub((groups, 16), "int32")
-            half_values = T.alloc_ub((groups, 64), "float16")
-            values = T.alloc_ub((groups, 64), "float32")
+            half_values = T.alloc_ub((min(groups, 128), 64), "float16")
+            values = T.alloc_ub((min(groups, 128), 64), "float32")
             half_scales = T.alloc_ub((groups, 1), "float16")
-            scale = T.alloc_ub((groups, 1), "float32")
-            broadcast = T.alloc_ub((groups, 64), "float32")
+            scale = T.alloc_ub((min(groups, 128), 1), "float32")
+            broadcast = T.alloc_ub((min(groups, 128), 64), "float32")
             y = T.alloc_ub((tile_slots, 512), "bfloat16")
-            staged_rows = T.alloc_ub((groups, 64), "bfloat16")
-            T.reinterpretcast(staged_rows, y, "bfloat16_t")
+            staged_rows = _contiguous_view(y, (groups, 64))
             flag = T.alloc_ub((max(8, tile_slots),), "int32")
             flat = cid * 2 + vid
             row, first = flat // tiles, flat % tiles * tile_slots
@@ -455,6 +478,7 @@ def gather_attention(
                     swa,
                     False,
                     staged_rows,
+                    async_gather,
                 )
 
-    return main
+    return main.with_attr("orinfer.gather_pipeline", async_gather)

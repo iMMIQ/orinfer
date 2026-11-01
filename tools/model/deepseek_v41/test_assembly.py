@@ -1089,10 +1089,6 @@ class ConvergenceTests(unittest.TestCase):
             validate_rows(model, root)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ExpertFusionContractTests(unittest.TestCase):
     def fixture(self):
         from tools.model.deepseek_v41.expert_fusion import selected_chain
@@ -1147,3 +1143,66 @@ class ExpertFusionContractTests(unittest.TestCase):
         program[0]["snapshot"] = "unrelated"
         with self.assertRaisesRegex(ValueError, "shared routed NZ"):
             select(program, 0, lambda s: specs.get(s.get("manifest")))
+
+
+class ReplayTableCompactionTests(unittest.TestCase):
+    def test_retargeted_owner_tables_drop_old_replay_bindings_and_keep_row_roles(self):
+        names = [
+            "orphan",
+            "decoder_rows",
+            "stage",
+            "live_work",
+            "live_pointer",
+            "old_work",
+            "old_pointer",
+            "active",
+            "ends",
+        ]
+        model = dict(
+            batch=dict(
+                private=["decoder_rows", "stage"],
+                active="active",
+                endpoints="ends",
+                columns=[
+                    dict(buffer="orphan"),
+                    dict(buffer="decoder_rows", row_bytes=4, decoder=True, decode=False),
+                    dict(buffer="stage", row_bytes=None),
+                ],
+                pointers=dict(live_pointer=[1, 2], old_pointer=[0]),
+                work=dict(live_work=dict(op="rows"), old_work=dict(op="rows")),
+                decoder_replay=dict(
+                    tables=["old_work", "live_pointer", "old_pointer", "live_work"]
+                ),
+            ),
+            ranks=[
+                dict(
+                    buffers=[dict(name=n, bytes=32) for n in names],
+                    packets=[
+                        dict(
+                            coordinates={},
+                            reset=[],
+                            head=[],
+                            body=[
+                                dict(
+                                    op="kernel",
+                                    manifest="selected",
+                                    owner_work=dict(op="rows"),
+                                    buffers=["live_work", "live_pointer", "active"],
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+        )
+        compact_buffers(model, owner_tables=True)
+        contract = model["batch"]
+        self.assertEqual(contract["decoder_replay"]["tables"], ["live_pointer", "live_work"])
+        self.assertEqual(contract["pointers"], dict(live_pointer=[0, 1]))
+        self.assertTrue(contract["columns"][0]["decoder"])
+        self.assertIsNone(contract["columns"][1]["row_bytes"])
+        self.assertNotIn("old_pointer", {b["name"] for b in model["ranks"][0]["buffers"]})
+
+
+if __name__ == "__main__":
+    unittest.main()

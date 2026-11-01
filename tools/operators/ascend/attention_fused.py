@@ -360,6 +360,9 @@ def selected_int8(
     staged_swa=False,
     softmax_heads=1,
     long_selected=512,
+    tile_d=128,
+    pv_l0_k=128,
+    async_gather=False,
 ):
     """One paired-core selected-KV gather/QK/softmax/PV invocation per query.
 
@@ -368,18 +371,25 @@ def selected_int8(
     normalization and normalized BF16 probability boundary.
     """
     from tools.operators.ascend.attention_cube import softmax_row, softmax_head_tile
-    from tools.operators.ascend.kv_int8 import gather_tile
+    from tools.operators.ascend.kv_int8 import gather_tile, _contiguous_view
 
     selected = 128 + long_selected if compressed else 128
     storage = swa_storage_rows or capacity
-    if heads not in (8, 16, 32, 64) or tile_slots not in (1, 4, 8, 16):
+    if heads not in (8, 16, 32, 64) or tile_slots not in (1, 4, 8, 16, 32):
         raise ValueError("Fused selected attention requires H8/16/32/64 and legal KV slot tiles")
     if not 128 <= storage <= capacity or (reuse_long and not compressed):
         raise ValueError("Invalid selected attention cache/reuse geometry")
     if long_selected not in (128, 512):
         raise ValueError("Selected long KV must contain128or512slots")
     padded_heads = (heads + 15) // 16 * 16
-    dimension, tile_k, tile_d = 512, 128, 128
+    dimension, tile_k = 512, 128
+    if tile_d not in (128, 256) or pv_l0_k not in (64, 128):
+        raise ValueError("Selected PV requires a supported dimension and L0 reduction tile")
+    l1_elements = padded_heads * (dimension + selected) + tile_k * dimension + selected * tile_d
+    if l1_elements * 2 > 524032 or tile_d * pv_l0_k * 4 > 65536:
+        raise ValueError("Selected PV schedule exceeds the A2 L1 or double-buffered L0B allocation")
+    if async_gather and tile_slots == 1:
+        raise ValueError("Asynchronous gather requires independent multi-slot DMA tiles")
     half_heads, decode_groups = heads // 2, tile_slots * 8
     if softmax_heads not in (1, 4, 8) or half_heads % softmax_heads:
         raise ValueError("Softmax head tile must divide each Vector's head group")
@@ -435,33 +445,37 @@ def selected_int8(
                     key_l1 = T.alloc_L1((tile_k, dimension), "bfloat16")
                     probability_l1 = T.alloc_L1((padded_heads, selected), "bfloat16")
                     value_l1 = T.alloc_L1((selected, tile_d), "bfloat16")
-                    acc = T.alloc_L0C((padded_heads, 128), "float32")
+                    score_acc = T.alloc_L0C((padded_heads, tile_k), "float32")
+                    output_acc = T.alloc_L0C((padded_heads, tile_d), "float32")
                     T.copy(query[row, :, :], query_l1[:heads, :])
                     T.wait_cross_flag(0)
                     for slot in T.serial(selected // tile_k):
                         T.copy(kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :], key_l1)
-                        T.gemm_v0(query_l1, key_l1, acc, transpose_B=True, init=True, kL0Size=128)
-                        T.copy(acc, score_workspace[row, :, slot * 128 : (slot + 1) * 128])
+                        T.gemm_v0(
+                            query_l1, key_l1, score_acc, transpose_B=True, init=True, kL0Size=128
+                        )
+                        T.copy(
+                            score_acc, score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k]
+                        )
                     T.set_cross_flag("FIX", 1)
                     T.wait_cross_flag(2)
                     T.copy(probability_workspace[row, :heads, :], probability_l1[:heads, :])
                     for d in T.serial(dimension // tile_d):
                         T.copy(kv_workspace[row, :, d * tile_d : (d + 1) * tile_d], value_l1)
-                        T.gemm_v0(probability_l1, value_l1, acc, init=True, kL0Size=128)
-                        T.copy(acc, output_workspace[row, :, d * 128 : (d + 1) * 128])
+                        T.gemm_v0(probability_l1, value_l1, output_acc, init=True, kL0Size=pv_l0_k)
+                        T.copy(output_acc, output_workspace[row, :, d * tile_d : (d + 1) * tile_d])
                     T.set_cross_flag("FIX", 3)
                     T.wait_cross_flag(4)
                 with T.Scope("V"):
                     q = T.alloc_ub((decode_groups, 64), "int8")
                     zeros = T.alloc_ub((decode_groups, 16), "int32")
-                    half_values = T.alloc_ub((decode_groups, 64), "float16")
-                    values = T.alloc_ub((decode_groups, 64), "float32")
+                    half_values = T.alloc_ub((min(decode_groups, 128), 64), "float16")
+                    values = T.alloc_ub((min(decode_groups, 128), 64), "float32")
                     half_scales = T.alloc_ub((decode_groups, 1), "float16")
-                    scale = T.alloc_ub((decode_groups, 1), "float32")
-                    broadcast = T.alloc_ub((decode_groups, 64), "float32")
+                    scale = T.alloc_ub((min(decode_groups, 128), 1), "float32")
+                    broadcast = T.alloc_ub((min(decode_groups, 128), 64), "float32")
                     decoded = T.alloc_ub((tile_slots, dimension), "bfloat16")
-                    staged_rows = T.alloc_ub((decode_groups, 64), "bfloat16")
-                    T.reinterpretcast(staged_rows, decoded, "bfloat16_t")
+                    staged_rows = _contiguous_view(decoded, (decode_groups, 64))
                     flag = T.alloc_ub((max(8, tile_slots),), "int32")
                     x = T.alloc_ub((softmax_heads, selected), "float32")
                     ids = T.alloc_ub((1, selected), "int32")
@@ -506,6 +520,7 @@ def selected_int8(
                             staged_swa_cache,
                             staged_swa,
                             staged_rows,
+                            async_gather,
                         )
                     T.set_cross_flag("MTE3", 0)
                     T.wait_cross_flag(1)
@@ -654,6 +669,7 @@ def selected_int8(
 
     return (
         main.with_attr("orinfer.coupled_resources", True)
+        .with_attr("orinfer.gather_pipeline", async_gather)
         .with_attr("orinfer.explicit_cross_sync", True)
         .with_attr(
             "orinfer.component_sources",

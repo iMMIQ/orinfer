@@ -413,6 +413,10 @@ bash tools/operators/ascend/run.sh --without-devices python3 \
 
 输出计划位于 `a2-kv-staging/package/model.json`。离线检查原 SWA 写入与 attention 之间的工作区访问：索引器 Cube 工作区在此区间空闲的层，将当前片段及其之前的至多 127 行的 BF16 暂存并入原 INT8 写入 kernel，各 query 按原选中顺序共享读取；其余层保留原绑定。两者复用同一写入／解量化与 attention 计算体，保持 INT8 缓存、FP16 scale、FP32 运算及 BF16 概率边界。4096 行临时环借用 owner 私有索引器 Cube 工作区前 4 MiB，不增加 owner 分配；每层重新准备，prefix 恢复无需保存临时值。`validate_kv_staging --output REPORT` 对照原始 scatter/attention，检查完整 INT8 缓存、scale、暂存值、选中 KV、mask、概率和输出，并在环形跨界及工作区被覆盖后验证 Graph replay；`--reuse-long` 覆盖保留长 KV 的调用。`validate_private_rows --op kv_int8.scatter_staged --output REPORT` 检查融合写入的 owner 换序、短尾和捕获保护；消费侧使用 `--op attention_fused.selected_int8 --staged-swa --kv-slot-tiles 16 --attention-heads 64`。
 
+已有小行数 target 验证 family 可通过 `--min-rows 32 --max-rows 511 --model-dir MODEL_DIR` 单独构建；筛选以完整 packet 的行数区间为单位。构建沿用原查询分片、owner 行数范围和 bounded decoder replay 角色，收敛资产时同步移除旧 replay 表引用。分支标记只改变 stream 顺序，分支内算子的实际工作区访问仍参与别名检查；Rust 执行器继续检查完整并行分支的物理读写依赖。KV 持久表示和权重保持原样。
+
+融合 selected attention 的多 slot INT8 gather 支持 `async_gather=true` 离线调度。使用 `private_schedule --operator attention_fused.selected_int8 --parameters '{"async_gather":true}' --match-parameters '{"heads":8}' --model-dir MODEL_DIR` 可重建已有 H8 绑定；相同 launch 几何直接保留原 owner work 表及其 source／bounded decoder 角色。共享 TileLang 计算体保持所有精度边界，独立 slot 的 DMA 在一个 tile 内连续提交，tile 两端保留完整同步。编译后的调度收敛只移除声明区间内多余的全流水屏障；无法识别标记、出现向量算术、GM 写入或其他未声明操作时拒绝构建。该配置要求多 slot tile，最终包仅收录选中的库；完整请求收益通过独立短测确定。
+
 
 `tools.model.deepseek_v41.quantize_kv --plan BF16_PLAN --output INT8_PLAN` 将尚未量化 KV 的 DSv4.1 TP8 原生计划转换为 INT8 缓存，输出与输入共用资产目录。40 层 SWA 和四个共享压缩 KV bank 均按每 64 个值使用一个 FP16 scale，512 维每行共 528 字节。写入按实际存储的 FP16 scale 做对称舍入，整数范围为 −127..127；scale 下限为 FP16 最小正数，上限为 65504。零组写零，`-1` 位置跳过写入，其他越界位置设置错误标志。压缩器的 FP32 ring 状态和索引器现有 INT8 格式保持各自的契约。
 

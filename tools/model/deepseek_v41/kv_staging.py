@@ -13,16 +13,17 @@ from pathlib import Path
 from tools.build.files import atomic_json, file_hash
 from tools.model.deepseek_v41.batch import compile_task, DTYPES, SIZES
 from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
+from tools.model.deepseek_v41.fuse_attention import selected_work_key
 
 
-def build(plan, output, workers=4, minimum=512):
+def build(plan, output, workers=4, minimum=512, maximum=None, model_dir=None):
     from kernels.model.rows import row_count
     from tools.operators.ascend.build import operand
     from tools.operators.ascend.geometry import physical_shapes
     from tools.operators.ascend.private_rows import indirect
 
-    if output.exists():
-        raise ValueError("Require a new output directory")
+    if output.exists() or minimum < 1 or (maximum is not None and maximum < minimum):
+        raise ValueError("Require a new output directory and a valid packet row interval")
     model = json.loads(plan.read_text())
     base = output / "source"
     publish_package(model, plan.parent, base)
@@ -62,7 +63,7 @@ def build(plan, output, workers=4, minimum=512):
             elif definitions[name]["bytes"] != size:
                 raise ValueError("SWA staging extent differs")
 
-        def bind(module, name, params, capacity, ids, writes, partition, external=()):
+        def bind(module, name, params, capacity, ids, writes, partition, source, external=()):
             identity = json.dumps([module, name, params, capacity], sort_keys=True)
             if identity not in prototypes:
                 factory = getattr(importlib.import_module("tools.operators.ascend." + module), name)
@@ -130,13 +131,18 @@ def build(plan, output, workers=4, minimum=512):
             digest = hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]
             pointer = "batch.kv_staging.pointers." + digest
             contract["pointers"][pointer] = ids
-            work = (
-                "batch.kv_staging.work."
-                + hashlib.sha256(
-                    json.dumps([grid, partition], sort_keys=True).encode()
-                ).hexdigest()[:16]
+            extent = contract.get("work_ranges", {}).get(
+                source["buffers"][0], dict(min_rows=1, max_rows=capacity)
+            )
+            replay = contract.get("decoder_replay")
+            decoder = replay is not None and source["buffers"][1] in replay["tables"]
+            work = "batch.kv_staging.work." + selected_work_key(
+                grid, partition if partition > 1 else None, extent, decoder
             )
             contract["work"][work] = grid
+            contract.setdefault("work_ranges", {})[work] = extent
+            if decoder:
+                replay["tables"] = sorted(set(replay["tables"]) | {work, pointer})
             if partition > 1:
                 contract.setdefault("partitioned_tables", {}).update(
                     {work: partition, pointer: partition}
@@ -151,7 +157,12 @@ def build(plan, output, workers=4, minimum=512):
             )
 
         for packet in rank["packets"]:
-            if packet.get("batch_decode") or packet.get("min_rows", 1) < minimum:
+            if (
+                packet.get("role", "target") != "target"
+                or packet.get("batch_decode")
+                or packet.get("min_rows", 1) < minimum
+                or (maximum is not None and packet.get("max_rows", packet["rows"]) > maximum)
+            ):
                 continue
             if definitions[scratch_name]["bytes"] < 4096 * 512 * 2:
                 raise ValueError("Indexer scratch cannot cover the SWA ring")
@@ -167,6 +178,10 @@ def build(plan, output, workers=4, minimum=512):
                 return name
 
             def touches_scratch(step):
+                # Branch markers only order streams. Every enclosed operation
+                # is visited separately and checked against the scratch root.
+                if step["op"] in ("fork", "switch", "join"):
+                    return False
                 if step["op"] not in ("kernel", "gather", "exchange"):
                     return True
                 names = list(step.get("buffers", []))
@@ -197,7 +212,9 @@ def build(plan, output, workers=4, minimum=512):
                             or p["_owner_token_capacity"] + 127 > p["table_rows"]
                         ):
                             raise ValueError("Require one complete SWA producer before attention")
-                        pending = dict(index=len(body), parameters=p, ids=ids, touched=False)
+                        pending = dict(
+                            index=len(body), parameters=p, ids=ids, touched=False, source=step
+                        )
                         scatters += 1
                     elif pending is not None:
                         pending["touched"] |= touches_scratch(step)
@@ -225,6 +242,7 @@ def build(plan, output, workers=4, minimum=512):
                             pending["ids"] + [stage_column],
                             set(producer["_owner_writes"]) | {"staged"},
                             1,
+                            pending["source"],
                         )
                         params = {
                             k: v for k, v in p.items() if not k.startswith("_") and k != "rows"
@@ -238,7 +256,8 @@ def build(plan, output, workers=4, minimum=512):
                                 p["_owner_token_capacity"],
                                 ids + [stage_column],
                                 set(p["_owner_writes"]),
-                                len(model["ranks"]),
+                                contract.get("partitioned_tables", {}).get(step["buffers"][0], 1),
+                                step,
                                 step["buffers"][3:],
                             )
                         )
@@ -265,7 +284,7 @@ def build(plan, output, workers=4, minimum=512):
                 if step.get("manifest") in replacements:
                     step["manifest"] = replacements[step["manifest"]]
     compact_buffers(model, owner_tables=True)
-    validate_rows(model, base)
+    validate_rows(model, base, model_dir=model_dir)
     assets = publish_package(model, base, output / "package")
     report = dict(
         producers=sum(counts),
@@ -288,8 +307,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--min-rows", type=int, default=512)
+    parser.add_argument("--max-rows", type=int)
+    parser.add_argument("--model-dir", type=Path)
     a = parser.parse_args()
-    print(json.dumps(build(a.plan, a.output, a.compile_workers, a.min_rows)))
+    print(
+        json.dumps(build(a.plan, a.output, a.compile_workers, a.min_rows, a.max_rows, a.model_dir))
+    )
 
 
 if __name__ == "__main__":

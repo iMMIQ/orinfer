@@ -20,6 +20,7 @@ from tools.build.elf import strip_library
 from tools.operators.ascend.vector_launch import lower_independent_cube, lower_independent_vector
 from tools.operators.ascend.rows import bounded_grid, split_resources
 from tools.operators.ascend.scalar_cache import lower_scalar_cache
+from tools.operators.ascend.pipeline import lower_gather_pipeline
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCES = [
@@ -154,6 +155,7 @@ def compile_kernel(
             Path(__file__).with_name("vector_launch.py"),
             Path(__file__).with_name("rows.py"),
             Path(__file__).with_name("scalar_cache.py"),
+            Path(__file__).with_name("pipeline.py"),
         ]
         if "." in name and module in SOURCES
         else SOURCES
@@ -212,6 +214,8 @@ def compile_kernel(
             from tools.operators.ascend.private_rows import lower_aliases
 
             source = lower_aliases(source, parameters["_owner_aliases"])
+        if function.attrs and function.attrs.get("orinfer.gather_pipeline", False):
+            source = lower_gather_pipeline(source, required=True)
         source = lower_scalar_cache(source)
         prototype = re.search(r'extern "C" void call\(([^)]*)\)', source)
         if prototype is None:

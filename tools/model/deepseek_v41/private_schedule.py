@@ -229,6 +229,7 @@ def rebuild(
     reuse_long_kv=False,
     measured_identity=None,
     match_parameters=None,
+    model_dir=None,
 ):
     from kernels.model.rows import row_count
     from tools.operators.ascend.private_rows import indirect
@@ -251,7 +252,7 @@ def rebuild(
     expected_op = "private_rows." + operator.replace(".", "_")
     contract = model["batch"]
     descriptions, replacements, schedules = {}, {}, {}
-    validate_rows(model, plan.parent)
+    validate_rows(model, plan.parent, model_dir=model_dir)
     changed = 0
 
     def describe(path):
@@ -416,7 +417,10 @@ def rebuild(
                 step = deepcopy(original)
                 step["manifest"] = replacements[key]
                 step["owner_work"] = grid
-                step["buffers"][0] = work(rank, grid, lower, upper, partition)
+                # Same-grid schedules retain the original source/decoder role,
+                # row interval and query partition through the existing table.
+                if grid != original["owner_work"] or lower != extent["min_rows"]:
+                    step["buffers"][0] = work(rank, grid, lower, upper, partition)
                 body.append(step)
                 changed += 1
             packet["body"] = body
@@ -434,7 +438,7 @@ def rebuild(
         name: value for name, value in contract.get("work_ranges", {}).items() if name in live
     }
     model = compact_buffers(model, owner_tables=bool(contract.get("partitioned_tables")))
-    validate_rows(model, base)
+    validate_rows(model, base, model_dir=model_dir)
     atomic_json(base / "model-scheduled.json", model)
     publish_package(model, base, output / "package")
     return dict(
@@ -453,6 +457,7 @@ def main():
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--operator", required=True)
+    parser.add_argument("--model-dir", type=Path)
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--parameters", type=json.loads)
     selection.add_argument("--tuning-record", type=Path)
@@ -542,6 +547,7 @@ def main():
                     reuse_long_kv=args.reuse_long_kv,
                     measured_identity=measured_identity,
                     match_parameters=args.match_parameters,
+                    model_dir=args.model_dir,
                 ),
                 selection=selected,
             )

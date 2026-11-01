@@ -199,6 +199,10 @@ def compact_buffers(model, *, owner_tables=False):
             if name in pointers
         }
         batch["work"] = {name: grid for name, grid in batch["work"].items() if name in work}
+        if "decoder_replay" in batch:
+            batch["decoder_replay"]["tables"] = sorted(
+                set(batch["decoder_replay"]["tables"]) & (work | pointers)
+            )
         for field in ("work_ranges", "partitioned_tables"):
             if field in batch:
                 batch[field] = {
