@@ -138,7 +138,7 @@ enum Launch {
 /// operand tables against this shared code.
 pub struct Template {
     path: PathBuf,
-    _library: Library,
+    _library: std::sync::Arc<Library>,
     spec: Spec,
     entry: Launch,
 }
@@ -164,10 +164,9 @@ impl Template {
         if !soc.starts_with("Ascend910B") {
             return Err(format!("A2 kernel cannot execute on {soc}"));
         }
-        // SAFETY: Explicitly selected, host/ABI-checked AOT code. Loading occurs
-        // in the owning context; the library remains live until its last fence.
-        let library =
-            unsafe { Library::new(path) }.map_err(|e| format!("A2 kernel library: {e}"))?;
+        // Loading occurs in the owning context. Driver retention also protects
+        // AscendC callbacks after the last kernel/Graph owner is destroyed.
+        let library = session.context.driver.aot_library(&path)?;
         // SAFETY: The versioned entry returns a static NUL-terminated descriptor
         // in this explicitly selected library. Metadata is checked before any launch.
         let descriptor = unsafe {

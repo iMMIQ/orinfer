@@ -130,6 +130,55 @@ impl Fixture {
 }
 
 #[test]
+fn aot_code_is_shared_across_ranks_and_unloads_after_acl_finalization() {
+    // Outlive the fixture on both success and assertion unwinding.
+    let mut unloaded_after_finalize = Box::new(-1);
+    let mut fixture = Fixture::new();
+    let path = fixture._dir.path().join("libaot-lifetime.so");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ascend_aot_lifetime.c");
+    assert!(
+        std::process::Command::new("cc")
+            .args(["-shared", "-fPIC", "-Wall", "-Werror"])
+            .arg(source)
+            .arg("-o")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let driver = fixture.driver.as_ref().unwrap();
+    let libraries = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|_| scope.spawn(|| driver.aot_library(&path).unwrap()))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(libraries.iter().all(|lib| Arc::ptr_eq(lib, &libraries[0])));
+    // SAFETY: Both symbols are compiled from our CPU fixtures. The result and
+    // counter library remain live until after the driver's retained code drops.
+    unsafe {
+        let configure = libraries[0]
+            .get::<unsafe extern "C" fn(unsafe extern "C" fn(i32) -> i32, *mut i32)>(
+                b"test_aot_lifetime\0",
+            )
+            .unwrap();
+        let counter = fixture
+            .library
+            .get::<unsafe extern "C" fn(i32) -> i32>(b"test_counter\0")
+            .unwrap();
+        configure(*counter, &mut *unloaded_after_finalize);
+    }
+    drop(libraries);
+    assert_eq!(*unloaded_after_finalize, -1);
+    assert_eq!(fixture.counter(6), 0);
+    fixture.assert_clean();
+    assert_eq!(*unloaded_after_finalize, 1);
+}
+
+#[test]
 fn aot_dynamic_rows_bind_real_extent_and_preserve_tail() {
     use super::kernels::{Kernel, Template};
     let mut fixture = Fixture::new();

@@ -13,6 +13,7 @@ use super::Inventory;
 use crate::artifact::Result;
 use libloading::Library;
 use std::{
+    collections::BTreeMap,
     ffi::{CStr, c_char},
     path::Path,
     ptr,
@@ -25,12 +26,34 @@ type Count = unsafe extern "C" fn(*mut u32) -> i32;
 type Soc = unsafe extern "C" fn() -> *const c_char;
 
 struct Driver {
+    // AscendC stubs register process-wide profiler callbacks. Background CANN
+    // threads can invoke them after the last kernel/Graph fence, including
+    // during HCCL teardown. Keep their code until ACL finalization completes.
+    aot_libraries: Mutex<BTreeMap<std::path::PathBuf, Arc<Library>>>,
     _library: Library,
     finalize: Finalize,
     initialized: bool,
     count: Count,
     soc: Soc,
     path: std::path::PathBuf,
+}
+impl Driver {
+    fn aot_library(&self, path: &Path) -> Result<Arc<Library>> {
+        let mut libraries = self
+            .aot_libraries
+            .lock()
+            .map_err(|_| "ACL AOT library cache poisoned")?;
+        if let Some(library) = libraries.get(path) {
+            return Ok(Arc::clone(library));
+        }
+        // SAFETY: The caller checked the selected AOT asset/host ABI. Retain
+        // even a library whose descriptor later fails validation: its static
+        // constructors may already have registered native callbacks.
+        let library =
+            Arc::new(unsafe { Library::new(path) }.map_err(|e| format!("A2 kernel library: {e}"))?);
+        libraries.insert(path.into(), Arc::clone(&library));
+        Ok(library)
+    }
 }
 impl Drop for Driver {
     fn drop(&mut self) {
@@ -75,6 +98,7 @@ fn open_library(path: &Path) -> Result<Driver> {
         )
     };
     let mut runtime = Driver {
+        aot_libraries: Mutex::new(BTreeMap::new()),
         _library: library,
         finalize,
         initialized: false,
