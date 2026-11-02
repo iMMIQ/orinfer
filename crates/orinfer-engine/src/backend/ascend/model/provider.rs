@@ -856,9 +856,14 @@ impl Runtime {
             }
         }
         let decoders = batch - prefill_requests;
-        if decoders > 0 && timing.replay {
-            self.speculation_policy
-                .baseline(decoders, full, prefill_rows > 0, seconds);
+        if decoders > 0 {
+            self.speculation_policy.baseline_execution(
+                decoders,
+                full,
+                prefill_rows > 0,
+                seconds,
+                timing.replay,
+            );
         }
         let mut steps = self.commit_packet(requests, selected, &values)?;
         steps.extend(cached_outputs(requests)?);

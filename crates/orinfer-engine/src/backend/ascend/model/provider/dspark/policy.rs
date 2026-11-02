@@ -68,9 +68,17 @@ pub(in crate::backend::ascend::model::provider) struct Budget {
     pub uniform: bool,
 }
 
-#[derive(Default)]
 pub(in crate::backend::ascend::model::provider) struct Policy {
     curves: BTreeMap<(usize, bool, bool), Curve>,
+    trace: bool,
+}
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            curves: BTreeMap::new(),
+            trace: std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some(),
+        }
+    }
 }
 #[derive(Default)]
 struct Curve {
@@ -145,6 +153,27 @@ fn queue(
     rows
 }
 impl Policy {
+    pub fn baseline_execution(
+        &mut self,
+        batch: usize,
+        full: bool,
+        mixed: bool,
+        seconds: f64,
+        replay: bool,
+    ) {
+        if self.trace {
+            eprintln!(
+                "DSPARK_BASELINE {}",
+                serde_json::json!({
+                    "batch": batch, "full": full, "mixed": mixed,
+                    "seconds": seconds, "replay": replay,
+                })
+            );
+        }
+        if replay {
+            self.baseline(batch, full, mixed, seconds);
+        }
+    }
     pub fn baseline(&mut self, batch: usize, full: bool, mixed: bool, seconds: f64) {
         if !seconds.is_finite() || seconds <= 0. {
             return;
@@ -179,6 +208,17 @@ impl Policy {
         let curve = self.curves.entry((batch, full, mixed)).or_default();
         curve.ticks += 1;
         if limit <= batch || curve.baseline_samples < 4 {
+            if self.trace {
+                trace_selection(
+                    curve,
+                    full,
+                    mixed,
+                    limit,
+                    maxima,
+                    &depths,
+                    "baseline_or_budget",
+                );
+            }
             return Ok(depths);
         }
         if blocks.is_empty()
@@ -314,6 +354,9 @@ impl Policy {
                     }
                 }
             }
+            if self.trace {
+                trace_selection(curve, full, mixed, limit, maxima, &depths, "uniform_score");
+            }
             return Ok(depths);
         }
         // N-2 confidence chooses capacity; N-1 allocates that capacity by owner.
@@ -322,6 +365,9 @@ impl Policy {
             .take(best - batch)
         {
             depths[owner] += 1;
+        }
+        if self.trace {
+            trace_selection(curve, full, mixed, limit, maxima, &depths, "request_score");
         }
         Ok(depths)
     }
@@ -384,6 +430,31 @@ impl Policy {
         }
         curve.acceptance_samples += 1;
     }
+}
+
+fn trace_selection(
+    curve: &Curve,
+    full: bool,
+    mixed: bool,
+    limit: usize,
+    maxima: &[usize],
+    depths: &[usize],
+    reason: &str,
+) {
+    eprintln!(
+        "DSPARK_POLICY {}",
+        serde_json::json!({
+            "batch": maxima.len(), "full": full, "mixed": mixed, "limit": limit,
+            "maxima": maxima, "depths": depths, "reason": reason,
+            "baseline_samples": curve.baseline_samples, "baseline_s": curve.baseline,
+            "ticks": curve.ticks,
+            "blocks": curve.blocks.iter().map(|(&(block, uniform), c)| serde_json::json!({
+                "block":block,"uniform":uniform,"samples":c.samples,"draft_s":c.draft,
+                "extra_s":c.extra,"restore_s":c.restore,"setup_s":c.setup,
+                "acceptance":c.acceptance,
+            })).collect::<Vec<_>>(),
+        })
+    );
 }
 
 #[cfg(test)]
