@@ -11,12 +11,51 @@ from tools.model.deepseek_v41.assembly import (
     compact_buffers,
     publish_package,
     retarget_packet_boundary,
+    validate_owner_row_domains,
     validate_rows,
 )
 from tools.model.row_contract import expression, resolve
 from tools.model.row_selection import aggregate_winner, bounded_choices, guarded_winner
 from tools.model.deepseek_v41.sequence_parallel import external_reads
 from tools.model.deepseek_v41.private_schedule import reusable_long_gathers, select_schedule
+
+
+class OwnerRowDomainTests(unittest.TestCase):
+    def test_fused_output_and_table_must_inherit_replay_domain_together(self):
+        source = dict(buffer="query", row_bytes=4096, decoder=True)
+        private = dict(buffer="scratch", row_bytes=None)
+        output = dict(buffer="candidates", row_bytes=4096)
+        contract = dict(
+            columns=[source, private, output],
+            pointers={"source": [0, 1], "fused": [0, 1, 2]},
+            decoder_replay=dict(tables=["source"]),
+        )
+        for register, mark in [(False, False), (True, False), (False, True)]:
+            candidate = deepcopy(contract)
+            if register:
+                candidate["decoder_replay"]["tables"].append("fused")
+            if mark:
+                candidate["columns"][2]["decoder"] = True
+            with (
+                self.subTest(register=register, mark=mark),
+                self.assertRaisesRegex(ValueError, "mixes full and decoder"),
+            ):
+                validate_owner_row_domains(candidate)
+        output["decoder"] = True
+        contract["decoder_replay"]["tables"].append("fused")
+        validate_owner_row_domains(contract)
+
+    def test_full_rows_and_private_scratch_remain_valid(self):
+        contract = dict(
+            columns=[dict(buffer="query", row_bytes=4), dict(buffer="state", row_bytes=None)],
+            pointers={"full": [0, 1]},
+            decoder_replay=dict(tables=[]),
+        )
+        validate_owner_row_domains(contract)
+        contract.pop("decoder_replay")
+        contract["columns"][0]["decoder"] = True
+        with self.assertRaisesRegex(ValueError, "require a replay contract"):
+            validate_owner_row_domains(contract)
 
 
 class PacketBoundaryTests(unittest.TestCase):

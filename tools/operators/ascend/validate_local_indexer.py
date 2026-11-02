@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", type=int, default=7)
+    parser.add_argument("--min-rows", type=int, default=512)
     parser.add_argument("--rows", type=int, nargs="+", default=[17, 129, 512, 544, 1921, 2048])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -36,7 +37,13 @@ def main():
     libraries, reports = [], []
     for rank_id in (0, 7):
         original = baseline["ranks"][rank_id]
-        packet = next(p for p in original["packets"] if p["min_rows"] == 512)
+        packet = next(
+            p
+            for p in original["packets"]
+            if not p.get("batch_decode")
+            and p.get("role", "target") == "target"
+            and p["min_rows"] == args.min_rows
+        )
 
         def describe(step):
             return json.loads((args.baseline.parent / step["manifest"]).read_text())
@@ -47,7 +54,13 @@ def main():
             if (c := query_chain(packet["body"], i, describe)) is not None
         )
         new_rank = candidate["ranks"][rank_id]
-        new_packet = next(p for p in new_rank["packets"] if p["min_rows"] == 512)
+        new_packet = next(
+            p
+            for p in new_rank["packets"]
+            if not p.get("batch_decode")
+            and p.get("role", "target") == "target"
+            and p["min_rows"] == args.min_rows
+        )
         start = next(
             i
             for i, s in enumerate(new_packet["body"])
@@ -90,7 +103,9 @@ def main():
                         .view(port["shape"])
                     )
                     definition = definitions[name]
-                    if "weight" in definition or "prepared_weight" in definition:
+                    if any(
+                        k in definition for k in ("weight", "prepared_weight", "prepared_tensor")
+                    ):
                         value.copy_(
                             read_bank(
                                 root,

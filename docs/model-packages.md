@@ -450,6 +450,8 @@ uv run --locked python -m tools.model.deepseek_v41.decoder_rows \
 
 `tools.model.deepseek_v41.local_indexer --plan OWNER_PLAN --output artifacts/a2-local-indexer` 为已有 TP8 query 分片前移索引器的输入分片。默认处理 `min_rows >= 512` 的 packet family：先按 rank 选取 Q-A 的 INT8 值、FP32 scale、hidden 和 RoPE 坐标，再调用原有投影、RoPE、量化及 weights projection，将结果直接写入原索引器地址表。各 rank 处理 `ceil(实际 token 行数 / 8)` 行，量化在同一算子内展开 32 个 head；真实 owner 行的 INT8 query、FP16 scale 和 BF16 weights 保持原始舍入边界。未分配给 owner 的尾部不参与索引评分。小行数 family、普通 decode、KV 与请求状态契约保持相同。
 
+`local_indexer`、`fuse_indexer` 与 `fuse_topk` 共用 `--min-rows`／`--max-rows` 选择 target 行数区间，在区间边界拆分已有 family 并保留原物理容量。可用 `--min-rows 32 --max-rows 511` 将同源局部投影、因果 TopK 和归并应用到已有 indexer query 分片的 head 并行 family；区间外的 target、普通 decode 与 draft 保留原程序。已发布 safetensors 计划通过 `--model-dir` 读取只读单位 scale，沿用原 BF16 输出契约检查。
+
 构建器通过 `--query-tile-m` 选择同源整数投影 tile，默认 128；动态表达式和 AOT 描述显式区分 token 行与 head 行，scale 常量复用共享只读资产的有界视图。`tools.operators.ascend.validate_local_indexer --baseline BASE_PLAN --plan LOCAL_PLAN --model-dir CHECKPOINT --output DIR` 使用真实权重比较有效 query 行，在 rank 0/7 验证非对齐尾部、改输入后的 Graph replay，并测量完整前处理链。完整请求与 Mini 继续单独验收。
 
 新构建的最终窗口包另行声明 `decoder_state`，用于完整 prompt 检查点。服务在目标头完成、采样开始前保存 producer 状态、decoder SWA 和未处理的目标 logits；后者计入缓存预算。完全相同的 token 输入命中有效目标头时，恢复全部状态并按当前请求的 seed、采样参数、logprob 和约束处理首 token，随后沿用普通 decode；首 token 复用无需模型 forward。混合请求中的其他 owner 仍正常执行，同一请求每轮只提交一次输出。扩展或改变输入时继续遵守普通 prefix 的回退窗口，重新构建新的 decoder 窗口。旧包缺少该声明时沿用原策略；关闭 prefix cache 同时关闭完整头缓存。这里复用公共 prefix 索引的 `logits_valid` 契约，执行包的算子、行选择和 owner 常驻分配保持相同。

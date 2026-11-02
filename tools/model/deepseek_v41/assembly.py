@@ -19,6 +19,55 @@ from tools.build.files import atomic_json, file_hash, source_hash
 from tools.model.row_contract import resolve
 
 
+def selected_packet_ranges(packets, minimum, maximum=None):
+    """Split target row families at an offline transform's selected boundaries."""
+    if minimum < 1 or (maximum is not None and maximum < minimum):
+        raise ValueError("Require a positive, ordered target row interval")
+    result = []
+    boundaries = [minimum] + ([maximum + 1] if maximum is not None else [])
+    for packet in packets:
+        if packet.get("role", "target") != "target" or packet.get("batch_decode"):
+            result.append(packet)
+            continue
+        low, high = packet.get("min_rows", 1), packet.get("max_rows", packet["rows"])
+        cuts = [b for b in boundaries if low < b <= high]
+        if not cuts:
+            result.append(packet)
+            continue
+        for first, end in zip([low] + cuts, cuts + [high + 1], strict=True):
+            part = deepcopy(packet)
+            part.update(min_rows=first, max_rows=end - 1)
+            result.append(part)
+    return result
+
+
+def selected_target_packet(packet, minimum, maximum=None):
+    """Select complete target families after splitting their row intervals."""
+    return (
+        packet.get("role", "target") == "target"
+        and not packet.get("batch_decode")
+        and packet.get("min_rows", 1) >= minimum
+        and (maximum is None or packet.get("max_rows", packet["rows"]) <= maximum)
+    )
+
+
+def validate_owner_row_domains(contract):
+    """Apply the native replay table invariant before offline compilation."""
+    replay = contract.get("decoder_replay")
+    if replay is None:
+        if any(c.get("decoder", False) for c in contract.get("columns", [])):
+            raise ValueError("Decoder columns require a replay contract")
+        return
+    tables = set(replay["tables"])
+    for name, indices in contract["pointers"].items():
+        if any(
+            c["row_bytes"] is not None and c.get("decoder", False) != (name in tables)
+            for i in indices
+            for c in [contract["columns"][i]]
+        ):
+            raise ValueError("Owner table mixes full and decoder row domains: " + name)
+
+
 def unit_scale_manifests(model, base, model_dir=None):
     """Require immutable FP32 ones at every binding of a BF16 projection."""
     eligible, rejected, descriptions, constants = set(), set(), {}, {}
@@ -316,6 +365,8 @@ def retarget_packet_boundary(model, previous, minimum):
 
 def validate_rows(model, base, *, model_dir=None):
     """Offline full-domain arithmetic and physical span checks, deduplicated."""
+    if model.get("batch"):
+        validate_owner_row_domains(model["batch"])
     expressions, specs = {}, {}
     unit_scales = None
     sizes = dict(i8=1, u8=1, f16=2, bf16=2, f32=4, i32=4, i64=8, u64=8)

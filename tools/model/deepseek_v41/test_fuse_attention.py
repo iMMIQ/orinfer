@@ -5,6 +5,7 @@ from tools.model.deepseek_v41.fuse_attention import (
     selected_packet_ranges,
     selected_work_key,
 )
+from tools.model.deepseek_v41.assembly import selected_target_packet
 
 
 class SelectedAttentionChainTests(unittest.TestCase):
@@ -31,6 +32,36 @@ class SelectedAttentionChainTests(unittest.TestCase):
             selected_work_key(grid, None, extent, False),
             selected_work_key(grid, None, extent, True),
         )
+
+    def test_bounded_transform_keeps_other_families_and_draft_bindings(self):
+        decode = dict(rows=32, min_rows=1, batch_decode=True)
+        draft = dict(rows=512, min_rows=5, max_rows=160, role="draft")
+        packets = [decode, dict(rows=2048, min_rows=1, body=[dict(op="kernel")]), draft]
+        selected = selected_packet_ranges(packets, 32, 511)
+        self.assertEqual(
+            [(p["min_rows"], p.get("max_rows", p["rows"])) for p in selected],
+            [(1, 32), (1, 31), (32, 511), (512, 2048), (5, 160)],
+        )
+        self.assertEqual(
+            [p["min_rows"] for p in selected if selected_target_packet(p, 32, 511)], [32]
+        )
+        self.assertIs(selected[0], decode)
+        self.assertIs(selected[-1], draft)
+        selected[2]["body"][0]["op"] = "fused"
+        self.assertEqual(selected[1]["body"][0]["op"], "kernel")
+        self.assertEqual(selected[3]["body"][0]["op"], "kernel")
+        self.assertEqual(packets[1]["body"][0]["op"], "kernel")
+
+    def test_bounded_selection_preserves_row_coverage_and_exact_boundary_points(self):
+        packets = [dict(rows=2048, min_rows=1, max_rows=31), dict(rows=2048, min_rows=32)]
+        selected = selected_packet_ranges(packets, 32, 511)
+        for rows in (1, 31, 32, 511, 512, 2048):
+            matches = [p for p in selected if p["min_rows"] <= rows <= p.get("max_rows", p["rows"])]
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(selected_target_packet(matches[0], 32, 511), 32 <= rows <= 511)
+        for minimum, maximum in [(0, None), (32, 31)]:
+            with self.assertRaises(ValueError):
+                selected_packet_ranges(packets, minimum, maximum)
 
     def fixture(self):
         names = [

@@ -7,6 +7,7 @@ import multiprocessing
 from pathlib import Path
 
 from tools.build.files import atomic_json
+from tools.model.deepseek_v41.assembly import selected_packet_ranges
 
 
 def selected_chain(program, index, describe, contract):
@@ -61,30 +62,6 @@ def selected_work_key(grid, partition, extent, decoder):
     return hashlib.sha256(
         json.dumps([grid, partition, extent, decoder], sort_keys=True).encode()
     ).hexdigest()[:16]
-
-
-def selected_packet_ranges(packets, minimum):
-    """Keep the measured small-row schedule within the existing target family."""
-    import copy
-
-    if minimum < 1:
-        raise ValueError("Selected attention requires a positive minimum row count")
-    result = []
-    for packet in packets:
-        low = packet.get("min_rows", 1)
-        high = packet.get("max_rows", packet["rows"])
-        if (
-            packet.get("role", "target") == "target"
-            and not packet.get("batch_decode", False)
-            and low < minimum <= high
-        ):
-            small = copy.deepcopy(packet)
-            small["max_rows"] = minimum - 1
-            packet = copy.deepcopy(packet)
-            packet["min_rows"] = minimum
-            result.append(small)
-        result.append(packet)
-    return result
 
 
 def build_selected(

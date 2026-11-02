@@ -11,10 +11,16 @@ from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
 from tools.model.deepseek_v41.batch import compile_task
-from tools.model.deepseek_v41.assembly import compact_buffers, publish_package, validate_rows
+from tools.model.deepseek_v41.assembly import (
+    compact_buffers,
+    publish_package,
+    selected_packet_ranges,
+    selected_target_packet,
+    validate_rows,
+)
 
 
-def build(plan, output, workers=4, minimum=512, tile_rows=8):
+def build(plan, output, workers=4, minimum=512, tile_rows=8, maximum=None, model_dir=None):
     from kernels.model.rows import row_count
     from tools.operators.ascend.build import operand
     from tools.operators.ascend.geometry import physical_shapes
@@ -24,6 +30,8 @@ def build(plan, output, workers=4, minimum=512, tile_rows=8):
     if output.exists():
         raise ValueError("Require a new output directory")
     model = json.loads(plan.read_text())
+    for rank in model["ranks"]:
+        rank["packets"] = selected_packet_ranges(rank["packets"], minimum, maximum)
     base = output / "source"
     publish_package(model, plan.parent, base)
     contract, peers = model["batch"], len(model["ranks"])
@@ -60,7 +68,7 @@ def build(plan, output, workers=4, minimum=512, tile_rows=8):
                 definitions[name] = item
 
         for packet in rank["packets"]:
-            if packet.get("batch_decode") or packet.get("min_rows", 1) < minimum:
+            if not selected_target_packet(packet, minimum, maximum):
                 continue
             old, body, index, count = packet["body"], [], 0, 0
             while index < len(old):
@@ -162,6 +170,11 @@ def build(plan, output, workers=4, minimum=512, tile_rows=8):
                             row_alignment=1,
                             decode=False,
                             row_partition=peers,
+                            **(
+                                {"decoder": True}
+                                if contract["columns"][ids[0]].get("decoder")
+                                else {}
+                            ),
                         )
                     )
                 ]
@@ -174,6 +187,9 @@ def build(plan, output, workers=4, minimum=512, tile_rows=8):
                 pointer = "batch.indexer_fused.pointers." + digest
                 contract["pointers"][pointer] = new_ids
                 contract["partitioned_tables"][pointer] = peers
+                replay = contract.get("decoder_replay")
+                if replay and step["buffers"][1] in replay["tables"]:
+                    replay["tables"] = sorted(set(replay["tables"]) | {pointer})
                 buffer(pointer, contract["owners"] * (len(new_ids) + 1) * 8)
                 body.append(
                     dict(
@@ -200,7 +216,7 @@ def build(plan, output, workers=4, minimum=512, tile_rows=8):
                 if step.get("manifest") in replacements:
                     step["manifest"] = replacements[step["manifest"]]
     compact_buffers(model, owner_tables=True)
-    validate_rows(model, base)
+    validate_rows(model, base, model_dir=model_dir)
     assets = publish_package(model, base, output / "package")
     report = dict(
         changed_chains=changed,
@@ -219,11 +235,21 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tile-rows", type=int, choices=(1, 2, 4, 8), default=8)
     parser.add_argument("--min-rows", type=int, default=512)
+    parser.add_argument("--max-rows", type=int)
+    parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--compile-workers", type=int, default=4)
     args = parser.parse_args()
     print(
         json.dumps(
-            build(args.plan, args.output, args.compile_workers, args.min_rows, args.tile_rows)
+            build(
+                args.plan,
+                args.output,
+                args.compile_workers,
+                args.min_rows,
+                args.tile_rows,
+                args.max_rows,
+                args.model_dir,
+            )
         )
     )
 

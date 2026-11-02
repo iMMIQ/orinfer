@@ -13,6 +13,8 @@ from tools.model.deepseek_v41.assembly import (
     check_intermediate_liveness,
     compact_buffers,
     publish_package,
+    selected_packet_ranges,
+    selected_target_packet,
     validate_rows,
 )
 
@@ -76,13 +78,15 @@ def causal_lengths(producer, chain, describe, batch, definitions):
     return length["buffer"]
 
 
-def build(plan, output, workers=2, minimum=512):
+def build(plan, output, workers=2, minimum=512, maximum=None, model_dir=None):
     if output.exists():
         raise ValueError("Require a new output directory")
     model = json.loads(plan.read_text())
+    for rank in model["ranks"]:
+        rank["packets"] = selected_packet_ranges(rank["packets"], minimum, maximum)
     if not model.get("batch"):
         raise ValueError("Require the owner-row native A2 contract")
-    validate_rows(model, plan.parent)
+    validate_rows(model, plan.parent, model_dir=model_dir)
     base = output / "source"
     publish_package(model, plan.parent, base)
     descriptions, tasks, counts = {}, {}, []
@@ -96,7 +100,7 @@ def build(plan, output, workers=2, minimum=512):
     for rank in model["ranks"]:
         definitions = {b["name"]: b for b in rank["buffers"]}
         for packet in rank["packets"]:
-            if packet.get("batch_decode") or packet["min_rows"] < minimum:
+            if not selected_target_packet(packet, minimum, maximum):
                 continue
             old, body, index, changed = packet["body"], [], 0, 0
             while index < len(old):
@@ -158,7 +162,7 @@ def build(plan, output, workers=2, minimum=512):
                 if step.get("manifest") in replacements:
                     step["manifest"] = replacements[step["manifest"]]
     compact_buffers(model, owner_tables=True)
-    validate_rows(model, base)
+    validate_rows(model, base, model_dir=model_dir)
     assets = publish_package(model, base, output / "package")
     report = dict(
         model=str(output / "package/model.json"),
@@ -178,8 +182,21 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-workers", type=int, default=2)
     parser.add_argument("--min-rows", type=int, default=512)
+    parser.add_argument("--max-rows", type=int)
+    parser.add_argument("--model-dir", type=Path)
     args = parser.parse_args()
-    print(json.dumps(build(args.plan, args.output, args.compile_workers, args.min_rows)))
+    print(
+        json.dumps(
+            build(
+                args.plan,
+                args.output,
+                args.compile_workers,
+                args.min_rows,
+                args.max_rows,
+                args.model_dir,
+            )
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@ from tools.model.deepseek_v41.assembly import (
     check_intermediate_liveness as check_query_liveness,
     compact_buffers,
     publish_package,
+    selected_packet_ranges,
+    selected_target_packet,
     validate_rows,
 )
 from tools.model.row_contract import expression
@@ -57,7 +59,7 @@ def query_chain(steps, index, describe):
     return chain
 
 
-def build(plan, output, workers=4, minimum=512, query_tile_m=128):
+def build(plan, output, workers=4, minimum=512, query_tile_m=128, maximum=None, model_dir=None):
     from kernels.model.rows import row_count
     from tools.operators.ascend.build import operand
     from tools.operators.ascend.geometry import physical_shapes
@@ -65,10 +67,12 @@ def build(plan, output, workers=4, minimum=512, query_tile_m=128):
     if output.exists():
         raise ValueError("Require a new output directory")
     model = json.loads(plan.read_text())
+    for rank in model["ranks"]:
+        rank["packets"] = selected_packet_ranges(rank["packets"], minimum, maximum)
     peers = len(model["ranks"])
     if peers != 8 or not model.get("batch", {}).get("partitioned_tables"):
         raise ValueError("Require the TP8 owner-row indexer partitions")
-    validate_rows(model, plan.parent)
+    validate_rows(model, plan.parent, model_dir=model_dir)
     base = output / "source"
     publish_package(model, plan.parent, base)
     descriptions, tasks, counts = {}, {}, []
@@ -111,7 +115,7 @@ def build(plan, output, workers=4, minimum=512, query_tile_m=128):
             return name
 
         for packet in rank["packets"]:
-            if packet.get("batch_decode") or packet["min_rows"] < minimum:
+            if not selected_target_packet(packet, minimum, maximum):
                 continue
             capacity = packet["rows"]
             if capacity % peers:
@@ -246,7 +250,7 @@ def build(plan, output, workers=4, minimum=512, query_tile_m=128):
                 if step.get("manifest") in replacements:
                     step["manifest"] = replacements[step["manifest"]]
     compact_buffers(model, owner_tables=True)
-    validate_rows(model, base)
+    validate_rows(model, base, model_dir=model_dir)
     assets = publish_package(model, base, output / "package")
     report = dict(
         model=str(output / "package/model.json"),
@@ -267,11 +271,21 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--min-rows", type=int, default=512)
+    parser.add_argument("--max-rows", type=int)
+    parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--query-tile-m", type=int, default=128)
     args = parser.parse_args()
     print(
         json.dumps(
-            build(args.plan, args.output, args.compile_workers, args.min_rows, args.query_tile_m)
+            build(
+                args.plan,
+                args.output,
+                args.compile_workers,
+                args.min_rows,
+                args.query_tile_m,
+                args.max_rows,
+                args.model_dir,
+            )
         )
     )
 
