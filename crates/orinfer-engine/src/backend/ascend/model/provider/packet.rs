@@ -11,6 +11,27 @@ pub(super) struct Selection {
     pub prefill_requests: usize,
 }
 
+pub(super) fn work(
+    selected: &[(usize, usize)],
+    requests: &[&mut Request],
+    prefill_rows: usize,
+) -> dspark::Work {
+    dspark::Work {
+        rows: selected.iter().map(|&(_, count)| count).sum(),
+        prefill_rows,
+        context: selected
+            .iter()
+            .map(|&(i, _)| {
+                if requests[i].prefilling {
+                    requests[i].offset
+                } else {
+                    requests[i].history.len()
+                }
+            })
+            .max()
+            .unwrap_or(0),
+    }
+}
 pub(super) fn request_order(requests: &[&mut Request], tokens_per_s: f64) -> Vec<usize> {
     // Freeze ages before sorting: the same policy ranks waiting admissions and
     // active prompt suffixes. Progress resets age, so long prompts can resume.

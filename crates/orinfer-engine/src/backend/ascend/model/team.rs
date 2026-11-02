@@ -102,11 +102,12 @@ pub(super) struct Team {
     host_tables: Option<Arc<SharedTables>>,
 }
 
-/// Preparation and direct execution are startup costs, not replay observations.
+/// Execution mode and preparation are measured separately; direct is a valid steady path.
 pub(super) struct Timing {
     pub seconds: f64,
     pub preparation: f64,
     pub replay: bool,
+    pub setup: f64,
 }
 impl Team {
     pub fn load(plan: &Path, model_dir: &Path) -> Result<Self> {
@@ -818,6 +819,7 @@ fn forward_with(
             seconds: started.elapsed().as_secs_f64(),
             preparation: prepare_s,
             replay: capture,
+            setup: if cached_prepare { 0. } else { prepare_s },
         },
     ))
 }

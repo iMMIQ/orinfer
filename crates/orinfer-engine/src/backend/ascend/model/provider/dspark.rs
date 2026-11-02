@@ -1,7 +1,7 @@
 //! DSpark shares target verification and commits only confirmed state.
 use super::*;
 mod policy;
-pub(super) use policy::{Budget, Costs, Feedback, Policy};
+pub(super) use policy::{Budget, Costs, Feedback, Identity, Policy, Work};
 
 impl Runtime {
     pub(super) fn advance_dspark(
@@ -62,6 +62,8 @@ impl Runtime {
             mixed,
             Budget {
                 rows: row_budget,
+                work: packet::work(&baseline.selected, requests, baseline.prefill_rows),
+                prefill_tokens_per_s: self.prefill_tokens_per_s,
                 uniform,
                 remaining: indices
                     .iter()
@@ -163,6 +165,7 @@ impl Runtime {
         {
             return Err("Insufficient DSpark verification workspace".into());
         }
+        let verified_work = packet::work(&packet_requests, requests, prefill_rows);
         let started = Instant::now();
         self.team.exchange(Command::BeginVerification(journal))?;
         let save_s = started.elapsed().as_secs_f64();
@@ -289,16 +292,18 @@ impl Runtime {
         self.speculation_policy.observe(
             selected.len(),
             (full, mixed, uniform),
-            Costs { replay: draft_timing.replay && verify_timing.replay, stages: [
-                draft_s,
-                verify_s + sampling_s
-                    // Charge prompt work displaced by verification to the agent's
-                    // next turn, even when this packet's wall time is unchanged.
-                    + if uniform { 0. } else { baseline.prefill_rows.saturating_sub(prefill_rows) as f64
-                        / self.prefill_tokens_per_s },
-                restore_s,
-                draft_prepare + verify_prepare,
-            ] },
+            Costs {
+                draft_replay: draft_timing.replay,
+                verify_replay: verify_timing.replay,
+                work: verified_work,
+                setup: [draft_timing.setup, verify_timing.setup],
+                stages: [
+                    draft_s + draft_prepare - draft_timing.setup,
+                    verify_s + sampling_s + verify_prepare - verify_timing.setup,
+                    restore_s,
+                    0.,
+                ],
+            },
             &counts,
             block,
             &confidence,

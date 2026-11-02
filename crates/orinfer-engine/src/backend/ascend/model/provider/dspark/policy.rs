@@ -1,6 +1,10 @@
 //! Shared batch cost and request-local, causal confidence budgets.
 use crate::artifact::Result;
 use std::collections::BTreeMap;
+#[path = "cost.rs"]
+mod cost;
+pub(in crate::backend::ascend::model::provider) use cost::{Identity, Work};
+use cost::{Model, Point, Stage};
 
 #[derive(Default)]
 pub(in crate::backend::ascend::model::provider) struct Feedback {
@@ -66,17 +70,21 @@ pub(in crate::backend::ascend::model::provider) struct Budget {
     pub rows: usize,
     pub remaining: usize,
     pub uniform: bool,
+    pub work: Work,
+    pub prefill_tokens_per_s: f64,
 }
 
 pub(in crate::backend::ascend::model::provider) struct Policy {
     curves: BTreeMap<(usize, bool, bool), Curve>,
     trace: bool,
+    costs: Model,
 }
 impl Default for Policy {
     fn default() -> Self {
         Self {
             curves: BTreeMap::new(),
             trace: std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some(),
+            costs: Model::default(),
         }
     }
 }
@@ -91,10 +99,6 @@ struct Curve {
 struct BlockCurve {
     samples: usize,
     acceptance_samples: usize,
-    draft: f64,
-    extra: f64,
-    restore: f64,
-    setup: f64,
     seen: BTreeMap<usize, usize>,
     acceptance: Vec<f64>,
     previous: Vec<f64>,
@@ -103,14 +107,20 @@ struct BlockCurve {
 
 pub(in crate::backend::ascend::model::provider) struct Costs {
     pub stages: [f64; 4],
-    pub replay: bool,
+    pub draft_replay: bool,
+    pub verify_replay: bool,
+    pub work: Work,
+    pub setup: [f64; 2],
 }
 
 impl From<[f64; 4]> for Costs {
     fn from(stages: [f64; 4]) -> Self {
         Self {
             stages,
-            replay: true,
+            draft_replay: false,
+            verify_replay: false,
+            work: Work::default(),
+            setup: [stages[3] * 0.5; 2],
         }
     }
 }
@@ -120,14 +130,6 @@ fn update(old: &mut f64, sample: f64, initialized: bool) {
     } else {
         sample
     };
-}
-fn update_cost(old: &mut f64, sample: f64, initialized: bool) {
-    if !initialized || sample < *old {
-        // The first steady Graph replay replaces direct/capture startup cost.
-        *old = sample;
-    } else {
-        update(old, sample, true);
-    }
 }
 fn queue(
     maxima: &[usize],
@@ -153,33 +155,64 @@ fn queue(
     rows
 }
 impl Policy {
+    pub fn load(identity: Identity) -> Result<Self> {
+        let mut policy = Self::default();
+        policy.costs = Model::load(identity, policy.trace)?;
+        Ok(policy)
+    }
     pub fn baseline_execution(
         &mut self,
         batch: usize,
         full: bool,
-        mixed: bool,
-        seconds: f64,
-        replay: bool,
+        work: Work,
+        timing: &super::super::super::team::Timing,
     ) {
         if self.trace {
             eprintln!(
                 "DSPARK_BASELINE {}",
                 serde_json::json!({
-                    "batch": batch, "full": full, "mixed": mixed,
-                    "seconds": seconds, "replay": replay,
+                    "batch": batch, "full": full, "mixed": work.prefill_rows > 0,
+                    "seconds": timing.seconds, "replay": timing.replay,
                 })
             );
         }
-        if replay {
-            self.baseline(batch, full, mixed, seconds);
-        }
+        self.costs.observe(Point {
+            stage: Stage::Target,
+            block: 0,
+            full,
+            replay: timing.replay,
+            work,
+            seconds: timing.seconds + timing.preparation - timing.setup,
+            setup_s: timing.setup,
+        });
+        let curve = self
+            .curves
+            .entry((batch, full, work.prefill_rows > 0))
+            .or_default();
+        update(
+            &mut curve.baseline,
+            timing.seconds,
+            curve.baseline_samples > 0,
+        );
+        curve.baseline_samples += 1;
     }
+    #[cfg(test)]
     pub fn baseline(&mut self, batch: usize, full: bool, mixed: bool, seconds: f64) {
-        if !seconds.is_finite() || seconds <= 0. {
-            return;
-        }
+        let work = Work {
+            rows: batch,
+            ..Work::default()
+        };
+        self.costs.observe(Point {
+            stage: Stage::Target,
+            block: 0,
+            full,
+            replay: false,
+            work,
+            seconds,
+            setup_s: 0.,
+        });
         let curve = self.curves.entry((batch, full, mixed)).or_default();
-        update_cost(&mut curve.baseline, seconds, curve.baseline_samples > 0);
+        curve.baseline = seconds;
         curve.baseline_samples += 1;
     }
     pub fn select_requests(
@@ -205,9 +238,18 @@ impl Policy {
         } else {
             budget.rows.min(available)
         };
+        let work = if budget.work.rows == 0 {
+            Work {
+                rows: batch,
+                ..Work::default()
+            }
+        } else {
+            budget.work
+        };
+        let normal = self.costs.predict(Stage::Target, 0, full, work);
         let curve = self.curves.entry((batch, full, mixed)).or_default();
         curve.ticks += 1;
-        if limit <= batch || curve.baseline_samples < 4 {
+        if limit <= batch || normal.is_none() {
             if self.trace {
                 trace_selection(
                     curve,
@@ -232,7 +274,8 @@ impl Policy {
         let mut best = batch;
         let mut best_maxima = maxima.to_vec();
         let mut best_block = blocks[0];
-        let mut throughput = batch as f64 / (curve.baseline * 0.97);
+        let normal = normal.unwrap();
+        let mut throughput = batch as f64 / (normal.seconds * 0.97);
         let explore = curve.ticks.is_multiple_of(16);
         for &block in blocks {
             let width = maxima.iter().copied().max().unwrap_or(0).min(block);
@@ -247,7 +290,16 @@ impl Policy {
                 })
                 .collect::<Vec<_>>();
             let positive = local.iter().filter(|&&m| m > 0).count();
-            let local_limit = limit.min(batch + local.iter().sum::<usize>());
+            let mut local_limit = limit.min(batch + local.iter().sum::<usize>());
+            if positive == 0 {
+                continue;
+            }
+            if budget.uniform {
+                local_limit = batch + (local_limit - batch) / positive * positive;
+            }
+            if local_limit == batch {
+                continue;
+            }
             // A row budget too small to reach this block belongs to a shorter template.
             if blocks
                 .iter()
@@ -265,28 +317,37 @@ impl Policy {
             if cost.acceptance.len() < block {
                 cost.acceptance.resize(block, 0.7);
             }
-            let minimum_samples = if block == blocks[0] { 8 } else { 3 };
-            if cost.samples < minimum_samples
-                && block != blocks[0]
-                && budget.remaining < (minimum_samples - cost.samples) * (block + 1)
-            {
-                continue;
-            }
-            if cost.samples < minimum_samples
-                || explore
-                    && !budget.uniform
+            let draft_work = Work {
+                rows: positive,
+                ..Work::default()
+            };
+            let draft = self.costs.predict(Stage::Draft, block, false, draft_work);
+            let restore = self.costs.predict(Stage::Restore, block, full, draft_work);
+            // At most three early uses let a repeated shape reach Graph replay.
+            // Direct cost alone must not prevent this promotion. Periodic probes
+            // remain bounded when mixed shapes change instead of reaching replay.
+            let unknown = draft.is_none() || restore.is_none();
+            let cold_graph = cost.seen.get(&local_limit).copied().unwrap_or(0) < 3
+                && budget.remaining >= 3 * (block + 1);
+            let probe = cold_graph
+                || (unknown
+                    && cost.samples == 0
+                    && (block == blocks[0] || budget.remaining >= 3 * (block + 1)))
+                || (explore
                     && !curve.ticks.is_multiple_of(32)
                     && (curve.ticks / 16) % blocks.len()
-                        == blocks.iter().position(|&b| b == block).unwrap()
-            {
+                        == blocks.iter().position(|&b| b == block).unwrap());
+            if probe {
                 best = local_limit;
                 best_maxima = local;
                 best_block = block;
                 break;
             }
-            if curve.ticks.is_multiple_of(32) {
+            if unknown || curve.ticks.is_multiple_of(32) {
                 continue;
             }
+            let draft = draft.unwrap();
+            let restore = restore.unwrap();
             let mean = Feedback {
                 blocks: [(
                     block,
@@ -318,16 +379,21 @@ impl Policy {
                     let remaining_rounds = (budget.remaining * batch) as f64 / expected;
                     let pending_setups =
                         3usize.saturating_sub(cost.seen.get(&rows).copied().unwrap_or(0));
-                    let setup = if budget.uniform {
-                        0.
-                    } else {
-                        cost.setup * pending_setups as f64 / remaining_rounds.max(1.)
+                    let target_work = work.extend(rows - batch);
+                    let Some(target) = self.costs.predict(Stage::Target, 0, full, target_work)
+                    else {
+                        continue;
                     };
-                    let time = setup
-                        + cost.draft
-                        + curve.baseline
-                        + cost.restore
-                        + cost.extra * (rows - batch) as f64 / batch as f64;
+                    let setup = (draft.setup_s + target.setup_s) * pending_setups as f64
+                        / remaining_rounds.max(1.);
+                    let displaced = work.prefill_rows - target_work.prefill_rows;
+                    let opportunity = if budget.prefill_tokens_per_s > 0. {
+                        displaced as f64 / budget.prefill_tokens_per_s
+                    } else {
+                        0.
+                    };
+                    let time =
+                        setup + draft.seconds + target.seconds + restore.seconds + opportunity;
                     if expected / time > throughput {
                         throughput = expected / time;
                         best = rows;
@@ -338,14 +404,6 @@ impl Policy {
             }
         }
         if budget.uniform {
-            if best == batch && curve.ticks.is_multiple_of(16) && !curve.ticks.is_multiple_of(32) {
-                let width = maxima.iter().copied().max().unwrap_or(0);
-                best_maxima = maxima
-                    .iter()
-                    .map(|&m| if m >= width { width } else { 0 })
-                    .collect();
-                best = batch + best_maxima.iter().sum::<usize>();
-            }
             let positive = best_maxima.iter().filter(|&&m| m > 0).count();
             if let Some(count) = (best - batch).checked_div(positive) {
                 for (depth, &maximum) in depths.iter_mut().zip(&best_maxima) {
@@ -385,34 +443,59 @@ impl Policy {
         let (full, mixed, uniform) = mode;
         let curve = self.curves.entry((batch, full, mixed)).or_default();
         let positive = counts.iter().filter(|p| p.0 > 0).count();
-        let proposed = counts.iter().map(|p| p.0).sum::<usize>() as f64 / batch as f64;
         if positive == 0 {
             return;
         }
-        let baseline = curve.baseline;
         let curve = curve.blocks.entry((block, uniform)).or_default();
         curve.older = std::mem::replace(&mut curve.previous, confidence.to_vec());
-        curve.setup = curve.setup.max(timing[3]);
         *curve
             .seen
             .entry(batch + counts.iter().map(|p| p.0).sum::<usize>())
             .or_default() += 1;
-        // Retain a conservative full-cohort draft cost when only some owners draft.
-        let scale = if uniform {
-            1.
-        } else {
-            batch as f64 / positive as f64
+        let draft_work = Work {
+            rows: positive,
+            ..Work::default()
         };
-        if costs.replay {
-            update_cost(&mut curve.draft, timing[0] * scale, curve.samples > 0);
-            update_cost(
-                &mut curve.extra,
-                ((timing[1] - baseline) / proposed).max(0.),
-                curve.samples > 0,
-            );
-            update_cost(&mut curve.restore, timing[2] * scale, curve.samples > 0);
-            curve.samples += 1;
+        let work = if costs.work.rows == 0 {
+            Work {
+                rows: batch + counts.iter().map(|p| p.0).sum::<usize>(),
+                ..Work::default()
+            }
+        } else {
+            costs.work
+        };
+        for point in [
+            Point {
+                stage: Stage::Draft,
+                block,
+                full: false,
+                replay: costs.draft_replay,
+                work: draft_work,
+                seconds: timing[0],
+                setup_s: costs.setup[0],
+            },
+            Point {
+                stage: Stage::Target,
+                block: 0,
+                full,
+                replay: costs.verify_replay,
+                work,
+                seconds: timing[1],
+                setup_s: costs.setup[1],
+            },
+            Point {
+                stage: Stage::Restore,
+                block,
+                full,
+                replay: false,
+                work: draft_work,
+                seconds: timing[2],
+                setup_s: 0.,
+            },
+        ] {
+            self.costs.observe(point);
         }
+        curve.samples += 1;
         let width = counts.iter().map(|p| p.0).max().unwrap_or(0);
         if curve.acceptance.len() < width {
             curve.acceptance.resize(width, 0.7);
@@ -449,8 +532,7 @@ fn trace_selection(
             "baseline_samples": curve.baseline_samples, "baseline_s": curve.baseline,
             "ticks": curve.ticks,
             "blocks": curve.blocks.iter().map(|(&(block, uniform), c)| serde_json::json!({
-                "block":block,"uniform":uniform,"samples":c.samples,"draft_s":c.draft,
-                "extra_s":c.extra,"restore_s":c.restore,"setup_s":c.setup,
+                "block":block,"uniform":uniform,"samples":c.samples,
                 "acceptance":c.acceptance,
             })).collect::<Vec<_>>(),
         })
@@ -465,6 +547,7 @@ mod tests {
             rows,
             remaining: 1024,
             uniform: false,
+            ..Budget::default()
         }
     }
     #[test]
@@ -554,7 +637,8 @@ mod tests {
                     Budget {
                         rows: 0,
                         remaining: 16,
-                        uniform: false
+                        uniform: false,
+                        ..Budget::default()
                     },
                     &[16],
                     &[&state],
@@ -613,8 +697,22 @@ mod tests {
             [0]
         );
         assert_eq!(
-            fast.select_requests(false, true, budget(0), &[16], &[&f], &[16])
-                .unwrap(),
+            fast.select_requests(
+                false,
+                true,
+                Budget {
+                    work: Work {
+                        rows: 129,
+                        prefill_rows: 128,
+                        context: 2048
+                    },
+                    ..budget(0)
+                },
+                &[16],
+                &[&f],
+                &[16]
+            )
+            .unwrap(),
             [0]
         );
         let (mut slow, f) = measured(16, 0.01, 0, [0.010, 0.040, 0.003]);
@@ -625,26 +723,121 @@ mod tests {
         );
     }
     #[test]
-    fn direct_execution_does_not_disable_a_profitable_replay_curve() {
-        let (mut policy, feedback) = measured(5, 0.99, 5, [0.003, 0.030, 0.001]);
-        for _ in 0..8 {
-            policy.observe(
+    fn costly_direct_shapes_get_bounded_graph_probes_with_rounded_budgets() {
+        let (mut p, f) = measured(5, 0.8, 3, [0.003, 1.0, 0.001]);
+        let limits = || Budget {
+            rows: 4,
+            remaining: 1024,
+            uniform: true,
+            ..Budget::default()
+        };
+        // A new width needs promotion even though a larger direct-only width
+        // was too expensive. Observe exactly the rows that were actually run.
+        for _ in 0..3 {
+            let selected = p
+                .select_requests(false, false, limits(), &[5], &[&f], &[5])
+                .unwrap();
+            assert_eq!(selected, [3]);
+            p.observe(
                 1,
-                (false, false, false),
-                Costs {
-                    stages: [0.250, 2.0, 0.020, 0.5],
-                    replay: false,
-                },
-                &[(5, 5)],
+                (false, false, true),
+                [0.003, 1.0, 0.001, 0.],
+                &[(3, 0)],
                 5,
-                &[0.99; 5],
+                &[],
             );
         }
         assert_eq!(
-            policy
-                .select_requests(false, false, budget(0), &[5], &[&feedback], &[5])
+            p.select_requests(false, false, limits(), &[5], &[&f], &[5])
                 .unwrap(),
-            [5]
+            [0]
+        );
+        let mut p = Policy::default();
+        p.baseline(2, false, false, 0.020);
+        let limits = Budget {
+            rows: 7,
+            uniform: true,
+            ..budget(7)
+        };
+        let a = Feedback::default();
+        let b = Feedback::default();
+        assert_eq!(
+            p.select_requests(false, false, limits, &[5; 2], &[&a, &b], &[5])
+                .unwrap(),
+            [2; 2]
+        );
+    }
+    #[test]
+    fn direct_mixed_baseline_and_partial_replay_feedback_do_not_deadlock() {
+        let mut policy = Policy::default();
+        let work = Work {
+            rows: 128,
+            prefill_rows: 112,
+            context: 8192,
+        };
+        let feedback = (0..16).map(|_| Feedback::default()).collect::<Vec<_>>();
+        let feedback = feedback.iter().collect::<Vec<_>>();
+        let limits = || Budget {
+            work,
+            rows: 96,
+            remaining: 1024,
+            uniform: true,
+            prefill_tokens_per_s: 4000.,
+        };
+        policy.baseline_execution(
+            16,
+            false,
+            work,
+            &super::super::super::super::team::Timing {
+                seconds: 0.1,
+                preparation: 0.01,
+                setup: 0.,
+                replay: false,
+            },
+        );
+        let selected = policy
+            .select_requests(false, true, limits(), &[5; 16], &feedback, &[5])
+            .unwrap();
+        assert_eq!(selected, [5; 16]);
+        policy.observe(
+            16,
+            (false, true, true),
+            Costs {
+                stages: [0.01, 0.1, 0.001, 0.],
+                draft_replay: true,
+                verify_replay: false,
+                work: work.extend(80),
+                setup: [0.; 2],
+            },
+            &[(5, 5); 16],
+            5,
+            &[0.99; 5],
+        );
+        // Draft replay has no direct sample yet: a bounded subsequent probe
+        // can seed it, while target feedback is already usable independently.
+        assert!(
+            policy
+                .costs
+                .predict(Stage::Target, 0, false, work.extend(80))
+                .is_some()
+        );
+        assert!(
+            policy
+                .costs
+                .predict(
+                    Stage::Draft,
+                    5,
+                    false,
+                    Work {
+                        rows: 16,
+                        ..Work::default()
+                    }
+                )
+                .is_some()
+        );
+        assert_eq!(
+            policy.curves[&(16, false, true)].blocks[&(5, true)].samples,
+            1
         );
     }
     #[test]
@@ -655,14 +848,16 @@ mod tests {
                 .unwrap(),
             [0]
         );
-        p.observe(
-            1,
-            (false, false, false),
-            [0.007, 0.036, 0.001, 0.],
-            &[(16, 16)],
-            16,
-            &[],
-        );
+        for _ in 0..16 {
+            p.observe(
+                1,
+                (false, false, false),
+                [0.007, 0.036, 0.001, 0.],
+                &[(16, 16)],
+                16,
+                &[],
+            );
+        }
         let chosen = p
             .select_requests(false, false, budget(8), &[16], &[&f], &[16])
             .unwrap();

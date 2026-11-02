@@ -271,6 +271,13 @@ impl Runtime {
         {
             return Err("A2 service context/state contract differs".into());
         }
+        let speculation_policy = dspark::Policy::load(dspark::Identity {
+            schema_version: 1,
+            execution_package: model.execution_package,
+            target: model.metadata.target,
+            cann: "9.2".into(),
+            ranks: team.ranks(),
+        })?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         eprintln!(
             "A2 MODEL READY after {:.3}s; owners={}, context={}, rows={}",
@@ -294,7 +301,7 @@ impl Runtime {
             hints: vec![],
             prefill_tokens_per_s: 4000.,
             draft_limit,
-            speculation_policy: Default::default(),
+            speculation_policy,
             speculation: Default::default(),
         })
     }
@@ -860,9 +867,8 @@ impl Runtime {
             self.speculation_policy.baseline_execution(
                 decoders,
                 full,
-                prefill_rows > 0,
-                seconds,
-                timing.replay,
+                packet::work(&selected, requests, prefill_rows),
+                &timing,
             );
         }
         let mut steps = self.commit_packet(requests, selected, &values)?;

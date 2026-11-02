@@ -108,6 +108,10 @@ DSpark Markov 的步号通过只读 INT32 表绑定，argmax、confidence 和 ra
 
 设置 `ORINFER_A2_DSPARK_POLICY_TRACE=1` 后，A2 模型在标准错误输出普通执行的 direct／replay 状态、耗时及 DSpark 决策的样本数、行预算、请求深度和成本曲线。该开关在模型创建时读取，默认关闭。记录可用于区分样本不足、行预算、短尾和成本评分引起的关闭；计时诊断需计入日志开销。
 
+A2 DSpark 用共享稀疏成本曲线估计 target、draft 和状态恢复，分别记录 direct 与 Graph replay。普通混合执行可以直接提供成本样本；新 batch 复用邻近行数和上下文区间的数据，缺少阶段数据时执行有次数上限的探测。重复形状允许最多三次连续预热尝试，随后只保留低频探测。成本评分计入实际 prompt 行数、验证挤出的 prefill 工作和准备成本的摊销；请求的历史置信度决定预算，较新的置信度分配请求前缀。Graph 捕获沿用公共缓存规则。
+
+对代表性短负载开启上述 trace 后，运行 `uv run --locked python -m tools.bench.dspark_costs --log SERVICE_LOG --output COSTS_JSON` 生成性能先验。通过 `ORINFER_A2_DSPARK_COST_MODEL=COSTS_JSON` 在服务启动时读取；文件位于独立调优缓存，与权重分开保存。先验固定执行包、目标设备、CANN 9.2 和 TP rank 数，身份不匹配或数据无效时返回加载错误。先验只描述耗时，不表示当前 Graph 已缓存；在线执行继续修正估计。缺少先验时使用运行中收集的数据，不在启动时扫描权重或遍历全部形状测量。
+
 `run.sh` 将所选基础镜像解析为本地不可变镜像 ID；板上运行时串行取得 GPU 实验锁，无卡编译使用 `--without-devices`。编译产物、参考数据和缓存保存在 `artifacts`：
 
 ```bash
