@@ -254,7 +254,7 @@ class Export:
             mode="r",
             dtype=NUMPY[source["dtype"]],
             offset=source["offset"],
-            shape=source["shape"],
+            shape=tuple(source["shape"]),
         )
 
     def chunks(self, entry):

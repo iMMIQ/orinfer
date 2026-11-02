@@ -1,4 +1,4 @@
-"""Prepare target heads or DSpark Markov bias for the shared floating Cube factory."""
+"""Prepare and compact exact output heads with the shared floating Cube factory."""
 
 import argparse
 from copy import deepcopy
@@ -269,6 +269,200 @@ class HeadRelease(Export):
         return group, deepcopy(self.old_records[group])
 
 
+class CompactHeadRelease(HeadRelease):
+    """Keep one exact BF16 plane when both published residual planes are zero."""
+
+    def plan(self):
+        config = json.loads((self.source / self.model["config"]["file"]).read_text())
+        config = config.get("text_config", config)
+        if config["vocab_size"] % len(self.model["ranks"]):
+            raise ValueError("Output vocabulary must divide the tensor-parallel ranks")
+        self.n, self.k = config["vocab_size"] // len(self.model["ranks"]), config["hidden_size"]
+        descriptions, candidates = {}, {}
+        self.calls, self.transforms = [], {}
+        for r, rank in enumerate(self.model["ranks"]):
+            definitions = {b["name"]: b for b in rank["buffers"]}
+            for pi, packet in enumerate(rank["packets"]):
+                for program in ("body", "head"):
+                    for i, step in enumerate(packet[program]):
+                        if step["op"] != "kernel":
+                            continue
+                        path = step["manifest"]
+                        if path not in descriptions:
+                            descriptions[path] = json.loads((self.package / path).read_text())
+                        spec = descriptions[path]
+                        p = spec["parameters"]
+                        if spec["op"] != "floating.partials" or (
+                            p.get("output"),
+                            p.get("reduction"),
+                            p.get("input_parts", 1),
+                            p.get("weight_parts", 3),
+                        ) != (self.n, self.k, 1, 3):
+                            continue
+                        if len(step["buffers"]) != 3:
+                            raise ValueError("Floating head requires its three-operand ABI")
+                        bank = definitions[step["buffers"][1]]
+                        tensor = bank.get("prepared_tensor", {})
+                        if (
+                            tensor.get("dtype") != "BF16"
+                            or tensor.get("shape") != [3, self.n, self.k]
+                            or bank["bytes"] != 3 * self.n * self.k * 2
+                            or not p.get("_row_capacity")
+                        ):
+                            raise ValueError("Head compaction requires three published BF16 planes")
+                        candidates.setdefault(tensor["name"], []).append((r, pi, program, i))
+        for name, calls in candidates.items():
+            source = self.tensor(name)
+            if source["dtype"] != "BF16" or source["shape"] != [3, self.n, self.k]:
+                raise ValueError("Published head header differs from its physical binding")
+            values = self.array(name)
+            planes = values.reshape(3, -1)
+            if any(
+                np.any(plane[first : first + CHUNK // 2])
+                for plane in planes[1:]
+                for first in range(0, plane.size, CHUNK // 2)
+            ):
+                continue
+            if any(
+                np.any((planes[0, first : first + CHUNK // 2] & 0x7F80) == 0x7F80)
+                for first in range(0, planes.shape[1], CHUNK // 2)
+            ):
+                raise ValueError("Exact head requires finite BF16 weights")
+            suffix = ".bf16_residual3"
+            replacement = name.removesuffix(suffix) + ".bf16_exact"
+            if replacement in self.old_index["weight_map"]:
+                raise ValueError("Exact head tensor name already exists")
+            self.transforms[name] = replacement
+            self.calls.extend(calls)
+        if not self.calls:
+            raise ValueError("No redundant BF16 output-head planes")
+        allowed = set(self.calls)
+        for r, rank in enumerate(self.model["ranks"]):
+            changed = set()
+            for bank in rank["buffers"]:
+                tensor = bank.get("prepared_tensor", {})
+                if tensor.get("name") in self.transforms:
+                    changed.add(bank["name"])
+                    tensor.update(name=self.transforms[tensor["name"]], shape=[1, self.n, self.k])
+                    bank["bytes"] = self.n * self.k * 2
+            if any(b.get("view", {}).get("parent") in changed for b in rank["buffers"]):
+                raise ValueError("Compacted head cannot have another buffer view")
+            for pi, packet in enumerate(rank["packets"]):
+                for program in ("body", "head"):
+                    for i, step in enumerate(packet[program]):
+                        if (
+                            changed.intersection(step.get("buffers", []))
+                            and (r, pi, program, i) not in allowed
+                        ):
+                            raise ValueError("Compacted head has another consumer")
+        self.index = deepcopy(self.old_index)
+        old = json.loads((self.source / "release-manifest.json").read_text())
+        self.old_records, self.rewrite_groups = old["files"], set()
+        source_package = self.manifest["source_package"]
+        self.manifest.update(deepcopy(old))
+        self.manifest.update(source_package=source_package, files={})
+        self.manifest["exact_bf16_heads"] = deepcopy(self.transforms)
+        for name, replacement in self.transforms.items():
+            logical = self.manifest.get("logical_shapes", {})
+            if name in logical:
+                logical[replacement] = logical.pop(name)
+        for group, record in self.old_records.items():
+            path = self.source / group
+            if path not in self.headers:
+                from tools.model.safetensors_source import local_header
+
+                self.headers[path] = local_header(path)
+            start, header = self.headers[path]
+            for name in sorted(record["tensors"], key=lambda n: header[n]["data_offsets"][0]):
+                spec = header[name]
+                size = spec["data_offsets"][1] - spec["data_offsets"][0]
+                dtype, shape = spec["dtype"], spec["shape"]
+                source = dict(file=str(path), offset=start + spec["data_offsets"][0])
+                if name in self.transforms:
+                    if dtype != "BF16" or shape != [3, self.n, self.k]:
+                        raise ValueError("Compacted head differs from its published tensor")
+                    shape, size = [1, self.n, self.k], self.n * self.k * 2
+                    replacement = self.transforms[name]
+                    self.index["weight_map"][replacement] = self.index["weight_map"].pop(name)
+                    name = replacement
+                    self.rewrite_groups.add(group)
+                self.groups[group].append(
+                    (name, dict(dtype=dtype, shape=shape, bytes=size, source=source))
+                )
+        return self
+
+    def build(self):
+        from tools.model.deepseek_v41.assembly import publish_package, validate_rows
+        from tools.model.deepseek_v41.build import compile_task, kernel_rebuild_task
+
+        source = self.build_dir / "source"
+        if source.exists():
+            if json.loads((source / "model.json").read_text()) != self.original_model:
+                raise ValueError("Head compilation input changed")
+        else:
+            publish_package(self.original_model, self.package, source)
+        self.package = source
+        tasks, selected = {}, {}
+
+        def rebuild(path):
+            if path in tasks:
+                return
+            spec = json.loads((source / path).read_text())
+            p = spec["parameters"]
+            if spec["op"] != "floating.partials" or (
+                p.get("output"),
+                p.get("reduction"),
+                p.get("input_parts", 1),
+                p.get("weight_parts", 3),
+            ) != (self.n, self.k, 1, 3):
+                raise ValueError("Head variants must retain their original matrix contract")
+            task = kernel_rebuild_task(deepcopy(spec), path)
+            task["arguments"]["weight_parts"] = 1
+            if task["specs"][1]["name"] != "weight" or task["specs"][1]["shape"] != [
+                3,
+                self.n,
+                self.k,
+            ]:
+                raise ValueError("Head variant physical weight geometry differs")
+            task["specs"][1]["shape"][0] = 1
+            tasks[path] = task
+
+        for r, pi, program, i in self.calls:
+            step = self.model["ranks"][r]["packets"][pi][program][i]
+            for path in [step["manifest"], step.get("uncompacted_manifest")]:
+                if path is None:
+                    continue
+                rebuild(path)
+                if path in self.model.get("row_selections", {}):
+                    selected[path] = deepcopy(self.model["row_selections"][path])
+                    for variant in selected[path]:
+                        for kernel in variant["kernels"]:
+                            rebuild(kernel)
+        compiled = dict(compile_task((task, source)) for task in tasks.values())
+        for r, pi, program, i in self.calls:
+            step = self.model["ranks"][r]["packets"][pi][program][i]
+            step["manifest"] = compiled[step["manifest"]]
+            if step.get("uncompacted_manifest"):
+                step["uncompacted_manifest"] = compiled[step["uncompacted_manifest"]]
+        for path, variants in selected.items():
+            for variant in variants:
+                variant["kernels"] = [compiled[k] for k in variant["kernels"]]
+            self.model["row_selections"][compiled[path]] = variants
+        used = {
+            s[key]
+            for rank in self.model["ranks"]
+            for packet in rank["packets"]
+            for s in packet["body"] + packet["head"]
+            if s["op"] == "kernel"
+            for key in ("manifest", "uncompacted_manifest")
+            if s.get(key)
+        }
+        self.model["row_selections"] = {
+            k: v for k, v in self.model.get("row_selections", {}).items() if k in used
+        }
+        validate_rows(self.model, source, model_dir=self.source)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
@@ -278,15 +472,21 @@ def main():
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--tile-m", type=int, default=64)
     parser.add_argument("--tile-n", type=int, default=128)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--markov-bias",
         action="store_true",
         help="Convert the configured DSpark Markov bias bank only when exactly representable in BF16",
     )
+    mode.add_argument(
+        "--compact-zero-planes",
+        action="store_true",
+        help="Remove fully zero BF16 head residual planes without rounding weights",
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
-    job = HeadRelease(
+    job = (CompactHeadRelease if args.compact_zero_planes else HeadRelease)(
         args.source,
         args.output,
         source_execution=args.source_execution,
@@ -302,7 +502,7 @@ def main():
                 head_banks=len(job.transforms),
                 calls=len(job.calls),
                 rewritten_shards=len(job.rewrite_groups),
-                tile=[args.tile_m, args.tile_n],
+                tile="preserved" if args.compact_zero_planes else [args.tile_m, args.tile_n],
             )
         ),
         flush=True,

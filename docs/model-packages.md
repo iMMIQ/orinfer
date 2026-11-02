@@ -205,7 +205,9 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 `tools.model.deepseek_v41.floating_head` 将已发布的 FP32 target／DSpark 输出头离线转换为三个精确 BF16 残差分量，复用 `floating.partials` 与 FP32 八段归约。一个动态 tile 配置覆盖普通 decode、验证与 draft 的实际输出行数；库描述保留各 family 的物理容量。宽列 tile 支持 32 列对齐的词表尾部，partial workspace 按 tile 补齐，归约只写真实词表列。权重值无损，MMA 的 FP32 累加与旧 Vector 求和可能存在微小舍入差异，发布前比较固定历史概率和完整请求性能。
 
-该转换替换原 FP32 bank，新增的分量不与原 bank 同时常驻。当前 TP8 target／draft 两个完整输出头每卡合计增加约 316 MiB；变更分片重新写出，其余分片复用硬链接。源与输出须位于同一文件系统及容器挂载点；可先在宿主机将发布目录硬链接到工作区，再在离线环境执行：
+同一入口的 `--compact-zero-planes` 会完整检查已发布输出头的两个 BF16 残差分量；确认全零且主分量有限时，只保留主 BF16 分量，并复用原投影 tile、BF16 激活及 FP32 归约边界。非零残差保持三分量。检查限定在离线预处理，在线直接加载物理权重。该模式与 `--markov-bias` 互斥，仅重写受影响的语义分片，其余分片复用硬链接。
+
+该转换替换原 FP32 bank，新增的分量不与原 bank 同时常驻。TP8 target／draft 两个完整输出头均采用三分量时，每卡合计增加约 316 MiB；变更分片重新写出，其余分片复用硬链接。源与输出须位于同一文件系统及容器挂载点；可先在宿主机将发布目录硬链接到工作区，再在离线环境执行：
 
 ```bash
 ORINFER_ASCEND_MODEL_ROOT=/data bash tools/operators/ascend/run.sh --without-devices \

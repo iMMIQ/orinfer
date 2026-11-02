@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 from safetensors.numpy import save_file
 
-from tools.model.deepseek_v41.floating_head import HeadRelease, head_calls
+from tools.model.deepseek_v41.floating_head import CompactHeadRelease, HeadRelease, head_calls
 from tools.model.safetensors_source import local_header
 
 
@@ -78,6 +78,113 @@ def fixture(root, reduction=1024, exact=False):
     )
     (package / "model.json").write_text(json.dumps(model))
     return source, cache, package, model, weight
+
+
+def compact_fixture(root, exact=True):
+    source, cache, package, _, weight = fixture(root, exact=exact)
+    previous = HeadRelease(
+        source,
+        root / "three-planes",
+        source_execution=cache,
+        execution_output=root / "unused-cache",
+        build_dir=root / "unused-build",
+    ).plan()
+    group, record = previous.write_shard("layer.safetensors")
+    source = previous.output
+    (source / "cache").mkdir()
+    (source / "cache/model.json").write_text(json.dumps(dict(execution_package="original")))
+    (source / "config.json").write_text((root / "weights/config.json").read_text())
+    (source / "model.safetensors.index.json").write_text(json.dumps(previous.index))
+    (source / "release-manifest.json").write_text(
+        json.dumps(dict(source_package="ancestor", files={group: record}))
+    )
+    (package / "model.json").write_text(json.dumps(previous.model))
+    for capacity in [4, 8]:
+        (package / f"partials{capacity}.json").write_text(
+            json.dumps(
+                dict(
+                    op="floating.partials",
+                    parameters=dict(
+                        rows=capacity,
+                        output=64,
+                        reduction=1024,
+                        input_parts=1,
+                        weight_parts=3,
+                        _row_capacity=capacity,
+                    ),
+                    operands=[
+                        dict(name="activation", dtype="bf16", shape=[1, capacity, 1024]),
+                        dict(name="weight", dtype="bf16", shape=[3, 64, 1024]),
+                        dict(name="out", dtype="f32", shape=[capacity, 1024]),
+                    ],
+                )
+            )
+        )
+    return (
+        CompactHeadRelease(
+            source,
+            root / "single-plane",
+            source_execution=cache,
+            execution_output=root / "compact-cache",
+            build_dir=root / "compact-build",
+        ),
+        source,
+        package,
+        previous.model,
+        weight,
+    )
+
+
+class CompactHeadTests(unittest.TestCase):
+    def test_complete_zero_proof_preserves_main_plane_and_other_tensors(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            job, source, _, _, _ = compact_fixture(root)
+            job.plan()
+            self.assertEqual(len(job.calls), 2)
+            self.assertEqual(job.transforms, {"head.bf16_residual3": "head.bf16_exact"})
+            self.assertEqual(job.manifest["source_package"], "original")
+            bank = job.model["ranks"][0]["buffers"][0]
+            self.assertEqual(bank["prepared_tensor"]["shape"], [1, 64, 1024])
+            self.assertEqual(bank["bytes"], 64 * 1024 * 2)
+            job.write_shard("layer.safetensors")
+            old_start, old = local_header(source / "layer.safetensors")
+            start, new = local_header(job.output / "layer.safetensors")
+            old_value = old["head.bf16_residual3"]
+            new_value = new["head.bf16_exact"]
+            self.assertEqual(old_value["shape"], [3, 64, 1024])
+            self.assertEqual(new_value["shape"], [1, 64, 1024])
+            with (source / "layer.safetensors").open("rb") as stream:
+                stream.seek(old_start + old_value["data_offsets"][0])
+                reference = stream.read(64 * 1024 * 2)
+            with (job.output / "layer.safetensors").open("rb") as stream:
+                stream.seek(start + new_value["data_offsets"][0])
+                self.assertEqual(stream.read(64 * 1024 * 2), reference)
+            self.assertIn("untouched", new)
+
+    def test_nonzero_residual_and_nonfinite_main_plane_cannot_be_compacted(self):
+        with TemporaryDirectory() as directory:
+            job, _, _, _, _ = compact_fixture(Path(directory), exact=False)
+            with self.assertRaisesRegex(ValueError, "No redundant"):
+                job.plan()
+        with TemporaryDirectory() as directory:
+            job, source, _, _, _ = compact_fixture(Path(directory))
+            start, header = local_header(source / "layer.safetensors")
+            offset = start + header["head.bf16_residual3"]["data_offsets"][0]
+            with (source / "layer.safetensors").open("r+b") as stream:
+                stream.seek(offset)
+                stream.write(bytes([0x80, 0x7F]))
+            with self.assertRaisesRegex(ValueError, "finite BF16"):
+                job.plan()
+
+    def test_other_weight_consumers_require_an_explicit_conversion_contract(self):
+        with TemporaryDirectory() as directory:
+            job, _, package, model, _ = compact_fixture(Path(directory))
+            model["ranks"][0]["packets"][0]["body"].append(dict(op="copy", buffers=["weight"]))
+            (package / "model.json").write_text(json.dumps(model))
+            job.model = model
+            with self.assertRaisesRegex(ValueError, "another consumer"):
+                job.plan()
 
 
 class FloatingHeadTests(unittest.TestCase):
