@@ -35,10 +35,9 @@ pub(super) fn validate_replacement(
         spec.parameters
             .iter()
             .filter(|(key, _)| {
-                !matches!(
-                    key.as_str(),
-                    "tile_m" | "tile_n" | "block_k" | "pipeline_stages" | "_grid_limit"
-                )
+                !matches!(key.as_str(), "tile_m" | "pipeline_stages" | "_grid_limit")
+                    && !(spec.op == "dense.projection"
+                        && matches!(key.as_str(), "tile_n" | "block_k"))
             })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<std::collections::BTreeMap<_, _>>()
@@ -46,7 +45,7 @@ pub(super) fn validate_replacement(
     let target = |spec: &super::super::kernels::Spec| {
         serde_json::to_value(&spec.target).map_err(|e| e.to_string())
     };
-    if source.op != "dense.projection"
+    if !matches!(source.op.as_str(), "dense.projection" | "floating.partials")
         || replacement.op != source.op
         || target(source)? != target(replacement)?
         || source.source_sha256 != replacement.source_sha256
@@ -130,6 +129,36 @@ pub(super) fn view_offset(view: &View, actual: usize) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn floating_row_choices_preserve_partial_layout_and_reduction_arithmetic() {
+        let source: super::super::super::kernels::Spec =
+            serde_json::from_value(serde_json::json!({
+                "schema_version":1,"op":"floating.partials","source_sha256":"0".repeat(64),
+                "compiler":{"version":"pinned"},"target":{"host_arch":std::env::consts::ARCH,
+                    "backend":"ascend","device_arch":"ascend910b"},
+                "library":{"file":"kernel.so","sha256":"0".repeat(64)},
+                "parameters":{"rows":544,"_row_capacity":544,"tile_m":64,"tile_n":128,
+                    "block_k":128,"weight_parts":3,"pipeline_stages":3},
+                "operands":[{"name":"out","dtype":"f32","access":"write","shape":[544,130048]}]
+            }))
+            .unwrap();
+        let mut replacement = source.clone();
+        replacement.parameters.insert("tile_m".into(), 128.into());
+        validate_replacement(&source, &replacement).unwrap();
+        for (key, value) in [("tile_n", 64), ("block_k", 256), ("weight_parts", 1)] {
+            let mut invalid = replacement.clone();
+            invalid.parameters.insert(key.into(), value.into());
+            assert!(validate_replacement(&source, &invalid).is_err());
+        }
+        let mut invalid = replacement.clone();
+        invalid.operands[0].shape[1] += 1;
+        assert!(validate_replacement(&source, &invalid).is_err());
+        invalid = replacement;
+        invalid
+            .compiler
+            .insert("version".into(), "different".into());
+        assert!(validate_replacement(&source, &invalid).is_err());
+    }
     #[test]
     fn graph_churn_keeps_decode_and_recent_rows() {
         let mut cache = PacketLru::new(4);

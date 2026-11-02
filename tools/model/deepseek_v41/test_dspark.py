@@ -12,6 +12,7 @@ from unittest.mock import patch
 from tools.model.deepseek_v41.dspark import (
     converge_draft_blocks,
     converge_captures,
+    converge_markov_steps,
     reuse_prepared_draft,
     validate_block_size,
     write_constant,
@@ -127,6 +128,34 @@ class HistoryStorageTests(unittest.TestCase):
 
 
 class CapacityTests(unittest.TestCase):
+    def test_legacy_markov_steps_share_operands_and_keep_graph_step_addresses(self):
+        descriptions, instructions = {}, []
+        for step in range(16):
+            for op in ("topk.add_bias_argmax", "topk.reduce_rank_best", "vector.confidence"):
+                name = f"{op}.{step}"
+                descriptions[name] = dict(
+                    op=op, parameters=dict(rows=32, block_size=16, step=step), operands=[]
+                )
+                instructions.append(dict(op="kernel", manifest=name, buffers=["input"]))
+        packet = dict(body=instructions, head=[])
+        model = dict(ranks=[dict(buffers=[], packets=[packet])])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertEqual(converge_markov_steps(model, root, descriptions), 48)
+            definitions = {b["name"]: b for b in model["ranks"][0]["buffers"]}
+            for step in range(16):
+                names = {s["buffers"][-1] for s in instructions[step * 3 : (step + 1) * 3]}
+                self.assertEqual(len(names), 1)
+                view = definitions[names.pop()]["view"]
+                self.assertEqual(view["offset"], step * 4)
+                parent = definitions[view["parent"]]
+                data = (root / parent["data"]["file"]).read_bytes()
+                self.assertEqual(int.from_bytes(data[step * 4 : step * 4 + 4], "little"), step)
+            self.assertEqual(len({json.dumps(s, sort_keys=True) for s in descriptions.values()}), 3)
+            frozen = deepcopy(model)
+            self.assertEqual(converge_markov_steps(model, root, descriptions), 0)
+            self.assertEqual(model, frozen)
+
     def test_active_noise_blocks_reuse_body_and_bounded_markov_prefixes(self):
         compiler = SimpleNamespace(map=lambda fn, items: map(fn, items))
         fake = SimpleNamespace(compile_task=lambda item: (item[0]["placeholder"], "padding.json"))

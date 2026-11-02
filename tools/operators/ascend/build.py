@@ -21,6 +21,7 @@ from tools.operators.ascend.vector_launch import lower_independent_cube, lower_i
 from tools.operators.ascend.rows import bounded_grid, split_resources
 from tools.operators.ascend.scalar_cache import lower_scalar_cache
 from tools.operators.ascend.pipeline import lower_gather_pipeline
+from tools.operators.ascend.toolchain import cann_version
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCES = [
@@ -132,6 +133,7 @@ def compile_kernel(
         "tilelang": tilelang.__version__,
         "bisheng": subprocess.check_output(["bisheng", "--version"], text=True).splitlines()[0],
         "cann_home": os.environ["ASCEND_HOME_PATH"],
+        "cann_version": cann_version(os.environ["ASCEND_HOME_PATH"]),
         "storage_rewrite": "explicit-npu-v1",
         "vector_launch": "paired-aiv-v2",
         "scalar_cache": "entry-invalidate-exit-clean-v1",
@@ -156,6 +158,7 @@ def compile_kernel(
             Path(__file__).with_name("rows.py"),
             Path(__file__).with_name("scalar_cache.py"),
             Path(__file__).with_name("pipeline.py"),
+            Path(__file__).with_name("toolchain.py"),
         ]
         if "." in name and module in SOURCES
         else SOURCES

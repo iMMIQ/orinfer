@@ -2,7 +2,8 @@
 # Offline compiler/validation runner. Production execution uses the Rust loader.
 set -euo pipefail
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
-image=${ORINFER_ASCEND_IMAGE:-orinfer-a2-tilelang:0.1.4-d182ae8-cann9.1-arm64}
+image=${ORINFER_ASCEND_IMAGE:-orinfer-a2-tilelang:0.1.4-d182ae8-cann9.2-arm64}
+toolchain_root=${ORINFER_ASCEND_CANN_ROOT:-/usr/local/Ascend/cann-9.2.0}
 driver_root=${ORINFER_ASCEND_DRIVER_ROOT:-/usr/local/Ascend/driver}
 model_root=${ORINFER_ASCEND_MODEL_ROOT:-/data/models}
 wheel_name=tilelang-0.1.4+ubuntu.24.3.cann910-cp312-cp312-linux_aarch64.whl
@@ -10,7 +11,7 @@ wheel_dir="$repo_dir/artifacts/ascend-runtime/wheels"
 wheel_url='https://github.com/tile-ai/tilelang-ascend/releases/download/TileLang-ascend-v0.1.2.000-release/tilelang-0.1.4%2Bubuntu.24.3.cann910-cp312-cp312-linux_aarch64.whl'
 
 if [[ ${1:-} == build ]]; then
-    base_image=${ORINFER_ASCEND_BASE_IMAGE:?Set ORINFER_ASCEND_BASE_IMAGE to a CANN 9.1 / Python 3.12 runtime image}
+    base_image=${ORINFER_ASCEND_BASE_IMAGE:?Set ORINFER_ASCEND_BASE_IMAGE to a Python 3.12 / torch_npu compiler frontend image}
     base_id=$(docker image inspect --format '{{.Id}}' "$base_image")
     base_tag="orinfer-ascend-base:build-$$"
     docker tag "$base_id" "$base_tag"
@@ -38,6 +39,11 @@ if [[ ${1:-} == --without-devices ]]; then
     fi
 fi
 docker image inspect "$image" >/dev/null
+if [[ ! -f "$toolchain_root/compiler/version.info" ]] ||
+    ! rg -q '^Version=9\.2\.' "$toolchain_root/compiler/version.info"; then
+    echo 'Native A2 compilation and validation require a CANN 9.2 installation.' >&2
+    exit 2
+fi
 devices=()
 lock=()
 if [[ $without_devices == false ]]; then
@@ -55,5 +61,8 @@ mkdir -p "$repo_dir/artifacts"
     "${devices[@]}" \
     "${mounts[@]}" \
     --mount "type=bind,src=$driver_root,dst=/usr/local/Ascend/driver,readonly" \
+    --mount "type=bind,src=$toolchain_root,dst=$toolchain_root,readonly" \
+    --env "ASCEND_HOME_PATH=$toolchain_root" \
     --mount "type=bind,src=$repo_dir,dst=/workspace/orinfer" \
-    --workdir /workspace/orinfer --entrypoint "$1" "$image" "${@:2}"
+    --workdir /workspace/orinfer --entrypoint /bin/bash "$image" -c \
+    'source "$ASCEND_HOME_PATH/set_env.sh"; exec "$@"' orinfer-ascend "$@"

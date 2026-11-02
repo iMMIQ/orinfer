@@ -408,13 +408,15 @@ def validate_rows(model, base, *, model_dir=None):
             previous = variant["max_rows"]
             replacement = spec_for(variant["kernels"][0])
             check_unit_scales(variant["kernels"][0])
-            knobs = {"tile_m", "tile_n", "block_k", "pipeline_stages", "_grid_limit", "unit_scale"}
+            knobs = {"tile_m", "pipeline_stages", "_grid_limit"}
+            if source["op"] == "dense.projection":
+                knobs.update(("tile_n", "block_k", "unit_scale"))
 
             def math_parameters(spec):
                 return {k: v for k, v in spec["parameters"].items() if k not in knobs}
 
             if (
-                source["op"] != "dense.projection"
+                source["op"] not in ("dense.projection", "floating.partials")
                 or replacement["op"] != source["op"]
                 or source.get("target") != replacement.get("target")
                 or source.get("source_sha256") != replacement.get("source_sha256")

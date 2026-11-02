@@ -160,7 +160,7 @@ def build(
             if label in definitions:
                 return define(label, definitions[label]["bytes"] if size is None else size)
             size = old["bytes"] if size is None else size
-            if "view" in old and name.startswith("sequence."):
+            if "view" in old and (name.startswith("sequence.") or immutable(old["view"]["parent"])):
                 view = deepcopy(old["view"])
                 view["parent"] = runtime_buffer(view["parent"], family)
                 return define(label, size, dict(view=view))
@@ -210,7 +210,11 @@ def build(
                 if label not in private:
                     private.append(label)
             else:
-                if old and "view" in old and name.startswith("sequence."):
+                if (
+                    old
+                    and "view" in old
+                    and (name.startswith("sequence.") or immutable(old["view"]["parent"]))
+                ):
                     return runtime_buffer(name, family, size)
                 # Row workspaces are independent allocations; dropping obsolete
                 # static views makes mixed-owner slices unambiguous.

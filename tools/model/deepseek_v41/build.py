@@ -1776,10 +1776,28 @@ def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None):
     descriptions = {}
     for binding, key in references:
         manifest = binding[key]
-        if manifest in tasks:
-            continue
         if manifest not in descriptions:
             descriptions[manifest] = json.loads((base / manifest).read_text())
+    from tools.model.deepseek_v41.dspark import MARKOV_STEP_OPS, converge_markov_steps
+
+    if all_kernels or operators and set(operators) & MARKOV_STEP_OPS:
+        selected = {
+            path: spec
+            for path, spec in descriptions.items()
+            if all_kernels and not operators or operators and spec["op"] in operators
+        }
+        # The binding upgrade must see every instruction's description, while
+        # only selected operators may change ABI in a partial rebuild.
+        upgraded = {
+            path: spec if path in selected else dict(spec, op="unselected")
+            for path, spec in descriptions.items()
+        }
+        converge_markov_steps(model, base, upgraded)
+    identities, aliases = {}, {}
+    for binding, key in references:
+        manifest = binding[key]
+        if manifest in tasks:
+            continue
         spec = descriptions[manifest]
         if operators and spec["op"] not in operators:
             continue
@@ -1793,7 +1811,15 @@ def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None):
             )
         ):
             continue
-        tasks[manifest] = kernel_rebuild_task(spec, manifest)
+        task = kernel_rebuild_task(spec, manifest)
+        identity = json.dumps(
+            {k: v for k, v in task.items() if k not in ("placeholder", "key")}, sort_keys=True
+        )
+        if identity in identities:
+            aliases[manifest] = identities[identity]
+        else:
+            identities[identity] = manifest
+            tasks[manifest] = task
     if operators and set(operators) - {t["operator"] for t in tasks.values()}:
         raise ValueError("Selected operator is absent from the plan")
     replacements = {}
@@ -1804,7 +1830,13 @@ def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None):
             replacements[old] = new
             print(json.dumps(dict(rebuilt=len(replacements), total=len(tasks))), flush=True)
     for binding, key in references:
-        binding[key] = replacements.get(binding[key], binding[key])
+        old = binding[key]
+        binding[key] = replacements.get(aliases.get(old, old), old)
+    if "row_selections" in model:
+        model["row_selections"] = {
+            replacements.get(aliases.get(slot, slot), slot): variants
+            for slot, variants in model["row_selections"].items()
+        }
     suffix = "-selected.json" if operators else "-rebuilt.json" if all_kernels else "-paired.json"
     output = plan.with_name(plan.stem + suffix)
     atomic_json(output, model)

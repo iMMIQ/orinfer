@@ -42,7 +42,7 @@ def mean_sections(rows, width=5120, branches=4, sections=3, section=0):
     return main
 
 
-def confidence(rows, width=5120, rank=256, block_size=5, step=0):
+def confidence(rows, width=5120, rank=256, block_size=5):
     """FP32 confidence from pre-norm draft hidden and the previous-token embedding."""
     size = width + rank
 
@@ -52,6 +52,7 @@ def confidence(rows, width=5120, rank=256, block_size=5, step=0):
         embedding: T.Tensor((rows, rank), "bfloat16"),
         weight: T.Tensor((size,), "float32"),
         probabilities: T.Tensor((rows * block_size,), "float32"),
+        step_index: T.Tensor((1,), "int32"),
     ):
         with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
             half = T.alloc_ub((1, size), "bfloat16")
@@ -62,6 +63,7 @@ def confidence(rows, width=5120, rank=256, block_size=5, step=0):
             result = T.alloc_ub((1, 1), "float32")
             row = cid * 2 + vid
             if row < rows:
+                step = step_index[0]
                 T.copy(
                     hidden[row * block_size + step : row * block_size + step + 1, :],
                     half[:, :width],

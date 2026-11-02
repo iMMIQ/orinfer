@@ -7,8 +7,87 @@ import json
 from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
-from tools.model.row_selection import aggregate_winner
+from tools.model.row_selection import aggregate_winner, guarded_winner
 from tools.model.tuning import compile_candidates, measure, read_record, record_path
+
+
+def head_configs(parameters):
+    """Keep the released head tile as reference and preserve its output layout."""
+    baseline = dict(
+        tile_m=parameters.get("tile_m", 16),
+        tile_n=parameters.get("tile_n", 32),
+        pipeline_stages=parameters.get("pipeline_stages", 0),
+    )
+    configs = [baseline]
+    for m, s in ((baseline["tile_m"], 3), (128, 0), (128, 3)):
+        candidate = dict(baseline, tile_m=m, pipeline_stages=s)
+        if candidate not in configs:
+            configs.append(candidate)
+    return configs
+
+
+def canonical_partials(values, rows, output, tile_n):
+    """Compare logical columns/splits, excluding unpublished vocabulary padding."""
+    blocks = (output + tile_n - 1) // tile_n
+    return (
+        values[:rows]
+        .reshape(rows, blocks, 8, tile_n)
+        .swapaxes(2, 3)
+        .reshape(rows, blocks * tile_n, 8)[:, :output, :]
+    )
+
+
+def head_row_policy(records, contracts, maximum_regression=0.1):
+    """Choose a fallback and one measured larger-row interval with matching ABI."""
+
+    def signature(spec):
+        return json.dumps(
+            {
+                **{
+                    k: spec.get(k)
+                    for k in ("op", "source_sha256", "compiler", "target", "operands")
+                },
+                "parameters": {
+                    k: v
+                    for k, v in spec["parameters"].items()
+                    if k not in ("tile_m", "pipeline_stages", "_grid_limit")
+                },
+            },
+            sort_keys=True,
+        )
+
+    names = sorted(contracts)
+    policies = [dict(default=name, variant=None, minimum=1) for name in names]
+    for fallback in names:
+        for variant in names:
+            if fallback == variant or signature(contracts[fallback]) != signature(
+                contracts[variant]
+            ):
+                continue
+            policies += [
+                dict(default=fallback, variant=variant, minimum=row)
+                for row in sorted({r["rows"] for r in records})
+                if row > 1
+            ]
+    cases = [
+        dict(
+            rows=r["rows"],
+            times={
+                str(i): r["times"][
+                    p["variant"]
+                    if p["variant"] is not None and r["rows"] >= p["minimum"]
+                    else p["default"]
+                ]
+                for i, p in enumerate(policies)
+            },
+        )
+        for r in records
+    ]
+    reference = next(
+        str(i) for i, p in enumerate(policies) if p["default"] == "0" and p["variant"] is None
+    )
+    selected = guarded_winner(cases, reference=reference, maximum_regression=maximum_regression)
+    return policies[int(selected)]
 
 
 def main():
@@ -26,6 +105,8 @@ def main():
     parser.add_argument("--reuse-operand-only", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--mask-only", action="store_true")
+    parser.add_argument("--head-only", action="store_true")
+    parser.add_argument("--maximum-regression", type=float, default=0.1)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     parser.add_argument(
@@ -37,6 +118,8 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.calls_per_replay <= 64:
         parser.error("Graph replay call count must be in 1..64")
+    if not 0 <= args.maximum_regression <= 1:
+        parser.error("Maximum regression must be in 0..1")
     if (
         sum(
             (
@@ -49,6 +132,7 @@ def main():
                 args.reuse_operand_only,
                 args.quantize_only,
                 args.mask_only,
+                args.head_only,
             )
         )
         > 1
@@ -58,7 +142,7 @@ def main():
     import torch_npu  # noqa: F401
     from kernels.model.rows import row_count
     from tools.model.deepseek_v41.floating import bf16_parts
-    from tools.model.deepseek_v41.tune import file_hash_bytes, npu_benchmark, read_weight
+    from tools.model.deepseek_v41.tune import file_hash_bytes, npu_benchmark, read_bank
     from tools.operators.ascend import attention_prefill, dense, floating, model_ops, moe, vector
     from tools.operators.ascend.build import compile_kernel
 
@@ -69,12 +153,18 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     model = json.loads(args.plan.read_text())
     base = args.plan.parent
+    head_geometry = None
+    if args.head_only:
+        config = json.loads((args.model_dir / model["config"]["file"]).read_text())
+        config = config.get("text_config", config)
+        head_geometry = (config["vocab_size"] // len(model["ranks"]), config["hidden_size"])
     index = json.loads((args.model_dir / model["index"]["file"]).read_text())["weight_map"]
     definitions = {b["name"]: b for b in model["ranks"][0]["buffers"]}
     replacements = {}
     reduction_steps = {}
     reducer_manifests = set()
     paired_reducers = {}
+    head_selections = {}
     for packet in model["ranks"][0]["packets"]:
         for step in packet["body"] + packet["head"]:
             if step["op"] == "kernel":
@@ -83,6 +173,7 @@ def main():
                     reduction_steps[step["buffers"][0]] = (step["manifest"], definition)
                     reducer_manifests.add(step["manifest"])
     seen = set()
+    matched_heads = 0
     for packet in model["ranks"][0]["packets"]:
         for step in packet["body"] + packet["head"]:
             if step["op"] != "kernel" or step["manifest"] in seen:
@@ -123,6 +214,18 @@ def main():
                 continue
             if args.hc_reuse_only and kind != "vector.mhc_post_pre":
                 continue
+            if args.head_only and (
+                kind != "floating.partials"
+                or (manifest["parameters"]["output"], manifest["parameters"]["reduction"])
+                != head_geometry
+            ):
+                continue
+            if args.head_only:
+                matched_heads += 1
+                if step["manifest"] in model.get("row_selections", {}):
+                    raise ValueError(
+                        "Head tuning requires a frozen reference without head row choices"
+                    )
             params = dict(manifest["parameters"])
             if "_row_capacity" not in params:
                 if args.quantize_only and params.get("fp16_query_scale"):
@@ -139,7 +242,10 @@ def main():
             capacity = params.pop("_row_capacity")
             grid_limit = params.pop("_grid_limit", 64)
             row_factor = 1
-            if kind == "attention_prefill.selected_mask":
+            if args.head_only:
+                configs = head_configs(params)
+                factory = floating.partials
+            elif kind == "attention_prefill.selected_mask":
                 baseline_config = dict(
                     explicit_sync=params.get("explicit_sync", False),
                     store_unroll=params.get("store_unroll", 1),
@@ -221,6 +327,8 @@ def main():
                     configs = [baseline_config] + [c for c in configs if c != baseline_config]
 
             def build(config):
+                if args.head_only and config == configs[0]:
+                    return base / step["manifest"]
                 parameters = dict(params, **config)
                 factory_args = dict(parameters, rows=row_count(capacity, True))
                 if row_factor != 1:
@@ -243,33 +351,73 @@ def main():
 
             baseline = build(configs[0])
             descriptor = json.loads(baseline.read_text())
+            head_compiled, head_contracts, head_reducer = None, {}, None
+            if args.head_only:
+                head_compiled = compile_candidates(configs, build, tolerate_failures=True)
+                head_contracts = {
+                    str(path.relative_to(base)): json.loads(path.read_text())
+                    for path in head_compiled[0]
+                }
+                head_reducer = reduction_steps[step["buffers"][2]]
             identity = dict(
                 source=descriptor["source_sha256"],
                 compiler=descriptor["compiler"],
                 device=None if args.compile_only else torch.npu.get_device_name(args.device),
                 parameters=params,
                 configs=configs,
-                samples=sorted({r for r in args.rows if 1 <= r <= capacity}),
+                samples=sorted(
+                    {
+                        r
+                        for r in ([*args.rows, capacity] if args.head_only else args.rows)
+                        if 1 <= r <= capacity
+                    }
+                ),
                 calls_per_replay=args.calls_per_replay,
+                maximum_regression=args.maximum_regression if args.head_only else None,
                 tuner_sha256=file_hash(Path(__file__)),
                 seed=20261002,
                 reduction_source=file_hash(Path(dense.__file__)),
             )
+            if args.head_only:
+                # A frozen package may use an older compatible compiler. Keep
+                # both provenances instead of measuring a rebuilt reference.
+                identity.update(head_candidates=head_contracts, head_reducer=list(head_reducer))
             weight = None
             if kind == "floating.partials":
                 definition = definitions[step["buffers"][1]]
-                if "prepared_weight" in definition:
-                    weight = torch.from_file(
-                        str(base / definition["prepared_weight"]),
-                        shared=False,
-                        size=definition["bytes"] // 2,
-                        dtype=torch.bfloat16,
-                    ).reshape(params["weight_parts"], params["output"], params["reduction"])
-                else:
-                    weight = read_weight(args.model_dir, index, definition["weight"])[None]
+                weight = read_bank(
+                    base,
+                    args.model_dir,
+                    index,
+                    definition,
+                    "bf16",
+                    manifest["operands"][1]["shape"],
+                )
                 identity["weight_sha256"] = file_hash_bytes(weight)
 
             def valid(record):
+                if args.head_only:
+                    relative = record["manifest"]
+                    if (
+                        relative not in head_contracts
+                        or record.get("reducer_manifest") != head_reducer[0]
+                    ):
+                        return False
+                    names = [relative] + [
+                        name for v in record.get("variants", []) for name in v["kernels"]
+                    ]
+                    if any(name not in head_contracts for name in names):
+                        return False
+                    for name, expected in [(name, head_contracts[name]) for name in names] + [
+                        head_reducer
+                    ]:
+                        path = base / name
+                        actual = json.loads(path.read_text())
+                        if actual != expected or actual["library"]["sha256"] != file_hash(
+                            path.parent / actual["library"]["file"]
+                        ):
+                            return False
+                    return True
                 expected_compiler = dict(descriptor["compiler"])
                 if kind == "attention_prefill.selected_mask":
                     expected_compiler.pop("pipeline_sync", None)
@@ -298,12 +446,16 @@ def main():
             cached = read_record(record, identity, valid) if not args.compile_only else None
             if cached:
                 replacements[step["manifest"]] = cached["manifest"]
+                if cached.get("variants"):
+                    head_selections[cached["manifest"]] = cached["variants"]
                 if cached.get("reducer_manifest"):
                     replacements[reduction_steps[step["buffers"][2]][0]] = cached[
                         "reducer_manifest"
                     ]
                 continue
-            paths, legal, rejected = compile_candidates(configs, build, tolerate_failures=True)
+            paths, legal, rejected = head_compiled or compile_candidates(
+                configs, build, tolerate_failures=True
+            )
             if legal[0] != configs[0]:
                 raise ValueError("Missing baseline auxiliary kernel")
             if args.compile_only:
@@ -354,7 +506,8 @@ def main():
             original = torch.randn(capacity, params["reduction"]) if weight is not None else None
             measurements = []
             invalid = set()
-            for rows in sorted(set(identity["samples"] + [1, 2, 17, 31, 129, capacity])):
+            validation_rows = [1, capacity] if args.head_only else [1, 2, 17, 31, 129, capacity]
+            for rows in sorted(set(identity["samples"] + validation_rows)):
                 if rows > capacity:
                     continue
                 if kind == "moe.combine":
@@ -407,25 +560,10 @@ def main():
                             actual = tensors[slot][:count]
                             if kind == "floating.partials":
                                 columns = legal[i].get("tile_n", params.get("tile_n", 32))
-                                actual = (
-                                    actual.reshape(
-                                        rows, params["output"] // columns, 8, columns // 32, 32
-                                    )
-                                    .permute(0, 1, 3, 2, 4)
-                                    .reshape(rows, -1)
-                                )
+                                actual = canonical_partials(actual, rows, params["output"], columns)
                                 reference_columns = params.get("tile_n", 32)
-                                reference_value = (
-                                    ref[:rows]
-                                    .reshape(
-                                        rows,
-                                        params["output"] // reference_columns,
-                                        8,
-                                        reference_columns // 32,
-                                        32,
-                                    )
-                                    .permute(0, 1, 3, 2, 4)
-                                    .reshape(rows, -1)
+                                reference_value = canonical_partials(
+                                    ref, rows, params["output"], reference_columns
                                 )
                             torch.testing.assert_close(
                                 actual,
@@ -478,32 +616,62 @@ def main():
                 sample["times"] = {
                     k: v for k, v in sample["times"].items() if int(k) not in invalid
                 }
-            selected = int(aggregate_winner(measurements))
+            policy = (
+                head_row_policy(
+                    measurements,
+                    {
+                        str(i): head_contracts[str(path.relative_to(base))]
+                        for i, path in enumerate(paths)
+                        if i not in invalid
+                    },
+                    args.maximum_regression,
+                )
+                if args.head_only
+                else None
+            )
+            selected = int(policy["default"] if policy else aggregate_winner(measurements))
             chosen = str(paths[selected].relative_to(base))
+            variants = []
+            if policy and policy["variant"] is not None:
+                variants = [
+                    dict(
+                        min_rows=policy["minimum"],
+                        max_rows=capacity,
+                        multiple_of=1,
+                        kernels=[str(paths[int(policy["variant"])].relative_to(base))],
+                    )
+                ]
+                head_selections[chosen] = variants
             reducer_manifest = None
             if kind == "floating.partials" and not params.get("variance"):
                 _, reduce_spec = reduction_steps[step["buffers"][2]]
                 reference_columns = params.get("tile_n", 32)
                 columns = legal[selected].get("tile_n", reference_columns)
                 reduce_params = dict(rows=capacity, output=params["output"], splits=8)
-                reference_path = compile_kernel(
-                    dense.fp32_reduce(row_count(capacity, True), params["output"])
-                    if reference_columns == 32
-                    else floating.reduce_partials(
-                        row_count(capacity, True), params["output"], tile_n=reference_columns
-                    ),
-                    "dense.fp32_reduce" if reference_columns == 32 else "floating.reduce_partials",
-                    reduce_spec["operands"],
-                    reduce_params
-                    if reference_columns == 32
-                    else dict(reduce_params, tile_n=reference_columns),
-                    base / "cache",
-                    row_capacity=capacity,
-                    grid_limit=grid_limit,
+                reference_path = (
+                    (base / head_reducer[0])
+                    if args.head_only
+                    else compile_kernel(
+                        dense.fp32_reduce(row_count(capacity, True), params["output"])
+                        if reference_columns == 32
+                        else floating.reduce_partials(
+                            row_count(capacity, True), params["output"], tile_n=reference_columns
+                        ),
+                        "dense.fp32_reduce"
+                        if reference_columns == 32
+                        else "floating.reduce_partials",
+                        reduce_spec["operands"],
+                        reduce_params
+                        if reference_columns == 32
+                        else dict(reduce_params, tile_n=reference_columns),
+                        base / "cache",
+                        row_capacity=capacity,
+                        grid_limit=grid_limit,
+                    )
                 )
                 reduced_path = (
                     reference_path
-                    if columns == 32
+                    if columns == reference_columns
                     else compile_kernel(
                         floating.reduce_partials(
                             row_count(capacity, True), params["output"], tile_n=columns
@@ -547,7 +715,12 @@ def main():
                     if status:
                         raise RuntimeError(f"Floating reduction failed: {status}")
 
-                for rows in sorted({1, 2, 17, 31, 129, capacity}):
+                reduce_rows = (
+                    {1, 33, min(160, capacity), capacity}
+                    if args.head_only
+                    else {1, 2, 17, 31, 129, capacity}
+                )
+                for rows in sorted(reduce_rows):
                     if rows > capacity:
                         continue
                     if original is not None:
@@ -567,7 +740,14 @@ def main():
                         reduce_run(0)
 
                     def selected_run():
-                        launch(selected)
+                        implementation = (
+                            int(policy["variant"])
+                            if policy
+                            and policy["variant"] is not None
+                            and rows >= policy["minimum"]
+                            else selected
+                        )
+                        launch(implementation)
                         reduce_run(1)
 
                     def reduction_change():
@@ -602,12 +782,15 @@ def main():
                 config=legal[selected],
                 manifest=chosen,
                 reducer_manifest=reducer_manifest,
+                variants=variants,
             )
             if not valid(result):
                 raise ValueError("Selected auxiliary kernel identity differs")
             atomic_json(record, result)
             replacements[step["manifest"]] = chosen
             print(dict(op=kind, **result), flush=True)
+    if args.head_only and not matched_heads:
+        raise ValueError("No published floating output heads match the model geometry")
     if args.compile_only:
         return
     for rank in model["ranks"]:
@@ -623,6 +806,7 @@ def main():
                     step["manifest"] = layouts[step["buffers"][0]]
                 else:
                     step["manifest"] = replacements.get(original_manifest, original_manifest)
+    model.setdefault("row_selections", {}).update(head_selections)
     atomic_json(args.plan.with_name(args.plan.stem + "-aux-tuned.json"), model)
 
 

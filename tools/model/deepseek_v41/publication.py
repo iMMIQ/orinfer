@@ -9,6 +9,7 @@ import tempfile
 from tools.build.elf import strip_library
 from tools.build.files import atomic_json, file_hash
 from tools.model.publication import AssetReader, source_path
+from tools.operators.ascend.toolchain import require_cann92
 
 
 def manifests(model):
@@ -28,6 +29,15 @@ def manifests(model):
 
 def prepare_execution(model, source, stage):
     source, stage = Path(source).resolve(), Path(stage)
+    descriptions = {
+        name: json.loads(source_path(source, name).read_text()) for name in manifests(model)
+    }
+    if descriptions:
+        require_cann92(descriptions.values())
+    sources = {}
+    for spec in descriptions.values():
+        if sources.setdefault(spec["op"], spec["source_sha256"]) != spec["source_sha256"]:
+            raise ValueError("Publish one source identity per A2 operator; rebuild the full plan")
     assets = {model["engram"]["file"], *(v["file"] for v in model["rope"].values())}
     assets.update(b["data"]["file"] for r in model["ranks"] for b in r["buffers"] if b.get("data"))
     for name in sorted(assets):
@@ -36,9 +46,8 @@ def prepare_execution(model, source, stage):
         shutil.copyfile(source_path(source, name), target)
     copied = {}
     originals = {}
-    for name in manifests(model):
+    for name, spec in descriptions.items():
         path = source_path(source, name)
-        spec = json.loads(path.read_text())
         library = spec["library"]
         if library.get("tensor"):
             raise ValueError("Native A2 libraries must be standalone files")

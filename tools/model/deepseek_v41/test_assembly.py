@@ -1123,6 +1123,40 @@ class ConvergenceTests(unittest.TestCase):
                 with self.subTest(key=key), self.assertRaises(ValueError):
                     validate_rows(model, root)
 
+    def test_floating_row_choices_keep_partial_layout_and_k_reduction(self):
+        model = self.model()
+        source = dict(
+            op="floating.partials",
+            source_sha256="factory",
+            compiler={"version": "pinned"},
+            parameters=dict(
+                rows=256, _row_capacity=256, tile_m=64, tile_n=128, block_k=128, weight_parts=3
+            ),
+            operands=[
+                dict(name=name, dtype="i32", shape=[256], access=access)
+                for name, access in (("input", "read"), ("out", "write"))
+            ],
+        )
+        replacement = deepcopy(source)
+        replacement["parameters"]["tile_m"] = 128
+        model["row_selections"] = {
+            "kernel.json": [dict(min_rows=80, max_rows=256, kernels=["large.json"])]
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "kernel.json").write_text(json.dumps(source))
+            (root / "large.json").write_text(json.dumps(replacement))
+            validate_rows(model, root)
+            for key, value in (("tile_n", 64), ("block_k", 256), ("weight_parts", 1)):
+                invalid = deepcopy(replacement)
+                invalid["parameters"][key] = value
+                (root / "large.json").write_text(json.dumps(invalid))
+                with (
+                    self.subTest(key=key),
+                    self.assertRaisesRegex(ValueError, "changes arithmetic"),
+                ):
+                    validate_rows(model, root)
+
     def test_direct_bf16_output_requires_unit_scales_for_defaults_and_local_choices(self):
         import struct
 
@@ -1241,6 +1275,42 @@ class ExpertFusionContractTests(unittest.TestCase):
         program[0]["snapshot"] = "unrelated"
         with self.assertRaisesRegex(ValueError, "shared routed NZ"):
             select(program, 0, lambda s: specs.get(s.get("manifest")))
+
+    def test_draft_route_count_uses_the_same_fusion_contract(self):
+        select, program, specs = self.fixture()
+        program[1].update(rows=96, experts=16)
+        program[1].pop("expected_expert_rows")
+        specs["g"]["parameters"]["rows"] = 96
+        specs["a"]["parameters"].update(rows=96, selected=3)
+        _, geometry = select(program, 0, lambda s: specs.get(s.get("manifest")))
+        self.assertEqual(geometry, (32, 96, 5120, 2304, 16))
+        specs["a"]["parameters"]["selected"] = 6
+        with self.assertRaisesRegex(ValueError, "geometry or dataflow"):
+            select(program, 0, lambda s: specs.get(s.get("manifest")))
+
+
+class CannToolchainTests(unittest.TestCase):
+    def test_publication_requires_one_cann92_compiler(self):
+        from tools.operators.ascend.toolchain import require_cann92
+
+        source = dict(compiler=dict(cann_version="9.2.0", bisheng="pinned", tilelang="pinned"))
+        require_cann92([source, deepcopy(source)])
+        for compiler in [dict(cann_version="9.1.0"), {}, dict(cann_version="9.2.1")]:
+            with self.assertRaisesRegex(ValueError, "every referenced"):
+                require_cann92([source, dict(compiler=compiler)])
+
+    def test_compiler_reads_the_installed_version(self):
+        from tools.operators.ascend.toolchain import cann_version
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "compiler").mkdir()
+            path = root / "compiler/version.info"
+            path.write_text("Version=9.2.0\nversion_dir=cann\n")
+            self.assertEqual(cann_version(root), "9.2.0")
+            path.write_text("Version=9.1.0\n")
+            with self.assertRaisesRegex(ValueError, "CANN 9.2"):
+                cann_version(root)
 
 
 class ReplayTableCompactionTests(unittest.TestCase):

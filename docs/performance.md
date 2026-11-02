@@ -4,7 +4,7 @@
 
 ## DSv4.1 A2 单流 decode（2026-10-28）
 
-八卡 Ascend 910B3、TP8，使用 DSv4.1 Flash-1017 原始 W4A8 checkpoint 和完整 40 层 `bench-ascend`。运行时为 CANN 9.2；离线编译使用固定的 CANN 9.1 / TileLang-Ascend 0.1.4（`d182ae8`）镜像。保持原始 W4 bank、scale 和 assist，在线直接读取准备好的物理布局。
+八卡 Ascend 910B3、TP8，使用 DSv4.1 Flash-1017 原始 W4A8 checkpoint 和完整 40 层 `bench-ascend`。当前编译和运行统一使用 CANN 9.2，TileLang-Ascend 前端固定为 0.1.4（`d182ae8`）；下列历史测量包含 CANN 9.1 编译、CANN 9.2 运行的产物，其成绩保持原测试范围。保持原始 W4 bank、scale 和 assist，在线直接读取准备好的物理布局。
 
 输入采用 `tools/bench/ascend_single.py --prepare` 生成的 1024-token completion case，greedy、seed `20261002`，关闭投机解码和跨请求 prefix 复用。每次生成 129 tokens，decode 按首输出之后的 128 tokens / 生成耗时计算，包含 CPU 查找、传输、图提交、完成等待和 HCCL。排除模型加载，每项先预热，再测三次完整请求，表中取中位数。TTFT 包含 prefill 和首输出头。
 

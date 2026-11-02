@@ -14,7 +14,7 @@ from tools.model.deepseek_v41.pack_host_release import HostRecordRelease
 from tools.model.safetensors_source import local_header
 from tools.build.files import file_hash
 from tools.build.elf import runtime_sections
-from tools.model.deepseek_v41.publication import publish_execution
+from tools.model.deepseek_v41.publication import prepare_execution, publish_execution
 
 
 def write_tensors(path, tensors):
@@ -39,6 +39,29 @@ def read_tensor(root, index, name):
 
 
 class ReleaseExportTests(unittest.TestCase):
+    def test_publication_rejects_mixed_sources_before_copying_assets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            steps = []
+            for i in range(2):
+                name = f"kernel{i}.json"
+                (root / name).write_text(
+                    json.dumps(
+                        dict(
+                            op="dense.projection",
+                            source_sha256=str(i) * 64,
+                            compiler=dict(
+                                cann_version="9.2.0", bisheng="pinned", tilelang="pinned"
+                            ),
+                        )
+                    )
+                )
+                steps.append(dict(op="kernel", manifest=name))
+            model = dict(ranks=[dict(packets=[dict(body=steps, head=[])])])
+            with self.assertRaisesRegex(ValueError, "one source identity"):
+                prepare_execution(model, root, root / "stage")
+            self.assertFalse((root / "stage").exists())
+
     def test_execution_publication_strips_symbols_preserves_runtime_and_prunes_assets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -51,7 +74,12 @@ class ReleaseExportTests(unittest.TestCase):
             library = source / "op/kernel.so"
             subprocess.run(["cc", "-shared", "-fPIC", str(code), "-o", str(library)], check=True)
             original = library.read_bytes()
-            spec = dict(library=dict(file="kernel.so", sha256=file_hash(library)))
+            spec = dict(
+                op="fixture.identity",
+                source_sha256="0" * 64,
+                compiler=dict(cann_version="9.2.0", bisheng="pinned", tilelang="pinned"),
+                library=dict(file="kernel.so", sha256=file_hash(library)),
+            )
             (source / "op/kernel.json").write_text(json.dumps(spec))
             (source / "engram.json").write_text("{}")
             (source / "unused.bin").write_bytes(b"retired experiment")

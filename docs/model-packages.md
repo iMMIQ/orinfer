@@ -102,10 +102,14 @@ local TopK 的空块使用交错的 `(-inf, -1)` 候选对。`tools.operators.as
 
 已有原生计划可使用 `tools.model.deepseek_v41.build --rebuild-plan PLAN --rebuild-op topk.local` 只重建相关算子，输出同目录的 `PLAN-selected.json`。`--rebuild-op` 可重复提供，未出现在计划中的算子名会报错；未选中的库和权重保持原引用。重建复用公共编译任务及内容缓存，最终部署仍需发布新的执行包。
 
-当前离线编译镜像面向 aarch64，使用调用者提供的 CANN 9.1 / Python 3.12 运行时基础镜像，固定 TileLang-Ascend wheel 的版本与 SHA256。基础镜像需包含匹配的 PyTorch、torch_npu 和 CANN 编译器。`run.sh` 将所选基础镜像解析为本地不可变镜像 ID；板上运行时串行取得 GPU 实验锁，无卡编译使用 `--without-devices`。运行前先结束占用同一批 NPU 的开发容器；驱动的容器设备归属可能持续到容器退出。编译产物、参考数据和缓存保存在 `artifacts`：
+当前 A2 编译和运行统一支持 CANN 9.2。离线镜像面向 aarch64，包含 Python 3.12、PyTorch、torch_npu 和固定版本与 SHA256 的 TileLang-Ascend 前端；wheel 文件名中的 `cann910` 是上游发布名称。`run.sh` 挂载本机 `/usr/local/Ascend/cann-9.2.0` 并加载其环境，实际编译器与运行库均来自该目录，可通过 `ORINFER_ASCEND_CANN_ROOT` 指定另一份 CANN 9.2 安装。编译记录包含安装版本及 Bisheng 身份；发布要求全部引用算子具有同一 CANN 9.2 工具链身份。已有执行计划通过 `tools.model.deepseek_v41.build --rebuild-plan PLAN` 全量重建，保持权重和执行边界，合并同契约的编译任务，再发布引用到的库。
+
+DSpark Markov 的步号通过只读 INT32 表绑定，argmax、confidence 和 rank reduce 各复用一个动态算子。5／8／16 长度别名只截取公共 Markov 调用序列。专家融合使用实际专家路由倍率，`tools.model.deepseek_v41.expert_fusion --role target|draft` 共用 gather、A4 GMM 和激活边界的构建流程；所有者行数、专家数和路由倍率共同确定几何。
+
+`run.sh` 将所选基础镜像解析为本地不可变镜像 ID；板上运行时串行取得 GPU 实验锁，无卡编译使用 `--without-devices`。编译产物、参考数据和缓存保存在 `artifacts`：
 
 ```bash
-ORINFER_ASCEND_BASE_IMAGE='your-cann-runtime:9.1-py312' \
+ORINFER_ASCEND_BASE_IMAGE='your-torch-npu-frontend:py312' \
   bash tools/operators/ascend/run.sh build
 # 先在不映射 NPU 的容器编译，再在相同 cache 中执行板上验收：
 bash tools/operators/ascend/run.sh --without-devices python3 -m tools.operators.ascend.validate \
@@ -206,6 +210,8 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 `tools.model.deepseek_v41.floating_head` 将已发布的 FP32 target／DSpark 输出头离线转换为三个精确 BF16 残差分量，复用 `floating.partials` 与 FP32 八段归约。一个动态 tile 配置覆盖普通 decode、验证与 draft 的实际输出行数；库描述保留各 family 的物理容量。宽列 tile 支持 32 列对齐的词表尾部，partial workspace 按 tile 补齐，归约只写真实词表列。权重值无损，MMA 的 FP32 累加与旧 Vector 求和可能存在微小舍入差异，发布前比较固定历史概率和完整请求性能。
 
 同一入口的 `--compact-zero-planes` 会完整检查已发布输出头的两个 BF16 残差分量；确认全零且主分量有限时，只保留主 BF16 分量，并复用原投影 tile、BF16 激活及 FP32 归约边界。非零残差保持三分量。检查限定在离线预处理，在线直接加载物理权重。该模式与 `--markov-bias` 互斥，仅重写受影响的语义分片，其余分片复用硬链接。
+
+`tune_auxiliary --head-only --plan PLAN --model-dir RELEASE --output REPORT --rows 1 6 32 33 80 128 129 160 192 544 --calls-per-replay 16` 以实际发布的输出头库为冻结基线，读取已发布 safetensors bank，比较同源 M tile 与流水配置。候选保持输出列 tile、BF16 分量、八段 FP32 partial 布局和原归约库；词表末块只比较真实列，另查输出行尾部和改变输入后的 Graph replay。按实测生成共享 fallback 与大行数区间，默认每个测量点相对基线最多回退 10%。同一选择槽内的候选具有一致的源码、编译器、设备及物理 ABI，浮点 partial 只允许调整 M tile、流水与 grid 上限。冻结参考和新候选分别记录编译身份。调优只更新执行计划和库，权重保持原表示；输入采用尚无输出头行数选择的冻结计划，在独立构建目录运行，选定后发布被引用的资产并验收真实请求。
 
 该转换替换原 FP32 bank，新增的分量不与原 bank 同时常驻。TP8 target／draft 两个完整输出头均采用三分量时，每卡合计增加约 316 MiB；变更分片重新写出，其余分片复用硬链接。源与输出须位于同一文件系统及容器挂载点；可先在宿主机将发布目录硬链接到工作区，再在离线环境执行：
 

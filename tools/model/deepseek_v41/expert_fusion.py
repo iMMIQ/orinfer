@@ -31,7 +31,6 @@ def selected_chain(program, index, describe):
         or up["op"] != "w4"
         or up.get("weight_layout") != "transposed_nz"
         or not up.get("groups")
-        or up.get("expected_expert_rows") is None
         or set(gather) != {"op", "buffers", "manifest"}
         or set(activation) != {"op", "buffers", "manifest"}
     ):
@@ -39,9 +38,10 @@ def selected_chain(program, index, describe):
     rows, reduction, columns, experts = (up[k] for k in ("rows", "input", "output", "experts"))
     gp, ap = g["parameters"], a["parameters"]
     capacity = gp.get("_row_capacity")
+    selected = rows // capacity if capacity and rows % capacity == 0 else 0
     if (
         not capacity
-        or rows != capacity * 6
+        or selected < 1
         or columns % 512
         or gp["rows"] != rows
         or gp["width"] != reduction
@@ -49,7 +49,7 @@ def selected_chain(program, index, describe):
         or ap["rows"] != rows
         or ap["width"] * 2 != columns
         or ap.get("limit", 10.0) != 10.0
-        or ap.get("selected", 6) != 6
+        or ap.get("selected", 6) != selected
         or ap.get("_row_capacity") != capacity
         or gather["buffers"][3:5] != [up["buffers"][0], up["buffers"][4]]
         or activation["buffers"][0] != up["buffers"][5]
@@ -68,12 +68,13 @@ def build(
     *,
     epilogue_tile=2304,
     expected_expert_rows=None,
+    role="target",
 ):
     """Replace complete selected packets; reuse all state, banks and other packets."""
     import numpy as np
     from tools.operators.ascend.build import operand
 
-    if output.exists() or not 1 <= minimum <= maximum <= 4096:
+    if output.exists() or not 1 <= minimum <= maximum <= 4096 or role not in ("target", "draft"):
         raise ValueError("Require a new output directory and a valid row interval")
     if (
         epilogue_tile < 32
@@ -117,7 +118,7 @@ def build(
 
         for packet in rank["packets"]:
             low, high = packet.get("min_rows", 1), packet.get("max_rows", packet["rows"])
-            if packet.get("batch_decode", False) or packet.get("role", "target") != "target":
+            if packet.get("batch_decode", False) or packet.get("role", "target") != role:
                 continue
             if high < minimum or low > maximum:
                 continue
@@ -132,6 +133,7 @@ def build(
                     continue
                 (gather, up, activation), geometry = selected_chain(old, index, describe)
                 capacity, rows, reduction, width, experts = geometry
+                selected = rows // capacity
                 if capacity != packet["rows"]:
                     raise ValueError("Expert fusion requires the original packet capacity")
                 check_intermediate_liveness(
@@ -141,7 +143,7 @@ def build(
                     model["batch"],
                     definitions,
                 )
-                prefix = f"expert.split.m{capacity}.k{reduction}.n{width}.e{experts}"
+                prefix = f"expert.split.m{capacity}.s{selected}.k{reduction}.n{width}.e{experts}"
                 groups = buffer(prefix + ".groups", experts * 8)
                 partial = buffer(prefix + ".partial", rows * 2 * width * 2 * 2)
                 unit_tokens = buffer(
@@ -158,7 +160,7 @@ def build(
                         arguments=dict(
                             rows=rows, table_rows=capacity, width=reduction, experts=experts
                         ),
-                        dynamic=dict(rows=6, table_rows=1),
+                        dynamic=dict(rows=selected, table_rows=1),
                         specs=[
                             operand("table", "i8", [capacity, reduction]),
                             operand("scales", "f32", [capacity]),
@@ -177,7 +179,7 @@ def build(
                         arguments=dict(
                             rows=rows, width=width, experts=experts, tile_n=epilogue_tile, slots=24
                         ),
-                        dynamic=dict(rows=6),
+                        dynamic=dict(rows=selected),
                         specs=[
                             operand("raw", "f16", [rows * 2, width * 2]),
                             operand("assist", "f32", [experts, width * 2]),
@@ -192,7 +194,7 @@ def build(
                     op="w4_a4",
                     rows=rows * 2,
                     groups=groups,
-                    expected_expert_rows=expected_expert_rows or up["expected_expert_rows"],
+                    expected_expert_rows=expected_expert_rows or up.get("expected_expert_rows"),
                 )
                 replacement["buffers"] = [
                     *up["buffers"][:4],
@@ -257,6 +259,7 @@ def main():
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--epilogue-tile", type=int, default=2304)
     parser.add_argument("--expected-expert-rows", type=int)
+    parser.add_argument("--role", choices=("target", "draft"), default="target")
     args = parser.parse_args()
     print(
         build(
@@ -268,6 +271,7 @@ def main():
             args.model_dir,
             epilogue_tile=args.epilogue_tile,
             expected_expert_rows=args.expected_expert_rows,
+            role=args.role,
         )
     )
 

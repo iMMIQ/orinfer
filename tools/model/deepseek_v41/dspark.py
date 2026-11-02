@@ -14,12 +14,58 @@ from pathlib import Path
 
 import numpy as np
 
-from tools.build.files import atomic_json
+from tools.build.files import atomic_json, file_hash
 from tools.model.deepseek_v41.dspark_state import HISTORY_ROWS
 
 DEFAULT_BLOCK = 5
 MAX_BLOCK = 31
 LAYERS = (37, 38, 39)
+MARKOV_STEP_OPS = frozenset(("topk.add_bias_argmax", "topk.reduce_rank_best", "vector.confidence"))
+
+
+def converge_markov_steps(model, base, descriptions):
+    """Upgrade legacy step-specialized bindings to the shared pointer-table ABI."""
+    import struct
+
+    data = struct.pack("<32i", *range(32))
+    relative = "data/markov.steps.shared.bin"
+    parent = "dspark.markov.steps.shared"
+    changed = 0
+    for rank in model["ranks"]:
+        definitions = {b["name"]: b for b in rank["buffers"]}
+        for packet in rank["packets"]:
+            for instruction in packet["body"] + packet["head"]:
+                if instruction["op"] != "kernel":
+                    continue
+                spec = descriptions[instruction["manifest"]]
+                if spec["op"] not in MARKOV_STEP_OPS or "step" not in spec["parameters"]:
+                    continue
+                step = spec["parameters"]["step"]
+                if type(step) is not int or not 0 <= step < spec["parameters"]["block_size"] <= 32:
+                    raise ValueError("Markov step exceeds its physical stride")
+                path = base / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_constant(path, data)
+                if parent not in definitions:
+                    definitions[parent] = dict(
+                        name=parent,
+                        bytes=len(data),
+                        data=dict(file=relative, sha256=file_hash(path)),
+                    )
+                    rank["buffers"].append(definitions[parent])
+                name = parent + f".{step}"
+                if name not in definitions:
+                    definitions[name] = dict(
+                        name=name, bytes=4, view=dict(parent=parent, offset=step * 4)
+                    )
+                    rank["buffers"].append(definitions[name])
+                instruction["buffers"].append(name)
+                changed += 1
+    for spec in descriptions.values():
+        if spec["op"] in MARKOV_STEP_OPS and "step" in spec["parameters"]:
+            spec["parameters"].pop("step")
+            spec["operands"].append(dict(name="step_index", dtype="i32", shape=[1], access="read"))
+    return changed
 
 
 def write_constant(path, data):
@@ -275,7 +321,14 @@ def builder_class(block_size=DEFAULT_BLOCK):
             cw = self.matrix("mtp.2.confidence_head.proj.weight", "bf16", 1, 5376, float32=True)
             proposals = self.temp("markov.proposals", (rows, 16160), "f32")
             parts = 8
+            step_table = self.asset("markov.steps", np.arange(block_size, dtype="<i4"), "i32")
             for step in range(block_size):
+                step_index = self.buffer(
+                    f"markov.step.{step}",
+                    (1,),
+                    "i32",
+                    view=dict(parent=step_table, offset=step * 4),
+                )
                 self.kernel(
                     memory,
                     "gather_rows",
@@ -292,23 +345,25 @@ def builder_class(block_size=DEFAULT_BLOCK):
                 self.kernel(
                     topk,
                     "add_bias_argmax",
-                    dict(rows=owners, vocab=16160, step=step, block_size=block_size),
+                    dict(rows=owners, vocab=16160, block_size=block_size),
                     [
                         ("base", logits, "f32", (rows, 16160), "read"),
                         ("bias", bias, "f32", (owners, 16160), "read"),
                         ("proposals", proposals, "f32", (rows, 16160), "read_write"),
                         ("packed", packed, "f32", (parts, owners, 2), "write"),
+                        ("step_index", step_index, "i32", (1,), "read"),
                     ],
                 )
                 self.kernel(
                     vector,
                     "confidence",
-                    dict(rows=owners, step=step, block_size=block_size),
+                    dict(rows=owners, block_size=block_size),
                     [
                         ("hidden", hidden, "bf16", (rows, 5120), "read"),
                         ("embedding", embedding, "bf16", (owners, 256), "read"),
                         ("weight", cw, "f32", (5376,), "read"),
                         ("probabilities", confidence, "f32", (rows,), "read_write"),
+                        ("step_index", step_index, "i32", (1,), "read"),
                     ],
                 )
                 all_ranks = self.temp("markov.all_ranks", (8 * parts, owners, 2), "f32")
@@ -329,7 +384,6 @@ def builder_class(block_size=DEFAULT_BLOCK):
                     "reduce_rank_best",
                     dict(
                         rows=owners,
-                        step=step,
                         ranks=8 * parts,
                         rank_parts=parts,
                         rank_vocab=16160,
@@ -340,6 +394,7 @@ def builder_class(block_size=DEFAULT_BLOCK):
                         ("previous", previous, "i32", (owners,), "read_write"),
                         ("tokens", tokens, "i32", (rows,), "read_write"),
                         ("values", values, "f32", (rows,), "read_write"),
+                        ("step_index", step_index, "i32", (1,), "read"),
                     ],
                 )
             for instruction in self.steps[begin:]:
