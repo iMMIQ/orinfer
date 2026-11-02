@@ -17,17 +17,29 @@ from tools.build.files import atomic_json
 def profile(paths):
     identity = None
     groups = defaultdict(list)
+    decode = False
     for path in paths:
         for line in Path(path).read_text().splitlines():
             if line.startswith("DSPARK_COST_IDENTITY "):
                 current = json.loads(line.split(" ", 1)[1])
+                if current["schema_version"] not in (1, 2):
+                    raise ValueError("Unsupported DSpark timing schema")
+                current["schema_version"] = 2
+                decode = False
                 if identity is not None and identity != current:
                     raise ValueError("DSpark traces have different execution identities")
                 identity = current
+            elif line.startswith("DSPARK_BASELINE "):
+                baseline = json.loads(line.split(" ", 1)[1])
+                decode = baseline["batch"] > 0 and not baseline["mixed"]
+            elif line.startswith("DSPARK_POLICY "):
+                decode = False
             elif line.startswith("DSPARK_COST "):
                 if identity is None:
                     raise ValueError("DSpark cost trace has no execution identity")
                 point = json.loads(line.split(" ", 1)[1])
+                if point.get("stage") == "target" and decode:
+                    point["stage"] = "decode"
                 if not (
                     math.isfinite(point["seconds"])
                     and point["seconds"] > 0
@@ -51,7 +63,9 @@ def profile(paths):
             dict(
                 {k: v for k, v in observations[0].items() if k not in ("seconds", "setup_s")},
                 seconds=median(p["seconds"] for p in observations),
-                setup_s=median(p["setup_s"] for p in observations),
+                setup_s=median(p["setup_s"] for p in observations if p["setup_s"] > 0)
+                if any(p["setup_s"] > 0 for p in observations)
+                else 0.0,
             )
         )
     if len(points) > 2048:

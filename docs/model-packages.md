@@ -108,9 +108,9 @@ DSpark Markov 的步号通过只读 INT32 表绑定，argmax、confidence 和 ra
 
 设置 `ORINFER_A2_DSPARK_POLICY_TRACE=1` 后，A2 模型在标准错误输出普通执行的 direct／replay 状态、耗时及 DSpark 决策的样本数、行预算、请求深度和成本曲线。该开关在模型创建时读取，默认关闭。记录可用于区分样本不足、行预算、短尾和成本评分引起的关闭；计时诊断需计入日志开销。
 
-A2 DSpark 用共享稀疏成本曲线估计 target、draft 和状态恢复，分别记录 direct 与 Graph replay。普通混合执行可以直接提供成本样本；新 batch 复用邻近行数和上下文区间的数据，缺少阶段数据时执行有次数上限的探测。重复形状允许最多三次连续预热尝试，随后只保留低频探测。成本评分计入实际 prompt 行数、验证挤出的 prefill 工作和准备成本的摊销；请求的历史置信度决定预算，较新的置信度分配请求前缀。Graph 捕获沿用公共缓存规则。
+A2 DSpark 用共享稀疏成本曲线估计 target、draft 和状态恢复，分别记录 direct 与 Graph replay。普通混合执行可以直接提供成本样本；新 batch 复用邻近行数和上下文区间的数据，缺少阶段数据时执行有次数上限的探测。缺少 Graph 先验的长稳定段允许有界预热；低频探测受累计成本额度约束。成本评分计入实际 prompt 行数、验证挤出的 prefill 工作和准备成本的摊销；请求的历史置信度决定预算，较新的置信度分配请求前缀。普通执行、draft 和 verify 共享捕获准入：工作区增长后读取全部 rank 的真实缓存状态，已有 Graph 直接 replay；新捕获需满足预热条件、剩余同形状执行次数的回本条件及延迟预算。一次性构建和捕获成本独立于稳态执行模式保存。解码步节省的时间可积累为捕获额度，额度至多一个 `target_tpot_ms`，超支从实际整步耗时扣回；空闲请求集合清零。TPOT 是软目标，额度允许有界的一次性捕获延迟，避免略超目标便始终无法捕获。
 
-对代表性短负载开启上述 trace 后，运行 `uv run --locked python -m tools.bench.dspark_costs --log SERVICE_LOG --output COSTS_JSON` 生成性能先验。通过 `ORINFER_A2_DSPARK_COST_MODEL=COSTS_JSON` 在服务启动时读取；文件位于独立调优缓存，与权重分开保存。先验固定执行包、目标设备、CANN 9.2 和 TP rank 数，身份不匹配或数据无效时返回加载错误。先验只描述耗时，不表示当前 Graph 已缓存；在线执行继续修正估计。缺少先验时使用运行中收集的数据，不在启动时扫描权重或遍历全部形状测量。
+对代表性短负载开启上述 trace 后，运行 `uv run --locked python -m tools.bench.dspark_costs --log SERVICE_LOG --output COSTS_JSON` 生成性能先验。通过 `ORINFER_A2_DSPARK_COST_MODEL=COSTS_JSON` 在服务启动时读取；文件位于独立调优缓存，与权重分开保存。先验固定执行包、目标设备、CANN 9.2 和 TP rank 数，身份不匹配或数据无效时返回加载错误。稳态耗时与正的冷准备事件分别聚合，普通 replay 的零准备耗时不计入捕获成本中位数。先验只描述耗时，不表示当前 Graph 已缓存；在线执行继续修正估计。缺少先验时使用运行中收集的数据，不在启动时扫描权重或遍历全部形状测量。
 
 `run.sh` 将所选基础镜像解析为本地不可变镜像 ID；板上运行时串行取得 GPU 实验锁，无卡编译使用 `--without-devices`。编译产物、参考数据和缓存保存在 `artifacts`：
 
@@ -660,7 +660,7 @@ A2 服务在当前没有活跃 decoder 时按执行包的 token 行容量填充 
 
 A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 owner-work launch 行数缓存。加载时从全部 rank／family 提取共享 launch 描述，把每种分片的全 rank 行数纳入身份，保持各 rank 的复用关系一致；长度策略范围和 decoder 边界同时保留。这些编译参数相同的 owner 长度组合可共享已捕获程序。精确 owner、长度、角色和输出位置继续通过 stream 有序的地址表与 work 表更新。各 rank 在捕获前统一探测缓存，任一未命中时仍全体准备相同请求。`ORINFER_A2_BATCH_PROFILE=1` 输出 rank 0 冷准备的绑定、ACLNN、预热与捕获耗时。
 
-公共多 owner 入口按复用情况晋升 Graph：全局形状首次出现时绑定并直接提交同一套算子。普通 decode、draft 和纯验证在同一执行家族内连续成功使用两次后晋升；不同家族分别计数，家族内切换形状重置连续次数。所有形状累计直接成功执行八次后也可晋升，使交替出现的常用形状仍能复用 Graph；prefill 和混合轮次采用这一累计门槛。晋升前等待全部 rank 满足条件，淘汰或协调失效同时清除对应形状的连续计数。晋升保留原 kernel、W4 计划、工作区及分支资源；每次实际捕获前仍执行完整 segment 预热。任一 rank 缺少缓存时全体重新从直接执行开始，已有缓存的模式不一致时统一重新捕获。直接提交与 Graph 共用指令顺序和完成事件的资源所有权；未能提交 join 的失败路径先排空辅助 stream，无法确认完成的资源随退休会话隔离。冷准备日志包含 `capture`、`promotion`、`family`、`direct_uses` 和 `consecutive_uses` 字段。
+公共多 owner 入口按复用情况和捕获回本条件晋升 Graph：全局形状首次出现时绑定并直接提交同一套算子。普通 decode、draft 和纯验证累计成功使用两次后具备捕获资格；prefill 和混合轮次使用八次门槛。服务入口再比较捕获成本与预计剩余同形状调用的收益，并检查活跃 decoder 的延迟预算；短尾可继续直接执行同一投机包。已有 Graph 继续复用。晋升前等待全部 rank 满足条件，淘汰或协调失效同时清除对应形状的连续计数。晋升保留原 kernel、W4 计划、工作区及分支资源；每次实际捕获前仍执行完整 segment 预热。任一 rank 缺少缓存时全体重新从直接执行开始，已有缓存的模式不一致时统一失效，再按共同计划直接执行或捕获。直接提交与 Graph 共用指令顺序和完成事件的资源所有权；未能提交 join 的失败路径先排空辅助 stream，无法确认完成的资源随退休会话隔离。冷准备日志包含 `capture`、`promotion`、`family`、`direct_uses` 和 `consecutive_uses` 字段。
 
 晋升耗时计入再次命中该形状的请求，可能形成一次性的延迟尖峰；性能同时比较完整请求序列与热态吞吐。固定 Mini 短测使用相同源片段和输出长度目标，分别记录 warmup、已完成的 profiling 请求及未完成的回放范围。
 

@@ -96,6 +96,7 @@ pub(crate) struct Runtime {
     next_snapshot: u64,
     hints: Vec<usize>,
     prefill_tokens_per_s: f64,
+    capture_credit_s: f64,
     draft_limit: usize,
     speculation_policy: dspark::Policy,
     speculation: crate::mtp::Statistics,
@@ -272,7 +273,7 @@ impl Runtime {
             return Err("A2 service context/state contract differs".into());
         }
         let speculation_policy = dspark::Policy::load(dspark::Identity {
-            schema_version: 1,
+            schema_version: 2,
             execution_package: model.execution_package,
             target: model.metadata.target,
             cann: "9.2".into(),
@@ -300,6 +301,7 @@ impl Runtime {
             next_snapshot: 0,
             hints: vec![],
             prefill_tokens_per_s: 4000.,
+            capture_credit_s: 0.,
             draft_limit,
             speculation_policy,
             speculation: Default::default(),
@@ -808,6 +810,26 @@ impl Runtime {
         options: &scheduler::Options,
         maintenance: impl FnOnce(),
     ) -> Result<Vec<StepOutput>> {
+        let has_decode = requests.iter().any(|r| !r.prefilling && !r.is_finished());
+        let started = Instant::now();
+        let result = self.advance_packet(requests, options, maintenance);
+        self.capture_credit_s = if has_decode && result.is_ok() {
+            super::team::capture_credit(
+                self.capture_credit_s,
+                options.target_tpot_ms / 1000.,
+                started.elapsed().as_secs_f64(),
+            )
+        } else {
+            0.
+        };
+        result
+    }
+    fn advance_packet(
+        &mut self,
+        requests: &mut [&mut Request],
+        options: &scheduler::Options,
+        maintenance: impl FnOnce(),
+    ) -> Result<Vec<StepOutput>> {
         self.reap()?;
         if requests.iter().any(|r| r.owner != self.owner || r.released) {
             return Err("Foreign or released A2 request".into());
@@ -837,7 +859,20 @@ impl Runtime {
         {
             return Err("Insufficient A2 workspace after reclaiming cached state".into());
         }
-        let (values, timing) = self.team.forward_with(layout, tokens, full, maintenance)?;
+        let work = packet::work(&selected, requests, prefill_rows);
+        let (uses, slack) = self.capture_context(
+            &selected,
+            requests,
+            None,
+            self.team.draft_blocks.first().copied().unwrap_or(0),
+            options,
+        );
+        let capture = self
+            .speculation_policy
+            .target_budget(full, layout.decode, work, uses, slack);
+        let (values, timing) =
+            self.team
+                .forward_with(layout, tokens, full, Some(capture), maintenance)?;
         let seconds = timing.seconds;
         let preparation = timing.preparation;
         self.statistics.iterations += 1;
@@ -863,14 +898,8 @@ impl Runtime {
             }
         }
         let decoders = batch - prefill_requests;
-        if decoders > 0 {
-            self.speculation_policy.baseline_execution(
-                decoders,
-                full,
-                packet::work(&selected, requests, prefill_rows),
-                &timing,
-            );
-        }
+        self.speculation_policy
+            .baseline_execution(decoders, full, work, &timing);
         let mut steps = self.commit_packet(requests, selected, &values)?;
         steps.extend(cached_outputs(requests)?);
         Ok(steps)
@@ -925,6 +954,9 @@ impl Runtime {
         }
         self.release_resident(request.slot)?;
         self.active.remove(&request.slot);
+        if self.active.is_empty() {
+            self.capture_credit_s = 0.;
+        }
         request.released = true;
         self.cache
             .update_statistics(self.team.ranks(), &mut request.prefix);

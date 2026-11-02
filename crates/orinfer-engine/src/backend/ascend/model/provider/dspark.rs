@@ -65,6 +65,10 @@ impl Runtime {
                 work: packet::work(&baseline.selected, requests, baseline.prefill_rows),
                 prefill_tokens_per_s: self.prefill_tokens_per_s,
                 uniform,
+                remaining_by_owner: indices
+                    .iter()
+                    .map(|&i| requests[i].limit - requests[i].generated)
+                    .collect(),
                 remaining: indices
                     .iter()
                     .map(|&i| requests[i].limit - requests[i].generated)
@@ -84,7 +88,7 @@ impl Runtime {
         if selected.iter().all(|(_, k)| *k == 0) {
             let limit = self.draft_limit;
             self.draft_limit = 0;
-            let result = self.advance_requests_with(requests, options, maintenance);
+            let result = self.advance_packet(requests, options, maintenance);
             self.draft_limit = limit;
             return result;
         }
@@ -123,7 +127,18 @@ impl Runtime {
         {
             return Err("Insufficient DSpark graph workspace".into());
         }
-        let (proposals, draft_timing) = self.team.forward_with(draft, inputs, false, || {})?;
+        let depths = selected.iter().copied().collect::<BTreeMap<_, _>>();
+        let (uses, slack) =
+            self.capture_context(&baseline.selected, requests, Some(&depths), block, options);
+        let capture = self.speculation_policy.draft_budget(
+            block,
+            selected.iter().filter(|(_, count)| *count > 0).count(),
+            uses,
+            slack,
+        );
+        let (proposals, draft_timing) =
+            self.team
+                .forward_with(draft, inputs, false, Some(capture), || {})?;
         let draft_s = draft_timing.seconds;
         let draft_prepare = draft_timing.preparation;
         let mut inputs = BTreeMap::new();
@@ -169,9 +184,22 @@ impl Runtime {
         let started = Instant::now();
         self.team.exchange(Command::BeginVerification(journal))?;
         let save_s = started.elapsed().as_secs_f64();
-        let (verified, verify_timing) =
-            self.team
-                .forward_with(layout, inputs, full || packet_full, maintenance)?;
+        let (uses, slack) =
+            self.capture_context(&packet_requests, requests, Some(&depths), block, options);
+        let capture = self.speculation_policy.target_budget(
+            full || packet_full,
+            layout.decode,
+            verified_work,
+            uses,
+            slack,
+        );
+        let (verified, verify_timing) = self.team.forward_with(
+            layout,
+            inputs,
+            full || packet_full,
+            Some(capture),
+            maintenance,
+        )?;
         let verify_s = verify_timing.seconds;
         let verify_prepare = verify_timing.preparation;
         let started = Instant::now();

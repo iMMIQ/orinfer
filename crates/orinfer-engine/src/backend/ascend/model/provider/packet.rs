@@ -69,6 +69,47 @@ pub(super) fn request_order(requests: &[&mut Request], tokens_per_s: f64) -> Vec
     order.into_iter().map(|(i, _, _)| i).collect()
 }
 impl Runtime {
+    pub(super) fn capture_context(
+        &self,
+        selected: &[(usize, usize)],
+        requests: &[&mut Request],
+        depths: Option<&BTreeMap<usize, usize>>,
+        block: usize,
+        options: &scheduler::Options,
+    ) -> (f64, f64) {
+        let now = Instant::now();
+        let mut uses = f64::INFINITY;
+        let mut slack = f64::INFINITY;
+        for &(i, count) in selected {
+            let r = &requests[i];
+            if r.prefilling {
+                uses = uses.min((r.input.len() - r.offset) as f64 / count.max(1) as f64);
+            } else {
+                let depth = depths.and_then(|d| d.get(&i)).copied().unwrap_or(0);
+                let guard = if depth == 0 {
+                    0
+                } else if self.draft_limit <= self.team.draft_blocks[0] {
+                    self.draft_limit
+                } else {
+                    depth
+                };
+                let remaining = r.limit.saturating_sub(r.generated + guard).max(1);
+                uses = uses.min(remaining as f64 / r.draft_feedback.progress(depth, block));
+                if options.policy == scheduler::Policy::Latency {
+                    slack = slack.min(
+                        options.target_tpot_ms / 1000.
+                            - now.duration_since(r.last_output).as_secs_f64(),
+                    );
+                }
+            }
+        }
+        // Output limits are ceilings. Keep a margin for EOS and role changes.
+        (
+            (uses * 0.8).max(1.),
+            (slack + self.capture_credit_s).max(0.),
+        )
+    }
+
     pub(super) fn select_packet(
         &self,
         requests: &[&mut Request],

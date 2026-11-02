@@ -18,6 +18,10 @@ struct History {
     attempts: Vec<usize>,
 }
 impl Feedback {
+    pub fn progress(&self, depth: usize, block: usize) -> f64 {
+        1. + self.rates(depth, true, &[], block).iter().sum::<f64>()
+    }
+
     pub fn observe(&mut self, confidence: &[f64], proposed: usize, accepted: usize, block: usize) {
         self.blocks
             .entry(block)
@@ -69,6 +73,7 @@ impl History {
 pub(in crate::backend::ascend::model::provider) struct Budget {
     pub rows: usize,
     pub remaining: usize,
+    pub remaining_by_owner: Vec<usize>,
     pub uniform: bool,
     pub work: Work,
     pub prefill_tokens_per_s: f64,
@@ -93,6 +98,7 @@ struct Curve {
     baseline: f64,
     baseline_samples: usize,
     ticks: usize,
+    probe_credit: f64,
     blocks: BTreeMap<(usize, bool), BlockCurve>,
 }
 #[derive(Default)]
@@ -154,11 +160,75 @@ fn queue(
     rows.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     rows
 }
+fn reuse_steps(
+    budget: &Budget,
+    depths: &[usize],
+    maxima: &[usize],
+    feedback: &[&Feedback],
+    block: usize,
+) -> f64 {
+    depths
+        .iter()
+        .enumerate()
+        .map(|(i, &depth)| {
+            let remaining = budget
+                .remaining_by_owner
+                .get(i)
+                .copied()
+                .unwrap_or(budget.remaining);
+            let guard = if depth == 0 {
+                0
+            } else if budget.uniform {
+                maxima[i]
+            } else {
+                depth
+            };
+            remaining.saturating_sub(guard).max(1) as f64 / feedback[i].progress(depth, block)
+        })
+        .fold(f64::INFINITY, f64::min)
+        .max(1.)
+}
 impl Policy {
     pub fn load(identity: Identity) -> Result<Self> {
         let mut policy = Self::default();
         policy.costs = Model::load(identity, policy.trace)?;
         Ok(policy)
+    }
+    pub fn target_budget(
+        &self,
+        full: bool,
+        decode: bool,
+        work: Work,
+        uses: f64,
+        slack: f64,
+    ) -> super::super::super::team::CaptureBudget {
+        self.costs.budget(
+            if decode { Stage::Decode } else { Stage::Target },
+            0,
+            full,
+            work,
+            uses,
+            slack,
+        )
+    }
+    pub fn draft_budget(
+        &self,
+        block: usize,
+        owners: usize,
+        uses: f64,
+        slack: f64,
+    ) -> super::super::super::team::CaptureBudget {
+        self.costs.budget(
+            Stage::Draft,
+            block,
+            false,
+            Work {
+                rows: owners,
+                ..Work::default()
+            },
+            uses,
+            slack,
+        )
     }
     pub fn baseline_execution(
         &mut self,
@@ -177,7 +247,11 @@ impl Policy {
             );
         }
         self.costs.observe(Point {
-            stage: Stage::Target,
+            stage: if batch > 0 && work.prefill_rows == 0 {
+                Stage::Decode
+            } else {
+                Stage::Target
+            },
             block: 0,
             full,
             replay: timing.replay,
@@ -203,7 +277,11 @@ impl Policy {
             ..Work::default()
         };
         self.costs.observe(Point {
-            stage: Stage::Target,
+            stage: if batch > 0 && work.prefill_rows == 0 {
+                Stage::Decode
+            } else {
+                Stage::Target
+            },
             block: 0,
             full,
             replay: false,
@@ -246,7 +324,8 @@ impl Policy {
         } else {
             budget.work
         };
-        let normal = self.costs.predict(Stage::Target, 0, full, work);
+        let ordinary = if mixed { Stage::Target } else { Stage::Decode };
+        let normal = self.costs.predict(ordinary, 0, full, work);
         let curve = self.curves.entry((batch, full, mixed)).or_default();
         curve.ticks += 1;
         if limit <= batch || normal.is_none() {
@@ -275,7 +354,13 @@ impl Policy {
         let mut best_maxima = maxima.to_vec();
         let mut best_block = blocks[0];
         let normal = normal.unwrap();
-        let mut throughput = batch as f64 / (normal.seconds * 0.97);
+        curve.probe_credit = (curve.probe_credit + normal.seconds * 0.025).min(normal.seconds * 3.);
+        let normal_horizon = reuse_steps(&budget, &vec![0; batch], maxima, feedback, blocks[0]);
+        let normal_time = self
+            .costs
+            .price(ordinary, 0, full, work, normal_horizon, 0)
+            .unwrap_or(normal.seconds);
+        let mut throughput = batch as f64 / (normal_time * 0.97);
         let explore = curve.ticks.is_multiple_of(16);
         for &block in blocks {
             let width = maxima.iter().copied().max().unwrap_or(0).min(block);
@@ -323,21 +408,37 @@ impl Policy {
             };
             let draft = self.costs.predict(Stage::Draft, block, false, draft_work);
             let restore = self.costs.predict(Stage::Restore, block, full, draft_work);
-            // At most three early uses let a repeated shape reach Graph replay.
-            // Direct cost alone must not prevent this promotion. Periodic probes
-            // remain bounded when mixed shapes change instead of reaching replay.
+            let horizon = reuse_steps(&budget, &local, maxima, feedback, block);
+            let graph_budget = self.costs.budget(
+                Stage::Target,
+                0,
+                full,
+                work.extend(local_limit - batch),
+                horizon,
+                f64::INFINITY,
+            );
             let unknown = draft.is_none() || restore.is_none();
-            let cold_graph = cost.seen.get(&local_limit).copied().unwrap_or(0) < 3
-                && budget.remaining >= 3 * (block + 1);
-            let probe = cold_graph
-                || (unknown
-                    && cost.samples == 0
-                    && (block == blocks[0] || budget.remaining >= 3 * (block + 1)))
-                || (explore
-                    && !curve.ticks.is_multiple_of(32)
-                    && (curve.ticks / 16) % blocks.len()
-                        == blocks.iter().position(|&b| b == block).unwrap());
-            if probe {
+            let missing_graph_prior =
+                graph_budget.replay_s.is_none() || graph_budget.capture_s.is_none();
+            let cold_probe = missing_graph_prior
+                && horizon >= 16.
+                && cost.seen.get(&local_limit).copied().unwrap_or(0) < 3;
+            let probe_cost = draft.map_or(normal_time, |p| p.seconds)
+                + graph_budget.direct_s.unwrap_or(normal_time)
+                - normal_time;
+            let periodic_probe = explore
+                && horizon >= 16.
+                && !curve.ticks.is_multiple_of(32)
+                && (curve.ticks / 16) % blocks.len()
+                    == blocks.iter().position(|&b| b == block).unwrap()
+                && curve.probe_credit >= probe_cost.max(0.);
+            if (unknown && cost.samples == 0 && (block == blocks[0] || horizon >= 16.))
+                || cold_probe
+                || periodic_probe
+            {
+                if periodic_probe {
+                    curve.probe_credit -= probe_cost.max(0.);
+                }
                 best = local_limit;
                 best_maxima = local;
                 best_block = block;
@@ -346,8 +447,6 @@ impl Policy {
             if unknown || curve.ticks.is_multiple_of(32) {
                 continue;
             }
-            let draft = draft.unwrap();
-            let restore = restore.unwrap();
             let mean = Feedback {
                 blocks: [(
                     block,
@@ -366,34 +465,41 @@ impl Policy {
                 feedback
             };
             let mut expected = batch as f64;
-            for (index, &(rate, _, _)) in queue(&local, scoring, &cost.acceptance, true, block)
+            let mut scored_depths = vec![0; batch];
+            for (index, &(rate, owner, _)) in queue(&local, scoring, &cost.acceptance, true, block)
                 .iter()
                 .take(local_limit - batch)
                 .enumerate()
             {
                 let rows = batch + index + 1;
                 expected += rate;
+                scored_depths[owner] += 1;
                 if (budget.uniform && (rows - batch).is_multiple_of(positive))
                     || (!budget.uniform && (rows.is_power_of_two() || rows == local_limit))
                 {
-                    let remaining_rounds = (budget.remaining * batch) as f64 / expected;
-                    let pending_setups =
-                        3usize.saturating_sub(cost.seen.get(&rows).copied().unwrap_or(0));
+                    let horizon = reuse_steps(&budget, &scored_depths, maxima, feedback, block);
+                    let warmup = 2usize.saturating_sub(cost.seen.get(&rows).copied().unwrap_or(0));
                     let target_work = work.extend(rows - batch);
-                    let Some(target) = self.costs.predict(Stage::Target, 0, full, target_work)
+                    let Some(target_time) =
+                        self.costs
+                            .price(Stage::Target, 0, full, target_work, horizon, warmup)
                     else {
                         continue;
                     };
-                    let setup = (draft.setup_s + target.setup_s) * pending_setups as f64
-                        / remaining_rounds.max(1.);
+                    let Some(draft_time) =
+                        self.costs
+                            .price(Stage::Draft, block, false, draft_work, horizon, warmup)
+                    else {
+                        continue;
+                    };
+                    let restore_time = restore.unwrap().seconds;
                     let displaced = work.prefill_rows - target_work.prefill_rows;
                     let opportunity = if budget.prefill_tokens_per_s > 0. {
                         displaced as f64 / budget.prefill_tokens_per_s
                     } else {
                         0.
                     };
-                    let time =
-                        setup + draft.seconds + target.seconds + restore.seconds + opportunity;
+                    let time = draft_time + target_time + restore_time + opportunity;
                     if expected / time > throughput {
                         throughput = expected / time;
                         best = rows;
@@ -571,6 +677,20 @@ mod tests {
             }
             let a = Feedback::default();
             let b = Feedback::default();
+            // Ordinary decode and one-draft verification have different
+            // execution geometry. Supply the measured short verification cost.
+            policy.costs.observe(Point {
+                stage: Stage::Target,
+                block: 0,
+                full: false,
+                replay: false,
+                work: Work {
+                    rows: 4,
+                    ..Work::default()
+                },
+                seconds: 0.022,
+                setup_s: 0.,
+            });
             let mut limits = budget(0);
             limits.uniform = true;
             assert_eq!(
@@ -783,6 +903,7 @@ mod tests {
             remaining: 1024,
             uniform: true,
             prefill_tokens_per_s: 4000.,
+            remaining_by_owner: vec![],
         };
         policy.baseline_execution(
             16,

@@ -11,7 +11,9 @@ use super::{
 use crate::{artifact::Result, error::EngineError};
 mod channel;
 mod host_release;
+mod preparation;
 use channel::{Peer, Transport, reply_channel};
+pub(super) use preparation::{CaptureBudget, capture_credit};
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -499,9 +501,10 @@ impl Team {
         layout: Layout,
         tokens: Vec<Vec<u32>>,
         full: bool,
+        budget: Option<CaptureBudget>,
         maintenance: impl FnOnce(),
     ) -> Result<(Vec<Output>, Timing)> {
-        forward_with(&self.peers, layout, tokens, full, maintenance)
+        forward_with(&self.peers, layout, tokens, full, budget, maintenance)
     }
 
     pub fn offload_allocations(&self, id: u64) -> Result<BTreeMap<u64, usize>> {
@@ -710,33 +713,13 @@ fn forward(
     tokens: Vec<Vec<u32>>,
     full: bool,
 ) -> Result<(Vec<Output>, f64, f64)> {
-    let (outputs, timing) = forward_with(peers, layout, tokens, full, || {})?;
+    let (outputs, timing) = forward_with(peers, layout, tokens, full, None, || {})?;
     Ok((outputs, timing.seconds, timing.preparation))
 }
-/// Every rank changes execution mode together. Any miss resets the shared
-/// class to direct. Successful uses are counted on every rank; promotion waits
-/// for the slowest rank. Offline TP8 measurements put prefill amortization at
-/// 8–20 uses (0.31–0.46 s capture versus 24–41 ms saved per execution).
-/// Decode/draft/verification promote after two successful uses of the shape,
-/// including alternating shapes. Prefill retains its eight-use threshold.
+#[cfg(test)]
 fn preparation(states: &[CacheState], repeated: bool) -> Result<(bool, bool)> {
-    if states.is_empty() {
-        return Err("Missing A2 TP cache states".into());
-    }
-    if states.contains(&CacheState::Missing) {
-        return Ok((true, false));
-    }
-    let graphs = states.iter().filter(|s| **s == CacheState::Graph).count();
-    if graphs > 0 {
-        return Ok((graphs != states.len(), true));
-    }
-    Ok((
-        false,
-        states.iter().all(|s| {
-            matches!(s, CacheState::Direct { uses, .. }
-                if *uses >= if repeated { 2 } else { 8 })
-        }),
-    ))
+    let plan = preparation::plan(states, repeated, None)?;
+    Ok((plan.invalidate, plan.capture()))
 }
 
 fn forward_with(
@@ -744,6 +727,7 @@ fn forward_with(
     layout: Layout,
     tokens: Vec<Vec<u32>>,
     full: bool,
+    mut budget: Option<CaptureBudget>,
     maintenance: impl FnOnce(),
 ) -> Result<(Vec<Output>, Timing)> {
     let started = Instant::now();
@@ -762,7 +746,22 @@ fn forward_with(
                 .decoder_roles
                 .iter()
                 .all(|r| *r == super::replay::Role::Continue);
-    let (invalidate, capture) = preparation(&states, repeated)?;
+    if let Some(budget) = &mut budget {
+        budget.slack_s -= started.elapsed().as_secs_f64();
+    }
+    let plan = preparation::plan(&states, repeated, budget)?;
+    let invalidate = plan.invalidate;
+    let capture = plan.capture();
+    if budget.is_some_and(|b| b.trace) {
+        eprintln!(
+            "A2_EXECUTION_PLAN {}",
+            serde_json::json!({
+                "role":format!("{:?}",layout.role), "rows":layout.rows.total,
+                "mode":plan.mode,"reason":plan.reason,"invalidate":invalidate,
+                "budget":budget,
+            })
+        );
+    }
     if invalidate {
         exchange(peers, Command::Invalidate(layout.clone()))?;
     }
