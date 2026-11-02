@@ -3,6 +3,7 @@
 import argparse
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -132,7 +133,12 @@ def publish(plan, checkpoint, output, share_prefix_banks=False):
                 compute_policy="w4a8",
                 execution_package=digest,
                 frontend_assets=assets,
-                metadata=dict(target="ascend910b", max_context=model["capacity"], vocab=129280),
+                metadata=dict(
+                    target="ascend910b",
+                    max_context=model["capacity"],
+                    vocab=129280,
+                    chat_format="deepseek_v41",
+                ),
             ),
         )
         temporary.rename(output)
@@ -142,9 +148,64 @@ def publish(plan, checkpoint, output, share_prefix_banks=False):
     return digest
 
 
+def publish_frontend(source, output):
+    """Atomically publish DSML metadata/template, hard-linking existing assets."""
+    model = json.loads((source / "cache/model.json").read_text())
+    if (
+        model.get("schema_version") != 1
+        or model.get("architecture") != "deepseek_v41"
+        or model.get("metadata", {}).get("target") != "ascend910b"
+    ):
+        raise ValueError("Frontend upgrade requires a native DSv4.1 A2 model")
+    if output.exists():
+        raise ValueError("Preserve existing model directories: " + str(output))
+    if output.resolve().is_relative_to(source.resolve()):
+        raise ValueError("Frontend output must be outside the source model")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=output.name + ".", dir=output.parent))
+    try:
+        shutil.copytree(source, temporary, copy_function=os.link, symlinks=True, dirs_exist_ok=True)
+        for link in temporary.rglob("*"):
+            if link.is_symlink():
+                target = (source / link.relative_to(temporary)).resolve(strict=True)
+                link.unlink()
+                link.symlink_to(target, target_is_directory=target.is_dir())
+        if (temporary / "cache").is_symlink():
+            (temporary / "cache").unlink()
+            shutil.copytree(
+                (source / "cache").resolve(),
+                temporary / "cache",
+                copy_function=os.link,
+                symlinks=True,
+            )
+        # Replace linked files; never truncate the source model's inode.
+        with tempfile.NamedTemporaryFile(
+            dir=temporary, prefix=".frontend-", delete=False
+        ) as stream:
+            stream.write((Path(__file__).with_name("templates") / "chat.jinja").read_bytes())
+            replacement = Path(stream.name)
+        replacement.replace(temporary / "chat_template.jinja")
+        model["metadata"]["chat_format"] = "deepseek_v41"
+        model["frontend_assets"]["chat_template.jinja"] = file_hash(
+            temporary / "chat_template.jinja"
+        )
+        atomic_json(temporary / "cache/model.json", model)
+        temporary.rename(output)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return model["execution_package"]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--plan", type=Path)
+    mode.add_argument(
+        "--frontend-only",
+        action="store_true",
+        help="Reuse existing weights and execution package; publish only a new frontend",
+    )
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--share-prefix-banks", action="store_true")
@@ -153,9 +214,9 @@ def main():
         json.dumps(
             dict(
                 output=str(args.output),
-                execution_package=publish(
-                    args.plan, args.model_dir, args.output, args.share_prefix_banks
-                ),
+                execution_package=publish_frontend(args.model_dir, args.output)
+                if args.frontend_only
+                else publish(args.plan, args.model_dir, args.output, args.share_prefix_banks),
             )
         )
     )

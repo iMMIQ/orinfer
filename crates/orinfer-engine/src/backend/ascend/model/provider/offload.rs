@@ -42,7 +42,7 @@ impl Runtime {
     pub(super) fn evict_host(&mut self) -> Result<bool> {
         if let Some(snapshot) = self.cache.host.evict_one() {
             self.team.exchange(Command::Evict(snapshot.id))?;
-            self.prefix.host_evictions += 1;
+            self.cache_reclamation.host += 1;
             Ok(true)
         } else {
             Ok(false)
@@ -89,9 +89,9 @@ impl Runtime {
             entry.snapshot.allocations(&mut allocations);
             entry.bytes = allocations.values().sum();
             self.cache.host.insert(entry);
-            self.prefix.host_stores += 1;
+            self.cache_reclamation.demotions += 1;
         }
-        self.prefix.evictions += 1;
+        self.cache_reclamation.device += 1;
         self.cache
             .update_statistics(self.team.ranks(), &mut self.prefix);
         Ok(true)

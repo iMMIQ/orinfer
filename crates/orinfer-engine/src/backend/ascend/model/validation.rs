@@ -170,6 +170,11 @@ pub(crate) fn validate(path: &Path) -> Result<ValidationReport> {
         || model.compute_policy != "w4a8"
         || model.metadata.target != "ascend910b"
         || model.metadata.vocab != 129280
+        || model
+            .metadata
+            .chat_format
+            .as_deref()
+            .is_some_and(|f| f != "deepseek_v41")
     {
         return Err("Unsupported native A2 model descriptor".into());
     }

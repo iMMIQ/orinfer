@@ -1,4 +1,34 @@
 use super::*;
+#[test]
+fn cache_reclamation_survives_request_snapshots_and_is_counted_once() {
+    let mut events = CacheReclamation {
+        device: 3,
+        demotions: 2,
+        host: 1,
+    };
+    let mut first = crate::prefix::Statistics {
+        host_stores: 4,
+        ..Default::default()
+    };
+    events.drain_into(&mut first);
+    assert_eq!(
+        (first.evictions, first.host_stores, first.host_evictions),
+        (3, 6, 1)
+    );
+    let mut next = crate::prefix::Statistics::default();
+    events.drain_into(&mut next);
+    assert_eq!(
+        (next.evictions, next.host_stores, next.host_evictions),
+        (0, 0, 0)
+    );
+    events.device = 1;
+    events.host = 2;
+    events.drain_into(&mut next);
+    assert_eq!(
+        (next.evictions, next.host_stores, next.host_evictions),
+        (1, 0, 2)
+    );
+}
 fn output() -> Arc<Output> {
     Arc::new(Output {
         owner: 17,

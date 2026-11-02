@@ -4,6 +4,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 use tokenizers::Tokenizer;
+mod deepseek;
+use super::output::ToolFormat;
 
 fn nullable_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
 where
@@ -102,6 +104,7 @@ pub struct ChatRequest {
 }
 
 pub struct Prepared {
+    pub tool_format: ToolFormat,
     pub input: Vec<u32>,
     pub prefix_hints: Vec<usize>,
     pub images: Vec<orinfer_engine::vision::ImageInput>,
@@ -122,6 +125,7 @@ pub struct Prepared {
 }
 
 pub struct ChatCodec {
+    pub tool_format: ToolFormat,
     pub tools_supported: bool,
     pub audio: Option<orinfer_engine::audio::AudioSpec>,
     pub tokenizer: Tokenizer,
@@ -232,8 +236,20 @@ impl ChatCodec {
         if audio.is_some() && generation["do_sample"] == false {
             sampling_defaults.temperature = 0.;
         }
+        let tool_format = match descriptor["metadata"]["chat_format"].as_str() {
+            Some("deepseek_v41") => ToolFormat::DeepSeekV41,
+            Some(other) => return Err(format!("Unsupported chat format: {other}")),
+            None => ToolFormat::Qwen,
+        };
+        if tool_format == ToolFormat::DeepSeekV41 {
+            // Serving prepares the frontend alongside model loading. Share one
+            // trie instead of building it on the first constrained request.
+            grammar.prepare()?;
+        }
         Ok(Self {
-            tools_supported: descriptor["metadata"]["target"] != "ascend910b",
+            tool_format,
+            tools_supported: tool_format == ToolFormat::DeepSeekV41
+                || descriptor["metadata"]["target"] != "ascend910b",
             audio,
             sampling_defaults,
             tokenizer,
@@ -245,7 +261,7 @@ impl ChatCodec {
     }
     pub fn prepare(
         &self,
-        request: ChatRequest,
+        mut request: ChatRequest,
         model: &str,
         context_limit: usize,
         vision: Option<&orinfer_engine::vision::VisionSpec>,
@@ -456,16 +472,26 @@ impl ChatCodec {
                 let name = choice["function"]["name"]
                     .as_str()
                     .ok_or("Forced tool name missing")?;
-                vec![
-                    request
-                        .tools
-                        .into_iter()
-                        .find(|v| v["function"]["name"] == name)
-                        .ok_or("Forced tool was not declared")?,
-                ]
+                if self.tool_format == ToolFormat::DeepSeekV41 {
+                    if !request.tools.iter().any(|v| v["function"]["name"] == name) {
+                        return Err("Forced tool was not declared".into());
+                    }
+                    request.tools
+                } else {
+                    vec![
+                        request
+                            .tools
+                            .into_iter()
+                            .find(|v| v["function"]["name"] == name)
+                            .ok_or("Forced tool was not declared")?,
+                    ]
+                }
             }
             _ => return Err("Invalid tool_choice".into()),
         };
+        if self.tool_format == ToolFormat::DeepSeekV41 {
+            deepseek::text_parts(&mut request.messages)?;
+        }
         let (messages_with_audio, audios) =
             super::audio::messages(request.messages, self.audio.as_ref(), preparation)?;
         let (raw_messages, images) = super::image::messages_with_options(
@@ -474,7 +500,7 @@ impl ChatCodec {
             &request.image_processing,
             preparation,
         )?;
-        let mut messages = normalize_messages(raw_messages)?;
+        let mut messages = normalize_messages_for(raw_messages, self.tool_format)?;
         if self.audio.is_some() {
             for message in &mut messages {
                 if message["role"] == "user"
@@ -487,7 +513,14 @@ impl ChatCodec {
             }
         }
         let parallel = request.parallel_tool_calls.unwrap_or(true);
-        let grammar = super::grammar::recipe(schema.as_ref(), &tools, &choice, parallel, thinking)?;
+        let (grammar, native_tools) = super::grammar::recipe_for(
+            self.tool_format,
+            schema.as_ref(),
+            &tools,
+            &choice,
+            parallel,
+            thinking,
+        )?;
         if grammar.is_some() && !stops.is_empty() {
             return Err("stop: Cannot interrupt constrained JSON or tool output".into());
         }
@@ -503,7 +536,7 @@ impl ChatCodec {
                 )
             })
             .transpose()?;
-        if constraint.is_some() {
+        if constraint.is_some() && !native_tools {
             let instruction = if tools.is_empty() {
                 format!(
                     "Return only JSON conforming to this schema: {}",
@@ -519,10 +552,14 @@ impl ChatCodec {
                 messages.insert(0, json!({"role":"system","content":instruction}));
             }
         }
-        for tool in &mut tools {
-            canonical(tool);
+        if self.tool_format == ToolFormat::Qwen {
+            for tool in &mut tools {
+                canonical(tool);
+            }
         }
-        if choice == "required" || choice.is_object() {
+        if self.tool_format != ToolFormat::DeepSeekV41
+            && (choice == "required" || choice.is_object())
+        {
             let instruction = if let Some(name) = choice["function"]["name"].as_str() {
                 format!("For this response you must call the function {name}.")
             } else {
@@ -536,6 +573,16 @@ impl ChatCodec {
             }
         }
         preparation.checkpoint(0)?;
+        let (messages, tool_schemas) = if self.tool_format == ToolFormat::DeepSeekV41 {
+            deepseek::prepare(messages, &tools)?
+        } else {
+            (messages, Vec::new())
+        };
+        let deepseek_effort = match request.reasoning_effort.as_deref() {
+            Some("minimal" | "low") => 50,
+            Some("max" | "xhigh") => 100,
+            _ => 75,
+        };
         let mut rendered = self
             .template
             .get_template("chat")
@@ -543,7 +590,9 @@ impl ChatCodec {
             .render(context! {
                 messages => Serde(&messages), tools => Serde(&tools), add_generation_prompt => true,
                 enable_thinking => thinking, reasoning_effort => effort,
-                preserve_thinking => true,
+                preserve_thinking => self.tool_format != ToolFormat::DeepSeekV41 || !tools.is_empty(),
+                tool_schemas => Serde(&tool_schemas), deepseek_effort => deepseek_effort,
+                canonical_tools => !native_tools && constraint.is_some() && !tools.is_empty(),
             })
             .map_err(|e| format!("Chat template: {e}"))?;
         preparation.checkpoint(0)?;
@@ -643,6 +692,15 @@ impl ChatCodec {
         prefix_hints.dedup();
         let _ = request.user; // Attribution only; it does not alter sampling identity.
         Ok(Prepared {
+            tool_format: if self.tool_format == ToolFormat::DeepSeekV41
+                && !native_tools
+                && constraint.is_some()
+                && !tools.is_empty()
+            {
+                ToolFormat::Qwen
+            } else {
+                self.tool_format
+            },
             input,
             prefix_hints,
             images,
@@ -731,7 +789,7 @@ fn valid_name(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
-fn text_content(v: &Value) -> Result<String> {
+fn text_content(v: &Value, separator: &str) -> Result<String> {
     match v {
         Value::Null => Ok(String::new()),
         Value::String(s) => Ok(s.clone()),
@@ -748,11 +806,15 @@ fn text_content(v: &Value) -> Result<String> {
                 }
             })
             .collect::<Result<Vec<_>>>()
-            .map(|v| v.concat()),
+            .map(|v| v.join(separator)),
         _ => Err("Invalid message content".into()),
     }
 }
-fn normalize_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
+#[cfg(test)]
+fn normalize_messages(messages: Vec<Value>) -> Result<Vec<Value>> {
+    normalize_messages_for(messages, ToolFormat::Qwen)
+}
+fn normalize_messages_for(mut messages: Vec<Value>, format: ToolFormat) -> Result<Vec<Value>> {
     if messages.is_empty() {
         return Err("messages must not be empty".into());
     }
@@ -769,10 +831,12 @@ fn normalize_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
             return Err("Unsupported message role".into());
         }
         if role == "system" || role == "developer" {
-            if dialogue {
+            if dialogue && format != ToolFormat::DeepSeekV41 {
                 return Err("System/developer messages must precede the dialogue".into());
             }
-            message["role"] = json!("system");
+            if format != ToolFormat::DeepSeekV41 {
+                message["role"] = json!("system");
+            }
         } else {
             dialogue = true;
         }
@@ -782,7 +846,20 @@ fn normalize_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
         if role != "tool" && !pending.is_empty() {
             return Err("Missing response for preceding tool call".into());
         }
-        message["content"] = json!(text_content(&message["content"])?);
+        message["content"] = json!(text_content(
+            &message["content"],
+            if format == ToolFormat::DeepSeekV41 {
+                "\n\n"
+            } else {
+                ""
+            }
+        )?);
+        if format == ToolFormat::DeepSeekV41
+            && message.get("reasoning_content").is_none()
+            && let Some(reasoning) = message.get("reasoning").cloned()
+        {
+            message["reasoning_content"] = reasoning;
+        }
         if role == "tool" {
             let id = message["tool_call_id"]
                 .as_str()
@@ -811,8 +888,21 @@ fn normalize_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
                 // Preserve failed/truncated calls for client error recovery. The
                 // native template requires a parameter map, so retain raw input
                 // under an explicit marker instead of guessing missing values.
-                let parsed = match serde_json::from_str::<Value>(arguments) {
+                let raw = serde_json::from_str::<Value>(arguments);
+                let raw = if format == ToolFormat::DeepSeekV41 {
+                    raw.and_then(|v| {
+                        if let Some(s) = v.as_str() {
+                            serde_json::from_str(s)
+                        } else {
+                            Ok(v)
+                        }
+                    })
+                } else {
+                    raw
+                };
+                let parsed = match raw {
                     Ok(value) if value.is_object() => value,
+                    _ if format == ToolFormat::DeepSeekV41 => json!({"arguments":arguments}),
                     _ => json!({"__orinfer_raw_arguments":arguments}),
                 };
                 call["function"]["arguments"] = parsed;
@@ -825,7 +915,9 @@ fn normalize_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
     }
     let mut normalized: Vec<Value> = vec![];
     for message in messages {
-        if message["role"] == "system" && normalized.first().is_some_and(|m| m["role"] == "system")
+        if format != ToolFormat::DeepSeekV41
+            && message["role"] == "system"
+            && normalized.first().is_some_and(|m| m["role"] == "system")
         {
             let current = normalized[0]["content"].as_str().unwrap_or("");
             normalized[0]["content"] = json!(format!(

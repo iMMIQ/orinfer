@@ -1,6 +1,14 @@
-//! Incremental Qwen XML tool/reasoning parsing into Chat Completions deltas.
+//! Incremental model tool/reasoning formats into shared Chat Completions deltas.
+mod dsml;
 use serde_json::{Map, Value, json};
 use std::{collections::BTreeMap, sync::OnceLock};
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolFormat {
+    #[default]
+    Qwen,
+    DeepSeekV41,
+}
 
 #[derive(Default)]
 struct Schemas {
@@ -48,6 +56,9 @@ impl Schemas {
 type Result<T> = std::result::Result<T, String>;
 
 pub struct Output {
+    format: ToolFormat,
+    dsml_calls: bool,
+    dsml_call: Option<dsml::Call>,
     schemas: Schemas,
     pending: String,
     reasoning: bool,
@@ -70,6 +81,9 @@ pub struct Output {
 impl Output {
     pub fn new(thinking: bool, tools: Vec<Value>, stops: Vec<String>, id: &str) -> Self {
         Self {
+            format: ToolFormat::Qwen,
+            dsml_calls: false,
+            dsml_call: None,
             schemas: Schemas::default(),
             pending: String::new(),
             reasoning: thinking,
@@ -92,6 +106,9 @@ impl Output {
     }
     pub fn structured_json(&mut self, enabled: bool) {
         self.structured = enabled;
+    }
+    pub fn tool_format(&mut self, format: ToolFormat) {
+        self.format = format;
     }
     pub fn constrained_tools(&mut self, enabled: bool) {
         self.constrained_tools = enabled;
@@ -122,6 +139,43 @@ impl Output {
                 .iter()
                 .filter_map(|s| self.pending.find(s).map(|at| (at, s.len())))
                 .min_by_key(|x| x.0);
+            if self.dsml_call.is_some() {
+                let limit = stop.map_or(self.pending.len(), |(at, _)| at);
+                let (consumed, event) = self
+                    .dsml_call
+                    .as_mut()
+                    .unwrap()
+                    .advance(&self.pending[..limit])?;
+                let waiting = event.is_none();
+                self.drain(consumed);
+                match event {
+                    Some(dsml::Event::Begin(name)) => self.stream_call(&name, "", &mut deltas)?,
+                    Some(dsml::Event::Arguments(fragment)) => {
+                        self.argument_delta(&fragment, &mut deltas)?
+                    }
+                    Some(dsml::Event::End) => {
+                        let (name, arguments) = self.streamed_call.as_ref().unwrap();
+                        if self.constrained_tools {
+                            let value: Value =
+                                serde_json::from_str(arguments).map_err(|e| e.to_string())?;
+                            self.schemas.validate(&self.tools, name, &value)?;
+                        }
+                        self.calls.push(json!({"id":format!("call_{}_{}",self.call_prefix,self.calls.len()),"type":"function","function":{"name":name,"arguments":arguments}}));
+                        self.streamed_call = None;
+                        self.dsml_call = None;
+                        self.in_tool = false;
+                    }
+                    None => {}
+                }
+                if consumed == 0 && waiting {
+                    if stop.is_some() {
+                        self.pending.clear();
+                        self.stopped = true;
+                    }
+                    break;
+                }
+                continue;
+            }
             if self.in_tool {
                 let end = call_end(&self.pending);
                 if stop.is_some_and(|(at, _)| end.is_none_or(|end| at < end)) {
@@ -155,7 +209,24 @@ impl Output {
                 }
                 break;
             }
-            let markers: &[&str] = if self.tools.is_empty() {
+            let markers: &[&str] = if self.format == ToolFormat::DeepSeekV41
+                && !self.tools.is_empty()
+                && !self.reasoning
+            {
+                if self.dsml_calls {
+                    &[dsml::INVOKE, dsml::CLOSE]
+                } else if self.constrained_tools {
+                    &[
+                        "\n\n<｜DSML｜ calls>",
+                        dsml::OPEN,
+                        "<tool_call>",
+                        "<think>",
+                        "</think>",
+                    ]
+                } else {
+                    &["\n\n<｜DSML｜ calls>", dsml::OPEN, "<think>", "</think>"]
+                }
+            } else if self.tools.is_empty() || self.format == ToolFormat::DeepSeekV41 {
                 &["<think>", "</think>"]
             } else {
                 &["<tool_call>", "<think>", "</think>"]
@@ -173,9 +244,21 @@ impl Output {
             }
             if let Some((at, tag)) = marker {
                 let before = self.pending[..at].to_owned();
-                self.emit_text(&before, &mut deltas);
+                if self.dsml_calls {
+                    if !before.trim().is_empty() {
+                        return Err("Unexpected text inside DSML calls".into());
+                    }
+                } else {
+                    self.emit_text(&before, &mut deltas);
+                }
                 self.drain(at + tag.len());
                 match tag {
+                    dsml::OPEN | "\n\n<｜DSML｜ calls>" => self.dsml_calls = true,
+                    dsml::CLOSE => self.dsml_calls = false,
+                    dsml::INVOKE => {
+                        self.dsml_call = Some(dsml::Call::default());
+                        self.in_tool = true;
+                    }
                     "<tool_call>" if self.reasoning => {
                         return Err("Tool call inside reasoning".into());
                     }
@@ -206,7 +289,13 @@ impl Output {
             };
             let n = self.pending.len() - hold;
             let text = self.pending[..n].to_owned();
-            self.emit_text(&text, &mut deltas);
+            if self.dsml_calls {
+                if !text.trim().is_empty() {
+                    return Err("Unexpected text inside DSML calls".into());
+                }
+            } else {
+                self.emit_text(&text, &mut deltas);
+            }
             self.drain(n);
             break;
         }
@@ -252,12 +341,23 @@ impl Output {
             previous.len()
         } else {
             deltas.push(json!({"tool_calls":[{"index":index,"id":format!("call_{}_{}",self.call_prefix,index),"type":"function","function":{"name":name,"arguments":""}}]}));
+            self.streamed_call = Some((name.into(), String::new()));
             0
         };
         if arguments.len() > previous {
-            deltas.push(json!({"tool_calls":[{"index":index,"function":{"arguments":&arguments[previous..]}}]}));
+            self.argument_delta(&arguments[previous..], deltas)?;
         }
-        self.streamed_call = Some((name.into(), arguments.into()));
+        Ok(())
+    }
+    fn argument_delta(&mut self, fragment: &str, deltas: &mut Vec<Value>) -> Result<()> {
+        let (_, arguments) = self
+            .streamed_call
+            .as_mut()
+            .ok_or("Tool argument before name")?;
+        arguments.push_str(fragment);
+        deltas.push(
+            json!({"tool_calls":[{"index":self.calls.len(),"function":{"arguments":fragment}}]}),
+        );
         Ok(())
     }
     pub fn finish(
@@ -286,6 +386,12 @@ impl Output {
             } else if !exhausted {
                 return Err("Model emitted an incomplete tool call".into());
             }
+        }
+        if self.dsml_calls {
+            if self.constrained_tools && !exhausted {
+                return Err("Incomplete DSML calls envelope".into());
+            }
+            self.incomplete_call = true;
         }
         if !parallel && self.calls.len() > 1 {
             return Err("Model emitted multiple calls with parallel_tool_calls=false".into());

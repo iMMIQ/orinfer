@@ -186,6 +186,7 @@ impl<'a> Active<'a> {
             job.prepared.stops.clone(),
             &job.id,
         );
+        parser.tool_format(job.prepared.tool_format);
         parser.structured_json(job.prepared.structured);
         parser.constrained_tools(job.prepared.constrained_tools);
         let queue_s = job.queued.elapsed().as_secs_f64();
@@ -872,6 +873,7 @@ mod tests {
             _memory: None,
             limits: Limits::default(),
             prepared: Prepared {
+                tool_format: output::ToolFormat::Qwen,
                 audios: vec![],
                 input: vec![1],
                 images: vec![],

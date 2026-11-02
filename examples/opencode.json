@@ -97,6 +97,50 @@
               "thinking_token_budget": 2048
             }
           }
+        },
+        "deepseek-v4.1": {
+          "name": "DeepSeek V4.1 on Orinfer",
+          "attachment": false,
+          "reasoning": true,
+          "tool_call": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          },
+          "options": {
+            "temperature": 0,
+            "enable_thinking": true,
+            "reasoningEffort": "high"
+          },
+          "variants": {
+            "off": {
+              "enable_thinking": false,
+              "reasoningEffort": "none"
+            },
+            "low": {
+              "enable_thinking": true,
+              "reasoningEffort": "low"
+            },
+            "high": {
+              "enable_thinking": true,
+              "reasoningEffort": "high"
+            },
+            "max": {
+              "enable_thinking": true,
+              "reasoningEffort": "max"
+            }
+          }
         }
       }
     }

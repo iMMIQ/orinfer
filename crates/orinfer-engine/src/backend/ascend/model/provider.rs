@@ -39,6 +39,8 @@ pub(super) struct Descriptor {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Metadata {
+    #[serde(default)]
+    pub(super) chat_format: Option<String>,
     pub(super) target: String,
     pub(super) max_context: usize,
     pub(super) vocab: usize,
@@ -88,6 +90,7 @@ pub(crate) struct Runtime {
     pub frontend_assets: BTreeMap<String, String>,
     cache: Tiered<Snapshot, Snapshot>,
     prefix: crate::prefix::Statistics,
+    cache_reclamation: CacheReclamation,
     statistics: scheduler::Statistics,
     active: BTreeSet<usize>,
     resident: BTreeSet<usize>,
@@ -100,6 +103,21 @@ pub(crate) struct Runtime {
     draft_limit: usize,
     speculation_policy: dspark::Policy,
     speculation: crate::mtp::Statistics,
+}
+/// Shared-cache events belong to the runtime. Charge them once to the next
+/// completion so request-log aggregation survives overlapping request lifetimes.
+#[derive(Default)]
+struct CacheReclamation {
+    device: usize,
+    demotions: usize,
+    host: usize,
+}
+impl CacheReclamation {
+    fn drain_into(&mut self, statistics: &mut crate::prefix::Statistics) {
+        statistics.evictions += std::mem::take(&mut self.device);
+        statistics.host_stores += std::mem::take(&mut self.demotions);
+        statistics.host_evictions += std::mem::take(&mut self.host);
+    }
 }
 pub(crate) struct Request {
     owner: u64,
@@ -249,6 +267,11 @@ impl Runtime {
             || model.compute_policy != "w4a8"
             || model.metadata.target != "ascend910b"
             || model.metadata.vocab != 129280
+            || model
+                .metadata
+                .chat_format
+                .as_deref()
+                .is_some_and(|f| f != "deepseek_v41")
         {
             return Err("Unsupported native A2 model descriptor".into());
         }
@@ -293,6 +316,7 @@ impl Runtime {
             frontend_assets: model.frontend_assets,
             cache: Tiered::new(options.prefix_cache_bytes, host_budget),
             prefix: Default::default(),
+            cache_reclamation: Default::default(),
             statistics: Default::default(),
             active: Default::default(),
             resident: Default::default(),
@@ -958,6 +982,7 @@ impl Runtime {
             self.capture_credit_s = 0.;
         }
         request.released = true;
+        self.cache_reclamation.drain_into(&mut request.prefix);
         self.cache
             .update_statistics(self.team.ranks(), &mut request.prefix);
         self.prefix = request.prefix.clone();

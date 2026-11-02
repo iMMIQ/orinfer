@@ -64,6 +64,9 @@ impl Factory {
     pub fn compile(&self, grammar: String, param: &str) -> Result<Box<dyn Constraint>> {
         compile(self.factory()?, grammar, &self.eos, param)
     }
+    pub fn prepare(&self) -> Result<()> {
+        self.factory().map(|_| ())
+    }
 }
 fn compile(
     factory: &ParserFactory,
@@ -246,6 +249,16 @@ pub fn recipe(
     parallel: bool,
     thinking: bool,
 ) -> Result<Option<String>> {
+    recipe_inner(schema, tools, choice, parallel, thinking, true)
+}
+fn recipe_inner(
+    schema: Option<&Value>,
+    tools: &[Value],
+    choice: &Value,
+    parallel: bool,
+    thinking: bool,
+    head_text: bool,
+) -> Result<Option<String>> {
     let forced = choice == "required" || choice.is_object();
     let strict = tools.iter().any(|t| t["function"]["strict"] == true);
     if schema.is_none() && !(forced || strict || !parallel && !tools.is_empty()) {
@@ -291,7 +304,7 @@ args{i}: %json {params}
             ));
             calls.push(format!("call{i}"));
         }
-        grammar.push_str(if schema.is_some() {
+        grammar.push_str(if schema.is_some() || !head_text {
             "head: \"<tool_call>\"\n"
         } else {
             "head[lazy]: /(?s:.*)/ \"<tool_call>\"\n"
@@ -322,9 +335,120 @@ args{i}: %json {params}
     Ok(Some(grammar))
 }
 
+/// Native DSML for representable property schemas; general JSON Schema keeps
+/// the shared JSON envelope rather than weakening cross-property constraints.
+pub fn recipe_for(
+    format: super::output::ToolFormat,
+    schema: Option<&Value>,
+    tools: &[Value],
+    choice: &Value,
+    parallel: bool,
+    thinking: bool,
+) -> Result<(Option<String>, bool)> {
+    if format == super::output::ToolFormat::Qwen {
+        return Ok((recipe(schema, tools, choice, parallel, thinking)?, false));
+    }
+    if format == super::output::ToolFormat::DeepSeekV41 && schema.is_none() {
+        let constrained = choice == "required"
+            || choice.is_object()
+            || tools.iter().any(|t| t["function"]["strict"] == true)
+            || !parallel && !tools.is_empty();
+        if !constrained {
+            return Ok((None, true));
+        }
+        if let Some(grammar) = dsml::recipe(tools, choice, parallel, thinking)? {
+            return Ok((Some(grammar), true));
+        }
+    }
+    let selected: Vec<_> = tools
+        .iter()
+        .filter(|t| {
+            choice["function"]["name"]
+                .as_str()
+                .is_none_or(|name| t["function"]["name"] == name)
+        })
+        .cloned()
+        .collect();
+    Ok((
+        recipe_inner(schema, &selected, choice, parallel, thinking, false)?,
+        false,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_dsml_constraints_keep_types_bounds_and_call_count() {
+        let tools = vec![
+            json!({"type":"function","function":{"name":"write","strict":true,"parameters":{"type":"object","properties":{"text":{"type":"string","minLength":2,"maxLength":4},"count":{"type":"integer","minimum":1,"maximum":3}},"required":["text","count"],"additionalProperties":false}}}),
+        ];
+        let (grammar, native) = recipe_for(
+            super::super::output::ToolFormat::DeepSeekV41,
+            None,
+            &tools,
+            &json!("required"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(native);
+        let grammar = grammar.unwrap();
+        let raw = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"write\">\n<｜DSML｜ parameter name=\"text\" string=\"true\">中文</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"count\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        check(grammar.clone(), raw).unwrap();
+        assert!(check(grammar.clone(), &raw.replace("中文", "x")).is_err());
+        assert!(check(grammar, &raw.replace(">2</", ">9</")).is_err());
+    }
+    #[test]
+    fn complex_tool_schema_uses_full_shared_json_constraints() {
+        let tools = vec![
+            json!({"type":"function","function":{"name":"write","strict":true,"parameters":{"type":"object","properties":{"x":{"type":"string","pattern":"^a+$","minLength":3}},"required":["x"],"additionalProperties":false}}}),
+        ];
+        let (grammar, native) = recipe_for(
+            super::super::output::ToolFormat::DeepSeekV41,
+            None,
+            &tools,
+            &json!("required"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!native);
+        check(
+            grammar.unwrap(),
+            "<tool_call>{\"name\":\"write\",\"arguments\":{\"x\":\"aaa\"}}</tool_call>",
+        )
+        .unwrap();
+    }
+    #[test]
+    fn dsml_union_with_sibling_assertion_keeps_full_schema() {
+        let tools = vec![
+            json!({"type":"function","function":{"name":"write","strict":true,"parameters":{"type":"object","properties":{"x":{"anyOf":[{"type":"integer"},{"type":"string"}],"enum":[2,"ok"]}},"required":["x"],"additionalProperties":false}}}),
+        ];
+        let (grammar, native) = recipe_for(
+            super::super::output::ToolFormat::DeepSeekV41,
+            None,
+            &tools,
+            &json!("required"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!native);
+        let grammar = grammar.unwrap();
+        check(
+            grammar.clone(),
+            "<tool_call>{\"name\":\"write\",\"arguments\":{\"x\":2}}</tool_call>",
+        )
+        .unwrap();
+        assert!(
+            check(
+                grammar,
+                "<tool_call>{\"name\":\"write\",\"arguments\":{\"x\":3}}</tool_call>"
+            )
+            .is_err()
+        );
+    }
     fn check(grammar: String, text: &str) -> Result<()> {
         let factory = ParserFactory::new_simple(&ApproximateTokEnv::single_byte_env()).unwrap();
         let mut c = compile(&factory, grammar, &[261], "test")?;
@@ -393,3 +517,4 @@ mod tests {
         assert!(check(g, &call.replace("北京", "bad")).is_err());
     }
 }
+mod dsml;

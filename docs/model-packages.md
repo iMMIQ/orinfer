@@ -668,9 +668,20 @@ A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 own
 
 `--length-input` 让同一索引 Cube 工厂读取每行的有效前缀长度，按 owner 内单调递增的位置决定实际 key tile 数，写入有效 score 前缀。TopK 使用相同长度屏蔽其余容量，完整有效候选与原有归约顺序保持一致。此模式以长度向量替代稠密因果索引矩阵，同时适用于 decode 和 prefill。`--gather-slots` 选择同一 INT8 gather 工厂每次转换的槽位数。可重复提供 `--reuse-cache /path/to/compiled/cache`，复用完整编译对象；编译器仍校验对象身份和库哈希。
 
-当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样、prefix 恢复及匹配执行包的 DSpark。工具定义／工具调用、媒体、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的原生计划封装。v0.3.0 的 `package install` 在 CPU 上校验并原子安装该执行包；`validate-model` 另行校验配置、前端和全部发布权重分片，分片内容依据 `release-manifest.json` 每个文件扫描一次。正常服务加载不计算资产内容 SHA256。A2 模型通过原生 provider 接入公共运行时，模型计划尚未迁移到通用模型 cdylib C ABI。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
+当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样、prefix 恢复及匹配执行包的 DSpark。声明 `metadata.chat_format=deepseek_v41` 的前端支持函数工具、工具结果回传、并行调用、增量参数和 thinking 历史。媒体、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的原生计划封装。v0.3.0 的 `package install` 在 CPU 上校验并原子安装该执行包；`validate-model` 另行校验配置、前端和全部发布权重分片，分片内容依据 `release-manifest.json` 每个文件扫描一次。正常服务加载不计算资产内容 SHA256。A2 模型通过原生 provider 接入公共运行时，模型计划尚未迁移到通用模型 cdylib C ABI。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
 
 ### A2 DSpark 构建与运行
+
+工具前端由模型格式选择，GPU／NPU 复用公共 Chat、schema 校验、调用 ID、SSE 和完成控制。DSv4.1 使用 checkpoint 的 `<｜DSML｜ calls>`、`invoke` 和 `parameter` 标签；`string` 属性决定参数是原始字符串还是 JSON，逐块处理长代码并只保留可能跨块的标签后缀。工具结果按调用顺序合并，带工具的 thinking 历史保留完整推理；普通新一轮对话按官方规则丢弃旧推理。官方 reasoning effort 的 low/high/max 分别为 50/75/100。原生可表达的严格参数使用同一 DSML 语法；复杂跨字段 schema 使用公共 JSON 工具封装及完整 JSON Schema 约束。`tool_choice=none` 从本轮提示词中移除工具定义。
+
+已有 A2 模型使用以下离线命令生成新前端目录。新旧目录须位于同一文件系统；权重和现有资产使用硬链接，模板和描述原子替换，执行包 digest 保持不变。旧目录保留用于回滚；正常加载不增加权重哈希扫描：
+
+```bash
+uv run --locked python -m tools.model.deepseek_v41.service --frontend-only \
+  --model-dir /path/to/current-model --output /path/to/model-with-dsml
+```
+
+共享 KV 回收事件按完成顺序计入一次请求统计；evictions、host_stores 和 host_evictions 汇总时不会被并发请求的私有统计覆盖。这些共享缓存事件不表示完成请求自身的 KV 被逐出。
 
 DSpark 包复用 target 的动态行验证程序和整数投影。三个 draft 层使用同一动态行计算体，Markov head 依次生成候选。默认构建容量为 5；`tools.model.deepseek_v41.dspark --block-size 16` 可发布容量 16 和实际 5／8／16 行的轻量程序别名。别名共享投影、attention 和 Markov 算子，仅改变实际噪声行数及执行的 Markov 前缀。Markov 边界使用同源动态搬运模板将实际行写入固定 stride workspace。Ascend checkpoint 的 target 使用 QuaRot 坐标，draft 使用独立的原始坐标 embedding 与输出头；main_proj 已离线包含 target 坐标到 draft 坐标的变换。target 37／38／39 层的 attention 输入按 HC 分支取均值；token 分片从真实局部 residual 收集三个特征段，再用一次 AllGather 恢复原行序，投影后更新各 owner 的 draft SWA。Markov 加偏置与分块 argmax 融合，8 卡交换小候选。draft KV 使用 group-64 INT8 和 FP16 scale，逻辑窗口为 128，物理历史环为 256 行；噪声 KV 保持独立的 128 行 bank。最多 32 行验证保留完整已确认历史，公共 journal 自动跳过不覆盖历史的写入，拒绝后按接受长度截断。旧 128 行执行包继续使用原 journal 语义。验证返回每个位置的 target 输出；提交保留已接受的写入，并恢复被拒绝候选覆盖的有效窗口槽位。C2 的 32 槽环只读取相邻历史位置，通过逻辑长度保留正确前缀。
 

@@ -1,7 +1,10 @@
 """CPU checks for explicit native A2 snapshot geometry."""
 
+import json
+from pathlib import Path
+import tempfile
 import unittest
-from tools.model.deepseek_v41.service import enable_prefix_sharing, state_layout
+from tools.model.deepseek_v41.service import enable_prefix_sharing, publish_frontend, state_layout
 
 
 class StateLayoutTests(unittest.TestCase):
@@ -58,6 +61,39 @@ class StateLayoutTests(unittest.TestCase):
             self.assertTrue(states[name]["append_only"])
         for name in ("cache.swa.0", "cache.swa.0.scale", "cache.ring.2"):
             self.assertFalse(states[name].get("append_only", False))
+
+
+class FrontendPublicationTests(unittest.TestCase):
+    def test_upgrade_replaces_linked_metadata_without_modifying_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source, output = base / "old", base / "new"
+            (source / "cache").mkdir(parents=True)
+            descriptor = {
+                "schema_version": 1,
+                "architecture": "deepseek_v41",
+                "execution_package": "existing-package",
+                "metadata": {"target": "ascend910b"},
+                "frontend_assets": {"chat_template.jinja": "old"},
+            }
+            (source / "cache/model.json").write_text(json.dumps(descriptor))
+            (source / "chat_template.jinja").write_text("old template")
+            weights = source / "layer.safetensors"
+            weights.write_bytes(b"unchanged checkpoint payload")
+            self.assertEqual(publish_frontend(source, output), "existing-package")
+            self.assertEqual((output / weights.name).stat().st_ino, weights.stat().st_ino)
+            self.assertEqual((source / "chat_template.jinja").read_text(), "old template")
+            self.assertEqual(json.loads((source / "cache/model.json").read_text()), descriptor)
+            updated = json.loads((output / "cache/model.json").read_text())
+            self.assertEqual(updated["metadata"]["chat_format"], "deepseek_v41")
+            self.assertNotEqual(
+                (source / "cache/model.json").stat().st_ino,
+                (output / "cache/model.json").stat().st_ino,
+            )
+            with self.assertRaises(ValueError):
+                publish_frontend(source, output)
+            with self.assertRaises(ValueError):
+                publish_frontend(source, source / "nested")
 
 
 if __name__ == "__main__":

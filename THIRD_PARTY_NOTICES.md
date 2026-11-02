@@ -10,7 +10,8 @@ upstream revisions, NVIDIA toolchain image, and pinned dependencies.
 The wheels retain their upstream BSD licenses and bundled third-party notices.
 
 The Engram tokenizer-normalization and addressing rules in
-`tools/model/deepseek_v41/export_engram.py` are adapted from DeepSeek's V4.1
+`tools/model/deepseek_v41/export_engram.py`, the DSv4.1 chat template and
+`fixtures/chat/deepseek-v41.json` are adapted from DeepSeek's V4.1
 reference inference implementation, Copyright (c) 2023 DeepSeek, under the MIT
 License. The full license is in `tools/model/deepseek_v41/LICENSE`.
 
