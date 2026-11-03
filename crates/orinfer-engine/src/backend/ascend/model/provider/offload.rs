@@ -1,9 +1,36 @@
 //! A second radix cache for complete CPU state endpoints, under a global budget.
 use super::*;
 type Hit = (bool, u64);
+/// Defer only for a future endpoint this owner can actually publish and the
+/// waiting request can restore. A shared BOS alone provides no new work.
+pub(super) fn pending_endpoint(
+    offset: usize,
+    owner: usize,
+    waiting: usize,
+    common: usize,
+    cached: usize,
+    keep: usize,
+    complete: bool,
+) -> bool {
+    let next = (offset / 4096 + 1) * 4096;
+    [
+        (next, false),
+        (owner.saturating_sub(keep), false),
+        (owner, complete),
+    ]
+    .into_iter()
+    .any(|(end, head)| {
+        offset >= cached
+            && end > offset
+            && end > cached
+            && end <= common
+            && end <= owner
+            && (end < waiting && end <= waiting.saturating_sub(keep) || end == waiting && head)
+    })
+}
 impl Runtime {
-    pub(super) fn matched(&self, input: &[u32]) -> Option<Hit> {
-        matched_tier(&self.cache, input, self.final_decoder_window())
+    pub(super) fn matched(&self, input: &[u32], media: &Media) -> Option<Hit> {
+        matched_tier(&self.cache, input, media, self.final_decoder_window())
     }
     pub(super) fn entry(&self, hit: Hit) -> &Entry<Snapshot> {
         if hit.0 {
@@ -97,17 +124,32 @@ impl Runtime {
         Ok(true)
     }
 }
-fn matched_tier(cache: &Tiered<Snapshot, Snapshot>, input: &[u32], reserve: usize) -> Option<Hit> {
+fn matched_tier(
+    cache: &Tiered<Snapshot, Snapshot>,
+    input: &[u32],
+    media: &Media,
+    reserve: usize,
+) -> Option<Hit> {
     let score = |entry: &Entry<Snapshot>| {
         (entry.tokens.len() <= input.len().saturating_sub(reserve)
             || entry.tokens.len() == input.len() && entry.snapshot.output.is_some())
         .then_some(-(entry.tokens.len() as f64))
     };
-    cache.matched(input, &Media::default(), score, score)
+    cache.matched(input, media, score, score)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_prefixes_require_new_restorable_endpoints() {
+        assert!(!pending_endpoint(1, 772, 772, 1, 1, 128, true));
+        assert!(pending_endpoint(1, 7000, 7500, 5000, 1, 128, true));
+        assert!(!pending_endpoint(4096, 7000, 7500, 5000, 4096, 128, true));
+        assert!(pending_endpoint(4096, 6000, 6500, 5900, 4096, 128, true));
+        assert!(!pending_endpoint(4096, 6000, 5900, 5900, 4096, 128, true));
+        assert!(pending_endpoint(1, 1000, 1000, 1000, 1, 128, true));
+        assert!(!pending_endpoint(1, 1000, 1000, 1, 1, 128, true));
+    }
     fn entry(tokens: &[u32], id: u64) -> Entry<Snapshot> {
         Entry::new(
             tokens.to_vec(),
@@ -124,14 +166,44 @@ mod tests {
         )
     }
     #[test]
+    fn identical_image_token_ids_match_only_their_own_media_across_tiers() {
+        let tokens = [1, 129264, 129264, 129264, 2];
+        let mut query = tokens.to_vec();
+        query.push(3);
+        let a = Media(vec![(1, [3; 32])]);
+        let b = Media(vec![(1, [7; 32])]);
+        let mut cache = Tiered::new(256, 256);
+        let mut first = entry(&tokens, 1);
+        first.media = a.clone();
+        let mut second = entry(&tokens, 2);
+        second.media = b.clone();
+        cache.device.insert(first);
+        cache.host.insert(second);
+        assert_eq!(matched_tier(&cache, &query, &a, 0), Some((false, 1)));
+        assert_eq!(matched_tier(&cache, &query, &b, 0), Some((true, 1)));
+        assert_eq!(
+            matched_tier(&cache, &query, &Media(vec![(1, [9; 32])]), 0),
+            None
+        );
+    }
+    #[test]
     fn tier_lookup_preserves_decoder_boundary_and_device_ties() {
         let mut cache = Tiered::new(256, 256);
         cache.device.insert(entry(&[1, 2], 1));
         cache.host.insert(entry(&[1, 2, 3], 2));
-        assert_eq!(matched_tier(&cache, &[1, 2, 3, 4, 5], 2), Some((true, 1)));
-        assert_eq!(matched_tier(&cache, &[1, 2, 3, 4], 2), Some((false, 1)));
+        assert_eq!(
+            matched_tier(&cache, &[1, 2, 3, 4, 5], &Media::default(), 2),
+            Some((true, 1))
+        );
+        assert_eq!(
+            matched_tier(&cache, &[1, 2, 3, 4], &Media::default(), 2),
+            Some((false, 1))
+        );
         cache.device.insert(entry(&[1, 2, 3], 3));
-        assert_eq!(matched_tier(&cache, &[1, 2, 3, 4, 5], 2), Some((false, 2)));
+        assert_eq!(
+            matched_tier(&cache, &[1, 2, 3, 4, 5], &Media::default(), 2),
+            Some((false, 2))
+        );
         let moved = cache.device.evict_entry_one_except(Some(1)).unwrap();
         cache.host.insert(moved);
         let mut stats = crate::prefix::Statistics::default();

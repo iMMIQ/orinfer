@@ -100,7 +100,7 @@
         },
         "deepseek-v4.1": {
           "name": "DeepSeek V4.1 on Orinfer",
-          "attachment": false,
+          "attachment": true,
           "reasoning": true,
           "tool_call": true,
           "interleaved": {
@@ -108,7 +108,8 @@
           },
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image"
             ],
             "output": [
               "text"

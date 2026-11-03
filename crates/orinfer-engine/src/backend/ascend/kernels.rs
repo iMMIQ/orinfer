@@ -73,7 +73,7 @@ impl Spec {
             .map(|v| {
                 v.as_u64()
                     .and_then(|n| usize::try_from(n).ok())
-                    .filter(|n| (2..=4096).contains(n))
+                    .filter(|n| (2..=16384).contains(n))
                     .ok_or_else(|| "Invalid AOT dynamic row capacity".into())
             })
             .transpose()

@@ -7,6 +7,13 @@ use safetensors::Dtype;
 use serde::Deserialize;
 use std::{fs, path::Path, rc::Rc, time::Instant};
 
+pub(super) struct Inputs<'a> {
+    pub tokens: &'a [u32],
+    pub hashes: &'a [i64],
+    pub valid: &'a [bool],
+    pub visual_rows: &'a [super::vision::Overlay],
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Coordinates {
@@ -17,6 +24,8 @@ pub(super) struct Coordinates {
     pub draft_swa_storage_rows: Option<usize>,
     #[serde(default)]
     pub input_ids: Option<String>,
+    #[serde(default)]
+    pub image_rows: Option<String>,
     #[serde(default)]
     pub device_indices: bool,
     pub base_cos: String,
@@ -69,6 +78,7 @@ impl Coordinates {
         ];
         names.extend(self.source_swa_indices.as_deref());
         names.extend(self.input_ids.as_deref());
+        names.extend(self.image_rows.as_deref());
         names
     }
 }
@@ -409,17 +419,31 @@ impl Worker {
         valid: &[bool],
         logits: bool,
     ) -> Result<Ticket> {
-        self.enqueue_packet_retained(execution, tokens, hashes, valid, logits, vec![])
+        self.enqueue_packet_retained(
+            execution,
+            Inputs {
+                tokens,
+                hashes,
+                valid,
+                visual_rows: &[],
+            },
+            logits,
+            vec![],
+        )
     }
     pub(super) fn enqueue_packet_retained(
         &mut self,
         execution: Rc<Execution>,
-        tokens: &[u32],
-        hashes: &[i64],
-        valid: &[bool],
+        input: Inputs<'_>,
         logits: bool,
         retained: Vec<Buffer>,
     ) -> Result<Ticket> {
+        let Inputs {
+            tokens,
+            hashes,
+            valid,
+            visual_rows,
+        } = input;
         let head = if logits {
             execution.head.as_slice()
         } else {
@@ -433,10 +457,13 @@ impl Worker {
                     tensor,
                     first_column,
                     columns,
-                } => Some((
-                    destination,
-                    self.embedding(tensor, tokens, *first_column, *columns)?,
-                )),
+                } => {
+                    let mut data = self.embedding(tensor, tokens, *first_column, *columns)?;
+                    for overlay in visual_rows {
+                        overlay.apply(*first_column, *columns, &mut data)?;
+                    }
+                    Some((destination, data))
+                }
                 _ => None,
             };
             if let Some((destination, data)) = input {
@@ -508,6 +535,7 @@ impl Worker {
         valid: &[bool],
         head: bool,
         path: &Path,
+        visual_rows: &[super::vision::Overlay],
     ) -> Result<()> {
         let trace = (self.rank == 0).then_some(path);
         for step in execution
@@ -515,7 +543,21 @@ impl Worker {
             .iter()
             .chain(if head { execution.head.as_slice() } else { &[] })
         {
-            self.step(step, tokens, hashes, valid, 0, trace)?;
+            if let Step::Embed {
+                destination,
+                tensor,
+                first_column,
+                columns,
+            } = step
+            {
+                let mut data = self.embedding(tensor, tokens, *first_column, *columns)?;
+                for overlay in visual_rows {
+                    overlay.apply(*first_column, *columns, &mut data)?;
+                }
+                upload(&self.session, &destination.slice(0, data.len())?, &data)?;
+            } else {
+                self.step(step, tokens, hashes, valid, 0, trace)?;
+            }
         }
         self.session.synchronize()
     }

@@ -111,13 +111,7 @@ impl ModelRuntime {
             .filter(|p| p.patches >= patches && p.min_patches <= patches)
             .min_by_key(|p| p.patches)
             .ok_or("No image graph")?;
-        let raw: Vec<u8> = image
-            .normalized(v)
-            .flat_map(|x| match v.dtype {
-                crate::vision::Precision::F16 => half::f16::from_f32(x).to_bits().to_le_bytes(),
-                crate::vision::Precision::Bf16 => half::bf16::from_f32(x).to_bits().to_le_bytes(),
-            })
-            .collect();
+        let raw = crate::vision::encode_pixels(image, v)?;
         self.upload_bytes(&v.pixels, &raw)?;
         self.upload_ids(
             &v.grid,

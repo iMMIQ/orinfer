@@ -59,8 +59,10 @@ def partials(
         raise ValueError("mHC variance requires one BF16 input and 32 output lanes")
     if tile_m not in (16, 32, 64, 128):
         raise ValueError("Floating Cube M tile must be 16, 32, 64 or 128")
-    if tile_n not in (32, 64, 128) or (variance and tile_n != 32):
-        raise ValueError("Floating output tile must be 32/64/128 and retain HC lanes")
+    if tile_n not in (32, 64, 128, 256) or (variance and tile_n != 32):
+        raise ValueError("Floating output tile must be 32/64/128/256 and retain HC lanes")
+    if tile_m * tile_n * 4 > 131072:
+        raise ValueError("Floating accumulator exceeds the A2 L0C allocation")
     blocks = (output + tile_n - 1) // tile_n
     loops = reduction // splits // block_k
     iterations = loops if reuse_operand else loops * input_parts * weight_parts

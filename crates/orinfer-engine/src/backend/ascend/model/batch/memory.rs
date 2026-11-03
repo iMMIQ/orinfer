@@ -299,6 +299,7 @@ impl Worker {
                     buffers,
                     history: vec![],
                     limit: None,
+                    vision: Default::default(),
                 },
             );
             self.reset_owner(id)?;
@@ -318,10 +319,13 @@ impl Worker {
             .owners
             .get_mut(&id)
             .ok_or("Unknown owner")?;
-        for name in names {
-            self.session.fill(&get(&owner.buffers, name)?, 0)?.wait()?;
-        }
+        let buffers = names
+            .into_iter()
+            .map(|name| get(&owner.buffers, name))
+            .collect::<Result<Vec<_>>>()?;
+        self.session.fill_many(&buffers, 0)?.wait()?;
         owner.history.clear();
+        owner.vision = Default::default();
         Ok(())
     }
     pub(in crate::backend::ascend::model) fn release_owners(&mut self) -> Result<()> {

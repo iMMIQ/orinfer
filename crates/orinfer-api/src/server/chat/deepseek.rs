@@ -4,7 +4,65 @@ use super::*;
 /// Preserve the checkpoint's text-part boundaries before shared media packing
 /// turns content arrays into strings. Non-text parts keep its validation path.
 pub(super) fn text_parts(messages: &mut [Value]) -> Result<()> {
+    // Sort before shared media extraction: prompt placeholders and their image
+    // payloads must follow the same order when tool results arrive reversed.
+    let mut order = std::collections::BTreeMap::<String, usize>::new();
+    let mut cursor = 0;
+    while cursor < messages.len() {
+        if messages[cursor]["role"] == "assistant" {
+            order = messages[cursor]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(|(i, c)| c["id"].as_str().map(|id| (id.to_owned(), i)))
+                .collect();
+        }
+        if messages[cursor]["role"] != "tool" && messages[cursor]["role"] != "user" {
+            cursor += 1;
+            continue;
+        }
+        let end = messages[cursor..]
+            .iter()
+            .position(|m| m["role"] != "tool" && m["role"] != "user")
+            .map_or(messages.len(), |n| cursor + n);
+        let slots: Vec<_> = (cursor..end)
+            .filter(|&i| messages[i]["role"] == "tool")
+            .collect();
+        let mut results: Vec<_> = slots
+            .iter()
+            .map(|&i| std::mem::take(&mut messages[i]))
+            .collect();
+        results.sort_by_key(|m| {
+            m["tool_call_id"]
+                .as_str()
+                .and_then(|id| order.get(id).copied())
+                .unwrap_or(usize::MAX)
+        });
+        for (slot, result) in slots.into_iter().zip(results) {
+            messages[slot] = result;
+        }
+        cursor = end;
+    }
     for message in messages {
+        for field in ["content", "reasoning_content", "reasoning"] {
+            if message[field]
+                .as_str()
+                .is_some_and(|s| s.contains("<｜deepseek_image｜>"))
+                || message[field].as_array().is_some_and(|parts| {
+                    parts.iter().any(|p| {
+                        p["type"] == "text"
+                            && p["text"]
+                                .as_str()
+                                .is_some_and(|s| s.contains("<｜deepseek_image｜>"))
+                    })
+                })
+            {
+                return Err(
+                    "DeepSeek image placeholders must come from image content parts".into(),
+                );
+            }
+        }
         if message["content"]
             .as_array()
             .is_some_and(|parts| parts.iter().all(|p| p["type"] == "text"))
@@ -141,6 +199,24 @@ fn python_json(value: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tool_images_are_ordered_before_media_extraction_and_literal_markers_are_rejected() {
+        let part = |value| json!({"type":"image_url","image_url":{"url":value}});
+        let mut messages = vec![
+            json!({"role":"assistant","tool_calls":[{"id":"first"},{"id":"second"}]}),
+            json!({"role":"tool","tool_call_id":"second","content":[part("second.png")]}),
+            json!({"role":"tool","tool_call_id":"first","content":[part("first.png")]}),
+        ];
+        text_parts(&mut messages).unwrap();
+        assert_eq!(messages[1]["content"][0]["image_url"]["url"], "first.png");
+        assert_eq!(messages[2]["content"][0]["image_url"]["url"], "second.png");
+        for content in [
+            json!("<｜deepseek_image｜>"),
+            json!([{"type":"text","text":"<｜deepseek_image｜>"}]),
+        ] {
+            assert!(text_parts(&mut [json!({"role":"user","content":content})]).is_err());
+        }
+    }
     #[test]
     fn native_template_matches_official_tool_and_thinking_vectors() {
         let fixtures: Value = serde_json::from_str(include_str!(

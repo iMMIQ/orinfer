@@ -527,6 +527,7 @@ pub(super) fn worker(
                 .collect();
             let mut admitted = false;
             let mut cached_text = false;
+            let mut deferred_images = false;
             let mut untried: Vec<_> = if latency {
                 (0..waiting.len()).collect()
             } else {
@@ -649,6 +650,8 @@ pub(super) fn worker(
                             job.events.is_closed() || shutdown.load(Ordering::Relaxed)
                         }) {
                             Ok(mut request) => {
+                                deferred_images =
+                                    has_images && model.deferred_image_startup(&costs[i]);
                                 if has_images && let Some(memory) = &job._memory {
                                     memory.release_images();
                                 }
@@ -729,7 +732,11 @@ pub(super) fn worker(
                         has_decoders,
                         admitted_count,
                         admission.elapsed().as_secs_f64(),
-                        cached_text,
+                        // Encoding runs after admission across the rank team.
+                        // A 10 ms host slice otherwise admits just one image
+                        // owner after its arena/prefix setup. The surrounding
+                        // loop still bounds admission by actual decode slack.
+                        cached_text || has_decoders && deferred_images,
                     ))
             {
                 break;

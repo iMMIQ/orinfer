@@ -331,6 +331,11 @@ impl Model {
             Implementation::Ascend(inner) => inner.can_admit(input, options),
         }
     }
+    /// Image work that the provider defers to its shared execution cohort.
+    /// Cache hits carry no encoder work and keep ordinary admission pacing.
+    pub fn deferred_image_startup(&self, cost: &crate::scheduler::Waiting) -> bool {
+        matches!(&self.0, Implementation::Ascend(_)) && cost.startup_s > 0.
+    }
     pub fn start_request(
         &mut self,
         input: GenerationInput,

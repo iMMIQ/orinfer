@@ -1,21 +1,11 @@
 //! Qwen image spans and interleaved MRoPE positions.
-use orinfer_model_sdk::{abi::ImageGrid, artifact::Result, vision::VisionSpec};
+use orinfer_model_sdk::{
+    abi::ImageGrid,
+    artifact::Result,
+    vision::{ImageLayout, VisionSpec},
+};
 fn feature_count(v: &VisionSpec, image: &ImageGrid) -> Result<usize> {
-    let n = image
-        .grid_height
-        .checked_mul(image.grid_width)
-        .ok_or("Image grid overflow")?;
-    if v.merge_size == 0
-        || image.grid_height == 0
-        || image.grid_width == 0
-        || !image.grid_height.is_multiple_of(v.merge_size)
-        || !image.grid_width.is_multiple_of(v.merge_size)
-        || n > v.max_patches
-        || v.plans.iter().all(|p| p.patches < n)
-    {
-        return Err("Invalid image grid or vision capacity".into());
-    }
-    Ok(n / v.merge_size / v.merge_size)
+    v.grid_features(image.grid_height, image.grid_width)
 }
 /// Physical KV positions stay linear. Only rotary coordinates are compressed
 /// across each spatial image grid; generation resumes after their maximum.
@@ -41,6 +31,25 @@ pub fn layout(
         let image = images.get(image_index).ok_or("Unbound image tokens")?;
         let count = feature_count(v, image)?;
         let end = cursor.checked_add(count).ok_or("Image span overflow")?;
+        if v.layout == ImageLayout::DeepseekV41 {
+            if end > tokens.len()
+                || tokens[cursor..end].iter().any(|&id| id != v.image_token_id)
+                || feature
+                    .checked_add(count)
+                    .is_none_or(|n| n > v.max_features)
+            {
+                return Err("Invalid DeepSeek image span or feature capacity".into());
+            }
+            for row in 0..count {
+                index[cursor + row] = (feature + row) as i32;
+                positions.extend([(base + row) as u32; 3]);
+            }
+            base += count;
+            cursor = end;
+            feature += count;
+            image_index += 1;
+            continue;
+        }
         if cursor == 0
             || tokens[cursor - 1] != v.vision_start_token_id
             || end >= tokens.len()
@@ -110,6 +119,37 @@ mod tests {
             grid_width: w,
             pixels: vec![0.; h * w * 1536],
         }
+    }
+    #[test]
+    fn deepseek_two_odd_grids_keep_linear_positions_and_distinct_feature_spans() {
+        let mut v = spec();
+        v.layout = ImageLayout::DeepseekV41;
+        v.max_image_tokens = Some(1024);
+        v.patch_size = 14;
+        v.temporal_patch_size = 1;
+        v.merge_size = 3;
+        let grids = [
+            ImageGrid {
+                grid_height: 2,
+                grid_width: 4,
+            },
+            ImageGrid {
+                grid_height: 4,
+                grid_width: 5,
+            },
+        ];
+        let mut tokens = vec![1];
+        tokens.extend([10; 5]);
+        tokens.push(2);
+        tokens.extend([10; 8]);
+        tokens.push(3);
+        let (indices, positions) = layout(&v, &tokens, &grids, 32).unwrap();
+        assert_eq!(&indices[1..6], &[0, 1, 2, 3, 4]);
+        assert_eq!(indices[6], -1);
+        assert_eq!(&indices[7..15], &[5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(positions, (0..32).flat_map(|i| [i; 3]).collect::<Vec<_>>());
+        tokens[8] = 4;
+        assert!(layout(&v, &tokens, &grids, 32).is_err());
     }
     #[test]
     fn multiple_images_and_decode_positions() {

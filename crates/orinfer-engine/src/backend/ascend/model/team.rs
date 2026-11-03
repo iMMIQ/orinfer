@@ -25,6 +25,8 @@ use std::{
 #[derive(Clone)]
 pub(super) enum Command {
     Admit(Vec<usize>),
+    EncodeImages(Arc<Vec<crate::vision::ImageInput>>),
+    InstallImages(usize, Arc<Vec<super::vision::Span>>),
     Limit(usize, usize),
     GrowCached(Layout),
     OwnerRequirement(usize, usize),
@@ -71,6 +73,7 @@ pub(super) enum Command {
 }
 pub(super) enum Reply {
     Ready,
+    Image(Option<super::vision::Encoded>),
     Cached(CacheState),
     Outputs(Vec<Output>),
     Allocations(BTreeMap<u64, usize>),
@@ -368,6 +371,30 @@ impl Team {
                                     snapshots.remove(&id);
                                     Reply::Ready
                                 }),
+                            Command::InstallImages(owner, spans) => worker
+                                .batch
+                                .as_mut()
+                                .ok_or_else(|| "Missing batch runtime".to_owned())
+                                .and_then(|batch| {
+                                    batch
+                                        .owners
+                                        .get_mut(&owner)
+                                        .ok_or_else(|| "Missing image owner".to_owned())
+                                })
+                                .map(|owner| {
+                                    owner.vision = spans;
+                                    Reply::Ready
+                                }),
+                            Command::EncodeImages(images) => match images.get(worker.rank as usize)
+                            {
+                                Some(image) => worker
+                                    .vision
+                                    .as_mut()
+                                    .ok_or_else(|| "Missing native vision encoder".to_owned())
+                                    .and_then(|encoder| encoder.encode(&worker.session, image))
+                                    .map(|image| Reply::Image(Some(image))),
+                                None => Ok(Reply::Image(None)),
+                            },
                             Command::Admit(ids) => worker.admit(&ids).map(|_| Reply::Ready),
                             Command::Limit(id, tokens) => {
                                 worker.limit_owner(id, tokens).map(|_| Reply::Ready)

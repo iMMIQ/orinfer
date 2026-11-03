@@ -16,6 +16,7 @@ mod row_contract;
 mod state;
 mod team;
 pub(crate) mod validation;
+pub mod vision;
 mod weights;
 
 use super::{
@@ -67,6 +68,8 @@ struct Model {
     packet_cache_capacity: usize,
     #[serde(default)]
     batch: Option<batch::Contract>,
+    #[serde(default)]
+    vision: Option<vision::Program>,
     #[serde(skip)]
     graph_launches: std::collections::BTreeSet<batch::WorkLaunch>,
 }
@@ -468,6 +471,7 @@ type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
 struct Worker {
     growth: BTreeMap<String, crate::backend::growth::TokenLayout>,
     session: Session,
+    vision: Option<vision::Encoder>,
     comm: Communicator,
     buffers: BTreeMap<String, Buffer>,
     views: BTreeMap<String, (View, usize)>,

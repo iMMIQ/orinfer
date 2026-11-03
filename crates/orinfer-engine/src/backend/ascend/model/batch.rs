@@ -121,6 +121,7 @@ pub(super) struct Owner {
     pub buffers: BTreeMap<String, Buffer>,
     pub history: Vec<u32>,
     pub limit: Option<usize>,
+    pub vision: std::sync::Arc<Vec<super::vision::Span>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CacheState {
@@ -1030,9 +1031,48 @@ impl Worker {
         );
         let retained = self.update_batch_tables(layout, &execution.packet)?;
         let mut joined = vec![];
+        let mut visual_rows = vec![];
         let mut hashes = vec![];
         let mut valid = vec![];
         let mut inputs = vec![];
+        let image_input = |name: Option<&String>| -> Result<Option<(Buffer, Vec<u8>)>> {
+            name.map(|name| {
+                let buffer = get(&self.buffers, name)?;
+                let data = vec![0u8; buffer.bytes()];
+                Ok((buffer, data))
+            })
+            .transpose()
+        };
+        // Include the padded sequence rows. Every rank reads its existing
+        // contiguous view; an old image flag must not survive in a dummy row.
+        let mut source_images = image_input(execution.packet.coordinates.image_rows.as_ref())?;
+        let mut decoder_images = image_input(
+            execution
+                .packet
+                .decoder_coordinates
+                .as_ref()
+                .and_then(|c| c.image_rows.as_ref()),
+        )?;
+        let decoder = execution
+            .packet
+            .decoder_coordinates
+            .as_ref()
+            .map(|_| -> Result<_> {
+                let replay = self
+                    .batch
+                    .as_ref()
+                    .unwrap()
+                    .contract
+                    .decoder_replay
+                    .as_ref()
+                    .ok_or("Missing decoder replay contract")?;
+                Ok((
+                    layout.decoder(replay.keep, replay.final_prompt_only)?,
+                    replay.keep,
+                    replay.final_prompt_only,
+                ))
+            })
+            .transpose()?;
         for (i, (segment, input)) in layout.segments.iter().zip(tokens).enumerate() {
             let history = &self.batch.as_ref().unwrap().owners[&segment.slot].history;
             inputs.extend(self.coordinate_inputs(
@@ -1042,18 +1082,18 @@ impl Worker {
                 layout.rows.starts[i],
                 None,
             )?);
+            if let Some((_, data)) = &mut source_images {
+                super::vision::write_mask(
+                    data,
+                    layout.rows.starts[i],
+                    &self.batch.as_ref().unwrap().owners[&segment.slot].vision,
+                    history.len(),
+                    segment.tokens,
+                )?;
+            }
             if let Some(names) = &execution.packet.decoder_coordinates {
-                let replay = self
-                    .batch
-                    .as_ref()
-                    .unwrap()
-                    .contract
-                    .decoder_replay
-                    .as_ref()
-                    .ok_or("Missing decoder replay contract")?;
-                let keep = replay.keep;
-                let final_prompt_only = replay.final_prompt_only;
-                let suffix = layout.decoder(keep, final_prompt_only)?;
+                let (suffix, keep, final_prompt_only) = decoder.as_ref().unwrap();
+                let (keep, final_prompt_only) = (*keep, *final_prompt_only);
                 let count = suffix.segments[i].tokens;
                 let skipped = segment.tokens - count;
                 if final_prompt_only
@@ -1067,6 +1107,15 @@ impl Worker {
                     );
                 }
                 if count > 0 {
+                    if let Some((_, data)) = &mut decoder_images {
+                        super::vision::write_mask(
+                            data,
+                            suffix.rows.starts[i],
+                            &self.batch.as_ref().unwrap().owners[&segment.slot].vision,
+                            history.len() + skipped,
+                            count,
+                        )?;
+                    }
                     inputs.extend(self.coordinate_inputs(
                         names,
                         history.len() + skipped,
@@ -1091,8 +1140,27 @@ impl Worker {
                 .hash_into(history, input, &mut owner_hashes, &mut owner_valid)?;
             hashes.extend(owner_hashes);
             valid.extend(owner_valid);
+            if layout.role == super::PacketRole::Target {
+                for span in self.batch.as_ref().unwrap().owners[&segment.slot]
+                    .vision
+                    .iter()
+                {
+                    let start = history.len().max(span.start);
+                    let end = (history.len() + input.len()).min(span.end());
+                    if start < end {
+                        visual_rows.push(super::vision::Overlay {
+                            row: joined.len() + start - history.len(),
+                            source_row: start - span.start,
+                            rows: end - start,
+                            data: std::sync::Arc::clone(&span.data),
+                        });
+                    }
+                }
+            }
             joined.extend_from_slice(input);
         }
+        inputs.extend(source_images);
+        inputs.extend(decoder_images);
         inputs.push((
             get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
             1i32.to_le_bytes().to_vec(),
@@ -1128,14 +1196,18 @@ impl Worker {
                 &valid,
                 !layout.outputs.is_empty(),
                 &path,
+                &visual_rows,
             )?;
             self.trace_rings(&path, "after")?;
         } else {
             self.enqueue_packet_retained(
                 Rc::clone(&execution),
-                &joined,
-                &hashes,
-                &valid,
+                super::packet::Inputs {
+                    tokens: &joined,
+                    hashes: &hashes,
+                    valid: &valid,
+                    visual_rows: &visual_rows,
+                },
                 !layout.outputs.is_empty(),
                 retained,
             )?

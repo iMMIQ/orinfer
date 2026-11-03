@@ -115,6 +115,17 @@ enum Command {
         #[arg(long)]
         fixtures: PathBuf,
     },
+    /// Compare the complete native A2 vision encoder with checkpoint reference fixtures.
+    ValidateAscendVision {
+        #[arg(long, default_value_t = 7)]
+        device: u32,
+        #[arg(long)]
+        program: PathBuf,
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long)]
+        fixtures: PathBuf,
+    },
     /// Benchmark complete single-sequence native A2 model execution.
     BenchAscend {
         #[arg(long)]
@@ -575,6 +586,14 @@ fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
         Command::ValidateAscendKernels { device, fixtures } => print_json(
             orinfer_engine::backend::ascend::kernels::validation::run(device, &fixtures)?,
         ),
+        Command::ValidateAscendVision {
+            device,
+            program,
+            model_dir,
+            fixtures,
+        } => print_json(orinfer_engine::backend::ascend::model::vision::validate(
+            device, &program, &model_dir, &fixtures,
+        )?),
         Command::BenchAscend {
             plan,
             model_dir,

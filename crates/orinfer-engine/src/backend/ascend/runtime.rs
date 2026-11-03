@@ -862,18 +862,31 @@ impl Session {
         Ok(out)
     }
     pub fn fill(&self, buffer: &Buffer, value: u8) -> Result<Ticket> {
-        self.require(buffer)?;
-        self.make_kv_writable(&[(
-            buffer.clone(),
-            MemoryRange {
-                offset: 0,
-                bytes: buffer.bytes(),
-            },
-        )])?;
+        self.fill_many(std::slice::from_ref(buffer), value)
+    }
+    /// Enqueue a set of fills in stream order with one retained completion.
+    pub fn fill_many(&self, buffers: &[Buffer], value: u8) -> Result<Ticket> {
+        for buffer in buffers {
+            self.require(buffer)?;
+        }
+        self.make_kv_writable(
+            &buffers
+                .iter()
+                .map(|buffer| {
+                    (
+                        buffer.clone(),
+                        MemoryRange {
+                            offset: 0,
+                            bytes: buffer.bytes(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )?;
         self.submit(
             self.context.compute,
             Retained {
-                _buffers: vec![buffer.clone()],
+                _buffers: buffers.to_vec(),
                 _host: None,
                 _extra: None,
             },
@@ -881,17 +894,25 @@ impl Session {
                 // Large ACL memset submissions have a higher per-byte cost.
                 // Keep the same stream order and one completion for all chunks.
                 const CHUNK: usize = 4 << 20;
-                for offset in (0..buffer.bytes()).step_by(CHUNK) {
-                    let bytes = CHUNK.min(buffer.bytes() - offset);
-                    let pointer = buffer.range(offset, bytes)?;
-                    check(
-                        // SAFETY: Each checked slice belongs to the retained
-                        // destination; the final event follows every fill.
-                        unsafe {
-                            (self.context.api.memset)(pointer, bytes, value.into(), bytes, stream)
-                        },
-                        "ACL fill",
-                    )?;
+                for buffer in buffers {
+                    for offset in (0..buffer.bytes()).step_by(CHUNK) {
+                        let bytes = CHUNK.min(buffer.bytes() - offset);
+                        let pointer = buffer.range(offset, bytes)?;
+                        check(
+                            // SAFETY: Each checked slice belongs to a retained
+                            // destination; the final event follows every fill.
+                            unsafe {
+                                (self.context.api.memset)(
+                                    pointer,
+                                    bytes,
+                                    value.into(),
+                                    bytes,
+                                    stream,
+                                )
+                            },
+                            "ACL fill",
+                        )?;
+                    }
                 }
                 Ok(())
             },

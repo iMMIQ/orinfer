@@ -100,6 +100,9 @@ fn verify_assets(model: &Model, base: &Path) -> Result<()> {
             names.extend(variant.kernels.iter().cloned());
         }
     }
+    if let Some(vision) = &model.vision {
+        names.extend(vision.manifests().map(str::to_owned));
+    }
     let mut seen = BTreeMap::new();
     let mut reader = AssetReader::default();
     let mut verify = |root: &Path, id: &FileIdentity| -> Result<()> {

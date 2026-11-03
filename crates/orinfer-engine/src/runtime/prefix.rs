@@ -1,6 +1,6 @@
 use super::*;
 use crate::backend::snapshot::Range;
-use crate::prefix::{Entry, Media, Resident};
+use crate::prefix::{Entry, Media, Resident, hash_floats};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,16 +10,6 @@ pub(super) struct Context {
     pub statistics: crate::prefix::Statistics,
 }
 
-fn hash_floats(hash: &mut Sha256, values: &[f32]) {
-    let (chunks, tail) = values.as_chunks::<256>();
-    for chunk in chunks {
-        hash.update(chunk.map(f32::to_le_bytes).as_flattened());
-    }
-    for value in tail {
-        hash.update(value.to_le_bytes());
-    }
-}
-
 impl ModelRuntime {
     pub(crate) fn prefix_media(
         &self,
@@ -27,39 +17,8 @@ impl ModelRuntime {
         images: &[crate::vision::ImageInput],
         audios: &[crate::audio::AudioInput],
     ) -> Result<Media> {
-        let mut media = vec![];
+        let mut media = Media::images(input, images, self.manifest.vision.as_ref())?.0;
         let mut cursor = 0;
-        for image in images {
-            let v = self
-                .manifest
-                .vision
-                .as_ref()
-                .ok_or("Model has no image adapter")?;
-            let start = input
-                .get(cursor..)
-                .ok_or("Image span outside prompt")?
-                .iter()
-                .position(|&id| id == v.image_token_id)
-                .map(|p| p + cursor)
-                .ok_or("Image marker missing")?;
-            let mut hash = Sha256::new();
-            hash.update((image.grid_height as u64).to_le_bytes());
-            hash.update((image.grid_width as u64).to_le_bytes());
-            if image.rgb.is_empty() {
-                hash_floats(&mut hash, &image.pixels);
-            } else {
-                hash.update(b"rgb8");
-                hash.update(&image.rgb);
-            }
-            media.push((start, hash.finalize().into()));
-            cursor = start
-                .checked_add(v.feature_count(image)?)
-                .ok_or("Image extent overflow")?;
-            if cursor > input.len() {
-                return Err("Image span outside prompt".into());
-            }
-        }
-        cursor = 0;
         for audio in audios {
             let a = self
                 .manifest

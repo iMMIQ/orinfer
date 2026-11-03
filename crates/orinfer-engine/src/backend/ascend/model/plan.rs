@@ -22,7 +22,12 @@ pub(super) fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf
     preflight(&model, &base)?;
     let mut checkpoint = Checkpoint::open(model_dir, &model.index.file)?;
     let mut checked = std::collections::BTreeSet::new();
-    for definition in model.ranks.iter().flat_map(|r| &r.buffers) {
+    for definition in model
+        .ranks
+        .iter()
+        .flat_map(|r| &r.buffers)
+        .chain(model.vision.iter().flat_map(|v| v.definitions()))
+    {
         if let Some(tensor) = &definition.prepared_tensor
             && checked.insert((&tensor.name, &tensor.dtype, &tensor.shape, definition.bytes))
         {
@@ -39,6 +44,9 @@ pub(super) fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf
 /// Reject incomplete or mismatched packages before allocating resident weights.
 pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
     batch::validate(model)?;
+    if let Some(vision) = &model.vision {
+        vision.preflight(base)?;
+    }
     let mut kernels = BTreeMap::<String, super::super::kernels::Spec>::new();
     let used: std::collections::BTreeSet<_> = model
         .ranks
@@ -181,6 +189,13 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
             return Err("TP ranks have different row contracts".into());
         }
         for packet in &rank.packets {
+            if packet.rows == 0
+                || packet.rows > 4096
+                || packet.rows > model.capacity
+                || packet.dispatch_max() > packet.rows
+            {
+                return Err("Invalid packet row capacity".into());
+            }
             if packet.role == PacketRole::Target {
                 replay::validate_packet(packet, model.batch.as_ref())?;
             }
@@ -188,6 +203,11 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                 std::iter::once(&packet.coordinates).chain(packet.decoder_coordinates.as_ref())
             {
                 coordinates.draft_storage_rows()?;
+                if coordinates.image_rows.as_ref().is_some_and(|name| {
+                    buffers.get(name.as_str()).copied() != Some(packet.rows * 4)
+                }) {
+                    return Err("Image row masks require full packet capacity".into());
+                }
                 if coordinates
                     .names()
                     .iter()
@@ -196,15 +216,13 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                     return Err("Packet coordinate buffer is not defined".into());
                 }
             }
+            if packet.decoder_coordinates.as_ref().is_some_and(|c| {
+                c.image_rows.is_some() && c.image_rows == packet.coordinates.image_rows
+            }) {
+                return Err("Image source and decoder masks must have distinct row domains".into());
+            }
             branches::validate_instructions(&packet.body)?;
             branches::validate_instructions(&packet.head)?;
-            if packet.rows == 0
-                || packet.rows > 4096
-                || packet.rows > model.capacity
-                || packet.dispatch_max() > packet.rows
-            {
-                return Err("Invalid packet row capacity".into());
-            }
             let layers = packet
                 .body
                 .iter()

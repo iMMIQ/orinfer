@@ -8,6 +8,7 @@ mod budget;
 mod dspark;
 mod offload;
 mod packet;
+mod vision;
 #[cfg(test)]
 use crate::prefix::Cache;
 use crate::{
@@ -87,6 +88,9 @@ fn matched(cache: &Cache<Snapshot>, input: &[u32], reserve: usize) -> Option<u64
 }
 pub(crate) struct Runtime {
     team: Team,
+    vision_cursor: usize,
+    vision_seconds_per_patch: f64,
+    vision_cache: crate::vision::FeatureCache<Vec<u8>>,
     pub frontend_assets: BTreeMap<String, String>,
     cache: Tiered<Snapshot, Snapshot>,
     prefix: crate::prefix::Statistics,
@@ -124,6 +128,9 @@ pub(crate) struct Request {
     slot: usize,
     abandoned: Arc<Mutex<Vec<usize>>>,
     input: Vec<u32>,
+    media: Media,
+    pending_images: std::collections::VecDeque<vision::Pending>,
+    image_features: Arc<Vec<super::vision::Span>>,
     history: Vec<u32>,
     offset: usize,
     generated: usize,
@@ -258,6 +265,7 @@ impl Runtime {
         if options.prompt_lookup {
             return Err("A2 native service does not enable prompt lookup".into());
         }
+        let vision_cache_bytes = super::load::host_memory_budget("ORINFER_VISION_CACHE_MIB", 128)?;
         let descriptor = crate::model::resolve_manifest(path)?;
         let cache_root = descriptor.parent().ok_or("Missing A2 cache root")?;
         let root = cache_root.parent().ok_or("Missing A2 model root")?;
@@ -313,6 +321,9 @@ impl Runtime {
         let host_budget = options.kv_offload_bytes / team.ranks();
         Ok(Self {
             team,
+            vision_cursor: 0,
+            vision_seconds_per_patch: 60e-6,
+            vision_cache: crate::vision::FeatureCache::new(vision_cache_bytes),
             frontend_assets: model.frontend_assets,
             cache: Tiered::new(options.prefix_cache_bytes, host_budget),
             prefix: Default::default(),
@@ -358,7 +369,7 @@ impl Runtime {
         129280
     }
     pub fn vision(&self) -> Option<&crate::vision::VisionSpec> {
-        None
+        self.team.model.vision.as_ref().map(|program| &program.spec)
     }
     pub fn speculation_statistics(&self) -> Option<&crate::mtp::Statistics> {
         (self.draft_limit > 0).then_some(&self.speculation)
@@ -397,8 +408,9 @@ impl Runtime {
         images: &[crate::vision::ImageInput],
     ) -> Result<usize> {
         self.require_text(images, &[])?;
+        let media = Media::images(input, images, self.vision())?;
         Ok(self
-            .matched(input)
+            .matched(input, &media)
             .map_or(0, |hit| self.entry(hit).tokens.len()))
     }
     fn require_text(
@@ -406,8 +418,8 @@ impl Runtime {
         images: &[crate::vision::ImageInput],
         audios: &[crate::audio::AudioInput],
     ) -> Result<()> {
-        if !images.is_empty() || !audios.is_empty() {
-            Err("A2 native service supports text inputs".into())
+        if !audios.is_empty() || !images.is_empty() && self.vision().is_none() {
+            Err("A2 package has no adapter for the supplied media".into())
         } else {
             Ok(())
         }
@@ -419,11 +431,25 @@ impl Runtime {
         audios: &[crate::audio::AudioInput],
     ) -> Result<scheduler::RequestHint> {
         self.require_text(images, audios)?;
+        let media = Media::images(input, images, self.vision())?;
+        let cached = self
+            .matched(input, &media)
+            .map_or(0, |hit| self.entry(hit).tokens.len());
+        let mut image_work = 0usize;
+        if let Some(spec) = self.vision() {
+            for (image, (start, identity)) in images.iter().zip(&media.0) {
+                if start + spec.feature_count(image)? > cached
+                    && !self.vision_cache.contains(identity)
+                {
+                    image_work += image.grid_height * image.grid_width;
+                }
+            }
+        }
         Ok(scheduler::RequestHint {
             owner: self.owner,
             tokens: input.to_vec(),
-            media: Media::default(),
-            image_work: 0,
+            media,
+            image_work,
         })
     }
     pub fn estimated_request_cost(
@@ -437,15 +463,16 @@ impl Runtime {
         if hint.owner != self.owner {
             return Err("Foreign A2 request hint".into());
         }
-        let remaining = hint
-            .tokens
-            .len()
-            .saturating_sub(self.cached_prefix_tokens(&hint.tokens, &[])?);
+        let remaining = hint.tokens.len().saturating_sub(
+            self.matched(&hint.tokens, &hint.media)
+                .map_or(0, |hit| self.entry(hit).tokens.len()),
+        );
         Ok(scheduler::Waiting {
             age_s: 0.,
             remaining_s: remaining as f64 / self.prefill_tokens_per_s,
             restore_s: 0.,
-            startup_s: 0.,
+            startup_s: hint.image_work as f64 * self.vision_seconds_per_patch
+                / hint.media.0.len().max(1).min(self.team.ranks()) as f64,
             remaining_tokens: remaining,
         })
     }
@@ -479,10 +506,13 @@ impl Runtime {
     }
     fn head_only(&self, input: &GenerationInput) -> bool {
         input.max_new_tokens == 1
-            && self.matched(&input.input_tokens).is_some_and(|id| {
-                self.entry(id).tokens.len() == input.input_tokens.len()
-                    && self.entry(id).snapshot.output.is_some()
-            })
+            && Media::images(&input.input_tokens, &input.images, self.vision())
+                .ok()
+                .and_then(|media| self.matched(&input.input_tokens, &media))
+                .is_some_and(|id| {
+                    self.entry(id).tokens.len() == input.input_tokens.len()
+                        && self.entry(id).snapshot.output.is_some()
+                })
     }
     pub fn can_admit(
         &mut self,
@@ -491,6 +521,9 @@ impl Runtime {
     ) -> Result<bool> {
         self.reap()?;
         self.require_text(&input.images, &input.audios)?;
+        if let Some(vision) = self.vision() {
+            vision.image_spans(&input.input_tokens, &input.images)?;
+        }
         input.sampling.validate()?;
         if input.input_tokens.is_empty()
             || input.max_new_tokens == 0
@@ -541,6 +574,7 @@ impl Runtime {
         self.reap()?;
         let reap_s = started.elapsed().as_secs_f64();
         self.require_text(&input.images, &input.audios)?;
+        let media = Media::images(&input.input_tokens, &input.images, self.vision())?;
         let slot = (0..self.team.model.batch.as_ref().unwrap().owners)
             .find(|slot| !self.active.contains(slot))
             .ok_or("A2 owner capacity exhausted")?;
@@ -569,7 +603,7 @@ impl Runtime {
         let mut offset = 0;
         let mut ready_output = None;
         let at = Instant::now();
-        let matched = self.matched(&input.input_tokens);
+        let matched = self.matched(&input.input_tokens, &media);
         let lookup_s = at.elapsed().as_secs_f64();
         if let Some(id) = matched {
             let entry = if id.0 {
@@ -617,7 +651,12 @@ impl Runtime {
                 })
             );
         }
+        let pending_images =
+            self.pending_images(&input.input_tokens, input.images, offset, &media)?;
         Ok(Request {
+            media,
+            pending_images,
+            image_features: Default::default(),
             owner: self.owner,
             slot,
             abandoned: Arc::clone(&self.abandoned),
@@ -657,7 +696,9 @@ impl Runtime {
                 .values()
                 .chain(self.cache.host.entries.values())
                 .any(|e| {
-                    e.tokens == request.history[..count] && (output.is_none() || e.logits_valid)
+                    e.tokens == request.history[..count]
+                        && e.media.common_tokens(&request.media, count) == count
+                        && (output.is_none() || e.logits_valid)
                 })
         {
             return Ok(());
@@ -769,7 +810,10 @@ impl Runtime {
             let obsolete = cache
                 .entries
                 .iter()
-                .filter(|(_, e)| e.tokens == request.history[..count])
+                .filter(|(_, e)| {
+                    e.tokens == request.history[..count]
+                        && e.media.common_tokens(&request.media, count) == count
+                })
                 .map(|(&id, _)| id)
                 .collect::<Vec<_>>();
             for old in obsolete {
@@ -784,7 +828,7 @@ impl Runtime {
         };
         cache.insert(Entry::new(
             request.history[..count].to_vec(),
-            Media::default(),
+            request.media.clone(),
             snapshot,
             bytes,
             0,
@@ -809,16 +853,41 @@ impl Runtime {
         if request.owner != self.owner || hint.owner != self.owner {
             return Err("Foreign A2 request".into());
         }
-        if request.prefilling
-            && self.resident.contains(&request.slot)
-            && request.offset > 0
+        if !request.prefilling || !self.resident.contains(&request.slot) {
+            return Ok(false);
+        }
+        let cached = self
+            .matched(&hint.tokens, &hint.media)
+            .map_or(0, |hit| self.entry(hit).tokens.len());
+        if request.offset > cached
+            && request.media.common_tokens(&hint.media, request.offset) == request.offset
             && request.input[..request.offset]
                 == hint.tokens[..hint.tokens.len().min(request.offset)]
         {
             self.store(request, None)?;
-            Ok(true)
+            Ok(self
+                .matched(&hint.tokens, &hint.media)
+                .is_some_and(|hit| self.entry(hit).tokens.len() > cached))
         } else {
-            Ok(false)
+            let common = request
+                .input
+                .iter()
+                .zip(&hint.tokens)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let common = request.media.common_tokens(&hint.media, common);
+            Ok(request.cache_prompt
+                && (request.pending_images.is_empty()
+                    || common == request.input.len() && hint.tokens.len() == request.input.len())
+                && offload::pending_endpoint(
+                    request.offset,
+                    request.input.len(),
+                    hint.tokens.len(),
+                    common,
+                    cached,
+                    self.final_decoder_window(),
+                    self.complete_prompt_cache(),
+                ))
         }
     }
     pub fn advance_requests(
@@ -834,6 +903,11 @@ impl Runtime {
         options: &scheduler::Options,
         maintenance: impl FnOnce(),
     ) -> Result<Vec<StepOutput>> {
+        self.reap()?;
+        if requests.iter().any(|r| r.owner != self.owner || r.released) {
+            return Err("Foreign or released A2 request".into());
+        }
+        self.prepare_images(requests)?;
         let has_decode = requests.iter().any(|r| !r.prefilling && !r.is_finished());
         let started = Instant::now();
         let result = self.advance_packet(requests, options, maintenance);

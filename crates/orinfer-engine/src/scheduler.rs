@@ -331,9 +331,9 @@ pub fn admission_should_yield(
     has_decoders: bool,
     admitted: usize,
     elapsed_s: f64,
-    cached_text: bool,
+    batchable_start: bool,
 ) -> bool {
-    if !cached_text {
+    if !batchable_start {
         // Build a small prompt cohort from work that has already arrived;
         // ongoing decoders retain the existing admission time bound.
         return if has_decoders {
@@ -342,8 +342,8 @@ pub fn admission_should_yield(
             admitted >= 8 || elapsed_s >= 0.200
         };
     }
-    // Initial CUDA arena allocation is slower than reusing warm arenas. Allow
-    // a bounded cold cohort while no decoder is waiting for its next token.
+    // Cached text and deferred image encoding can amortize startup in a cohort.
+    // Callers also enforce the live decoder's remaining slack between owners.
     let (count, seconds) = if has_decoders { (8, 0.100) } else { (32, 3.0) };
     admitted >= count || elapsed_s >= seconds
 }

@@ -24,6 +24,7 @@ def manifests(model):
     for choices in model.get("row_selections", {}).values():
         for choice in choices:
             names.update(choice["kernels"])
+    names.update(op["manifest"] for op in model.get("vision", {}).get("body", []))
     return sorted(names)
 
 

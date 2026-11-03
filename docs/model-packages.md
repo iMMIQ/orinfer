@@ -668,7 +668,15 @@ A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 own
 
 `--length-input` 让同一索引 Cube 工厂读取每行的有效前缀长度，按 owner 内单调递增的位置决定实际 key tile 数，写入有效 score 前缀。TopK 使用相同长度屏蔽其余容量，完整有效候选与原有归约顺序保持一致。此模式以长度向量替代稠密因果索引矩阵，同时适用于 decode 和 prefill。`--gather-slots` 选择同一 INT8 gather 工厂每次转换的槽位数。可重复提供 `--reuse-cache /path/to/compiled/cache`，复用完整编译对象；编译器仍校验对象身份和库哈希。
 
-当前范围为纯文本 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样、prefix 恢复及匹配执行包的 DSpark。声明 `metadata.chat_format=deepseek_v41` 的前端支持函数工具、工具结果回传、并行调用、增量参数和 thinking 历史。媒体、prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的原生计划封装。v0.3.0 的 `package install` 在 CPU 上校验并原子安装该执行包；`validate-model` 另行校验配置、前端和全部发布权重分片，分片内容依据 `release-manifest.json` 每个文件扫描一次。正常服务加载不计算资产内容 SHA256。A2 模型通过原生 provider 接入公共运行时，模型计划尚未迁移到通用模型 cdylib C ABI。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
+原生服务支持 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样、prefix 恢复及匹配执行包的 DSpark。声明 `metadata.chat_format=deepseek_v41` 的前端支持函数工具、工具结果回传、并行调用、增量参数和 thinking 历史。包含原生视觉程序及对应视觉权重的包支持单图、多图与带图片的工具交互；纯文本包收到图片时返回不支持错误。prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的原生计划封装。`package install` 在 CPU 上校验并原子安装执行包；`validate-model` 另行校验配置、前端和全部发布权重分片，分片内容依据 `release-manifest.json` 每个文件扫描一次。正常服务加载不计算资产内容 SHA256。A2 模型通过原生 provider 接入公共运行时，模型计划尚未迁移到通用模型 cdylib C ABI。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
+
+DSv4.1 视觉的权重、Q/K、残差和 aligner 保持 BF16；softmax 使用 FP32，概率按当前前缀归一化后以 FP16 执行 PV，并以 FP32 累加、BF16 输出。V 先保留原始 BF16 边界，再转为 FP16；离线导出及构建依据实际 checkpoint 的 RMSNorm 和 QKV 权重证明幅值范围，超出范围时拒绝构建。同一套动态 TileLang 算子处理实际 patch 数和非对齐尾部。图缓存复用稳定输入地址；网格及二维 RoPE 由实际长宽更新。请求间将图片分配到现有 rank 并行编码，各请求的图片顺序、绝对 token 位置和视觉路由 bias 保持独立。prefix 身份同时包含图片内容与网格，替换图片不会复用旧图的 KV。每张图片至多 1024 个视觉 token，请求合计容量由包内 `max_features` 声明；`image_processing` 可进一步限制图片数、像素和 token 预算。
+
+视觉权重单独存放在 `vision.safetensors`，与执行库、算子和计划分开发布。该分片必须与语言权重采用相同的 Ascend 预处理基；原始 BF16 checkpoint 的 aligner 输出不能直接替换。离线导出、编译、接入和重打包分别使用 `tools.model.deepseek_v41.vision`、`vision_build`、`vision_attach` 和 `vision_release`。`validate-ascend-vision` 对完整编码器与固定 checkpoint 参考特征进行数值及耗时对照；它不代替 HTTP 图片任务和并发性能验收。设置 `ORINFER_A2_VISION_PROFILE=1` 可记录每轮图片分配、上传、编码、读回和 Graph 复用耗时。
+
+`vision_build --source CONFIG_DIR --weights PREPARED_VISION_DIR --output BUILD_DIR` 在离线 CANN 9.2 / TileLang 环境构建编码器；`--weights` 提供已导出的视觉分片以分析 V 的数值范围。对已有视觉计划运行 `vision_attach` 时，前端与 VL 路由契约须保持相同；工具替换视觉程序，按既有 source/decoder 行域重绑图片 mask，并复用已验证的语言算术组件。发布重打包只保留最终计划引用的算子资产。
+
+图片特征按模型实例和输入内容复用，与 token prefix 独立；同一轮相同图片只编码一次，再绑定各请求自己的 token 位置。A2 默认以 `ORINFER_VISION_CACHE_MIB=128` 限制额外保留的 CPU 特征缓存，`0` 关闭跨轮保留。预算包含特征分配及条目开销；淘汰缓存不影响活跃请求持有的不可变特征。该预算独立于设备 KV、CPU offload 和请求私有内存。
 
 ### A2 DSpark 构建与运行
 

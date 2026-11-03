@@ -160,6 +160,7 @@ impl Runtime {
                 if budget == 0
                     || request.is_finished()
                     || request.ready_output.is_some()
+                    || !request.pending_images.is_empty()
                     || request.prefilling != prefill
                     || !prefill && decode_inputs.is_some_and(|v| !v.contains_key(&i))
                 {

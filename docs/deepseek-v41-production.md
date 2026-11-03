@@ -1,6 +1,6 @@
 # DSv4.1 A2 部署
 
-v0.3.1 支持 CANN 9.2、Ascend 910B TP8 的文本、HTTP/SSE、连续 batch、DSpark、设备及 CPU prefix cache，以及 DSML 工具与 thinking 历史。引擎与执行包分别安装，模型目录提供对应的前端和权重。媒体等支持范围见[模型包说明](model-packages.md)。
+v0.3.1 候选支持 CANN 9.2、Ascend 910B TP8 的文本、HTTP/SSE、连续 batch、DSpark、设备及 CPU prefix cache，以及 DSML 工具与 thinking 历史。匹配视觉执行包及视觉权重后支持单图、多图和 OpenCode 读图工具交互。引擎与执行包分别安装，模型目录提供对应的前端和权重。支持范围见[模型包说明](model-packages.md#a2-文本服务与长上下文)。正式发布仍以图片正确性、并发性能及部署验收完成为条件。
 
 ## 安装与升级
 
@@ -20,7 +20,7 @@ uv run --locked python -m tools.model.deepseek_v41.service --frontend-only \
   --model-dir /data/model/current --output /data/model/dsv41-v0.3.1
 ```
 
-离线工具的 Python 环境在源码目录执行 `make python-env` 准备。在线服务使用 Rust 二进制。正常加载校验结构和范围，内容完整性由独立 `validate-model` 命令校验。权重、执行包和 DSpark 成本配置的既有完整性验收在身份相同时复用。
+该命令只更新工具前端；启用图片还需包含 `vision.safetensors` 的模型目录和声明原生视觉程序的执行包。视觉分片使用与语言权重相同的 Ascend 预处理基，算子和执行计划保留在独立执行包中。离线工具的 Python 环境在源码目录执行 `make python-env` 准备。在线服务使用 Rust 二进制。正常加载校验结构和范围，内容完整性由独立 `validate-model` 命令校验。权重、执行包和 DSpark 成本配置的既有完整性验收在身份相同时复用。
 
 ## 部门入口
 
@@ -53,6 +53,8 @@ bin/orinfer serve /data/model/dsv41-v0.3.1 \
 ## 工具与质量边界
 
 OpenCode 使用[配置示例](../examples/opencode.json)中的 `orinfer/deepseek-v4.1`，模型 ID 与服务一致。需要参数类型和格式保证时采用 `strict` 工具或 `response_format` JSON Schema，检查 `finish_reason` 后再执行工具。`length` 表示输出可能截断；工具应校验参数，并将执行错误作为对应 `tool_call_id` 的结果回传。
+
+图片通过 Chat 消息的 `image_url` 内容传入，同一消息可按顺序包含多张图片。OpenCode 配置声明 `attachment` 和 `modalities.input=["text","image"]`，工具读取图片后沿同一接口提交。图片内容与预处理网格参与 prefix 身份；替换图片或调整图片顺序会重新匹配缓存。每图至多 1024 个视觉 token，单请求总量由执行包限制；可用 `image_processing.max_images`、`max_pixels` 和 `max_tokens` 收紧入口预算。排队、图片编码、语言 prefill 和 decode 均计入客户端请求期限。
 
 固定样例、代码执行、长上下文检索及短压测用于验收部署行为；它们不代表完整编码任务基准。自由文本的严格格式遵循和工具任务正确性分别记录。原有 32K 检索样例曾正确找到值，但多输出 `RELEASE_CODE=` 前缀；程序消费结果时使用受约束的结构化输出。
 

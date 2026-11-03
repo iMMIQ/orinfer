@@ -787,6 +787,43 @@ fn check_chunked_fill(session: &Session) {
     assert_eq!(session.allocated_bytes(), 0);
 }
 
+fn check_grouped_fill(session: &Session) {
+    let first = session.allocate(67).unwrap();
+    let second = session.allocate(33).unwrap();
+    session
+        .fill_many(&[first.clone(), second.clone()], 11)
+        .unwrap()
+        .wait()
+        .unwrap();
+    let views = [first.slice(3, 31).unwrap(), second.slice(4, 17).unwrap()];
+    let ticket = session.fill_many(&views, 173).unwrap();
+    drop(views);
+    ticket.wait().unwrap();
+    let mut expected = vec![11; 67];
+    expected[3..34].fill(173);
+    assert_eq!(session.download(&first, 0, 67).unwrap(), expected);
+    let mut expected = vec![11; 33];
+    expected[4..21].fill(173);
+    assert_eq!(session.download(&second, 0, 33).unwrap(), expected);
+    drop((first, second, ticket));
+    session.synchronize().unwrap();
+    assert_eq!(session.allocated_bytes(), 0);
+}
+
+#[test]
+fn grouped_fills_share_completion_and_preserve_each_view() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    check_grouped_fill(&session);
+    assert_eq!(
+        fixture.counter(10),
+        2,
+        "one event per group, not per buffer"
+    );
+    drop(session);
+    fixture.assert_clean();
+}
+
 #[test]
 fn large_fills_preserve_view_guards_tails_and_completion_ownership() {
     let mut fixture = Fixture::new();
@@ -814,6 +851,7 @@ fn large_fills_preserve_view_guards_tails_and_completion_ownership_on_device() {
     );
     let session = Session::new(0, Limits::default()).unwrap();
     check_chunked_fill(&session);
+    check_grouped_fill(&session);
 }
 
 #[test]

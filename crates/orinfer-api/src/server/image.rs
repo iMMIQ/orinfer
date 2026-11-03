@@ -1,7 +1,8 @@
 //! Images-only OpenAI content parts. CPU work runs outside the async executor.
+mod deepseek;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{ImageReader, imageops::FilterType};
-use orinfer_engine::vision::{ImageInput, VisionSpec};
+use orinfer_engine::vision::{ImageInput, ImageLayout, VisionSpec};
 use serde_json::{Value, json};
 use std::{
     io::{Cursor, Read},
@@ -11,6 +12,43 @@ type Result<T> = std::result::Result<T, String>;
 const MAX_BYTES: usize = 24 * 1024 * 1024;
 const MIN_PIXELS: usize = 256 * 256;
 const MARKER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+fn planned_shape(
+    v: &VisionSpec,
+    height: usize,
+    width: usize,
+    detail: &str,
+    max_pixels: Option<usize>,
+    feature_limit: Option<usize>,
+) -> Result<(usize, usize)> {
+    if !["auto", "high", "low"].contains(&detail) {
+        return Err("image_url.detail must be auto, high or low".into());
+    }
+    let minimum = v.minimum_pixels();
+    let limit = if detail == "low" {
+        minimum
+    } else {
+        max_pixels
+            .unwrap_or(usize::MAX)
+            .min(v.max_patches * v.patch_size * v.patch_size)
+            .min(16_777_216)
+    };
+    if v.layout == ImageLayout::DeepseekV41 {
+        return deepseek::dimensions(v, height, width, limit, feature_limit);
+    }
+    let factor = v.patch_size * v.merge_size;
+    let limit = limit.min(feature_limit.map_or(usize::MAX, |n| n.saturating_mul(factor * factor)));
+    if limit < minimum {
+        return Err(
+            "Too many images for the model's minimum image detail; reduce the image count".into(),
+        );
+    }
+    let result = resize_shape(height, width, factor, limit)?;
+    if feature_limit.is_some_and(|n| result.0 / factor * (result.1 / factor) > n) {
+        return Err("Image aspect ratio exceeds its automatic image budget at minimum detail; reduce the image count".into());
+    }
+    Ok(result)
+}
 
 /// Per-request limits supplement the execution package and shared host-memory budget.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -148,38 +186,20 @@ pub fn preprocess(
     detail: &str,
     preparation: &mut super::preparation::Context,
 ) -> Result<ImageInput> {
-    preprocess_with_limit(data, v, detail, None, preparation)
+    preprocess_with_limit(data, v, detail, None, None, preparation)
 }
 fn preprocess_with_limit(
     data: &[u8],
     v: &VisionSpec,
     detail: &str,
+    max_pixels: Option<usize>,
     feature_limit: Option<usize>,
     preparation: &mut super::preparation::Context,
 ) -> Result<ImageInput> {
-    if !["auto", "high", "low"].contains(&detail) {
-        return Err("image_url.detail must be auto, high or low".into());
-    }
     preparation.checkpoint(0)?;
     let (height, width) = dimensions(data)?;
     let source_pixels = height * width;
-    let factor = v.patch_size * v.merge_size;
-    let configured_pixels = if detail == "low" {
-        MIN_PIXELS
-    } else {
-        (v.max_patches * v.patch_size * v.patch_size).min(16_777_216)
-    };
-    let max_pixels = configured_pixels
-        .min(feature_limit.map_or(usize::MAX, |n| n.saturating_mul(factor * factor)));
-    if max_pixels < MIN_PIXELS {
-        return Err(
-            "Too many images for the model's minimum image detail; reduce the image count".into(),
-        );
-    }
-    let (rh, rw) = resize_shape(height, width, v.patch_size * v.merge_size, max_pixels)?;
-    if feature_limit.is_some_and(|limit| rh / factor * (rw / factor) > limit) {
-        return Err("Image aspect ratio exceeds its automatic image budget at minimum detail; reduce the image count".into());
-    }
+    let (rh, rw) = planned_shape(v, height, width, detail, max_pixels, feature_limit)?;
     // Decode may hold RGBA/16-bit source, RGB conversion and resized patch FP32 together.
     preparation.checkpoint(data.len() + source_pixels * 12 + rh * rw * 16)?;
     let mut reader = ImageReader::new(Cursor::new(data))
@@ -195,33 +215,54 @@ fn preprocess_with_limit(
         .decode()
         .map_err(|e| format!("Image decode: {e}"))?
         .to_rgb8();
-    let (height, width) = resize_shape(
-        decoded.height() as usize,
-        decoded.width() as usize,
-        v.patch_size * v.merge_size,
-        max_pixels,
-    )?;
+    let (height, width) = (rh, rw);
+    let (content_height, content_width) = if v.layout == ImageLayout::DeepseekV41 {
+        deepseek::content_dimensions(
+            decoded.height(),
+            decoded.width(),
+            height as u32,
+            width as u32,
+        )
+    } else {
+        (height as u32, width as u32)
+    };
+    if content_height == 0 || content_width == 0 {
+        return Err("Image aspect ratio produces an empty resized image".into());
+    }
     // Pillow/torchvision's uint8 bicubic path rounds and clips the horizontal
     // pass before the vertical pass. A single floating-point two-axis resize
     // produces different values at sharp high-contrast edges.
     let horizontal = image::imageops::resize(
         &decoded,
-        width as u32,
+        content_width,
         decoded.height(),
         FilterType::CatmullRom,
     );
-    let rgb = image::imageops::resize(
+    let resized = image::imageops::resize(
         &horizontal,
-        width as u32,
-        height as u32,
+        content_width,
+        content_height,
         FilterType::CatmullRom,
     );
     drop(horizontal);
     drop(decoded);
+    let rgb = if content_height != height as u32 || content_width != width as u32 {
+        let mut canvas =
+            image::RgbImage::from_pixel(width as u32, height as u32, image::Rgb([127; 3]));
+        image::imageops::replace(
+            &mut canvas,
+            &resized,
+            ((width as u32 - content_width) as f64 * 0.5).round_ties_even() as i64,
+            ((height as u32 - content_height) as f64 * 0.5).round_ties_even() as i64,
+        );
+        canvas
+    } else {
+        resized
+    };
     let (gh, gw) = (height / v.patch_size, width / v.patch_size);
     let rgb = rgb.into_raw();
     preparation.retain(rgb.len())?;
-    preparation.worker_scratch(gh * gw * v.patch_values()? * 2)?;
+    preparation.worker_scratch(gh * gw * v.encoder_patch_values()? * 2)?;
     let input = ImageInput {
         grid_height: gh,
         grid_width: gw,
@@ -249,7 +290,10 @@ pub fn messages_with_options(
     for message in &messages {
         if let Some(parts) = message["content"].as_array() {
             for part in parts.iter().filter(|p| p["type"] == "image_url") {
-                if message["role"] != "user" {
+                if message["role"] != "user"
+                    && !(message["role"] == "tool"
+                        && spec.is_some_and(|v| v.layout == ImageLayout::DeepseekV41))
+                {
                     return Err("Image parts are supported in user messages".into());
                 }
                 let url = part["image_url"]["url"]
@@ -290,7 +334,12 @@ pub fn messages_with_options(
             .max_tokens
             .unwrap_or(v.max_features)
             .min(v.max_features);
-        if count > budget / MIN_PIXELS.div_ceil(token_pixels) {
+        let minimum_tokens = if v.layout == ImageLayout::DeepseekV41 {
+            4
+        } else {
+            MIN_PIXELS.div_ceil(token_pixels)
+        };
+        if count > budget / minimum_tokens {
             return Err(format!(
                 "Images exceed feature capacity at minimum image detail: {count} images, {budget} available features; reduce the image count"
             ));
@@ -306,7 +355,7 @@ pub fn messages_with_options(
             preparation.retain(data.len())?;
             let (h, w) = dimensions(&data)?;
             let max_pixels = if detail == "low" {
-                MIN_PIXELS
+                v.minimum_pixels()
             } else {
                 options
                     .max_pixels
@@ -314,19 +363,16 @@ pub fn messages_with_options(
                     .min(v.max_patches * v.patch_size * v.patch_size)
                     .min(16_777_216)
             };
-            let (rh, rw) = resize_shape(h, w, factor, max_pixels)?;
+            let (rh, rw) = planned_shape(v, h, w, detail, Some(max_pixels), None)?;
             if options.max_pixels.is_some_and(|n| rh * rw > n) {
                 return Err(
                     "Image aspect ratio cannot fit image_processing.max_pixels at minimum detail"
                         .into(),
                 );
             }
-            let features = rh / factor * (rw / factor);
-            let (mh, mw) = resize_shape(h, w, factor, MIN_PIXELS)?;
-            let minimum = mh / factor * (mw / factor);
-            if features > v.max_patches / v.merge_size.pow(2) {
-                return Err("Image aspect ratio exceeds encoder patch capacity".into());
-            }
+            let features = v.grid_features(rh / v.patch_size, rw / v.patch_size)?;
+            let (mh, mw) = planned_shape(v, h, w, detail, Some(v.minimum_pixels()), None)?;
+            let minimum = v.grid_features(mh / v.patch_size, mw / v.patch_size)?;
             total += features;
             if detail == "auto" {
                 demand.push((features, minimum));
@@ -345,6 +391,7 @@ pub fn messages_with_options(
                     &data,
                     v,
                     detail,
+                    options.max_pixels,
                     Some(features),
                     preparation,
                 )?);
@@ -368,7 +415,14 @@ pub fn messages_with_options(
             } else {
                 features
             };
-            let image = preprocess_with_limit(&data, v, detail, Some(limit), preparation)?;
+            let image = preprocess_with_limit(
+                &data,
+                v,
+                detail,
+                options.max_pixels,
+                Some(limit),
+                preparation,
+            )?;
             preparation.release(data.len());
             prepared[i] = Some(image);
         }
@@ -380,8 +434,12 @@ pub fn messages_with_options(
             continue;
         };
         let mut content = String::new();
-        for part in parts {
+        let is_deepseek = spec.is_some_and(|v| v.layout == ImageLayout::DeepseekV41);
+        for (index, part) in parts.iter().enumerate() {
             preparation.checkpoint(0)?;
+            if is_deepseek && index > 0 {
+                content.push_str("\n\n");
+            }
             match part["type"].as_str() {
                 Some("text") => {
                     content.push_str(part["text"].as_str().ok_or("Text part needs text")?)
@@ -393,7 +451,11 @@ pub fn messages_with_options(
                             .take()
                             .ok_or("Missing prepared image")?,
                     );
-                    content.push_str(MARKER);
+                    content.push_str(if is_deepseek {
+                        "<｜deepseek_image｜>"
+                    } else {
+                        MARKER
+                    });
                 }
                 _ => return Err("Supported content parts: text and image_url".into()),
             }

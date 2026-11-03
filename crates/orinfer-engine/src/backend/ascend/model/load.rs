@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 const UPLOAD_CHUNK: usize = 8 << 20;
 const UPLOAD_DEPTH: usize = 6;
 
-fn host_memory_budget(name: &str, default_mib: usize) -> Result<usize> {
+pub(super) fn host_memory_budget(name: &str, default_mib: usize) -> Result<usize> {
     let mib = match std::env::var(name) {
         Ok(value) => value
             .parse::<usize>()
@@ -49,7 +49,7 @@ fn upload_file(session: &Session, buffer: &Buffer, path: &Path, bytes: usize) ->
     }
     upload_file_range(session, buffer, &file, 0, bytes)
 }
-fn upload_file_range(
+pub(super) fn upload_file_range(
     session: &Session,
     buffer: &Buffer,
     file: &std::fs::File,
@@ -113,6 +113,16 @@ impl Worker {
             .try_fold(0usize, |n, b| {
                 n.checked_add(b.bytes).ok_or("Model byte estimate overflow")
             })?;
+        let needed = needed
+            .checked_add(
+                model
+                    .vision
+                    .as_ref()
+                    .map(vision::Program::device_bytes)
+                    .transpose()?
+                    .unwrap_or(0),
+            )
+            .ok_or("Model and vision memory size overflow")?;
         if needed > session.memory_info()?.0.saturating_sub(1 << 30) {
             return Err(format!(
                 "Rank {} needs {needed} bytes plus 1 GiB headroom",
@@ -264,7 +274,15 @@ impl Worker {
                 &model.graph_launches,
             )
         });
+        let vision = model
+            .vision
+            .as_ref()
+            .map(|program| {
+                vision::Encoder::from_program(&session, program, package, &mut checkpoint)
+            })
+            .transpose()?;
         let mut worker = Self {
+            vision,
             growth,
             session,
             comm,

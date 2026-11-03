@@ -1,6 +1,7 @@
 //! Compressed token radix index with exact state endpoints and byte accounting.
 mod tiered;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 pub(crate) use tiered::{Admission, Tiered};
 
@@ -28,7 +29,44 @@ pub struct Statistics {
 /// Image identities are scoped to the first affected token, not the request.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Media(pub Vec<(usize, [u8; 32])>);
+pub(crate) fn hash_floats(hash: &mut Sha256, values: &[f32]) {
+    let (chunks, tail) = values.as_chunks::<256>();
+    for chunk in chunks {
+        hash.update(chunk.map(f32::to_le_bytes).as_flattened());
+    }
+    for value in tail {
+        hash.update(value.to_le_bytes());
+    }
+}
 impl Media {
+    pub fn images(
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+        vision: Option<&crate::vision::VisionSpec>,
+    ) -> crate::artifact::Result<Self> {
+        let Some(vision) = vision else {
+            return if images.is_empty() {
+                Ok(Self::default())
+            } else {
+                Err("Model has no image adapter".into())
+            };
+        };
+        let spans = vision.image_spans(input, images)?;
+        let mut media = Vec::with_capacity(images.len());
+        for (image, span) in images.iter().zip(spans) {
+            let mut hash = Sha256::new();
+            hash.update((image.grid_height as u64).to_le_bytes());
+            hash.update((image.grid_width as u64).to_le_bytes());
+            if image.rgb.is_empty() {
+                hash_floats(&mut hash, &image.pixels);
+            } else {
+                hash.update(b"rgb8");
+                hash.update(&image.rgb);
+            }
+            media.push((span.start, hash.finalize().into()));
+        }
+        Ok(Self(media))
+    }
     pub fn common_tokens(&self, other: &Self, limit: usize) -> usize {
         let mut left = self.0.iter().filter(|(p, _)| *p < limit);
         let mut right = other.0.iter().filter(|(p, _)| *p < limit);
@@ -385,6 +423,39 @@ pub(crate) fn match_tiers<D: Resident, H: Resident>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_identity_preserves_text_prefix_and_separates_changed_or_reordered_images() {
+        let vision: crate::vision::VisionSpec = serde_json::from_value(serde_json::json!({
+            "layout":"deepseek_v41","max_image_tokens":1024,"hidden":5120,
+            "patch_size":14,"temporal_patch_size":1,"merge_size":3,"max_patches":9216,
+            "max_features":4096,"pixels":"p","grid":"g","length":"n","output":"o",
+            "features":"f","feature_index":"i","mrope_positions":"r",
+            "plans":[{"patches":9216,"program":"vision"}],"image_token_id":10,
+            "vision_start_token_id":10,"vision_end_token_id":10
+        }))
+        .unwrap();
+        let red = crate::vision::ImageInput {
+            grid_height: 2,
+            grid_width: 4,
+            rgb: vec![127; 2 * 4 * 14 * 14 * 3],
+            ..Default::default()
+        };
+        let mut blue = red.clone();
+        blue.rgb[0] = 128;
+        let images = [red.clone(), blue.clone()];
+        let tokens = vision.expand(&[1, 10, 2, 10, 3], &images, 32).unwrap();
+        let original = Media::images(&tokens, &images, Some(&vision)).unwrap();
+        let same = Media::images(&tokens, &images, Some(&vision)).unwrap();
+        let changed = Media::images(&tokens, &[red.clone(), red], Some(&vision)).unwrap();
+        let reversed = Media::images(&tokens, &[blue, images[0].clone()], Some(&vision)).unwrap();
+        assert_eq!(original, same);
+        assert_eq!(original.common_tokens(&same, tokens.len()), tokens.len());
+        assert_eq!(original.common_tokens(&changed, tokens.len()), 7);
+        assert_eq!(original.common_tokens(&reversed, tokens.len()), 1);
+        let mut invalid = tokens;
+        invalid[2] = 4;
+        assert!(Media::images(&invalid, &images, Some(&vision)).is_err());
+    }
     #[test]
     fn decoded_insertion_preserves_its_prompt_but_admission_can_reclaim_it() {
         let mut cache = Cache::new(100);
