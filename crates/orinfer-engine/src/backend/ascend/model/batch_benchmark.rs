@@ -43,6 +43,10 @@ fn one() -> usize {
 struct Frame {
     #[serde(default)]
     decode: bool,
+    /// Teacher-forced multi-row continuation uses the verifier's state view,
+    /// rather than rebuilding a final prompt window.
+    #[serde(default)]
+    continuation: bool,
     requests: Vec<Request>,
 }
 #[derive(Clone, Deserialize)]
@@ -116,7 +120,7 @@ struct Timings {
 }
 impl Timings {
     fn record(&mut self, frame: &Frame, outputs: usize, seconds: f64) {
-        if frame.decode {
+        if frame.decode || frame.continuation {
             self.decode_s += seconds;
             self.decode_tokens += outputs;
         } else {
@@ -134,7 +138,7 @@ struct Comparison {
 }
 
 fn frame_layout(frame: &Frame, capacity: usize, owners: usize) -> Result<Layout> {
-    Layout::new(
+    let mut layout = Layout::new(
         frame
             .requests
             .iter()
@@ -152,7 +156,11 @@ fn frame_layout(frame: &Frame, capacity: usize, owners: usize) -> Result<Layout>
         frame.decode,
         capacity,
         owners,
-    )
+    )?;
+    if frame.continuation {
+        layout.decoder_roles.fill(super::replay::Role::Continue);
+    }
+    Ok(layout)
 }
 fn forward(
     team: &Team,
@@ -248,6 +256,7 @@ fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<
             }
             frames.push(Frame {
                 decode: false,
+                continuation: false,
                 requests: rows,
             });
             continue;
@@ -276,6 +285,7 @@ fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<
         }
         frames.push(Frame {
             decode: false,
+            continuation: false,
             requests: rows,
         });
     }
@@ -339,6 +349,7 @@ fn plan_prompt_frames(requests: &[Request], budget: usize, keep: usize) -> Resul
         }
         frames.push(Frame {
             decode: false,
+            continuation: false,
             requests: rows,
         });
         cursor = next;
@@ -545,6 +556,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                     {
                         frames.push(Frame {
                             decode: true,
+                            continuation: false,
                             requests: last_outputs
                                 .values()
                                 .map(|o| Request {
@@ -597,6 +609,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                 {
                                     let one = Frame {
                                         decode: frame.decode,
+                                        continuation: frame.continuation,
                                         requests: frame
                                             .requests
                                             .iter()
@@ -613,6 +626,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                             for (index, frame) in frames.iter().enumerate() {
                                 let f = Frame {
                                     decode: frame.decode,
+                                    continuation: frame.continuation,
                                     requests: frame
                                         .requests
                                         .iter()
@@ -753,6 +767,33 @@ mod tests {
         assert_eq!(times.prefill_s, 1.);
         assert_eq!(times.decode_s, 0.5);
         assert_eq!(times.decode_tokens, 1);
+    }
+    #[test]
+    fn teacher_continuation_preserves_verifier_history_and_owner_endpoints() {
+        let frame: Frame = serde_json::from_value(serde_json::json!({
+            "continuation":true,"requests":[
+                {"owner":17,"tokens":[1,2,3,4,5,6],"output":true},
+                {"owner":3,"tokens":[7,8],"output":true}
+            ]
+        }))
+        .unwrap();
+        let layout = frame_layout(&frame, 2048, 32).unwrap();
+        let decoder = layout.decoder(128, true).unwrap();
+        assert!(!layout.decode);
+        assert_eq!(decoder.rows.total, 8);
+        assert_eq!(decoder.output_positions, [5, 1]);
+        assert_eq!(decoder.segments[0].slot, 17);
+        assert_eq!(decoder.segments[1].slot, 3);
+        assert!(
+            decoder
+                .decoder_roles
+                .iter()
+                .all(|r| *r == super::super::replay::Role::Continue)
+        );
+        let mut timings = Timings::default();
+        timings.record(&frame, 2, 0.2);
+        assert_eq!(timings.decode_tokens, 2);
+        assert_eq!(timings.input_tokens, 0);
     }
     #[test]
     fn model_chunk_quantum_fills_packets_without_short_long_request_tails() {
