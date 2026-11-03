@@ -10,7 +10,7 @@
 typedef struct { void *dst; const void *src; size_t n; int value, kind; void *stream; void *event; } Job;
 typedef struct { void *stream; int ready, capture_supported; } Event;
 static Job jobs[1024];
-static int count, counters[13], failure, stream_creates, capturing;
+static int count, counters[14], failure, stream_creates, capturing;
 static void *current;
 static char aot_contract[4096];
 void test_kernel_contract(const char *text) {
@@ -63,7 +63,7 @@ int aclrtCreateStream(void **p) {
     *p=malloc(1);counters[3]++;return 0;
 }
 int aclrtDestroyStream(void *p) { free(p);counters[3]--;return 0; }
-int aclrtSynchronizeStreamWithTimeout(void *s,int timeout) { (void)timeout;counters[12]++;return flush(s); }
+int aclrtSynchronizeStreamWithTimeout(void *s,int timeout) { (void)timeout;counters[12]++;counters[13]++;return flush(s); }
 int aclrtCreateEventWithFlag(void **p,uint32_t flag) {
     if(flag!=1)return 7;
     if(failure==13 && counters[2]>0)return 7;
@@ -88,7 +88,7 @@ int aclrtRecordEvent(void *p,void *s) {
 /* With no waiters, wait-status can complete while the record is pending. */
 int aclrtQueryEventWaitStatus(void *p,int *state) { (void)p;*state=0;return 0; }
 int aclrtQueryEventStatus(void *p,int *state) { *state=(failure==11 || ((Event*)p)->ready)?1:0;return 0; }
-int aclrtSynchronizeEventWithTimeout(void *p,int timeout) { (void)timeout;return flush(((Event*)p)->stream); }
+int aclrtSynchronizeEventWithTimeout(void *p,int timeout) { (void)timeout;counters[13]++;return flush(((Event*)p)->stream); }
 int aclrtStreamWaitEventWithTimeout(void *s,void *p,int timeout) {
     (void)timeout;jobs[count++]=(Job){.kind=4,.stream=s,.event=p};return 0;
 }

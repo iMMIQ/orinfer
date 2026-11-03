@@ -969,9 +969,19 @@ fn failed_completion_retires_and_quarantines_dma_backing() {
     let buffer = session.allocate(8).unwrap();
     let ticket = session.upload(&buffer, 0, &[1; 8]).unwrap();
     fixture.failure(3);
+    let fences = fixture.counter(13);
     assert!(ticket.wait().is_err());
+    assert_eq!(fixture.counter(13), fences + 1);
+    assert!(super::runtime::has_quarantined_resources());
+    assert!(ticket.wait().is_err());
+    assert!(session.synchronize().is_err());
     assert!(session.allocate(1).is_err());
     drop((ticket, buffer, session));
+    assert_eq!(
+        fixture.counter(13),
+        fences + 1,
+        "retired work must not refence"
+    );
     assert_eq!(fixture.counter(0), 1);
     assert_eq!(fixture.counter(1), 1);
     assert_eq!(fixture.counter(4), 1);
@@ -980,6 +990,20 @@ fn failed_completion_retires_and_quarantines_dma_backing() {
         0,
         "unfenced context must not finalize ACL"
     );
+}
+
+#[test]
+fn retired_empty_session_keeps_native_streams_and_driver_quarantined() {
+    let fixture = Fixture::new();
+    let session = fixture.session();
+    fixture.failure(3);
+    let fences = fixture.counter(13);
+    assert!(session.synchronize().is_err());
+    drop(session);
+    assert_eq!(fixture.counter(13), fences + 1);
+    assert_eq!(fixture.counter(3), 2, "unfenced streams remain live");
+    assert_eq!(fixture.counter(4), 1, "unfenced context remains live");
+    assert_eq!(fixture.counter(6), 0, "unfenced driver must not finalize");
 }
 
 #[test]
@@ -1273,12 +1297,15 @@ fn reduce_scatter_checks_rank_extents_types_and_completion_ownership() {
 #[test]
 fn failed_collective_creation_never_destroys_an_unowned_output_handle() {
     use super::hccl::{Communicator, RootInfo};
-    let mut fixture = Fixture::new();
+    let fixture = Fixture::new();
     let session = fixture.session();
     let root = RootInfo::fixture(&session, &fixture._dir.path().join("libacl-fixture.so")).unwrap();
     fixture.failure(10);
     assert!(Communicator::join(&session, &root, 0).is_err());
     assert!(session.allocate(1).is_err());
     drop((root, session));
-    fixture.assert_clean();
+    assert_eq!(fixture.counter(8), 0, "no communicator was owned");
+    assert_eq!(fixture.counter(3), 2, "retired streams remain quarantined");
+    assert_eq!(fixture.counter(4), 1, "retired context remains quarantined");
+    assert_eq!(fixture.counter(6), 0, "retired driver must not finalize");
 }

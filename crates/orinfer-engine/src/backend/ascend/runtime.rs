@@ -14,8 +14,19 @@ use std::{
     cell::{Cell, RefCell},
     ptr,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
+
+static QUARANTINED: AtomicBool = AtomicBool::new(false);
+
+/// Standalone runners must bypass native exit hooks after an unfenced failure,
+/// even when the owning Rust worker has finished retiring its resources.
+pub fn has_quarantined_resources() -> bool {
+    QUARANTINED.load(Ordering::Acquire)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -67,6 +78,7 @@ pub(super) struct Current<'a> {
 impl Context {
     pub(super) fn retire(&self) {
         self.poisoned.set(true);
+        QUARANTINED.store(true, Ordering::Release);
     }
     pub(super) fn compute_stream(&self) -> Handle {
         self.compute
@@ -75,6 +87,10 @@ impl Context {
         self.limits.timeout_ms
     }
     pub fn enter(&self) -> Result<Current<'_>> {
+        // A failed fence retires every outstanding operation. Re-entering for
+        // each completion/graph destructor would repeat the same device timeout
+        // and could release backing whose execution has not stopped.
+        self.ready()?;
         let previous = self.api.current()?;
         if previous != self.handle {
             // SAFETY: Retained ACL library and owned context.
@@ -98,7 +114,7 @@ impl Context {
             "synchronize ACL stream",
         );
         if result.is_err() {
-            self.poisoned.set(true);
+            self.retire();
         }
         result
     }
@@ -121,6 +137,12 @@ impl Drop for Current<'_> {
 }
 impl Drop for Context {
     fn drop(&mut self) {
+        if self.poisoned.get() {
+            // Native streams remain quarantined until process exit, together
+            // with the library whose callbacks may still reference them.
+            std::mem::forget(Arc::clone(&self.driver));
+            return;
+        }
         // No allocation or completion can outlive the last Rc<Context>. Never
         // reset a device: other processes and independently owned contexts exist.
         let mut previous = ptr::null_mut();
@@ -272,7 +294,7 @@ impl Completion {
                 "wait for ACL completion",
             );
             if result.is_err() {
-                self.context.poisoned.set(true);
+                self.context.retire();
             }
             result?;
             self.complete.set(true);

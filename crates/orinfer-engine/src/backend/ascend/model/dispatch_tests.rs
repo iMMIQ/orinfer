@@ -63,16 +63,19 @@ fn direct_segments_retain_parallel_resources_and_fence_partial_errors() {
         if fail_before_join {
             fixture.failure(14);
         }
+        let fences = fixture.counter(13);
         let submitted = segment.enqueue(&session);
         if fail_before_join {
             assert!(submitted.is_err());
-            // Segment remains cached/alive; its Drop cannot supply this fence.
-            assert_eq!(fixture.pending_jobs(), 0);
+            // HCCL retired the context during submission. Leave queued work
+            // and all backing quarantined instead of entering native fences.
+            assert!(fixture.pending_jobs() > 0);
+            assert_eq!(fixture.counter(13), fences);
         }
         drop((segment, input, reduced, root));
         if fail_before_join {
             // A native HCCL failure retires the context. The failed packet
-            // keeps all native backing even after our explicit branch fence.
+            // keeps all native backing without attempting another native fence.
             assert_eq!(fixture.counter(8), 1);
             assert_eq!(session.allocated_bytes(), 16);
             drop((output, session));

@@ -778,7 +778,7 @@ fn batch_overrides(
 }
 fn exit_with_unfinished_workers(pending: bool) {
     if pending {
-        // SAFETY: An API error returned while native teardown is still live.
+        // SAFETY: Native teardown is still live or resources were quarantined.
         // Running CANN process-exit hooks concurrently can double-free native
         // state. _exit terminates this standalone process without those hooks;
         // the OS reclaims its threads, accelerator handles and GPU lease.
@@ -804,10 +804,18 @@ fn main() -> ExitCode {
         unsafe { std::env::set_var("ASCEND_COREDUMP_SIGNAL", "none") };
     }
     match execute(cli.command.unwrap_or(Command::Info), &cli.data_dir) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            exit_with_unfinished_workers(
+                orinfer_engine::backend::ascend::runtime::has_quarantined_resources(),
+            );
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             eprintln!("{error}");
-            exit_with_unfinished_workers(orinfer_api::has_live_model_workers());
+            exit_with_unfinished_workers(
+                orinfer_api::has_live_model_workers()
+                    || orinfer_engine::backend::ascend::runtime::has_quarantined_resources(),
+            );
             ExitCode::FAILURE
         }
     }
