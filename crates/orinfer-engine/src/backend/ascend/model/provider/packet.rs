@@ -94,11 +94,17 @@ impl Runtime {
                     depth
                 };
                 let remaining = r.limit.saturating_sub(r.generated + guard).max(1);
-                uses = uses.min(remaining as f64 / r.draft_feedback.progress(depth, block));
+                let progress = r
+                    .draft_feedback
+                    .progress(depth, block)
+                    .min(r.limit.saturating_sub(r.generated).max(1) as f64);
+                uses = uses.min(remaining as f64 / progress);
                 if options.policy == scheduler::Policy::Latency {
                     slack = slack.min(
-                        options.target_tpot_ms / 1000.
-                            - now.duration_since(r.last_output).as_secs_f64(),
+                        super::super::team::capture_interval(
+                            options.target_tpot_ms / 1000.,
+                            progress,
+                        ) - now.duration_since(r.last_output).as_secs_f64(),
                     );
                 }
             }

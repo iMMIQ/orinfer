@@ -13,7 +13,7 @@ mod channel;
 mod host_release;
 mod preparation;
 use channel::{Peer, Transport, reply_channel};
-pub(super) use preparation::{CaptureBudget, capture_credit};
+pub(super) use preparation::{CaptureBudget, capture_credit, capture_interval};
 use std::{
     collections::BTreeMap,
     path::Path,

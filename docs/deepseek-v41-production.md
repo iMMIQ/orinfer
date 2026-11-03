@@ -46,6 +46,8 @@ bin/orinfer serve /data/model/dsv41-v0.3.1 \
 
 设备 prefix 预算按每卡计，CPU offload 预算为 TP ranks 合计。常驻 CPU 表另计约 212000 MiB，主机还需为行缓存、offload、前端和系统保留空间。灰度从 16 活跃请求开始，依据实际请求长度、排队和首 token 时延再放宽到已验收的 32。队列容量固定为 128；`--queue-timeout-ms` 只限制排队，`--output-timeout-ms` 限制输出通道等待进展，二者均不等于请求总期限。
 
+示例的 30 秒排队预算用于网关已收紧上下文的交互入口。长上下文通道单独设置并发、排队和客户端总期限；冷请求的准入等待可能超过 30 秒，达到该期限会结束请求。性能对照固定相同的排队预算与缓存准备条件，并同时报告成功请求、排队超时和运行时故障。
+
 队列满返回 HTTP 429 和 `Retry-After: 1`。排队期限到达时，非流式请求返回 HTTP 408，流式请求在已建立的 SSE 中返回终止错误 `request_queue_timeout`，携带 `retryable=true` 和 `retry_after_ms=1000`。客户端从该等待时间开始指数退避，限制尝试次数和总期限。已经收到文本、thinking 或工具调用片段后停止自动重试，避免重复执行 agent 工具。慢客户端输出超时使用 `client_output_timeout`，携带 `retryable=false`；客户端关闭连接后，请求进入回收流程。
 
 需要精确字段或机器读取输出时，显式使用严格的 `response_format: {type: "json_schema", ...}` 和本任务字段 schema。语法约束保证合法格式，字段语义通过任务答案另行验收。自由文本保留模型实际输出，调用方按业务要求检查格式。

@@ -5,8 +5,15 @@ pub(in crate::backend::ascend::model) fn capture_credit(
     previous: f64,
     target: f64,
     elapsed: f64,
+    committed: usize,
 ) -> f64 {
-    (previous + target - elapsed).clamp(0., target)
+    (previous + target * committed as f64 - elapsed).clamp(0., target)
+}
+
+pub(in crate::backend::ascend::model) fn capture_interval(target: f64, progress: f64) -> f64 {
+    // Account for a speculative burst without allowing its entire depth to
+    // become an unbounded pause for another owner.
+    target * progress.clamp(1., 2.)
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -78,6 +85,23 @@ pub(super) fn plan(
     let ready = !missing && (graphs > 0 || states.iter().all(|s| {
         matches!(s, CacheState::Direct { uses, .. } if *uses >= if repeated { 2 } else { 8 })
     }));
+    let budget = budget.map(|mut budget| {
+        // A final prompt window has one use left within its request. Repeated
+        // hits of the same retained packet also establish cross-request reuse;
+        // bound that forecast so cold or changing shapes keep their direct path.
+        let observed = states
+            .iter()
+            .map(|s| match s {
+                CacheState::Direct { uses, .. } => *uses,
+                _ => 0,
+            })
+            .min()
+            .unwrap_or(0);
+        if !repeated && observed >= 8 {
+            budget.uses = budget.uses.max(f64::from(observed.min(16)) * 2.);
+        }
+        budget
+    });
     let profitable = budget.is_none_or(|b| b.profitable(0));
     let capture = ready && profitable;
     Ok(Plan {
@@ -116,10 +140,34 @@ mod tests {
     }
     #[test]
     fn latency_credit_is_bounded_and_repays_capture_overrun() {
-        assert!((capture_credit(0., 0.4, 0.18) - 0.22).abs() < 1e-12);
-        assert!((capture_credit(0.22, 0.4, 0.42) - 0.20).abs() < 1e-12);
-        assert_eq!(capture_credit(0.4, 0.4, 0.01), 0.4);
-        assert_eq!(capture_credit(0.2, 0.4, 1.0), 0.);
+        assert!((capture_credit(0., 0.4, 0.18, 1) - 0.22).abs() < 1e-12);
+        assert!((capture_credit(0.22, 0.4, 0.42, 1) - 0.20).abs() < 1e-12);
+        assert_eq!(capture_credit(0.4, 0.4, 0.01, 1), 0.4);
+        assert_eq!(capture_credit(0.2, 0.4, 1.0, 1), 0.);
+        assert_eq!(capture_credit(0., 0.4, 0.54, 6), 0.4);
+        assert!((capture_credit(0.2, 0.4, 0.1, 0) - 0.1).abs() < 1e-12);
+    }
+    #[test]
+    fn speculative_progress_can_pay_for_capture_without_unbounded_burst_slack() {
+        let budget = CaptureBudget {
+            uses: 64.,
+            direct_s: Some(0.54),
+            replay_s: None,
+            capture_s: Some(0.30),
+            slack_s: capture_interval(0.4, 6.) - 0.30 + capture_credit(0., 0.4, 0.54, 6),
+            trace: false,
+        };
+        assert!(budget.profitable(0));
+        assert!(
+            !CaptureBudget {
+                slack_s: capture_interval(0.4, 1.) - 0.30,
+                ..budget
+            }
+            .profitable(0)
+        );
+        assert_eq!(capture_interval(0.4, 6.), 0.8);
+        assert_eq!(capture_interval(0.4, 1.), 0.4);
+        assert_eq!(capture_interval(0.4, 0.), 0.4);
     }
     #[test]
     fn short_tail_keeps_direct_and_long_packet_can_capture() {
@@ -148,6 +196,50 @@ mod tests {
                 .unwrap()
                 .mode,
             Mode::Replay
+        );
+    }
+    #[test]
+    fn retained_prompt_tail_can_learn_reuse_across_requests() {
+        let unknown = CaptureBudget {
+            uses: 1.,
+            direct_s: Some(0.14),
+            replay_s: None,
+            capture_s: Some(0.30),
+            slack_s: f64::INFINITY,
+            trace: false,
+        };
+        let state = |uses| CacheState::Direct {
+            uses,
+            consecutive: 1,
+        };
+        assert_eq!(
+            plan(&[state(7); 8], false, Some(unknown)).unwrap().mode,
+            Mode::Direct
+        );
+        assert_eq!(
+            plan(&[state(8); 8], false, Some(unknown)).unwrap().mode,
+            Mode::CaptureReplay
+        );
+        for budget in [
+            CaptureBudget {
+                replay_s: Some(0.20),
+                ..unknown
+            },
+            CaptureBudget {
+                slack_s: 0.10,
+                ..unknown
+            },
+        ] {
+            assert_eq!(
+                plan(&[state(16); 8], false, Some(budget)).unwrap().mode,
+                Mode::Direct
+            );
+        }
+        assert_eq!(
+            plan(&[CacheState::Missing, state(16)], false, Some(unknown))
+                .unwrap()
+                .mode,
+            Mode::BuildDirect
         );
     }
     #[test]

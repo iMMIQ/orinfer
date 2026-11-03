@@ -921,14 +921,25 @@ impl Runtime {
             return Err("Foreign or released A2 request".into());
         }
         self.prepare_images(requests, options)?;
-        let has_decode = requests.iter().any(|r| !r.prefilling && !r.is_finished());
+        let decoding = requests
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.prefilling && !r.is_finished())
+            .map(|(i, r)| (i, r.generated))
+            .collect::<Vec<_>>();
         let started = Instant::now();
         let result = self.advance_packet(requests, options, maintenance);
-        self.capture_credit_s = if has_decode && result.is_ok() {
+        self.capture_credit_s = if !decoding.is_empty() && result.is_ok() {
+            let committed = decoding
+                .iter()
+                .map(|&(i, before)| requests[i].generated.saturating_sub(before))
+                .min()
+                .unwrap_or(0);
             super::team::capture_credit(
                 self.capture_credit_s,
                 options.target_tpot_ms / 1000.,
                 started.elapsed().as_secs_f64(),
+                committed,
             )
         } else {
             0.

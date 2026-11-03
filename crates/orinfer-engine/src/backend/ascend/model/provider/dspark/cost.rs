@@ -192,13 +192,36 @@ impl Model {
         work: Work,
         replay: bool,
     ) -> Option<Prediction> {
+        self.predict_mode_scoped(stage, block, full, work, replay, false)
+    }
+    fn predict_mode_scoped(
+        &self,
+        stage: Stage,
+        block: usize,
+        full: bool,
+        work: Work,
+        replay: bool,
+        comparable: bool,
+    ) -> Option<Prediction> {
         let requested = family(stage, block, full, work);
         // Select a context/prompt-work neighborhood before interpolating rows.
         let group = self
             .cells
             .keys()
-            .filter(|Key(f, _, mode)| {
-                f.0 == stage && f.1 == block && f.2 == full && f.3 == requested.3 && *mode == replay
+            .filter(|Key(f, rows, mode)| {
+                f.0 == stage
+                    && f.1 == block
+                    && f.2 == full
+                    && f.3 == requested.3
+                    && *mode == replay
+                    && (!comparable
+                        || f.4.ilog2().abs_diff(requested.4.ilog2()) <= 1
+                            && f.5.abs_diff(requested.5) <= 1
+                            // Producer and final-window packets can differ in
+                            // decoder work even in the same prompt-size bin.
+                            && (!requested.3 || *rows == work.rows)
+                            && (*rows).max(work.rows)
+                                <= (*rows).min(work.rows).max(1).saturating_mul(2))
             })
             .min_by_key(|Key(f, rows, _)| {
                 (
@@ -298,7 +321,10 @@ impl Model {
                 .predict_mode(stage, block, full, work, false)
                 .map(|p| p.seconds),
             replay_s: self
-                .predict_mode(stage, block, full, work, true)
+                // A distant prior still prices unseen work, but cannot prove
+                // that a new local Graph would be slower. Leave it unknown so
+                // repeated packets can use the existing bounded capture probe.
+                .predict_mode_scoped(stage, block, full, work, true, true)
                 .map(|p| p.seconds),
             capture_s: self.cold_estimate(stage, block, work, true),
             slack_s,
@@ -391,6 +417,99 @@ mod tests {
         assert_eq!(
             model.cold_estimate(Stage::Target, 0, work, false),
             Some(0.020)
+        );
+    }
+    #[test]
+    fn distant_replay_priors_do_not_block_local_capture_probes() {
+        for distant in [
+            Work {
+                rows: 20,
+                context: 131072,
+                ..Work::default()
+            },
+            Work {
+                rows: 2048,
+                context: 1024,
+                ..Work::default()
+            },
+        ] {
+            let mut model = Model::default();
+            let work = Work {
+                rows: 20,
+                context: 1024,
+                ..Work::default()
+            };
+            model.observe(Point {
+                work,
+                ..point(20, false, 0.11)
+            });
+            model.insert(
+                Point {
+                    work: distant,
+                    setup_s: 0.25,
+                    ..point(distant.rows, true, 0.51)
+                },
+                false,
+            );
+            let prior = model
+                .predict_mode(Stage::Target, 0, false, work, true)
+                .unwrap();
+            assert_eq!(prior.seconds, 0.51);
+            let budget = model.budget(Stage::Target, 0, false, work, 64., 1.);
+            assert!(budget.replay_s.is_none());
+            assert!(budget.profitable(0));
+            assert!(
+                !model
+                    .budget(Stage::Target, 0, false, work, 5., 1.)
+                    .profitable(0)
+            );
+
+            // Nearby observations retain their cost and payback decision.
+            model.insert(
+                Point {
+                    work: Work {
+                        rows: 32,
+                        context: 2048,
+                        ..Work::default()
+                    },
+                    ..point(32, true, 0.06)
+                },
+                false,
+            );
+            let budget = model.budget(Stage::Target, 0, false, work, 64., 1.);
+            assert_eq!(budget.replay_s, Some(0.06));
+            assert!(budget.profitable(0));
+        }
+    }
+    #[test]
+    fn prompt_capture_does_not_price_a_producer_from_a_larger_final_window() {
+        let mut model = Model::default();
+        let work = Work {
+            rows: 1921,
+            prefill_rows: 1921,
+            context: 0,
+        };
+        model.observe(Point {
+            work,
+            ..point(1921, false, 0.16)
+        });
+        model.insert(
+            Point {
+                work: Work {
+                    rows: 2048,
+                    prefill_rows: 2048,
+                    context: 0,
+                },
+                setup_s: 0.25,
+                ..point(2048, true, 0.20)
+            },
+            false,
+        );
+        assert!(
+            model
+                .budget(Stage::Target, 0, false, work, 16., 1.)
+                .replay_s
+                .is_none()
         );
     }
     #[test]
