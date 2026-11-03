@@ -612,7 +612,8 @@ impl Session {
         let mut event = cached.unwrap_or(ptr::null_mut());
         if event.is_null() {
             check(
-                // SAFETY: ACL_EVENT_SYNC=1 supports host synchronization; output is live.
+                // SAFETY: Ex events support re-recording retired generations
+                // without ResetEvent. ACL_EVENT_SYNC=1 also permits stream waits.
                 unsafe { (self.context.api.create_event)(&mut event, 1) },
                 "create ACL completion",
             )?;

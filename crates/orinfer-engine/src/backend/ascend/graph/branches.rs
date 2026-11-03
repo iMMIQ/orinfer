@@ -71,11 +71,11 @@ impl Branches {
                 // Captured cross-stream dependencies require Ex events with
                 // ACL_EVENT_SYNC=1. Each fork has its own event generation.
                 check(
-                    (branches.context.api.create_capture_event)(&mut pair.0, 1),
+                    (branches.context.api.create_event)(&mut pair.0, 1),
                     "create ACL Graph fork event",
                 )?;
                 check(
-                    (branches.context.api.create_capture_event)(&mut pair.1, 1),
+                    (branches.context.api.create_event)(&mut pair.1, 1),
                     "create ACL Graph join event",
                 )?;
             }

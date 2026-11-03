@@ -40,8 +40,7 @@ functions! {
     create_stream: aclrtCreateStream(*mut Handle) -> i32;
     destroy_stream: aclrtDestroyStream(Handle) -> i32;
     sync_stream: aclrtSynchronizeStreamWithTimeout(Handle, i32) -> i32;
-    create_event: aclrtCreateEventWithFlag(*mut Handle, u32) -> i32;
-    create_capture_event: aclrtCreateEventExWithFlag(*mut Handle, u32) -> i32;
+    create_event: aclrtCreateEventExWithFlag(*mut Handle, u32) -> i32;
     destroy_event: aclrtDestroyEvent(Handle) -> i32;
     record_event: aclrtRecordEvent(Handle, Handle) -> i32;
     query_event: aclrtQueryEventStatus(Handle, *mut i32) -> i32;

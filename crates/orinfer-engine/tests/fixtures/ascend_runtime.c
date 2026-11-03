@@ -78,6 +78,9 @@ int aclrtCreateEventExWithFlag(void **p,uint32_t flag) {
 int aclrtRecordEvent(void *p,void *s) {
     if(failure==4)return 7;
     if(capturing && !((Event*)p)->capture_supported)return 207000;
+    /* Legacy SYNC events need a reset before reuse. Ex events bind a fresh
+       record generation; completion pooling must use the latter contract. */
+    if(((Event*)p)->ready && !((Event*)p)->capture_supported)return 207000;
     ((Event*)p)->stream=s;
     ((Event*)p)->ready=0;
     jobs[count++]=(Job){.kind=3,.stream=s,.event=p};return 0;
