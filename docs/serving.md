@@ -143,6 +143,8 @@ thinking 可与 JSON 输出组合，正文仍受约束。MTP 的 target 和 draf
 
 auto 调用在宽松模式下沿用原生 XML 协议。未知函数、缺失参数或错误参数类型仍作为调用交给客户端，客户端应校验并返回 `role=tool` 错误结果，让模型重试；工具由客户端执行。XML 参数按声明类型转换，无法转换的值保留为字符串。语法损坏到无法辨认函数的输出仍报错。输出预算用尽时返回 `finish_reason=length` 并保留已生成的调用前缀，流式与非流式参数一致；客户端仅执行完整且通过参数校验的调用。回传历史中存在无效 JSON 对象参数时，原始字符串在原生模板中以 `__orinfer_raw_arguments` 参数完整保留。
 
+DSv4.1 部门部署的安装、准入、长请求期限与回滚配置见[生产部署说明](deepseek-v41-production.md)。
+
 ### OpenCode 与 Pi
 
 [OpenCode 配置](../examples/opencode.json)使用 `@ai-sdk/openai-compatible` 和默认编码 agent，启用自动压缩，声明图片、工具、thinking 及 `reasoning_content` 历史回传；agent 按客户端自身的运行策略推进。将其复制为项目中的 `opencode.json`，按服务的 `--model` 选择对应模型：
