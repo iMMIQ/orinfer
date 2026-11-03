@@ -1424,7 +1424,6 @@ impl ModelRuntime {
                     Err(error) => return Err(error),
                 };
                 let seconds = began.elapsed().as_secs_f64();
-                let per_token = seconds / tokens.len().max(1) as f64;
                 // Copies and model drafts have different costs and acceptance.
                 // A successful copy must not make a later model draft look
                 // artificially profitable at the same verification width.
@@ -1436,7 +1435,6 @@ impl ModelRuntime {
                         .or_default()
                         .observe(seconds);
                 }
-                self.mtp_seconds_per_token = self.mtp_seconds_per_token * 0.8 + per_token * 0.2;
                 self.scheduler_statistics.speculative_iterations += 1;
                 self.scheduler_statistics.decode_tokens += tokens.len();
                 output.push(StepOutput { request: i, tokens });
@@ -1513,17 +1511,30 @@ impl ModelRuntime {
         if let Some(feedback) = feedback {
             let stats = self.execution.batch_statistics();
             if requests.iter().map(|r| r.mtp.lookup_rounds).sum::<usize>() == feedback.lookups {
+                let seconds = feedback_at.elapsed().as_secs_f64();
+                let tokens = feedback
+                    .indices
+                    .iter()
+                    .map(|&i| requests[i].generated)
+                    .sum::<usize>()
+                    - feedback.generated;
+                let observation = stats.observation_since(feedback_stats);
+                if tokens > 0
+                    && let Some(extra) = self.dynamic_speculation.extra_seconds(
+                        feedback.key,
+                        feedback.width,
+                        seconds,
+                        observation,
+                    )
+                {
+                    self.mtp_seconds_per_draft = self.mtp_seconds_per_draft * 0.8 + extra * 0.2;
+                }
                 self.dynamic_speculation.observe(
                     feedback.key,
                     feedback.width,
-                    feedback_at.elapsed().as_secs_f64(),
-                    feedback
-                        .indices
-                        .iter()
-                        .map(|&i| requests[i].generated)
-                        .sum::<usize>()
-                        - feedback.generated,
-                    stats.observation_since(feedback_stats),
+                    seconds,
+                    tokens,
+                    observation,
                 );
             }
         }
@@ -1627,8 +1638,11 @@ impl ModelRuntime {
                                     .max_context
                                     .saturating_sub(req.history.len().saturating_sub(1))
                                 && req.prompt_lookup.available(&req.history, n - 1)
-                                && req.lookup_costs.get(&n).map_or(
-                                    self.mtp_seconds_per_token * n as f64,
+                                && req.lookup_costs.get(&n).map_or_else(
+                                    || {
+                                        self.predict_iteration(requests, &target)
+                                            + self.mtp_seconds_per_draft * (n - 1) as f64
+                                    },
                                     speculation::Profile::upper,
                                 ) <= slack
                         })

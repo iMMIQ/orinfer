@@ -393,8 +393,7 @@ impl BatchExecutionStatistics {
             },
             preparing: self.initialization_s() > before.initialization_s()
                 || self.capture_s > before.capture_s
-                || self.sequence_capture_s > before.sequence_capture_s
-                || self.graph_capture_deferrals > before.graph_capture_deferrals,
+                || self.sequence_capture_s > before.sequence_capture_s,
             deferred: self.graph_capture_deferrals > before.graph_capture_deferrals,
             evicted: self.graph_evictions > before.graph_evictions,
             // Cache eviction does not invalidate another arm's measured cost.

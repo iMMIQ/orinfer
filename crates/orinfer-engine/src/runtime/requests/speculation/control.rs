@@ -113,6 +113,7 @@ struct Arm {
     state: State,
     last_trial: usize,
     needs_setup: bool,
+    recapture_cost: f64,
 }
 
 impl Arm {
@@ -132,7 +133,7 @@ struct Cohort {
     calls: usize,
     active: usize,
     calibrating: Option<usize>,
-    cache_cooldown: Option<usize>,
+    recovering: bool,
 }
 #[derive(Clone, Copy, Default, PartialEq)]
 enum SinglePolicy {
@@ -153,6 +154,7 @@ pub(in crate::runtime) struct Controller {
     credit_cap: f64,
     calibration_limit: f64,
     bootstrap_used: bool,
+    batch_allocated: f64,
     loan: Option<(Key, usize)>,
     generation: usize,
     trace: bool,
@@ -178,6 +180,7 @@ impl Default for Controller {
             credit_cap: 0.4,
             calibration_limit: 0.4,
             bootstrap_used: false,
+            batch_allocated: 0.,
             loan: None,
             generation: 0,
             trace: std::env::var("ORINFER_MTP_TRACE").as_deref() == Ok("1"),
@@ -202,10 +205,36 @@ impl Controller {
         }
     }
 
+    /// Train the common draft-cost fallback from actual hot packet execution.
+    /// Acceptance changes committed yield, not the cost per added draft row.
+    pub(in crate::runtime) fn extra_seconds(
+        &self,
+        key: Key,
+        width: usize,
+        seconds: f64,
+        observation: ExecutionObservation,
+    ) -> Option<f64> {
+        if width <= 1 || observation.preparing || !seconds.is_finite() || seconds <= 0. {
+            return None;
+        }
+        let normal = self
+            .cohorts
+            .get(&key)?
+            .arms
+            .get(&1)?
+            .hot(observation.generation);
+        (normal.time.samples >= 3)
+            .then(|| (seconds - normal.time.mean).max(0.) / (width - 1) as f64)
+    }
+
     fn retain_key(&mut self, key: Key) {
         if self.cohorts.len() >= 256 && !self.cohorts.contains_key(&key) {
             let oldest = self.cohorts.keys().next().copied().unwrap();
             self.cohorts.remove(&oldest);
+        }
+        if self.balances.len() >= 256 && !self.balances.contains_key(&key.family()) {
+            let victim = *self.balances.keys().next().unwrap();
+            self.balances.remove(&victim);
         }
     }
     pub(in crate::runtime) fn observe(
@@ -239,10 +268,6 @@ impl Controller {
         // Preparation and zero-yield attempts are real costs even though they
         // cannot train a steady throughput estimate.
         self.credit = (self.credit + change).min(self.credit_cap);
-        if self.balances.len() >= 256 && !self.balances.contains_key(&key.family()) {
-            let victim = *self.balances.keys().next().unwrap();
-            self.balances.remove(&victim);
-        }
         let balance = self.balances.entry(key.family()).or_default();
         *balance = (*balance + change).min(self.credit_cap);
         let family_funds = *balance;
@@ -256,6 +281,9 @@ impl Controller {
             self.loan = None;
         }
         if self.trace {
+            if observation.evicted {
+                eprintln!("MTP_CACHE_EVICT {key:?} width={width} victim=unknown");
+            }
             eprintln!(
                 "MTP_OBSERVE {key:?} width={width} seconds={seconds:.6} tokens={tokens} {observation:?} normal={normal:.6} credit={:.6} family={family_funds:.6} loan={:?}",
                 self.credit, self.loan
@@ -263,15 +291,21 @@ impl Controller {
         }
         let cohort = self.cohorts.entry(key).or_default();
         cohort.calls += 1;
-        let displaces_winner = width > 1
-            && observation.evicted
-            && cohort.arms.iter().any(|(&w, a)| {
-                w > 1
-                    && w != width
-                    && a.state == State::Ready
-                    && a.hot(self.generation).time.samples >= 3
-            });
         let arm = cohort.arms.entry(width).or_default();
+        arm.recapture_cost = arm
+            .modes
+            .iter()
+            .filter(|p| p.generation == self.generation && p.time.samples >= 3)
+            .map(|p| p.time.mean)
+            .min_by(f64::total_cmp)
+            .map_or(0., |hot| {
+                arm.recapture_cost * (31. / 32.)
+                    + if observation.preparing {
+                        (seconds - hot).max(0.) / 32.
+                    } else {
+                        0.
+                    }
+            });
         arm.mode = observation.mode;
         arm.last_trial = cohort.calls;
         arm.needs_setup = observation.deferred;
@@ -287,13 +321,9 @@ impl Controller {
         }
         if observation.preparing {
             arm.preparation.observe((seconds - arm.prior).max(1e-6));
-            if displaces_winner {
-                arm.state = State::Cooldown;
-                cohort.cache_cooldown = Some(cohort.calls);
-                if cohort.calibrating == Some(width) {
-                    cohort.calibrating = None;
-                }
-            }
+            // An eviction counter does not identify the victim. Another arm's
+            // actual recapture is charged when it executes, without inventing
+            // a cohort-wide delay from an unrelated graph's eviction.
             return;
         }
         if tokens == 0 {
@@ -366,15 +396,26 @@ impl Controller {
             .map(|c| c.prior_seconds * 4.)
             .filter(|s| s.is_finite())
             .fold(self.calibration_limit, f64::max);
-        let funds = self
-            .credit
-            .min(*self.balances.get(&key.family()).unwrap_or(&0.));
+        let family_funds = *self.balances.get(&key.family()).unwrap_or(&0.);
+        let funds = self.credit.min(family_funds);
+        // Allocate only already-earned model credit, with one lifetime cap
+        // across every batch/context family. An indebted family cannot ask for
+        // another allocation. Execution still debits both ledgers in full.
         self.retain_key(key);
         let cohort = self.cohorts.entry(key).or_default();
         let normal = cohort.arms.get(&1)?.hot(self.generation);
         if normal.time.samples < 3 {
             return None;
         }
+        let transferable = if key.batch > 1 && family_funds >= 0. {
+            // A setup plus three hot samples should not put hundreds of
+            // milliseconds into a packet that normally takes only a few ms.
+            (self.calibration_limit.min(normal.time.mean * 4.) - self.batch_allocated)
+                .max(0.)
+                .min((self.credit - funds).max(0.))
+        } else {
+            0.
+        };
         let normal_seconds = normal
             .time
             .mean
@@ -400,20 +441,42 @@ impl Controller {
             }
             let arm = cohort.arms.get(&candidate.width);
             let p = arm.map(|a| a.hot(self.generation)).unwrap_or_default();
-            let seconds = if p.time.samples > 0 {
+            let recapture_cost = arm.map_or(0., |a| a.recapture_cost);
+            let seconds = (if p.time.samples > 0 {
                 p.time.upper()
             } else {
                 priors[&candidate.width]
-            };
+            }) + recapture_cost;
             if !seconds.is_finite() || seconds <= 0. || seconds > slack {
                 continue;
             }
             let samples = p.time.samples;
+            // Some row geometries cost more than a wider packet. A measured
+            // slower shape cannot win when that wider shape also has at least
+            // its expected yield. Keep its samples instead of periodically
+            // resetting and recapturing an already dominated implementation.
+            // A new mode/generation or an unmeasured alternative still probes.
+            let dominated = samples >= 3
+                && candidates.iter().any(|other| {
+                    if other.width == candidate.width
+                        || other.expected_tokens < candidate.expected_tokens
+                        || !other.expected_tokens.is_finite()
+                    {
+                        return false;
+                    }
+                    let Some(other) = cohort.arms.get(&other.width) else {
+                        return false;
+                    };
+                    let cost = other.recapture_cost;
+                    let other = other.hot(self.generation);
+                    other.time.samples >= 3
+                        && other.time.upper() + cost < p.time.mean + recapture_cost
+                });
             let score = if samples > 0 {
                 // Timing samples describe a shape, not the acceptance of the
                 // current request. Its conditional estimator already shrinks
                 // sparse observations toward the model prior.
-                p.time.mean / candidate.expected_tokens.max(1.)
+                (p.time.mean + recapture_cost) / candidate.expected_tokens.max(1.)
             } else {
                 f64::INFINITY
             };
@@ -422,13 +485,12 @@ impl Controller {
             }
             let stale = arm.is_some_and(|a| cohort.calls.saturating_sub(a.last_trial) >= 32);
             let pending = cohort.calibrating == Some(candidate.width);
-            let recovering = samples < 3 && arm.is_some_and(|a| a.state == State::Ready);
-            let cooling = arm.is_some_and(|a| a.state == State::Cooldown) && !stale
-                || !pending
-                    && !recovering
-                    && cohort
-                        .cache_cooldown
-                        .is_some_and(|at| cohort.calls.saturating_sub(at) < 32);
+            let recovering = samples < 3
+                && arm.is_some_and(|a| {
+                    (a.state == State::Ready || pending && cohort.recovering)
+                        && (a.prior + recapture_cost) / candidate.expected_tokens.max(1.) < baseline
+                });
+            let cooling = arm.is_some_and(|a| a.state == State::Cooldown) && !stale;
             let calibrate = samples < 3 || (stale && score >= baseline);
             // Completed preparation is already charged. Reserve setup again
             // only for a deferred capture or a changed graph generation.
@@ -441,7 +503,7 @@ impl Controller {
             } else {
                 0.
             };
-            let missing = if samples >= 3 { 3 } else { 3 - samples };
+            let missing = if samples >= 3 { 1 } else { 3 - samples };
             let required =
                 setup + missing as f64 * (seconds - baseline * candidate.expected_tokens).max(0.);
             // Calibration needs enough legal invocations before the shortest
@@ -468,7 +530,13 @@ impl Controller {
             } else {
                 funds
             };
+            let allocation = if !pending && !recovering {
+                transferable.min((self.credit - calibration_funds).max(0.))
+            } else {
+                0.
+            };
             let available = calibration_funds
+                + allocation
                 + if loan || initial {
                     self.calibration_limit
                 } else {
@@ -476,19 +544,32 @@ impl Controller {
                 };
             if self.trace {
                 eprintln!(
-                    "MTP_CANDIDATE {key:?} width={} samples={samples} baseline={baseline:.6} seconds={seconds:.6} score={score:.6} pending={pending} setup={setup:.6} required={required:.6} available={available:.6} loan={loan}",
+                    "MTP_CANDIDATE {key:?} width={} samples={samples} baseline={baseline:.6} seconds={seconds:.6} score={score:.6} pending={pending} setup={setup:.6} required={required:.6} available={available:.6} loan={loan} allocation={allocation:.6} cooling={cooling} dominated={dominated} recapture={recapture_cost:.6}",
                     candidate.width
                 );
             }
             if calibrate
+                && !dominated
                 && !cooling
                 && enough_work
                 && (single || required <= recoverable)
                 && (pending || recovering || cohort.calibrating.is_none())
                 && available >= required
-                && probe.is_none()
+                && probe.as_ref().is_none_or(|&(_, _, _, priority, cost)| {
+                    let rank = usize::from(pending) + 2 * usize::from(recovering);
+                    rank > priority
+                        || rank == priority
+                            && recovering
+                            && seconds / candidate.expected_tokens < cost
+                })
             {
-                probe = Some((candidate.width, initial));
+                probe = Some((
+                    candidate.width,
+                    initial,
+                    (required - calibration_funds).max(0.).min(allocation),
+                    usize::from(pending) + 2 * usize::from(recovering),
+                    seconds / candidate.expected_tokens,
+                ));
             }
             let margin = if samples > 0 {
                 ((p.time.upper() - p.time.mean)
@@ -510,7 +591,9 @@ impl Controller {
                 best = Some((candidate.width, score));
             }
         }
-        if let Some((width, initial)) = probe {
+        if let Some((width, initial, allocation, priority, _)) = probe {
+            *self.balances.entry(key.family()).or_default() += allocation;
+            self.batch_allocated += allocation;
             if let Some(previous) = cohort.calibrating.filter(|&previous| previous != width)
                 && let Some(arm) = cohort.arms.get_mut(&previous)
             {
@@ -518,14 +601,15 @@ impl Controller {
                 arm.last_trial = cohort.calls;
             }
             let arm = cohort.arms.entry(width).or_default();
-            if arm.state == State::Cooldown {
-                arm.modes[arm.mode as usize] = Performance {
-                    generation: self.generation,
-                    ..Default::default()
-                };
-            }
+            // A stale retry refreshes measured costs. Only a new mode or
+            // invalidation needs three fresh hot samples; cooldown is not a
+            // change to the arithmetic or launch geometry.
             arm.state = State::Calibrating;
             cohort.calibrating = Some(width);
+            // Keep restoration ahead of other stale/cold probes until its
+            // actual execution mode has three hot samples, including after
+            // the first sample changes the arm from Ready to Calibrating.
+            cohort.recovering = priority >= 2;
             if initial {
                 self.bootstrap_used = true;
                 self.loan = Some((key, width));

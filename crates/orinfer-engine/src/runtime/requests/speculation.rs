@@ -331,7 +331,7 @@ impl ModelRuntime {
             candidates.push(control::Candidate {
                 width,
                 expected_tokens,
-                prior_seconds: baseline + self.mtp_seconds_per_token * (width - 1) as f64,
+                prior_seconds: baseline + self.mtp_seconds_per_draft * (width - 1) as f64,
                 remaining_tokens,
             });
         }
