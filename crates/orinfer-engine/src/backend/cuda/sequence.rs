@@ -2213,6 +2213,7 @@ impl Executor {
             self.sync()?;
             let mut statistics = self.batch_statistics.get();
             statistics.direct_s += at.elapsed().as_secs_f64();
+            statistics.direct_iterations += 1;
             statistics.dynamic_direct_iterations += usize::from(dynamic);
             self.batch_statistics.set(statistics);
         }

@@ -1,5 +1,5 @@
 //! Runtime decisions only: kernels and legal row geometries remain package-owned.
-use crate::scheduler::Estimate;
+use crate::scheduler::{Estimate, ExecutionMode, ExecutionObservation};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -76,20 +76,61 @@ pub(in crate::runtime) struct Key {
     pub context: u32,
     pub sampling: bool,
     pub prefill: usize,
+    pub shared_work: bool,
 }
-#[derive(Default)]
-struct Arm {
-    trials: usize,
+impl Key {
+    fn family(self) -> (usize, bool, usize) {
+        (
+            self.batch,
+            self.sampling,
+            usize::from(self.prefill > 0) + 2 * usize::from(self.shared_work),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Performance {
     time: Estimate,
     tokens: f64,
+    generation: usize,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum State {
+    #[default]
+    Unseen,
+    Calibrating,
+    Ready,
+    Cooldown,
+}
+
+#[derive(Default)]
+struct Arm {
+    modes: [Performance; 3],
+    mode: ExecutionMode,
+    preparation: Estimate,
+    prior: f64,
+    state: State,
     last_trial: usize,
 }
+
+impl Arm {
+    fn hot(&self, generation: usize) -> Performance {
+        let p = self.modes[self.mode as usize];
+        if p.generation == generation {
+            p
+        } else {
+            Performance::default()
+        }
+    }
+}
+
 #[derive(Default)]
 struct Cohort {
     arms: BTreeMap<usize, Arm>,
     calls: usize,
     active: usize,
-    probe_credit: f64,
+    calibrating: Option<usize>,
 }
 #[derive(Clone, Copy, Default, PartialEq)]
 enum SinglePolicy {
@@ -103,6 +144,15 @@ enum SinglePolicy {
 pub(in crate::runtime) struct Controller {
     single_policy: SinglePolicy,
     cohorts: BTreeMap<Key, Cohort>,
+    // Funding survives context changes. Separate family balances prevent a
+    // profitable singleton from subsidizing repeated unprofitable batch probes.
+    balances: BTreeMap<(usize, bool, usize), f64>,
+    credit: f64,
+    credit_cap: f64,
+    calibration_limit: f64,
+    bootstrap_used: bool,
+    loan: Option<(Key, usize)>,
+    generation: usize,
     #[cfg(test)]
     pub(in crate::runtime) fixed_width: Option<usize>,
 }
@@ -120,6 +170,13 @@ impl Default for Controller {
         };
         Self {
             cohorts: Default::default(),
+            balances: Default::default(),
+            credit: 0.,
+            credit_cap: 0.4,
+            calibration_limit: 0.4,
+            bootstrap_used: false,
+            loan: None,
+            generation: 0,
             single_policy,
             #[cfg(test)]
             fixed_width: None,
@@ -132,8 +189,15 @@ pub(in crate::runtime) struct Candidate {
     pub width: usize,
     pub expected_tokens: f64,
     pub prior_seconds: f64,
+    pub remaining_tokens: usize,
 }
 impl Controller {
+    pub(in crate::runtime) fn set_calibration_limit(&mut self, seconds: f64) {
+        if seconds.is_finite() && seconds > 0. {
+            self.calibration_limit = seconds;
+        }
+    }
+
     fn retain_key(&mut self, key: Key) {
         if self.cohorts.len() >= 256 && !self.cohorts.contains_key(&key) {
             let oldest = self.cohorts.keys().next().copied().unwrap();
@@ -146,27 +210,90 @@ impl Controller {
         width: usize,
         seconds: f64,
         tokens: usize,
+        observation: ExecutionObservation,
     ) {
-        if !seconds.is_finite() || seconds <= 0. || tokens == 0 {
+        if !seconds.is_finite() || seconds <= 0. {
             return;
         }
         self.retain_key(key);
-        let cohort = self.cohorts.entry(key).or_default();
-        let arm = cohort.arms.entry(width).or_default();
-        if key.batch == 1 && key.prefill == 0 && width > 1 && arm.trials == 1 {
-            // Exclude the first cold graph/module cost from the steady estimate.
-            // The width-one baseline keeps every observation: its cohort gate
-            // requires three plain samples before any speculation is weighed.
-            arm.time = Default::default();
+        self.generation = observation.generation;
+        let normal = self
+            .cohorts
+            .get(&key)
+            .and_then(|c| c.arms.get(&1))
+            .map(|a| a.hot(self.generation).time.mean / key.batch.max(1) as f64)
+            .unwrap_or(0.);
+        let change = if width == 1 && tokens > 0 {
+            seconds * 0.02
+        } else {
+            normal * tokens as f64 - seconds
+        };
+        // Preparation and zero-yield attempts are real costs even though they
+        // cannot train a steady throughput estimate.
+        self.credit = (self.credit + change).min(self.credit_cap);
+        if self.balances.len() >= 256 && !self.balances.contains_key(&key.family()) {
+            let victim = *self.balances.keys().next().unwrap();
+            self.balances.remove(&victim);
         }
-        arm.trials += 1;
-        arm.time.observe(seconds);
-        arm.tokens = if arm.time.samples == 1 {
+        let balance = self.balances.entry(key.family()).or_default();
+        *balance = (*balance + change).min(self.credit_cap);
+        let cohort = self.cohorts.entry(key).or_default();
+        cohort.calls += 1;
+        let arm = cohort.arms.entry(width).or_default();
+        arm.mode = observation.mode;
+        arm.last_trial = cohort.calls;
+        if observation.preparing || observation.evicted {
+            arm.modes = [Performance {
+                generation: self.generation,
+                ..Default::default()
+            }; 3];
+        }
+        let p = &mut arm.modes[arm.mode as usize];
+        if p.generation != self.generation {
+            *p = Performance {
+                generation: self.generation,
+                ..Default::default()
+            };
+        }
+        if observation.preparing || observation.evicted {
+            arm.preparation.observe((seconds - arm.prior).max(1e-6));
+            return;
+        }
+        if tokens == 0 {
+            return;
+        }
+        p.time.observe(seconds);
+        p.tokens = if p.time.samples == 1 {
             tokens as f64
         } else {
-            arm.tokens * 0.8 + tokens as f64 * 0.2
+            p.tokens * 0.8 + tokens as f64 * 0.2
         };
-        arm.last_trial = cohort.calls;
+        arm.prior = p.time.upper();
+        arm.state = if p.time.samples >= 3 {
+            State::Ready
+        } else {
+            State::Calibrating
+        };
+        if width > 1 && p.time.samples >= 3 {
+            if cohort.calibrating == Some(width) {
+                cohort.calibrating = None;
+            }
+            if self.loan == Some((key, width)) {
+                self.loan = None;
+            }
+        }
+    }
+
+    fn prior(&self, key: Key, width: usize, fallback: f64) -> f64 {
+        self.cohorts
+            .iter()
+            .filter(|(k, _)| k.family() == key.family() && k.context.abs_diff(key.context) <= 1)
+            .filter_map(|(k, c)| {
+                let arm = c.arms.get(&width)?;
+                (arm.prior > 0.).then_some((k.context.abs_diff(key.context), arm.prior))
+            })
+            .min_by_key(|(distance, _)| *distance)
+            .map_or(fallback, |(_, seconds)| seconds)
     }
     pub(in crate::runtime) fn choose(
         &mut self,
@@ -190,16 +317,22 @@ impl Controller {
                 .max_by_key(|c| c.width)
                 .map(|c| (c.width, false));
         }
-        let explore_single = single
-            && matches!(
-                self.single_policy,
-                SinglePolicy::Explore | SinglePolicy::ExploreLocal
-            );
         let local_acceptance = single && self.single_policy == SinglePolicy::ExploreLocal;
+        let priors: BTreeMap<_, _> = candidates
+            .iter()
+            .map(|c| (c.width, self.prior(key, c.width, c.prior_seconds)))
+            .collect();
+        self.credit_cap = candidates
+            .iter()
+            .map(|c| c.prior_seconds * 4.)
+            .filter(|s| s.is_finite())
+            .fold(self.calibration_limit, f64::max);
+        let funds = self
+            .credit
+            .min(*self.balances.get(&key.family()).unwrap_or(&0.));
         self.retain_key(key);
         let cohort = self.cohorts.entry(key).or_default();
-        cohort.calls += 1;
-        let normal = cohort.arms.get(&1)?;
+        let normal = cohort.arms.get(&1)?.hot(self.generation);
         if normal.time.samples < 3 {
             return None;
         }
@@ -208,81 +341,96 @@ impl Controller {
             .mean
             .max(normal_seconds.min(normal.time.upper()));
         let baseline = normal_seconds / key.batch.max(1) as f64;
-        let credit_cap = cohort
-            .arms
-            .values()
-            .map(|a| a.time.upper())
-            .chain(
-                candidates
-                    .iter()
-                    .map(|c| c.prior_seconds)
-                    .filter(|s| s.is_finite() && *s > 0. && *s <= slack),
-            )
-            .fold(normal_seconds * 4., f64::max);
-        cohort.probe_credit = (cohort.probe_credit + normal_seconds * 0.02).min(credit_cap);
-        let bootstrap = candidates
-            .iter()
-            .filter(|c| c.width >= 2)
-            .map(|c| c.width)
-            .min();
-        let cold_pending = candidates.iter().any(|c| {
-            c.width >= 2
-                && c.expected_tokens > 0.
-                && c.prior_seconds.is_finite()
-                && c.prior_seconds > 0.
-                && c.prior_seconds <= slack
-                && cohort
-                    .arms
-                    .get(&c.width)
-                    .is_none_or(|a| a.time.samples == 0)
-        });
+        if cohort
+            .calibrating
+            .is_some_and(|w| !candidates.iter().any(|c| c.width == w))
+        {
+            cohort.calibrating = None;
+            if self.loan.is_some_and(|(k, _)| k == key) {
+                self.loan = None;
+            }
+        }
         let mut best = None;
         let mut probe = None;
         for candidate in candidates {
-            if candidate.width < 2 || candidate.expected_tokens <= 0. {
+            if candidate.width < 2
+                || !candidate.expected_tokens.is_finite()
+                || candidate.expected_tokens <= 0.
+            {
                 continue;
             }
             let arm = cohort.arms.get(&candidate.width);
-            let seconds = arm.map_or(candidate.prior_seconds, |a| a.time.upper());
+            let p = arm.map(|a| a.hot(self.generation)).unwrap_or_default();
+            let seconds = if p.time.samples > 0 {
+                p.time.upper()
+            } else {
+                priors[&candidate.width]
+            };
             if !seconds.is_finite() || seconds <= 0. || seconds > slack {
                 continue;
             }
-            let samples = arm.map_or(0, |a| a.time.samples);
-            let score = arm.map_or(f64::INFINITY, |a| {
+            let samples = p.time.samples;
+            let score = if samples > 0 {
                 // Request-local acceptance already includes sparse-sample shrinkage.
                 // A previous prompt's acceptance must not cap this prompt's yield.
                 let expected = if local_acceptance {
                     candidate.expected_tokens
                 } else {
-                    candidate.expected_tokens.min(a.tokens)
+                    candidate.expected_tokens.min(p.tokens)
                 };
-                a.time.mean / expected.max(1.)
-            });
-            // Bootstrap the cheapest depth even with an uncertain cold prior.
-            // Other cold depths must either predict a win or spend accumulated
-            // time credit; a short cohort cannot afford a free sweep of all arms.
-            // Include cold priors in credit_cap so pessimistic estimates never
-            // permanently prevent discovering a profitable depth.
-            let initial = samples == 0
-                && (Some(candidate.width) == bootstrap
-                    || candidate.prior_seconds / candidate.expected_tokens < baseline);
-            let promising = samples < 3 && score < baseline * 1.1;
+                p.time.mean / expected.max(1.)
+            } else {
+                f64::INFINITY
+            };
             let stale = arm.is_some_and(|a| cohort.calls.saturating_sub(a.last_trial) >= 32);
-            // Cheap stale losers must not repeatedly consume all credit before
-            // a more expensive, still unseen depth gets its first measurement.
-            let retry = (stale || samples == 0)
-                && (samples == 0 || !cold_pending)
-                && cohort.probe_credit >= seconds;
-            if ((explore_single && samples < 3) || initial || promising || retry) && probe.is_none()
+            let pending = cohort.calibrating == Some(candidate.width);
+            let calibrate = samples < 3 || (stale && score >= baseline);
+            // A deferred graph can still need capture on its next invocation.
+            // Keep funding preparation until an actual hot sample arrives.
+            let setup = if samples == 0 {
+                arm.filter(|a| a.preparation.samples > 0)
+                    .map_or(seconds, |a| a.preparation.upper())
+            } else {
+                0.
+            };
+            let missing = if samples >= 3 { 3 } else { 3 - samples };
+            let required =
+                setup + missing as f64 * (seconds - baseline * candidate.expected_tokens).max(0.);
+            // Calibration needs enough legal invocations before the shortest
+            // owner finishes. Even a zero-overhead draft cannot repay setup
+            // beyond this optimistic bound on the remaining batch's savings.
+            let enough_work = candidate.remaining_tokens
+                >= key.batch.saturating_mul(candidate.width + missing - 1);
+            let recoverable = baseline
+                * candidate.remaining_tokens as f64
+                * (1. - key.batch as f64 / candidate.expected_tokens).max(0.);
+            let loan = self
+                .loan
+                .is_some_and(|(k, w)| k.family() == key.family() && w == candidate.width);
+            let initial = single && !key.shared_work && !self.bootstrap_used;
+            let available = funds
+                + if loan || initial {
+                    self.calibration_limit
+                } else {
+                    0.
+                };
+            if calibrate
+                && enough_work
+                && (single || required <= recoverable)
+                && (pending || cohort.calibrating.is_none())
+                && available >= required
+                && probe.is_none()
             {
-                probe = Some((candidate.width, if retry { seconds } else { 0. }));
+                probe = Some((candidate.width, initial));
             }
-            let margin = arm.map_or(1., |a| {
-                ((a.time.upper() - a.time.mean)
-                    / a.time.mean.max(1e-9)
+            let margin = if samples > 0 {
+                ((p.time.upper() - p.time.mean)
+                    / p.time.mean.max(1e-9)
                     / (samples.max(1) as f64).sqrt())
                 .clamp(0.01, 0.1)
-            });
+            } else {
+                0.1
+            };
             let threshold = if cohort.active == candidate.width {
                 1.
             } else {
@@ -295,9 +443,34 @@ impl Controller {
                 best = Some((candidate.width, score));
             }
         }
-        if let Some((width, charged)) = probe {
-            cohort.probe_credit -= charged;
+        if let Some((width, initial)) = probe {
+            let arm = cohort.arms.entry(width).or_default();
+            if arm.state == State::Cooldown {
+                arm.modes[arm.mode as usize] = Performance {
+                    generation: self.generation,
+                    ..Default::default()
+                };
+            }
+            arm.state = State::Calibrating;
+            cohort.calibrating = Some(width);
+            if initial {
+                self.bootstrap_used = true;
+                self.loan = Some((key, width));
+            } else if self
+                .loan
+                .is_some_and(|(k, w)| k.family() == key.family() && w == width)
+            {
+                self.loan = Some((key, width));
+            }
             return Some((width, true));
+        }
+        for (&width, arm) in &mut cohort.arms {
+            if width > 1
+                && arm.hot(self.generation).time.samples >= 3
+                && best.is_none_or(|(w, _)| w != width)
+            {
+                arm.state = State::Cooldown;
+            }
         }
         cohort.active = best.map_or(0, |(width, _)| width);
         best.map(|(width, _)| (width, false))
@@ -305,202 +478,5 @@ impl Controller {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn row_budget_favors_accepting_prefixes_and_respects_caps_and_holes() {
-        let choices = vec![
-            vec![(2, 1.9), (3, 2.7), (4, 3.4)],
-            vec![(2, 1.2), (3, 1.22), (4, 1.221)],
-        ];
-        assert_eq!(allocate(&choices, 6), Some(vec![4, 2]));
-        assert_eq!(allocate(&choices, 8), Some(vec![4, 4]));
-        assert_eq!(allocate(&choices, 9), None);
-        assert_eq!(allocate(&choices, 3), None);
-        assert_eq!(allocate(&[vec![(2, 1.8), (4, 2.9)]], 3), None);
-        assert_eq!(allocate(&[vec![(2, 1.8), (4, 2.9)]], 4), Some(vec![4]));
-    }
-    #[test]
-    fn single_fixed_respects_legal_widths_and_leaves_batch_adaptive() {
-        let mut c = Controller {
-            single_policy: SinglePolicy::Fixed(4),
-            ..Default::default()
-        };
-        let plans = [
-            Candidate {
-                width: 2,
-                expected_tokens: 1.5,
-                prior_seconds: 0.03,
-            },
-            Candidate {
-                width: 3,
-                expected_tokens: 2.,
-                prior_seconds: 0.04,
-            },
-        ];
-        assert_eq!(c.choose(key(1), &plans, 0.02, 0.4), Some((3, false)));
-        assert_eq!(c.choose(key(2), &plans, 0.02, 0.4), None);
-        assert_eq!(c.choose(key(1), &plans, 0.02, 0.01), None);
-        c.single_policy = SinglePolicy::Fixed(1);
-        assert_eq!(c.choose(key(1), &plans, 0.02, 0.4), None);
-    }
-    #[test]
-    fn single_explore_replaces_one_cold_sample_only() {
-        let mut c = Controller {
-            single_policy: SinglePolicy::Explore,
-            ..Default::default()
-        };
-        c.observe(key(1), 3, 1., 2);
-        c.observe(key(1), 3, 0.03, 2);
-        assert_eq!(c.cohorts[&key(1)].arms[&3].time.samples, 1);
-        c.observe(key(1), 3, 0.03, 2);
-        assert_eq!(c.cohorts[&key(1)].arms[&3].time.samples, 2);
-        assert!((c.cohorts[&key(1)].arms[&3].time.mean - 0.03).abs() < 1e-9);
-    }
-    #[test]
-    fn single_local_acceptance_does_not_inherit_another_prompts_rejection_rate() {
-        let mut c = Controller {
-            single_policy: SinglePolicy::ExploreLocal,
-            ..Default::default()
-        };
-        for _ in 0..4 {
-            c.observe(key(1), 1, 0.03, 1);
-            c.observe(key(1), 3, 0.05, 3);
-            c.observe(key(1), 4, 0.055, 2);
-        }
-        let plans = [
-            Candidate {
-                width: 3,
-                expected_tokens: 2.8,
-                prior_seconds: 0.05,
-            },
-            Candidate {
-                width: 4,
-                expected_tokens: 3.8,
-                prior_seconds: 0.055,
-            },
-        ];
-        assert_eq!(c.choose(key(1), &plans, 0.03, 0.4), Some((4, false)));
-        c.single_policy = SinglePolicy::Explore;
-        assert_eq!(c.choose(key(1), &plans, 0.03, 0.4), Some((3, false)));
-    }
-    fn key(batch: usize) -> Key {
-        Key {
-            batch,
-            context: 8,
-            sampling: false,
-            prefill: 0,
-        }
-    }
-    fn normal(c: &mut Controller, k: Key) {
-        for _ in 0..3 {
-            c.observe(k, 1, 0.02, k.batch);
-        }
-    }
-    #[test]
-    fn acceptance_tracks_tested_prefix_and_never_invents_suffix_samples() {
-        let mut a = Acceptance::default();
-        a.observe(3, 1);
-        assert_eq!(a.samples, [1, 1, 0, 0, 0, 0, 0]);
-        assert!(a.expected(2) > 1. && a.expected(2) < 3.);
-        a.observe(1, 1);
-        assert_eq!(a.samples[1], 1);
-    }
-    #[test]
-    fn selects_goodput_and_retains_ordinary_as_a_real_candidate() {
-        let mut c = Controller::default();
-        let k = key(4);
-        normal(&mut c, k);
-        let plans = [
-            Candidate {
-                width: 2,
-                expected_tokens: 7.,
-                prior_seconds: 0.03,
-            },
-            Candidate {
-                width: 3,
-                expected_tokens: 9.,
-                prior_seconds: 0.04,
-            },
-        ];
-        assert_eq!(c.choose(k, &plans, 0.02, 0.1), Some((2, true)));
-        for _ in 0..3 {
-            c.observe(k, 2, 0.03, 7);
-            c.observe(k, 3, 0.05, 9);
-        }
-        assert_eq!(c.choose(k, &plans, 0.02, 0.1), Some((2, false)));
-        let low = [Candidate {
-            expected_tokens: 4.2,
-            ..plans[0]
-        }];
-        assert_eq!(c.choose(k, &low, 0.02, 0.1), None);
-        assert_eq!(c.choose(k, &plans, 0.02, 0.001), None);
-    }
-    #[test]
-    fn disabled_plans_reprobe_and_batch_changes_have_independent_costs() {
-        let mut c = Controller::default();
-        let k = key(1);
-        normal(&mut c, k);
-        let plans = [Candidate {
-            width: 2,
-            expected_tokens: 1.5,
-            prior_seconds: 0.04,
-        }];
-        c.observe(k, 2, 0.04, 1);
-        assert!((0..150).any(|_| c.choose(k, &plans, 0.02, 0.1) == Some((2, true))));
-        assert_eq!(c.choose(key(128), &plans, 0.2, 1.), None);
-        c.observe(k, 2, f64::NAN, 1);
-        assert_eq!(c.cohorts[&k].arms[&2].time.samples, 1);
-    }
-    #[test]
-    fn slow_rejected_arm_can_accumulate_enough_credit_for_a_retry() {
-        let mut c = Controller::default();
-        let k = key(1);
-        normal(&mut c, k);
-        let plans = [Candidate {
-            width: 2,
-            expected_tokens: 1.5,
-            prior_seconds: 0.2,
-        }];
-        c.observe(k, 2, 0.2, 1);
-        assert!((0..1000).any(|_| c.choose(k, &plans, 0.02, 1.) == Some((2, true))));
-    }
-    #[test]
-    fn cold_expensive_depths_wait_for_credit_without_becoming_unreachable() {
-        let mut c = Controller::default();
-        let k = key(1);
-        normal(&mut c, k);
-        let plans = [
-            Candidate {
-                width: 2,
-                expected_tokens: 1.5,
-                prior_seconds: 0.04,
-            },
-            Candidate {
-                width: 3,
-                expected_tokens: 1.6,
-                prior_seconds: 0.2,
-            },
-        ];
-        assert_eq!(c.choose(k, &plans, 0.02, 1.), Some((2, true)));
-        c.observe(k, 2, 0.04, 1);
-        for _ in 0..20 {
-            assert_eq!(c.choose(k, &plans, 0.02, 1.), None);
-        }
-        let mut discovered = false;
-        for _ in 0..1000 {
-            match c.choose(k, &plans, 0.02, 1.) {
-                Some((2, _)) => c.observe(k, 2, 0.04, 1),
-                Some((3, _)) => {
-                    discovered = true;
-                    break;
-                }
-                _ => (),
-            }
-        }
-        assert!(
-            discovered,
-            "Cold prior must not cap credit below its trial cost"
-        );
-    }
-}
+#[path = "control_tests.rs"]
+mod tests;

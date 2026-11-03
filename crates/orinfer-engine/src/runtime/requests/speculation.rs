@@ -160,6 +160,7 @@ impl ModelRuntime {
                 .filter(|(i, _)| requests[*i].prefilling)
                 .map(|(_, n)| n)
                 .sum(),
+            shared_work: selected.iter().any(|(i, _)| requests[*i].shared_work),
         }
     }
     pub(super) fn speculation_feedback(
@@ -233,6 +234,18 @@ impl ModelRuntime {
             .filter(|(i, _)| !requests[*i].prefilling)
             .map(|(i, _)| *i)
             .collect();
+        let remaining_tokens = owners
+            .iter()
+            .map(|&i| {
+                let req = &requests[i];
+                (req.limit - req.generated).min(
+                    self.manifest
+                        .max_context
+                        .saturating_sub(req.history.len().saturating_sub(1)),
+                )
+            })
+            .min()?
+            .saturating_mul(key.batch);
         let choices: Vec<Vec<_>> = owners
             .iter()
             .map(|&i| {
@@ -319,9 +332,12 @@ impl ModelRuntime {
                 width,
                 expected_tokens,
                 prior_seconds: baseline + self.mtp_seconds_per_token * (width - 1) as f64,
+                remaining_tokens,
             });
         }
         candidates.sort_by_key(|c| c.width);
+        self.dynamic_speculation
+            .set_calibration_limit(options.target_tpot_ms / 1000.);
         let decision = self
             .dynamic_speculation
             .choose(key, &candidates, baseline, slack);

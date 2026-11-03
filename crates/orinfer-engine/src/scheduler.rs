@@ -358,6 +358,7 @@ pub struct BatchExecutionStatistics {
     pub workspace_mapping_s: f64,
     pub dynamic_graph_captures: usize,
     pub dynamic_direct_iterations: usize,
+    pub direct_iterations: usize,
     pub graph_capture_deferrals: usize,
     pub graph_hits: usize,
     pub graph_misses: usize,
@@ -380,6 +381,45 @@ impl BatchExecutionStatistics {
     pub(crate) fn initialization_s(self) -> f64 {
         self.kernel_load_s + self.workspace_mapping_s
     }
+
+    pub(crate) fn observation_since(self, before: Self) -> ExecutionObservation {
+        let replay = self.graph_hits > before.graph_hits || self.replay_s > before.replay_s;
+        let direct = self.direct_iterations > before.direct_iterations;
+        ExecutionObservation {
+            mode: match (direct, replay) {
+                (true, true) => ExecutionMode::Mixed,
+                (false, true) => ExecutionMode::Replay,
+                _ => ExecutionMode::Direct,
+            },
+            preparing: self.initialization_s() > before.initialization_s()
+                || self.capture_s > before.capture_s
+                || self.sequence_capture_s > before.sequence_capture_s
+                || self.graph_capture_deferrals > before.graph_capture_deferrals,
+            evicted: self.graph_evictions > before.graph_evictions,
+            // An eviction can remove another arm's graph. Invalidate its old
+            // readiness too; its timing remains usable only as a cost prior.
+            generation: self
+                .graph_invalidations
+                .saturating_add(self.graph_evictions),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExecutionMode {
+    #[default]
+    Direct,
+    Replay,
+    Mixed,
+}
+
+/// Describes work that actually ran; a prior estimate cannot make a cold graph ready.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExecutionObservation {
+    pub mode: ExecutionMode,
+    pub preparing: bool,
+    pub evicted: bool,
+    pub generation: usize,
 }
 
 #[derive(Default, Clone, Debug, Serialize)]

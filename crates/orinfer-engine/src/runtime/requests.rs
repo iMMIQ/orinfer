@@ -50,6 +50,7 @@ pub struct RequestState {
     lookup_costs: BTreeMap<usize, speculation::Profile>,
     prompt_lookup: prompt_lookup::PromptLookup,
     mtp_blocked: bool,
+    shared_work: bool,
     draft_acceptance: speculation::control::Acceptance,
     decoder: crate::sampling::Decoder,
     cache_prompt: bool,
@@ -730,6 +731,7 @@ impl ModelRuntime {
                 lookup_costs: Default::default(),
                 prompt_lookup: Default::default(),
                 mtp_blocked: false,
+                shared_work: false,
                 draft_acceptance: Default::default(),
                 decoder: Default::default(),
                 cache_prompt: true,
@@ -1319,6 +1321,11 @@ impl ModelRuntime {
         if requests.is_empty() {
             return Ok(vec![]);
         }
+        if requests.iter().filter(|r| !r.is_finished()).count() > 1 {
+            for r in requests.iter_mut() {
+                r.shared_work = true;
+            }
+        }
         // Encoder work follows the selected text packet. Encoding every admitted
         // recording here would delay existing decoders and the first prompt
         // behind media that cannot fit in this iteration's token budget.
@@ -1505,22 +1512,18 @@ impl ModelRuntime {
         }
         if let Some(feedback) = feedback {
             let stats = self.execution.batch_statistics();
-            let cold = stats.initialization_s() - feedback_stats.initialization_s()
-                + stats.capture_s
-                - feedback_stats.capture_s
-                + stats.sequence_capture_s
-                - feedback_stats.sequence_capture_s;
             if requests.iter().map(|r| r.mtp.lookup_rounds).sum::<usize>() == feedback.lookups {
                 self.dynamic_speculation.observe(
                     feedback.key,
                     feedback.width,
-                    (feedback_at.elapsed().as_secs_f64() - cold).max(1e-6),
+                    feedback_at.elapsed().as_secs_f64(),
                     feedback
                         .indices
                         .iter()
                         .map(|&i| requests[i].generated)
                         .sum::<usize>()
                         - feedback.generated,
+                    stats.observation_since(feedback_stats),
                 );
             }
         }
