@@ -112,6 +112,7 @@ struct Arm {
     prior: f64,
     state: State,
     last_trial: usize,
+    needs_setup: bool,
 }
 
 impl Arm {
@@ -131,6 +132,7 @@ struct Cohort {
     calls: usize,
     active: usize,
     calibrating: Option<usize>,
+    cache_cooldown: Option<usize>,
 }
 #[derive(Clone, Copy, Default, PartialEq)]
 enum SinglePolicy {
@@ -153,6 +155,7 @@ pub(in crate::runtime) struct Controller {
     bootstrap_used: bool,
     loan: Option<(Key, usize)>,
     generation: usize,
+    trace: bool,
     #[cfg(test)]
     pub(in crate::runtime) fixed_width: Option<usize>,
 }
@@ -177,6 +180,7 @@ impl Default for Controller {
             bootstrap_used: false,
             loan: None,
             generation: 0,
+            trace: std::env::var("ORINFER_MTP_TRACE").as_deref() == Ok("1"),
             single_policy,
             #[cfg(test)]
             fixed_width: None,
@@ -228,6 +232,10 @@ impl Controller {
         } else {
             normal * tokens as f64 - seconds
         };
+        let previous_loan_funds = self.loan.map(|(k, _)| {
+            self.credit
+                .min(*self.balances.get(&k.family()).unwrap_or(&0.))
+        });
         // Preparation and zero-yield attempts are real costs even though they
         // cannot train a steady throughput estimate.
         self.credit = (self.credit + change).min(self.credit_cap);
@@ -237,17 +245,39 @@ impl Controller {
         }
         let balance = self.balances.entry(key.family()).or_default();
         *balance = (*balance + change).min(self.credit_cap);
+        let family_funds = *balance;
+        if previous_loan_funds.is_some_and(|funds| funds < 0.)
+            && self.loan.is_some_and(|(k, _)| {
+                self.credit
+                    .min(*self.balances.get(&k.family()).unwrap_or(&0.))
+                    >= 0.
+            })
+        {
+            self.loan = None;
+        }
+        if self.trace {
+            eprintln!(
+                "MTP_OBSERVE {key:?} width={width} seconds={seconds:.6} tokens={tokens} {observation:?} normal={normal:.6} credit={:.6} family={family_funds:.6} loan={:?}",
+                self.credit, self.loan
+            );
+        }
         let cohort = self.cohorts.entry(key).or_default();
         cohort.calls += 1;
+        let displaces_winner = width > 1
+            && observation.evicted
+            && cohort.arms.iter().any(|(&w, a)| {
+                w > 1
+                    && w != width
+                    && a.state == State::Ready
+                    && a.hot(self.generation).time.samples >= 3
+            });
         let arm = cohort.arms.entry(width).or_default();
         arm.mode = observation.mode;
         arm.last_trial = cohort.calls;
-        if observation.preparing || observation.evicted {
-            arm.modes = [Performance {
-                generation: self.generation,
-                ..Default::default()
-            }; 3];
-        }
+        arm.needs_setup = observation.deferred;
+        // Capture and unrelated eviction do not change the hot arithmetic of
+        // this shape. Keep its measured modes; an explicit invalidation below
+        // still discards samples from an obsolete generation.
         let p = &mut arm.modes[arm.mode as usize];
         if p.generation != self.generation {
             *p = Performance {
@@ -255,8 +285,15 @@ impl Controller {
                 ..Default::default()
             };
         }
-        if observation.preparing || observation.evicted {
+        if observation.preparing {
             arm.preparation.observe((seconds - arm.prior).max(1e-6));
+            if displaces_winner {
+                arm.state = State::Cooldown;
+                cohort.cache_cooldown = Some(cohort.calls);
+                if cohort.calibrating == Some(width) {
+                    cohort.calibrating = None;
+                }
+            }
             return;
         }
         if tokens == 0 {
@@ -278,7 +315,10 @@ impl Controller {
             if cohort.calibrating == Some(width) {
                 cohort.calibrating = None;
             }
-            if self.loan == Some((key, width)) {
+            // A profitable arm may cross a context bucket before its cold
+            // preparation is repaid. Keep the same bounded loan for its next
+            // calibration; readiness alone does not repay that debt.
+            if self.loan == Some((key, width)) && self.credit.min(family_funds) >= 0. {
                 self.loan = None;
             }
         }
@@ -317,7 +357,6 @@ impl Controller {
                 .max_by_key(|c| c.width)
                 .map(|c| (c.width, false));
         }
-        let local_acceptance = single && self.single_policy == SinglePolicy::ExploreLocal;
         let priors: BTreeMap<_, _> = candidates
             .iter()
             .map(|c| (c.width, self.prior(key, c.width, c.prior_seconds)))
@@ -371,25 +410,34 @@ impl Controller {
             }
             let samples = p.time.samples;
             let score = if samples > 0 {
-                // Request-local acceptance already includes sparse-sample shrinkage.
-                // A previous prompt's acceptance must not cap this prompt's yield.
-                let expected = if local_acceptance {
-                    candidate.expected_tokens
-                } else {
-                    candidate.expected_tokens.min(p.tokens)
-                };
-                p.time.mean / expected.max(1.)
+                // Timing samples describe a shape, not the acceptance of the
+                // current request. Its conditional estimator already shrinks
+                // sparse observations toward the model prior.
+                p.time.mean / candidate.expected_tokens.max(1.)
             } else {
                 f64::INFINITY
             };
+            if self.loan == Some((key, candidate.width)) && samples >= 3 && score >= baseline {
+                self.loan = None;
+            }
             let stale = arm.is_some_and(|a| cohort.calls.saturating_sub(a.last_trial) >= 32);
             let pending = cohort.calibrating == Some(candidate.width);
+            let recovering = samples < 3 && arm.is_some_and(|a| a.state == State::Ready);
+            let cooling = arm.is_some_and(|a| a.state == State::Cooldown) && !stale
+                || !pending
+                    && !recovering
+                    && cohort
+                        .cache_cooldown
+                        .is_some_and(|at| cohort.calls.saturating_sub(at) < 32);
             let calibrate = samples < 3 || (stale && score >= baseline);
-            // A deferred graph can still need capture on its next invocation.
-            // Keep funding preparation until an actual hot sample arrives.
-            let setup = if samples == 0 {
+            // Completed preparation is already charged. Reserve setup again
+            // only for a deferred capture or a changed graph generation.
+            let needs_setup = arm.is_none_or(|a| {
+                a.needs_setup || a.modes[a.mode as usize].generation != self.generation
+            });
+            let setup = if samples == 0 && (!pending || needs_setup) {
                 arm.filter(|a| a.preparation.samples > 0)
-                    .map_or(seconds, |a| a.preparation.upper())
+                    .map_or(seconds, |a| a.preparation.upper().min(seconds))
             } else {
                 0.
             };
@@ -404,20 +452,39 @@ impl Controller {
             let recoverable = baseline
                 * candidate.remaining_tokens as f64
                 * (1. - key.batch as f64 / candidate.expected_tokens).max(0.);
-            let loan = self
-                .loan
-                .is_some_and(|(k, w)| k.family() == key.family() && w == candidate.width);
+            let loan = self.loan.is_some_and(|(k, w)| {
+                k.family() == key.family()
+                    && k.context.abs_diff(key.context) <= 1
+                    && w == candidate.width
+                    && samples < 3
+            });
             let initial = single && !key.shared_work && !self.bootstrap_used;
-            let available = funds
+            // Admission was funded by this family's earned allowance. Finish
+            // that calibration using actual model-wide savings as well; a
+            // cold debit must not strand a profitable batch after one sample.
+            // This grants no new loan and cannot admit another cold arm.
+            let calibration_funds = if (pending || recovering) && samples < 3 {
+                self.credit
+            } else {
+                funds
+            };
+            let available = calibration_funds
                 + if loan || initial {
                     self.calibration_limit
                 } else {
                     0.
                 };
+            if self.trace {
+                eprintln!(
+                    "MTP_CANDIDATE {key:?} width={} samples={samples} baseline={baseline:.6} seconds={seconds:.6} score={score:.6} pending={pending} setup={setup:.6} required={required:.6} available={available:.6} loan={loan}",
+                    candidate.width
+                );
+            }
             if calibrate
+                && !cooling
                 && enough_work
                 && (single || required <= recoverable)
-                && (pending || cohort.calibrating.is_none())
+                && (pending || recovering || cohort.calibrating.is_none())
                 && available >= required
                 && probe.is_none()
             {
@@ -444,6 +511,12 @@ impl Controller {
             }
         }
         if let Some((width, initial)) = probe {
+            if let Some(previous) = cohort.calibrating.filter(|&previous| previous != width)
+                && let Some(arm) = cohort.arms.get_mut(&previous)
+            {
+                arm.state = State::Cooldown;
+                arm.last_trial = cohort.calls;
+            }
             let arm = cohort.arms.entry(width).or_default();
             if arm.state == State::Cooldown {
                 arm.modes[arm.mode as usize] = Performance {
@@ -473,6 +546,9 @@ impl Controller {
             }
         }
         cohort.active = best.map_or(0, |(width, _)| width);
+        if let Some((width, _)) = best {
+            cohort.arms.get_mut(&width).unwrap().state = State::Ready;
+        }
         best.map(|(width, _)| (width, false))
     }
 }

@@ -76,8 +76,82 @@ fn cold_loss_does_not_starve_funded_single_calibration() {
         hot(&mut c, k, 2, 0.04, 2);
     }
     assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, false)));
-    assert!(c.loan.is_none());
+    assert!(c.loan.is_some());
     assert!(c.bootstrap_used);
+}
+
+#[test]
+fn initial_profitable_loan_survives_context_change_until_repaid() {
+    let mut c = Controller::default();
+    let k = key(1);
+    normal(&mut c, k);
+    let plans = [candidate(2, 1.8, 0.06)];
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, true)));
+    c.observe(
+        k,
+        2,
+        0.2,
+        1,
+        ExecutionObservation {
+            preparing: true,
+            ..Default::default()
+        },
+    );
+    for _ in 0..3 {
+        hot(&mut c, k, 2, 0.04, 2);
+    }
+    assert!(c.credit < 0. && c.loan.is_some());
+    let neighbor = Key { context: 9, ..k };
+    normal(&mut c, neighbor);
+    for _ in 0..3 {
+        assert_eq!(c.choose(neighbor, &plans, 0.03, 0.4), Some((2, true)));
+        hot(&mut c, neighbor, 2, 0.04, 2);
+    }
+    assert_eq!(c.choose(neighbor, &plans, 0.03, 0.4), Some((2, false)));
+    for _ in 0..3 {
+        hot(&mut c, neighbor, 2, 0.04, 2);
+    }
+    assert!(c.credit >= 0. && c.loan.is_none());
+    let next = Key {
+        context: 10,
+        ..neighbor
+    };
+    normal(&mut c, next);
+    assert_eq!(c.choose(next, &plans, 0.03, 0.4), None);
+    assert!(c.bootstrap_used);
+}
+
+#[test]
+fn outstanding_loan_does_not_fund_a_stale_loser_retry() {
+    let mut c = Controller::default();
+    let k = key(1);
+    normal(&mut c, k);
+    assert_eq!(
+        c.choose(k, &[candidate(2, 1.8, 0.06)], 0.03, 0.4),
+        Some((2, true))
+    );
+    c.observe(
+        k,
+        2,
+        0.2,
+        1,
+        ExecutionObservation {
+            preparing: true,
+            ..Default::default()
+        },
+    );
+    for _ in 0..3 {
+        hot(&mut c, k, 2, 0.04, 2);
+    }
+    for _ in 0..32 {
+        hot(&mut c, k, 1, 0.03, 1);
+    }
+    assert!(c.credit < 0. && c.loan.is_some());
+    assert_eq!(c.choose(k, &[candidate(2, 1., 0.04)], 0.03, 0.4), None);
+    for _ in 0..8 {
+        hot(&mut c, k, 2, 0.04, 1);
+    }
+    assert!(c.loan.is_none());
 }
 
 #[test]
@@ -123,6 +197,143 @@ fn profitable_single_cannot_fund_a_cold_batch_by_itself() {
     assert!(c.credit > 0.3);
     normal(&mut c, key(4));
     assert_eq!(c.choose(key(4), &[candidate(2, 6., 0.06)], 0.03, 0.4), None);
+}
+
+#[test]
+fn earned_model_savings_can_finish_an_admitted_batch_calibration() {
+    let mut c = Controller::default();
+    normal(&mut c, key(1));
+    for _ in 0..30 {
+        hot(&mut c, key(1), 2, 0.03, 2);
+    }
+    let k = key(4);
+    normal(&mut c, k);
+    for _ in 0..200 {
+        hot(&mut c, k, 1, 0.03, 4);
+    }
+    let plans = [candidate(2, 6., 0.06)];
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, true)));
+    c.observe(
+        k,
+        2,
+        0.18,
+        8,
+        ExecutionObservation {
+            preparing: true,
+            ..Default::default()
+        },
+    );
+    for _ in 0..3 {
+        assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, true)));
+        hot(&mut c, k, 2, 0.04, 8);
+    }
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, false)));
+    assert_eq!(c.choose(k, &[candidate(3, 8., 0.1)], 0.03, 0.4), None);
+}
+
+#[test]
+fn deeper_evictions_preserve_the_winner_and_cool_the_new_candidate() {
+    let mut c = Controller::default();
+    normal(&mut c, key(1));
+    for _ in 0..30 {
+        hot(&mut c, key(1), 2, 0.03, 2);
+    }
+    let k = key(4);
+    normal(&mut c, k);
+    for _ in 0..200 {
+        hot(&mut c, k, 1, 0.03, 4);
+    }
+    for _ in 0..3 {
+        hot(&mut c, k, 2, 0.04, 8);
+    }
+    let plans = [
+        candidate(2, 6., 0.04),
+        candidate(3, 10., 0.06),
+        candidate(4, 12., 0.06),
+    ];
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((3, true)));
+    c.observe(
+        k,
+        3,
+        0.12,
+        8,
+        ExecutionObservation {
+            preparing: true,
+            deferred: true,
+            evicted: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(c.cohorts[&k].arms[&2].hot(0).time.samples, 3);
+    assert!(c.cohorts[&k].arms[&3].state == State::Cooldown);
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, false)));
+    for _ in 0..32 {
+        hot(&mut c, k, 2, 0.04, 8);
+    }
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((3, true)));
+}
+
+#[test]
+fn recapture_preserves_a_winners_hot_samples() {
+    let mut c = Controller::default();
+    normal(&mut c, key(1));
+    for _ in 0..30 {
+        hot(&mut c, key(1), 2, 0.03, 2);
+    }
+    let k = key(4);
+    normal(&mut c, k);
+    for _ in 0..200 {
+        hot(&mut c, k, 1, 0.03, 4);
+    }
+    for _ in 0..3 {
+        hot(&mut c, k, 2, 0.04, 8);
+    }
+    let plans = [candidate(2, 6., 0.04), candidate(3, 10., 0.06)];
+    assert_eq!(c.choose(k, &plans[..1], 0.03, 0.4), Some((2, false)));
+    c.observe(
+        k,
+        2,
+        0.12,
+        8,
+        ExecutionObservation {
+            preparing: true,
+            deferred: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(c.cohorts[&k].arms[&2].hot(0).time.samples, 3);
+    assert_eq!(c.choose(k, &plans[..1], 0.03, 0.4), Some((2, false)));
+}
+
+#[test]
+fn ordinary_graph_eviction_does_not_cancel_batch_calibration() {
+    let mut c = Controller::default();
+    let k = key(4);
+    normal(&mut c, k);
+    for _ in 0..300 {
+        hot(&mut c, k, 1, 0.03, 4);
+    }
+    let plans = [candidate(2, 7., 0.04)];
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, true)));
+    for _ in 0..3 {
+        c.observe(
+            k,
+            2,
+            0.05,
+            8,
+            ExecutionObservation {
+                preparing: true,
+                deferred: true,
+                evicted: true,
+                ..Default::default()
+            },
+        );
+        assert!(c.cohorts[&k].cache_cooldown.is_none());
+        assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, true)));
+        hot(&mut c, k, 2, 0.04, 8);
+    }
+    assert_eq!(c.cohorts[&k].arms[&2].hot(0).time.samples, 3);
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, false)));
 }
 
 #[test]
@@ -206,11 +417,37 @@ fn deferred_capture_needs_funding_even_after_a_probe_was_admitted() {
         8,
         ExecutionObservation {
             preparing: true,
+            deferred: true,
             ..Default::default()
         },
     );
     assert!(c.cohorts[&k].calibrating == Some(2));
     assert_eq!(c.choose(k, &plans, 0.03, 0.4), None);
+}
+
+#[test]
+fn completed_preparation_is_not_reserved_a_second_time() {
+    let mut c = Controller::default();
+    let k = key(1);
+    normal(&mut c, k);
+    let plans = [candidate(2, 1.8, 0.06)];
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, true)));
+    c.observe(
+        k,
+        2,
+        0.3,
+        1,
+        ExecutionObservation {
+            preparing: true,
+            ..Default::default()
+        },
+    );
+    assert!(c.credit < -0.25);
+    for _ in 0..3 {
+        assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, true)));
+        hot(&mut c, k, 2, 0.04, 2);
+    }
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, false)));
 }
 
 #[test]
@@ -235,7 +472,7 @@ fn calibration_requires_remaining_work_and_possible_batch_payback() {
 }
 
 #[test]
-fn recapture_requires_fresh_hot_samples_before_reusing_a_winner() {
+fn a_new_execution_mode_does_not_inherit_another_modes_samples() {
     let mut c = Controller::default();
     let k = key(1);
     normal(&mut c, k);
@@ -261,7 +498,7 @@ fn recapture_requires_fresh_hot_samples_before_reusing_a_winner() {
         c.cohorts[&k].arms[&2].modes[ExecutionMode::Direct as usize]
             .time
             .samples,
-        0
+        3
     );
     assert_eq!(c.choose(k, &plans, 0.03, 0.4), None);
 }
@@ -364,7 +601,7 @@ fn single_fixed_respects_legal_widths_and_leaves_batch_adaptive() {
 }
 
 #[test]
-fn local_acceptance_does_not_inherit_another_prompts_rejection_rate() {
+fn request_acceptance_is_shared_by_default_and_compatibility_policies() {
     let mut c = Controller {
         single_policy: SinglePolicy::ExploreLocal,
         ..Default::default()
@@ -377,7 +614,59 @@ fn local_acceptance_does_not_inherit_another_prompts_rejection_rate() {
     let plans = [candidate(3, 2.8, 0.05), candidate(4, 3.8, 0.055)];
     assert_eq!(c.choose(key(1), &plans, 0.03, 0.4), Some((4, false)));
     c.single_policy = SinglePolicy::Explore;
-    assert_eq!(c.choose(key(1), &plans, 0.03, 0.4), Some((3, false)));
+    assert_eq!(c.choose(key(1), &plans, 0.03, 0.4), Some((4, false)));
+    c.single_policy = SinglePolicy::Auto;
+    assert_eq!(c.choose(key(1), &plans, 0.03, 0.4), Some((4, false)));
+}
+
+#[test]
+fn sparse_bad_yield_does_not_cancel_a_profitable_request_prior() {
+    let mut c = Controller::default();
+    let k = key(1);
+    normal(&mut c, k);
+    let plans = [candidate(2, 1.8, 0.06)];
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, true)));
+    c.observe(
+        k,
+        2,
+        0.2,
+        1,
+        ExecutionObservation {
+            preparing: true,
+            ..Default::default()
+        },
+    );
+    for _ in 0..3 {
+        hot(&mut c, k, 2, 0.04, 1);
+    }
+    assert!(c.credit < 0.);
+    assert_eq!(c.choose(k, &plans, 0.03, 0.4), Some((2, false)));
+    assert!(c.loan.is_some());
+    assert_eq!(c.choose(k, &[candidate(2, 1., 0.04)], 0.03, 0.4), None);
+    assert!(c.loan.is_none());
+}
+
+#[test]
+fn deferred_capture_reservation_excludes_paid_module_materialization() {
+    let mut c = Controller::default();
+    let k = key(1);
+    for _ in 0..3 {
+        hot(&mut c, k, 1, 0.017, 1);
+    }
+    let plans = [candidate(2, 1.7, 0.072)];
+    assert_eq!(c.choose(k, &plans, 0.017, 0.4), Some((2, true)));
+    c.observe(
+        k,
+        2,
+        0.155,
+        1,
+        ExecutionObservation {
+            preparing: true,
+            deferred: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(c.choose(k, &plans, 0.017, 0.4), Some((2, true)));
 }
 
 #[test]
@@ -390,9 +679,12 @@ fn execution_feedback_identifies_preparation_and_partial_replay() {
     after.graph_hits = 1;
     let observed = after.observation_since(before);
     assert!(observed.preparing);
+    assert!(observed.deferred);
     assert_eq!(observed.mode, ExecutionMode::Mixed);
     let hot = after.observation_since(after);
     assert!(!hot.preparing);
     after.graph_evictions = 1;
-    assert_eq!(after.observation_since(before).generation, 1);
+    assert_eq!(after.observation_since(before).generation, 0);
+    after.graph_invalidations = 2;
+    assert_eq!(after.observation_since(before).generation, 2);
 }

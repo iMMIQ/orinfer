@@ -395,12 +395,11 @@ impl BatchExecutionStatistics {
                 || self.capture_s > before.capture_s
                 || self.sequence_capture_s > before.sequence_capture_s
                 || self.graph_capture_deferrals > before.graph_capture_deferrals,
+            deferred: self.graph_capture_deferrals > before.graph_capture_deferrals,
             evicted: self.graph_evictions > before.graph_evictions,
-            // An eviction can remove another arm's graph. Invalidate its old
-            // readiness too; its timing remains usable only as a cost prior.
-            generation: self
-                .graph_invalidations
-                .saturating_add(self.graph_evictions),
+            // Cache eviction does not invalidate another arm's measured cost.
+            // Its own next materialization reports preparation explicitly.
+            generation: self.graph_invalidations,
         }
     }
 }
@@ -418,6 +417,7 @@ pub(crate) enum ExecutionMode {
 pub(crate) struct ExecutionObservation {
     pub mode: ExecutionMode,
     pub preparing: bool,
+    pub deferred: bool,
     pub evicted: bool,
     pub generation: usize,
 }
