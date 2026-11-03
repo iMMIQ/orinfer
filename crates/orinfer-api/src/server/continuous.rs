@@ -79,10 +79,11 @@ impl Mailbox {
         {
             self.failed = true;
             self.pending.clear();
+            self.bytes = 0;
             let _ = self
                 .job
                 .events
-                .try_send(ModelEvent::Failed("Client output deadline exceeded".into()));
+                .try_send(ModelEvent::Deadline(deadline::Deadline::Output));
             return false;
         }
         while let Some((event, size)) = self.pending.pop_front() {
@@ -111,6 +112,7 @@ impl Mailbox {
         let size = match &event {
             ModelEvent::Chunk(v) | ModelEvent::Complete(v) => v.to_string().len(),
             ModelEvent::Failed(s) | ModelEvent::Unavailable(s) => s.len(),
+            ModelEvent::Deadline(deadline) => deadline.message().len(),
         };
         let ceiling = match &event {
             ModelEvent::Complete(_) if self.job.prepared.sampling.top_logprobs.is_some() => self
@@ -863,7 +865,7 @@ fn receive_waiting(waiting: &mut Vec<Job>, jobs: &mut mpsc::Receiver<Job>) {
         {
             let _ = job
                 .events
-                .try_send(ModelEvent::Failed("Request queue deadline exceeded".into()));
+                .try_send(ModelEvent::Deadline(deadline::Deadline::Queue));
             return false;
         }
         !job.events.is_closed()
@@ -954,6 +956,34 @@ mod tests {
         drop((first_receiver, arrival_receiver));
         receive_waiting(&mut waiting, &mut jobs);
         assert!(waiting.is_empty());
+    }
+
+    #[test]
+    fn queue_deadline_releases_the_waiter_and_keeps_later_requests_usable() {
+        let (sender, mut jobs) = mpsc::channel(4);
+        let (mut expired, mut expired_receiver) = mailbox();
+        expired.job.limits.queue_ms = 1;
+        expired.job.queued = Instant::now() - std::time::Duration::from_secs(1);
+        sender.try_send(expired.job).unwrap();
+        let (live, mut live_receiver) = mailbox();
+        sender.try_send(live.job).unwrap();
+        let mut waiting = Vec::new();
+        receive_waiting(&mut waiting, &mut jobs);
+        assert_eq!(waiting.len(), 1);
+        assert!(matches!(
+            expired_receiver.try_recv().unwrap(),
+            ModelEvent::Deadline(deadline::Deadline::Queue)
+        ));
+        assert!(expired_receiver.is_closed());
+        assert!(live_receiver.try_recv().is_err());
+        waiting[0]
+            .events
+            .try_send(ModelEvent::Chunk(json!(1)))
+            .unwrap();
+        assert!(matches!(
+            live_receiver.try_recv().unwrap(),
+            ModelEvent::Chunk(_)
+        ));
     }
 
     #[test]

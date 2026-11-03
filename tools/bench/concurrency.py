@@ -14,7 +14,26 @@ from pathlib import Path
 import statistics
 import threading
 import time
+import urllib.error
 import urllib.request
+
+
+class RequestError(ValueError):
+    """Keep overload outcomes typed; callers own bounded retries and backoff."""
+
+    def __init__(self, error, status=200, *, started=False, retry_after=None):
+        super().__init__(error)
+        self.error = error
+        self.status = status
+        self.code = error.get("code")
+        self.retryable = not started and error.get("retryable", status in (408, 429, 503))
+        try:
+            delay = float(error.get("retry_after_ms", 1000)) / 1000
+            if retry_after is not None:
+                delay = float(retry_after)
+            self.retry_after_s = max(0.1, min(delay, 10.0)) if math.isfinite(delay) else 1.0
+        except (TypeError, ValueError):
+            self.retry_after_s = 1.0
 
 
 def events(response):
@@ -30,7 +49,9 @@ def events(response):
         raise ValueError("Unterminated SSE event")
 
 
-def request(base_url, body, barrier=None, *, on_content=None, collect_arrivals=False):
+def request(
+    base_url, body, barrier=None, *, on_content=None, collect_arrivals=False, timeout_s=1800
+):
     headers = {"Content-Type": "application/json"}
     if os.getenv("ORINFER_API_KEY"):
         headers["Authorization"] = "Bearer " + os.environ["ORINFER_API_KEY"]
@@ -46,7 +67,19 @@ def request(base_url, body, barrier=None, *, on_content=None, collect_arrivals=F
     usage, finish, done = None, None, False
     arrivals, content, reasoning = [], [], []
     first_content, first_reasoning = None, None
-    with urllib.request.urlopen(req, timeout=1800) as response:
+    try:
+        response = urllib.request.urlopen(req, timeout=timeout_s)
+    except urllib.error.HTTPError as error:
+        with error:
+            raw = error.read()
+        try:
+            details = json.loads(raw)["error"]
+        except (ValueError, KeyError, TypeError):
+            details = {"message": raw.decode(errors="replace")}
+        raise RequestError(
+            details, error.code, retry_after=error.headers.get("Retry-After")
+        ) from error
+    with response:
         for event in events(response):
             at = time.perf_counter() - start
             if event == "[DONE]":
@@ -54,7 +87,7 @@ def request(base_url, body, barrier=None, *, on_content=None, collect_arrivals=F
                 break
             value = json.loads(event)
             if value.get("error"):
-                raise ValueError(value["error"])
+                raise RequestError(value["error"], started=bool(arrivals))
             usage = value.get("usage") or usage
             for choice in value.get("choices", []):
                 delta = choice.get("delta", {})

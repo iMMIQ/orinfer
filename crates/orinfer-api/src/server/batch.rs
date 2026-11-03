@@ -229,6 +229,7 @@ async fn submit(
             match event {
                 ModelEvent::Complete(body) => return Ok(body),
                 ModelEvent::Failed(error) | ModelEvent::Unavailable(error) => return Err(error),
+                ModelEvent::Deadline(deadline) => return Err(deadline.message().into()),
                 ModelEvent::Chunk(_) => {}
             }
         }

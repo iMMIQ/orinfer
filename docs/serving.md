@@ -163,7 +163,7 @@ opencode run --model orinfer/deepseek-v4.1 '检查并修复当前项目的测试
 opencode run --model orinfer/deepseek-v4.1 --variant off '检查并修复当前项目的测试失败'
 ```
 
-该条目仅声明文本输入，默认开启 thinking，low/high/max 分别对应官方模板的 50/75/100 倾向值，off 关闭。倾向值不构成思考 token 硬上限；需要硬上限时传入 `thinking_token_budget`。context 与 output 应按实际部署容量设置。
+该条目声明文本和图片输入；图片需要匹配视觉权重及执行包，默认开启 thinking，low/high/max 分别对应官方模板的 50/75/100 倾向值，off 关闭。倾向值不构成思考 token 硬上限；需要硬上限时传入 `thinking_token_budget`。context 与 output 应按实际部署容量设置。
 
 [Pi 配置](../examples/pi-models.json)对应 `earendil-works/pi`。将 provider 合并到 Pi agent 目录中的 `models.json`，默认目录为 `~/.pi/agent`；配置使用 `openai-completions`，可通过 `/model` 和 `/thinking` 切换模型与思考级别：
 

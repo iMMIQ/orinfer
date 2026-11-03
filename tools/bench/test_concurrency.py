@@ -1,10 +1,45 @@
 import io
 import unittest
+import urllib.error
 from unittest.mock import patch
-from tools.bench.concurrency import counter_delta, decode_window, events, request, percentile
+from tools.bench.concurrency import (
+    RequestError,
+    counter_delta,
+    decode_window,
+    events,
+    request,
+    percentile,
+)
 
 
 class StreamingTests(unittest.TestCase):
+    def test_queue_deadlines_remain_retryable_only_before_any_output(self):
+        error = b'data: {"error":{"code":"request_queue_timeout","retryable":true,"retry_after_ms":1500}}\n\n'
+        prefix = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        for started in [False, True]:
+            stream = io.BytesIO((prefix if started else b"") + error)
+            with patch("urllib.request.urlopen", return_value=stream):
+                with self.assertRaises(RequestError) as caught:
+                    request("http://localhost/v1", {})
+            self.assertEqual(caught.exception.code, "request_queue_timeout")
+            self.assertEqual(caught.exception.retryable, not started)
+            self.assertEqual(caught.exception.retry_after_s, 1.5)
+
+    def test_http_overload_keeps_status_and_backoff_hint(self):
+        error = urllib.error.HTTPError(
+            "http://localhost/v1",
+            429,
+            "full",
+            {"Retry-After": "2"},
+            io.BytesIO(b'{"error":{"code":"queue_full"}}'),
+        )
+        with patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(RequestError) as caught:
+                request("http://localhost/v1", {}, timeout_s=3)
+        self.assertEqual(caught.exception.status, 429)
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(caught.exception.retry_after_s, 2)
+
     def test_decode_window_excludes_prefill_and_queueing_but_keeps_idle_samples(self):
         def sample(at, prefill, tokens, active=4, queued=0):
             return dict(

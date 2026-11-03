@@ -2,6 +2,7 @@ pub(crate) mod audio;
 pub(crate) mod batch;
 mod chat;
 mod continuous;
+mod deadline;
 pub(crate) mod defaults;
 mod grammar;
 mod image;
@@ -79,6 +80,7 @@ enum ModelEvent {
     Complete(Value),
     Failed(String),
     Unavailable(String),
+    Deadline(deadline::Deadline),
 }
 
 fn stream_payload(event: Option<ModelEvent>) -> (String, bool) {
@@ -87,6 +89,7 @@ fn stream_payload(event: Option<ModelEvent>) -> (String, bool) {
         Some(ModelEvent::Complete(_)) => ("[DONE]".into(), true),
         Some(ModelEvent::Failed(message)) => (json!({"error":{"message":message,"type":"server_error","code":"generation_error"}}).to_string(), true),
         Some(ModelEvent::Unavailable(message)) => (json!({"error":{"message":message,"type":"server_error","code":"service_unavailable"}}).to_string(), true),
+        Some(ModelEvent::Deadline(deadline)) => (deadline.payload().to_string(), true),
         None => (json!({"error":{"message":"GPU worker disconnected before completion","type":"server_error","code":"worker_disconnected"}}).to_string(), true),
     }
 }
@@ -270,11 +273,17 @@ pub(crate) fn error(status: StatusCode, message: impl Into<String>) -> Response 
         StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
         _ => "server_error",
     };
-    (
+    let mut response = (
         status,
         Json(json!({"error":{"message":message,"type":kind,"param":param,"code":code}})),
     )
-        .into_response()
+        .into_response();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, "1".parse().unwrap());
+    }
+    response
 }
 async fn health(State(state): State<Service>) -> Response {
     (if state.activity.lifecycle.is_ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(
@@ -439,6 +448,7 @@ async fn completions(
                 }
                 ModelEvent::Failed(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
                 ModelEvent::Unavailable(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e),
+                ModelEvent::Deadline(deadline) => return deadline.response(),
                 ModelEvent::Chunk(_) => {}
             }
         }
@@ -492,6 +502,26 @@ pub(crate) async fn shutdown_signal() {
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+    #[tokio::test]
+    async fn deadlines_have_the_same_typed_outcome_in_http_and_sse() {
+        for deadline in [deadline::Deadline::Queue, deadline::Deadline::Output] {
+            let (payload, terminal) = stream_payload(Some(ModelEvent::Deadline(deadline)));
+            assert!(terminal);
+            let payload: Value = serde_json::from_str(&payload).unwrap();
+            let response = deadline.response();
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+            let retryable = matches!(deadline, deadline::Deadline::Queue);
+            assert_eq!(response.headers().contains_key("retry-after"), retryable);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), payload);
+            assert_eq!(payload["error"]["retryable"], retryable);
+            assert_ne!(payload["error"]["code"], "generation_error");
+        }
+        let response = error(StatusCode::TOO_MANY_REQUESTS, "Request queue is full");
+        assert_eq!(response.headers()["retry-after"], "1");
+    }
     #[tokio::test]
     async fn context_overflow_has_a_client_recognizable_code_and_parameter() {
         let response = error(
