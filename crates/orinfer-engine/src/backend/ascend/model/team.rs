@@ -25,7 +25,9 @@ use std::{
 #[derive(Clone)]
 pub(super) enum Command {
     Admit(Vec<usize>),
-    EncodeImages(Arc<Vec<crate::vision::ImageInput>>),
+    BeginImages(Arc<Vec<crate::vision::ImageInput>>),
+    AdvanceImages(usize),
+    CancelImages,
     InstallImages(usize, Arc<Vec<super::vision::Span>>),
     Limit(usize, usize),
     GrowCached(Layout),
@@ -385,16 +387,29 @@ impl Team {
                                     owner.vision = spans;
                                     Reply::Ready
                                 }),
-                            Command::EncodeImages(images) => match images.get(worker.rank as usize)
-                            {
-                                Some(image) => worker
-                                    .vision
-                                    .as_mut()
-                                    .ok_or_else(|| "Missing native vision encoder".to_owned())
-                                    .and_then(|encoder| encoder.encode(&worker.session, image))
-                                    .map(|image| Reply::Image(Some(image))),
-                                None => Ok(Reply::Image(None)),
-                            },
+                            Command::BeginImages(images) => {
+                                match images.get(worker.rank as usize) {
+                                    Some(image) => worker
+                                        .vision
+                                        .as_mut()
+                                        .ok_or_else(|| "Missing native vision encoder".to_owned())
+                                        .and_then(|encoder| encoder.begin(&worker.session, image))
+                                        .map(|()| Reply::Ready),
+                                    None => Ok(Reply::Ready),
+                                }
+                            }
+                            Command::AdvanceImages(segments) => worker
+                                .vision
+                                .as_mut()
+                                .ok_or_else(|| "Missing native vision encoder".to_owned())
+                                .and_then(|encoder| encoder.advance(&worker.session, segments))
+                                .map(Reply::Image),
+                            Command::CancelImages => {
+                                if let Some(encoder) = &mut worker.vision {
+                                    encoder.cancel();
+                                }
+                                Ok(Reply::Ready)
+                            }
                             Command::Admit(ids) => worker.admit(&ids).map(|_| Reply::Ready),
                             Command::Limit(id, tokens) => {
                                 worker.limit_owner(id, tokens).map(|_| Reply::Ready)

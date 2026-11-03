@@ -9,11 +9,46 @@ import unittest
 
 from tools.model.deepseek_v41.vision import export, tensor_shapes
 from tools.model.deepseek_v41.vision_attach import attach, rebind_masks
+from tools.model.deepseek_v41.vision_build import program
 from tools.model.row_contract import expression, resolve
 from tools.model.safetensors_source import local_header
 
 
 class VisionExportTests(unittest.TestCase):
+    def test_frame_boundaries_preserve_layer_state_and_the_final_aligner(self):
+        config = dict(
+            text_config=dict(hidden_size=5120),
+            image_token_id=129264,
+            vision_config=dict(
+                hidden_size=1024,
+                intermediate_size=2816,
+                patch_size=14,
+                num_attention_heads=16,
+                num_hidden_layers=8,
+                downsample_ratio=3,
+                min_pixels=295936,
+                max_image_tokens=1024,
+                rope_theta=10000,
+            ),
+        )
+        contracts = {}
+
+        def describe(module, name, arguments, ports, capacity):
+            key = str(len(contracts))
+            contracts[key] = (module, name, arguments)
+            return key
+
+        plan = program(config, describe)
+        self.assertEqual(plan["segment_ends"][-1], len(plan["body"]))
+        for end in plan["segment_ends"][:-1]:
+            previous = plan["body"][end - 1]
+            module, name, arguments = contracts[previous["manifest"]]
+            self.assertEqual((module, name), ("vision", "epilogue"))
+            self.assertTrue(arguments["residual"])
+            self.assertEqual(previous["buffers"][-1], "vision.h0")
+            self.assertEqual(plan["body"][end]["buffers"][0], "vision.h0")
+        self.assertEqual(plan["body"][-1]["buffers"][-1], "vision.output")
+
     def test_bf16_payload_and_target_basis_are_preserved_with_only_patch_k_padding(self):
         config = dict(
             quantization_config={"quant_method": "ascend"},

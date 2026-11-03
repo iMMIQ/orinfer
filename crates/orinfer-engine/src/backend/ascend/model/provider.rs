@@ -91,6 +91,7 @@ pub(crate) struct Runtime {
     vision_cursor: usize,
     vision_seconds_per_patch: f64,
     vision_cache: crate::vision::FeatureCache<Vec<u8>>,
+    image_wave: Option<vision::Wave>,
     pub frontend_assets: BTreeMap<String, String>,
     cache: Tiered<Snapshot, Snapshot>,
     prefix: crate::prefix::Statistics,
@@ -324,6 +325,7 @@ impl Runtime {
             vision_cursor: 0,
             vision_seconds_per_patch: 60e-6,
             vision_cache: crate::vision::FeatureCache::new(vision_cache_bytes),
+            image_wave: None,
             frontend_assets: model.frontend_assets,
             cache: Tiered::new(options.prefix_cache_bytes, host_budget),
             prefix: Default::default(),
@@ -353,6 +355,9 @@ impl Runtime {
     }
     pub fn prefill_packet_capacity(&self) -> usize {
         self.team.rows
+    }
+    pub fn vision_parallelism(&self) -> usize {
+        self.team.ranks()
     }
     pub fn scheduler_statistics(&self) -> scheduler::Statistics {
         let mut statistics = self.statistics.clone();
@@ -467,12 +472,20 @@ impl Runtime {
             self.matched(&hint.tokens, &hint.media)
                 .map_or(0, |hit| self.entry(hit).tokens.len()),
         );
+        let image_s = hint.image_work as f64 * self.vision_seconds_per_patch
+            / hint.media.0.len().max(1).min(self.team.ranks()) as f64;
+        let startup_s = image_s
+            * self
+                .team
+                .model
+                .vision
+                .as_ref()
+                .map_or(1., super::vision::Program::startup_fraction);
         Ok(scheduler::Waiting {
             age_s: 0.,
-            remaining_s: remaining as f64 / self.prefill_tokens_per_s,
+            remaining_s: remaining as f64 / self.prefill_tokens_per_s + image_s - startup_s,
             restore_s: 0.,
-            startup_s: hint.image_work as f64 * self.vision_seconds_per_patch
-                / hint.media.0.len().max(1).min(self.team.ranks()) as f64,
+            startup_s,
             remaining_tokens: remaining,
         })
     }
@@ -907,7 +920,7 @@ impl Runtime {
         if requests.iter().any(|r| r.owner != self.owner || r.released) {
             return Err("Foreign or released A2 request".into());
         }
-        self.prepare_images(requests)?;
+        self.prepare_images(requests, options)?;
         let has_decode = requests.iter().any(|r| !r.prefilling && !r.is_finished());
         let started = Instant::now();
         let result = self.advance_packet(requests, options, maintenance);

@@ -25,8 +25,46 @@ pub(super) struct Program {
     features_capacity: usize,
     buffers: Vec<Definition>,
     body: Vec<Operation>,
+    #[serde(default)]
+    segment_ends: Vec<usize>,
 }
 impl Program {
+    fn segments(&self) -> Result<Vec<usize>> {
+        let ends = if self.segment_ends.is_empty() {
+            vec![self.body.len()]
+        } else {
+            self.segment_ends.clone()
+        };
+        if self.body.is_empty()
+            || ends.last() != Some(&self.body.len())
+            || ends[0] == 0
+            || ends.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err("Invalid vision frame boundaries".into());
+        }
+        Ok(ends)
+    }
+    pub(super) fn startup_fraction(&self) -> f64 {
+        let Some(&last) = self.segment_ends.last() else {
+            return 1.;
+        };
+        let longest = self
+            .segment_ends
+            .iter()
+            .copied()
+            .zip(std::iter::once(0).chain(self.segment_ends.iter().copied()))
+            .map(|(end, start)| end.saturating_sub(start))
+            .max()
+            .unwrap_or(last);
+        longest as f64 / last.max(1) as f64
+    }
+    pub(super) fn advance_budget(&self, estimated_s: f64, quantum_s: f64) -> usize {
+        let count = self.segment_ends.len().max(1);
+        if estimated_s <= quantum_s {
+            return count;
+        }
+        ((quantum_s / (estimated_s * self.startup_fraction())) as usize).clamp(1, count)
+    }
     pub(super) fn manifests(&self) -> impl Iterator<Item = &str> {
         self.body.iter().map(|op| op.manifest.as_str())
     }
@@ -43,6 +81,7 @@ impl Program {
         &self.buffers
     }
     pub(super) fn preflight(&self, base: &Path) -> Result<()> {
+        self.segments()?;
         let mut names = BTreeMap::new();
         for definition in &self.buffers {
             if definition.bytes == 0
@@ -99,7 +138,17 @@ struct Prepared {
 }
 struct Frame {
     kernels: Rc<Vec<Kernel>>,
-    graph: Option<Graph>,
+    graphs: Option<Rc<Vec<Graph>>>,
+}
+struct Running {
+    key: (usize, usize),
+    span: usize,
+    width: usize,
+    cursor: usize,
+    upload_s: f64,
+    compute_s: f64,
+    max_advance_s: f64,
+    graph_replay: bool,
 }
 pub(super) struct Encoder {
     spec: VisionSpec,
@@ -111,6 +160,8 @@ pub(super) struct Encoder {
     order: VecDeque<(usize, usize)>,
     markers: [Vec<u8>; 3],
     phase_grid: Option<(usize, usize)>,
+    segment_ends: Vec<usize>,
+    running: Option<Running>,
 }
 pub(super) struct Encoded {
     /// Row-major BF16 in the same basis as the language embedding table.
@@ -121,6 +172,7 @@ pub(super) struct Encoded {
     pub compute_s: f64,
     pub download_s: f64,
     pub graph_replay: bool,
+    pub max_advance_s: f64,
 }
 impl Encoder {
     pub fn load(session: &Session, path: &Path, checkpoint: &mut Checkpoint) -> Result<Self> {
@@ -256,9 +308,23 @@ impl Encoder {
             order: VecDeque::new(),
             markers,
             phase_grid: None,
+            segment_ends: program.segments()?,
+            running: None,
         })
     }
     pub fn encode(&mut self, session: &Session, image: &ImageInput) -> Result<Encoded> {
+        self.begin(session, image)?;
+        self.advance(session, usize::MAX)?
+            .ok_or_else(|| "Full vision execution did not complete".into())
+    }
+    pub(super) fn cancel(&mut self) {
+        // Every segment has completed before control returns to the scheduler.
+        self.running = None;
+    }
+    pub(super) fn begin(&mut self, session: &Session, image: &ImageInput) -> Result<()> {
+        if self.running.is_some() {
+            return Err("Vision encoder already has an active frame".into());
+        }
         let span = self.spec.feature_count(image)?;
         let patches = image
             .grid_height
@@ -330,23 +396,66 @@ impl Encoder {
                 key,
                 Frame {
                     kernels: Rc::new(kernels),
-                    graph: None,
+                    graphs: None,
                 },
             );
         }
         self.order.retain(|previous| *previous != key);
         self.order.push_back(key);
-        let frame = self.frames.get_mut(&key).unwrap();
-        let graph_replay = frame.graph.is_some();
+        self.running = Some(Running {
+            key,
+            span,
+            width,
+            cursor: 0,
+            upload_s,
+            compute_s: 0.,
+            max_advance_s: 0.,
+            graph_replay: self.frames[&key].graphs.is_some(),
+        });
+        Ok(())
+    }
+    pub(super) fn advance(
+        &mut self,
+        session: &Session,
+        segments: usize,
+    ) -> Result<Option<Encoded>> {
+        if segments == 0 {
+            return Err("Vision execution needs a positive frame budget".into());
+        }
+        let Some(run) = self.running.as_mut() else {
+            return Ok(None);
+        };
+        let frame = self.frames.get_mut(&run.key).unwrap();
+        let next = run
+            .cursor
+            .saturating_add(segments)
+            .min(self.segment_ends.len());
+        let begin = if run.cursor == 0 {
+            0
+        } else {
+            self.segment_ends[run.cursor - 1]
+        };
+        let end = self.segment_ends[next - 1];
         let compute_start = Instant::now();
-        if let Some(graph) = &frame.graph {
-            graph.enqueue(session)?.wait()?;
+        if let Some(graphs) = &frame.graphs {
+            let graphs = Rc::clone(graphs);
+            let first = run.cursor;
+            // SAFETY: The completion owns every graph and stable operand.
+            unsafe {
+                session.submit_compute(vec![], Box::new(Rc::clone(&graphs)), |stream| {
+                    for graph in &graphs[first..next] {
+                        graph.execute_on_stream(stream)?;
+                    }
+                    Ok(())
+                })
+            }?
+            .wait()?;
         } else {
             let kernels = Rc::clone(&frame.kernels);
             // SAFETY: This completion owns every kernel, stable operand and AOT library.
             unsafe {
                 session.submit_compute(vec![], Box::new(Rc::clone(&kernels)), |stream| {
-                    for kernel in kernels.iter() {
+                    for kernel in &kernels[begin..end] {
                         kernel.launch_on_stream(stream)?;
                     }
                     Ok(())
@@ -354,47 +463,63 @@ impl Encoder {
             }?
             .wait()?;
         }
-        let compute_s = compute_start.elapsed().as_secs_f64();
+        let seconds = compute_start.elapsed().as_secs_f64();
+        run.compute_s += seconds;
+        run.max_advance_s = run.max_advance_s.max(seconds);
+        run.cursor = next;
+        if next != self.segment_ends.len() {
+            return Ok(None);
+        }
+        let run = self.running.take().unwrap();
+        let (patches, merged) = run.key;
         let download_start = Instant::now();
         let output = session.download(
             &self.buffers[&self.spec.output],
             0,
             merged * self.spec.hidden * 2,
         )?;
-        let mut data = Vec::with_capacity(span * self.spec.hidden * 2);
+        let mut data = Vec::with_capacity(run.span * self.spec.hidden * 2);
         data.extend_from_slice(&self.markers[0]);
-        for row in output.chunks_exact(width * self.spec.hidden * 2) {
+        for row in output.chunks_exact(run.width * self.spec.hidden * 2) {
             data.extend_from_slice(row);
             data.extend_from_slice(&self.markers[2]);
         }
         data.extend_from_slice(&self.markers[1]);
-        if data.len() != span * self.spec.hidden * 2 {
+        if data.len() != run.span * self.spec.hidden * 2 {
             return Err("Vision output span differs".into());
         }
         let download_s = download_start.elapsed().as_secs_f64();
         // Capture only after the first real execution; capture itself is not an inference.
-        if frame.graph.is_none() {
-            let kernels = Rc::clone(&frame.kernels);
-            // SAFETY: Graph owns all bound kernels and operands; subsequent calls serialize
-            // input uploads, replay and output readback on this worker's owned session.
-            frame.graph = Some(unsafe {
-                Graph::capture(session, Box::new(Rc::clone(&kernels)), |stream| {
-                    for kernel in kernels.iter() {
-                        kernel.launch_on_stream(stream)?;
-                    }
-                    Ok(())
-                })
-            }?);
+        if frame.graphs.is_none() {
+            let mut graphs = Vec::with_capacity(self.segment_ends.len());
+            let mut begin = 0;
+            for &end in &self.segment_ends {
+                let kernels = Rc::clone(&frame.kernels);
+                // SAFETY: Capture follows complete readback. Only the next
+                // image's first segment can reuse these stable intermediate
+                // buffers; each graph retains its kernels and AOT libraries.
+                graphs.push(unsafe {
+                    Graph::capture(session, Box::new(Rc::clone(&kernels)), |stream| {
+                        for kernel in &kernels[begin..end] {
+                            kernel.launch_on_stream(stream)?;
+                        }
+                        Ok(())
+                    })
+                }?);
+                begin = end;
+            }
+            frame.graphs = Some(Rc::new(graphs));
         }
-        Ok(Encoded {
+        Ok(Some(Encoded {
             data,
-            span,
+            span: run.span,
             patches,
-            upload_s,
-            compute_s,
+            upload_s: run.upload_s,
+            compute_s: run.compute_s,
             download_s,
-            graph_replay,
-        })
+            graph_replay: run.graph_replay,
+            max_advance_s: run.max_advance_s,
+        }))
     }
 }
 
@@ -441,8 +566,28 @@ pub fn validate(
     for input in inputs.cases {
         let expected =
             std::fs::read(resolve_file(base, &input.expected)?).map_err(|e| e.to_string())?;
+        // A cancelled partial image must not contribute state to the next one.
+        encoder.begin(&session, &input.image)?;
+        if encoder.segment_ends.len() > 1 && encoder.advance(&session, 1)?.is_some() {
+            return Err("Partial vision frame completed before its boundary".into());
+        }
+        encoder.cancel();
+        let mut previous = None;
         for repeat in 0..2 {
-            let encoded = encoder.encode(&session, &input.image)?;
+            let encoded = if repeat == 0 {
+                encoder.encode(&session, &input.image)?
+            } else {
+                encoder.begin(&session, &input.image)?;
+                loop {
+                    if let Some(encoded) = encoder.advance(&session, 1)? {
+                        break encoded;
+                    }
+                }
+            };
+            if previous.as_ref().is_some_and(|data| *data != encoded.data) {
+                return Err("Vision frame replay changed the complete image features".into());
+            }
+            previous = Some(encoded.data.clone());
             if expected.len() != encoded.data.len() {
                 return Err("Vision reference extent differs".into());
             }
@@ -474,7 +619,7 @@ pub fn validate(
                 / (square_actual * square_reference)
                     .sqrt()
                     .max(f64::MIN_POSITIVE);
-            results.push(serde_json::json!({"name":input.name,"repeat":repeat,"span":encoded.span,"patches":encoded.patches,"max_abs":maximum,"relative_rms":relative_rms,"cosine":cosine,"upload_s":encoded.upload_s,"compute_s":encoded.compute_s,"download_s":encoded.download_s,"graph_replay":encoded.graph_replay}));
+            results.push(serde_json::json!({"name":input.name,"repeat":repeat,"span":encoded.span,"patches":encoded.patches,"max_abs":maximum,"relative_rms":relative_rms,"cosine":cosine,"upload_s":encoded.upload_s,"compute_s":encoded.compute_s,"download_s":encoded.download_s,"graph_replay":encoded.graph_replay,"max_advance_s":encoded.max_advance_s,"segments":encoder.segment_ends.len()}));
         }
     }
     session.synchronize()?;

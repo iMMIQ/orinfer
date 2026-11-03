@@ -28,7 +28,7 @@ def program(
     if hidden != 1024 or hidden // heads != 64 or v["downsample_ratio"] != 3:
         raise ValueError("Require the published DeepSeek ViT geometry")
     stride = (3 * v["patch_size"] ** 2 + 127) // 128 * 128
-    buffers, body = {}, []
+    buffers, body, segment_ends = {}, [], []
 
     def buffer(name, shape, dtype, **extra):
         size = 2 if dtype in ("BF16", "F16") else 4
@@ -254,6 +254,8 @@ def program(
         epilogue(x, None, "vision.skip.gated", "vision.gated", intermediate, activation="silu_mul")
         x = matmul("vision.gated", prefix + ".mlp.w2.weight", hidden, intermediate)
         epilogue(x, None, "vision.h1", "vision.h0", hidden, residual=True)
+        if (layer + 1) % 4 == 0:
+            segment_ends.append(len(body))
 
     norm("vision.h0", "vision.norm.weight")
     op(
@@ -303,6 +305,10 @@ def program(
         vision_start_token_id=config["image_token_id"],
         vision_end_token_id=config["image_token_id"],
     )
+    if segment_ends and segment_ends[-1] < len(body):
+        segment_ends[-1] = len(body)
+    else:
+        segment_ends.append(len(body))
     return dict(
         schema_version=1,
         spec=spec,
@@ -311,6 +317,7 @@ def program(
         features_capacity=features,
         buffers=list(buffers.values()),
         body=body,
+        segment_ends=segment_ends,
     )
 
 
@@ -322,6 +329,7 @@ def build(
     attention_m=128,
     attention_k=256,
     weights=None,
+    workspace_slots=64,
 ):
     from tools.model.deepseek_v41.build import compile_task
 
@@ -353,6 +361,7 @@ def build(
         gemm_n=gemm_n,
         attention_m=attention_m,
         attention_k=attention_k,
+        workspace_slots=workspace_slots,
     )
     # Deduplicate by operator contract, not by image size, layer or concurrent owner.
     with ProcessPoolExecutor(
@@ -418,6 +427,7 @@ def main():
     parser.add_argument("--gemm-n", type=int, choices=[128, 256], default=256)
     parser.add_argument("--attention-m", type=int, choices=[32, 64, 128, 256], default=128)
     parser.add_argument("--attention-k", type=int, choices=[128, 256, 512], default=256)
+    parser.add_argument("--workspace-slots", type=int, default=64)
     args = parser.parse_args()
     print(
         rebuild(args.program, args.output, args.operators, args.compile_workers)
@@ -430,6 +440,7 @@ def main():
             args.attention_m,
             args.attention_k,
             args.weights,
+            args.workspace_slots,
         )
     )
 

@@ -79,7 +79,7 @@ fn shared_banks_and_cpu_heads_are_charged_once_after_parent_eviction() {
     assert_eq!(statistics.shared_bytes, 0);
     assert_eq!(statistics.entries, 1);
 }
-fn request(output: Arc<Output>, sampling: crate::sampling::Options) -> Request {
+pub(super) fn request(output: Arc<Output>, sampling: crate::sampling::Options) -> Request {
     Request {
         owner: 1,
         slot: 91,
