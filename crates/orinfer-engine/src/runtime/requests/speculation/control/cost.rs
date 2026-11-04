@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 pub(super) struct Cost {
     pub time: Timing,
     overhead: f64,
+    /// Extra cost when ordinary decode left the owner's draft state behind.
+    pub transition_s: f64,
     pub last: usize,
 }
 impl Cost {
@@ -18,12 +20,28 @@ impl Cost {
     }
     fn observe(&mut self, measurement: Measurement, call: usize) {
         self.last = call;
-        let extra = if !measurement.is_steady() && self.time.samples() > 0 {
+        let extra = if measurement.warm_ready
+            && measurement.preparation_s > 0.
+            && self.time.samples() > 0
+        {
             (measurement.seconds - self.time.mean()).max(0.)
         } else {
             0.
         };
-        self.overhead = (31. * self.overhead + extra) / 32.;
+        // Draft catch-up is already priced once by transition_s. Only resource
+        // preparation of an otherwise warm invocation belongs in steady cost.
+        self.overhead = self.overhead * 0.8 + extra * 0.2;
+        if !measurement.warm_ready {
+            // Before any hot sample, the observed round is a conservative
+            // upper bound on its transition. It must still price the next
+            // cold attempt; consecutive warm calibration pays no such cost.
+            let hot = if self.time.samples() > 0 {
+                self.time.mean()
+            } else {
+                0.
+            };
+            self.transition_s = self.transition_s * 0.8 + (measurement.seconds - hot).max(0.) * 0.2;
+        }
         if measurement.is_steady() && measurement.tokens > 0 {
             self.time.observe(measurement.seconds);
         }

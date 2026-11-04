@@ -18,11 +18,12 @@ impl Acceptance {
     pub(in crate::runtime) fn observe(&mut self, proposed: usize, accepted: usize) {
         for j in 0..proposed.min(accepted.saturating_add(1)).min(7) {
             let value = f64::from(j < accepted);
-            self.probability[j] = if self.samples[j] == 0 {
-                value
+            let prior = if self.samples[j] == 0 {
+                0.7
             } else {
-                self.probability[j] * 0.8 + value * 0.2
+                self.probability[j]
             };
+            self.probability[j] = prior * 0.8 + value * 0.2;
             self.samples[j] += 1;
         }
     }
@@ -30,26 +31,29 @@ impl Acceptance {
         let mut prefix = 1.;
         let mut total = 1.;
         for j in 0..drafts.min(7) {
-            // Shrink sparse request observations toward a neutral model prior.
-            let confidence = self.samples[j] as f64 / (self.samples[j] as f64 + 4.);
-            prefix *= self.probability[j] * confidence + 0.7 * (1. - confidence);
+            // The neutral prior participates once, at EMA initialization.
+            // Reapplying a sample-count weight can make a success lower the
+            // estimate after an early rejection.
+            prefix *= if self.samples[j] == 0 {
+                0.7
+            } else {
+                self.probability[j]
+            };
             total += prefix;
         }
         total
     }
 }
 
-/// Latency protects the slowest owner's expected token rate. Throughput uses
-/// total expected commits. Both return token-equivalent progress for the packet;
-/// the latency value is a conservative lower bound on its total expected yield.
+/// Mean request TPOT is cost * mean(1 / expected yield). Express its inverse
+/// as token-equivalent progress; throughput instead uses total expected yield.
 pub(super) fn progress(yields: impl Iterator<Item = f64>, batch: usize, latency: bool) -> f64 {
-    let (total, minimum) = yields.fold((0., f64::INFINITY), |(total, minimum), value| {
-        (total + value, minimum.min(value))
-    });
     if latency {
-        minimum * batch as f64
+        let inverse: f64 = yields.map(f64::recip).sum();
+        let batch = batch as f64;
+        batch * batch / inverse
     } else {
-        total
+        yields.sum()
     }
 }
 
@@ -137,6 +141,10 @@ pub(in crate::runtime) struct Candidate {
     pub expected_tokens: f64,
     pub prior_seconds: f64,
     pub remaining_tokens: usize,
+    /// Read from the selected owners' actual draft cursors for this round.
+    pub warm_ready: bool,
+    /// The selected owners advanced without fresh draft acceptance observations.
+    pub review_acceptance: bool,
 }
 
 struct Decision {
@@ -151,7 +159,7 @@ fn select(
     candidates: &[Candidate],
     normal: f64,
     slack: f64,
-    available: f64,
+    funds: (f64, f64),
     prior: impl Fn(&Candidate) -> f64,
     batch: usize,
 ) -> Option<Decision> {
@@ -173,18 +181,27 @@ fn select(
     for candidate in candidates {
         if candidate.width < 2
             || !candidate.expected_tokens.is_finite()
-            || candidate.expected_tokens <= batch as f64
+            || candidate.expected_tokens < batch as f64
         {
             continue;
         }
         let shape = costs.arms.get(&candidate.width);
         let samples = shape.map_or(0, |s| s.time.samples());
-        let mean = shape
+        let available = if samples < 3 { funds.1 } else { funds.0 };
+        let transition = shape
+            .filter(|_| !candidate.warm_ready)
+            .map_or(0., |s| s.transition_s);
+        let hot = shape
             .filter(|s| s.time.samples() > 0)
             .map_or_else(|| prior(candidate), Cost::mean);
+        // Re-entry may pay back over the same three-round window used for hot
+        // calibration. The full transition still needs deadline and cash cover.
+        let horizon = (candidate.remaining_tokens as f64 / candidate.expected_tokens).clamp(1., 3.);
+        let mean = hot + transition / horizon;
         let upper = shape
             .filter(|s| s.time.samples() > 0)
-            .map_or(mean, Cost::upper);
+            .map_or(hot, Cost::upper)
+            + transition;
         if !upper.is_finite() || upper <= 0. || upper > slack {
             continue;
         }
@@ -197,23 +214,42 @@ fn select(
             continue;
         }
         let score = mean / candidate.expected_tokens;
-        if samples >= 3 && score < best.1 {
+        let review = candidate.review_acceptance
+            && hot / (batch as f64 * candidate.width as f64) < baseline * 0.98;
+        // Acceptance cannot refresh itself while ordinary decoding advances.
+        // A review reserves the loss of only one guaranteed target per owner,
+        // rather than financing a probe with the stale acceptance estimate.
+        let reserved_tokens = if review {
+            batch as f64
+        } else {
+            candidate.expected_tokens
+        };
+        let loss = (upper - baseline * reserved_tokens).max(0.);
+        if samples >= 3 && score < best.1 && (candidate.warm_ready || loss <= available) {
             best = (candidate.width, score);
         }
         let stale = shape.is_some_and(|s| costs.calls.saturating_sub(s.last) >= REFRESH_AFTER);
-        let loss = (upper - baseline * candidate.expected_tokens).max(0.);
-        // Before calibration, reserve a full invocation without counting on
-        // any accepted tokens. Steady refreshes reserve their predicted loss.
-        let required = if missing > 0 { upper } else { loss };
-        let recoverable = baseline
-            * candidate.remaining_tokens as f64
-            * (1. - batch as f64 / candidate.expected_tokens);
-        if (missing > 0 || stale) && required <= available && required <= recoverable {
+        // Exploration spends marginal time relative to ordinary execution,
+        // including while collecting hot samples. Reserving the full round
+        // can strand a profitable shape between catch-up and its hot samples.
+        // Unexpected rejection or preparation is settled as actual debt.
+        let recoverable = if review {
+            // A review can change acceptance, but not the measured arithmetic
+            // cost. Bound its possible benefit by perfect acceptance.
+            (baseline - hot / (batch as f64 * candidate.width as f64))
+                * candidate.remaining_tokens as f64
+                - transition
+        } else {
+            baseline
+                * candidate.remaining_tokens as f64
+                * (1. - batch as f64 / candidate.expected_tokens)
+        };
+        if (missing > 0 || stale || review) && loss <= available && loss <= recoverable {
             // Finish the smallest cold shape before trying a deeper shape.
             // Afterwards refresh oldest costs, without resetting their samples.
             let rank = (
-                usize::from(missing == 0),
-                if missing > 0 {
+                usize::from(missing == 0 && !review),
+                if missing > 0 || review {
                     candidate.width
                 } else {
                     shape.unwrap().last
@@ -262,21 +298,27 @@ impl Controller {
             .costs
             .normal(key)
             .filter(|s| s.time.samples() >= 3)
-            .map_or(0., Cost::mean);
+            .map_or(0., |s| s.time.mean());
+        let calibrating = width > 1
+            && self
+                .costs
+                .profiles
+                .get(&key)
+                .and_then(|p| p.arms.get(&width))
+                .is_none_or(|s| s.time.samples() < 3);
         self.budget.settle(
-            key.family(),
             width,
             measurement,
             normal,
             key.batch,
             self.calibration_limit,
+            calibrating,
         );
         self.costs.observe(key, width, measurement);
         if self.trace {
             eprintln!(
                 "MTP_OBSERVE {key:?} width={width} {measurement:?} normal={normal:.6} balance={:.6} startup_spent={:.6}",
-                self.budget.balance(key.family()),
-                self.budget.startup_spent
+                self.budget.balance, self.budget.startup_spent
             );
         }
         (width > 1 && normal > 0. && measurement.is_steady() && measurement.tokens > 0)
@@ -286,7 +328,6 @@ impl Controller {
         &mut self,
         key: Key,
         candidates: &[Candidate],
-        normal_seconds: f64,
         slack: f64,
     ) -> Option<(usize, bool)> {
         #[cfg(test)]
@@ -311,24 +352,35 @@ impl Controller {
         if base.time.samples() < 3 || key.batch == 0 {
             return None;
         }
-        let normal = base.mean().max(normal_seconds.min(base.upper()));
-        let available = self.budget.available(key.family(), self.calibration_limit);
-        if available == f64::NEG_INFINITY {
-            return None;
-        }
+        let normal = base.time.mean();
+        let available = self.budget.available(self.calibration_limit);
         let decision = select(
             profile,
             candidates,
             normal,
             slack,
-            available,
+            (self.budget.balance, available),
             |c| self.costs.prior(key, c.width, c.prior_seconds),
             key.batch,
         );
         let decision = decision.map(|choice| (choice.width, choice.exploring));
         if self.trace {
+            let prices: Vec<_> = candidates
+                .iter()
+                .map(|c| {
+                    let cost = profile.arms.get(&c.width);
+                    (
+                        c.width,
+                        c.expected_tokens,
+                        c.warm_ready,
+                        c.review_acceptance,
+                        cost.map(|s| (s.time.samples(), s.time.mean(), s.mean(), s.transition_s)),
+                    )
+                })
+                .collect();
             eprintln!(
-                "MTP_CHOOSE {key:?} decision={decision:?} normal={normal:.6} available={available:.6}"
+                "MTP_CHOOSE {key:?} decision={decision:?} normal={normal:.6} calibration_credit={available:.6} earned_credit={:.6} prices={prices:?}",
+                self.budget.balance
             );
         }
         decision

@@ -253,6 +253,10 @@ impl ModelRuntime {
             .filter(|(i, _)| !requests[*i].prefilling)
             .map(|(i, _)| *i)
             .collect();
+        let warm_ready = owners
+            .iter()
+            .all(|&i| requests[i].warm.tokens == requests[i].history.len() - 1);
+        let review_acceptance = !warm_ready;
         let remaining_tokens = owners
             .iter()
             .map(|&i| {
@@ -351,14 +355,14 @@ impl ModelRuntime {
                 expected_tokens,
                 prior_seconds: baseline + self.mtp_seconds_per_draft * (width - 1) as f64,
                 remaining_tokens,
+                warm_ready,
+                review_acceptance,
             });
         }
         candidates.sort_by_key(|c| c.width);
         self.dynamic_speculation
             .set_calibration_limit(options.target_tpot_ms / 1000.);
-        let decision = self
-            .dynamic_speculation
-            .choose(key, &candidates, baseline, slack);
+        let decision = self.dynamic_speculation.choose(key, &candidates, slack);
         *self
             .scheduler_statistics
             .mtp_depth_histogram
