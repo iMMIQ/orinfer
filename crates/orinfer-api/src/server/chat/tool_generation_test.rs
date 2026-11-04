@@ -29,11 +29,14 @@ fn generated_tools_match_their_token_stream() {
         LoadOptions {
             mtp_drafts: spec["drafts"].as_u64().map(|n| n as usize),
             prefix_cache_bytes: (spec["prefix_cache_mib"].as_u64().unwrap_or(8192) as usize) << 20,
-            kv_offload_bytes: 16 << 30,
+            kv_offload_bytes: (spec["kv_offload_mib"].as_u64().unwrap_or(16384) as usize) << 20,
             ..Default::default()
         },
     )
     .unwrap();
+    if spec["prefix_cache_mib"] == 0 && spec["kv_offload_mib"] == 0 {
+        assert!(!model.prefix_cache_enabled());
+    }
     let batch = spec["batch"].as_u64().unwrap() as usize;
     assert!((1..=32).contains(&batch));
     let mut report = vec![];
@@ -96,6 +99,7 @@ fn generated_tools_match_their_token_stream() {
             .collect::<Vec<_>>();
         let mut tokens = vec![vec![]; batch];
         let mut scores = vec![vec![]; batch];
+        let mut packets = vec![vec![]; batch];
         let mut done = vec![false; batch];
         let started = Instant::now();
         while done.iter().any(|v| !v) {
@@ -116,6 +120,10 @@ fn generated_tools_match_their_token_stream() {
                 .unwrap();
             for step in steps {
                 let i = indices[step.request];
+                packets[i].push(json!({
+                    "position":tokens[i].len(),"tokens":step.tokens.len(),
+                    "mtp_rounds":requests[i].speculation_statistics().rounds,
+                }));
                 scores[i].extend(
                     requests[i]
                         .take_logprobs()
@@ -175,7 +183,7 @@ fn generated_tools_match_their_token_stream() {
                 "speculative_row_budget":row_budget,"prefix":requests[i].prefix_statistics(),
                 "speculation":requests[i].speculation_statistics(),
                 "input_tokens":p.input,"raw_tokens":tokens[i],"raw_text":text,
-                "logprobs":scores[i],"message":message,"whole_message":whole_message,
+                "logprobs":scores[i],"packets":packets[i],"message":message,"whole_message":whole_message,
                 "parser_matches":parser_matches,"wall_s":started.elapsed().as_secs_f64()}),
             );
         }

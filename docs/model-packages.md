@@ -351,6 +351,10 @@ bash tools/operators/ascend/run.sh python3 \
 
 固定历史的多行续算使用 `continuation:true`。检查验证片段内部位置时使用 `verification:true`，通过生产验证布局和状态 journal 返回每个 owner 的全部位置；这些请求须启用 `output`。`decode`、`continuation` 和 `verification` 互斥。报告以 `owner` 和 owner 内的 `position` 标识输出；验证帧的 logits 文件名为 `frameN-ownerK-positionP.f32`，其他帧沿用 `frameN-ownerK.f32`。
 
+`draft:true` 复用发布包的 strided Draft packet，输入各 owner 的 anchor 与 noise token，返回全部草稿 proposal，保持 target 历史。各 owner 须先有 target 输入，片段长度须匹配包内草稿档位并启用 `output`。草稿帧与其他 frame 角色互斥，只用于显式帧诊断；正式 decode 计数与 `draft_s`／`draft_proposals_per_s` 分开报告。
+
+A2 离线 assembly 的 `--fp32-sums` 可将 BF16 AllReduce／ReduceScatter 提升为 FP32 求和，再舍入回原 BF16 边界；沿用各自的分区、补齐和行数表达式。转换复用 `model_ops.convert` 动态模板，scratch 跨层与 packet 复用，不改变权重或请求私有状态。默认关闭；启用后须验收工具质量、Graph replay 与完整请求性能。也可用 `python -m tools.model.deepseek_v41.sum_precision --plan PLAN --model-dir MODEL --output NEW_DIRECTORY` 从现有执行计划创建独立候选包。
+
 `compare_serial` 使用 batch 实际生成的固定历史，按相同计算家族逐请求重放，比较完整词表概率和 greedy 输出。它验证请求隔离及批量算术，不替代官方 BF16/FP8 质量对照。报告区分 forward 时间与执行计划准备时间；完整请求吞吐包含 CPU 坐标、Engram 查找、传输、计算、HCCL、输出头和同步，预热测量排除加载、准入、重置与 Graph 捕获。
 
 离线短测的 case 可设置 `record_routing:true`，在首次预热的每个 frame 完成后读取各 rank 的 W4 专家行计数。报告的 `routing` 保存 case、frame、角色、实际 token 行数及按计划 rank 顺序排列的计数；每项保留原始 groups buffer 名。读取由资源所属 worker 执行，耗时不计入 forward 测量。默认关闭，在线服务不采集该统计。

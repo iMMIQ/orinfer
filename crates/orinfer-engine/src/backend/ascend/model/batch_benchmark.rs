@@ -50,6 +50,9 @@ struct Frame {
     /// Return every causal position through the production verifier layout.
     #[serde(default)]
     verification: bool,
+    /// Run the released strided draft packet without committing target state.
+    #[serde(default)]
+    draft: bool,
     requests: Vec<Request>,
 }
 #[derive(Clone, Deserialize)]
@@ -99,6 +102,8 @@ struct Measurement {
     prefill_tokens_per_s: f64,
     decode_s: f64,
     decode_tokens_per_s: f64,
+    draft_s: f64,
+    draft_proposals_per_s: f64,
     preparation_s: f64,
     reset_s: f64,
     request_s: f64,
@@ -114,6 +119,7 @@ struct Preparation {
     graph_preparation_s: f64,
     first_prefill_s: f64,
     first_decode_s: f64,
+    first_draft_s: f64,
 }
 #[derive(Default)]
 struct Timings {
@@ -121,10 +127,15 @@ struct Timings {
     decode_s: f64,
     input_tokens: usize,
     decode_tokens: usize,
+    draft_s: f64,
+    draft_proposals: usize,
 }
 impl Timings {
     fn record(&mut self, frame: &Frame, outputs: usize, seconds: f64) {
-        if frame.decode || frame.continuation || frame.verification {
+        if frame.draft {
+            self.draft_s += seconds;
+            self.draft_proposals += outputs;
+        } else if frame.decode || frame.continuation || frame.verification {
             self.decode_s += seconds;
             self.decode_tokens += outputs;
         } else {
@@ -142,10 +153,16 @@ struct Comparison {
 }
 
 fn frame_layout(frame: &Frame, capacity: usize, owners: usize) -> Result<Layout> {
-    if usize::from(frame.decode) + usize::from(frame.continuation) + usize::from(frame.verification)
+    if usize::from(frame.decode)
+        + usize::from(frame.continuation)
+        + usize::from(frame.verification)
+        + usize::from(frame.draft)
         > 1
     {
-        return Err("Choose one decode, continuation or verification frame role".into());
+        return Err("Choose one decode, continuation, verification or draft frame role".into());
+    }
+    if frame.draft && frame.requests.iter().any(|r| !r.output) {
+        return Err("Draft frames return every proposal of every owner".into());
     }
     if frame.verification {
         if frame.requests.iter().any(|r| !r.output) {
@@ -186,6 +203,9 @@ fn frame_layout(frame: &Frame, capacity: usize, owners: usize) -> Result<Layout>
     if frame.continuation {
         layout.decoder_roles.fill(super::replay::Role::Continue);
     }
+    if frame.draft {
+        layout.role = super::PacketRole::Draft;
+    }
     Ok(layout)
 }
 fn forward(
@@ -196,7 +216,15 @@ fn forward(
     full: bool,
 ) -> Result<(Vec<Output>, f64, f64)> {
     let layout = frame_layout(frame, cap, owners)?;
-    let positions = layout.output_positions.clone();
+    let positions = if frame.draft {
+        frame
+            .requests
+            .iter()
+            .flat_map(|request| 0..request.tokens.len())
+            .collect()
+    } else {
+        layout.output_positions.clone()
+    };
     if frame.verification {
         team.exchange(Command::BeginVerification(
             frame
@@ -303,6 +331,7 @@ fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<
                 decode: false,
                 continuation: false,
                 verification: false,
+                draft: false,
                 requests: rows,
             });
             continue;
@@ -333,6 +362,7 @@ fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<
             decode: false,
             continuation: false,
             verification: false,
+            draft: false,
             requests: rows,
         });
     }
@@ -398,6 +428,7 @@ fn plan_prompt_frames(requests: &[Request], budget: usize, keep: usize) -> Resul
             decode: false,
             continuation: false,
             verification: false,
+            draft: false,
             requests: rows,
         });
         cursor = next;
@@ -467,6 +498,8 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
         .next()
         .ok_or("Missing prefill family")?;
     let mut inputs: Inputs = crate::model::read(inputs)?;
+    let logits_directory =
+        std::env::var_os("ORINFER_A2_BATCH_LOGITS_DIR").map(std::path::PathBuf::from);
     if inputs.cases.is_empty() {
         return Err("Empty batch workload".into());
     }
@@ -487,14 +520,37 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
         if case.frames.is_empty() || case.repeats == 0 {
             return Err("Empty batch case/repeats".into());
         }
+        if case.frames.iter().any(|frame| frame.draft)
+            && (case.compare_serial || case.decode_steps > 0 || logits_directory.is_some())
+        {
+            return Err("Draft diagnostics use explicit frames and proposal outputs".into());
+        }
         let mut lengths = std::collections::BTreeMap::<usize, usize>::new();
         for frame in &case.frames {
             frame_layout(frame, if frame.decode { owners } else { capacity }, owners)?;
+            if frame.draft
+                && !model.ranks[0].packets.iter().any(|packet| {
+                    packet.role == super::PacketRole::Draft
+                        && packet.draft_stride.is_some()
+                        && frame
+                            .requests
+                            .iter()
+                            .all(|r| Some(r.tokens.len()) == packet.coordinates.draft_block)
+                })
+            {
+                return Err("Draft diagnostic requires a supported strided block".into());
+            }
             for r in &frame.requests {
                 if r.tokens.iter().any(|&t| t >= 129280) {
                     return Err("Invalid token ID".into());
                 }
                 let count = lengths.entry(r.owner).or_default();
+                if frame.draft {
+                    if *count == 0 {
+                        return Err("Draft diagnostic requires target history".into());
+                    }
+                    continue;
+                }
                 *count = count
                     .checked_add(r.tokens.len())
                     .ok_or("Context overflow")?;
@@ -520,8 +576,6 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
         }
     }
     let team = Team::load(plan, model_dir)?;
-    let logits_directory =
-        std::env::var_os("ORINFER_A2_BATCH_LOGITS_DIR").map(std::path::PathBuf::from);
     let load_s = team.load_s;
     eprintln!("A2 shared batch model loaded in {load_s:.3}s");
     (|| {
@@ -611,6 +665,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                             decode: true,
                             continuation: false,
                             verification: false,
+                            draft: false,
                             requests: last_outputs
                                 .values()
                                 .map(|o| Request {
@@ -628,6 +683,8 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                     decode_s,
                     input_tokens,
                     decode_tokens,
+                    draft_s,
+                    draft_proposals,
                 } = timings;
                 if repeat == 0 {
                     preparations.push(Preparation {
@@ -637,6 +694,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                         graph_preparation_s: preparation_s,
                         first_prefill_s: prefill_s,
                         first_decode_s: decode_s,
+                        first_draft_s: draft_s,
                     });
                     if case.compare_serial {
                         team.exchange(Command::Release(None))?;
@@ -665,6 +723,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                         decode: frame.decode,
                                         continuation: frame.continuation,
                                         verification: frame.verification,
+                                        draft: frame.draft,
                                         requests: frame
                                             .requests
                                             .iter()
@@ -683,6 +742,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                     decode: frame.decode,
                                     continuation: frame.continuation,
                                     verification: frame.verification,
+                                    draft: frame.draft,
                                     requests: frame
                                         .requests
                                         .iter()
@@ -738,9 +798,15 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                     } else {
                         0.
                     },
+                    draft_s,
+                    draft_proposals_per_s: if draft_s > 0. {
+                        draft_proposals as f64 / draft_s
+                    } else {
+                        0.
+                    },
                     preparation_s,
                     reset_s,
-                    request_s: reset_s + preparation_s + prefill_s + decode_s,
+                    request_s: reset_s + preparation_s + prefill_s + decode_s + draft_s,
                     output_tokens: outputs,
                     serial: validation.take(),
                 });
@@ -849,6 +915,32 @@ mod tests {
         frame.continuation = true;
         assert!(frame_layout(&frame, 2048, 32).is_err());
         frame.continuation = false;
+        frame.requests[0].output = false;
+        assert!(frame_layout(&frame, 2048, 32).is_err());
+    }
+
+    #[test]
+    fn strided_draft_keeps_owner_endpoints_and_counts_proposals_separately() {
+        let mut frame: Frame = serde_json::from_value(serde_json::json!({
+            "draft":true,"requests":[
+                {"owner":17,"tokens":[271,128799,128799,128799,128799],"output":true},
+                {"owner":3,"tokens":[271,128799,128799,128799,128799],"output":true}
+            ]
+        }))
+        .unwrap();
+        let layout = frame_layout(&frame, 2048, 32).unwrap();
+        assert_eq!(layout.role, super::super::PacketRole::Draft);
+        assert_eq!(layout.outputs, [0, 1]);
+        assert_eq!(layout.output_positions, [4, 4]);
+        let mut timings = Timings::default();
+        timings.record(&frame, 10, 0.2);
+        assert_eq!(timings.draft_proposals, 10);
+        assert_eq!(timings.draft_s, 0.2);
+        assert_eq!(timings.decode_tokens, 0);
+        assert_eq!(timings.input_tokens, 0);
+        frame.decode = true;
+        assert!(frame_layout(&frame, 2048, 32).is_err());
+        frame.decode = false;
         frame.requests[0].output = false;
         assert!(frame_layout(&frame, 2048, 32).is_err());
     }

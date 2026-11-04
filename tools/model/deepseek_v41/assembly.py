@@ -664,6 +664,7 @@ def main():
     parser.add_argument("--reduce-scatter", action="store_true")
     parser.add_argument("--shared-attention", action="store_true")
     parser.add_argument("--fused-attention", action="store_true")
+    parser.add_argument("--fp32-sums", action="store_true")
     parser.add_argument("--fused-min-rows", type=int, default=512)
     parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--tune-projections", choices=("off", "local", "all"), default="off")
@@ -756,8 +757,14 @@ def main():
             sys.argv = previous
         current = current.with_name(current.stem + "-tuned.json")
         stages.append(dict(stage="tune", sha256=file_hash(current)))
-    model = compact_buffers(json.loads(current.read_text()))
-    validation = validate_rows(model, base)
+    model = json.loads(current.read_text())
+    if args.fp32_sums:
+        from tools.model.deepseek_v41.sum_precision import compile_promoted
+
+        model, sums = compile_promoted(model, base, args.compile_workers)
+        stages.append(dict(stage="fp32_sums", **sums))
+    model = compact_buffers(model)
+    validation = validate_rows(model, base, model_dir=args.model_dir)
     assets = publish_package(model, base, args.package_output) if args.package_output else None
     atomic_json(args.output, model)
     receipt = dict(
