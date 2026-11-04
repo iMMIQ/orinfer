@@ -6,6 +6,8 @@ use std::{collections::BTreeSet, path::Path};
 use tokenizers::Tokenizer;
 mod deepseek;
 use super::output::ToolFormat;
+#[cfg(test)]
+mod tool_generation_test;
 
 fn nullable_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
 where

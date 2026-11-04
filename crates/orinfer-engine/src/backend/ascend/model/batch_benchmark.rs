@@ -47,6 +47,9 @@ struct Frame {
     /// rather than rebuilding a final prompt window.
     #[serde(default)]
     continuation: bool,
+    /// Return every causal position through the production verifier layout.
+    #[serde(default)]
+    verification: bool,
     requests: Vec<Request>,
 }
 #[derive(Clone, Deserialize)]
@@ -60,6 +63,7 @@ struct Request {
 #[derive(Clone, Serialize)]
 struct Output {
     owner: usize,
+    position: usize,
     token: u32,
     #[serde(skip)]
     logits: Vec<f32>,
@@ -120,7 +124,7 @@ struct Timings {
 }
 impl Timings {
     fn record(&mut self, frame: &Frame, outputs: usize, seconds: f64) {
-        if frame.decode || frame.continuation {
+        if frame.decode || frame.continuation || frame.verification {
             self.decode_s += seconds;
             self.decode_tokens += outputs;
         } else {
@@ -138,6 +142,28 @@ struct Comparison {
 }
 
 fn frame_layout(frame: &Frame, capacity: usize, owners: usize) -> Result<Layout> {
+    if usize::from(frame.decode) + usize::from(frame.continuation) + usize::from(frame.verification)
+        > 1
+    {
+        return Err("Choose one decode, continuation or verification frame role".into());
+    }
+    if frame.verification {
+        if frame.requests.iter().any(|r| !r.output) {
+            return Err("Verification frames return every position of every owner".into());
+        }
+        return Layout::verification(
+            frame
+                .requests
+                .iter()
+                .map(|r| BatchSegment {
+                    slot: r.owner,
+                    tokens: r.tokens.len(),
+                })
+                .collect(),
+            capacity,
+            owners,
+        );
+    }
     let mut layout = Layout::new(
         frame
             .requests
@@ -169,16 +195,35 @@ fn forward(
     owners: usize,
     full: bool,
 ) -> Result<(Vec<Output>, f64, f64)> {
+    let layout = frame_layout(frame, cap, owners)?;
+    let positions = layout.output_positions.clone();
+    if frame.verification {
+        team.exchange(Command::BeginVerification(
+            frame
+                .requests
+                .iter()
+                .map(|r| (r.owner, r.tokens.len()))
+                .collect(),
+        ))?;
+    }
     let (values, seconds, preparation) = team.forward(
-        frame_layout(frame, cap, owners)?,
+        layout,
         frame.requests.iter().map(|r| r.tokens.clone()).collect(),
         full,
     )?;
+    if frame.verification {
+        team.exchange(Command::EndVerification)?;
+    }
+    if values.len() != positions.len() {
+        return Err("Native frame output positions differ".into());
+    }
     Ok((
         values
             .into_iter()
-            .map(|value| Output {
+            .zip(positions)
+            .map(|(value, position)| Output {
                 owner: value.owner,
+                position,
                 token: value.token,
                 logits: value.logits,
             })
@@ -257,6 +302,7 @@ fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<
             frames.push(Frame {
                 decode: false,
                 continuation: false,
+                verification: false,
                 requests: rows,
             });
             continue;
@@ -286,6 +332,7 @@ fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<
         frames.push(Frame {
             decode: false,
             continuation: false,
+            verification: false,
             requests: rows,
         });
     }
@@ -350,6 +397,7 @@ fn plan_prompt_frames(requests: &[Request], budget: usize, keep: usize) -> Resul
         frames.push(Frame {
             decode: false,
             continuation: false,
+            verification: false,
             requests: rows,
         });
         cursor = next;
@@ -368,7 +416,7 @@ fn compare(batch: &[Vec<Output>], serial: &[Vec<Output>]) -> Result<Comparison> 
         for b in expected {
             let s = actual
                 .iter()
-                .find(|v| v.owner == b.owner)
+                .find(|v| v.owner == b.owner && v.position == b.position)
                 .ok_or("Serial output missing")?;
             if b.logits.len() != 129280 || s.logits.len() != b.logits.len() {
                 return Err("Missing complete validation logits".into());
@@ -522,11 +570,16 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                 .iter()
                                 .flat_map(|v| v.to_le_bytes())
                                 .collect::<Vec<_>>();
-                            std::fs::write(
-                                directory.join(format!("frame{index}-owner{}.f32", value.owner)),
-                                bytes,
-                            )
-                            .map_err(|e| e.to_string())?;
+                            let name = if f.verification {
+                                format!(
+                                    "frame{index}-owner{}-position{}.f32",
+                                    value.owner, value.position
+                                )
+                            } else {
+                                format!("frame{index}-owner{}.f32", value.owner)
+                            };
+                            std::fs::write(directory.join(name), bytes)
+                                .map_err(|e| e.to_string())?;
                         }
                     }
                     preparation_s += prepare;
@@ -557,6 +610,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                         frames.push(Frame {
                             decode: true,
                             continuation: false,
+                            verification: false,
                             requests: last_outputs
                                 .values()
                                 .map(|o| Request {
@@ -610,6 +664,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                     let one = Frame {
                                         decode: frame.decode,
                                         continuation: frame.continuation,
+                                        verification: frame.verification,
                                         requests: frame
                                             .requests
                                             .iter()
@@ -627,6 +682,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                 let f = Frame {
                                     decode: frame.decode,
                                     continuation: frame.continuation,
+                                    verification: frame.verification,
                                     requests: frame
                                         .requests
                                         .iter()
@@ -768,6 +824,35 @@ mod tests {
         assert_eq!(times.decode_s, 0.5);
         assert_eq!(times.decode_tokens, 1);
     }
+    #[test]
+    fn verification_exposes_interior_causal_positions_for_each_owner() {
+        let mut frame: Frame = serde_json::from_value(serde_json::json!({
+            "verification":true,"requests":[
+                {"owner":17,"tokens":[1,2,3,4,5,6],"output":true},
+                {"owner":3,"tokens":[7,8],"output":true}
+            ]
+        }))
+        .unwrap();
+        let layout = frame_layout(&frame, 2048, 32).unwrap();
+        assert_eq!(layout.outputs, [0, 0, 0, 0, 0, 0, 1, 1]);
+        assert_eq!(layout.output_positions, [0, 1, 2, 3, 4, 5, 0, 1]);
+        assert!(
+            layout
+                .decoder_roles
+                .iter()
+                .all(|r| *r == super::super::replay::Role::Continue)
+        );
+        let mut timings = Timings::default();
+        timings.record(&frame, 8, 0.2);
+        assert_eq!(timings.decode_tokens, 8);
+        assert_eq!(timings.input_tokens, 0);
+        frame.continuation = true;
+        assert!(frame_layout(&frame, 2048, 32).is_err());
+        frame.continuation = false;
+        frame.requests[0].output = false;
+        assert!(frame_layout(&frame, 2048, 32).is_err());
+    }
+
     #[test]
     fn teacher_continuation_preserves_verifier_history_and_owner_endpoints() {
         let frame: Frame = serde_json::from_value(serde_json::json!({

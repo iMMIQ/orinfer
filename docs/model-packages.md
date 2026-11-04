@@ -349,6 +349,8 @@ bash tools/operators/ascend/run.sh python3 \
 
 也可用 `frames` 代替 `requests`，逐轮声明 `requests` 与 `decode`；每条请求的 `output` 控制该轮是否执行输出头。`decode:true` 要求各请求正好一行；默认家族接受不同片段长度及一行续算。自动 decode 要求每个 owner 的最后一个输入片段请求输出。owner 身份与行顺序独立，未出现在某轮的请求保留完整状态。
 
+固定历史的多行续算使用 `continuation:true`。检查验证片段内部位置时使用 `verification:true`，通过生产验证布局和状态 journal 返回每个 owner 的全部位置；这些请求须启用 `output`。`decode`、`continuation` 和 `verification` 互斥。报告以 `owner` 和 owner 内的 `position` 标识输出；验证帧的 logits 文件名为 `frameN-ownerK-positionP.f32`，其他帧沿用 `frameN-ownerK.f32`。
+
 `compare_serial` 使用 batch 实际生成的固定历史，按相同计算家族逐请求重放，比较完整词表概率和 greedy 输出。它验证请求隔离及批量算术，不替代官方 BF16/FP8 质量对照。报告区分 forward 时间与执行计划准备时间；完整请求吞吐包含 CPU 坐标、Engram 查找、传输、计算、HCCL、输出头和同步，预热测量排除加载、准入、重置与 Graph 捕获。
 
 离线短测的 case 可设置 `record_routing:true`，在首次预热的每个 frame 完成后读取各 rank 的 W4 专家行计数。报告的 `routing` 保存 case、frame、角色、实际 token 行数及按计划 rank 顺序排列的计数；每项保留原始 groups buffer 名。读取由资源所属 worker 执行，耗时不计入 forward 测量。默认关闭，在线服务不采集该统计。
