@@ -143,6 +143,7 @@ pub(crate) struct Request {
     prefix: crate::prefix::Statistics,
     mtp: crate::mtp::Statistics,
     draft_feedback: dspark::Feedback,
+    shared_work: bool,
     last_output: Instant,
     last_prefill: Instant,
     ready_output: Option<Arc<Output>>,
@@ -685,6 +686,7 @@ impl Runtime {
             prefix,
             mtp: Default::default(),
             draft_feedback: Default::default(),
+            shared_work: false,
             last_output: Instant::now(),
             last_prefill: Instant::now(),
             ready_output,
@@ -927,8 +929,33 @@ impl Runtime {
             .filter(|(_, r)| !r.prefilling && !r.is_finished())
             .map(|(i, r)| (i, r.generated))
             .collect::<Vec<_>>();
+        // Parallel draft blocks have distinct preparation costs. Bound the
+        // model-lifetime loss by the shared calibration horizon per physical family, rather
+        // than minting credit whenever batch membership or context changes.
+        let calibration_families = self
+            .team
+            .draft_blocks
+            .iter()
+            .position(|&block| block >= self.draft_limit)
+            .map_or(self.team.draft_blocks.len(), |i| i + 1)
+            .max(1);
+        self.speculation_policy.start_iteration(
+            options.target_tpot_ms / 1000. * crate::mtp::adaptive::CALIBRATION_ROUNDS as f64,
+            calibration_families,
+        );
         let started = Instant::now();
         let result = self.advance_packet(requests, options, maintenance);
+        let deltas = decoding
+            .iter()
+            .map(|&(i, before)| {
+                (
+                    requests[i].slot,
+                    requests[i].generated.saturating_sub(before),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.speculation_policy
+            .finish_iteration(started.elapsed().as_secs_f64(), &deltas);
         self.capture_credit_s = if !decoding.is_empty() && result.is_ok() {
             let committed = decoding
                 .iter()
@@ -981,7 +1008,19 @@ impl Runtime {
         {
             return Err("Insufficient A2 workspace after reclaiming cached state".into());
         }
+        let shared = packet::mark_shared(&selected, requests);
         let work = packet::work(&selected, requests, prefill_rows);
+        self.speculation_policy.begin_round(
+            selected
+                .iter()
+                .filter(|&&(i, _)| !requests[i].prefilling)
+                .map(|&(i, _)| requests[i].slot)
+                .collect(),
+            full,
+            work,
+            shared,
+            1,
+        );
         let (uses, slack) = self.capture_context(
             &selected,
             requests,

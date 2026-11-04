@@ -97,6 +97,7 @@ pub(super) fn request(output: Arc<Output>, sampling: crate::sampling::Options) -
         sampling,
         decoder: Default::default(),
         draft_feedback: Default::default(),
+        shared_work: false,
         prefix: Default::default(),
         mtp: Default::default(),
         last_output: Instant::now(),
@@ -281,4 +282,19 @@ fn packet_order_promotes_waiting_long_prompt_then_resets_on_progress() {
         packet::request_order(&[&mut long, &mut suffix], 4000.),
         vec![1, 0]
     );
+}
+
+#[test]
+fn shared_scheduling_membership_survives_a_single_owner_tail() {
+    let mut a = request(output(), Default::default());
+    let mut b = request(output(), Default::default());
+    a.slot = 7;
+    b.slot = 11;
+    assert!(packet::mark_shared(
+        &[(0, 1), (1, 1)],
+        &mut [&mut a, &mut b]
+    ));
+    assert!(packet::mark_shared(&[(0, 1)], &mut [&mut a]));
+    let mut fresh = request(output(), Default::default());
+    assert!(!packet::mark_shared(&[(0, 1)], &mut [&mut fresh]));
 }

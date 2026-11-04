@@ -1,34 +1,7 @@
 //! Timing samples have no ownership of execution resources or graph readiness.
-use super::super::Profile as Timing;
 use super::{Key, Measurement};
+pub(super) use crate::mtp::adaptive::Cost;
 use std::collections::BTreeMap;
-
-#[derive(Default)]
-pub(super) struct Cost {
-    pub time: Timing,
-    overhead: f64,
-    pub last: usize,
-}
-impl Cost {
-    pub fn mean(&self) -> f64 {
-        self.time.mean() + self.overhead
-    }
-    pub fn upper(&self) -> f64 {
-        self.time.upper() + self.overhead
-    }
-    fn observe(&mut self, measurement: Measurement, call: usize) {
-        self.last = call;
-        let extra = if !measurement.is_steady() && self.time.samples() > 0 {
-            (measurement.seconds - self.time.mean()).max(0.)
-        } else {
-            0.
-        };
-        self.overhead = (31. * self.overhead + extra) / 32.;
-        if measurement.is_steady() && measurement.tokens > 0 {
-            self.time.observe(measurement.seconds);
-        }
-    }
-}
 
 #[derive(Default)]
 pub(super) struct Profile {

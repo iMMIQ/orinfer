@@ -11,6 +11,16 @@ pub(super) struct Selection {
     pub prefill_requests: usize,
 }
 
+/// Shared scheduling membership survives a cohort's tail becoming single-stream.
+pub(super) fn mark_shared(selected: &[(usize, usize)], requests: &mut [&mut Request]) -> bool {
+    if selected.len() > 1 {
+        for &(i, _) in selected {
+            requests[i].shared_work = true;
+        }
+    }
+    selected.iter().any(|&(i, _)| requests[i].shared_work)
+}
+
 pub(super) fn work(
     selected: &[(usize, usize)],
     requests: &[&mut Request],

@@ -61,7 +61,17 @@ struct Family(Stage, usize, bool, bool, usize, usize);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Key(Family, usize, bool);
 struct Cell {
-    time: Estimate,
+    time: crate::mtp::adaptive::Timing,
+    prior: f64,
+}
+impl Cell {
+    fn mean(&self) -> f64 {
+        if self.time.observations() > 0 {
+            self.time.mean()
+        } else {
+            self.prior
+        }
+    }
 }
 #[derive(Default)]
 struct Cold {
@@ -79,6 +89,9 @@ pub(super) struct Model {
 pub(super) struct Prediction {
     pub seconds: f64,
     pub replay: bool,
+    pub samples: usize,
+    pub observations: usize,
+    nearby: bool,
 }
 fn bucket(value: usize) -> usize {
     value.max(1).next_power_of_two()
@@ -153,9 +166,20 @@ impl Model {
             return;
         }
         let cell = self.cells.entry(key).or_insert(Cell {
-            time: Estimate::default(),
+            time: Default::default(),
+            prior: 0.,
         });
-        cell.time.observe(point.seconds);
+        if online {
+            cell.time.observe(point.seconds);
+        } else {
+            // Imported timings price execution; only this process's real
+            // calls may consume its primer and establish hot observations.
+            cell.prior = if cell.prior > 0. {
+                cell.prior * 0.8 + point.seconds * 0.2
+            } else {
+                point.seconds
+            };
+        }
         if point.setup_s > 0. {
             // Host readback mode does not change the captured launch geometry.
             let cold_group = family(point.stage, point.block, false, point.work);
@@ -183,6 +207,27 @@ impl Model {
             .copied()
             .unwrap_or(false);
         self.predict_mode(stage, block, full, work, replay)
+    }
+    /// Measured neighboring rows can price another logical prefix in the same
+    /// physical draft family; they do not establish Graph residency.
+    pub(super) fn evidence(
+        &self,
+        stage: Stage,
+        block: usize,
+        full: bool,
+        work: Work,
+    ) -> (usize, usize) {
+        // Preparation reserves use real observation counts; calibration uses
+        // only samples retained by the shared primer in each execution mode.
+        [false, true]
+            .into_iter()
+            .filter_map(|replay| {
+                self.predict_mode(stage, block, full, work, replay)
+                    .filter(|p| p.nearby)
+            })
+            .fold((0, 0), |(hot, seen), p| {
+                (hot + p.samples, seen + p.observations)
+            })
     }
     pub fn predict_mode(
         &self,
@@ -247,9 +292,17 @@ impl Model {
                 upper = Some((*rows, cell));
             }
         }
+        // An upward row extrapolation is a prior, not local calibration.
+        // Downward reuse keeps the measured upper packet's whole cost.
+        let nearby = upper.is_some()
+            && group.4.ilog2().abs_diff(requested.4.ilog2()) <= 1
+            && group.5.abs_diff(requested.5) <= 1;
         let value = |cell: &Cell| Prediction {
-            seconds: cell.time.mean,
+            seconds: cell.mean(),
             replay,
+            samples: cell.time.samples(),
+            observations: cell.time.observations(),
+            nearby,
         };
         match (lower, upper) {
             // Replay pays the captured tier; no invented savings within a tier.
@@ -257,33 +310,66 @@ impl Model {
             (Some((lo, a)), Some((hi, b))) if lo < hi => {
                 let fraction = (work.rows - lo) as f64 / (hi - lo) as f64;
                 Some(Prediction {
-                    seconds: a.time.mean + (b.time.mean - a.time.mean) * fraction,
+                    seconds: a.mean() + (b.mean() - a.mean()) * fraction,
                     replay,
+                    samples: a.time.samples().min(b.time.samples()),
+                    observations: a.time.observations().min(b.time.observations()),
+                    nearby,
                 })
             }
             (Some((rows, cell)), _) => Some(Prediction {
-                seconds: cell.time.mean
+                seconds: cell.mean()
                     + (work.rows - rows) as f64
                         * previous.map_or(
-                            cell.time.mean / rows as f64,
+                            cell.mean() / rows as f64,
                             |(before_rows, before): (usize, &Cell)| {
-                                ((cell.time.mean - before.time.mean) / (rows - before_rows) as f64)
+                                ((cell.mean() - before.mean()) / (rows - before_rows) as f64)
                                     .max(0.)
                             },
                         ),
                 replay,
+                samples: cell.time.samples(),
+                observations: cell.time.observations(),
+                nearby,
             }),
             (_, Some((_, cell))) => Some(value(cell)),
             _ => None,
         }
     }
     fn cold_estimate(&self, stage: Stage, block: usize, work: Work, capture: bool) -> Option<f64> {
+        self.cold_estimate_scoped(stage, block, work, capture, false)
+    }
+    /// Exploration reserves preparation only from a comparable packet. A cold
+    /// prefill plan is not evidence that a tiny verification plan costs as much.
+    pub(super) fn probe_preparation(
+        &self,
+        stage: Stage,
+        block: usize,
+        work: Work,
+        capture: bool,
+    ) -> Option<f64> {
+        self.cold_estimate_scoped(stage, block, work, capture, true)
+    }
+    fn cold_estimate_scoped(
+        &self,
+        stage: Stage,
+        block: usize,
+        work: Work,
+        capture: bool,
+        comparable: bool,
+    ) -> Option<f64> {
         let requested = family(stage, block, false, work);
         self.cold
             .iter()
-            .filter(|((f, _), c)| {
+            .filter(|((f, rows), c)| {
                 f.0 == stage
                     && f.1 == block
+                    && (!comparable
+                        || f.3 == requested.3
+                            && f.4.ilog2().abs_diff(requested.4.ilog2()) <= 1
+                            && f.5.abs_diff(requested.5) <= 1
+                            && (*rows).max(work.rows)
+                                <= (*rows).min(work.rows).max(1).saturating_mul(2))
                     && if capture {
                         c.capture.samples > 0
                     } else {
@@ -376,6 +462,85 @@ fn valid(point: &Point) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn imported_timings_do_not_consume_the_runtime_primer() {
+        let mut model = Model::default();
+        let work = Work {
+            rows: 96,
+            context: 2048,
+            ..Work::default()
+        };
+        model.insert(point(96, true, 0.29), false);
+        assert_eq!(model.evidence(Stage::Target, 0, false, work), (0, 0));
+        assert!(
+            (model
+                .predict_mode(Stage::Target, 0, false, work, true)
+                .unwrap()
+                .seconds
+                - 0.29)
+                .abs()
+                < 1e-12
+        );
+        model.observe(point(96, true, 0.4));
+        assert_eq!(model.evidence(Stage::Target, 0, false, work), (0, 1));
+        model.observe(point(96, true, 0.29));
+        assert_eq!(model.evidence(Stage::Target, 0, false, work), (1, 2));
+        assert!(
+            (model
+                .predict_mode(Stage::Target, 0, false, work, true)
+                .unwrap()
+                .seconds
+                - 0.29)
+                .abs()
+                < 1e-12
+        );
+    }
+    #[test]
+    fn capture_primer_is_not_a_stable_replay_cost() {
+        let mut model = Model::default();
+        for (replay, seconds) in [(false, 0.45), (false, 0.44), (true, 0.4)] {
+            model.observe(point(96, replay, seconds));
+        }
+        let work = Work {
+            rows: 96,
+            context: 2048,
+            ..Work::default()
+        };
+        assert_eq!(model.evidence(Stage::Target, 0, false, work), (1, 3));
+        model.observe(point(96, true, 0.29));
+        assert!(
+            (model
+                .predict_mode(Stage::Target, 0, false, work, true)
+                .unwrap()
+                .seconds
+                - 0.29)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(model.evidence(Stage::Target, 0, false, work), (2, 4));
+    }
+    #[test]
+    fn calibration_combines_direct_and_replay_without_claiming_graph_residency() {
+        let mut model = Model::default();
+        for replay in [false, false, true, true] {
+            model.observe(point(6, replay, if replay { 0.03 } else { 0.1 }));
+        }
+        let work = Work {
+            rows: 5,
+            context: 2048,
+            ..Work::default()
+        };
+        assert_eq!(model.evidence(Stage::Target, 0, false, work), (2, 4));
+        assert_eq!(
+            model
+                .evidence(Stage::Target, 0, false, Work { rows: 24, ..work })
+                .0,
+            0
+        );
+        let prediction = model.predict(Stage::Target, 0, false, work).unwrap();
+        assert!(!prediction.replay);
+        assert!((prediction.seconds - 0.1).abs() < 1e-12);
+    }
     fn point(rows: usize, replay: bool, seconds: f64) -> Point {
         Point {
             stage: Stage::Target,

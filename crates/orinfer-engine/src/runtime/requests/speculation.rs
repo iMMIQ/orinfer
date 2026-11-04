@@ -3,34 +3,7 @@
 use super::*;
 pub(in crate::runtime) mod control;
 
-#[derive(Default)]
-pub(in crate::runtime) struct Profile {
-    time: scheduler::Estimate,
-    trials: usize,
-}
-impl Profile {
-    pub fn samples(&self) -> usize {
-        if self.trials <= 1 {
-            0
-        } else {
-            self.time.samples
-        }
-    }
-    pub fn mean(&self) -> f64 {
-        self.time.mean
-    }
-    pub fn upper(&self) -> f64 {
-        self.time.upper()
-    }
-    pub fn observe(&mut self, seconds: f64) {
-        if self.trials == 1 {
-            // The first use may capture a graph or load a lazy CUDA module.
-            self.time = Default::default();
-        }
-        self.time.observe(seconds);
-        self.trials += 1;
-    }
-}
+pub(in crate::runtime) use crate::mtp::adaptive::Timing as Profile;
 
 pub(super) enum Preparation {
     Finished(Vec<u32>),

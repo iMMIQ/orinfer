@@ -1,57 +1,12 @@
 //! Runtime decisions only: kernels and legal row geometries remain package-owned.
-mod budget;
 mod cost;
 // Reprofiling is a real execution and may displace captured graphs. Acceptance
 // changes are evaluated every round; only unused timing estimates age here.
-const REFRESH_AFTER: usize = 512;
-use budget::Budget;
+#[cfg(test)]
+use crate::mtp::adaptive::REFRESH_AFTER;
+use crate::mtp::adaptive::{self, Budget};
+pub(in crate::runtime) use crate::mtp::adaptive::{Acceptance, Measurement, progress};
 use cost::{Cost, Costs};
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(in crate::runtime) struct Acceptance {
-    // Conditional acceptance at each actually tested prefix position. A rejected
-    // prefix does not turn its untested suffix into independent rejections.
-    probability: [f64; 7],
-    samples: [usize; 7],
-}
-impl Acceptance {
-    pub(in crate::runtime) fn observe(&mut self, proposed: usize, accepted: usize) {
-        for j in 0..proposed.min(accepted.saturating_add(1)).min(7) {
-            let value = f64::from(j < accepted);
-            self.probability[j] = if self.samples[j] == 0 {
-                value
-            } else {
-                self.probability[j] * 0.8 + value * 0.2
-            };
-            self.samples[j] += 1;
-        }
-    }
-    pub(in crate::runtime) fn expected(&self, drafts: usize) -> f64 {
-        let mut prefix = 1.;
-        let mut total = 1.;
-        for j in 0..drafts.min(7) {
-            // Shrink sparse request observations toward a neutral model prior.
-            let confidence = self.samples[j] as f64 / (self.samples[j] as f64 + 4.);
-            prefix *= self.probability[j] * confidence + 0.7 * (1. - confidence);
-            total += prefix;
-        }
-        total
-    }
-}
-
-/// Latency protects the slowest owner's expected token rate. Throughput uses
-/// total expected commits. Both return token-equivalent progress for the packet;
-/// the latency value is a conservative lower bound on its total expected yield.
-pub(super) fn progress(yields: impl Iterator<Item = f64>, batch: usize, latency: bool) -> f64 {
-    let (total, minimum) = yields.fold((0., f64::INFINITY), |(total, minimum), value| {
-        (total + value, minimum.min(value))
-    });
-    if latency {
-        minimum * batch as f64
-    } else {
-        total
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::runtime) struct Key {
@@ -68,28 +23,6 @@ impl Key {
             self.sampling,
             usize::from(self.prefill > 0) + 2 * usize::from(self.shared_work),
         )
-    }
-}
-
-/// A complete execution sample. Preparation is charged in full but excluded
-/// from hot arithmetic; direct and replay execution share one timing estimate.
-#[derive(Clone, Copy, Debug, Default)]
-pub(in crate::runtime) struct Measurement {
-    pub seconds: f64,
-    pub preparation_s: f64,
-    pub tokens: usize,
-    /// The request draft state was caught up before this invocation.
-    pub warm_ready: bool,
-}
-impl Measurement {
-    fn is_steady(self) -> bool {
-        self.warm_ready && self.preparation_s == 0.
-    }
-    fn valid(self) -> bool {
-        self.seconds.is_finite()
-            && self.seconds > 0.
-            && self.preparation_s.is_finite()
-            && self.preparation_s >= 0.
     }
 }
 
@@ -139,13 +72,7 @@ pub(in crate::runtime) struct Candidate {
     pub remaining_tokens: usize,
 }
 
-struct Decision {
-    width: usize,
-    exploring: bool,
-}
-
-/// Choose from legal plans using frozen costs and request-local expected yield.
-/// The only policy states are measured samples and time since last measurement.
+/// Convert CUDA timing arms into the shared, backend-neutral selector input.
 fn select(
     costs: &cost::Profile,
     candidates: &[Candidate],
@@ -154,88 +81,42 @@ fn select(
     available: f64,
     prior: impl Fn(&Candidate) -> f64,
     batch: usize,
-) -> Option<Decision> {
-    if slack.is_nan() || slack <= 0. {
-        return None;
-    }
-    // Ordinary execution is the zero-speculation candidate. Keep its baseline
-    // current as well; no special calibration or recovery state is needed.
-    if costs
-        .arms
-        .get(&1)
-        .is_some_and(|s| costs.calls.saturating_sub(s.last) >= REFRESH_AFTER)
-    {
-        return None;
-    }
-    let baseline = normal / batch.max(1) as f64;
-    let mut best = (1, baseline * 0.98);
-    let mut probe: Option<(Decision, (usize, usize))> = None;
-    for candidate in candidates {
-        if candidate.width < 2
-            || !candidate.expected_tokens.is_finite()
-            || candidate.expected_tokens <= batch as f64
-        {
-            continue;
-        }
-        let shape = costs.arms.get(&candidate.width);
-        let samples = shape.map_or(0, |s| s.time.samples());
-        let mean = shape
-            .filter(|s| s.time.samples() > 0)
-            .map_or_else(|| prior(candidate), Cost::mean);
-        let upper = shape
-            .filter(|s| s.time.samples() > 0)
-            .map_or(mean, Cost::upper);
-        if !upper.is_finite() || upper <= 0. || upper > slack {
-            continue;
-        }
-        // Budget remaining output for one priming round as well as the hot
-        // samples. The extra round is conservative after partial profiling.
-        let missing = if samples < 3 { 4 - samples } else { 0 };
-        if candidate.remaining_tokens
-            < batch.saturating_mul(candidate.width.saturating_add(missing).saturating_sub(1))
-        {
-            continue;
-        }
-        let score = mean / candidate.expected_tokens;
-        if samples >= 3 && score < best.1 {
-            best = (candidate.width, score);
-        }
-        let stale = shape.is_some_and(|s| costs.calls.saturating_sub(s.last) >= REFRESH_AFTER);
-        let loss = (upper - baseline * candidate.expected_tokens).max(0.);
-        // Before calibration, reserve a full invocation without counting on
-        // any accepted tokens. Steady refreshes reserve their predicted loss.
-        let required = if missing > 0 { upper } else { loss };
-        let recoverable = baseline
-            * candidate.remaining_tokens as f64
-            * (1. - batch as f64 / candidate.expected_tokens);
-        if (missing > 0 || stale) && required <= available && required <= recoverable {
-            // Finish the smallest cold shape before trying a deeper shape.
-            // Afterwards refresh oldest costs, without resetting their samples.
-            let rank = (
-                usize::from(missing == 0),
-                if missing > 0 {
-                    candidate.width
-                } else {
-                    shape.unwrap().last
-                },
-            );
-            if probe.as_ref().is_none_or(|(_, priority)| rank < *priority) {
-                probe = Some((
-                    Decision {
-                        width: candidate.width,
-                        exploring: true,
-                    },
-                    rank,
-                ));
+) -> Option<adaptive::Decision> {
+    let candidates = candidates
+        .iter()
+        .map(|candidate| {
+            let shape = costs.arms.get(&candidate.width);
+            let samples = shape.map_or(0, |s| s.time.samples());
+            let mean = shape
+                .filter(|s| s.time.samples() > 0)
+                .map_or_else(|| prior(candidate), Cost::mean);
+            let upper = shape
+                .filter(|s| s.time.samples() > 0)
+                .map_or(mean, Cost::upper);
+            adaptive::Candidate {
+                id: candidate.width,
+                width: candidate.width,
+                expected_tokens: candidate.expected_tokens,
+                remaining_tokens: candidate.remaining_tokens,
+                mean_s: mean,
+                upper_s: upper,
+                probe_reserve_s: None,
+                samples,
+                last: shape.map(|s| s.last),
             }
-        }
-    }
-    probe.map(|(decision, _)| decision).or_else(|| {
-        (best.0 > 1).then_some(Decision {
-            width: best.0,
-            exploring: false,
         })
-    })
+        .collect::<Vec<_>>();
+    adaptive::select(
+        adaptive::Selection {
+            normal_s: normal,
+            batch,
+            slack_s: slack,
+            available_s: available,
+            calls: costs.calls,
+            normal_last: costs.arms.get(&1).map(|s| s.last),
+        },
+        &candidates,
+    )
 }
 
 impl Controller {
@@ -261,7 +142,7 @@ impl Controller {
         let normal = self
             .costs
             .normal(key)
-            .filter(|s| s.time.samples() >= 3)
+            .filter(|s| s.time.samples() >= adaptive::HOT_SAMPLES)
             .map_or(0., Cost::mean);
         self.budget.settle(
             key.family(),
@@ -325,7 +206,7 @@ impl Controller {
             |c| self.costs.prior(key, c.width, c.prior_seconds),
             key.batch,
         );
-        let decision = decision.map(|choice| (choice.width, choice.exploring));
+        let decision = decision.map(|choice| (choice.id, choice.exploring));
         if self.trace {
             eprintln!(
                 "MTP_CHOOSE {key:?} decision={decision:?} normal={normal:.6} available={available:.6}"

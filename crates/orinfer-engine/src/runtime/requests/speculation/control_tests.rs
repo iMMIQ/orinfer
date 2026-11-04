@@ -39,11 +39,11 @@ fn normal(c: &mut Controller, k: Key) {
 fn acceptance_preserves_conditional_sampling_and_request_identity() {
     let mut a = Acceptance::default();
     a.observe(3, 1);
-    assert_eq!(a.samples, [1, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(&a.sample_counts()[..7], &[1, 1, 0, 0, 0, 0, 0]);
     assert!(a.expected(2) > 1. && a.expected(2) < 3.);
     a.observe(1, 1);
-    assert_eq!(a.samples[1], 1);
-    assert_eq!(Acceptance::default().samples, [0; 7]);
+    assert_eq!(a.sample_counts()[1], 1);
+    assert_eq!(Acceptance::default().sample_counts(), &[0; 31]);
 }
 
 #[test]

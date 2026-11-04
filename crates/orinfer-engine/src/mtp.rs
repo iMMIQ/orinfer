@@ -5,6 +5,7 @@ use crate::model::Manifest;
 use serde::Serialize;
 
 pub use orinfer_model_sdk::mtp::*;
+pub(crate) mod adaptive;
 
 pub fn greedy_commit(drafts: &[u32], target: &[u32]) -> Result<Vec<u32>> {
     if target.len() != drafts.len() + 1 || target.is_empty() {

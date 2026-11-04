@@ -10,10 +10,21 @@ impl Runtime {
         options: &scheduler::Options,
         maintenance: impl FnOnce(),
     ) -> Result<Vec<StepOutput>> {
+        let round_started = Instant::now();
+        // Apply the model's verification domain to the whole mixed packet,
+        // including prefill rows, rather than only to the decoder-row budget.
+        let bounded_options = scheduler::Options {
+            max_batch_tokens: options
+                .max_batch_tokens
+                .min(self.team.verification_rows.max(1)),
+            ..*options
+        };
+        let options = &bounded_options;
         let owners = self.team.model.batch.as_ref().unwrap().owners;
         let baseline = self
             .select_packet(requests, options, None)?
             .ok_or("Missing DSpark decoder packet")?;
+        let shared_work = packet::mark_shared(&baseline.selected, requests);
         let mixed = baseline.prefill_rows > 0;
         let full = baseline.full;
         let indices = baseline
@@ -46,6 +57,20 @@ impl Runtime {
                     .min(physical)
             })
             .collect::<Vec<_>>();
+        // Price selection within the same bounded speculative output window
+        // used by capture admission, rather than the one-token ordinary window.
+        let draft_window = indices
+            .iter()
+            .copied()
+            .zip(maxima.iter().copied())
+            .collect::<BTreeMap<_, _>>();
+        let window_block = self
+            .team
+            .draft_blocks
+            .iter()
+            .copied()
+            .find(|&b| b >= maxima.iter().copied().max().unwrap_or(0))
+            .unwrap_or(self.team.draft_blocks[0]);
         let feedback = indices
             .iter()
             .map(|&i| &requests[i].draft_feedback)
@@ -55,13 +80,32 @@ impl Runtime {
         let row_budget = if options.max_speculative_tokens == 0 {
             self.team.verification_rows
         } else {
-            options.max_speculative_tokens
+            // This is an upper budget, not permission to cross the model's
+            // automatic verification communication domain. Large prefill
+            // packets keep their separate target execution contract.
+            options
+                .max_speculative_tokens
+                .min(self.team.verification_rows)
         };
         let depths = self.speculation_policy.select_requests(
             full,
             mixed,
             Budget {
                 rows: row_budget,
+                shared_work,
+                latency: options.policy == scheduler::Policy::Latency,
+                slack_s: if options.policy == scheduler::Policy::Latency {
+                    self.capture_context(
+                        &baseline.selected,
+                        requests,
+                        Some(&draft_window),
+                        window_block,
+                        options,
+                    )
+                    .1
+                } else {
+                    f64::INFINITY
+                },
                 work: packet::work(&baseline.selected, requests, baseline.prefill_rows),
                 prefill_tokens_per_s: self.prefill_tokens_per_s,
                 uniform,
@@ -93,6 +137,13 @@ impl Runtime {
             return result;
         }
         let maximum = selected.iter().map(|(_, count)| *count).max().unwrap();
+        self.speculation_policy.begin_round(
+            selected.iter().map(|&(i, _)| requests[i].slot).collect(),
+            full,
+            packet::work(&baseline.selected, requests, baseline.prefill_rows),
+            shared_work,
+            maximum + 1,
+        );
         let block = self
             .team
             .draft_blocks
@@ -308,15 +359,6 @@ impl Runtime {
         }
         self.team.exchange(Command::EndVerification)?;
         let restore_s = started.elapsed().as_secs_f64() + save_s;
-        let confidence = (0..block)
-            .map(|position| {
-                proposals
-                    .chunks_exact(block)
-                    .map(|owner| owner[position].value as f64)
-                    .sum::<f64>()
-                    / (proposals.len() / block) as f64
-            })
-            .collect::<Vec<_>>();
         self.speculation_policy.observe(
             selected.len(),
             (full, mixed, uniform),
@@ -325,6 +367,7 @@ impl Runtime {
                 verify_replay: verify_timing.replay,
                 work: verified_work,
                 setup: [draft_timing.setup, verify_timing.setup],
+                wall_s: Some(round_started.elapsed().as_secs_f64()),
                 stages: [
                     draft_s + draft_prepare - draft_timing.setup,
                     verify_s + sampling_s + verify_prepare - verify_timing.setup,
@@ -334,7 +377,6 @@ impl Runtime {
             },
             &counts,
             block,
-            &confidence,
         );
         self.speculation.rounds += selected.len();
         for &(i, _) in &selected {
