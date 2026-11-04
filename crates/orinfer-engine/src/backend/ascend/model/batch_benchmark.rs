@@ -50,10 +50,21 @@ struct Frame {
     /// Return every causal position through the production verifier layout.
     #[serde(default)]
     verification: bool,
+    /// Prefix owners verify; trailing owners run ordinary prompt rows.
+    #[serde(default)]
+    verification_requests: Option<usize>,
     /// Run the released strided draft packet without committing target state.
     #[serde(default)]
     draft: bool,
     requests: Vec<Request>,
+}
+impl Frame {
+    fn verification_count(&self) -> usize {
+        self.verification_requests.unwrap_or(self.requests.len())
+    }
+    fn mixed(&self) -> bool {
+        self.verification && self.verification_count() < self.requests.len()
+    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +115,9 @@ struct Measurement {
     decode_tokens_per_s: f64,
     draft_s: f64,
     draft_proposals_per_s: f64,
+    mixed_s: f64,
+    mixed_prefill_tokens: usize,
+    mixed_decode_tokens: usize,
     preparation_s: f64,
     reset_s: f64,
     request_s: f64,
@@ -120,6 +134,7 @@ struct Preparation {
     first_prefill_s: f64,
     first_decode_s: f64,
     first_draft_s: f64,
+    first_mixed_s: f64,
 }
 #[derive(Default)]
 struct Timings {
@@ -129,12 +144,29 @@ struct Timings {
     decode_tokens: usize,
     draft_s: f64,
     draft_proposals: usize,
+    mixed_s: f64,
+    mixed_prefill_tokens: usize,
+    mixed_decode_tokens: usize,
 }
 impl Timings {
+    fn request_s(&self, reset_s: f64, preparation_s: f64) -> f64 {
+        reset_s + preparation_s + self.prefill_s + self.decode_s + self.draft_s + self.mixed_s
+    }
     fn record(&mut self, frame: &Frame, outputs: usize, seconds: f64) {
         if frame.draft {
             self.draft_s += seconds;
             self.draft_proposals += outputs;
+        } else if frame.mixed() {
+            self.mixed_s += seconds;
+            let count = frame.verification_count();
+            self.mixed_decode_tokens += frame.requests[..count]
+                .iter()
+                .map(|r| r.tokens.len())
+                .sum::<usize>();
+            self.mixed_prefill_tokens += frame.requests[count..]
+                .iter()
+                .map(|r| r.tokens.len())
+                .sum::<usize>();
         } else if frame.decode || frame.continuation || frame.verification {
             self.decode_s += seconds;
             self.decode_tokens += outputs;
@@ -161,14 +193,21 @@ fn frame_layout(frame: &Frame, capacity: usize, owners: usize) -> Result<Layout>
     {
         return Err("Choose one decode, continuation, verification or draft frame role".into());
     }
+    if frame.verification_requests.is_some() && !frame.verification {
+        return Err("Verification prefix requires a verification frame".into());
+    }
     if frame.draft && frame.requests.iter().any(|r| !r.output) {
         return Err("Draft frames return every proposal of every owner".into());
     }
     if frame.verification {
-        if frame.requests.iter().any(|r| !r.output) {
-            return Err("Verification frames return every position of every owner".into());
+        let count = frame.verification_count();
+        if count == 0
+            || count > frame.requests.len()
+            || frame.requests[..count].iter().any(|r| !r.output)
+        {
+            return Err("Verification prefix requires valid owners and all outputs".into());
         }
-        return Layout::verification(
+        let mut layout = Layout::verification(
             frame
                 .requests
                 .iter()
@@ -179,7 +218,27 @@ fn frame_layout(frame: &Frame, capacity: usize, owners: usize) -> Result<Layout>
                 .collect(),
             capacity,
             owners,
-        );
+        )?;
+        let endpoints = layout
+            .outputs
+            .iter()
+            .copied()
+            .zip(layout.output_positions.iter().copied())
+            .filter(|&(lane, position)| {
+                lane < count
+                    || frame.requests[lane].output
+                        && position + 1 == frame.requests[lane].tokens.len()
+            })
+            .collect::<Vec<_>>();
+        (layout.outputs, layout.output_positions) = endpoints.into_iter().unzip();
+        for (lane, role) in layout.decoder_roles.iter_mut().enumerate().skip(count) {
+            *role = if frame.requests[lane].output {
+                super::replay::Role::Final
+            } else {
+                super::replay::Role::Producer
+            };
+        }
+        return Ok(layout);
     }
     let mut layout = Layout::new(
         frame
@@ -230,6 +289,7 @@ fn forward(
             frame
                 .requests
                 .iter()
+                .take(frame.verification_count())
                 .map(|r| (r.owner, r.tokens.len()))
                 .collect(),
         ))?;
@@ -331,6 +391,7 @@ fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<
                 decode: false,
                 continuation: false,
                 verification: false,
+                verification_requests: None,
                 draft: false,
                 requests: rows,
             });
@@ -362,6 +423,7 @@ fn plan_frames(requests: &[Request], budget: usize, preferred: usize) -> Result<
             decode: false,
             continuation: false,
             verification: false,
+            verification_requests: None,
             draft: false,
             requests: rows,
         });
@@ -428,6 +490,7 @@ fn plan_prompt_frames(requests: &[Request], budget: usize, keep: usize) -> Resul
             decode: false,
             continuation: false,
             verification: false,
+            verification_requests: None,
             draft: false,
             requests: rows,
         });
@@ -524,6 +587,14 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
             && (case.compare_serial || case.decode_steps > 0 || logits_directory.is_some())
         {
             return Err("Draft diagnostics use explicit frames and proposal outputs".into());
+        }
+        if case.frames.iter().any(Frame::mixed)
+            && (case.compare_serial || case.compare_whole_prompt || case.decode_steps > 0)
+        {
+            return Err(
+                "Mixed verification diagnostics require explicit frames without serial comparison"
+                    .into(),
+            );
         }
         let mut lengths = std::collections::BTreeMap::<usize, usize>::new();
         for frame in &case.frames {
@@ -665,6 +736,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                             decode: true,
                             continuation: false,
                             verification: false,
+                            verification_requests: None,
                             draft: false,
                             requests: last_outputs
                                 .values()
@@ -678,6 +750,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                     }
                     outputs.push(out);
                 }
+                let request_s = timings.request_s(reset_s, preparation_s);
                 let Timings {
                     prefill_s,
                     decode_s,
@@ -685,6 +758,9 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                     decode_tokens,
                     draft_s,
                     draft_proposals,
+                    mixed_s,
+                    mixed_prefill_tokens,
+                    mixed_decode_tokens,
                 } = timings;
                 if repeat == 0 {
                     preparations.push(Preparation {
@@ -695,6 +771,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                         first_prefill_s: prefill_s,
                         first_decode_s: decode_s,
                         first_draft_s: draft_s,
+                        first_mixed_s: mixed_s,
                     });
                     if case.compare_serial {
                         team.exchange(Command::Release(None))?;
@@ -723,6 +800,9 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                         decode: frame.decode,
                                         continuation: frame.continuation,
                                         verification: frame.verification,
+                                        verification_requests: frame
+                                            .verification_requests
+                                            .map(|_| 1),
                                         draft: frame.draft,
                                         requests: frame
                                             .requests
@@ -742,6 +822,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                     decode: frame.decode,
                                     continuation: frame.continuation,
                                     verification: frame.verification,
+                                    verification_requests: frame.verification_requests.map(|_| 1),
                                     draft: frame.draft,
                                     requests: frame
                                         .requests
@@ -804,9 +885,12 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                     } else {
                         0.
                     },
+                    mixed_s,
+                    mixed_prefill_tokens,
+                    mixed_decode_tokens,
                     preparation_s,
                     reset_s,
-                    request_s: reset_s + preparation_s + prefill_s + decode_s + draft_s,
+                    request_s,
                     output_tokens: outputs,
                     serial: validation.take(),
                 });
@@ -916,6 +1000,47 @@ mod tests {
         assert!(frame_layout(&frame, 2048, 32).is_err());
         frame.continuation = false;
         frame.requests[0].output = false;
+        assert!(frame_layout(&frame, 2048, 32).is_err());
+    }
+
+    #[test]
+    fn mixed_verification_journals_the_prefix_and_keeps_prompt_roles() {
+        let mut frame: Frame = serde_json::from_value(serde_json::json!({
+            "verification":true,"verification_requests":2,"requests":[
+                {"owner":17,"tokens":[1,2,3,4,5,6],"output":true},
+                {"owner":3,"tokens":[7,8,9,10,11,12],"output":true},
+                {"owner":7,"tokens":vec![13;788],"output":false}
+            ]
+        }))
+        .unwrap();
+        let layout = frame_layout(&frame, 2048, 32).unwrap();
+        assert_eq!(layout.rows.total, 800);
+        assert_eq!(frame.verification_count(), 2);
+        assert_eq!(layout.outputs, [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(
+            layout.decoder_roles[2],
+            super::super::replay::Role::Producer
+        );
+        assert_eq!(layout.decoder(128, true).unwrap().rows.total, 12);
+        let mut timings = Timings::default();
+        timings.record(&frame, 12, 0.2);
+        assert_eq!(timings.mixed_prefill_tokens, 788);
+        assert_eq!(timings.mixed_decode_tokens, 12);
+        assert_eq!(timings.mixed_s, 0.2);
+        assert_eq!(timings.prefill_s + timings.decode_s, 0.);
+        assert!((timings.request_s(0.1, 0.3) - 0.6).abs() < 1e-12);
+        frame.requests[2].output = true;
+        let layout = frame_layout(&frame, 2048, 32).unwrap();
+        assert_eq!(layout.outputs.last(), Some(&2));
+        assert_eq!(layout.output_positions.last(), Some(&787));
+        assert_eq!(layout.decoder_roles[2], super::super::replay::Role::Final);
+        assert_eq!(layout.decoder(128, true).unwrap().rows.total, 140);
+        for count in [0, 4] {
+            frame.verification_requests = Some(count);
+            assert!(frame_layout(&frame, 2048, 32).is_err());
+        }
+        frame.verification_requests = Some(2);
+        frame.verification = false;
         assert!(frame_layout(&frame, 2048, 32).is_err());
     }
 

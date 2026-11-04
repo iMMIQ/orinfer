@@ -353,6 +353,8 @@ bash tools/operators/ascend/run.sh python3 \
 
 `draft:true` 复用发布包的 strided Draft packet，输入各 owner 的 anchor 与 noise token，返回全部草稿 proposal，保持 target 历史。各 owner 须先有 target 输入，片段长度须匹配包内草稿档位并启用 `output`。草稿帧与其他 frame 角色互斥，只用于显式帧诊断；正式 decode 计数与 `draft_s`／`draft_proposals_per_s` 分开报告。
 
+混合验证帧设置 `verification:true` 和 `verification_requests:N`：前 N 个请求返回全部验证位置并进入状态 journal，其余请求沿用普通 prefill 的 Producer／Final 角色和末位置输出约定。省略 N 时验证全部请求。混合帧使用显式输入，不启用自动 decode 或 serial 对照；报告以 `mixed_s`、`mixed_prefill_tokens` 和 `mixed_decode_tokens` 单独计量共享执行时间与两类 token，避免混入纯 prefill／decode TPS。
+
 A2 离线 assembly 的 `--fp32-sums` 可将 BF16 AllReduce／ReduceScatter 提升为 FP32 求和，再舍入回原 BF16 边界；沿用各自的分区、补齐和行数表达式。转换复用 `model_ops.convert` 动态模板，scratch 跨层与 packet 复用，不改变权重或请求私有状态。默认关闭；启用后须验收工具质量、Graph replay 与完整请求性能。也可用 `python -m tools.model.deepseek_v41.sum_precision --plan PLAN --model-dir MODEL --output NEW_DIRECTORY` 从现有执行计划创建独立候选包。
 
 `compare_serial` 使用 batch 实际生成的固定历史，按相同计算家族逐请求重放，比较完整词表概率和 greedy 输出。它验证请求隔离及批量算术，不替代官方 BF16/FP8 质量对照。报告区分 forward 时间与执行计划准备时间；完整请求吞吐包含 CPU 坐标、Engram 查找、传输、计算、HCCL、输出头和同步，预热测量排除加载、准入、重置与 Graph 捕获。
