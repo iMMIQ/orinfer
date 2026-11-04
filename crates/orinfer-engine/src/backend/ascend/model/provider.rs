@@ -929,19 +929,10 @@ impl Runtime {
             .filter(|(_, r)| !r.prefilling && !r.is_finished())
             .map(|(i, r)| (i, r.generated))
             .collect::<Vec<_>>();
-        // Parallel draft blocks have distinct preparation costs. Bound the
-        // model-lifetime loss by the shared calibration horizon per physical family, rather
-        // than minting credit whenever batch membership or context changes.
-        let calibration_families = self
-            .team
-            .draft_blocks
-            .iter()
-            .position(|&block| block >= self.draft_limit)
-            .map_or(self.team.draft_blocks.len(), |i| i + 1)
-            .max(1);
+        // Parallel CANN preparation uses the shared calibration horizon;
+        // one model-lifetime balance funds all batches and contexts.
         self.speculation_policy.start_iteration(
             options.target_tpot_ms / 1000. * crate::mtp::adaptive::CALIBRATION_ROUNDS as f64,
-            calibration_families,
         );
         let started = Instant::now();
         let result = self.advance_packet(requests, options, maintenance);

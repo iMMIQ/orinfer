@@ -35,6 +35,15 @@ impl Runtime {
             .map(|&(i, _)| i)
             .collect::<Vec<_>>();
         let uniform = self.draft_limit <= self.team.draft_blocks[0];
+        for &i in &indices {
+            self.speculation_policy.prepare_feedback(
+                indices.len(),
+                full,
+                mixed,
+                uniform,
+                &mut requests[i].draft_feedback,
+            );
+        }
         let maxima = indices
             .iter()
             .map(|&i| {
@@ -92,7 +101,6 @@ impl Runtime {
             mixed,
             Budget {
                 rows: row_budget,
-                shared_work,
                 latency: options.policy == scheduler::Policy::Latency,
                 slack_s: if options.policy == scheduler::Policy::Latency {
                     self.capture_context(

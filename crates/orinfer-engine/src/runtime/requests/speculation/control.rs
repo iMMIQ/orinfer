@@ -2,11 +2,12 @@
 mod cost;
 // Reprofiling is a real execution and may displace captured graphs. Acceptance
 // changes are evaluated every round; only unused timing estimates age here.
+use cost::{Cost, Costs};
+
 #[cfg(test)]
 use crate::mtp::adaptive::REFRESH_AFTER;
 use crate::mtp::adaptive::{self, Budget};
 pub(in crate::runtime) use crate::mtp::adaptive::{Acceptance, Measurement, progress};
-use cost::{Cost, Costs};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::runtime) struct Key {
@@ -70,38 +71,45 @@ pub(in crate::runtime) struct Candidate {
     pub expected_tokens: f64,
     pub prior_seconds: f64,
     pub remaining_tokens: usize,
+    /// Read from the selected owners' actual draft cursors for this round.
+    pub warm_ready: bool,
+    /// The selected owners advanced without fresh draft acceptance observations.
+    pub review_acceptance: bool,
 }
 
-/// Convert CUDA timing arms into the shared, backend-neutral selector input.
+/// Freeze CUDA prices; the common selector owns scoring and funding.
 fn select(
     costs: &cost::Profile,
     candidates: &[Candidate],
     normal: f64,
     slack: f64,
-    available: f64,
+    funds: (f64, f64),
     prior: impl Fn(&Candidate) -> f64,
     batch: usize,
 ) -> Option<adaptive::Decision> {
-    let candidates = candidates
+    let choices = candidates
         .iter()
-        .map(|candidate| {
-            let shape = costs.arms.get(&candidate.width);
-            let samples = shape.map_or(0, |s| s.time.samples());
-            let mean = shape
+        .map(|c| {
+            let shape = costs.arms.get(&c.width);
+            let hot = shape
                 .filter(|s| s.time.samples() > 0)
-                .map_or_else(|| prior(candidate), Cost::mean);
-            let upper = shape
-                .filter(|s| s.time.samples() > 0)
-                .map_or(mean, Cost::upper);
+                .map_or_else(|| prior(c), Cost::mean);
             adaptive::Candidate {
-                id: candidate.width,
-                width: candidate.width,
-                expected_tokens: candidate.expected_tokens,
-                remaining_tokens: candidate.remaining_tokens,
-                mean_s: mean,
-                upper_s: upper,
-                probe_reserve_s: None,
-                samples,
+                id: c.width,
+                width: c.width,
+                expected_tokens: c.expected_tokens,
+                maximum_tokens: (batch * c.width) as f64,
+                remaining_tokens: c.remaining_tokens,
+                mean_s: hot,
+                upper_s: shape
+                    .filter(|s| s.time.samples() > 0)
+                    .map_or(hot, Cost::upper),
+                transition_s: shape
+                    .filter(|_| !c.warm_ready)
+                    .map_or(0., |s| s.transition_s),
+                warm_ready: c.warm_ready,
+                review_acceptance: c.review_acceptance,
+                samples: shape.map_or(0, |s| s.time.samples()),
                 last: shape.map(|s| s.last),
             }
         })
@@ -111,11 +119,12 @@ fn select(
             normal_s: normal,
             batch,
             slack_s: slack,
-            available_s: available,
+            available_s: funds.0,
+            calibration_s: funds.1,
             calls: costs.calls,
             normal_last: costs.arms.get(&1).map(|s| s.last),
         },
-        &candidates,
+        &choices,
     )
 }
 
@@ -142,22 +151,28 @@ impl Controller {
         let normal = self
             .costs
             .normal(key)
-            .filter(|s| s.time.samples() >= adaptive::HOT_SAMPLES)
-            .map_or(0., Cost::mean);
+            .filter(|s| s.time.samples() >= 3)
+            .map_or(0., |s| s.time.mean());
+        let calibrating = width > 1
+            && self
+                .costs
+                .profiles
+                .get(&key)
+                .and_then(|p| p.arms.get(&width))
+                .is_none_or(|s| s.time.samples() < 3);
         self.budget.settle(
-            key.family(),
             width,
             measurement,
             normal,
             key.batch,
             self.calibration_limit,
+            calibrating,
         );
         self.costs.observe(key, width, measurement);
         if self.trace {
             eprintln!(
                 "MTP_OBSERVE {key:?} width={width} {measurement:?} normal={normal:.6} balance={:.6} startup_spent={:.6}",
-                self.budget.balance(key.family()),
-                self.budget.startup_spent
+                self.budget.balance, self.budget.startup_spent
             );
         }
         (width > 1 && normal > 0. && measurement.is_steady() && measurement.tokens > 0)
@@ -167,7 +182,6 @@ impl Controller {
         &mut self,
         key: Key,
         candidates: &[Candidate],
-        normal_seconds: f64,
         slack: f64,
     ) -> Option<(usize, bool)> {
         #[cfg(test)]
@@ -192,24 +206,35 @@ impl Controller {
         if base.time.samples() < 3 || key.batch == 0 {
             return None;
         }
-        let normal = base.mean().max(normal_seconds.min(base.upper()));
-        let available = self.budget.available(key.family(), self.calibration_limit);
-        if available == f64::NEG_INFINITY {
-            return None;
-        }
+        let normal = base.time.mean();
+        let available = self.budget.available(self.calibration_limit);
         let decision = select(
             profile,
             candidates,
             normal,
             slack,
-            available,
+            (self.budget.balance, available),
             |c| self.costs.prior(key, c.width, c.prior_seconds),
             key.batch,
         );
         let decision = decision.map(|choice| (choice.id, choice.exploring));
         if self.trace {
+            let prices: Vec<_> = candidates
+                .iter()
+                .map(|c| {
+                    let cost = profile.arms.get(&c.width);
+                    (
+                        c.width,
+                        c.expected_tokens,
+                        c.warm_ready,
+                        c.review_acceptance,
+                        cost.map(|s| (s.time.samples(), s.time.mean(), s.mean(), s.transition_s)),
+                    )
+                })
+                .collect();
             eprintln!(
-                "MTP_CHOOSE {key:?} decision={decision:?} normal={normal:.6} available={available:.6}"
+                "MTP_CHOOSE {key:?} decision={decision:?} normal={normal:.6} calibration_credit={available:.6} earned_credit={:.6} prices={prices:?}",
+                self.budget.balance
             );
         }
         decision

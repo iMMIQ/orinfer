@@ -69,7 +69,6 @@ pub(in crate::backend::ascend::model::provider) struct Budget {
     pub prefill_tokens_per_s: f64,
     pub latency: bool,
     pub slack_s: f64,
-    pub shared_work: bool,
 }
 impl Default for Budget {
     fn default() -> Self {
@@ -82,7 +81,6 @@ impl Default for Budget {
             prefill_tokens_per_s: 0.,
             latency: false,
             slack_s: f64::INFINITY,
-            shared_work: false,
         }
     }
 }
@@ -94,12 +92,16 @@ pub(in crate::backend::ascend::model::provider) struct Policy {
     ledger: adaptive::Budget,
     calibration_limit: f64,
     pending: Option<Receipt>,
+    next_calibrating: bool,
 }
 struct Receipt {
     family: (usize, bool, usize),
     slots: Vec<usize>,
     width: usize,
     normal_s: f64,
+    preparation_s: f64,
+    calibrating: bool,
+    normal: Option<Point>,
 }
 impl Default for Policy {
     fn default() -> Self {
@@ -110,6 +112,7 @@ impl Default for Policy {
             ledger: adaptive::Budget::default(),
             calibration_limit: 0.4,
             pending: None,
+            next_calibrating: true,
         }
     }
 }
@@ -211,11 +214,29 @@ fn reuse_steps(
         .max(1.)
 }
 impl Policy {
-    pub fn start_iteration(&mut self, limit: f64, families: usize) {
+    pub fn prepare_feedback(
+        &self,
+        batch: usize,
+        full: bool,
+        mixed: bool,
+        uniform: bool,
+        feedback: &mut Feedback,
+    ) {
+        if let Some(curve) = self.curves.get(&(batch, full, mixed)) {
+            for (&(block, allocation), observed) in &curve.blocks {
+                if allocation == uniform {
+                    feedback.blocks.entry(block).or_insert_with(|| History {
+                        acceptance: observed.acceptance.prior(),
+                        ..History::default()
+                    });
+                }
+            }
+        }
+    }
+    pub fn start_iteration(&mut self, limit: f64) {
         self.pending = None;
         if limit.is_finite() && limit > 0. {
-            self.calibration_limit = limit * families.max(1) as f64;
-            self.ledger.restrict_family_startup(limit);
+            self.calibration_limit = limit;
         }
     }
     pub fn begin_round(
@@ -242,9 +263,13 @@ impl Policy {
             ),
             slots,
             width,
+            preparation_s: 0.,
+            calibrating: width > 1 && self.next_calibrating,
+            normal: None,
             normal_s: self
                 .costs
                 .predict(stage, 0, full, work)
+                .filter(|p| p.samples >= adaptive::HOT_SAMPLES)
                 .map_or(0., |p| p.seconds),
         });
     }
@@ -261,23 +286,32 @@ impl Policy {
             seconds,
             tokens,
             warm_ready: true,
-            preparation_s: 0.,
+            preparation_s: receipt.preparation_s,
         };
         if !sample.valid() {
             return;
         }
+        if tokens > 0
+            && let Some(mut point) = receipt.normal
+        {
+            // Price ordinary decode over the same completed iteration as
+            // verification: CPU sampling, constraints and commit belong here.
+            // Record one sample, excluding only the separately billed setup.
+            point.seconds = (seconds - receipt.preparation_s).max(0.);
+            self.costs.observe(point);
+        }
         self.ledger.settle(
-            receipt.family,
             receipt.width,
             sample,
             receipt.normal_s,
             receipt.slots.len(),
             self.calibration_limit,
+            receipt.calibrating,
         );
         if self.trace {
             eprintln!(
                 "DSPARK_SETTLE {}",
-                serde_json::json!({"family":receipt.family,"width":receipt.width,"seconds":seconds,"committed":tokens,"normal_s":receipt.normal_s,"balance":self.ledger.balance(receipt.family),"startup_spent":self.ledger.startup_spent})
+                serde_json::json!({"family":receipt.family,"width":receipt.width,"seconds":seconds,"committed":tokens,"normal_s":receipt.normal_s,"balance":self.ledger.balance,"startup_spent":self.ledger.startup_spent})
             );
         }
     }
@@ -329,6 +363,9 @@ impl Policy {
         work: Work,
         timing: &super::super::super::team::Timing,
     ) {
+        if let Some(r) = &mut self.pending {
+            r.preparation_s += timing.setup;
+        }
         if self.trace {
             eprintln!(
                 "DSPARK_BASELINE {}",
@@ -338,7 +375,7 @@ impl Policy {
                 })
             );
         }
-        self.costs.observe(Point {
+        let point = Point {
             stage: if batch > 0 && work.prefill_rows == 0 {
                 Stage::Decode
             } else {
@@ -350,7 +387,13 @@ impl Policy {
             work,
             seconds: timing.seconds + timing.preparation - timing.setup,
             setup_s: timing.setup,
-        });
+        };
+        if let Some(receipt) = &mut self.pending {
+            receipt.normal = Some(point);
+        } else {
+            // Standalone prefill has no decoder settlement receipt.
+            self.costs.observe(point);
+        }
         let curve = self
             .curves
             .entry((batch, full, work.prefill_rows > 0))
@@ -439,12 +482,7 @@ impl Policy {
             return Err("Invalid DSpark physical blocks".into());
         }
         let curve = self.curves.entry((batch, full, mixed)).or_default();
-        let family = (
-            batch,
-            full,
-            usize::from(mixed) + 2 * usize::from(budget.shared_work),
-        );
-        let available = self.ledger.available(family, self.calibration_limit);
+        let available = self.ledger.available(self.calibration_limit);
         let horizon = reuse_steps(&budget, &ordinary, maxima, feedback, blocks[0]);
         let normal_s = self
             .costs
@@ -549,7 +587,6 @@ impl Policy {
                     self.costs.evidence(Stage::Restore, block, full, draft_work),
                 ];
                 let inferred = evidence.iter().map(|p| p.0).min().unwrap();
-                let measured = evidence.iter().map(|p| p.1).min().unwrap();
                 let samples = observed.map_or(0, |c| c.time.samples()).max(inferred);
                 // One representative maximum packet calibrates a physical
                 // family. Shorter prefixes reuse its conservative measured
@@ -563,7 +600,6 @@ impl Policy {
                         + restore_s
                         + opportunity,
                 );
-                let hot_upper = upper;
                 if samples < adaptive::HOT_SAMPLES {
                     for (stage, block, work, current) in [
                         (Stage::Target, 0, target_work, target),
@@ -607,13 +643,17 @@ impl Policy {
                     },
                     mean_s: mean,
                     upper_s: upper,
-                    probe_reserve_s: (samples < adaptive::HOT_SAMPLES
-                        && measured >= 2
-                        && seen >= 2)
-                        .then(|| {
-                            (upper - hot_upper).max(0.)
-                                + (hot_upper - normal_s * expected / batch as f64).max(0.)
-                        }),
+                    maximum_tokens: adaptive::progress(
+                        selected.iter().map(|&d| d as f64 + 1.),
+                        batch,
+                        budget.latency,
+                    ),
+                    transition_s: 0.,
+                    warm_ready: true,
+                    review_acceptance: feedback.iter().any(|f| !f.blocks.contains_key(&block))
+                        || curve
+                            .last_normal
+                            .is_some_and(|n| prior.is_some_and(|p| n > p.last)),
                     samples,
                     last: observed.map(|c| c.last).or_else(|| prior.map(|p| p.last)),
                 });
@@ -628,12 +668,19 @@ impl Policy {
                 normal_s,
                 batch,
                 slack_s: budget.slack_s,
-                available_s: available,
+                available_s: self.ledger.balance,
+                calibration_s: available,
                 calls: curve.calls,
                 normal_last: curve.last_normal,
             },
             &estimates,
         );
+        self.next_calibrating = decision.as_ref().is_some_and(|d| {
+            estimates
+                .iter()
+                .find(|c| c.id == d.id)
+                .is_some_and(|c| c.samples < adaptive::HOT_SAMPLES)
+        });
         let reason = if decision.as_ref().is_some_and(|d| d.exploring) {
             "shared_probe"
         } else {
@@ -654,6 +701,9 @@ impl Policy {
         block: usize,
     ) {
         let costs = timing.into();
+        if let Some(r) = &mut self.pending {
+            r.preparation_s += costs.setup.iter().sum::<f64>();
+        }
         let timing = costs.stages;
         let (full, mixed, uniform) = mode;
         let curve = self.curves.entry((batch, full, mixed)).or_default();
@@ -770,6 +820,79 @@ mod tests {
         }
     }
     #[test]
+    fn ordinary_prices_include_host_commit_and_record_one_sample_per_round() {
+        let mut p = Policy::default();
+        let work = Work {
+            rows: 16,
+            ..Work::default()
+        };
+        for round in 0..4 {
+            p.start_iteration(0.4);
+            p.begin_round((0..16).collect(), true, work, true, 1);
+            let setup = if round == 0 { 0.4 } else { 0. };
+            p.baseline_execution(
+                16,
+                true,
+                work,
+                &super::super::super::super::team::Timing {
+                    seconds: 0.069,
+                    preparation: setup,
+                    setup,
+                    replay: true,
+                },
+            );
+            if round == 0 {
+                assert!(p.costs.predict(Stage::Decode, 0, true, work).is_none());
+            }
+            p.finish_iteration(
+                0.096 + setup,
+                &(0..16).map(|owner| (owner, 1)).collect::<Vec<_>>(),
+            );
+        }
+        let priced = p.costs.predict(Stage::Decode, 0, true, work).unwrap();
+        assert_eq!(priced.observations, 4);
+        assert_eq!(priced.samples, adaptive::HOT_SAMPLES);
+        assert!((priced.seconds - 0.096).abs() < 1e-12);
+        assert_eq!(p.curves[&(16, true, false)].calls, 4);
+    }
+    #[test]
+    fn new_owners_reuse_cohort_priors_without_resetting_their_own_rejections() {
+        let mut p = Policy::default();
+        for _ in 0..4 {
+            p.baseline(16, false, false, 0.070);
+        }
+        for _ in 0..6 {
+            p.observe(
+                16,
+                (false, false, false),
+                [0.014, 0.380, 0.001, 0.],
+                &[(5, 5); 16],
+                5,
+            );
+        }
+        let mut f = Feedback::default();
+        p.prepare_feedback(16, false, false, false, &mut f);
+        assert_eq!(
+            f.blocks[&5].acceptance.sample_counts(),
+            &[0; crate::execution::MAX_MTP_DRAFTS]
+        );
+        assert_eq!(
+            p.select_requests(false, false, budget(96), &[5; 16], &[&f; 16], &[5])
+                .unwrap(),
+            [5; 16]
+        );
+        for _ in 0..32 {
+            f.observe(&[1.; 5], 5, 0, 5);
+        }
+        p.prepare_feedback(16, false, false, false, &mut f);
+        assert!(f.blocks[&5].acceptance.rate(0, 0.7) < 0.001);
+        assert_eq!(
+            p.select_requests(false, false, budget(96), &[5; 16], &[&f; 16], &[5])
+                .unwrap(),
+            [0; 16]
+        );
+    }
+    #[test]
     fn a_prefill_only_packet_has_no_speculative_plan_or_budget_effect() {
         let mut p = Policy::default();
         assert!(
@@ -795,9 +918,9 @@ mod tests {
         assert!(rejected.rates(5, true, &[])[0] < 0.1);
     }
     #[test]
-    fn a_workload_cannot_consume_another_cohorts_bootstrap_allowance() {
+    fn actual_earnings_fund_a_new_cohort_without_recreating_startup_credit() {
         let mut p = Policy::default();
-        p.start_iteration(0.4, 3);
+        p.start_iteration(0.4);
         p.begin_round(
             vec![1],
             true,
@@ -806,12 +929,12 @@ mod tests {
                 ..Work::default()
             },
             false,
-            6,
+            1,
         );
-        p.finish_iteration(0.7, &[(1, 0)]);
-        assert!((p.ledger.startup_spent - 0.4).abs() < 1e-12);
-        assert!((p.ledger.balance((1, true, 0)) + 0.3).abs() < 1e-12);
-        p.start_iteration(0.4, 3);
+        p.finish_iteration(5., &[(1, 1)]);
+        assert!((p.ledger.balance - 0.1).abs() < 1e-12);
+        assert_eq!(p.ledger.startup_spent, 0.);
+        p.start_iteration(0.4);
         p.begin_round(
             vec![2, 3, 4, 5],
             true,
@@ -822,16 +945,15 @@ mod tests {
             true,
             6,
         );
-        p.finish_iteration(0.3, &[(2, 0), (3, 0), (4, 0), (5, 0)]);
-        assert!((p.ledger.startup_spent - 0.7).abs() < 1e-12);
-        assert_eq!(p.ledger.balance((4, true, 2)), 0.);
-        assert!((p.ledger.balance((1, true, 0)) + 0.3).abs() < 1e-12);
+        p.finish_iteration(0.15, &[(2, 0), (3, 0), (4, 0), (5, 0)]);
+        assert!((p.ledger.startup_spent - 0.05).abs() < 1e-12);
+        assert_eq!(p.ledger.balance, 0.);
     }
     #[test]
     fn actual_losses_survive_context_and_curve_changes_and_settle_once() {
         let mut p = Policy::default();
         p.baseline(1, false, false, 0.02);
-        p.start_iteration(0.4, 1);
+        p.start_iteration(0.4);
         p.begin_round(
             vec![7],
             false,
@@ -844,13 +966,12 @@ mod tests {
             6,
         );
         p.finish_iteration(0.8, &[(7, 0), (9, 100)]);
-        let family = (1, false, 2);
         assert_eq!(p.ledger.startup_spent, 0.4);
-        assert!((p.ledger.balance(family) + 0.4).abs() < 1e-12);
+        assert!((p.ledger.balance + 0.4).abs() < 1e-12);
         p.finish_iteration(0.8, &[(7, 0)]);
-        assert!((p.ledger.balance(family) + 0.4).abs() < 1e-12);
+        assert!((p.ledger.balance + 0.4).abs() < 1e-12);
         p.curves.clear();
-        p.start_iteration(0.4, 1);
+        p.start_iteration(0.4);
         p.begin_round(
             vec![11],
             false,
@@ -863,7 +984,7 @@ mod tests {
             1,
         );
         p.finish_iteration(0.02, &[(11, 1)]);
-        assert!((p.ledger.balance(family) + 0.3996).abs() < 1e-12);
+        assert!((p.ledger.balance + 0.3996).abs() < 1e-12);
         assert_eq!(p.ledger.startup_spent, 0.4);
     }
     #[test]
@@ -1009,7 +1130,7 @@ mod tests {
             );
         }
         assert_eq!(p.ledger.startup_spent, 0.);
-        assert_eq!(p.ledger.balance((1, false, 0)), 0.);
+        assert_eq!(p.ledger.balance, 0.);
         assert_eq!(p.curves[&(1, false, false)].calls, 4);
     }
     #[test]
@@ -1044,7 +1165,7 @@ mod tests {
         );
     }
     #[test]
-    fn latency_protects_a_low_acceptance_owner_while_throughput_uses_total_yield() {
+    fn latency_uses_mean_owner_tpot_while_throughput_uses_total_yield() {
         let mut p = Policy::default();
         let mut high = Feedback::default();
         let mut low = Feedback::default();
@@ -1055,7 +1176,7 @@ mod tests {
             p.observe(
                 2,
                 (false, false, false),
-                [0.003, 0.03, 0.001, 0.],
+                [0.003, 0.046, 0.001, 0.],
                 &[(5, 5), (5, 0)],
                 5,
             );
@@ -1149,7 +1270,9 @@ mod tests {
             expected
                 .iter()
                 .enumerate()
-                .all(|(i, &p)| (p - 0.94_f64.powi(i as i32 + 1)).abs() < 1e-12)
+                .all(
+                    |(i, &p)| (p - (1. - 0.3 * 0.8_f64.powi(16)).powi(i as i32 + 1)).abs() < 1e-12
+                )
         );
         assert_eq!(
             policy

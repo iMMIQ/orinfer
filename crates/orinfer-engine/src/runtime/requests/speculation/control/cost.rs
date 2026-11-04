@@ -1,4 +1,4 @@
-//! Timing samples have no ownership of execution resources or graph readiness.
+//! CUDA timing identities; shared samples do not own execution resources.
 use super::{Key, Measurement};
 pub(super) use crate::mtp::adaptive::Cost;
 use std::collections::BTreeMap;
