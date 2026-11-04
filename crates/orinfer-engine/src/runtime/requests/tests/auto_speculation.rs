@@ -13,7 +13,7 @@ fn validate_dynamic_speculation_transitions() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            mtp_drafts: Some(2),
+            mtp_drafts: Some(3),
             prefix_cache_bytes: 0,
             ..Default::default()
         },
@@ -31,7 +31,28 @@ fn validate_dynamic_speculation_transitions() {
         }
         requests.push(request);
     }
+    let feedback_ready = |runtime: &ModelRuntime, states: &mut [RequestState]| {
+        let work = Work::SpeculativeBatch(speculation::BatchChoice {
+            selected: (0..states.len()).map(|i| (i, 3)).collect(),
+        });
+        runtime
+            .speculation_feedback(&states.iter_mut().collect::<Vec<_>>(), &work)
+            .unwrap()
+            .warm_ready
+    };
+    assert!(feedback_ready(&model, &mut requests));
     model.dynamic_speculation.fixed_width = Some(3);
+    let joint: Vec<_> = (0..requests.len()).map(|i| (i, 1)).collect();
+    let choice = model
+        .select_auto_speculation(
+            &requests.iter_mut().collect::<Vec<_>>(),
+            &joint,
+            &options,
+            f64::INFINITY,
+        )
+        .unwrap();
+    assert_eq!(choice.selected, vec![(0, 3), (1, 3), (2, 3)]);
+
     for _ in 0..3 {
         model
             .advance_requests(&mut requests.iter_mut().collect::<Vec<_>>(), &options)
@@ -39,6 +60,7 @@ fn validate_dynamic_speculation_transitions() {
     }
     let before: usize = requests.iter().map(|r| r.mtp.rounds).sum();
     assert!(before > 0);
+    assert!(feedback_ready(&model, &mut requests));
     // Advertise a small retention window to exercise the rollover scheduler
     // without generating 4096 tokens. Actual capture/storage stay unchanged.
     let ring = model
@@ -66,6 +88,7 @@ fn validate_dynamic_speculation_transitions() {
     assert_eq!(before, requests.iter().map(|r| r.mtp.rounds).sum::<usize>());
     assert!(model.scheduler_statistics.mtp_catchup_tokens > 0);
     assert!(requests.iter().all(|r| !r.mtp_blocked));
+    assert!(!feedback_ready(&model, &mut requests));
     model.dynamic_speculation.fixed_width = Some(3);
     for _ in 0..3 {
         model
@@ -73,6 +96,7 @@ fn validate_dynamic_speculation_transitions() {
             .unwrap();
     }
     assert!(requests.iter().map(|r| r.mtp.rounds).sum::<usize>() > before);
+    assert!(feedback_ready(&model, &mut requests));
     for req in &mut requests {
         model
             .with_request(req, |m, r| {

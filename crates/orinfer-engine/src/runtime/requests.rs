@@ -1353,6 +1353,7 @@ impl ModelRuntime {
         }
         let feedback_at = Instant::now();
         let feedback_stats = self.execution.batch_statistics();
+        let catchup_before = self.scheduler_statistics.mtp_catchup_s;
         self.maintain_lazy_drafts(requests)?;
         let prefill_work = self.select_work(requests, options, &initialized)?;
         let media_at = Instant::now();
@@ -1518,24 +1519,19 @@ impl ModelRuntime {
                     .map(|&i| requests[i].generated)
                     .sum::<usize>()
                     - feedback.generated;
-                let observation = stats.observation_since(feedback_stats);
-                if tokens > 0
-                    && let Some(extra) = self.dynamic_speculation.extra_seconds(
-                        feedback.key,
-                        feedback.width,
-                        seconds,
-                        observation,
-                    )
-                {
-                    self.mtp_seconds_per_draft = self.mtp_seconds_per_draft * 0.8 + extra * 0.2;
-                }
-                self.dynamic_speculation.observe(
+                if let Some(extra) = self.dynamic_speculation.observe(
                     feedback.key,
                     feedback.width,
-                    seconds,
-                    tokens,
-                    observation,
-                );
+                    speculation::control::Measurement {
+                        seconds,
+                        preparation_s: stats.preparation_s_since(feedback_stats)
+                            + (self.scheduler_statistics.mtp_catchup_s - catchup_before).max(0.),
+                        warm_ready: feedback.warm_ready,
+                        tokens,
+                    },
+                ) {
+                    self.mtp_seconds_per_draft = self.mtp_seconds_per_draft * 0.8 + extra * 0.2;
+                }
             }
         }
         overlap();

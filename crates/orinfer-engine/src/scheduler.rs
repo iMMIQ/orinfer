@@ -382,43 +382,13 @@ impl BatchExecutionStatistics {
         self.kernel_load_s + self.workspace_mapping_s
     }
 
-    pub(crate) fn observation_since(self, before: Self) -> ExecutionObservation {
-        let replay = self.graph_hits > before.graph_hits || self.replay_s > before.replay_s;
-        let direct = self.direct_iterations > before.direct_iterations;
-        ExecutionObservation {
-            mode: match (direct, replay) {
-                (true, true) => ExecutionMode::Mixed,
-                (false, true) => ExecutionMode::Replay,
-                _ => ExecutionMode::Direct,
-            },
-            preparing: self.initialization_s() > before.initialization_s()
-                || self.capture_s > before.capture_s
-                || self.sequence_capture_s > before.sequence_capture_s,
-            deferred: self.graph_capture_deferrals > before.graph_capture_deferrals,
-            evicted: self.graph_evictions > before.graph_evictions,
-            // Cache eviction does not invalidate another arm's measured cost.
-            // Its own next materialization reports preparation explicitly.
-            generation: self.graph_invalidations,
-        }
+    /// Timed preparation is separate from hot arithmetic. Deferral, eviction
+    /// and graph generations do not describe the cost of the next round.
+    pub(crate) fn preparation_s_since(self, before: Self) -> f64 {
+        (self.initialization_s() - before.initialization_s()).max(0.)
+            + (self.capture_s - before.capture_s).max(0.)
+            + (self.sequence_capture_s - before.sequence_capture_s).max(0.)
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ExecutionMode {
-    #[default]
-    Direct,
-    Replay,
-    Mixed,
-}
-
-/// Describes work that actually ran; a prior estimate cannot make a cold graph ready.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ExecutionObservation {
-    pub mode: ExecutionMode,
-    pub preparing: bool,
-    pub deferred: bool,
-    pub evicted: bool,
-    pub generation: usize,
 }
 
 #[derive(Default, Clone, Debug, Serialize)]

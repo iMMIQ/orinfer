@@ -9,6 +9,16 @@ pub(in crate::runtime) struct Profile {
     trials: usize,
 }
 impl Profile {
+    pub fn samples(&self) -> usize {
+        if self.trials <= 1 {
+            0
+        } else {
+            self.time.samples
+        }
+    }
+    pub fn mean(&self) -> f64 {
+        self.time.mean
+    }
     pub fn upper(&self) -> f64 {
         self.time.upper()
     }
@@ -66,6 +76,7 @@ pub(super) struct Feedback {
     pub(super) width: usize,
     pub(super) lookups: usize,
     pub(super) generated: usize,
+    pub(super) warm_ready: bool,
     pub(super) indices: Vec<usize>,
 }
 
@@ -179,8 +190,8 @@ impl ModelRuntime {
         if key.batch == 0 {
             return None;
         }
-        // Reallocated packets keep the same total row budget as the nominal
-        // controller arm; request-local depths need not be equal.
+        // Automatic packets share a depth, so the timing key identifies both
+        // verification rows and serial draft waves.
         let rows: usize = selected
             .iter()
             .filter(|(i, _)| !requests[*i].prefilling)
@@ -193,6 +204,14 @@ impl ModelRuntime {
         Some(Feedback {
             key,
             width,
+            // Ordinary target execution leaves lazy draft work behind. The
+            // next speculative round pays that preparation once; its elapsed
+            // time is not a steady observation of the selected width.
+            warm_ready: width == 1
+                || selected
+                    .iter()
+                    .filter(|(i, _)| !requests[*i].prefilling)
+                    .all(|(i, _)| requests[*i].warm.tokens == requests[*i].history.len() - 1),
             lookups: requests.iter().map(|r| r.mtp.lookup_rounds).sum(),
             indices: selected
                 .iter()
@@ -246,25 +265,6 @@ impl ModelRuntime {
             })
             .min()?
             .saturating_mul(key.batch);
-        let choices: Vec<Vec<_>> = owners
-            .iter()
-            .map(|&i| {
-                let req = &requests[i];
-                let limit = (req.limit - req.generated)
-                    .min(
-                        self.manifest
-                            .max_context
-                            .saturating_sub(req.history.len().saturating_sub(1)),
-                    )
-                    .min(spec.default_verification_tokens);
-                plans
-                    .iter()
-                    .copied()
-                    .filter(|&n| n >= 2 && n <= limit)
-                    .map(|n| (n, req.draft_acceptance.expected(n - 1)))
-                    .collect()
-            })
-            .collect();
         if joint
             .iter()
             .any(|(i, _)| !requests[*i].prefilling && requests[*i].mtp_blocked)
@@ -278,17 +278,18 @@ impl ModelRuntime {
             options.max_speculative_tokens
         };
         let mut candidates = vec![];
-        let mut allocations = BTreeMap::new();
         for width in plans.into_iter().filter(|&n| {
-            n >= 2 && n <= spec.default_verification_tokens && n * key.batch <= row_budget
+            n >= 2
+                && n <= spec.default_verification_tokens
+                && n <= remaining_tokens / key.batch
+                && n * key.batch <= row_budget
         }) {
-            let Some(depths) = control::allocate(&choices, width * key.batch) else {
-                continue;
-            };
-            let depths: BTreeMap<_, _> = owners.iter().copied().zip(depths).collect();
+            // One depth is one physical draft/verify geometry. Redistributing
+            // rows could turn width 3 into [4,4,2,2], changing both serial draft
+            // waves and request progress while retaining the same timing key.
             let selected: Vec<_> = joint
                 .iter()
-                .map(|&(i, n)| (i, depths.get(&i).copied().unwrap_or(n)))
+                .map(|&(i, n)| (i, if requests[i].prefilling { n } else { width }))
                 .collect();
             let mut segments: Vec<_> = selected
                 .iter()
@@ -318,12 +319,29 @@ impl ModelRuntime {
             if packet && !self.model_package.supports_batch(&segments, operation) {
                 continue;
             }
-            let expected_tokens = selected
-                .iter()
-                .filter(|(i, _)| !requests[*i].prefilling)
-                .map(|(i, n)| requests[*i].draft_acceptance.expected(n - 1))
-                .sum();
-            allocations.insert(width, selected.clone());
+            let expected_tokens = control::progress(
+                owners
+                    .iter()
+                    .map(|&i| requests[i].draft_acceptance.expected(width - 1)),
+                key.batch,
+                options.policy == scheduler::Policy::Latency,
+            );
+            if self.dynamic_speculation.tracing() {
+                let yields: Vec<_> = owners
+                    .iter()
+                    .map(|&i| {
+                        (
+                            requests[i].slot,
+                            requests[i].generated,
+                            requests[i].draft_acceptance.expected(width - 1),
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "MTP_PROGRESS {key:?} width={width} policy={:?} expected={expected_tokens:.6} owners={yields:?}",
+                    options.policy
+                );
+            }
             // A verification round rides the same joined weight pass as one
             // plain iteration; only the extra draft tokens add real cost. A
             // rows*context prior priced each owner as its own prefill chunk
@@ -348,7 +366,10 @@ impl ModelRuntime {
             .or_default() += 1;
         let (width, exploring) = decision?;
         self.scheduler_statistics.mtp_probe_iterations += usize::from(exploring);
-        let selected = allocations.remove(&width)?;
+        let selected: Vec<_> = joint
+            .iter()
+            .map(|&(i, n)| (i, if requests[i].prefilling { n } else { width }))
+            .collect();
         for &(i, n) in &selected {
             if !requests[i].prefilling {
                 *self
