@@ -25,6 +25,7 @@ struct Rank {
     all_to_all_v_verified: bool,
     reduce_scatter_graph_verified: bool,
     all_to_all_graph_verified: bool,
+    graph_lifecycle_verified: bool,
     initialize_ms: f64,
 }
 
@@ -94,7 +95,7 @@ pub fn run(devices: &[u32]) -> Result<Report> {
     })?;
     Ok(Report {
         ranks,
-        scope: "Native HCCL AllReduce, AllGather, ReduceScatter with changed-input Graph replay and variable-count plus changed-input BF16/I32 AlltoAllV Graph replay across device contexts; no model execution",
+        scope: "Native HCCL collectives, changed-input Graph replay and 12 capture/replay/reclaim cycles with unequal per-device Graph retention; no model execution",
     })
 }
 fn count(source: u32, destination: u32) -> u64 {
@@ -171,6 +172,7 @@ fn validate_rank(session: &Session, root: &RootInfo, rank: u32, device: u32) -> 
     comm.check_async_error()?;
     validate_exchange_graph(session, &comm, rank)?;
     validate_scatter(session, &comm, rank)?;
+    validate_graph_lifecycle(session, &comm, rank)?;
     Ok(Rank {
         rank,
         device,
@@ -179,8 +181,89 @@ fn validate_rank(session: &Session, root: &RootInfo, rank: u32, device: u32) -> 
         all_to_all_v_verified: true,
         reduce_scatter_graph_verified: true,
         all_to_all_graph_verified: true,
+        graph_lifecycle_verified: true,
         initialize_ms,
     })
+}
+
+fn validate_graph_lifecycle(session: &Session, comm: &Communicator, rank: u32) -> Result<()> {
+    use crate::backend::ascend::graph::Graph;
+    let count = 51200usize;
+    let source = session.allocate(count * 4)?;
+    let reduced = session.allocate(count * 4)?;
+    let gathered = session.allocate(count * 4 * comm.ranks() as usize)?;
+    let mut graphs = std::collections::VecDeque::new();
+    for iteration in 0..12 {
+        let input = vec![rank as f32 + 1.; count];
+        let input: Vec<_> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+        upload_large(session, &source, &input)?;
+        for _ in 0..2 {
+            comm.all_reduce_sum(session, &source, &reduced, count as u64, Element::Float32)?
+                .wait()?;
+            comm.all_gather(session, &source, &gathered, count as u64, Element::Float32)?
+                .wait()?;
+        }
+        let retained = (
+            comm.clone(),
+            source.clone(),
+            reduced.clone(),
+            gathered.clone(),
+        );
+        // SAFETY: Retained owns this communicator and all stable buffers through
+        // Graph destruction. Both collectives use this session's compute stream.
+        let graph = unsafe {
+            Graph::capture(session, Box::new(retained), |stream| {
+                comm.native.status(
+                    (comm.native.api.reduce)(
+                        source.pointer(),
+                        reduced.pointer(),
+                        count as u64,
+                        Element::Float32.native(),
+                        0,
+                        comm.native.handle,
+                        stream,
+                    ),
+                    "capture lifecycle AllReduce",
+                )?;
+                comm.native.status(
+                    (comm.native.api.gather)(
+                        source.pointer(),
+                        gathered.pointer(),
+                        count as u64,
+                        Element::Float32.native(),
+                        comm.native.handle,
+                        stream,
+                    ),
+                    "capture lifecycle AllGather",
+                )
+            })
+        }?;
+        let multiplier = (iteration + 2) as f32;
+        let changed = vec![(rank as f32 + 1.) * multiplier; count];
+        let changed: Vec<_> = changed.iter().flat_map(|v| v.to_le_bytes()).collect();
+        upload_large(session, &source, &changed)?;
+        graph.enqueue(session)?.wait()?;
+        let expected = (comm.ranks() * (comm.ranks() + 1) / 2) as f32 * multiplier;
+        if values(&session.download(&reduced, 0, reduced.bytes())?)
+            .iter()
+            .any(|&v| v != expected)
+            || values(&session.download(&gathered, 0, gathered.bytes())?)
+                .iter()
+                .enumerate()
+                .any(|(i, &v)| v != (i / count + 1) as f32 * multiplier)
+        {
+            return Err(format!(
+                "HCCL lifecycle Graph replay mismatch on rank {rank}, round {iteration}"
+            ));
+        }
+        graphs.push_back(graph);
+        // A same-process runtime must safely reuse IDs even when the ranks
+        // reclaim different sets of historical Graphs at different times.
+        if graphs.len() > rank as usize % 4 + 1 {
+            graphs.pop_front();
+        }
+    }
+    Ok(())
 }
 
 fn validate_exchange_graph(session: &Session, comm: &Communicator, rank: u32) -> Result<()> {

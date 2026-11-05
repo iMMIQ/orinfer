@@ -1789,6 +1789,7 @@ dependencies = [
 name = "orinfer-engine"
 version = "0.3.1-fix1"
 dependencies = [
+ "cc",
  "cudarc",
  "flate2",
  "half",

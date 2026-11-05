@@ -39,8 +39,12 @@ impl Drop for Captured {
         }
         if !self.handle.is_null() {
             // SAFETY: Every graph submission retains Captured through its fence.
-            unsafe {
-                (self.api.destroy)(self.handle);
+            let status = unsafe { (self.api.destroy)(self.handle) };
+            if status != 0 || super::hccl::graph_registry::check().is_err() {
+                self.context.retire();
+                std::mem::forget(self.keepalive.take());
+                std::mem::forget(Rc::clone(&self.context));
+                eprintln!("Retired ACL context after Graph destruction failure: {status}");
             }
         }
     }
@@ -53,6 +57,7 @@ impl Graph {
     /// The caller retains this graph through an enclosing compute completion
     /// and serializes invocations on the owning session's compute stream.
     pub(super) unsafe fn execute_on_stream(&self, stream: Handle) -> Result<()> {
+        super::hccl::graph_registry::check()?;
         check(
             // SAFETY: The caller supplies this graph's owned stream and retains
             // its stable operands and native resources through completion.
@@ -71,6 +76,7 @@ impl Graph {
             return Err("ACL Graph capture is disabled for this session".into());
         }
         session.same_context(&session.context)?;
+        super::hccl::graph_registry::check()?;
         session.synchronize()?;
         let _current = session.context.enter()?;
         let library = &session.context.driver._library;
@@ -112,6 +118,7 @@ impl Graph {
             "end ACL Graph capture",
         )?;
         captured.active = false;
+        super::hccl::graph_registry::check()?;
         if captured.handle.is_null() {
             return Err("ACL capture returned null model instance".into());
         }
@@ -121,6 +128,7 @@ impl Graph {
         })
     }
     pub fn enqueue(&self, session: &Session) -> Result<Ticket> {
+        super::hccl::graph_registry::check()?;
         session.same_context(&self.captured.context)?;
         if let Some(last) = self.last.borrow().as_ref()
             && !last.is_ready()?
