@@ -5,7 +5,9 @@ use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 use tokenizers::Tokenizer;
 mod deepseek;
+mod template_options;
 use super::output::ToolFormat;
+pub(super) use template_options::THINKING_FIELDS;
 #[cfg(test)]
 mod tool_generation_test;
 
@@ -91,6 +93,8 @@ pub struct ChatRequest {
     pub logit_bias: Option<std::collections::BTreeMap<u32, f64>>,
     pub response_format: Option<Value>,
     pub enable_thinking: Option<bool>,
+    #[serde(default, deserialize_with = "nullable_default")]
+    pub chat_template_kwargs: serde_json::Map<String, Value>,
     pub asr_language: Option<String>,
     #[serde(default)]
     pub image_processing: super::image::ImageProcessing,
@@ -270,6 +274,8 @@ impl ChatCodec {
         preparation: &mut super::preparation::Context,
     ) -> Result<Prepared> {
         preparation.checkpoint(0)?;
+        request.resolve_template_options()?;
+        let preserve_thinking_override = request.template_bool("preserve_thinking")?;
         if request.model != model {
             return Err(format!(
                 "model: Unknown model {}; expected {model}",
@@ -585,17 +591,20 @@ impl ChatCodec {
             Some("max" | "xhigh") => 100,
             _ => 75,
         };
+        let preserve_thinking = preserve_thinking_override
+            .unwrap_or(self.tool_format != ToolFormat::DeepSeekV41 || !tools.is_empty());
+        let controlled = context! {
+            messages => Serde(&messages), tools => Serde(&tools), add_generation_prompt => true,
+            enable_thinking => thinking, thinking => thinking, reasoning_effort => effort,
+            preserve_thinking => preserve_thinking,
+            tool_schemas => Serde(&tool_schemas), deepseek_effort => deepseek_effort,
+            canonical_tools => !native_tools && constraint.is_some() && !tools.is_empty(),
+        };
         let mut rendered = self
             .template
             .get_template("chat")
             .map_err(|e| e.to_string())?
-            .render(context! {
-                messages => Serde(&messages), tools => Serde(&tools), add_generation_prompt => true,
-                enable_thinking => thinking, reasoning_effort => effort,
-                preserve_thinking => self.tool_format != ToolFormat::DeepSeekV41 || !tools.is_empty(),
-                tool_schemas => Serde(&tool_schemas), deepseek_effort => deepseek_effort,
-                canonical_tools => !native_tools && constraint.is_some() && !tools.is_empty(),
-            })
+            .render(context! { ..controlled, ..Serde(&request.chat_template_kwargs) })
             .map_err(|e| format!("Chat template: {e}"))?;
         preparation.checkpoint(0)?;
         if let Some(language) = request.asr_language {

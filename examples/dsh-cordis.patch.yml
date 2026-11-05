@@ -1,0 +1,38 @@
+# Merge these entries into $DSH_HOME/profiles/headless/cordis.patch.yml.
+# Keep the key in ORINFER_API_KEY, outside this file.
+- id: agent-default-model
+  config:
+    provider: orinfer
+    model: deepseek-v4.1
+    reasoningEffort: high
+- id: llm-pi-ai
+  config:
+    providers:
+      orinfer:
+        api: openai-completions
+        baseURL: http://127.0.0.1:8000/v1
+        apiKeyEnv: ORINFER_API_KEY
+        defaultContextWindow: 262144
+        defaultMaxTokens: 8192
+        compat:
+          maxTokensField: max_completion_tokens
+          supportsDeveloperRole: true
+          supportsUsageInStreaming: true
+          thinkingFormat: chat-template
+          chatTemplateKwargs:
+            enable_thinking:
+              $var: thinking.enabled
+            reasoning_effort:
+              $var: thinking.effort
+            preserve_thinking: true
+            thinking_token_budget: 1024
+        models:
+          - id: deepseek-v4.1
+            input: [text, image]
+            contextWindow: 262144
+            maxTokens: 8192
+            reasoningEfforts:
+              'off':
+              low: low
+              high: high
+              max: max
