@@ -20,6 +20,52 @@ from tools.model.deepseek_v41.sequence_parallel import external_reads
 from tools.model.deepseek_v41.private_schedule import reusable_long_gathers, select_schedule
 
 
+class HcFusionTests(unittest.TestCase):
+    def test_normalization_and_sinkhorn_require_matching_physical_rows(self):
+        from tools.model.deepseek_v41.fuse_hc import chain
+
+        normalize = dict(op="kernel", manifest="normalize", buffers=["partials", "mix"])
+        sinkhorn = dict(op="kernel", manifest="sinkhorn", buffers=["mix", "scale"])
+        descriptions = dict(
+            normalize=dict(
+                op="hc_prefill.reduce",
+                parameters=dict(rows=2048, _row_capacity=2048, width=5120, splits=8),
+            ),
+            sinkhorn=dict(
+                op="vector.mhc_split_sinkhorn",
+                parameters=dict(rows=2048, _row_capacity=2048, tile_rows=32),
+            ),
+        )
+
+        def describe(step):
+            return descriptions.get(step.get("manifest"))
+
+        self.assertIsNotNone(chain(normalize, sinkhorn, describe))
+        self.assertIsNone(chain(sinkhorn, normalize, describe))
+        shard = dict(op="divide", lhs=dict(op="rows"), rhs=dict(op="constant", value=8))
+        self.assertIsNotNone(
+            chain(
+                dict(normalize, row_expression=shard),
+                dict(sinkhorn, row_expression=shard),
+                describe,
+            )
+        )
+        with self.assertRaises(ValueError):
+            chain(dict(normalize, row_expression=shard), sinkhorn, describe)
+        with self.assertRaises(ValueError):
+            chain(dict(normalize, fixed_rows=True), sinkhorn, describe)
+        for field, value in [("rows", 192), ("_row_capacity", 192), ("tile_rows", 1)]:
+            original = descriptions["sinkhorn"]["parameters"][field]
+            descriptions["sinkhorn"]["parameters"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                chain(normalize, sinkhorn, describe)
+            descriptions["sinkhorn"]["parameters"][field] = original
+        with self.assertRaises(ValueError):
+            chain(normalize, dict(sinkhorn, buffers=["other", "scale"]), describe)
+        with self.assertRaises(ValueError):
+            chain(dict(normalize, decoder_only=True), sinkhorn, describe)
+
+
 class OwnerRowDomainTests(unittest.TestCase):
     def test_fused_output_and_table_must_inherit_replay_domain_together(self):
         source = dict(buffer="query", row_bytes=4096, decoder=True)

@@ -301,6 +301,8 @@ A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和
 
 A2 专家 GMM 可通过 `tools.model.deepseek_v41.expert_fusion` 离线选择已有 target 行数区间，默认 `32..511`。gather 将完整 A8 无损拆成两行 signed INT4，复用发布的 NZ W4 bank 与原生 grouped matmul；GMM 在 FP16 部分积舍入前应用原权重 scale，后处理融合部分积合并、FP32 assist/token scale、BF16 SwiGLU 和 FP32 行量化。`--min-rows`、`--max-rows` 必须覆盖完整的已有 packet 区间；其他 packet、请求状态和权重文件沿用原契约。该计划使用显式 `w4_a4` 指令，需要支持它的引擎。执行包单独发布单位 token scale 常量及临时 workspace，权重包保持原样。
 
+A2 mHC 可通过 `tools.model.deepseek_v41.fuse_hc --plan PLAN --output OUTPUT --model-dir MODEL` 离线融合八分片归一化与 Sinkhorn，保留 FP32 计算顺序及真实行表达式，支持 sequence-parallel 分片和 decoder 后缀。构建器复用同一个归一化宏与 Sinkhorn 计算体，每种物理容量发布一个动态入口；`--capacity-tiles FILE` 读取以容量为键的离线 tile 选择，例如 `{"256":8,"2048":32}`。该容量内的各实际 batch 和长度共享同一配置。`tools.operators.ascend.validate_hc_fused` 对已发布参考检查精确数值、尾部及变输入 Graph，`--benchmark` 复用公共 Graph 测量工具。执行资产单独发布，权重和请求状态布局沿用原契约。
+
 HTTP 在加载模型前绑定监听地址，端口被占用时立即退出；模型和预热完成后开始处理 HTTP。就绪探针使用 `/health` 的 HTTP 200，TCP 连通只表示监听地址已绑定。A2 全量常驻 CPU 表的启动可能需要数分钟，部署时为启动探针预留足够时间，例如 600 秒。正常退出及启动失败会清理本服务创建的 Unix socket；已有 socket 绑定失败时保留原文件。
 
 A2 rank 的命令使用一个共同的等待期限，`ORINFER_A2_COMMAND_TIMEOUT_MS` 默认 `30000`，支持 `1..1800000` 毫秒，同时设置 ACL 同步等待期限；初始模型加载单独允许 1800 秒。rank 驱动错误、线程退出或命令超时会使当前 TP 团队失效，保留首个故障的类型和驱动错误码，后续请求无法继续使用该团队。服务故障后由进程管理器重启；调整命令期限时也应相应配置 HTTP 和停机期限。

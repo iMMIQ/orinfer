@@ -513,15 +513,26 @@ def mhc_split_sinkhorn(rows, iterations=20, eps=1e-6, vector_rows=True, tile_row
     return main
 
 
-def _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows):
+def mhc_normalized_sinkhorn(rows, width=5120, iterations=20, eps=1e-6, tile_rows=32):
+    """Normalize and emit mHC gates in one pass with identical FP32 boundaries."""
+    return _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows, normalization_width=width)
+
+
+def _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows, normalization_width=None):
     """Batch independent 4x4 matrices with the original row/column reductions."""
     if tile_rows not in (2, 4, 8, 16, 32):
         raise ValueError("mHC Sinkhorn row tile must be 1, 2, 4, 8, 16 or 32")
     width = tile_rows * 32
+    normalized_input = normalization_width is not None
+    input_rows = rows * 8 if normalized_input else rows
+    if normalized_input:
+        from tools.operators.ascend.hc_prefill import normalization
+
+        normalize = normalization(tile_rows, normalization_width)
 
     @T.prim_func
     def main(
-        mixes: T.Tensor((rows, 32), "float32"),
+        mixes: T.Tensor((input_rows, 32), "float32"),
         scale: T.Tensor((8,), "float32"),
         base: T.Tensor((32,), "float32"),
         pre: T.Tensor((rows, 8), "float32"),
@@ -560,7 +571,10 @@ def _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows):
             if first < rows:
                 valid = T.min(tile_rows, rows - first)
                 T.tile.fill(m, 0.0)
-                T.copy(mixes[first : first + valid, :], m[:valid, :])
+                if normalized_input:
+                    normalize(mixes, m, first, valid)
+                else:
+                    T.copy(mixes[first : first + valid, :], m[:valid, :])
                 T.copy(scale, s)
                 T.copy(base, b[0, :])
                 T.tile.fill(scale_row, 0.0)
@@ -662,6 +676,8 @@ def _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows):
                 T.copy(q[:valid, :], post[first : first + valid, :])
                 T.copy(packed[:valid, :], combination[first : first + valid, :])
 
+    if normalized_input:
+        main = main.with_attr("orinfer.component_sources", ["tools/operators/ascend/hc_prefill.py"])
     return main
 
 
