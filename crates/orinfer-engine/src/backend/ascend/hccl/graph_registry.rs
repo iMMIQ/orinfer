@@ -183,7 +183,7 @@ mod tests {
                     "-O2",
                     "-D_GLIBCXX_USE_CXX11_ABI=0",
                     "-static-libstdc++",
-                    "-static-libgcc",
+                    "-shared-libgcc",
                     "-Wl,--exclude-libs,ALL",
                     "-I",
                 ])
