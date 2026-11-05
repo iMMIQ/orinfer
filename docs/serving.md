@@ -82,6 +82,8 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 默认关闭 thinking；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 开启后，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
+`chat_template_kwargs` 接受对象或 `null`，兼容 DSH、vLLM 客户端的模板参数。嵌套的 `enable_thinking`（或 `thinking`）、`reasoning_effort` 和 `thinking_token_budget` 与对应顶层控制一致；同名非空顶层值优先。`preserve_thinking` 控制模板中的历史推理保留，其余自定义变量传给模型模板；消息、工具、生成边界和运行时控制由服务端绑定。请求中的嵌套 thinking 设置会覆盖部署默认值中的顶层或嵌套 thinking 设置，模板默认变量按键补齐；显式 `chat_template_kwargs: null` 清除默认模板变量。thinking 开关必须为布尔值。接入配置见 [DeepSeek Harness](deepseek-harness.md)。
+
 `thinking_token_budget` 限制本轮初始思考段的 token 数，支持 0；到达上限时解码强制选择 `</think>`，随后继续回答或调用工具。结束标记仅计入 completion。预算自动缩小到总输出上限减 2，为结束标记和至少一个回答 token 留空间；开启 thinking 且指定此参数时，总输出预算至少为 2。该预算在 thinking 开启时生效。限制是请求私有状态，MTP 的草稿和 target 共同遵守。无惩罚、无概率报告的 greedy 请求在 GPU argmax 满足约束时直接复用结果；预算耗尽时可直接选择唯一的结束标记。其他约束选择保留 CPU 回退，随机采样保持相同目标分布。effort 控制思考倾向，`thinking_token_budget` 提供硬上限。
 
 默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限默认 32 MiB，通过 `--request-body-mib` 调整。

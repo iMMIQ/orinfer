@@ -1,15 +1,15 @@
 # DSv4.1 A2 部署
 
-v0.3.1 候选支持 CANN 9.2、Ascend 910B TP8 的文本、HTTP/SSE、连续 batch、DSpark、设备及 CPU prefix cache，以及 DSML 工具与 thinking 历史。匹配视觉执行包及视觉权重后支持单图、多图和 OpenCode 读图工具交互。引擎与执行包分别安装，模型目录提供对应的前端和权重。支持范围见[模型包说明](model-packages.md#a2-文本服务与长上下文)。正式发布以图片正确性、质量、资源稳定性及最终部署包验收完成为条件；性能按实际工作负载与基线比较。
+v0.3.1-fix1 支持 CANN 9.2、Ascend 910B TP8 的文本、HTTP/SSE、连续 batch、DSpark、设备及 CPU prefix cache，以及 DSML 工具与 thinking 历史。匹配视觉执行包及视觉权重后支持单图、多图和 OpenCode 读图工具交互。引擎与执行包分别安装，模型目录提供对应的前端和权重。支持范围见[模型包说明](model-packages.md#a2-文本服务与长上下文)。性能按实际工作负载与基线比较。DSH 接入方式见 [DeepSeek Harness](deepseek-harness.md)。
 
 ## 安装与升级
 
-解压 `orinfer-v0.3.1-linux-aarch64.tar.xz`，使用其中的二进制安装匹配的执行包：
+解压 `orinfer-v0.3.1-fix1-linux-aarch64.tar.xz`，使用其中的二进制安装匹配的执行包：
 
 ```bash
 bin/orinfer --version
 bin/orinfer package install \
-  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.1.tar.xz \
+  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.1-fix1.tar.xz \
   --cache /srv/orinfer/execution-cache
 ```
 
@@ -26,27 +26,26 @@ uv run --locked python -m tools.model.deepseek_v41.service --frontend-only \
 
 服务绑定本机地址，通过部门网关提供访问、用户配额及请求期限。将 `ORINFER_API_KEY` 放在仓库外的受保护环境文件中，客户端使用 `Authorization: Bearer ...`。网关应保留 SSE 流式转发并关闭响应缓冲。
 
-以下为本机已使用的资源配置；CPU 绑核按部署机器拓扑调整。本次发布的 `dspark-costs-deepseek-v41-flash-1017-ascend910b-v0.3.1.json` 可复制为 `/srv/orinfer/dspark-costs.json`；它匹配当前执行包、CANN 9.2、TP8 及成本 schema 2。其他离线成本文件可由 `tools/bench/dspark_costs.py` 生成；已有匹配文件可直接复用。
+以下配置适用于至少 96 核 CPU、1 TB 主机内存和完整 8 卡独享的 A2 部署。DSpark 使用 `auto`，预处理线程及 batch 行数保留默认值。视觉特征缓存设为 1024 MiB；前处理缓存默认 256 MiB，按实际图片历史与内存压力调整。已有与执行包、CANN 9.2、TP8 和成本 schema 2 匹配的离线成本文件时，可显式设置 `ORINFER_A2_DSPARK_COST_MODEL`；未设置时由运行时估计成本。
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
 export ORINFER_EXECUTION_CACHE=/srv/orinfer/execution-cache
 export ORINFER_A2_HOST_TABLE_MIB=212000
-export ORINFER_A2_HOST_ROW_CACHE_MIB=2048
-export ORINFER_A2_DSPARK_COST_MODEL=/srv/orinfer/dspark-costs.json
+export ORINFER_VISION_CACHE_MIB=1024
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_NPU_SOCKET_PORT_RANGE=auto
 
 bin/orinfer serve /data/model/dsv41-v0.3.1 \
   --model deepseek-v4.1 --listen 127.0.0.1:8088 \
-  --mtp-drafts auto --max-active-requests 16 --max-batch-tokens 128 \
-  --max-speculative-tokens 192 --prefix-cache-mib 8192 --kv-offload-mib 16384 \
-  --queue-timeout-ms 30000 --output-timeout-ms 300000 --drain-timeout-ms 120000
+  --mtp-drafts auto --prefix-cache-mib 8192 --kv-offload-mib 262144 \
+  --request-body-mib 64 \
+  --queue-timeout-ms 60000 --output-timeout-ms 180000 --drain-timeout-ms 120000
 ```
 
-设备 prefix 预算按每卡计，CPU offload 预算为 TP ranks 合计。常驻 CPU 表另计约 212000 MiB，主机还需为行缓存、offload、前端和系统保留空间。灰度从 16 活跃请求开始，依据实际请求长度、排队和首 token 时延再放宽到已验收的 32。队列容量固定为 128；`--queue-timeout-ms` 只限制排队，`--output-timeout-ms` 限制输出通道等待进展，二者均不等于请求总期限。
+默认最多 32 个活跃请求，普通 decode 行预算为 128；投机验证行数由执行包自动约束。设备 prefix 预算按每卡计，CPU offload 预算为 TP ranks 合计。CPU 的 256 GiB 是 prefix 状态缓存容量上限，实际占用按需增长，短测没有形成 CPU 层命中时不能据此声称吞吐收益。它不扩展活跃请求的 NPU KV 容量。常驻 CPU 表另计约 207 GiB，主机还需为缓存、前端和系统保留空间。交互客户端可从 16 并发起步，32 为服务准入上限，不要求每轮凑满。队列容量固定为 128；`--queue-timeout-ms` 只限制排队，`--output-timeout-ms` 限制输出通道等待进展，二者均不等于请求总期限。
 
-示例的 30 秒排队预算用于网关已收紧上下文的交互入口。长上下文通道单独设置并发、排队和客户端总期限；冷请求的准入等待可能超过 30 秒，达到该期限会结束请求。性能对照固定相同的排队预算与缓存准备条件，并同时报告成功请求、排队超时和运行时故障。
+长上下文通道单独设置并发、排队和客户端总期限；冷请求的准入等待可能超过交互入口的排队预算，达到该期限会结束请求。性能对照固定相同的排队预算与缓存准备条件，并同时报告成功请求、排队超时和运行时故障。
 
 队列满返回 HTTP 429 和 `Retry-After: 1`。排队期限到达时，非流式请求返回 HTTP 408，流式请求在已建立的 SSE 中返回终止错误 `request_queue_timeout`，携带 `retryable=true` 和 `retry_after_ms=1000`。客户端从该等待时间开始指数退避，限制尝试次数和总期限。已经收到文本、thinking 或工具调用片段后停止自动重试，避免重复执行 agent 工具。慢客户端输出超时使用 `client_output_timeout`，携带 `retryable=false`；客户端关闭连接后，请求进入回收流程。
 
@@ -60,7 +59,7 @@ bin/orinfer serve /data/model/dsv41-v0.3.1 \
 
 OpenCode 使用[配置示例](../examples/opencode.json)中的 `orinfer/deepseek-v4.1`，模型 ID 与服务一致。需要参数类型和格式保证时采用 `strict` 工具或 `response_format` JSON Schema，检查 `finish_reason` 后再执行工具。`length` 表示输出可能截断；工具应校验参数，并将执行错误作为对应 `tool_call_id` 的结果回传。
 
-图片通过 Chat 消息的 `image_url` 内容传入，同一消息可按顺序包含多张图片。OpenCode 配置声明 `attachment` 和 `modalities.input=["text","image"]`，工具读取图片后沿同一接口提交。图片内容与预处理网格参与 prefix 身份；替换图片或调整图片顺序会重新匹配缓存。每图至多 1024 个视觉 token，单请求总量由执行包限制；可用 `image_processing.max_images`、`max_pixels` 和 `max_tokens` 收紧入口预算。排队、图片编码、语言 prefill 和 decode 均计入客户端请求期限。
+图片通过 Chat 消息的 `image_url` 内容传入，同一消息可按顺序包含多张图片。OpenCode 配置声明 `attachment` 和 `modalities.input=["text","image"]`，工具读取图片后沿同一接口提交。图片内容与预处理网格参与 prefix 身份；替换图片或调整图片顺序会重新匹配缓存。每图至多 1024 个视觉 token，原生 A2 图片历史按模型上下文和内存预算管理；可用 `image_processing.max_images`、`max_pixels`、`max_tokens_per_image` 和 `max_tokens` 收紧入口预算。`--request-body-mib` 调整 HTTP 请求体上限，`--image-cache-mib` 调整前处理缓存；UUID 引用与淘汰重传见服务文档。排队、图片编码、语言 prefill 和 decode 均计入客户端请求期限。
 
 固定样例、代码执行、长上下文检索及短压测用于验收部署行为；它们不代表完整编码任务基准。自由文本的严格格式遵循和工具任务正确性分别记录。原有 32K 检索样例曾正确找到值，但多输出 `RELEASE_CODE=` 前缀；程序消费结果时使用受约束的结构化输出。
 
