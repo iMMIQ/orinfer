@@ -165,6 +165,7 @@ impl Ending {
     }
 }
 struct Active<'a> {
+    retain_image_memory: bool,
     request: RequestState,
     mailbox: Mailbox,
     parser: output::Output,
@@ -181,7 +182,7 @@ struct Active<'a> {
     content_scores: Vec<Value>,
 }
 impl<'a> Active<'a> {
-    fn new(request: RequestState, job: Job, codec: &'a ChatCodec) -> Self {
+    fn new(request: RequestState, job: Job, codec: &'a ChatCodec, has_images: bool) -> Self {
         let mut parser = output::Output::new(
             job.prepared.thinking,
             job.prepared.tools.clone(),
@@ -193,6 +194,7 @@ impl<'a> Active<'a> {
         parser.constrained_tools(job.prepared.constrained_tools);
         let queue_s = job.queued.elapsed().as_secs_f64();
         Self {
+            retain_image_memory: has_images,
             request,
             mailbox: Mailbox::new(job),
             parser,
@@ -657,7 +659,10 @@ pub(super) fn worker(
                                 } else {
                                     0
                                 };
-                                if has_images && let Some(memory) = &job._memory {
+                                if has_images
+                                    && !request.has_pending_host_images()
+                                    && let Some(memory) = &job._memory
+                                {
                                     memory.release_images();
                                 }
                                 if let Some(shared) = job.shared_prefix {
@@ -670,7 +675,7 @@ pub(super) fn worker(
                                 }
                                 cached_text = text_only
                                     && request.prefix_statistics().cached_tokens == prompt_tokens;
-                                let mut a = Active::new(request, job, codec);
+                                let mut a = Active::new(request, job, codec, has_images);
                                 a.mailbox
                                     .delta(model_id, json!({"role":"assistant","content":""}));
                                 active.push(a);
@@ -794,6 +799,14 @@ pub(super) fn worker(
             drop(mailboxes);
             match result {
                 Ok(outputs) => {
+                    for a in &mut active {
+                        if a.retain_image_memory && !a.request.has_pending_host_images() {
+                            if let Some(memory) = &a.mailbox.job._memory {
+                                memory.release_images();
+                            }
+                            a.retain_image_memory = false;
+                        }
+                    }
                     for output in outputs {
                         active[output.request].consume(&output.tokens, codec, model_id);
                     }

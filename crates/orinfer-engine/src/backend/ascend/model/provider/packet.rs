@@ -176,7 +176,6 @@ impl Runtime {
                 if budget == 0
                     || request.is_finished()
                     || request.ready_output.is_some()
-                    || !request.pending_images.is_empty()
                     || request.prefilling != prefill
                     || !prefill && decode_inputs.is_some_and(|v| !v.contains_key(&i))
                 {
@@ -197,6 +196,11 @@ impl Runtime {
                     } else {
                         limit.min(next)
                     };
+                    // Ready text/image rows can run while a later image is
+                    // still encoding. Never cross an unavailable image span.
+                    let limit = request.pending_images.front().map_or(limit, |image| {
+                        limit.min(image.start.saturating_sub(request.offset))
+                    });
                     let Some(count) = super::super::replay::prompt_rows(
                         left,
                         limit,

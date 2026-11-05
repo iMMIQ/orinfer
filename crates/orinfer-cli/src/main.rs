@@ -269,6 +269,12 @@ struct InferenceArgs {
     preprocess_workers: usize,
     #[arg(long, default_value_t = PreprocessingLimits::default().memory_mib)]
     preprocess_memory_mib: usize,
+    /// Retained image payload/preprocessing cache in MiB; 0 disables reuse and UUID references.
+    #[arg(long, default_value_t = PreprocessingLimits::default().image_cache_mib)]
+    image_cache_mib: usize,
+    /// Maximum HTTP request body in MiB, bounded by the preprocessing memory budget.
+    #[arg(long, default_value_t = PreprocessingLimits::default().request_body_mib)]
+    request_body_mib: usize,
 }
 #[derive(Args)]
 struct ServeArgs {
@@ -337,6 +343,8 @@ impl From<InferenceArgs> for ServerConfig {
             limits: PreprocessingLimits {
                 preprocess_workers: args.preprocess_workers,
                 memory_mib: args.preprocess_memory_mib,
+                image_cache_mib: args.image_cache_mib,
+                request_body_mib: args.request_body_mib,
                 ..Default::default()
             },
         }

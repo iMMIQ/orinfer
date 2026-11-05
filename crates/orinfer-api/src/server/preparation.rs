@@ -5,6 +5,7 @@ pub(super) struct Pool {
     pub workers: Arc<tokio::sync::Semaphore>,
     pub memory: Arc<tokio::sync::Semaphore>,
     bodies: Arc<tokio::sync::Semaphore>,
+    pub images: Arc<super::image::cache::Cache>,
 }
 impl Pool {
     pub fn new(limits: Limits) -> Self {
@@ -12,6 +13,9 @@ impl Pool {
             bodies: Arc::new(tokio::sync::Semaphore::new(16)),
             workers: Arc::new(tokio::sync::Semaphore::new(limits.preprocess_workers)),
             memory: Arc::new(tokio::sync::Semaphore::new(limits.memory_mib)),
+            images: Arc::new(super::image::cache::Cache::new(
+                limits.image_cache_mib << 20,
+            )),
         }
     }
 }
@@ -28,6 +32,7 @@ impl Drop for Cancellation {
     }
 }
 pub(super) struct Context {
+    pub images: Option<Arc<super::image::cache::Cache>>,
     cancelled: Arc<AtomicBool>,
     budget: usize,
     retained: usize,
@@ -37,6 +42,7 @@ pub(super) struct Context {
 impl Context {
     pub fn new(cancelled: Arc<AtomicBool>, budget: usize) -> Self {
         Self {
+            images: None,
             cancelled,
             budget,
             retained: 0,

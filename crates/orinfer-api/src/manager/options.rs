@@ -23,6 +23,8 @@ pub struct WorkerOptions {
     pub prompt_lookup: bool,
     pub preprocess_workers: usize,
     pub preprocess_memory_mib: usize,
+    pub image_cache_mib: usize,
+    pub request_body_mib: usize,
     pub default_request_params: Map<String, Value>,
 }
 impl Default for WorkerOptions {
@@ -44,6 +46,8 @@ impl Default for WorkerOptions {
             prompt_lookup: false,
             preprocess_workers: 2,
             preprocess_memory_mib: 2048,
+            image_cache_mib: 256,
+            request_body_mib: 32,
             default_request_params: Map::new(),
         }
     }
@@ -69,6 +73,8 @@ impl WorkerOptions {
             prompt_lookup: settings.prompt_lookup,
             preprocess_workers: settings.limits.preprocess_workers,
             preprocess_memory_mib: settings.limits.memory_mib,
+            image_cache_mib: settings.limits.image_cache_mib,
+            request_body_mib: settings.limits.request_body_mib,
             default_request_params: settings.default_request_params.clone(),
         }
     }
@@ -106,6 +112,8 @@ impl WorkerOptions {
             limits: crate::PreprocessingLimits {
                 preprocess_workers: self.preprocess_workers,
                 memory_mib: self.preprocess_memory_mib,
+                image_cache_mib: self.image_cache_mib,
+                request_body_mib: self.request_body_mib,
                 ..Default::default()
             },
             ..Default::default()
@@ -137,6 +145,10 @@ impl WorkerOptions {
             self.preprocess_workers.to_string(),
             "--preprocess-memory-mib".into(),
             self.preprocess_memory_mib.to_string(),
+            "--image-cache-mib".into(),
+            self.image_cache_mib.to_string(),
+            "--request-body-mib".into(),
+            self.request_body_mib.to_string(),
             "--memory-reserve-mib".into(),
             self.memory_reserve_mib.to_string(),
             "--default-request-params".into(),

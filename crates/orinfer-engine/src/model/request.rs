@@ -82,6 +82,13 @@ impl RequestState {
             Implementation::Ascend(inner) => inner.is_prefilling(),
         }
     }
+    /// Native asynchronous encoders retain charged host media until consumed.
+    pub fn has_pending_host_images(&self) -> bool {
+        match &self.0 {
+            Implementation::Cuda(_) => false,
+            Implementation::Ascend(inner) => inner.has_pending_host_images(),
+        }
+    }
     pub fn remaining_prefill_tokens(&self) -> usize {
         match &self.0 {
             Implementation::Cuda(inner) => inner.remaining_prefill_tokens(),

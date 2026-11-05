@@ -129,6 +129,8 @@ impl ServerConfig {
         }
         if !(1..=32).contains(&self.limits.preprocess_workers)
             || !(512..=16384).contains(&self.limits.memory_mib)
+            || self.limits.image_cache_mib > 16384
+            || !(1..=self.limits.memory_mib / 8).contains(&self.limits.request_body_mib)
             || self.limits.output_ms == 0
             || self.limits.drain_ms == 0
         {
@@ -142,6 +144,9 @@ impl ServerConfig {
 pub struct PreprocessingLimits {
     pub preprocess_workers: usize,
     pub memory_mib: usize,
+    /// Retained immutable image assets; separate from in-flight preparation.
+    pub image_cache_mib: usize,
+    pub request_body_mib: usize,
     pub queue_ms: u64,
     pub output_ms: u64,
     pub drain_ms: u64,
@@ -151,6 +156,8 @@ impl Default for PreprocessingLimits {
         Self {
             preprocess_workers: 2,
             memory_mib: 2048,
+            image_cache_mib: 256,
+            request_body_mib: 32,
             queue_ms: 0,
             output_ms: 60000,
             drain_ms: 30000,

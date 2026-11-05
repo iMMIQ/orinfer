@@ -20,14 +20,32 @@ fn resolve(
     cache: &mut crate::vision::FeatureCache<Vec<u8>>,
     completed: &BTreeMap<[u8; 32], Arc<Vec<u8>>>,
     installed: &mut BTreeSet<usize>,
+    lookahead: usize,
 ) -> usize {
     let mut hits = 0;
     for (i, request) in requests.iter_mut().enumerate() {
         if request.is_finished() {
             continue;
         }
+        if request
+            .image_features
+            .first()
+            .is_some_and(|span| span.end() <= request.offset)
+        {
+            Arc::make_mut(&mut request.image_features).retain(|span| span.end() > request.offset);
+            installed.insert(i);
+        }
+        let end = request.offset.saturating_add(lookahead);
         let mut pending = VecDeque::new();
         while let Some(image) = request.pending_images.pop_front() {
+            if image.start >= end && !completed.contains_key(&image.identity) {
+                pending.push_back(image);
+                if completed.is_empty() {
+                    pending.append(&mut request.pending_images);
+                    break;
+                }
+                continue;
+            }
             let data = if let Some(data) = completed.get(&image.identity) {
                 Some(Arc::clone(data))
             } else {
@@ -93,6 +111,7 @@ impl Runtime {
         if requests.is_empty() {
             return Ok(());
         }
+        let lookahead = self.team.rows;
         let at = Instant::now();
         let mut installed = BTreeSet::new();
         let mut cache_hits = resolve(
@@ -100,6 +119,7 @@ impl Runtime {
             &mut self.vision_cache,
             &BTreeMap::new(),
             &mut installed,
+            lookahead,
         );
         if self.image_wave.as_ref().is_some_and(|wave| {
             !requests.iter().any(|r| {
@@ -115,9 +135,24 @@ impl Runtime {
         let mut coalesced = 0;
         if self.image_wave.is_none() {
             let start = self.vision_cursor % requests.len();
+            // Trigger from the next packet, then fill a complete encoder wave.
+            // A narrow token cutoff on every image would turn a long, single
+            // owner's history into repeated one/two-rank waves. At most one
+            // full wave is prefetched beyond each owner's current packet.
+            let eligible: Vec<_> = requests
+                .iter()
+                .map(|r| {
+                    !r.is_finished()
+                        && r.pending_images
+                            .front()
+                            .is_some_and(|p| p.start < r.offset.saturating_add(lookahead))
+                })
+                .collect();
             let depth = requests
                 .iter()
-                .map(|r| r.pending_images.len())
+                .zip(&eligible)
+                .filter(|(_, ready)| **ready)
+                .map(|(r, _)| r.pending_images.len())
                 .max()
                 .unwrap_or(0);
             let mut images = Vec::new();
@@ -125,7 +160,7 @@ impl Runtime {
             'selection: for depth in 0..depth {
                 for i in (start..requests.len()).chain(0..start) {
                     let request = &mut requests[i];
-                    if request.is_finished() {
+                    if !eligible[i] {
                         continue;
                     }
                     let Some(pending) = request.pending_images.get_mut(depth) else {
@@ -211,7 +246,13 @@ impl Runtime {
                         .insert(identity, Arc::clone(&data), data.capacity());
                     completed.insert(identity, data);
                 }
-                cache_hits += resolve(requests, &mut self.vision_cache, &completed, &mut installed);
+                cache_hits += resolve(
+                    requests,
+                    &mut self.vision_cache,
+                    &completed,
+                    &mut installed,
+                    lookahead,
+                );
             }
         }
         let changed = !installed.is_empty();
@@ -271,6 +312,7 @@ mod tests {
             &mut cache,
             &completed,
             &mut installed,
+            64,
         );
         assert_eq!(installed, BTreeSet::from([0, 1]));
         assert!(second.pending_images.is_empty());
@@ -289,6 +331,7 @@ mod tests {
             &mut cache,
             &completed,
             &mut installed,
+            64,
         );
         assert_eq!(installed, BTreeSet::from([1]));
         assert!(replacement.image_features.is_empty());
@@ -302,5 +345,68 @@ mod tests {
             [10, 30]
         );
         assert_eq!(cache.bytes(), 0);
+    }
+    #[test]
+    fn image_lookahead_and_retirement_follow_each_owners_position() {
+        let mut cache = crate::vision::FeatureCache::new(1 << 20);
+        let data = Arc::new(vec![1u8; 5120 * 2]);
+        cache.insert([1; 32], Arc::clone(&data), data.len());
+        cache.insert([2; 32], Arc::clone(&data), data.len());
+        let mut request = owner(4, &[(10, 1), (40, 2)]);
+        let mut installed = BTreeSet::new();
+        assert_eq!(
+            resolve(
+                &mut [&mut request],
+                &mut cache,
+                &BTreeMap::new(),
+                &mut installed,
+                16
+            ),
+            1
+        );
+        assert_eq!(request.image_features[0].start, 10);
+        assert_eq!(request.pending_images.front().unwrap().start, 40);
+        request.offset = 32;
+        installed.clear();
+        assert_eq!(
+            resolve(
+                &mut [&mut request],
+                &mut cache,
+                &BTreeMap::new(),
+                &mut installed,
+                16
+            ),
+            1
+        );
+        assert_eq!(request.image_features.len(), 1);
+        assert_eq!(request.image_features[0].start, 40);
+        assert!(request.pending_images.is_empty());
+        request.offset = 48;
+        installed.clear();
+        resolve(
+            &mut [&mut request],
+            &mut cache,
+            &BTreeMap::new(),
+            &mut installed,
+            16,
+        );
+        assert!(request.image_features.is_empty());
+        assert!(installed.contains(&0));
+        // A full encoder wave may finish beyond this packet's lookahead.
+        // Its immutable outputs must survive even when LRU retention is off.
+        let mut request = owner(7, &[(10, 1), (40, 2)]);
+        let completed = BTreeMap::from([([1; 32], Arc::clone(&data)), ([2; 32], data)]);
+        let mut disabled = crate::vision::FeatureCache::new(0);
+        installed.clear();
+        resolve(
+            &mut [&mut request],
+            &mut disabled,
+            &completed,
+            &mut installed,
+            16,
+        );
+        assert!(request.pending_images.is_empty());
+        assert_eq!(request.image_features.len(), 2);
+        assert_eq!(request.image_features[1].start, 40);
     }
 }

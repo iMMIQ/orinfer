@@ -1,5 +1,8 @@
 //! Images-only OpenAI content parts. CPU work runs outside the async executor.
+pub(super) mod cache;
 mod deepseek;
+#[cfg(test)]
+mod history;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{ImageReader, imageops::FilterType};
 use orinfer_engine::vision::{ImageInput, ImageLayout, VisionSpec};
@@ -56,6 +59,8 @@ fn planned_shape(
 pub struct ImageProcessing {
     pub max_pixels: Option<usize>,
     pub max_tokens: Option<usize>,
+    /// Fixed per-image budget, independent of the other images in the history.
+    pub max_tokens_per_image: Option<usize>,
     pub max_images: Option<usize>,
     pub auto_resize: bool,
 }
@@ -200,6 +205,27 @@ fn preprocess_with_limit(
     let (height, width) = dimensions(data)?;
     let source_pixels = height * width;
     let (rh, rw) = planned_shape(v, height, width, detail, max_pixels, feature_limit)?;
+    let cache = preparation.images.clone();
+    let identity = cache.as_ref().map(|_| cache::Cache::identity(data));
+    let policy = cache::Cache::policy(v, rh, rw)?;
+    let gate = cache
+        .as_ref()
+        .zip(identity)
+        .map(|(cache, id)| cache.gate(id));
+    let _gate = gate
+        .as_ref()
+        .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()));
+    preparation.checkpoint(0)?;
+    if let Some(image) = cache
+        .as_ref()
+        .zip(identity)
+        .and_then(|(cache, id)| cache.get(&id, policy))
+    {
+        preparation.retain(image.host_bytes())?;
+        preparation
+            .worker_scratch(image.grid_height * image.grid_width * v.encoder_patch_values()? * 2)?;
+        return Ok((*image).clone());
+    }
     // Decode may hold RGBA/16-bit source, RGB conversion and resized patch FP32 together.
     preparation.checkpoint(data.len() + source_pixels * 12 + rh * rw * 16)?;
     let mut reader = ImageReader::new(Cursor::new(data))
@@ -270,6 +296,9 @@ fn preprocess_with_limit(
         rgb,
     };
     v.feature_count(&input)?;
+    if let Some((cache, id)) = cache.as_ref().zip(identity) {
+        cache.insert(id, policy, data, &input);
+    }
     Ok(input)
 }
 #[cfg(test)]
@@ -296,9 +325,22 @@ pub fn messages_with_options(
                 {
                     return Err("Image parts are supported in user messages".into());
                 }
-                let url = part["image_url"]["url"]
-                    .as_str()
-                    .ok_or("image_url requires url")?;
+                let url = part["image_url"]["url"].as_str();
+                if !part["image_url"]["url"].is_null() && url.is_none() {
+                    return Err("image_url.url must be a string or null".into());
+                }
+                let uuid = part
+                    .get("uuid")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .filter(|id| !id.is_empty() && id.len() <= 256)
+                            .ok_or("Image uuid must be a nonempty string of at most 256 bytes")
+                    })
+                    .transpose()?;
+                if url.is_none() && uuid.is_none() {
+                    return Err("image_url requires url or a cached uuid".into());
+                }
                 let detail = part["image_url"]
                     .get("detail")
                     .map(|v| v.as_str().ok_or("Invalid image detail"))
@@ -307,7 +349,7 @@ pub fn messages_with_options(
                 if !["auto", "high", "low"].contains(&detail) {
                     return Err("image_url.detail must be auto, high or low".into());
                 }
-                descriptors.push((url, detail));
+                descriptors.push((url, detail, uuid));
             }
         }
     }
@@ -316,6 +358,7 @@ pub fn messages_with_options(
         std::iter::repeat_with(|| None).take(count).collect();
     if options.max_pixels.is_some_and(|n| n < MIN_PIXELS)
         || options.max_tokens == Some(0)
+        || options.max_tokens_per_image == Some(0)
         || options.max_images == Some(0)
     {
         return Err(
@@ -334,6 +377,9 @@ pub fn messages_with_options(
             .max_tokens
             .unwrap_or(v.max_features)
             .min(v.max_features);
+        // Group-wide resizing changes old image tokens when another turn adds
+        // an image. Native DeepSeek histories use deterministic per-image caps.
+        let auto_resize = options.auto_resize && v.layout != ImageLayout::DeepseekV41;
         let minimum_tokens = if v.layout == ImageLayout::DeepseekV41 {
             4
         } else {
@@ -350,8 +396,17 @@ pub fn messages_with_options(
         let mut total = 0;
         let mut fixed = 0;
         let mut demand = Vec::new();
-        for (i, &(url, detail)) in descriptors.iter().enumerate() {
-            let data = load(url, preparation)?;
+        for (i, &(url, detail, uuid)) in descriptors.iter().enumerate() {
+            let data = if let Some(url) = url {
+                load(url, preparation)?
+            } else {
+                preparation.checkpoint(MAX_BYTES)?;
+                let cache = preparation
+                    .images
+                    .as_ref()
+                    .ok_or("Image uuid cache is unavailable; resend image_url.url")?;
+                (*cache.source(uuid.ok_or("Missing image uuid")?)?).clone()
+            };
             preparation.retain(data.len())?;
             let (h, w) = dimensions(&data)?;
             let max_pixels = if detail == "low" {
@@ -363,7 +418,14 @@ pub fn messages_with_options(
                     .min(v.max_patches * v.patch_size * v.patch_size)
                     .min(16_777_216)
             };
-            let (rh, rw) = planned_shape(v, h, w, detail, Some(max_pixels), None)?;
+            let (rh, rw) = planned_shape(
+                v,
+                h,
+                w,
+                detail,
+                Some(max_pixels),
+                options.max_tokens_per_image,
+            )?;
             if options.max_pixels.is_some_and(|n| rh * rw > n) {
                 return Err(
                     "Image aspect ratio cannot fit image_processing.max_pixels at minimum detail"
@@ -379,12 +441,12 @@ pub fn messages_with_options(
             } else {
                 fixed += features;
             }
-            if options.auto_resize {
+            if auto_resize {
                 pending.push((data, detail, features));
             } else {
                 if total > budget {
                     return Err(format!(
-                        "Images exceed feature capacity: require at least {total} visual tokens, limit {budget}; lower image_processing.max_pixels, enable image_processing.auto_resize for auto images, or use fewer images"
+                        "Images exceed feature capacity: require at least {total} visual tokens, limit {budget}; lower image_processing.max_pixels/max_tokens_per_image, increase the explicit total budget within the model context, or use fewer images"
                     ));
                 }
                 prepared[i] = Some(preprocess_with_limit(
@@ -395,11 +457,14 @@ pub fn messages_with_options(
                     Some(features),
                     preparation,
                 )?);
+                if let Some((cache, uuid)) = preparation.images.as_ref().zip(uuid) {
+                    cache.bind(uuid, &data)?;
+                }
                 preparation.release(data.len());
             }
         }
         let limits = if total > budget {
-            if !options.auto_resize || fixed > budget {
+            if !auto_resize || fixed > budget {
                 return Err(format!(
                     "Images exceed feature capacity: require {total} visual tokens, limit {budget}; lower image_processing.max_pixels, enable image_processing.auto_resize for auto images, or use fewer images"
                 ));
@@ -425,6 +490,9 @@ pub fn messages_with_options(
             )?;
             preparation.release(data.len());
             prepared[i] = Some(image);
+            if let Some((cache, uuid)) = preparation.images.as_ref().zip(descriptors[i].2) {
+                cache.bind(uuid, &data)?;
+            }
         }
     }
     drop(descriptors);

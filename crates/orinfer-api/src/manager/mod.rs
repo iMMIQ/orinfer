@@ -730,6 +730,7 @@ pub fn run(mut config: ManagerConfig) -> Result<()> {
     if config.max_loaded_models == Some(0)
         || config.load_timeout_s == 0
         || config.memory_reserve_mib > 65536
+        || !(1..=2048).contains(&config.worker_options.request_body_mib)
     {
         return Err("Invalid model manager limits".into());
     }
@@ -740,6 +741,7 @@ pub fn run(mut config: ManagerConfig) -> Result<()> {
     private_directory(&directory)?;
     let _owner = locked_file(&directory.join("daemon.lock"))?;
     let records = registry::read(&config.data_dir)?;
+    let body_memory_mib = 512.max(config.worker_options.request_body_mib * 4);
     let manager = Arc::new(Manager {
         config,
         directory,
@@ -749,7 +751,7 @@ pub fn run(mut config: ManagerConfig) -> Result<()> {
         failures: Mutex::new(BTreeMap::new()),
         transition: Semaphore::new(1),
         requests: Arc::new(Semaphore::new(128)),
-        body_memory: Arc::new(Semaphore::new(512)),
+        body_memory: Arc::new(Semaphore::new(body_memory_mib)),
         budgets: Arc::new(SyncMutex::new(BudgetTotals::default())),
         gpu_owner: SyncMutex::new(None),
         stopping: AtomicBool::new(false),

@@ -92,14 +92,15 @@ async fn gateway_request(
             "Global request queue is full",
         );
     };
-    let reserve = if transcription { 128 } else { 96 };
+    let body_mib = manager.config.worker_options.request_body_mib;
+    let reserve = (body_mib * if transcription { 4 } else { 3 }) as u32;
     let Ok(mut memory) = Arc::clone(&manager.body_memory)
         .acquire_many_owned(reserve)
         .await
     else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "Service is stopping");
     };
-    let bytes = match axum::body::to_bytes(body, 32 << 20).await {
+    let bytes = match axum::body::to_bytes(body, body_mib << 20).await {
         Ok(b) => b,
         Err(e) => return error(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
     };

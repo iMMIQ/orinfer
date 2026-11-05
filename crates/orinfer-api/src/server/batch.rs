@@ -168,6 +168,7 @@ async fn submit(
         let codec = Arc::clone(&state.codec);
         let model = Arc::clone(&state.model);
         let vision = state.vision.clone();
+        let image_cache = Arc::clone(&state.preparation.images);
         let context = state.context;
         let cancellation = preparation::Cancellation::default();
         let flag = cancellation.flag();
@@ -175,6 +176,7 @@ async fn submit(
         let prepared = tokio::task::spawn_blocking(move || {
             let (_cpu, mut memory) = (cpu, reserved);
             let mut context_budget = estimate.context(flag);
+            context_budget.images = Some(image_cache);
             let mut prepared = codec.prepare(
                 request,
                 &model,

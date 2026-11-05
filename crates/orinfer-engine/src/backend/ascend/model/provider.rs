@@ -88,6 +88,9 @@ fn matched(cache: &Cache<Snapshot>, input: &[u32], reserve: usize) -> Option<u64
 }
 pub(crate) struct Runtime {
     team: Team,
+    // Native A2 overlays consume only the current packet's image rows. The
+    // encoder's physical capacity does not bound the complete image history.
+    vision_spec: Option<crate::vision::VisionSpec>,
     vision_cursor: usize,
     vision_seconds_per_patch: f64,
     vision_cache: crate::vision::FeatureCache<Vec<u8>>,
@@ -214,6 +217,9 @@ impl Request {
     pub fn is_prefilling(&self) -> bool {
         self.prefilling
     }
+    pub fn has_pending_host_images(&self) -> bool {
+        !self.pending_images.is_empty() || !self.image_features.is_empty()
+    }
     pub fn remaining_prefill_tokens(&self) -> usize {
         if self.prefilling {
             self.input.len() - self.offset
@@ -321,8 +327,14 @@ impl Runtime {
             team.rows
         );
         let host_budget = options.kv_offload_bytes / team.ranks();
+        let vision_spec = team.model.vision.as_ref().map(|program| {
+            let mut spec = program.spec.clone();
+            spec.max_features = team.model.capacity;
+            spec
+        });
         Ok(Self {
             team,
+            vision_spec,
             vision_cursor: 0,
             vision_seconds_per_patch: 60e-6,
             vision_cache: crate::vision::FeatureCache::new(vision_cache_bytes),
@@ -375,7 +387,7 @@ impl Runtime {
         129280
     }
     pub fn vision(&self) -> Option<&crate::vision::VisionSpec> {
-        self.team.model.vision.as_ref().map(|program| &program.spec)
+        self.vision_spec.as_ref()
     }
     pub fn speculation_statistics(&self) -> Option<&crate::mtp::Statistics> {
         (self.draft_limit > 0).then_some(&self.speculation)

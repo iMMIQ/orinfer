@@ -150,7 +150,7 @@ async fn serve(settings: Settings) -> Result<()> {
         .method_not_allowed_fallback(|| async {
             error(StatusCode::METHOD_NOT_ALLOWED, "Unsupported HTTP method")
         })
-        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(limits.request_body_mib * 1024 * 1024))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             request_id,
@@ -292,6 +292,8 @@ async fn health(State(state): State<Service>) -> Response {
         "verify_weights":state.verify_weights,
         "resident_experts":state.resident_experts,
         "default_request_params":state.default_request_params.as_ref(),
+        "image_preprocess_cache":state.preparation.images.statistics(),
+        "image_limits":{"history_tokens":state.vision.as_ref().map(|v|v.max_features),"tokens_per_image":state.vision.as_ref().and_then(|v|v.max_image_tokens),"request_body_mib":state.limits.request_body_mib},
         "chat_capabilities":{"streaming":true,"default_stream":state.default_request_params.get("stream").and_then(Value::as_bool).unwrap_or(false),"max_choices":1,
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
             "tools":{"function":state.codec.tools_supported,"strict":state.codec.tools_supported,"required":state.codec.tools_supported,"incremental_arguments":state.codec.tools_supported},
@@ -368,6 +370,7 @@ async fn completions(
     let model = Arc::clone(&state.model);
     let context = state.context;
     let vision = state.vision.clone();
+    let image_cache = Arc::clone(&state.preparation.images);
     let cancellation = preparation::Cancellation::default();
     let flag = cancellation.flag();
     let prepared = match tokio::task::spawn_blocking(move || {
@@ -375,6 +378,7 @@ async fn completions(
         let _cpu = cpu;
         let _body = body;
         let mut preparation = estimate.context(flag);
+        preparation.images = Some(image_cache);
         preparation.checkpoint(0)?;
         let prepared =
             codec.prepare(request, &model, context, vision.as_ref(), &mut preparation)?;

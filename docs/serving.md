@@ -84,7 +84,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 `thinking_token_budget` 限制本轮初始思考段的 token 数，支持 0；到达上限时解码强制选择 `</think>`，随后继续回答或调用工具。结束标记仅计入 completion。预算自动缩小到总输出上限减 2，为结束标记和至少一个回答 token 留空间；开启 thinking 且指定此参数时，总输出预算至少为 2。该预算在 thinking 开启时生效。限制是请求私有状态，MTP 的草稿和 target 共同遵守。无惩罚、无概率报告的 greedy 请求在 GPU argmax 满足约束时直接复用结果；预算耗尽时可直接选择唯一的结束标记。其他约束选择保留 CPU 回退，随机采样保持相同目标分布。effort 控制思考倾向，`thinking_token_budget` 提供硬上限。
 
-默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限为 32 MiB。
+默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限默认 32 MiB，通过 `--request-body-mib` 调整。
 
 上下文溢出返回 `error.code=context_length_exceeded`，客户端可据此压缩历史并重试；其他无效参数仍为 `invalid_request`。
 
@@ -274,6 +274,8 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 | `--memory-reserve-mib` | `1024` | 系统余量以外的准入保留内存 |
 | `--preprocess-workers` | `2` | 同时执行图片/模板/tokenizer CPU 任务数 |
 | `--preprocess-memory-mib` | `2048` | 预处理和排队图片张量预算 |
+| `--image-cache-mib` | `256` | 额外的图片原始数据和前处理结果 LRU 缓存；0 关闭缓存和 UUID 引用 |
+| `--request-body-mib` | `32` | HTTP 请求体上限；最大为预处理内存预算的八分之一 |
 | `--queue-timeout-ms` | `0` | 排队期限，0 持续等待；仅作用于排队阶段 |
 | `--output-timeout-ms` | `60000` | 输出通道等待进展的期限，从输出阶段开始计时 |
 | `--drain-timeout-ms` | `30000` | SIGINT/SIGTERM 后 HTTP 排空期限 |
@@ -345,13 +347,28 @@ HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU
   "image_processing": {
     "max_pixels": 1048576,
     "max_tokens": 16384,
+    "max_tokens_per_image": 1024,
     "max_images": 20,
     "auto_resize": false
   }
 }
 ```
 
-这些字段均可省略。`max_pixels` 限制每张图缩放后的像素数（至少 65536，尺寸按 patch/merge 对齐）；`max_tokens` 限制所有图片合计的视觉 token；`max_images` 限制图片数量。总容量同时受执行包的 `max_features` 和完整文本上下文限制，主机预处理仍受服务的共享内存预算限制。默认按每张图的实际尺寸处理，超出总容量会返回所需和可用视觉 token 数。`auto_resize: true` 在超限时缩小 `detail: auto` 的图片；小图保留实际需求，将空余份额分配给大图，`high`/`low` 保留各自明确的分辨率语义。
+这些字段均可省略。`max_pixels` 限制每张图缩放后的像素数（至少 65536，尺寸按 patch/merge 对齐）；`max_tokens_per_image` 给每张图固定的视觉 token 预算；`max_tokens` 限制所有图片合计的视觉 token；`max_images` 显式限制图片数量，默认不设置张数上限。总容量同时受模型报告的视觉容量和完整文本上下文限制，主机预处理仍受服务的共享内存预算限制。默认按每张图的实际尺寸处理，超出总容量会返回所需和可用视觉 token 数。
+
+原生 A2 / DSv4.1 的图片历史容量随模型上下文，保留单图最多 1024 个视觉 token 的编码契约；已有执行包中历史性的 8192 总量声明不再限制原生分块覆盖路径。每轮只编码当前 prefill 范围需要的图片，已经命中 KV 前缀的图片跳过编码，消费完的特征从 owner 释放。追加图片保持旧图的处理尺寸和身份；总量超限时即使设置 `auto_resize` 也返回错误，调用方可以显式降低 `max_tokens_per_image` 或 `max_pixels`。Qwen 路径仍支持 `auto_resize: true` 对 `detail: auto` 图片按总预算分配分辨率；长期 agent 历史建议使用固定单图预算。
+
+图片前处理缓存与视觉编码特征缓存、KV prefix cache 分开计费。相同内容和处理几何复用 CPU 解码/缩放结果，并合并同图的并发前处理。HTTP(S) URL 每次读取实际内容以识别原地址的图片变化；data URI 同样按内容识别。需要省去历史图片传输时，先携带完整图片并指定内容项的 `uuid`，随后可以只发送引用：
+
+```json
+{"type":"image_url","uuid":"drawing-revision-1","image_url":{"url":"data:image/png;base64,..."}}
+```
+
+```json
+{"type":"image_url","uuid":"drawing-revision-1","image_url":null}
+```
+
+UUID 在当前模型服务内解析，使用每份图片独立的随机 UUID；缓存内同一个 UUID 绑定不同内容会返回错误。缓存按预算淘汰且不持久化，引用未命中返回 400，错误提示重传完整图片和 UUID；客户端须保留原始媒体以处理淘汰或服务重启。改变处理参数会从缓存的原始图片重新准备。`/health.image_preprocess_cache` 报告缓存字节、命中、引用命中与淘汰数，`image_limits` 报告实际图片历史、单图和请求体上限。重复图片在新消息位置仍占上下文 token，特征缓存与 KV 前缀分别复用。
 
 排队期间仅保留缩放后的 RGB8。GPU worker 逐图生成 checkpoint 要求的 FP16/BF16 patch 输入，完成上传后释放该图的 CPU 数据。单图上传 scratch 与队列数据一起计费；请求的图片顺序、MRoPE、prefix 身份和私有特征空间保持绑定。原有离线 FP32 图片夹具继续支持。
 
