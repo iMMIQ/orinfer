@@ -39,6 +39,7 @@ pub(in crate::runtime) struct Controller {
     costs: Costs,
     budget: Budget,
     calibration_limit: f64,
+    prefill_calibration: Option<(super::super::cost::Key, usize)>,
     trace: bool,
     #[cfg(test)]
     pub(in crate::runtime) fixed_width: Option<usize>,
@@ -58,6 +59,7 @@ impl Default for Controller {
             costs: Costs::default(),
             budget: Budget::default(),
             calibration_limit: 0.4,
+            prefill_calibration: None,
             trace: std::env::var("ORINFER_MTP_TRACE").as_deref() == Ok("1"),
             #[cfg(test)]
             fixed_width: None,
@@ -81,11 +83,8 @@ pub(in crate::runtime) struct Candidate {
 fn select(
     costs: &cost::Profile,
     candidates: &[Candidate],
-    normal: f64,
-    slack: f64,
-    funds: (f64, f64),
+    input: adaptive::Selection,
     prior: impl Fn(&Candidate) -> f64,
-    batch: usize,
 ) -> Option<adaptive::Decision> {
     let choices = candidates
         .iter()
@@ -98,7 +97,7 @@ fn select(
                 id: c.width,
                 width: c.width,
                 expected_tokens: c.expected_tokens,
-                maximum_tokens: (batch * c.width) as f64,
+                maximum_tokens: (input.batch * c.width) as f64,
                 remaining_tokens: c.remaining_tokens,
                 mean_s: hot,
                 upper_s: shape
@@ -114,22 +113,11 @@ fn select(
             }
         })
         .collect::<Vec<_>>();
-    adaptive::select(
-        adaptive::Selection {
-            normal_s: normal,
-            batch,
-            slack_s: slack,
-            available_s: funds.0,
-            calibration_s: funds.1,
-            calls: costs.calls,
-            normal_last: costs.arms.get(&1).map(|s| s.last),
-        },
-        &choices,
-    )
+    adaptive::select(input, &choices)
 }
 
 impl Controller {
-    pub(super) fn tracing(&self) -> bool {
+    pub(in crate::runtime) fn tracing(&self) -> bool {
         self.trace
     }
     pub(in crate::runtime) fn set_calibration_limit(&mut self, seconds: f64) {
@@ -137,13 +125,100 @@ impl Controller {
             self.calibration_limit = seconds;
         }
     }
+    /// Mixed packets perform their prompt work once. Extra accepted tokens
+    /// displace only standalone decoder work, not another copy of the prompt.
+    fn fixed_work(&self, key: Key, normal: f64) -> Option<f64> {
+        if key.prefill == 0 {
+            return Some(0.);
+        }
+        if normal <= 0. {
+            return None;
+        }
+        self.costs
+            .normal(Key { prefill: 0, ..key })
+            .filter(|cost| cost.time.samples() >= adaptive::HOT_SAMPLES)
+            .map(|cost| (normal - cost.time.mean()).max(0.))
+    }
+    /// A waiting prompt gets the next calibration opportunity after existing
+    /// debt is repaid. The lease expires when that workload stops recurring.
+    pub(in crate::runtime) fn calibrate_prefill(
+        &mut self,
+        key: super::super::cost::Key,
+        excess_s: Option<f64>,
+    ) {
+        match excess_s {
+            None if self
+                .prefill_calibration
+                .is_some_and(|(pending, _)| pending == key) =>
+            {
+                self.prefill_calibration = None;
+            }
+            Some(excess)
+                if excess
+                    <= self.calibration_limit
+                        + (self.calibration_limit - self.budget.startup_spent).max(0.)
+                    && self.prefill_calibration.is_none_or(|(pending, until)| {
+                        pending == key || self.costs.clock >= until
+                    }) =>
+            {
+                self.prefill_calibration = Some((
+                    key,
+                    self.costs.clock.saturating_add(adaptive::REFRESH_AFTER),
+                ));
+            }
+            _ => {}
+        }
+    }
+    pub(in crate::runtime) fn exploration_credit(&self, calibrating: bool) -> f64 {
+        if calibrating {
+            self.budget.available(self.calibration_limit)
+        } else {
+            self.budget.balance
+        }
+    }
+    pub(in crate::runtime) fn settle_action(
+        &mut self,
+        seconds: f64,
+        baseline: f64,
+        measured: bool,
+        calibrating: bool,
+    ) {
+        if !seconds.is_finite() || seconds <= 0. || !baseline.is_finite() {
+            return;
+        }
+        let delta = baseline - seconds;
+        self.budget.settle_delta(
+            if measured { delta } else { delta.min(0.) },
+            self.calibration_limit,
+            calibrating,
+        );
+    }
+    pub(in crate::runtime) fn earn_ordinary(&mut self, seconds: f64, preparation_s: f64) {
+        if seconds.is_finite() && seconds > 0. && preparation_s.is_finite() && preparation_s >= 0. {
+            self.budget.settle_delta(
+                (seconds - preparation_s).max(0.) * 0.02,
+                self.calibration_limit,
+                false,
+            );
+        }
+    }
     /// The single settlement path charges preparation, rejection and zero yield.
     /// Returned hot marginal cost trains the runtime's unmeasured-shape prior.
+    #[cfg(test)]
     pub(in crate::runtime) fn observe(
         &mut self,
         key: Key,
         width: usize,
         measurement: Measurement,
+    ) -> Option<f64> {
+        self.observe_with_alternative(key, width, measurement, None)
+    }
+    pub(in crate::runtime) fn observe_with_alternative(
+        &mut self,
+        key: Key,
+        width: usize,
+        measurement: Measurement,
+        alternative: Option<super::super::cost::Alternative>,
     ) -> Option<f64> {
         if !measurement.valid() || key.batch == 0 {
             return None;
@@ -160,14 +235,33 @@ impl Controller {
                 .get(&key)
                 .and_then(|p| p.arms.get(&width))
                 .is_none_or(|s| s.time.samples() < 3);
-        self.budget.settle(
-            width,
-            measurement,
-            normal,
-            key.batch,
-            self.calibration_limit,
-            calibrating,
-        );
+        if let Some(alternative) = alternative {
+            self.settle_action(
+                measurement.seconds,
+                alternative.seconds(measurement.tokens),
+                alternative.measured,
+                alternative.calibrating || calibrating,
+            );
+        } else if key.prefill > 0 && width > 1 {
+            let baseline = self.fixed_work(key, normal).map(|fixed| {
+                fixed + (normal - fixed) * measurement.tokens as f64 / key.batch as f64
+            });
+            self.settle_action(
+                measurement.seconds,
+                baseline.unwrap_or(0.),
+                baseline.is_some(),
+                calibrating,
+            );
+        } else {
+            self.budget.settle(
+                width,
+                measurement,
+                normal,
+                key.batch,
+                self.calibration_limit,
+                calibrating,
+            );
+        }
         self.costs.observe(key, width, measurement);
         if self.trace {
             eprintln!(
@@ -207,15 +301,25 @@ impl Controller {
             return None;
         }
         let normal = base.time.mean();
+        let fixed_s = self.fixed_work(key, normal)?;
         let available = self.budget.available(self.calibration_limit);
         let decision = select(
             profile,
             candidates,
-            normal,
-            slack,
-            (self.budget.balance, available),
+            adaptive::Selection {
+                normal_s: normal,
+                fixed_s,
+                batch: key.batch,
+                slack_s: slack,
+                available_s: self.budget.balance,
+                calibration_s: available,
+                allow_exploration: self
+                    .prefill_calibration
+                    .is_none_or(|(_, until)| self.costs.clock >= until),
+                calls: profile.calls,
+                normal_last: Some(base.last),
+            },
             |c| self.costs.prior(key, c.width, c.prior_seconds),
-            key.batch,
         );
         let decision = decision.map(|choice| (choice.id, choice.exploring));
         if self.trace {

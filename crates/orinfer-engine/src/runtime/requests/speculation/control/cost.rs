@@ -12,7 +12,7 @@ pub(super) struct Profile {
 #[derive(Default)]
 pub(super) struct Costs {
     pub profiles: BTreeMap<Key, Profile>,
-    clock: usize,
+    pub(super) clock: usize,
 }
 impl Costs {
     pub fn normal(&self, key: Key) -> Option<&Cost> {

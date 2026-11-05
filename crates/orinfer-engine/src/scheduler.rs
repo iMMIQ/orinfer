@@ -288,6 +288,39 @@ impl Estimate {
     }
 }
 
+/// First-use observations prime an execution shape; later samples train its hot cost.
+#[derive(Default)]
+pub(crate) struct Timing {
+    time: Estimate,
+    trials: usize,
+}
+impl Timing {
+    pub fn observations(&self) -> usize {
+        self.trials
+    }
+    pub fn samples(&self) -> usize {
+        if self.trials <= 1 {
+            0
+        } else {
+            self.time.samples
+        }
+    }
+    pub fn mean(&self) -> f64 {
+        self.time.mean
+    }
+    pub fn upper(&self) -> f64 {
+        self.time.upper()
+    }
+    pub fn observe(&mut self, seconds: f64) {
+        if self.trials == 1 {
+            // The first use may capture a graph or load a lazy CUDA module.
+            self.time = Default::default();
+        }
+        self.time.observe(seconds);
+        self.trials += 1;
+    }
+}
+
 /// Prefill requests spend real wall time, not iteration counts. Deficits may
 /// become negative after a large indivisible chunk; refill enough rounds for
 /// some request to become eligible without spinning or leaving the GPU idle.

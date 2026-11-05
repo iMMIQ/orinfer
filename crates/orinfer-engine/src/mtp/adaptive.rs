@@ -1,6 +1,6 @@
 //! Shared speculation decisions and actual-loss accounting. Backends own legal plans and execution resources.
 mod budget;
-use crate::{execution::MAX_MTP_DRAFTS, scheduler};
+use crate::execution::MAX_MTP_DRAFTS;
 pub(crate) use budget::Budget;
 pub(crate) const REFRESH_AFTER: usize = 512;
 pub(crate) const HOT_SAMPLES: usize = 3;
@@ -105,37 +105,7 @@ impl Measurement {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct Timing {
-    time: scheduler::Estimate,
-    trials: usize,
-}
-impl Timing {
-    pub fn observations(&self) -> usize {
-        self.trials
-    }
-    pub fn samples(&self) -> usize {
-        if self.trials <= 1 {
-            0
-        } else {
-            self.time.samples
-        }
-    }
-    pub fn mean(&self) -> f64 {
-        self.time.mean
-    }
-    pub fn upper(&self) -> f64 {
-        self.time.upper()
-    }
-    pub fn observe(&mut self, seconds: f64) {
-        if self.trials == 1 {
-            // The first use may capture a graph or load a lazy CUDA module.
-            self.time = Default::default();
-        }
-        self.time.observe(seconds);
-        self.trials += 1;
-    }
-}
+pub(crate) use crate::scheduler::Timing;
 
 #[derive(Default)]
 pub(crate) struct Cost {
@@ -199,10 +169,13 @@ pub(crate) struct Candidate {
 }
 pub(crate) struct Selection {
     pub normal_s: f64,
+    /// Packet work shared by all widths, paid once rather than per output.
+    pub fixed_s: f64,
     pub batch: usize,
     pub slack_s: f64,
     pub available_s: f64,
     pub calibration_s: f64,
+    pub allow_exploration: bool,
     pub calls: usize,
     pub normal_last: Option<usize>,
 }
@@ -214,16 +187,20 @@ pub(crate) struct Decision {
 pub(crate) fn select(input: Selection, candidates: &[Candidate]) -> Option<Decision> {
     let Selection {
         normal_s: normal,
+        fixed_s,
         batch,
         slack_s: slack,
         available_s: earned,
         calibration_s: calibration,
+        allow_exploration,
         calls,
         normal_last,
     } = input;
     if batch == 0
         || !normal.is_finite()
         || normal <= 0.
+        || !fixed_s.is_finite()
+        || normal <= fixed_s
         || slack.is_nan()
         || slack <= 0.
         || earned.is_nan()
@@ -233,7 +210,7 @@ pub(crate) fn select(input: Selection, candidates: &[Candidate]) -> Option<Decis
     {
         return None;
     }
-    let baseline = normal / batch as f64;
+    let baseline = (normal - fixed_s) / batch as f64;
     let mut best = (usize::MAX, baseline * 0.98);
     let mut probe: Option<(Decision, (usize, usize))> = None;
     for c in candidates {
@@ -267,26 +244,35 @@ pub(crate) fn select(input: Selection, candidates: &[Candidate]) -> Option<Decis
         {
             continue;
         }
-        let score = mean / c.expected_tokens;
-        let review = c.review_acceptance && hot / c.maximum_tokens < baseline * 0.98;
+        let score = (mean - fixed_s) / c.expected_tokens;
+        let review = c.review_acceptance && (hot - fixed_s) / c.maximum_tokens < baseline * 0.98;
         let reserved_tokens = if review {
             batch as f64
         } else {
             c.expected_tokens
         };
-        let loss = (upper - baseline * reserved_tokens).max(0.);
-        if c.samples >= HOT_SAMPLES && score < best.1 && (c.warm_ready || loss <= available) {
+        let loss = (upper - fixed_s - baseline * reserved_tokens).max(0.);
+        if c.samples >= HOT_SAMPLES
+            && score < best.1
+            && (!c.review_acceptance || allow_exploration)
+            && (c.warm_ready || loss <= available)
+        {
             best = (c.id, score);
         }
         let stale = c
             .last
             .is_some_and(|last| calls.saturating_sub(last) >= REFRESH_AFTER);
         let recoverable = if review {
-            (baseline - hot / c.maximum_tokens) * c.remaining_tokens as f64 - c.transition_s
+            (baseline - (hot - fixed_s) / c.maximum_tokens) * c.remaining_tokens as f64
+                - c.transition_s
         } else {
             baseline * c.remaining_tokens as f64 * (1. - batch as f64 / c.expected_tokens)
         };
-        if (missing > 0 || stale || review) && loss <= available && loss <= recoverable {
+        if allow_exploration
+            && (missing > 0 || stale || review)
+            && loss <= available
+            && loss <= recoverable
+        {
             let rank = (
                 usize::from(missing == 0 && !review),
                 if missing > 0 || review {
@@ -338,10 +324,12 @@ mod tests {
     fn parallel_capacity_does_not_inflate_an_adopted_prefix_review() {
         let input = || Selection {
             normal_s: 0.02,
+            fixed_s: 0.,
             batch: 1,
             slack_s: 0.4,
             available_s: 0.1,
             calibration_s: 0.1,
+            allow_exploration: true,
             calls: 1,
             normal_last: Some(1),
         };

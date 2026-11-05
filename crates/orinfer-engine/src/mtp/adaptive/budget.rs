@@ -34,6 +34,9 @@ impl Budget {
         } else {
             normal * sample.tokens as f64 / batch.max(1) as f64 - sample.seconds
         };
+        self.settle_delta(delta, limit, calibrating);
+    }
+    pub fn settle_delta(&mut self, delta: f64, limit: f64, calibrating: bool) {
         if !delta.is_finite() {
             return;
         }

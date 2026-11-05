@@ -666,10 +666,12 @@ impl Policy {
         let decision = adaptive::select(
             adaptive::Selection {
                 normal_s,
+                fixed_s: 0.,
                 batch,
                 slack_s: budget.slack_s,
                 available_s: self.ledger.balance,
                 calibration_s: available,
+                allow_exploration: true,
                 calls: curve.calls,
                 normal_last: curve.last_normal,
             },

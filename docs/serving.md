@@ -283,7 +283,7 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 | `--drain-timeout-ms` | `30000` | SIGINT/SIGTERM 后 HTTP 排空期限 |
 | `--gpu-lock` | `artifacts/gpu-experiment.lock` | GPU worker 使用的共享锁 |
 
-默认 `latency` 策略按完整迭代成本选择联合或独立 prefill。多个冷请求到达时保留长请求的原生大块；联合路径经过测量后才参与成本选择。混合 batch 与独立 prefill 共用 decode 时间预算，执行 prompt 工作后会留出受 `--prefill-budget-ms` 和 `--target-tpot-ms` 限制的连续 decode 时间，期间允许 MTP；等待过久的 prefill 保留推进机会。`throughput` 策略放开时间配额和冷 prefill 数限制，允许探测未知联合形状，仍保留内存准入与请求隔离，适合[离线任务](batch.md)。`/health` 的 `independent_prefill_choices`、`joint_prefill_choices` 和 `decode_burst_iterations` 可核对实际选择。请求日志分别记录排队、从进入模型队列起的首 token 时延、生成总时长和 thinking token 数；首 token 指引擎提交，可能早于客户端可见的完整文本。
+默认 `latency` 策略按完整迭代成本选择联合或独立 prefill。计时包含输入准备、target、输出头、每次请求必需的 MTP warm、状态提交及采样；分层 prefill 累加实际执行片段，暂停等待另计。首次执行用于预热，后续热态样本的均值用于收益比较，上界用于延迟预算。未校准和过期联合形状可在模型级共享探索预算内重新测量；该预算与 MTP 共用，混合包的 prefill 固定成本只计算一次，新增输出按普通 decode 热态成本比较；按完整动作的实际收益或亏损结算，换请求或形状不会重置补贴。联合形状试跑时使用普通 decode，完成热态校准后再选择 MTP 深度，避免同轮重复占用探索预算。等待校准的 prefill 暂停新的 MTP 探索，让正常执行偿还共享债务后优先获得试跑机会；该优先机会在工作负载停止出现后自动过期。多个冷请求到达时保留长请求的原生大块。混合 batch 与独立 prefill 共用 decode 时间预算，执行 prompt 工作后会留出受 `--prefill-budget-ms` 和 `--target-tpot-ms` 限制的连续 decode 时间，期间允许 MTP；等待过久的 prefill 保留推进机会。`throughput` 策略放开时间配额和冷 prefill 数限制，沿用相同成本学习和探索预算，仍保留内存准入与请求隔离，适合[离线任务](batch.md)。`/health` 的 `independent_prefill_choices`、`joint_prefill_choices` 和 `decode_burst_iterations` 可核对实际选择。请求日志分别记录排队、从进入模型队列起的首 token 时延、生成总时长和 thinking token 数；首 token 指引擎提交，可能早于客户端可见的完整文本。
 
 `/health` 显示 starting/ready/draining/failed，并提供调度、准入、缓存恢复和 Graph 统计。GPU worker 故障时返回 503；CUDA 或内部状态故障后需要重启服务。统计和真实 API 性能测量见[性能工具](../tools/bench/README.md)。
 
