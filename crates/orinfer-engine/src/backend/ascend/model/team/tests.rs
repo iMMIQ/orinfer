@@ -79,12 +79,20 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
             });
             (states, repeated, budget)
         })
+    })
+    .flat_map(|(states, repeated, budget)| {
+        [false, true].map(|graphs_enabled| (states, repeated, budget, graphs_enabled))
     }) {
-        let (statuses, repeated, budget) = statuses;
+        let (statuses, repeated, budget, graphs_enabled) = statuses;
         std::thread::scope(|scope| {
             let mut peers = Transport::new(Duration::from_secs(5));
             let mut maintained = vec![];
-            let plan = preparation::plan(&statuses, repeated, budget).unwrap();
+            let plan = if graphs_enabled {
+                preparation::plan(&statuses, repeated, budget)
+            } else {
+                preparation::direct_plan(&statuses)
+            }
+            .unwrap();
             let (recapture, capture) = (plan.invalidate, plan.capture());
             for hit in statuses {
                 let (send, commands) = mpsc::channel();
@@ -147,7 +155,8 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
                         for maintenance in maintained {
                             maintenance.send(()).unwrap();
                         }
-                    }
+                    },
+                    graphs_enabled,
                 )
                 .unwrap()
                 .0

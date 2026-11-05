@@ -97,6 +97,7 @@ pub(super) struct Output {
 }
 pub(super) struct Team {
     peers: Transport,
+    graphs_enabled: bool,
     handles: Vec<JoinHandle<()>>,
     pub model: Arc<Model>,
     pub load_s: f64,
@@ -118,12 +119,13 @@ pub(super) struct Timing {
 }
 impl Team {
     pub fn load(plan: &Path, model_dir: &Path) -> Result<Self> {
-        Self::load_with_drafts(plan, model_dir, None)
+        Self::load_with_drafts(plan, model_dir, None, true)
     }
     pub fn load_with_drafts(
         plan: &Path,
         model_dir: &Path,
         requested: Option<usize>,
+        graphs_enabled: bool,
     ) -> Result<Self> {
         let model_dir = model_dir
             .canonicalize()
@@ -187,6 +189,7 @@ impl Team {
         let model = Arc::new(model);
         let mut team = Self {
             peers: Transport::new(timeout),
+            graphs_enabled,
             handles: vec![],
             model: Arc::clone(&model),
             load_s: 0.,
@@ -215,22 +218,17 @@ impl Team {
                         if let Some(cpus) = cpus.as_deref() {
                             affinity::apply(cpus)?;
                         }
+                        let session = Session::new(
+                            index,
+                            Limits {
+                                device_bytes: 58 << 30,
+                                pinned_bytes: 64 << 20,
+                                timeout_ms: timeout.as_millis() as i32,
+                            },
+                        )?;
+                        session.set_graphs_enabled(graphs_enabled);
                         Worker::load(
-                            Session::new(
-                                index,
-                                Limits {
-                                    device_bytes: 58 << 30,
-                                    pinned_bytes: 64 << 20,
-                                    timeout_ms: timeout.as_millis() as i32,
-                                },
-                            )?,
-                            &root,
-                            rank,
-                            &model,
-                            &model_dir,
-                            &package,
-                            layout,
-                            false,
+                            session, &root, rank, &model, &model_dir, &package, layout, false,
                             &shared,
                         )
                     })();
@@ -536,7 +534,7 @@ impl Team {
         tokens: Vec<Vec<u32>>,
         full: bool,
     ) -> Result<(Vec<Output>, f64, f64)> {
-        forward(&self.peers, layout, tokens, full)
+        forward(&self.peers, layout, tokens, full, self.graphs_enabled)
     }
     pub fn forward_with(
         &self,
@@ -546,7 +544,15 @@ impl Team {
         budget: Option<CaptureBudget>,
         maintenance: impl FnOnce(),
     ) -> Result<(Vec<Output>, Timing)> {
-        forward_with(&self.peers, layout, tokens, full, budget, maintenance)
+        forward_with(
+            &self.peers,
+            layout,
+            tokens,
+            full,
+            budget,
+            maintenance,
+            self.graphs_enabled,
+        )
     }
 
     pub fn offload_allocations(&self, id: u64) -> Result<BTreeMap<u64, usize>> {
@@ -754,8 +760,9 @@ fn forward(
     layout: Layout,
     tokens: Vec<Vec<u32>>,
     full: bool,
+    graphs_enabled: bool,
 ) -> Result<(Vec<Output>, f64, f64)> {
-    let (outputs, timing) = forward_with(peers, layout, tokens, full, None, || {})?;
+    let (outputs, timing) = forward_with(peers, layout, tokens, full, None, || {}, graphs_enabled)?;
     Ok((outputs, timing.seconds, timing.preparation))
 }
 #[cfg(test)]
@@ -771,6 +778,7 @@ fn forward_with(
     full: bool,
     mut budget: Option<CaptureBudget>,
     maintenance: impl FnOnce(),
+    graphs_enabled: bool,
 ) -> Result<(Vec<Output>, Timing)> {
     let started = Instant::now();
     let cached = exchange(peers, Command::GrowCached(layout.clone()))?;
@@ -791,7 +799,11 @@ fn forward_with(
     if let Some(budget) = &mut budget {
         budget.slack_s -= started.elapsed().as_secs_f64();
     }
-    let plan = preparation::plan(&states, repeated, budget)?;
+    let plan = if graphs_enabled {
+        preparation::plan(&states, repeated, budget)?
+    } else {
+        preparation::direct_plan(&states)?
+    };
     let invalidate = plan.invalidate;
     let capture = plan.capture();
     if budget.is_some_and(|b| b.trace) {

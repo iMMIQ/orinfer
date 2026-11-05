@@ -536,6 +536,21 @@ fn completion_cache_waits_for_the_last_ticket_and_reuses_fenced_generations() {
 }
 
 #[test]
+fn explicit_eager_session_rejects_graph_capture_before_allocating_native_models() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    assert!(session.graphs_enabled());
+    session.set_graphs_enabled(false);
+    // SAFETY: Empty capture has no operands; the session must reject capture
+    // before calling the native Graph API, including indirect vision callers.
+    let result = unsafe { super::graph::Graph::capture(&session, Box::new(()), |_| Ok(())) };
+    assert!(matches!(result, Err(error) if error.contains("disabled")));
+    assert_eq!(fixture.counter(7), 0);
+    drop(session);
+    fixture.assert_clean();
+}
+
+#[test]
 fn completion_cache_is_bounded_and_context_entry_preserves_the_previous_owner() {
     let mut fixture = Fixture::new();
     let session = fixture.session();

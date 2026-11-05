@@ -125,9 +125,44 @@ pub(super) fn plan(
     })
 }
 
+pub(super) fn direct_plan(states: &[CacheState]) -> Result<Plan> {
+    if states.is_empty() {
+        return Err("Missing A2 TP cache states".into());
+    }
+    let invalidate = states
+        .iter()
+        .any(|state| !matches!(state, CacheState::Direct { .. }));
+    Ok(Plan {
+        invalidate,
+        mode: if invalidate {
+            Mode::BuildDirect
+        } else {
+            Mode::Direct
+        },
+        reason: "graph_disabled",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn eager_mode_never_promotes_hot_packets_and_retires_any_captured_rank() {
+        let hot = CacheState::Direct {
+            uses: 255,
+            consecutive: 255,
+        };
+        let plan = direct_plan(&[hot, hot]).unwrap();
+        assert!(!plan.capture());
+        assert!(!plan.invalidate);
+        assert_eq!(plan.reason, "graph_disabled");
+        for states in [[hot, CacheState::Graph], [hot, CacheState::Missing]] {
+            let plan = direct_plan(&states).unwrap();
+            assert!(plan.invalidate);
+            assert!(!plan.capture());
+        }
+        assert!(direct_plan(&[]).is_err());
+    }
     fn budget(uses: f64) -> CaptureBudget {
         CaptureBudget {
             uses,

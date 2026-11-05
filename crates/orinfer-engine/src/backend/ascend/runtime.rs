@@ -66,6 +66,7 @@ pub(super) struct Context {
     device_bytes: Cell<usize>,
     pinned_bytes: Cell<usize>,
     poisoned: Cell<bool>,
+    graphs_enabled: Cell<bool>,
     // Only retired completion generations enter this context-local cache.
     // Raw handles avoid an Rc cycle back into their owning context.
     completion_events: RefCell<Vec<Handle>>,
@@ -296,7 +297,12 @@ impl Completion {
             if result.is_err() {
                 self.context.retire();
             }
-            result?;
+            result.map_err(|error| {
+                format!(
+                    "{error} (device={}, timeout_ms={})",
+                    self.context.device, self.context.limits.timeout_ms
+                )
+            })?;
             self.complete.set(true);
         }
         // Release retained resources only after the event really completed;
@@ -348,6 +354,12 @@ impl Ticket {
 }
 
 impl Session {
+    pub(in crate::backend::ascend) fn set_graphs_enabled(&self, enabled: bool) {
+        self.context.graphs_enabled.set(enabled);
+    }
+    pub(in crate::backend::ascend) fn graphs_enabled(&self) -> bool {
+        self.context.graphs_enabled.get()
+    }
     pub fn new(device: u32, limits: Limits) -> Result<Self> {
         Self::with_driver(acquire()?, device, limits)
     }
@@ -382,6 +394,7 @@ impl Session {
             device_bytes: Cell::new(0),
             pinned_bytes: Cell::new(0),
             poisoned: Cell::new(false),
+            graphs_enabled: Cell::new(true),
             completion_events: RefCell::new(vec![]),
         };
         let previous = api.current()?;
