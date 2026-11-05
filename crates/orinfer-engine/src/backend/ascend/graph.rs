@@ -67,6 +67,9 @@ impl Graph {
         keepalive: Box<dyn Any>,
         enqueue: impl FnOnce(Handle) -> Result<()>,
     ) -> Result<Self> {
+        if !session.graphs_enabled() {
+            return Err("ACL Graph capture is disabled for this session".into());
+        }
         session.same_context(&session.context)?;
         session.synchronize()?;
         let _current = session.context.enter()?;

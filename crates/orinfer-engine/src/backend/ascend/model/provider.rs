@@ -302,6 +302,7 @@ impl Runtime {
             &resolve_file(&package_root, &package.plan.file)?,
             root,
             options.mtp_drafts,
+            options.cuda_graph != crate::execution::CudaGraphMode::Off,
         )?;
         let draft_limit = options
             .mtp_drafts

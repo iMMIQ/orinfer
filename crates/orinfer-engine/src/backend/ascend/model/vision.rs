@@ -490,7 +490,7 @@ impl Encoder {
         }
         let download_s = download_start.elapsed().as_secs_f64();
         // Capture only after the first real execution; capture itself is not an inference.
-        if frame.graphs.is_none() {
+        if session.graphs_enabled() && frame.graphs.is_none() {
             let mut graphs = Vec::with_capacity(self.segment_ends.len());
             let mut begin = 0;
             for &end in &self.segment_ends {

@@ -623,6 +623,16 @@ impl Worker {
             .flatten()
             .collect();
         for (index, instruction) in instructions.iter().enumerate() {
+            // The explicit eager mode serializes the same operations on the
+            // owning stream and allocates no fork/join event dependencies.
+            if !self.session.graphs_enabled()
+                && matches!(
+                    instruction,
+                    Instruction::Fork | Instruction::Switch | Instruction::Join
+                )
+            {
+                continue;
+            }
             if (!clipped || empty_decoder) && boundary.as_ref().is_some_and(|b| b.skip(index)) {
                 continue;
             }
