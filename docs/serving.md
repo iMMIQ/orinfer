@@ -293,6 +293,8 @@ A2 普通 decode、草稿和验证形状在所有 rank 累计成功执行两次�
 
 A2 的 `--graph off` 关闭主干、DSpark 和视觉的 Graph 捕获及 replay，并将模型中的独立分支按原计划顺序提交到同一计算 stream。权重、长上下文、prefix cache、工具协议和图片输入沿用相同实现；直接执行会增加主机提交成本。该模式用于规避和定位 Graph replay 或跨 stream 事件依赖故障。ACL 507047 表示完成事件在指定期限内尚未完成，需结合首次故障定位；发生设备故障后的团队仍会退出服务，重启进程后应用新的配置。
 
+A2 在加载 CANN 前自动安装按设备隔离的 HCOMM Graph 回调注册表，支持 CANN HCOMM 9.2.0。单进程多卡可以各自淘汰、重建 Graph，设备内重复的 modelId 分别注册和清理；原生 modelId、AICPU 元数据及通信参数保持原有语义。兼容组件随引擎编译，在线从密封匿名内存加载，无需编译器、额外部署文件或修改系统 CANN。组件在进程内保留至退出；HCOMM 已提前加载或组件 ABI 不匹配时，启动返回明确错误。`validate-hccl` 包含改变输入的 replay，以及各 rank 分别保留 1–4 个 Graph 的 12 轮捕获、执行和回收检查。
+
 A2 的自动草稿验证预算保持在 target 首次启用跨 rank 行交换之前；执行包没有行交换时使用 target 容量。草稿深度与聚合验证行数共同决定执行计划，算子调优的行数分段共用该通信预算。`--max-speculative-tokens N` 进一步限制行预算；自动验证保持在模型声明的通信域内，包括同包 prefill 行，独立 prefill 保持原有容量。状态 journal 汇总本包各 owner 的保存或恢复拷贝，通过同一 stream 提交并统一等待完成。
 
 A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和 PV 计算体，支持每 rank 8/16/32/64 个 head，保留 FP32 softmax 与 BF16 probability 边界。`tools.model.deepseek_v41.fuse_attention --selected-int8 --min-rows N` 按实测聚合行数拆分已有 target 执行域，小行数保留原算子；草稿与普通 decode 沿用各自的计划选择。主干全行与 decoder 保留窗口分别绑定 work 表，在线只消费离线生成的计划。

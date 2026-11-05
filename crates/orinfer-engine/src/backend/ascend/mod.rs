@@ -76,6 +76,7 @@ fn check(status: i32, operation: &str) -> Result<()> {
 }
 
 fn open_library(path: &Path) -> Result<Driver> {
+    hccl::graph_registry::install()?;
     // SAFETY: CANN is an explicitly selected native dependency. The Library
     // owner stays live for every function pointer and ACL lifetime below.
     let library = unsafe { Library::new(path) }.map_err(|e| format!("{}: {e}", path.display()))?;

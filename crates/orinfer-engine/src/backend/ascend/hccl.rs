@@ -7,6 +7,7 @@ use super::{
 use crate::artifact::Result;
 use libloading::Library;
 use std::{ffi::c_void, path::Path, ptr, rc::Rc, sync::Arc};
+pub(super) mod graph_registry;
 pub mod validation;
 
 pub const ROOT_BYTES: usize = 4108;
@@ -55,6 +56,7 @@ impl Api {
         // by root descriptors, communicators, and every in-flight collective.
         unsafe {
             let library = Library::new(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            graph_registry::configure(&library)?;
             Ok(Arc::new(Self {
                 root: *library
                     .get(b"HcclGetRootInfo\0")
@@ -82,7 +84,7 @@ impl Api {
 }
 fn check(status: i32, operation: &str) -> Result<()> {
     if status == 0 {
-        Ok(())
+        graph_registry::check()
     } else {
         crate::error::record_ascend(status);
         Err(format!("{operation}: HCCL error {status}"))

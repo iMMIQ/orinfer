@@ -22,3 +22,12 @@ implementations use its public programming model and examples as references;
 generated AOT libraries include its templates. The license is retained in
 `tools/operators/ascend/LICENSE.tilelang`. The compiler image pins the wheel
 and its SHA256; CANN and Catlass retain their upstream notices in that image.
+
+The CANN 9.2 HCOMM Graph registry ABI declaration in
+`tools/operators/ascend/hccl_graph_registry_abi.h` is adapted from
+[CANN HCOMM v9.2.0](https://gitcode.com/cann/hcomm/tree/v9.2.0),
+Copyright (c) 2025 Huawei Technologies Co., Ltd., under the CANN Open Software
+License Agreement Version 2.0. Its full license is retained in
+`tools/operators/ascend/LICENSE.cann`. The optional Ascend adapter uses this
+declaration solely with the installed Huawei CANN runtime. Native HCOMM
+methods and resources remain provided by that runtime.
