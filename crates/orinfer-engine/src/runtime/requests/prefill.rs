@@ -10,6 +10,8 @@ pub(super) struct Frame {
     next: usize,
     workspace: Option<Rc<RefCell<Workspace>>>,
     regular_s: f64,
+    key: cost::Key,
+    active: cost::Measurement,
 }
 
 impl ModelRuntime {
@@ -49,6 +51,7 @@ impl ModelRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn advance_prefill_step(
         &mut self,
         req: &mut RequestState,
@@ -56,13 +59,27 @@ impl ModelRuntime {
         bounded: bool,
         budget_s: f64,
     ) -> Result<(usize, Vec<u32>)> {
+        let timer = cost::Timer::start(self.execution.batch_statistics());
+        self.advance_prefill_step_timed(req, chunk, bounded, budget_s, timer)
+    }
+    pub(super) fn advance_prefill_step_timed(
+        &mut self,
+        req: &mut RequestState,
+        chunk: usize,
+        bounded: bool,
+        budget_s: f64,
+        timer: cost::Timer,
+    ) -> Result<(usize, Vec<u32>)> {
+        let key = Self::iteration_key(&[&mut *req], &[(0, chunk)]);
         let plan = req
             .prefill_frame
             .as_ref()
             .map(|f| f.plan.clone())
             .or_else(|| self.manifest.prefill_plan(chunk).cloned());
         let Some(plan) = plan.filter(|p| !p.stages.is_empty()) else {
-            return self.advance_prefill(req, chunk, bounded);
+            let result = self.advance_prefill(req, chunk, bounded)?;
+            self.observe_iteration(key, timer.finish(self.execution.batch_statistics()));
+            return Ok(result);
         };
         if !plan.accepts(chunk)
             || req
@@ -93,6 +110,8 @@ impl ModelRuntime {
                 next: 0,
                 workspace: None,
                 regular_s: at.elapsed().as_secs_f64(),
+                key,
+                active: cost::Measurement::default(),
             }
         };
         if let Some(workspace) = &frame.workspace {
@@ -194,6 +213,9 @@ impl ModelRuntime {
                         .scheduler_statistics
                         .peak_prefill_frame_bytes
                         .max(workspace.borrow().bytes());
+                    frame
+                        .active
+                        .add(timer.finish(self.execution.batch_statistics()));
                     req.prefill_frame = Some(frame);
                     self.observe_prefill_window(at, bounded);
                     return Ok((0, vec![]));
@@ -220,6 +242,9 @@ impl ModelRuntime {
                 {
                     continue;
                 }
+                frame
+                    .active
+                    .add(timer.finish(self.execution.batch_statistics()));
                 req.prefill_frame = Some(frame);
                 self.observe_prefill_window(at, bounded);
                 return Ok((0, vec![]));
@@ -227,6 +252,10 @@ impl ModelRuntime {
             self.prefill_costs
                 .observe_at(chunk, end, frame.regular_s.max(0.000001));
             let tokens = self.after_prefill(req, chunk)?;
+            frame
+                .active
+                .add(timer.finish(self.execution.batch_statistics()));
+            self.observe_iteration(frame.key, frame.active);
             self.observe_prefill_window(at, bounded);
             self.scheduler_statistics.prefill_tokens += chunk;
             *self

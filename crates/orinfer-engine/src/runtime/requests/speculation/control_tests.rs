@@ -809,3 +809,164 @@ fn latency_utility_averages_request_tpot_without_a_worst_owner_veto() {
     );
     assert_eq!(c.choose(k, &[candidate(4, latency, 0.09)], 0.4), None);
 }
+
+#[test]
+fn prefill_calibration_shares_model_budget_and_retains_actual_debt() {
+    let mut c = Controller::default();
+    c.set_calibration_limit(0.4);
+    c.settle_action(0.7, 0.2, true, true);
+    assert!((c.budget.startup_spent - 0.4).abs() < 1e-12);
+    assert!((c.exploration_credit(true) + 0.1).abs() < 1e-12);
+    // A new shape cannot reset the one model-lifetime pool.
+    c.settle_action(0.3, 0.2, true, true);
+    assert!((c.exploration_credit(true) + 0.2).abs() < 1e-12);
+    c.earn_ordinary(5., 0.);
+    assert!((c.exploration_credit(true) + 0.1).abs() < 1e-12);
+}
+
+#[test]
+fn unmeasured_prefill_baseline_never_funds_other_probes() {
+    let mut c = Controller::default();
+    c.settle_action(0.1, 1., false, true);
+    assert_eq!(c.budget.balance, 0.);
+    assert_eq!(c.budget.startup_spent, 0.);
+}
+
+#[test]
+fn mixed_prefill_and_speculation_settle_the_complete_action_once() {
+    let mut c = Controller::default();
+    let alternative = super::super::super::cost::Alternative {
+        prefill_s: 1.,
+        decode_s: 0.04,
+        decoders: 4,
+        measured: true,
+        calibrating: false,
+        probing: false,
+    };
+    c.observe_with_alternative(
+        key(4),
+        2,
+        Measurement {
+            seconds: 1.1,
+            tokens: 12,
+            preparation_s: 0.,
+            warm_ready: true,
+        },
+        Some(alternative),
+    );
+    // Prompt work is paid once, decode work uses actual accepted tokens.
+    assert!((c.budget.balance - 0.02).abs() < 1e-12);
+    assert_eq!(c.budget.startup_spent, 0.);
+    c.observe_with_alternative(
+        key(4),
+        2,
+        Measurement {
+            seconds: 0.3,
+            tokens: 0,
+            preparation_s: 0.,
+            warm_ready: true,
+        },
+        Some(super::super::super::cost::Alternative {
+            prefill_s: 0.1,
+            ..alternative
+        }),
+    );
+    assert!((c.budget.balance - c.budget.startup_spent + 0.18).abs() < 1e-12);
+}
+
+#[test]
+fn ordinary_preparation_does_not_earn_hot_execution_credit() {
+    let mut c = Controller::default();
+    c.earn_ordinary(2., 2.);
+    assert_eq!(c.budget.balance, 0.);
+    c.earn_ordinary(2., 1.);
+    assert!((c.budget.balance - 0.02).abs() < 1e-12);
+}
+
+#[test]
+fn waiting_prefill_defers_new_mtp_probes_but_keeps_profitable_execution() {
+    let mut c = Controller::default();
+    let k = key(4);
+    normal(&mut c, k);
+    c.calibrate_prefill((3, 663, 262144, 771), Some(0.));
+    let shallow = candidate(2, 8., 0.04);
+    assert_eq!(c.choose(k, &[shallow], 0.4), None);
+    for _ in 0..4 {
+        hot(&mut c, k, 2, 0.04, 8);
+    }
+    let deep = candidate(3, 12., 0.05);
+    // A mature price for another geometry cannot release the waiting action.
+    c.calibrate_prefill((2, 442, 131072, 514), None);
+    assert_eq!(c.choose(k, &[shallow, deep], 0.4), Some((2, false)));
+    let review = Candidate {
+        review_acceptance: true,
+        ..shallow
+    };
+    assert_eq!(c.choose(k, &[review], 0.4), None);
+    c.calibrate_prefill((3, 663, 262144, 771), None);
+    assert_eq!(c.choose(k, &[shallow, deep], 0.4), Some((3, true)));
+}
+
+#[test]
+fn prefill_calibration_priority_expires_without_resetting_the_ledger() {
+    let mut c = Controller::default();
+    let k = key(4);
+    normal(&mut c, k);
+    c.calibrate_prefill((3, 663, 262144, 771), Some(0.));
+    let before = c.budget.startup_spent;
+    for _ in 0..REFRESH_AFTER {
+        hot(&mut c, k, 1, 0.03, 4);
+    }
+    assert_eq!(c.choose(k, &[candidate(2, 8., 0.04)], 0.4), Some((2, true)));
+    assert_eq!(c.budget.startup_spent, before);
+}
+
+#[test]
+fn mixed_mtp_does_not_multiply_prompt_work_into_its_savings() {
+    for (seconds, expected) in [(1.2, None), (1.06, Some((2, false)))] {
+        let mut c = Controller::default();
+        let decoder = key(4);
+        let mixed = Key {
+            prefill: 221,
+            ..decoder
+        };
+        for _ in 0..4 {
+            hot(&mut c, decoder, 1, 0.04, 4);
+        }
+        for _ in 0..4 {
+            hot(&mut c, mixed, 1, 1.04, 4);
+        }
+        for _ in 0..4 {
+            hot(&mut c, mixed, 2, seconds, 8);
+        }
+        // The alternative is 1.04 + 0.04, never 1.04 * 2.
+        assert_eq!(c.choose(mixed, &[candidate(2, 8., seconds)], 2.), expected);
+        if expected.is_none() {
+            assert!(c.budget.balance - c.budget.startup_spent < 0.);
+        }
+    }
+}
+
+#[test]
+fn mixed_mtp_waits_for_a_standalone_decode_baseline() {
+    let mut c = Controller::default();
+    let decoder = key(4);
+    let mixed = Key {
+        prefill: 221,
+        ..decoder
+    };
+    for _ in 0..4 {
+        hot(&mut c, mixed, 1, 1.04, 4);
+    }
+    for _ in 0..4 {
+        hot(&mut c, mixed, 2, 1.06, 8);
+    }
+    assert_eq!(c.choose(mixed, &[candidate(2, 8., 1.06)], 2.), None);
+    for _ in 0..4 {
+        hot(&mut c, decoder, 1, 0.04, 4);
+    }
+    assert_eq!(
+        c.choose(mixed, &[candidate(2, 8., 1.06)], 2.),
+        Some((2, false))
+    );
+}

@@ -1,5 +1,6 @@
 //! Persistent requests and iteration-level execution. API transport owns output
 //! parsing; this module owns GPU state, sampling counters and prefix endpoints.
+pub(super) mod cost;
 use super::*;
 use crate::{architecture::BatchSegment, prefix::Media, scheduler};
 use std::collections::{BTreeMap, BTreeSet};
@@ -393,7 +394,11 @@ impl ModelRuntime {
             (context + prompt_tokens).next_power_of_two(),
             0,
         );
-        let Some(next) = self.iteration_costs.get(&key).filter(|e| e.samples >= 4) else {
+        let Some(next) = self
+            .iteration_costs
+            .get(&key)
+            .filter(|e| e.time.samples() >= 4)
+        else {
             return true;
         };
         if next.upper() * 1000. > options.target_tpot_ms {
@@ -402,9 +407,9 @@ impl ModelRuntime {
         let previous = (active.len(), active.len(), context.next_power_of_two(), 0);
         self.iteration_costs
             .get(&previous)
-            .filter(|e| e.samples >= 4)
+            .filter(|e| e.time.samples() >= 4)
             .is_none_or(|old| {
-                (active.len() + 1) as f64 / next.mean >= active.len() as f64 / old.mean * 0.99
+                (active.len() + 1) as f64 / next.mean() >= active.len() as f64 / old.mean() * 0.99
             })
     }
     pub(crate) fn can_admit_request(
@@ -1099,15 +1104,26 @@ impl ModelRuntime {
         selected: &[(usize, usize)],
     ) -> f64 {
         let key = Self::iteration_key(requests, selected);
-        if let Some(upper) = self
-            .iteration_costs
-            .range((key.0, key.1, 0, 0)..=(key.0, key.1, key.2, usize::MAX))
-            .filter(|(k, _)| k.3 == key.3)
-            .map(|(_, e)| e.upper())
-            .max_by(f64::total_cmp)
-        {
+        if let Some(upper) = self.iteration_upper(key) {
             return upper;
         }
+        // A primer is a risk estimate, never a steady ranking sample.
+        self.iteration_costs.get(&key).map_or_else(
+            || self.iteration_prior(requests, selected, true),
+            |sample| {
+                sample
+                    .upper()
+                    .max(self.iteration_prior(requests, selected, true))
+            },
+        )
+    }
+    fn iteration_prior(
+        &self,
+        requests: &[&mut RequestState],
+        selected: &[(usize, usize)],
+        upper: bool,
+    ) -> f64 {
+        let key = Self::iteration_key(requests, selected);
         if selected
             .iter()
             .any(|(i, n)| *n > 1 && requests[*i].prefilling)
@@ -1118,36 +1134,45 @@ impl ModelRuntime {
             let prompt_s: f64 = selected
                 .iter()
                 .filter(|(i, n)| *n > 1 && requests[*i].prefilling)
-                .map(|(i, n)| self.prefill_costs.chunk_upper(*n, requests[*i].offset + n))
+                .map(|&(i, n)| {
+                    let one = Self::iteration_key(requests, &[(i, n)]);
+                    let observed = if upper {
+                        self.iteration_upper(one)
+                    } else {
+                        self.iteration_sample(one).map(cost::Sample::mean)
+                    };
+                    observed.unwrap_or_else(|| {
+                        self.prefill_costs.chunk_upper(n, requests[i].offset + n)
+                    })
+                })
                 .sum();
-            // Decoding requests wider than one row are verification segments of
-            // the same joined packet: they extend the decode row count instead
-            // of each paying a separate prefill weight pass. Summing their
-            // chunk costs froze batched speculation out of every probe.
-            let decode_rows = selected
+            let decoders: Vec<_> = selected
                 .iter()
+                .copied()
                 .filter(|(i, n)| *n == 1 || !requests[*i].prefilling)
-                .map(|(_, n)| *n)
-                .sum::<usize>();
-            // The window covers complete execution, including shifted MTP warm
-            // and endpoint/cache work; these costs do not vanish in a joint body.
-            let endpoints = (key.3 >> 8) & 255;
-            let checkpoints = key.3 >> 16;
-            let warm = if self.manifest.mtp.is_some() {
-                (key.3 & 255) as f64 * 0.015
-            } else {
-                0.
-            };
+                .collect();
             return prompt_s * if selected.len() > 1 { 0.75 } else { 1. }
-                + decode_rows as f64 * 0.005
-                + warm
-                + (endpoints + checkpoints) as f64 * 0.02;
+                + if decoders.is_empty() {
+                    0.
+                } else if upper {
+                    self.predict_iteration(requests, &decoders)
+                } else {
+                    self.mean_iteration(requests, &decoders)
+                };
         }
+
         let kv: usize = selected
             .iter()
             .map(|(i, n)| requests[*i].history.len() * n)
             .sum();
         0.09 + key.1 as f64 * 0.001 + kv as f64 * 0.0000001
+    }
+    fn mean_iteration(&self, requests: &[&mut RequestState], selected: &[(usize, usize)]) -> f64 {
+        self.iteration_sample(Self::iteration_key(requests, selected))
+            .map_or_else(
+                || self.iteration_prior(requests, selected, false),
+                cost::Sample::mean,
+            )
     }
     fn pack_prefill(
         &self,
@@ -1238,8 +1263,8 @@ impl ModelRuntime {
     ) -> bool {
         let key = Self::iteration_key(requests, selected);
         self.iteration_costs
-            .range((key.0, key.1, 0, 0)..=(key.0, key.1, key.2, usize::MAX))
-            .any(|(k, e)| k.3 == key.3 && e.samples >= 2)
+            .get(&key)
+            .is_some_and(|s| s.time.samples() >= crate::mtp::adaptive::HOT_SAMPLES)
     }
 
     fn native_prefill_chunk(
@@ -1313,6 +1338,10 @@ impl ModelRuntime {
         profile::mark("entry");
         self.reap_abandoned()?;
         options.validate()?;
+        self.dynamic_speculation
+            .set_calibration_limit(options.target_tpot_ms / 1000.);
+        self.prefill_alternative = None;
+
         for r in requests.iter() {
             if r.owner != self.owner_id || r.released {
                 return Err("Invalid active request arena".into());
@@ -1372,12 +1401,14 @@ impl ModelRuntime {
         let at = at + media_time;
         let feedback_at = feedback_at + media_time;
         let feedback = self.speculation_feedback(requests, &prefill_work);
+        let prefill_alternative = self.prefill_alternative.take();
         let does_prefill = match &prefill_work {
             Work::Prefill(..) => true,
             Work::MixedSpeculative(_) => true,
             Work::Batch(selected) => selected.iter().any(|&(i, _)| requests[i].prefilling),
             _ => false,
         };
+        let executed = !matches!(prefill_work, Work::Idle);
         match prefill_work {
             Work::MixedSpeculative(selected) => {
                 let prefills: Vec<_> = selected
@@ -1446,26 +1477,10 @@ impl ModelRuntime {
                     .or_default() += 1;
             }
             Work::Prefill(i, chunk, bounded, budget_s) => {
-                let key = Self::iteration_key(requests, &[(i, chunk)]);
-                let before = self.execution.batch_statistics();
+                let timer = cost::Timer::start(self.execution.batch_statistics());
                 let (_, tokens) = self.with_request(requests[i], |model, req| {
-                    model.advance_prefill_step(req, chunk, bounded, budget_s)
+                    model.advance_prefill_step_timed(req, chunk, bounded, budget_s, timer)
                 })?;
-                let after = self.execution.batch_statistics();
-                let cold_s = after.initialization_s() - before.initialization_s()
-                    + after.sequence_capture_s
-                    - before.sequence_capture_s;
-                if !self
-                    .manifest
-                    .prefill_plans
-                    .iter()
-                    .any(|p| p.accepts(chunk) && !p.stages.is_empty())
-                {
-                    self.iteration_costs
-                        .entry(key)
-                        .or_default()
-                        .observe((at.elapsed().as_secs_f64() - cold_s).max(0.000001));
-                }
                 requests[i].served = self.scheduler_statistics.iterations;
                 requests[i].credit_s -= at.elapsed().as_secs_f64();
                 if has_decoders {
@@ -1519,7 +1534,7 @@ impl ModelRuntime {
                     .map(|&i| requests[i].generated)
                     .sum::<usize>()
                     - feedback.generated;
-                if let Some(extra) = self.dynamic_speculation.observe(
+                if let Some(extra) = self.dynamic_speculation.observe_with_alternative(
                     feedback.key,
                     feedback.width,
                     speculation::control::Measurement {
@@ -1529,10 +1544,38 @@ impl ModelRuntime {
                         warm_ready: feedback.warm_ready,
                         tokens,
                     },
+                    prefill_alternative,
                 ) {
                     self.mtp_seconds_per_draft = self.mtp_seconds_per_draft * 0.8 + extra * 0.2;
                 }
+            } else if let Some(alternative) = prefill_alternative {
+                let tokens = feedback
+                    .indices
+                    .iter()
+                    .map(|&i| requests[i].generated)
+                    .sum::<usize>()
+                    - feedback.generated;
+                self.dynamic_speculation.settle_action(
+                    feedback_at.elapsed().as_secs_f64(),
+                    alternative.seconds(tokens),
+                    alternative.measured,
+                    alternative.calibrating,
+                );
             }
+        } else if let Some(alternative) = prefill_alternative {
+            self.dynamic_speculation.settle_action(
+                feedback_at.elapsed().as_secs_f64(),
+                alternative.seconds(0),
+                alternative.measured,
+                alternative.calibrating,
+            );
+        } else if executed {
+            self.dynamic_speculation.earn_ordinary(
+                feedback_at.elapsed().as_secs_f64(),
+                self.execution
+                    .batch_statistics()
+                    .preparation_s_since(feedback_stats),
+            );
         }
         overlap();
         self.scheduler_statistics.maintenance_calls += 1;
@@ -1707,7 +1750,7 @@ impl ModelRuntime {
                 self.pack_prefill(requests, &prefills, &mut joint, cap, f64::INFINITY)?;
                 if joint.len() > 1
                     && joint.iter().any(|(i, _)| requests[*i].prefilling)
-                    && self.prefer_joint_prefill(requests, &joint, f64::INFINITY, true)
+                    && self.prefer_joint_prefill(requests, &joint, f64::INFINITY)
                 {
                     self.scheduler_statistics.joint_prefill_choices += 1;
                     joint.sort_unstable_by_key(|(i, _)| requests[*i].slot);
@@ -1727,9 +1770,7 @@ impl ModelRuntime {
             if mixed && prefills.len() > 1 {
                 let mut joint = vec![];
                 self.pack_prefill(requests, &prefills, &mut joint, cap, f64::INFINITY)?;
-                if joint.len() > 1
-                    && self.prefer_joint_prefill(requests, &joint, f64::INFINITY, false)
-                {
+                if joint.len() > 1 && self.prefer_joint_prefill(requests, &joint, f64::INFINITY) {
                     self.scheduler_statistics.joint_prefill_choices += 1;
                     joint.sort_unstable_by_key(|(i, _)| requests[*i].slot);
                     return Ok(Work::Batch(joint));
@@ -1775,8 +1816,7 @@ impl ModelRuntime {
                 cap,
                 (decode_s + window_s).min(slack_s).max(0.) * 1000.,
             )?;
-            if joint.len() > selected.len()
-                && self.prefer_joint_prefill(requests, &joint, window_s, false)
+            if joint.len() > selected.len() && self.prefer_joint_prefill(requests, &joint, window_s)
             {
                 self.scheduler_statistics.joint_prefill_choices += 1;
                 for &(i, _) in &joint {
@@ -1808,55 +1848,82 @@ impl ModelRuntime {
     }
 
     fn prefer_joint_prefill(
-        &self,
+        &mut self,
         requests: &[&mut RequestState],
         joint: &[(usize, usize)],
         native_budget_s: f64,
-        probe: bool,
     ) -> bool {
-        // Reuse measured packet timings. An offline job can pay the first two
-        // real executions to discover useful shapes instead of permanently
-        // rejecting an unmeasured mixed path with a latency-oriented prior.
-        if probe && !self.measured_iteration(requests, joint) {
-            return true;
-        }
-        let mut loses_large_tile = false;
         let decoders: Vec<_> = joint
             .iter()
             .copied()
             .filter(|&(i, _)| !requests[i].prefilling)
             .collect();
-        let mut native_s = if decoders.is_empty() {
+        let decode_s = if decoders.is_empty() {
             0.
         } else {
-            self.predict_iteration(requests, &decoders)
+            self.mean_iteration(requests, &decoders)
         };
-        let mut has_native_prefill = false;
+        let mut measured = decoders.is_empty() || self.measured_iteration(requests, &decoders);
+        let mut prefill_s = 0.;
+        let mut has_native = false;
+        let mut loses_tile = false;
         for &(i, n) in joint {
-            if requests[i].prefilling {
-                let Some(native) = self.native_prefill_chunk(requests, i, native_budget_s, false)
-                else {
-                    // A joint step can still fit when a separate weight pass
-                    // would miss the deadline. Evaluate its complete cost.
-                    continue;
-                };
-                loses_large_tile |= native > n;
-                has_native_prefill = true;
-                native_s +=
-                    self.predict_iteration(requests, &[(i, native)]) * n as f64 / native as f64;
+            if !requests[i].prefilling {
+                continue;
             }
+            let Some(native) = self.native_prefill_chunk(requests, i, native_budget_s, false)
+            else {
+                continue;
+            };
+            has_native = true;
+            loses_tile |= native > n;
+            let single = [(i, native)];
+            measured &= self.measured_iteration(requests, &single);
+            prefill_s += self.mean_iteration(requests, &single) * n as f64 / native as f64;
         }
-        let joint_s = self.predict_iteration(requests, joint);
-        // There is no independent deadline-safe candidate in this case.
-        if !has_native_prefill {
+        if !has_native {
             return true;
         }
-        scheduler::joint_prefill_worthwhile(
-            loses_large_tile,
-            self.measured_iteration(requests, joint),
-            joint_s,
-            native_s,
-        )
+        let key = Self::iteration_key(requests, joint);
+        let sample = self.iteration_costs.get(&key);
+        let calibrating =
+            sample.is_none_or(|s| s.time.samples() < crate::mtp::adaptive::HOT_SAMPLES);
+        let stale = sample.is_some_and(|s| {
+            self.scheduler_statistics.iterations.saturating_sub(s.last)
+                >= crate::mtp::adaptive::REFRESH_AFTER
+        });
+        let mean = self.mean_iteration(requests, joint);
+        let upper = self.predict_iteration(requests, joint);
+        let native = prefill_s + decode_s;
+        let best =
+            !calibrating && scheduler::joint_prefill_worthwhile(loses_tile, true, mean, native);
+        let probe = (calibrating || stale)
+            && !loses_tile
+            && (upper - native).max(0.) <= self.dynamic_speculation.exploration_credit(calibrating);
+        let selected = best || probe;
+        if !calibrating {
+            self.dynamic_speculation.calibrate_prefill(key, None);
+        } else if !selected && !loses_tile && mean < native {
+            self.dynamic_speculation
+                .calibrate_prefill(key, Some((upper - native).max(0.)));
+        }
+        if self.dynamic_speculation.tracing() {
+            eprintln!(
+                "PREFILL_CHOOSE {key:?} selected={selected} probe={probe} calibrating={calibrating} native_measured={measured} loses_tile={loses_tile} mean={mean:.6} upper={upper:.6} native={native:.6} credit={:.6}",
+                self.dynamic_speculation.exploration_credit(calibrating)
+            );
+        }
+        if selected {
+            self.prefill_alternative = Some(cost::Alternative {
+                prefill_s,
+                decode_s,
+                decoders: decoders.len(),
+                measured,
+                calibrating,
+                probing: !best,
+            });
+        }
+        selected
     }
 
     fn execute_selected(
@@ -1879,10 +1946,8 @@ impl ModelRuntime {
             && (requests[selected[0].0].prefilling || !self.manifest.batch_profiles.contains(&1))
         {
             self.prepare_selected_audio(requests, selected)?;
-            let at = Instant::now();
             let key = Self::iteration_key(requests, selected);
-            let capture_before = self.execution.batch_statistics().sequence_capture_s;
-            let load_before = self.execution.batch_statistics().initialization_s();
+            let timer = cost::Timer::start(self.execution.batch_statistics());
             let i = selected[0].0;
             let tokens = self.with_request(requests[i], |model, req| {
                 if req.prefilling && model.manifest.prefill_plan(1).is_some() {
@@ -1942,12 +2007,7 @@ impl ModelRuntime {
                 .batch_histogram
                 .entry(1)
                 .or_default() += 1;
-            let capture_s = self.execution.batch_statistics().sequence_capture_s - capture_before;
-            let load_s = self.execution.batch_statistics().initialization_s() - load_before;
-            self.iteration_costs
-                .entry(key)
-                .or_default()
-                .observe((at.elapsed().as_secs_f64() - capture_s - load_s).max(0.000001));
+            self.observe_iteration(key, timer.finish(self.execution.batch_statistics()));
             return Ok(());
         }
         self.execute_batch_selected(requests, selected, output, overlap)
@@ -1963,7 +2023,7 @@ impl ModelRuntime {
         #[cfg(test)]
         profile::mark("policy");
         let inputs_at = Instant::now();
-        let load_before = self.execution.batch_statistics().initialization_s();
+        let timer = cost::Timer::start(self.execution.batch_statistics());
         let segments = self.prepare_batch_inputs(requests, selected)?;
         #[cfg(test)]
         profile::mark("inputs");
@@ -1982,7 +2042,6 @@ impl ModelRuntime {
         profile::mark("plan");
         self.scheduler_statistics.batch_plan_s += plan_at.elapsed().as_secs_f64();
         let key = Self::iteration_key(requests, selected);
-        let capture_before = self.execution.batch_statistics().capture_s;
         self.execution.execute_batch_operation_with(
             orinfer_model_sdk::abi::BatchOperation::Ordinary,
             graph_key,
@@ -2017,12 +2076,7 @@ impl ModelRuntime {
         let commit_s = commit_at.elapsed().as_secs_f64();
         self.scheduler_statistics.batch_commit_s += commit_s;
         let seconds = inputs_at.elapsed().as_secs_f64();
-        let load_s = self.execution.batch_statistics().initialization_s() - load_before;
-        let capture_s = self.execution.batch_statistics().capture_s - capture_before;
-        self.iteration_costs
-            .entry(key)
-            .or_default()
-            .observe((seconds - capture_s - load_s).max(0.000001));
+        self.observe_iteration(key, timer.finish(self.execution.batch_statistics()));
         let rows: usize = selected.iter().map(|(_, n)| n).sum();
         for &(i, chunk) in selected {
             requests[i].credit_s -= seconds * chunk as f64 / rows as f64;

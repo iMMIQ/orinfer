@@ -152,7 +152,6 @@ impl ModelRuntime {
         requests: &[&mut RequestState],
         work: &Work,
     ) -> Option<Feedback> {
-        self.manifest.mtp.as_ref()?;
         let selected = match work {
             Work::Batch(rows) | Work::MixedSpeculative(rows) => rows.clone(),
             Work::SpeculativeBatch(choice) => choice.selected.clone(),
@@ -365,6 +364,11 @@ impl ModelRuntime {
         options: &scheduler::Options,
         slack: f64,
     ) -> Option<Vec<(usize, usize)>> {
+        // Calibrate one decision at a time. Otherwise both selectors could
+        // independently pledge the same credit before the combined settlement.
+        if self.prefill_alternative.is_some_and(|a| a.probing) {
+            return None;
+        }
         self.select_auto_speculation(requests, joint, options, slack)
             .map(|choice| choice.selected)
     }

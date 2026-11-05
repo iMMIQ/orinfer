@@ -46,8 +46,8 @@ pub(crate) struct ModelRuntime {
     scheduler_cursor: usize,
     unmerged_prefill_s: f64,
     decode_until: Option<Instant>,
-    iteration_costs:
-        std::collections::BTreeMap<(usize, usize, usize, usize), crate::scheduler::Estimate>,
+    iteration_costs: std::collections::BTreeMap<requests::cost::Key, requests::cost::Sample>,
+    prefill_alternative: Option<requests::cost::Alternative>,
     mtp_seconds_per_draft: f64,
     dynamic_speculation: requests::speculation::control::Controller,
     prompt_lookup: bool,
@@ -138,6 +138,7 @@ impl ModelRuntime {
             unmerged_prefill_s: 0.,
             decode_until: None,
             iteration_costs: Default::default(),
+            prefill_alternative: None,
             mtp_seconds_per_draft: 0.055,
             dynamic_speculation: Default::default(),
             prompt_lookup: options.prompt_lookup,
