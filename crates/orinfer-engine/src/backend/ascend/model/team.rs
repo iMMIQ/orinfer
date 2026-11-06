@@ -205,6 +205,22 @@ impl Team {
             _bootstrap: Some(bootstrap),
             host_tables: Some(shared),
         };
+        // One shared CPU load owns no ACL handles. Join it with rank workers
+        // on every startup/teardown path, including partial rank failures.
+        let table_shared = Arc::clone(team.host_tables.as_ref().unwrap());
+        let table_dir = model_dir.to_owned();
+        let table_index = model.index.file.clone();
+        let table_layout = layout.clone();
+        team.handles.push(
+            std::thread::Builder::new()
+                .name("orinfer-a2-tables".into())
+                .spawn(move || {
+                    table_shared.get_or_init(|| {
+                        super::load::tables(&table_dir, &table_index, &table_layout)
+                    });
+                })
+                .map_err(|e| e.to_string())?,
+        );
         for rank in ranks {
             let cpus = cpus.as_ref().map(|v| v[rank.rank as usize].clone());
             let root = root.clone();

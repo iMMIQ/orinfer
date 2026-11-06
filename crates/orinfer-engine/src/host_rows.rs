@@ -200,12 +200,27 @@ impl Plane {
         let offset = first
             .checked_mul(self.row_bytes)
             .ok_or("Resident host table offset overflow")?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(bytes).map_err(|e| e.to_string())?;
-        data.resize(bytes, 0);
-        data.par_chunks_mut(32 << 20)
+        let mut data = resident::zeroed(bytes)?;
+        // Bound first-touch/file-I/O concurrency while device weights load.
+        // Stripes retain sequential reads and reuse the existing Rayon pool.
+        let readers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8);
+        let chunk = 32 << 20;
+        let stripe = bytes
+            .div_ceil(chunk)
+            .div_ceil(readers)
+            .max(1)
+            .checked_mul(chunk)
+            .ok_or("Host row stripe extent overflow")?;
+        data.par_chunks_mut(stripe)
             .enumerate()
-            .try_for_each(|(chunk, target)| self.read_bytes(offset + chunk * (32 << 20), target))?;
+            .try_for_each(|(index, target)| {
+                for (part, target) in target.chunks_mut(chunk).enumerate() {
+                    self.read_bytes(offset + index * stripe + part * chunk, target)?;
+                }
+                Ok::<_, String>(())
+            })?;
         self.resident = Some((first, data));
         Ok(())
     }

@@ -1,6 +1,7 @@
 //! Prepared physical weight loading and bounded stream-ordered transfers.
 use super::*;
 use std::collections::VecDeque;
+pub(super) mod pipeline;
 
 /// In-flight pinned storage stays within the session budget as DMA overlaps host copies.
 const UPLOAD_CHUNK: usize = 8 << 20;
@@ -39,41 +40,55 @@ pub(super) fn upload(session: &Session, buffer: &Buffer, data: &[u8]) -> Result<
     wait_in_flight(&mut tickets)
 }
 
-/// Streams a prepared weight file without materializing it in host memory;
-/// storage reads overlap device DMA instead of preceding it.
-fn upload_file(session: &Session, buffer: &Buffer, path: &Path, bytes: usize) -> Result<()> {
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let metadata = file.metadata().map_err(|e| e.to_string())?;
-    if !metadata.is_file() || metadata.len() != bytes as u64 {
-        return Err("Prepared weight metadata differs".into());
+pub(super) fn weight_layouts(
+    definitions: &[Definition],
+) -> Result<Vec<crate::backend::arena::ArenaLayout>> {
+    let mut layouts = Vec::new();
+    let mut group = Vec::new();
+    let mut bytes = 0usize;
+    for definition in definitions.iter().filter(|d| {
+        d.view.is_none() && (d.prepared_tensor.is_some() || d.prepared_weight.is_some())
+    }) {
+        if !group.is_empty() && bytes.saturating_add(definition.bytes) > 1 << 30 {
+            layouts.push(crate::backend::arena::ArenaLayout::from_sizes(
+                group.drain(..),
+            )?);
+            bytes = 0;
+        }
+        bytes = bytes
+            .checked_add(definition.bytes)
+            .ok_or("Weight arena extent overflow")?;
+        group.push((definition.name.as_str(), definition.bytes, 512));
     }
-    upload_file_range(session, buffer, &file, 0, bytes)
+    if !group.is_empty() {
+        layouts.push(crate::backend::arena::ArenaLayout::from_sizes(
+            group.into_iter(),
+        )?);
+    }
+    Ok(layouts)
 }
-pub(super) fn upload_file_range(
+
+pub(super) fn weight_buffers(
     session: &Session,
-    buffer: &Buffer,
-    file: &std::fs::File,
-    source_offset: usize,
-    bytes: usize,
-) -> Result<()> {
-    use std::os::unix::fs::FileExt;
-    if bytes != buffer.bytes() || source_offset.checked_add(bytes).is_none() {
-        return Err("Prepared tensor range differs".into());
-    }
-    let mut staging = vec![0u8; UPLOAD_CHUNK.min(bytes)];
-    let mut tickets = VecDeque::new();
-    let mut offset = 0;
-    while offset < bytes {
-        let want = UPLOAD_CHUNK.min(bytes - offset);
-        file.read_exact_at(&mut staging[..want], (source_offset + offset) as u64)
-            .map_err(|e| e.to_string())?;
-        tickets.push_back(session.upload(buffer, offset, &staging[..want])?);
-        offset += want;
-        if tickets.len() > UPLOAD_DEPTH {
-            tickets.pop_front().unwrap().wait()?;
+    definitions: &[Definition],
+    layouts: &[crate::backend::arena::ArenaLayout],
+) -> Result<BTreeMap<String, Buffer>> {
+    let sizes: BTreeMap<_, _> = definitions
+        .iter()
+        .map(|d| (d.name.as_str(), d.bytes))
+        .collect();
+    let mut buffers = BTreeMap::new();
+    for layout in layouts {
+        let owner = session.allocate(layout.allocation_bytes)?;
+        let base = (layout.base(owner.pointer() as u64)? - owner.pointer() as u64) as usize;
+        for (name, offset) in &layout.offsets {
+            buffers.insert(
+                name.clone(),
+                owner.slice(base + offset, sizes[name.as_str()])?,
+            );
         }
     }
-    wait_in_flight(&mut tickets)
+    Ok(buffers)
 }
 
 impl Worker {
@@ -113,6 +128,14 @@ impl Worker {
             .try_fold(0usize, |n, b| {
                 n.checked_add(b.bytes).ok_or("Model byte estimate overflow")
             })?;
+        let layouts = weight_layouts(&rank.buffers)?;
+        let padding = layouts.iter().try_fold(0usize, |n, l| {
+            n.checked_add(l.padding_bytes)
+                .ok_or("Weight arena padding overflow")
+        })?;
+        let needed = needed
+            .checked_add(padding)
+            .ok_or("Weight arena budget overflow")?;
         let needed = needed
             .checked_add(
                 model
@@ -129,8 +152,11 @@ impl Worker {
                 rank.rank
             ));
         }
+        let t = Instant::now();
+        let mut weight_buffers = weight_buffers(&session, &rank.buffers, &layouts)?;
+        phases.alloc_s += t.elapsed().as_secs_f64();
         let mut fills: Vec<Ticket> = Vec::new();
-        let mut prepared_files = BTreeMap::new();
+        let mut prepared = Vec::new();
         let growth = model
             .batch
             .as_ref()
@@ -153,7 +179,12 @@ impl Worker {
             } else {
                 let t = Instant::now();
                 let demand = growth.contains_key(&definition.name);
-                let buffer = if demand {
+                let buffer = if let Some(buffer) = weight_buffers.remove(&definition.name) {
+                    if demand {
+                        return Err("Resident weight cannot be a growing state buffer".into());
+                    }
+                    buffer
+                } else if demand {
                     session.reserve(definition.bytes)?
                 } else {
                     session.allocate(definition.bytes)?
@@ -161,24 +192,27 @@ impl Worker {
                 phases.alloc_s += t.elapsed().as_secs_f64();
                 if let Some(file) = definition.prepared_weight {
                     let path = resolve_file(package, &file)?;
-                    let t = Instant::now();
-                    upload_file(&session, &buffer, &path, definition.bytes)?;
-                    phases
-                        .prepared
-                        .add(definition.bytes, t.elapsed().as_secs_f64());
+                    let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+                    if !metadata.is_file() || metadata.len() != definition.bytes as u64 {
+                        return Err("Prepared weight metadata differs".into());
+                    }
+                    prepared.push(pipeline::Upload {
+                        source: crate::weights::TensorSource {
+                            path,
+                            offset: 0,
+                            bytes: definition.bytes,
+                        },
+                        buffer: buffer.clone(),
+                    });
                 } else if let Some(tensor) = definition.prepared_tensor {
                     let source = checkpoint.source(&tensor.name, &tensor.dtype, &tensor.shape)?;
                     if source.bytes != definition.bytes {
                         return Err("Prepared tensor byte extent differs".into());
                     }
-                    let t = Instant::now();
-                    let file = match prepared_files.entry(source.path.clone()) {
-                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                        std::collections::btree_map::Entry::Vacant(entry) => entry
-                            .insert(std::fs::File::open(&source.path).map_err(|e| e.to_string())?),
-                    };
-                    upload_file_range(&session, &buffer, file, source.offset, source.bytes)?;
-                    phases.prepared.add(source.bytes, t.elapsed().as_secs_f64());
+                    prepared.push(pipeline::Upload {
+                        source,
+                        buffer: buffer.clone(),
+                    });
                 } else if let Some(weight) = definition.weight {
                     let t = Instant::now();
                     let data = weights::load(&mut checkpoint, &weight)?;
@@ -203,60 +237,25 @@ impl Worker {
             buffers.insert(definition.name, buffer);
         }
         let t = Instant::now();
+        let loaded = pipeline::run(&session, prepared)?;
+        phases.prepared.add(loaded.bytes, t.elapsed().as_secs_f64());
+        eprintln!(
+            "A2 rank {} weights ready after {:.3}s; arenas={}; padding_bytes={padding}; read_chunks={}; read_wait={:.3}s; upload={:.3}s",
+            rank.rank,
+            start.elapsed().as_secs_f64(),
+            layouts.len(),
+            loaded.chunks,
+            loaded.read_wait_s,
+            loaded.upload_s
+        );
+        let t = Instant::now();
         for ticket in &fills {
             ticket.wait()?;
         }
         phases.zero.seconds += t.elapsed().as_secs_f64();
         let t = Instant::now();
         let tables = shared_tables
-            .get_or_init(|| {
-                let mut stores = BTreeMap::new();
-                for layer in &layout.layers {
-                    let prefix = format!("layers.{}.engram.embed", layer.layer);
-                    let shard = Shard {
-                        first: 0,
-                        rows: layer.rows,
-                    };
-                    let store = if let Some(records) = checkpoint.row_records(&prefix)? {
-                        Int8Rows::open_records(&records, shard)?
-                    } else {
-                        Int8Rows::open_sharded(
-                            &checkpoint.row_sources(&format!("{prefix}.weight"))?,
-                            &checkpoint.row_sources(&format!("{prefix}.scale"))?,
-                            shard,
-                        )?
-                    };
-                    stores.insert(layer.layer, store);
-                }
-                let mut resident_budget = host_memory_budget("ORINFER_A2_HOST_TABLE_MIB", 0)?;
-                let resident = resident_budget != 0;
-                let required =
-                    stores
-                        .values()
-                        .try_fold(0usize, |total, store| -> Result<usize> {
-                            total
-                                .checked_add(store.required_resident_bytes()?)
-                                .ok_or("Host table total extent overflow".into())
-                        })?;
-                if resident && required > resident_budget {
-                    return Err("A2 resident host tables exceed configured budget".into());
-                }
-                let table_budget = if resident {
-                    0
-                } else {
-                    host_memory_budget("ORINFER_A2_HOST_ROW_CACHE_MIB", 2048)?
-                        / layout.layers.len().max(1)
-                };
-                let mut tables = BTreeMap::new();
-                for (layer, mut store) in stores {
-                    if resident {
-                        store = store.into_resident(resident_budget)?;
-                        resident_budget -= store.resident_bytes();
-                    }
-                    tables.insert(layer, SharedInt8Rows::with_cache(store, table_budget)?);
-                }
-                Ok(Arc::new(tables))
-            })
+            .get_or_init(|| tables(model_dir, &model.index.file, &layout))
             .as_ref()
             .map_err(Clone::clone)?;
         let tables = Arc::clone(tables);
@@ -358,4 +357,65 @@ impl Worker {
         );
         Ok(worker)
     }
+}
+
+pub(super) fn tables(
+    model_dir: &Path,
+    index: &str,
+    layout: &HashLayout,
+) -> Result<Arc<BTreeMap<usize, SharedInt8Rows>>> {
+    let started = Instant::now();
+    let checkpoint = Checkpoint::open(model_dir, index)?;
+    let mut stores = BTreeMap::new();
+    for layer in &layout.layers {
+        let prefix = format!("layers.{}.engram.embed", layer.layer);
+        let shard = Shard {
+            first: 0,
+            rows: layer.rows,
+        };
+        let store = if let Some(records) = checkpoint.row_records(&prefix)? {
+            Int8Rows::open_records(&records, shard)?
+        } else {
+            Int8Rows::open_sharded(
+                &checkpoint.row_sources(&format!("{prefix}.weight"))?,
+                &checkpoint.row_sources(&format!("{prefix}.scale"))?,
+                shard,
+            )?
+        };
+        stores.insert(layer.layer, store);
+    }
+    let mut resident_budget = host_memory_budget("ORINFER_A2_HOST_TABLE_MIB", 0)?;
+    let resident = resident_budget != 0;
+    let required = stores
+        .values()
+        .try_fold(0usize, |total, store| -> Result<usize> {
+            total
+                .checked_add(store.required_resident_bytes()?)
+                .ok_or("Host table total extent overflow".into())
+        })?;
+    if resident && required > resident_budget {
+        return Err("A2 resident host tables exceed configured budget".into());
+    }
+    let table_budget = if resident {
+        0
+    } else {
+        host_memory_budget("ORINFER_A2_HOST_ROW_CACHE_MIB", 2048)? / layout.layers.len().max(1)
+    };
+    let mut tables = BTreeMap::new();
+    for (layer, mut store) in stores {
+        if resident {
+            store = store.into_resident(resident_budget)?;
+            resident_budget -= store.resident_bytes();
+        }
+        tables.insert(layer, SharedInt8Rows::with_cache(store, table_budget)?);
+    }
+    eprintln!(
+        "A2 HOST TABLES READY after {:.3}s; resident_bytes={}",
+        started.elapsed().as_secs_f64(),
+        tables
+            .values()
+            .map(|t| t.statistics().map(|s| s.resident_bytes).unwrap_or(0))
+            .sum::<usize>()
+    );
+    Ok(Arc::new(tables))
 }

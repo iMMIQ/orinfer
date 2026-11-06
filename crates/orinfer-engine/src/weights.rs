@@ -11,6 +11,7 @@ use std::{
 
 pub use orinfer_model_sdk::model::TensorIdentity;
 pub(crate) mod checkpoint;
+pub(crate) mod read;
 
 #[derive(Deserialize)]
 struct Index {

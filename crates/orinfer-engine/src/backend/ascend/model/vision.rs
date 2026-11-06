@@ -9,7 +9,6 @@ use orinfer_model_sdk::vision::{ImageInput, ImageLayout, Precision, VisionSpec};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::File,
     path::Path,
     rc::Rc,
     time::Instant,
@@ -69,12 +68,18 @@ impl Program {
         self.body.iter().map(|op| op.manifest.as_str())
     }
     pub(super) fn device_bytes(&self) -> Result<usize> {
-        self.buffers
+        let payload = self
+            .buffers
             .iter()
             .filter(|b| b.view.is_none())
-            .try_fold(0usize, |sum, b| {
-                sum.checked_add(b.bytes)
-                    .ok_or_else(|| "Vision memory size overflow".into())
+            .try_fold(0usize, |n, b| {
+                n.checked_add(b.bytes).ok_or("Vision memory size overflow")
+            })?;
+        load::weight_layouts(&self.buffers)?
+            .iter()
+            .try_fold(payload, |n, l| {
+                n.checked_add(l.padding_bytes)
+                    .ok_or_else(|| "Vision arena size overflow".into())
             })
     }
     pub(super) fn definitions(&self) -> &[Definition] {
@@ -212,6 +217,9 @@ impl Encoder {
         {
             return Err("Invalid native DeepSeek vision program".into());
         }
+        let layouts = load::weight_layouts(&program.buffers)?;
+        let mut weights = load::weight_buffers(session, &program.buffers, &layouts)?;
+        let mut prepared = Vec::new();
         let mut buffers: BTreeMap<String, Buffer> = BTreeMap::new();
         // Views are resolved after all owning allocations, independent of JSON order.
         for definition in &program.buffers {
@@ -226,16 +234,22 @@ impl Encoder {
             if definition.view.is_some() {
                 continue;
             }
-            let buffer = session.allocate(definition.bytes)?;
+            let buffer = match weights.remove(&definition.name) {
+                Some(buffer) => buffer,
+                None => session.allocate(definition.bytes)?,
+            };
             if let Some(tensor) = &definition.prepared_tensor {
                 let source = checkpoint.source(&tensor.name, &tensor.dtype, &tensor.shape)?;
-                let file = File::open(&source.path).map_err(|e| e.to_string())?;
-                load::upload_file_range(session, &buffer, &file, source.offset, source.bytes)?;
+                prepared.push(load::pipeline::Upload {
+                    source,
+                    buffer: buffer.clone(),
+                });
             } else {
                 session.fill(&buffer, 0)?.wait()?;
             }
             buffers.insert(definition.name.clone(), buffer);
         }
+        load::pipeline::run(session, prepared)?;
         for definition in &program.buffers {
             if let Some(view) = &definition.view {
                 if definition.prepared_tensor.is_some()
