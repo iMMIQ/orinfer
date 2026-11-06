@@ -554,6 +554,28 @@ orinfer bench-ascend-batch \
 
 `tools.quantization.activation` 提供 CPU 通用的激活统计、样本协方差加权输出误差及独立训练／保留行的 clipping 筛选。BF16→W8A8 的候选同时计入新增 A8 激活误差；权重误差与激活误差分别报告。候选 shadow 使用 FP32 scale，实际 dtype、舍入与算子边界另行验收。输入窗口、路由专家覆盖和局部输出误差只用于筛选，最终精度策略使用独立任务、固定历史 target NLL／KL 和实际请求性能选择。
 
+### A2 固定 W4 布局校准
+
+`calibration --layers 23 29 30 --labels 'expert\.up\..*|routing\.counts' --expert-rows 4096` 将采集限定到选定层及张量。专家输入、scale 和输出使用原 buffer 的有界视图，层覆盖标记保留两个字节；计算指令和权重保持原样。路由计数声明有效行，超出采集上限的行单独统计。原始 token、owner 与会话划分由调用者保存，校准、调参、最终验证按完整会话分开。
+
+`w4_calibration` 消费每 owner 一个 2048-token prefill 的 `p0-P3` 专家快照，使用显式 owner 列表指定局部验证会话。例如每会话两个 owner、前六个会话拟合、后两个会话验证：
+
+```bash
+OPENBLAS_NUM_THREADS=8 uv run --locked python -m tools.model.deepseek_v41.w4_calibration \
+  --trace artifacts/calibration/activations --output artifacts/calibration/fitted \
+  --official /path/to/official-checkpoint --integer-source /path/to/ascend-checkpoint \
+  --layers 23 29 30 --validation-owners 12 13 14 15 --minimum-rows 64 --workers 8
+
+uv run --locked python -m tools.model.deepseek_v41.w4_scale_release \
+  --source /path/to/release --source-execution /path/to/execution-cache \
+  --fitted artifacts/calibration/fitted --layers 29 --strength 0.5 \
+  --output /path/to/new-weights --execution-output /path/to/new-execution-cache
+```
+
+拟合按专家有界读取官方 W1，沿 checkpoint 的 FFN norm 和 block-32 旋转转换到现有输入基。固定整数码，按 SwiGLU 导数与原 W2 列能量加权拟合输出 scale，调整范围为 ±5%；局部验证包括 BF16 SwiGLU、逐行 A8 和原下投影。`--rounding-steps 4` 额外沿样本残差执行四轮加权坐标更新，每轮每输出通道至多修改一个合法 INT4 码，再用局部验证决定是否保留。数据不足或验证误差未改善 0.5% 的专家保持原值。该参考固定基线输入、W3 和 W2，属于条件 FFN 重建；完整模型的官方激活误差、跨专家抵消和后续路由误差需另行评估。
+
+导出同步更新 W1 scale 和低 nibble 偏移补偿；舍入候选只替换原 NZ bank 的 W1 区域，W3、W2、算子及全部行数选择保持原契约。纯 scale 候选支持 `--strength` 插值，含整数码修正时使用 `--strength 1`。默认按原语义分片替换张量，未改分片复用硬链接；权重和执行包使用独立目录。`--overlay` 用于快速实验：另写覆盖分片，每个修改后的专家 bank 按层／rank 分片，旧 tensor 仍占磁盘但不加载；最终权重使用默认语义导出。局部误差下降后，仍以独立会话的固定历史 NLL 和真实部署性能决定是否采用。
+
 ### 源码入口
 
 统一源码入口：

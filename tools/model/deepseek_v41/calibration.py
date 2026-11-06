@@ -13,9 +13,13 @@ from tools.model.deepseek_v41.vision_attach import hardlinks
 from tools.model.publication import source_path
 
 
-def instrument(model, read_spec):
+def instrument(model, read_spec, *, layers=None, labels=None, expert_rows=None):
     """Retain numerical instructions; serialize branches for host snapshots."""
     model = deepcopy(model)
+    layers = None if layers is None else set(layers)
+    labels = None if labels is None else re.compile(labels)
+    if expert_rows is not None and expert_rows < 1:
+        raise ValueError("Expert snapshot row limit must be positive")
     specs, points = {}, []
     for rank in model["ranks"]:
         definitions = {d["name"]: d for d in rank["buffers"]}
@@ -27,7 +31,27 @@ def instrument(model, read_spec):
             steps = []
 
             def observe(label, buffer, *, fixed=False, projection=None):
+                if layers is not None and layer not in layers:
+                    return
+                if labels is not None and not labels.fullmatch(label):
+                    return
                 definition = definitions[buffer]
+                captured_rows = None
+                if expert_rows is not None and label.startswith("expert.up."):
+                    routed_capacity = capacity * 6
+                    if definition["bytes"] % routed_capacity:
+                        raise ValueError("Expert snapshot requires a whole routed row stride")
+                    captured_rows = min(expert_rows, routed_capacity)
+                    name = f"calibration.P{packet_index}.L{layer}.{label}"
+                    view = dict(
+                        name=name,
+                        bytes=definition["bytes"] // routed_capacity * captured_rows,
+                        view=dict(parent=buffer, offset=0),
+                    )
+                    rank["buffers"].append(view)
+                    buffer = name
+                    definition = view
+                    fixed = True
                 # Fractional sequence partitions cannot use the legacy
                 # bytes/capacity row slicing. Retain the bounded allocation;
                 # consumers select valid rows from the paired frame contract.
@@ -47,6 +71,8 @@ def instrument(model, read_spec):
                 )
                 if projection is not None:
                     point["projection"] = projection
+                if captured_rows is not None:
+                    point["captured_rows"] = captured_rows
                 points.append(point)
 
             for step in packet["body"]:
@@ -54,6 +80,15 @@ def instrument(model, read_spec):
                     raise ValueError("Use the frozen source plan, without existing diagnostics")
                 if step["op"] in ("fork", "switch", "join"):
                     continue
+                if step["op"] == "snapshot" and expert_rows is not None:
+                    # Keep layer coverage markers without exporting every full
+                    # HC hidden allocation in an otherwise bounded trace.
+                    parent = step["buffer"]
+                    marker = f"calibration.marker.{len(rank['buffers'])}"
+                    rank["buffers"].append(
+                        dict(name=marker, bytes=2, view=dict(parent=parent, offset=0))
+                    )
+                    step.update(buffer=marker, fixed_rows=True)
                 steps.append(step)
                 if step["op"] == "kernel":
                     path = step["manifest"]
@@ -117,7 +152,7 @@ def instrument(model, read_spec):
     return model, dict(points=points, manifests=specs)
 
 
-def prepare(plan, output):
+def prepare(plan, output, **options):
     plan, output = Path(plan).resolve(strict=True), Path(output).resolve()
     if output.exists() or output.is_relative_to(plan.parent):
         raise ValueError("Use a new directory outside the source execution package")
@@ -125,7 +160,7 @@ def prepare(plan, output):
     if len(model.get("ranks", [])) != 8 or not model.get("batch"):
         raise ValueError("Expected a complete DSv4.1 TP8 batch plan")
     result, metadata = instrument(
-        model, lambda name: json.loads(source_path(plan.parent, name).read_text())
+        model, lambda name: json.loads(source_path(plan.parent, name).read_text()), **options
     )
     metadata.update(
         source_plan_sha256=file_hash(plan),
@@ -153,8 +188,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--layers", type=int, nargs="+")
+    parser.add_argument("--labels", help="Full-match expression selecting observed tensor labels")
+    parser.add_argument(
+        "--expert-rows", type=int, help="Bound captured up-projection rows per rank"
+    )
     args = parser.parse_args()
-    print(prepare(args.plan, args.output))
+    print(
+        prepare(
+            args.plan,
+            args.output,
+            layers=args.layers,
+            labels=args.labels,
+            expert_rows=args.expert_rows,
+        )
+    )
 
 
 if __name__ == "__main__":

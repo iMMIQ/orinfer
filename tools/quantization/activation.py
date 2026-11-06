@@ -33,6 +33,74 @@ def quantize_rows(values, bits=8, clip=1.0):
     return codes * scale
 
 
+def fit_output_scales(products, reference, scales, weights=None, *, shrink=0.5, limit=0.05):
+    """Bounded weighted least squares for fixed integer projection codes."""
+    products, reference = matrix(products), matrix(reference)
+    scales = np.asarray(scales, dtype=np.float32)
+    if products.shape != reference.shape or scales.shape != (products.shape[1],):
+        raise ValueError("Projection products, reference and scales differ")
+    if not np.isfinite(scales).all() or np.any(scales <= 0):
+        raise ValueError("Projection scales must be positive and finite")
+    if not 0 <= shrink <= 1 or not 0 <= limit < 1:
+        raise ValueError("Scale shrink and relative limit are outside their bounds")
+    weights = np.ones_like(products) if weights is None else np.asarray(weights, dtype=np.float32)
+    if weights.shape != products.shape or not np.isfinite(weights).all() or np.any(weights < 0):
+        raise ValueError("Projection weights must be finite, nonnegative and shape matched")
+    denominator = np.sum(weights * products * products, axis=0, dtype=np.float64)
+    numerator = np.sum(weights * products * reference, axis=0, dtype=np.float64)
+    fitted = np.divide(
+        numerator, denominator, out=scales.astype(np.float64), where=denominator > 1e-20
+    )
+    fitted = np.clip(fitted, scales * (1 - limit), scales * (1 + limit))
+    return (scales + shrink * (fitted - scales)).astype(np.float32)
+
+
+def refine_integer_codes(activation, reference, codes, scales, weights, *, steps=4):
+    """Greedy weighted coordinate descent with one legal INT4 update per output/step.
+
+    The sample covariance enters the residual update. Channels and physical order
+    stay fixed; this changes integer rounding without adding runtime metadata.
+    """
+    activation, reference, weights = map(matrix, (activation, reference, weights))
+    codes, scales = np.asarray(codes), np.asarray(scales, dtype="f4")
+    if (
+        codes.ndim != 2
+        or not np.issubdtype(codes.dtype, np.integer)
+        or codes.shape != (reference.shape[1], activation.shape[1])
+        or len(activation) != len(reference)
+        or weights.shape != reference.shape
+        or scales.shape != (len(codes),)
+        or np.any(codes < -8)
+        or np.any(codes > 7)
+        or np.any(weights < 0)
+        or not np.isfinite(scales).all()
+        or np.any(scales <= 0)
+        or not 1 <= steps <= 16
+    ):
+        raise ValueError(
+            "Require matched activations, nonnegative importance and signed INT4 codes"
+        )
+    codes = codes.astype("i1", copy=True)
+    residual = reference - (activation @ codes.astype("f4").T) * scales
+    diagonal = weights.T @ np.square(activation)
+    curvature = np.square(scales[:, None]) * diagonal
+    outputs = np.arange(len(codes))
+    for _ in range(steps):
+        gradient = (weights * residual).T @ activation
+        plus = np.where(codes < 7, curvature - 2 * scales[:, None] * gradient, np.inf)
+        minus = np.where(codes > -8, curvature + 2 * scales[:, None] * gradient, np.inf)
+        gain = np.minimum(plus, minus)
+        columns = gain.argmin(1)
+        active = outputs[gain[outputs, columns] < 0]
+        if not len(active):
+            break
+        columns = columns[active]
+        direction = np.where(plus[active, columns] < minus[active, columns], 1, -1).astype("i1")
+        codes[active, columns] += direction
+        residual[:, active] -= activation[:, columns] * (direction * scales[active])
+    return codes
+
+
 def statistics(activation):
     activation = matrix(activation)
     energy = np.square(activation, dtype=np.float64).sum(0)

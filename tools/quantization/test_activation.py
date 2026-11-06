@@ -2,10 +2,41 @@ import unittest
 
 import numpy as np
 
-from tools.quantization.activation import quantize_rows, relative_mse, screen_linear, statistics
+from tools.quantization.activation import (
+    fit_output_scales,
+    quantize_rows,
+    refine_integer_codes,
+    relative_mse,
+    screen_linear,
+    statistics,
+)
 
 
 class ActivationCalibrationTests(unittest.TestCase):
+    def test_coordinate_rounding_uses_activations_and_respects_int4_limits(self):
+        x = np.eye(2, dtype="f4")
+        codes = np.array([[0, 0], [7, -8]], dtype="i1")
+        target = np.array([[1, 20], [-1, -20]], dtype="f4")
+        rounded = refine_integer_codes(x, target, codes, np.ones(2), np.ones_like(target), steps=2)
+        np.testing.assert_array_equal(rounded, [[1, -1], [7, -8]])
+        np.testing.assert_array_equal(codes, [[0, 0], [7, -8]])
+        unchanged = refine_integer_codes(x, target, codes, np.ones(2), np.zeros_like(target))
+        np.testing.assert_array_equal(unchanged, codes)
+
+    def test_weighted_scale_fit_keeps_unobserved_channels_and_bounds_changes(self):
+        products = np.array([[1, 0], [2, 0]], dtype="f4")
+        reference = np.array([[2, 4], [2, 8]], dtype="f4")
+        scales = np.ones(2, dtype="f4")
+        weights = np.array([[1, 1], [0, 1]], dtype="f4")
+        fitted = fit_output_scales(products, reference, scales, weights, shrink=0.5, limit=0.04)
+        np.testing.assert_allclose(fitted, [1.02, 1.0])
+        np.testing.assert_array_equal(
+            fit_output_scales(products, reference, scales, shrink=0), scales
+        )
+        for invalid in (weights[:, :1], -weights, weights * np.nan):
+            with self.assertRaises(ValueError):
+                fit_output_scales(products, reference, scales, invalid)
+
     def test_activation_energy_changes_the_importance_of_equal_weight_errors(self):
         x = np.array([[100, 1], [-100, 1]], dtype=np.float32)
         reference = np.array([[1], [1]], dtype=np.float32)

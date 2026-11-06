@@ -60,3 +60,42 @@ class ActivationTracePlanTests(unittest.TestCase):
         self.assertEqual(result["ranks"][0]["packets"][1], draft)
         with self.assertRaises(ValueError):
             instrument(result, reader)
+
+    def test_bounded_expert_views_keep_math_and_layer_markers(self):
+        model, reader = self.fixture()
+        rank = model["ranks"][0]
+        rank["buffers"].extend(
+            [
+                dict(name="ex", bytes=2048 * 6 * 5120),
+                dict(name="es", bytes=2048 * 6 * 4),
+                dict(name="ey", bytes=2048 * 6 * 4608 * 2),
+                dict(name="counts", bytes=48 * 8),
+            ]
+        )
+        step = dict(
+            op="w4",
+            name="P3.L00.up",
+            output=4608,
+            groups="counts",
+            buffers=["ex", "x", "ws", "ws", "es", "ey"],
+        )
+        rank["packets"][0]["body"].insert(-2, step)
+        result, metadata = instrument(
+            model, reader, layers=[0], labels=r"expert\.up\..*|routing\.counts", expert_rows=17
+        )
+        points = metadata["points"]
+        self.assertEqual(len(points), 4)
+        bounded = [p for p in points if "captured_rows" in p]
+        self.assertEqual(len(bounded), 3)
+        for point in bounded:
+            self.assertEqual(point["captured_rows"], 17)
+            self.assertEqual(point["buffer"], point["definition"]["name"])
+            self.assertTrue(point["fixed_rows"])
+        sizes = {p["name"].split(".")[-1]: p["definition"]["bytes"] for p in bounded}
+        self.assertEqual(sizes, dict(input=17 * 5120, token_scale=17 * 4, output=17 * 4608 * 2))
+        body = result["ranks"][0]["packets"][0]["body"]
+        self.assertIn(step, body)
+        marker = next(s for s in body if s.get("name") == "layer00")
+        definition = next(b for b in result["ranks"][0]["buffers"] if b["name"] == marker["buffer"])
+        self.assertEqual(definition["bytes"], 2)
+        self.assertEqual(definition["view"]["parent"], "y")
