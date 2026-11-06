@@ -228,7 +228,11 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                 .body
                 .iter()
                 .filter_map(|step| {
-                    if let Instruction::Snapshot { name, .. } = step
+                    if let Instruction::Snapshot {
+                        name,
+                        diagnostic: false,
+                        ..
+                    } = step
                         && !model
                             .batch
                             .as_ref()

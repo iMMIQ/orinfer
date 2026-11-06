@@ -526,6 +526,30 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.reference
 
 测量排除权重加载和预热，输出固定输入的 token hash、全部生成 token ID、TTFT、decode 速度及端到端时延。TTFT 包含末位置输出头；由输入长度除以 TTFT 得到的值是 prefill 吞吐代理。Rust 计时包含 CPU 查找、提交、等待与 HCCL；`tools/bench/ascend_single.py` 对 vLLM 的测量还包含本机 HTTP 和调度开销。两端使用同一组原始 completion token，固定输出长度，关闭跨请求 prefix 复用和推测解码。输入 `cases` 可分别指定 `output_tokens`、`repeats` 和 `trace`，省略时沿用命令行设置。`--trace DIR` 下载各 rank 的快照用于排错，rank 0 写在根目录，其余写入 `rankN/`；正式测量使用 `trace: false` 或省略 `--trace`。
 
+### A2 激活校准诊断
+
+以已发布引擎、权重和执行包为冻结基线，使用固定输入 token ID 采集基线完整 logits。离线生成独立的只读诊断计划：
+
+```bash
+uv run --locked python -m tools.model.deepseek_v41.calibration \
+  --plan /path/to/installed-execution/model.json \
+  --output artifacts/calibration/new-package
+
+HCCL_DETERMINISTIC=strict \
+ORINFER_A2_BATCH_TRACE=artifacts/calibration/activations \
+ORINFER_A2_BATCH_TRACE_ALL_RANKS=1 \
+ORINFER_A2_BATCH_LOGITS_DIR=artifacts/calibration/logits \
+orinfer bench-ascend-batch \
+  --plan artifacts/calibration/new-package/calibration.json \
+  --model-dir /path/to/model --inputs /path/to/frozen-inputs.json
+```
+
+诊断引擎支持 `snapshot.diagnostic` 与 `snapshot.fixed_rows` 可选字段；普通层边界保持原契约。诊断点覆盖 target norm、整数/浮点投影、专家输入输出和路由计数；固定元数据与分片的小向量按完整有界 buffer 读回。有效行依据同一 frame 和算子几何选择，排除容量尾部。多个样本使用可区分的 owner／历史／片段布局或独立采集目录，避免相同形状覆盖记录。
+
+采集沿用原算子与权重，host 快照将分支串行化；本轮固定 B4、512 token 的验证在 strict 通信下与冻结基线完整 logits 逐位一致。默认高性能通信可能受调度及浮点求和顺序影响，应先核对采集前后的完整概率，再做误差归因。strict 用于校准的数值对齐，性能及候选质量仍回到实际部署配置验证。采集耗时不作为推理性能。
+
+`tools.quantization.activation` 提供 CPU 通用的激活统计、样本协方差加权输出误差及独立训练／保留行的 clipping 筛选。BF16→W8A8 的候选同时计入新增 A8 激活误差；权重误差与激活误差分别报告。候选 shadow 使用 FP32 scale，实际 dtype、舍入与算子边界另行验收。输入窗口、路由专家覆盖和局部输出误差只用于筛选，最终精度策略使用独立任务、固定历史 target NLL／KL 和实际请求性能选择。
+
 ### 源码入口
 
 统一源码入口：

@@ -177,6 +177,8 @@ mod tests {
                 Instruction::Snapshot {
                     name: "layer00".into(),
                     buffer: "x".into(),
+                    fixed_rows: false,
+                    diagnostic: false,
                 },
             ],
         ] {

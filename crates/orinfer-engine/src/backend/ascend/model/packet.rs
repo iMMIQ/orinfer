@@ -537,7 +537,9 @@ impl Worker {
         path: &Path,
         visual_rows: &[super::vision::Overlay],
     ) -> Result<()> {
-        let trace = (self.rank == 0).then_some(path);
+        let trace = (self.rank == 0
+            || std::env::var_os("ORINFER_A2_BATCH_TRACE_ALL_RANKS").is_some())
+        .then_some(path);
         for step in execution
             .body
             .iter()

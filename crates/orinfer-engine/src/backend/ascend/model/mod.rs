@@ -298,6 +298,11 @@ enum Instruction {
     Snapshot {
         name: String,
         buffer: String,
+        /// Fixed-size routing metadata is independent of packet token rows.
+        #[serde(default)]
+        fixed_rows: bool,
+        #[serde(default)]
+        diagnostic: bool,
     },
 }
 #[derive(Clone)]
@@ -678,7 +683,13 @@ impl Worker {
                 }
                 _ => {}
             }
-            if let Instruction::Snapshot { name, buffer } = instruction {
+            if let Instruction::Snapshot {
+                name,
+                buffer,
+                fixed_rows,
+                ..
+            } = instruction
+            {
                 // Snapshots only observe device state for tracing; without
                 // tracing the step is inert and kernels merge across it.
                 if snapshots {
@@ -688,7 +699,7 @@ impl Worker {
                         name: name.clone(),
                         buffer: {
                             let b = get(&self.buffers, buffer)?;
-                            if current_layout.is_some() {
+                            if current_layout.is_some() && !fixed_rows {
                                 b.slice(0, b.bytes() / capacity * active_rows)?
                             } else {
                                 b

@@ -186,6 +186,7 @@ impl Team {
                 .as_deref(),
         )?;
         let ranks = std::mem::take(&mut model.ranks);
+        let snapshots = std::env::var_os("ORINFER_A2_BATCH_TRACE").is_some();
         let cpus = affinity::from_env(ranks.len())?;
         let started = Instant::now();
         let bootstrap = Session::new(0, Limits::default())?;
@@ -249,7 +250,7 @@ impl Team {
                         )?;
                         session.set_graphs_enabled(graphs_enabled);
                         Worker::load(
-                            session, &root, rank, &model, &model_dir, &package, layout, false,
+                            session, &root, rank, &model, &model_dir, &package, layout, snapshots,
                             &shared,
                         )
                     })();
