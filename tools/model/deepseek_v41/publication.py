@@ -8,6 +8,7 @@ import tempfile
 
 from tools.build.elf import strip_library
 from tools.build.files import atomic_json, file_hash
+from tools.build.shared_json import decode
 from tools.model.publication import AssetReader, source_path
 from tools.operators.ascend.toolchain import require_cann92
 
@@ -80,13 +81,20 @@ def prepare_execution(model, source, stage):
 
 
 def publish_execution(
-    source, cache, *, packet_boundary=None, verification_capacity=None, model_dir=None
+    source,
+    cache,
+    *,
+    packet_boundary=None,
+    verification_capacity=None,
+    model_dir=None,
+    compact_rope=False,
+    engine=None,
 ):
     source, cache = Path(source).resolve(strict=True), Path(cache)
     package = json.loads((source / "package.json").read_text())
     if package.get("schema_version") != 1 or package.get("backend") != "ascend":
         raise ValueError("Expected native A2 schema-1 execution package")
-    model = json.loads(AssetReader(source).read(package["plan"]))
+    model = decode(json.loads(AssetReader(source).read(package["plan"])))
     if packet_boundary is not None or verification_capacity is not None:
         from tools.model.deepseek_v41.assembly import retarget_packet_boundary, validate_rows
 
@@ -104,6 +112,14 @@ def publish_execution(
         prepare_execution(model, source, stage)
         shutil.copytree(source / "licenses", stage / "licenses")
         digest = file_hash(stage / "package.json")
+        if compact_rope:
+            from tools.model.deepseek_v41.compact import compact
+
+            if engine is None:
+                raise ValueError("Compact RoPE publication requires --engine")
+            encoded_source = stage.with_name(digest)
+            stage.rename(encoded_source)
+            return compact(encoded_source, cache, engine)
         destination = cache / digest
         if destination.exists():
             raise ValueError("Execution package already published")
@@ -118,6 +134,8 @@ def main():
     parser.add_argument("--packet-boundary", type=int, nargs=2, metavar=("OLD", "NEW"))
     parser.add_argument("--verification-capacity", type=int)
     parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--compact-rope", action="store_true")
+    parser.add_argument("--engine", type=Path, help="Engine with installation asset generation")
     args = parser.parse_args()
     print(
         publish_execution(
@@ -126,6 +144,8 @@ def main():
             packet_boundary=args.packet_boundary,
             verification_capacity=args.verification_capacity,
             model_dir=args.model_dir,
+            compact_rope=args.compact_rope,
+            engine=args.engine,
         )
     )
 

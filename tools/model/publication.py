@@ -16,6 +16,26 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def generated_outputs(directory):
+    """Installed derived files are rebuilt on install, not redistributed."""
+    manifest = Path(directory) / "package.json"
+    if not manifest.exists():
+        return set()
+    outputs = set()
+    for asset in json.loads(manifest.read_text()).get("generated_assets", []):
+        name = asset["output"]["file"]
+        if (
+            not name
+            or Path(name).is_absolute()
+            or any(part in ("", ".", "..") for part in name.split("/"))
+        ):
+            raise ValueError("Unsafe generated asset output")
+        if name in outputs:
+            raise ValueError("Duplicate generated asset output")
+        outputs.add(name)
+    return outputs
+
+
 def source_path(base, file):
     path = Path(file)
     if not file or path.is_absolute() or any(p in (".", "..") for p in path.parts):

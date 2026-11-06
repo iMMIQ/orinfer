@@ -52,6 +52,8 @@ pub(crate) struct Package {
     pub(crate) schema_version: u32,
     pub(crate) backend: String,
     pub(crate) plan: FileIdentity,
+    #[serde(default)]
+    pub(crate) generated_assets: Vec<crate::operators::generated::Asset>,
 }
 struct Snapshot {
     id: u64,

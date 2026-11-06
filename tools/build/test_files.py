@@ -72,3 +72,48 @@ class BuildFilesTests(unittest.TestCase):
                     self.assertFalse(available())
                     raise RuntimeError("cancelled")
             self.assertTrue(available())
+
+
+class SharedPlanTests(unittest.TestCase):
+    def test_shared_plan_protocol_preserves_scalar_types_and_repeated_subtrees(self):
+        import json
+        from tools.build.shared_json import decode, encode
+
+        value = {"a": ["op", 1, 1.0], "b": ["op", 1, 1.0]}
+        # This protocol vector is also consumed by the Rust plan decoder test.
+        expected = {
+            "encoding": "shared-json-v1",
+            "nodes": ["op", 1, 1.0, [0, 1, 2], {"a": 3, "b": 3}],
+            "root": 4,
+        }
+        self.assertEqual(json.dumps(encode(value)), json.dumps(expected))
+        self.assertEqual(json.dumps(decode(expected)), json.dumps(value))
+        with self.assertRaisesRegex(ValueError, "precede"):
+            decode({"encoding": "shared-json-v1", "nodes": [[0]], "root": 0})
+
+    def test_rearchiving_an_installed_package_omits_derived_payloads(self):
+        import json
+        import tarfile
+        from tools.model.package import archive as model_archive
+        from tools.release.package import archive as release_archive
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            package = root / ("a" * 64)
+            package.mkdir()
+            (package / "generated.bin").write_bytes(b"large derived output")
+            (package / "patch.xz").write_bytes(b"packed corrections")
+            (package / "package.json").write_text(
+                json.dumps({"generated_assets": [{"output": {"file": "generated.bin"}}]})
+            )
+            for label, encode in [
+                ("model", lambda path: model_archive(package, path)),
+                ("release", lambda path: release_archive(package, path, 0)),
+            ]:
+                path = root / (label + ".tar.xz")
+                encode(path)
+                with tarfile.open(path) as archive:
+                    names = archive.getnames()
+                    self.assertNotIn(package.name + "/generated.bin", names)
+                    self.assertIn(package.name + "/patch.xz", names)
+                self.assertEqual((package / "generated.bin").read_bytes(), b"large derived output")

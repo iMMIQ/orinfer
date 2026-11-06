@@ -191,6 +191,17 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum PackageCommand {
+    /// Offline: encode exact FP32 RoPE assets for compact execution packages.
+    EncodeRope {
+        #[arg(long)]
+        cos: PathBuf,
+        #[arg(long)]
+        sin: PathBuf,
+        #[arg(long)]
+        columns: usize,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Verify and atomically install a .tar.xz or .tar.gz execution package.
     Install {
         archive: PathBuf,
@@ -574,6 +585,17 @@ fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
         } => print_json(orinfer_engine::operators::install::install(
             &archive,
             &cache.unwrap_or_else(orinfer_engine::operators::default_cache),
+        )?),
+        Command::Package {
+            command:
+                PackageCommand::EncodeRope {
+                    cos,
+                    sin,
+                    columns,
+                    output,
+                },
+        } => print_json(orinfer_engine::operators::generated::encode_rope(
+            &cos, &sin, columns, &output,
         )?),
         Command::Info => {
             println!("Orinfer {}", env!("CARGO_PKG_VERSION"));

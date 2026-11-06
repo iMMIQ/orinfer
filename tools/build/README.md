@@ -77,3 +77,22 @@ A2 的 `--operators` 直接接受经 `tools.model.deepseek_v41.publication` 整�
 从 0.1.2 起，引擎使用包含 `.so` 与 cubin 的 schema 1 原生执行包。0.1.1 及更早格式的模型需通过当前构建工具重新发布。当前原生格式的模型可以用[执行库更新工具](../../docs/model-packages.md)生成新目录，保留权重和 kernel 资产。
 
 实际发布时添加 `--publish --notes /path/to/release-notes.md`。工具核对 tag 与源码 revision，推送 tag，创建 GitHub Release，再重新下载并核对所有上传资产的 SHA256。每个 release 以独立版本发布，已发布资产保持原样。
+
+### A2 派生常量的紧凑发布
+
+已发布的 A2 包可保持全部算子、执行计划和运行时 RoPE 字节，改为安装时生成表：
+
+```bash
+uv run --locked python -m tools.model.deepseek_v41.compact \
+  --source /path/to/published-digest-directory \
+  --output-cache artifacts/compact-a2 \
+  --engine /path/to/new/orinfer
+```
+
+现有 `tools.model.deepseek_v41.publication` 也接受 `--compact-rope --engine PATH`。发布包仅携带 FP32 频率位表示和压缩 XOR 校正流；数学近似与校正共同组成版本固定的派生资产编码。`orinfer package install` 在私有临时目录内生成原始 FP32 文件，逐项校验原内容身份，通过全部包校验后原子发布到 cache。生成失败不会发布半成品，也不会覆盖已有包。安装不需要 Python、PyTorch、GPU 或 NPU；正常加载读取已安装文件，推理路径沿用原数值和 Graph 地址契约。
+
+新包保留 schema 1，增加可选 `generated_assets` 契约，需使用支持该契约的新引擎安装。新引擎继续支持原有 `.tar.xz` 和 `.tar.gz` 包。由 `package encode-rope` 提供离线编码入口，Python 构建器仅负责克隆、压缩及内容寻址发布；该命令不进入服务加载流程。完整内容校验仍在安装和独立 `validate-model` 中执行。
+
+紧凑发布同时以 `shared-json-v1` 结构表保存最终执行计划，复用 rank、layer、packet 间完全相同的值；数组顺序、数字类型、参数与 launch 表达式保持不变。安装后的计划仍保持紧凑，加载器按有界无环引用展开一次后交给原模型契约。旧的普通 JSON 计划继续直接读取。离线重建使用保留的原始构建计划；需要检查分发计划时，可通过 `python -m tools.build.shared_json --input PLAN --output EXPANDED --expand` 导出语义相同的普通 JSON，相对资产路径仍按原包目录解释。发布与紧凑工具直接识别这两种计划。
+
+模型归档器与发行归档器从已安装 cache 重新打包时，自动省略 `generated_assets` 声明的生成结果，保留生成配方及校正流，避免把展开的常量表重新放回分发包。

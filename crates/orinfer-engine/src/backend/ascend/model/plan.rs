@@ -4,7 +4,8 @@ use super::*;
 pub(super) fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf, HashLayout)> {
     let path = path.canonicalize().map_err(|e| e.to_string())?;
     let base = path.parent().ok_or("Model plan has no parent")?.to_owned();
-    let mut model: Model = crate::model::read(&path)?;
+    let mut model: Model =
+        crate::operators::shared_json::decode(&std::fs::read(&path).map_err(|e| e.to_string())?)?;
     if model.schema_version != 1
         || model.layers != 40
         || model.ranks.len() != 8

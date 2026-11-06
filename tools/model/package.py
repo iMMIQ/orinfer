@@ -13,7 +13,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.model.publication import AssetReader, source_path
+from tools.model.publication import AssetReader, generated_outputs, source_path
 from tools.build.files import file_hash
 
 
@@ -155,9 +155,14 @@ def archive(package, output):
     if output.exists():
         raise ValueError("Archive already exists")
     temporary = output.with_suffix(output.suffix + ".tmp")
+    omitted = generated_outputs(package)
+
+    def distributed(info):
+        return None if str(Path(info.name).relative_to(package.name)) in omitted else info
+
     try:
         with tarfile.open(temporary, "w:xz", preset=6) as stream:
-            stream.add(package, arcname=package.name)
+            stream.add(package, arcname=package.name, filter=distributed)
         temporary.rename(output)
     except BaseException:
         temporary.unlink(missing_ok=True)

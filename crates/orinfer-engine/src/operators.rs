@@ -12,7 +12,9 @@ use std::{
 };
 
 pub mod dynamic;
+pub mod generated;
 pub mod install;
+pub(crate) mod shared_json;
 
 pub const RUNTIME_ABI: u32 = orinfer_model_sdk::abi::RUNTIME_ABI;
 

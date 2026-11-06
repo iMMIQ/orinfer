@@ -145,8 +145,7 @@ pub(crate) fn validate_package(root: &Path, package: &provider::Package) -> Resu
     if package.schema_version != 1 || package.backend != "ascend" {
         return Err("Invalid native A2 execution package".into());
     }
-    let model: Model =
-        serde_json::from_slice(&read_identity(root, &package.plan)?).map_err(|e| e.to_string())?;
+    let model: Model = crate::operators::shared_json::decode(&read_identity(root, &package.plan)?)?;
     if model.schema_version != 1
         || model.layers != 40
         || model.ranks.len() != 8
@@ -157,7 +156,22 @@ pub(crate) fn validate_package(root: &Path, package: &provider::Package) -> Resu
         return Err("Expected complete 40-layer TP8 A2 plan".into());
     }
     super::plan::preflight(&model, root)?;
+    verify_generated(&model, root, package)?;
     verify_assets(&model, root)
+}
+
+fn verify_generated(model: &Model, root: &Path, package: &provider::Package) -> Result<()> {
+    for asset in &package.generated_assets {
+        asset.verify_recipe(root)?;
+        if !model.rope.values().any(|id| {
+            id.file == asset.output.file
+                && id.sha256 == asset.output.sha256
+                && id.tensor == asset.output.tensor
+        }) {
+            return Err("Generated asset is not a declared RoPE table".into());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate(path: &Path) -> Result<ValidationReport> {
@@ -197,6 +211,7 @@ pub(crate) fn validate(path: &Path) -> Result<ValidationReport> {
     }
     read_identity(&base, &package.plan)?;
     let (plan, base, layout) = load_spec(&resolve_file(&base, &package.plan.file)?, root)?;
+    verify_generated(&plan, &base, &package)?;
     if plan.capacity != model.metadata.max_context {
         return Err("A2 service context contract differs".into());
     }

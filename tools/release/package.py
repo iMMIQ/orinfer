@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # Support direct script invocation before loading project modules.
 sys.path.insert(0, str(ROOT))
 from tools.model.package import execution_identity, install  # noqa: E402
+from tools.model.publication import generated_outputs  # noqa: E402
 from tools.build.files import file_hash  # noqa: E402
 
 
@@ -23,12 +24,15 @@ def command(*args, cwd=ROOT):
 
 
 def archive(directory, output, epoch):
+    omitted = generated_outputs(directory)
     with (
         output.open("xb") as destination,
         lzma.LZMAFile(destination, mode="wb", preset=6) as compressed,
     ):
         with tarfile.open(fileobj=compressed, mode="w") as tar:
             for path in [directory, *sorted(directory.rglob("*"))]:
+                if str(path.relative_to(directory)) in omitted:
+                    continue
                 info = tar.gettarinfo(str(path), arcname=str(path.relative_to(directory.parent)))
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
