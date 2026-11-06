@@ -576,6 +576,23 @@ uv run --locked python -m tools.model.deepseek_v41.w4_scale_release \
 
 导出同步更新 W1 scale 和低 nibble 偏移补偿；舍入候选只替换原 NZ bank 的 W1 区域，W3、W2、算子及全部行数选择保持原契约。纯 scale 候选支持 `--strength` 插值，含整数码修正时使用 `--strength 1`。默认按原语义分片替换张量，未改分片复用硬链接；权重和执行包使用独立目录。`--overlay` 用于快速实验：另写覆盖分片，每个修改后的专家 bank 按层／rank 分片，旧 tensor 仍占磁盘但不加载；最终权重使用默认语义导出。局部误差下降后，仍以独立会话的固定历史 NLL 和真实部署性能决定是否采用。
 
+### A2 Q/KV 精度保护
+
+`tools.model.deepseek_v41.projection_precision` 从官方 FP4/FP8 checkpoint 恢复所选主干 Q/KV 投影，沿源 Ascend 包的 norm、QuaRot 和 SmoothQuant 基生成 BF16 权重，输入直接使用已有 BF16 norm 输出。默认选择全部 40 层的 `wq_a`、`wkv`；`--parts` 和 `--layers` 用于独立评估。主干专家、Q 后续投影、DSpark、INT8 KV 及请求状态保持源包策略。
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices \
+  python3 -m tools.model.deepseek_v41.projection_precision \
+  --source /path/to/release --source-execution /path/to/execution-cache \
+  --official /path/to/official-checkpoint --integer-source /path/to/ascend-checkpoint \
+  --output /path/to/new-weights --execution-output /path/to/new-execution-cache \
+  --build-dir artifacts/a2-qkv-precision --workers 4
+```
+
+恢复使用官方解码值及原始 norm 权重；Q 额外保留低秩输出端的 block32 移位旋转，再抵消现有 SmoothQuant norm 中的缩放，最终舍入为 BF16。已有 INT8 展开后的数值只用于检查变换基是否匹配。普通、混合、验证和分片 packet 复用现有 `dense.projection` BF16 动态工厂，保留真实行表达式、输出及 scratch 契约；只有确认无后续消费者时才移除原 A8 量化步骤。构建同时重建同一工厂的未改动消费者，保留其算术和调度参数，保证发布包源码身份一致。
+
+`--overlay` 提供独立的快速实验包，按四层打包覆盖权重；默认按原语义分片替换张量。两种模式与 W4 校准共用 `TensorRelease`，权重和执行资产仍分别导出。最终采用哪组投影，需要结合官方概率偏差、固定历史 NLL、任务质量、实际权重及对齐开销、完整请求性能评估。
+
 ### 源码入口
 
 统一源码入口：

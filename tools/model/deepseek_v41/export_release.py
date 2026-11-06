@@ -433,6 +433,147 @@ class Export:
                 path.chmod(0o644)
 
 
+class TensorRelease(Export):
+    """Replace offline tensor payloads, sharing semantic and experimental exports."""
+
+    def __init__(self, *args, overlay=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.overlay = overlay
+        old = json.loads((self.source / "release-manifest.json").read_text())
+        self.old_records = old["files"]
+        package = self.manifest["source_package"]
+        self.manifest.update(deepcopy(old))
+        self.manifest.update(
+            source_package=package, files=deepcopy(self.old_records) if overlay else {}
+        )
+        self.index = deepcopy(self.old_index)
+        self.transforms, self.payloads, self.payload_dtypes, self.override_groups = {}, {}, {}, {}
+        self.rewrite_groups = set()
+
+    def replace_tensor(self, definition, values, *, suffix, dtype=None, group):
+        original = definition["prepared_tensor"]["name"]
+        replacement = original + suffix
+        if original in self.transforms:
+            if self.transforms[original] != replacement:
+                raise ValueError("Inconsistent replacement of a shared weight")
+            previous = self.payloads[replacement]
+            if (
+                previous.shape != values.shape
+                or previous.dtype != values.dtype
+                or (previous is not values and not np.array_equal(previous, values))
+            ):
+                raise ValueError("Shared weight replacement values differ")
+        else:
+            if replacement in self.index["weight_map"]:
+                raise ValueError("Replacement tensor name already exists")
+            self.transforms[original] = replacement
+            self.payloads[replacement] = np.ascontiguousarray(values)
+            self.payload_dtypes[replacement] = dtype or definition["prepared_tensor"]["dtype"]
+            self.override_groups[replacement] = group
+        definition.update(
+            bytes=values.nbytes,
+            prepared_tensor=dict(
+                name=replacement, dtype=self.payload_dtypes[replacement], shape=list(values.shape)
+            ),
+        )
+
+    def prepare_overrides(self):
+        if self.overlay:
+            for name, values in self.payloads.items():
+                group = self.override_groups[name]
+                self.index["weight_map"][name] = group
+                self.groups[group].append(
+                    (
+                        name,
+                        dict(
+                            dtype=self.payload_dtypes[name],
+                            shape=list(values.shape),
+                            bytes=values.nbytes,
+                            source=dict(replacement=name),
+                        ),
+                    )
+                )
+        else:
+            for group, record in self.old_records.items():
+                path = self.source / group
+                start, header = local_header(path)
+                for name in sorted(record["tensors"], key=lambda n: header[n]["data_offsets"][0]):
+                    spec = header[name]
+                    entry = dict(
+                        dtype=spec["dtype"],
+                        shape=spec["shape"],
+                        bytes=spec["data_offsets"][1] - spec["data_offsets"][0],
+                        source=dict(file=str(path), offset=start + spec["data_offsets"][0]),
+                    )
+                    if name in self.transforms:
+                        replacement = self.transforms[name]
+                        values = self.payloads[replacement]
+                        self.index["weight_map"][replacement] = self.index["weight_map"].pop(name)
+                        entry.update(
+                            dtype=self.payload_dtypes[replacement],
+                            shape=list(values.shape),
+                            bytes=values.nbytes,
+                            source=dict(replacement=replacement),
+                        )
+                        name = replacement
+                        self.rewrite_groups.add(group)
+                    self.groups[group].append((name, entry))
+            for name, values in self.payloads.items():
+                if name in self.index["weight_map"]:
+                    continue
+                group = self.override_groups[name]
+                self.index["weight_map"][name] = group
+                self.groups[group].append(
+                    (
+                        name,
+                        dict(
+                            dtype=self.payload_dtypes[name],
+                            shape=list(values.shape),
+                            bytes=values.nbytes,
+                            source=dict(replacement=name),
+                        ),
+                    )
+                )
+                self.rewrite_groups.add(group)
+
+    def add_tensor(self, name, values, *, dtype, group):
+        if name in self.index["weight_map"] or name in self.payloads:
+            raise ValueError("Additional tensor name already exists")
+        self.payloads[name] = np.ascontiguousarray(values)
+        self.payload_dtypes[name] = dtype
+        self.override_groups[name] = group
+
+    def chunks(self, entry):
+        name = entry["source"].get("replacement")
+        if name is None:
+            yield from super().chunks(entry)
+        else:
+            raw = memoryview(self.payloads[name]).cast("B")
+            for first in range(0, len(raw), CHUNK):
+                yield raw[first : first + CHUNK]
+
+    def write_shard(self, group):
+        if self.overlay or group in self.rewrite_groups:
+            return super().write_shard(group)
+        target = self.output / group
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.hardlink_to(self.source / group)
+        return group, deepcopy(self.old_records[group])
+
+    def export(self, workers):
+        if not self.overlay:
+            return super().export(workers)
+        self.output.mkdir(parents=True, exist_ok=False)
+        for group in self.old_records:
+            target = self.output / group
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.hardlink_to(self.source / group)
+        for group in self.groups:
+            name, record = self.write_shard(group)
+            self.manifest["files"][name] = record
+        self.finish()
+
+
 def verify_release(output, workers=4, execution_output=None):
     output = Path(output)
     manifest = json.loads((output / "release-manifest.json").read_text())

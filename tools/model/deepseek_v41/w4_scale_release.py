@@ -1,15 +1,13 @@
 """Export calibrated W4 codes/scales in the existing layout and native programs."""
 
 import argparse
-from copy import deepcopy
 import json
 from pathlib import Path
 import re
 
 import numpy as np
 
-from tools.model.deepseek_v41.export_release import Export, CHUNK
-from tools.model.safetensors_source import local_header
+from tools.model.deepseek_v41.export_release import TensorRelease
 from tools.model.deepseek_v41.weight_layout import transposed_nz_blocks
 
 
@@ -75,26 +73,15 @@ def reconstruct_gate_bank(bank, replacements):
     return bank, changed
 
 
-class ScaleRelease(Export):
+class ScaleRelease(TensorRelease):
     def __init__(self, *args, fitted, layers, strength=1.0, overlay=False, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, overlay=overlay, **kwargs)
         self.fitted, self.layers = Path(fitted), sorted(set(layers))
         self.strength, self.overlay = strength, overlay
         if not self.layers or any(not 0 <= l < 40 for l in self.layers) or not 0 < strength <= 1:
             raise ValueError("Select target layers and a strength within (0,1]")
-        self.payloads = {}
-        self.override_groups, self.payload_dtypes = {}, {}
 
     def plan(self):
-        old = json.loads((self.source / "release-manifest.json").read_text())
-        self.old_records = old["files"]
-        package = self.manifest["source_package"]
-        self.manifest.update(deepcopy(old))
-        self.manifest.update(
-            source_package=package, files=deepcopy(self.old_records) if self.overlay else {}
-        )
-        self.index = deepcopy(self.old_index)
-        self.transforms, self.rewrite_groups = {}, set()
         selected = 0
         changed_banks = 0
         for ri, rank in enumerate(self.model["ranks"]):
@@ -149,56 +136,15 @@ class ScaleRelease(Export):
                 values_to_write[:2] = [scales, assist]
                 selected += count
                 for bank, values in zip(banks, values_to_write, strict=True):
-                    original_name = bank["prepared_tensor"]["name"]
-                    replacement = original_name + ".w4_calibrated"
-                    if replacement in self.index["weight_map"]:
-                        raise ValueError("Calibrated tensor name already exists")
-                    self.transforms[original_name] = replacement
-                    self.payloads[replacement] = values
-                    self.payload_dtypes[replacement] = bank["prepared_tensor"]["dtype"]
-                    bank["prepared_tensor"]["name"] = replacement
-                    if self.overlay:
-                        group = (
-                            f"weights/calibration/layer{layer}/rank{ri}.safetensors"
-                            if values.dtype.itemsize == 1
-                            else "weights/calibration/w1-scales.safetensors"
-                        )
-                        self.override_groups[replacement] = group
-                        self.index["weight_map"][replacement] = group
+                    group = (
+                        f"weights/calibration/layer{layer}/rank{ri}.safetensors"
+                        if values.dtype.itemsize == 1
+                        else "weights/calibration/w1-scales.safetensors"
+                    )
+                    self.replace_tensor(bank, values, suffix=".w4_calibrated", group=group)
         if not selected:
             raise ValueError("No selected W4 scale changes")
-        if self.overlay:
-            for name, values in self.payloads.items():
-                self.groups[self.override_groups[name]].append(
-                    (
-                        name,
-                        dict(
-                            dtype=self.payload_dtypes[name],
-                            shape=list(values.shape),
-                            bytes=values.nbytes,
-                            source=dict(calibrated=name),
-                        ),
-                    )
-                )
-        else:
-            for group, record in self.old_records.items():
-                path = self.source / group
-                start, header = local_header(path)
-                for name in sorted(record["tensors"], key=lambda n: header[n]["data_offsets"][0]):
-                    spec = header[name]
-                    entry = dict(
-                        dtype=spec["dtype"],
-                        shape=spec["shape"],
-                        bytes=spec["data_offsets"][1] - spec["data_offsets"][0],
-                        source=dict(file=str(path), offset=start + spec["data_offsets"][0]),
-                    )
-                    if name in self.transforms:
-                        replacement = self.transforms[name]
-                        self.index["weight_map"][replacement] = self.index["weight_map"].pop(name)
-                        entry["source"] = dict(calibrated=replacement)
-                        name = replacement
-                        self.rewrite_groups.add(group)
-                    self.groups[group].append((name, entry))
+        self.prepare_overrides()
         self.manifest["w4_calibration"] = dict(
             layers=self.layers,
             selected_experts=selected,
@@ -211,37 +157,6 @@ class ScaleRelease(Export):
             programs_unchanged=True,
         )
         return self
-
-    def chunks(self, entry):
-        name = entry["source"].get("calibrated")
-        if name is None:
-            yield from super().chunks(entry)
-        else:
-            raw = memoryview(np.ascontiguousarray(self.payloads[name])).cast("B")
-            for first in range(0, len(raw), CHUNK):
-                yield raw[first : first + CHUNK]
-
-    def write_shard(self, group):
-        if self.overlay or group in self.rewrite_groups:
-            return super().write_shard(group)
-        target = self.output / group
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.hardlink_to(self.source / group)
-        return group, deepcopy(self.old_records[group])
-
-    def export(self, workers):
-        if self.overlay:
-            self.output.mkdir(parents=True, exist_ok=False)
-            for group in self.old_records:
-                target = self.output / group
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.hardlink_to(self.source / group)
-            for group in self.groups:
-                name, record = self.write_shard(group)
-                self.manifest["files"][name] = record
-            self.finish()
-        else:
-            super().export(workers)
 
 
 def main():
