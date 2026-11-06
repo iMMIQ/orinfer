@@ -58,7 +58,14 @@ pub(super) fn weight_layouts(
         bytes = bytes
             .checked_add(definition.bytes)
             .ok_or("Weight arena extent overflow")?;
-        group.push((definition.name.as_str(), definition.bytes, 512));
+        // HUGE_FIRST places large standalone weights on large-page boundaries.
+        // Preserve that property inside the shared allocation as well.
+        let alignment = if definition.bytes >= 2 << 20 {
+            2 << 20
+        } else {
+            512
+        };
+        group.push((definition.name.as_str(), definition.bytes, alignment));
     }
     if !group.is_empty() {
         layouts.push(crate::backend::arena::ArenaLayout::from_sizes(

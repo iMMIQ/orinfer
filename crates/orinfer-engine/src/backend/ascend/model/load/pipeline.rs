@@ -157,6 +157,9 @@ mod tests {
         assert_eq!(session.allocated_bytes(), layouts[0].allocation_bytes);
         for buffer in buffers.values() {
             assert_eq!(buffer.pointer() as usize % 512, 0);
+            if buffer.bytes() >= 2 << 20 {
+                assert_eq!(buffer.pointer() as usize % (2 << 20), 0);
+            }
         }
         let uploads = || {
             vec![

@@ -339,7 +339,7 @@ A2 停机时，常驻 CPU 表等待所有读取者释放后回收，与 rank 和
 
 启动默认检查配置签名、执行库和 kernel 的 ABI，以及权重和 CPU 表的 safetensors 结构、dtype、shape、布局和偏移边界，不计算资产内容 SHA256。`serve`、`run-model` 和 `score-model` 添加 `--verify-weights` 可校验加载的权重内容；`validate-model` 始终完整校验模型权重。检测结构合法但数值受损的权重需开启完整内容校验。
 
-A2 的共享 CPU 表与各 rank 的设备权重并行准备。常驻表使用可失败的零初始化分配，按有界分片并行读取；设备读取复用 CUDA 的文件读取组件，合并连续文件范围并预取到可复用缓冲，再沿现有 stream 上传。原生调用和完成事件仍由所属 rank 持有；失败时等待读取线程退出，已提交 DMA 沿用完成事件及故障隔离规则回收。准备后的模型权重使用对齐 arena，padding 计入显存预算；请求私有状态和动态 KV 继续使用原有独立布局。TP8 加载队列的临时主机缓冲约 1 GiB，另有各 session 的 pinned 预算，全量常驻表单独计费。API READY 等待全部权重、CPU 表、视觉资源和首轮预热完成。
+A2 的共享 CPU 表与各 rank 的设备权重并行准备。常驻表使用可失败的零初始化分配，按有界分片并行读取；设备读取复用 CUDA 的文件读取组件，合并连续文件范围并预取到可复用缓冲，再沿现有 stream 上传。原生调用和完成事件仍由所属 rank 持有；失败时等待读取线程退出，已提交 DMA 沿用完成事件及故障隔离规则回收。准备后的模型权重使用对齐 arena，至少 2 MiB 的张量保留 2 MiB 大页边界，其余张量按 512 字节对齐；padding 计入显存预算。请求私有状态和动态 KV 继续使用原有独立布局。TP8 加载队列的临时主机缓冲约 1 GiB，另有各 session 的 pinned 预算，全量常驻表单独计费。API READY 等待全部权重、CPU 表、视觉资源和首轮预热完成。
 
 HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU worker 上创建和释放；两者成功并核对声明的前端身份与词表后才就绪。`WORKER READY` 分别记录前端、模型与并行准备总耗时，`API READY` 的 `startup` 包含前端和 HTTP 初始化。`LOAD STAGES` 提供 CUDA 初始化、buffer 分配、权重流水线等待和算子资产准备计时；`kernel_assets_s` 包含在 `module_load_bind_s` 中，权重等待计时包含在 `weight_upload_s` 中；总耗时按外层计时读取。完整进程到首输出的测量见[性能工具](../tools/bench/README.md)。
 
