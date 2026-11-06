@@ -1,23 +1,31 @@
 # DSv4.1 A2 部署
 
-v0.3.1-fix1 支持 CANN 9.2、Ascend 910B TP8 的文本、HTTP/SSE、连续 batch、DSpark、设备及 CPU prefix cache，以及 DSML 工具与 thinking 历史。匹配视觉执行包及视觉权重后支持单图、多图和 OpenCode 读图工具交互。引擎与执行包分别安装，模型目录提供对应的前端和权重。支持范围见[模型包说明](model-packages.md#a2-文本服务与长上下文)。性能按实际工作负载与基线比较。DSH 接入方式见 [DeepSeek Harness](deepseek-harness.md)。
+v0.3.2 支持 glibc 2.34 及以上、CANN 9.2、Ascend 910B TP8 的文本、HTTP/SSE、连续 batch、DSpark、设备及 CPU prefix cache，以及 DSML 工具与 thinking 历史。匹配视觉执行包及视觉权重后支持单图、多图和 OpenCode 读图工具交互。引擎与执行包分别安装，模型目录提供对应的前端和权重。支持范围见[模型包说明](model-packages.md#a2-文本服务与长上下文)。性能按实际工作负载与基线比较。DSH 接入方式见 [DeepSeek Harness](deepseek-harness.md)。
 
 ## 安装与升级
 
-解压 `orinfer-v0.3.1-fix1-linux-aarch64.tar.xz`，使用其中的二进制安装匹配的执行包：
+解压 `orinfer-v0.3.2-linux-aarch64.tar.xz`，使用其中的二进制安装匹配的执行包：
 
 ```bash
 bin/orinfer --version
 bin/orinfer package install \
-  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.1-fix1.tar.xz \
+  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.2.tar.xz \
   --cache /srv/orinfer/execution-cache
 ```
+
+本版 A2 执行包 digest 为 `8931eb00b3221fee90ca2469322bd65e7ffab414bff8369f719818eaefc5d1f0`，包含已验收的 mHC 融合与 192 行 decoder 验证容量。自动 DSpark 默认最多 5 个草稿，32 路请求可按成本选择同一动态验证实现。正常部署使用 `--max-speculative-tokens 0`，由执行包提供验证预算。
+
+已有 v0.3.1/fix1 模型的权重保持不变。通过 Hugging Face 模型仓库的 `v0.3.2` revision 下载配套元数据，确保 `cache/model.json` 声明上述 digest；旧 revision 与执行包仍可用于回滚。算子与执行计划继续单独安装。
 
 工具前端需要模型 `cache/model.json` 声明 `metadata.chat_format=deepseek_v41`。已有模型可通过包内离线工具生成新目录，保留旧目录用于回滚；同一文件系统上的权重使用硬链接：
 
 ```bash
 uv run --locked python -m tools.model.deepseek_v41.service --frontend-only \
-  --model-dir /data/model/current --output /data/model/dsv41-v0.3.1
+  --model-dir /data/model/current --output /data/model/dsv41-v0.3.2
+
+hf download immiq/DeepSeek-V4.1-Flash-1017-Orinfer-A2-W4A8 \
+  cache/model.json README.md publication.json SHA256SUMS \
+  --revision v0.3.2 --local-dir /data/model/dsv41-v0.3.2
 ```
 
 该命令只更新工具前端；启用图片还需包含 `vision.safetensors` 的模型目录和声明原生视觉程序的执行包。视觉分片使用与语言权重相同的 Ascend 预处理基，算子和执行计划保留在独立执行包中。离线工具的 Python 环境在源码目录执行 `make python-env` 准备。在线服务使用 Rust 二进制。正常加载校验结构和范围，内容完整性由独立 `validate-model` 命令校验。权重、执行包和 DSpark 成本配置的既有完整性验收在身份相同时复用。
@@ -36,9 +44,10 @@ export ORINFER_VISION_CACHE_MIB=1024
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_NPU_SOCKET_PORT_RANGE=auto
 
-bin/orinfer serve /data/model/dsv41-v0.3.1 \
+bin/orinfer serve /data/model/dsv41-v0.3.2 \
   --model deepseek-v4.1 --listen 127.0.0.1:8088 \
-  --mtp-drafts auto --prefix-cache-mib 8192 --kv-offload-mib 262144 \
+  --mtp-drafts auto --max-speculative-tokens 0 --graph full \
+  --prefix-cache-mib 8192 --kv-offload-mib 262144 \
   --request-body-mib 64 \
   --queue-timeout-ms 60000 --output-timeout-ms 180000 --drain-timeout-ms 120000
 ```
@@ -51,7 +60,7 @@ bin/orinfer serve /data/model/dsv41-v0.3.1 \
 
 需要精确字段或机器读取输出时，显式使用严格的 `response_format: {type: "json_schema", ...}` 和本任务字段 schema。语法约束保证合法格式，字段语义通过任务答案另行验收。自由文本保留模型实际输出，调用方按业务要求检查格式。
 
-模型容量为 262144 tokens，输入与输出合计受此上限约束。历史压力测试中 128K/256K 冷请求曾触及 210 秒客户端期限，成功完成的压力样本最长约 196K；容量不构成延迟承诺。交互入口先使用 32K 上下文预算，较长请求在网关独立准入；客户端及网关可从 300 秒总期限起配置，长上下文通道可从 600 秒起配置，并根据部署实测调整。示例服务为长请求保留 300 秒输出等待期限；仅服务短上下文时可缩短为 60 秒。总期限与 SSE 空闲期限分别设置，取消时关闭上游连接，限制自动重试，避免高负载下重复放大请求。
+模型容量为 262144 tokens，输入与输出合计受此上限约束。历史压力测试中 128K/256K 冷请求曾触及 210 秒客户端期限，成功完成的压力样本最长约 196K；容量不构成延迟承诺。交互入口先使用 32K 上下文预算，较长请求在网关独立准入；客户端及网关可从 300 秒总期限起配置，长上下文通道可从 600 秒起配置，并根据部署实测调整。示例服务保留 180 秒输出等待期限，长上下文通道可提高到 300 秒；仅服务短上下文时可缩短为 60 秒。总期限与 SSE 空闲期限分别设置，取消时关闭上游连接，限制自动重试，避免高负载下重复放大请求。
 
 `/health` 提供就绪、失败、活跃及排队信息。发布后观察非预期 5xx、进程退出、请求卡住、队列恢复和资源预算；将限流、排队期限、主动断连与运行时错误分别统计。服务处理 SIGTERM 并释放资源；外部进程管理器的停止期限应大于 120 秒。
 

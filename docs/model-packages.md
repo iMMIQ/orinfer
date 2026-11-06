@@ -739,7 +739,7 @@ DSpark 需要本次引擎及配套执行包；v0.3.0 target 包继续使用普�
 
 已有动态 target 家族的选择边界可通过 `--packet-boundary OLD NEW --model-dir MODEL_DIR` 离线调整。例如 `--packet-boundary 512 128` 让原有 query／序列分片模板从 128 个聚合 token 行开始执行。整理器要求各 rank 的两个家族相邻、容量及覆盖范围一致，保留两侧完整程序、算子与请求状态绑定，再校验动态行表达式及物理范围。新包的 digest 需同步写入模型描述。边界按完整请求测量选择；此操作复用已编译的动态算子。
 
-DSpark 自动验证的整个 packet（含混合 prefill 行）止于首个包含跨卡交换的 target 家族之前。`--max-speculative-tokens` 设置该范围内的验证行数上限，显式增大也遵守执行包的通信边界；例如首个交换家族从 128 行开始时，实际自动验证最多 127 行。草稿深度继续由自动策略选择；独立 prefill 沿用原有大行数执行计划。
+A2 执行包可通过 `batch.verification_capacity` 声明 decoder 验证行预算，包含每个 owner 的 anchor 和草稿行；0.3.2 发布包声明 192 行，支持 32 路各 5 个草稿的容量。`--max-speculative-tokens 0` 采用包声明的预算，显式非零设置进一步收紧该预算。混合包的 prefill 行与 decoder 验证行分别计入原有 packet 和验证容量，复用相同动态算子。未声明该字段的旧包沿用首个交换家族之前的限制，例如 128 行边界对应 127 行。草稿深度继续由自动策略按成本选择；独立 prefill 沿用原有大行数执行计划。
 
 安装 v0.3.0 的 A2 包：
 
