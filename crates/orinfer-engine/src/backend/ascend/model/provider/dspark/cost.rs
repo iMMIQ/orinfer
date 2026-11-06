@@ -237,17 +237,6 @@ impl Model {
         work: Work,
         replay: bool,
     ) -> Option<Prediction> {
-        self.predict_mode_scoped(stage, block, full, work, replay, false)
-    }
-    fn predict_mode_scoped(
-        &self,
-        stage: Stage,
-        block: usize,
-        full: bool,
-        work: Work,
-        replay: bool,
-        comparable: bool,
-    ) -> Option<Prediction> {
         let requested = family(stage, block, full, work);
         // Select a context/prompt-work neighborhood before interpolating rows.
         let group = self
@@ -263,14 +252,6 @@ impl Model {
                     // multiply a single-owner observation across a distant
                     // batch; leave that cost unknown for bounded calibration.
                     && work.rows <= rows.saturating_mul(2)
-                    && (!comparable
-                        || f.4.ilog2().abs_diff(requested.4.ilog2()) <= 1
-                            && f.5.abs_diff(requested.5) <= 1
-                            // Producer and final-window packets can differ in
-                            // decoder work even in the same prompt-size bin.
-                            && (!requested.3 || *rows == work.rows)
-                            && (*rows).max(work.rows)
-                                <= (*rows).min(work.rows).max(1).saturating_mul(2))
             })
             .min_by_key(|Key(f, rows, _)| {
                 (
@@ -410,12 +391,13 @@ impl Model {
             direct_s: self
                 .predict_mode(stage, block, full, work, false)
                 .map(|p| p.seconds),
+            // A larger graph's whole cost remains a conservative pricing prior.
+            // It cannot prove that capturing this smaller work key is slower
+            // than direct execution. Only the same work key prices payback.
             replay_s: self
-                // A distant prior still prices unseen work, but cannot prove
-                // that a new local Graph would be slower. Leave it unknown so
-                // repeated packets can use the existing bounded capture probe.
-                .predict_mode_scoped(stage, block, full, work, true, true)
-                .map(|p| p.seconds),
+                .cells
+                .get(&Key(family(stage, block, full, work), work.rows, true))
+                .map(Cell::mean),
             capture_s: self.cold_estimate(stage, block, work, true),
             slack_s,
             trace: self.trace,
@@ -633,7 +615,7 @@ mod tests {
                     .profitable(0)
             );
 
-            // Nearby observations retain their cost and payback decision.
+            // Nearby rows still price execution, without denying a local probe.
             model.insert(
                 Point {
                     work: Work {
@@ -646,9 +628,57 @@ mod tests {
                 false,
             );
             let budget = model.budget(Stage::Target, 0, false, work, 64., 1.);
-            assert_eq!(budget.replay_s, Some(0.06));
+            assert_eq!(budget.replay_s, None);
             assert!(budget.profitable(0));
         }
+    }
+    #[test]
+    fn larger_draft_graph_does_not_block_a_smaller_local_capture() {
+        let mut model = Model::default();
+        let work = Work {
+            rows: 16,
+            ..Work::default()
+        };
+        for (rows, replay, seconds, setup_s) in [(16, false, 0.014, 0.), (32, true, 0.022, 0.04)] {
+            model.observe(Point {
+                stage: Stage::Draft,
+                block: 5,
+                full: false,
+                replay,
+                work: Work { rows, ..work },
+                seconds,
+                setup_s,
+            });
+        }
+        assert_eq!(
+            model
+                .predict_mode(Stage::Draft, 5, false, work, true)
+                .unwrap()
+                .seconds,
+            0.022
+        );
+        let budget = model.budget(Stage::Draft, 5, false, work, 40., 0.4);
+        assert_eq!(budget.replay_s, None);
+        assert!(budget.profitable(0));
+        assert!(
+            !model
+                .budget(Stage::Draft, 5, false, work, 4., 0.4)
+                .profitable(0)
+        );
+        model.observe(Point {
+            stage: Stage::Draft,
+            block: 5,
+            full: false,
+            replay: true,
+            work,
+            seconds: 0.018,
+            setup_s: 0.04,
+        });
+        assert!(
+            !model
+                .budget(Stage::Draft, 5, false, work, 40., 0.4)
+                .profitable(0)
+        );
     }
     #[test]
     fn prompt_capture_does_not_price_a_producer_from_a_larger_final_window() {

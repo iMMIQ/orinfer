@@ -86,9 +86,9 @@ pub(super) fn plan(
         matches!(s, CacheState::Direct { uses, .. } if *uses >= if repeated { 2 } else { 8 })
     }));
     let budget = budget.map(|mut budget| {
-        // A final prompt window has one use left within its request. Repeated
-        // hits of the same retained packet also establish cross-request reuse;
-        // bound that forecast so cold or changing shapes keep their direct path.
+        // Short tails and final prompt windows have little request-local reuse.
+        // Actual hits of the same retained packet also establish reuse across
+        // cohorts; bound that forecast so cold or changing shapes stay direct.
         let observed = states
             .iter()
             .map(|s| match s {
@@ -97,7 +97,7 @@ pub(super) fn plan(
             })
             .min()
             .unwrap_or(0);
-        if !repeated && observed >= 8 {
+        if observed >= 8 {
             budget.uses = budget.uses.max(f64::from(observed.min(16)) * 2.);
         }
         budget
@@ -275,6 +275,42 @@ mod tests {
                 .unwrap()
                 .mode,
             Mode::BuildDirect
+        );
+    }
+    #[test]
+    fn retained_draft_shape_can_learn_reuse_across_short_cohorts() {
+        let budget = CaptureBudget {
+            uses: 1.,
+            direct_s: Some(0.014),
+            replay_s: None,
+            capture_s: Some(0.04),
+            slack_s: 0.4,
+            trace: false,
+        };
+        let state = |uses| CacheState::Direct {
+            uses,
+            consecutive: 1,
+        };
+        assert_eq!(
+            plan(&[state(7); 8], true, Some(budget)).unwrap().mode,
+            Mode::Direct
+        );
+        assert_eq!(
+            plan(&[state(8); 8], true, Some(budget)).unwrap().mode,
+            Mode::CaptureReplay
+        );
+        assert_eq!(
+            plan(
+                &[state(16); 8],
+                true,
+                Some(CaptureBudget {
+                    slack_s: 0.01,
+                    ..budget
+                })
+            )
+            .unwrap()
+            .mode,
+            Mode::Direct
         );
     }
     #[test]

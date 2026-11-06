@@ -299,6 +299,8 @@ A2 执行包可通过 `batch.verification_capacity` 声明自动草稿分配的 
 
 A2 自动草稿成本模型复用邻近行数的测量；向上预测限定在已测行数的两倍内。更大的未知 batch 使用现有的有界探索预算校准，收益和亏损仍记入同一模型级账户。这样可以避免将小 packet 的固定启动成本按请求数放大，长期阻止较大 batch 获得实测机会。
 
+A2 草稿 Graph 按实际参与草稿的 decoder 请求估算复用次数，整包 decoder 的 deadline 继续约束准备时间。相同缓存形状的真实命中可为跨请求复用提供有界预测；新形状保留直接执行的预热。Graph 捕获收益使用相同工作量的 replay 测量，其他行数的保守价格用于执行成本预测，本地捕获通过受预算约束的探测建立价格。
+
 A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和 PV 计算体，支持每 rank 8/16/32/64 个 head，保留 FP32 softmax 与 BF16 probability 边界。`tools.model.deepseek_v41.fuse_attention --selected-int8 --min-rows N` 按实测聚合行数拆分已有 target 执行域，小行数保留原算子；草稿与普通 decode 沿用各自的计划选择。主干全行与 decoder 保留窗口分别绑定 work 表，在线只消费离线生成的计划。
 
 A2 专家 GMM 可通过 `tools.model.deepseek_v41.expert_fusion` 离线选择已有 target 行数区间，默认 `32..511`。gather 将完整 A8 无损拆成两行 signed INT4，复用发布的 NZ W4 bank 与原生 grouped matmul；GMM 在 FP16 部分积舍入前应用原权重 scale，后处理融合部分积合并、FP32 assist/token scale、BF16 SwiGLU 和 FP32 行量化。`--min-rows`、`--max-rows` 必须覆盖完整的已有 packet 区间；其他 packet、请求状态和权重文件沿用原契约。该计划使用显式 `w4_a4` 指令，需要支持它的引擎。执行包单独发布单位 token scale 常量及临时 workspace，权重包保持原样。

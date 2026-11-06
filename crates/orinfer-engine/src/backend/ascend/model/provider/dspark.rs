@@ -186,14 +186,21 @@ impl Runtime {
             return Err("Insufficient DSpark graph workspace".into());
         }
         let depths = selected.iter().copied().collect::<BTreeMap<_, _>>();
-        let (uses, slack) =
+        // Only these owners execute the draft graph. A final prefill window
+        // or a non-speculating tail cannot shorten its reuse forecast.
+        let draft_owners = selected
+            .iter()
+            .copied()
+            .filter(|&(_, depth)| depth > 0)
+            .collect::<Vec<_>>();
+        let (uses, _) =
+            self.capture_context(&draft_owners, requests, Some(&depths), block, options);
+        // Draft preparation still delays every decoder in the packet.
+        let (_, slack) =
             self.capture_context(&baseline.selected, requests, Some(&depths), block, options);
-        let capture = self.speculation_policy.draft_budget(
-            block,
-            selected.iter().filter(|(_, count)| *count > 0).count(),
-            uses,
-            slack,
-        );
+        let capture = self
+            .speculation_policy
+            .draft_budget(block, draft_owners.len(), uses, slack);
         let (proposals, draft_timing) =
             self.team
                 .forward_with(draft, inputs, false, Some(capture), || {})?;
