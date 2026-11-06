@@ -2,6 +2,8 @@
 
 The service owns the GPU lock. This client never deploys or reconfigures it.
 An interrupted run retains diagnostics and cannot qualify as a benchmark score.
+The wall limit starts at request issue, excluding CLI initialization. Paired
+fresh services use the same source-derived benchmark ID and cache-bust inputs.
 Periodic memory sampling uses proc/status; PSS is collected before replay so
 walking a large model's page tables does not stall its timed work.
 """
@@ -24,7 +26,12 @@ from tools.build.files import atomic_json, file_hash
 
 def command(args):
     return [
+        str(args.harness.parent / "python"),
+        str(Path(__file__).with_name("agentx_entry.py")),
+        "--harness",
         str(args.harness),
+        "--benchmark-id",
+        args.benchmark_id,
         "profile",
         "--url",
         args.url,
@@ -71,7 +78,7 @@ def command(args):
             separators=(",", ":"),
         ),
         "--export-level",
-        "records",
+        "raw",
         "--server-metrics-formats",
         "json",
         "jsonl",
@@ -88,6 +95,16 @@ def fetch(url):
         return response.read().decode()
 
 
+def first_credit_ns(directory):
+    """The first completed record exposes request issue time, excluding CLI startup."""
+    try:
+        with (directory / "profile_export.jsonl").open() as file:
+            line = next(file, "")
+        return json.loads(line)["metadata"]["credit_issued_ns"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("harness", "tokenizer", "dataset", "manifest", "service-model", "output"):
@@ -96,6 +113,9 @@ def main():
     parser.add_argument("--model", default="deepseek-v41-flash-1017-w4a8")
     parser.add_argument("--service-pid", type=int, required=True)
     parser.add_argument("--wall-limit", type=int, default=900)
+    parser.add_argument(
+        "--benchmark-id", help="Fixed cache-bust identity; defaults to source identity"
+    )
     parser.add_argument("--mtp-drafts", type=int, default=0, help="Expected service draft limit")
     parser.add_argument(
         "--enable-thinking", action="store_true", help="Enable thinking for all replay requests"
@@ -147,6 +167,8 @@ def main():
         inputs[name] = digest
     if len(inputs) != 16:
         raise ValueError("Require the sixteen original Mini windows")
+    input_identity = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    args.benchmark_id = args.benchmark_id or "orinfer-mini-" + input_identity[:16]
     args.output.mkdir(parents=True, exist_ok=False)
     lock = args.output.parent / "agentx-mini.lock"
     with lock.open("a") as held:
@@ -172,6 +194,8 @@ def main():
             started_at=datetime.datetime.now().astimezone().isoformat(),
             command=invocation,
             wall_limit_s=args.wall_limit,
+            wall_limit_basis="first_request_credit",
+            benchmark_id=args.benchmark_id,
             mtp_drafts=args.mtp_drafts,
             enable_thinking=args.enable_thinking,
             service_pid=args.service_pid,
@@ -183,14 +207,16 @@ def main():
             service_model_sha256=file_hash(args.service_model / "cache/model.json"),
             manifest_sha256=file_hash(args.manifest),
             inputs=inputs,
-            input_identity=hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest(),
+            input_identity=input_identity,
             health_before=health,
             scope="Fixed Mini-Weka tuning surrogate; interrupted runs have no accepted score",
         )
         atomic_json(args.output / "provenance.json", provenance)
         (args.output / "metrics-before.txt").write_text(fetch(args.url + "/metrics"))
         start = time.monotonic()
+        start_wall = time.time()
         limited = False
+        first_request_ns = None
         with (
             (args.output / "console.log").open("w") as console,
             (args.output / "service-samples.jsonl").open("w") as samples,
@@ -205,11 +231,19 @@ def main():
             try:
                 while child.poll() is None:
                     elapsed = time.monotonic() - start
-                    if elapsed >= args.wall_limit:
+                    first_request_ns = first_request_ns or first_credit_ns(args.output)
+                    request_elapsed = (
+                        time.time() - first_request_ns / 1e9 if first_request_ns else None
+                    )
+                    if request_elapsed is not None and request_elapsed >= args.wall_limit:
                         limited = True
                         os.killpg(child.pid, signal.SIGTERM)
                         break
-                    record = dict(timestamp=time.time(), elapsed_s=elapsed)
+                    if first_request_ns is None and elapsed >= 120:
+                        raise TimeoutError("AgentX issued no completed request within 120 seconds")
+                    record = dict(
+                        timestamp=time.time(), elapsed_s=elapsed, request_elapsed_s=request_elapsed
+                    )
                     sample_start = time.monotonic()
                     try:
                         record["health"] = json.loads(fetch(args.url + "/health"))
@@ -232,6 +266,10 @@ def main():
                         os.killpg(child.pid, signal.SIGKILL)
                 status = child.wait()
         result = dict(exit_code=status, wall_limit_reached=limited, wall_s=time.monotonic() - start)
+        result["first_request_credit_ns"] = first_request_ns
+        if first_request_ns:
+            result["request_wall_s"] = time.time() - first_request_ns / 1e9
+            result["client_initialization_s"] = first_request_ns / 1e9 - start_wall
         try:
             rows = [
                 json.loads(line)

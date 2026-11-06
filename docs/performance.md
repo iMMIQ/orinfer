@@ -2,6 +2,8 @@
 
 本页记录 Jetson AGX Orin 64GB / CUDA SM87 和 Ascend 910B3 上的实测参考，各节注明设备与测量日期。2026-10-12 的 Orin 为 MAXN 模式、GPU 频率 1300.5 MHz；测试保持原有全局功耗和频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
 
+[Mini-Weka 调优短测](../tools/bench/agentx_mini.py) 从首个请求发放开始计算 `--wall-limit`，客户端初始化另行记录。配对比较在各自的新服务进程中使用相同源窗口、参数及由源身份生成的 `--benchmark-id`，使 AgentX 的 cache-bust 提示前缀保持一致；同进程重复执行按热缓存场景记录。原始请求导出保留实际输入；共同片段按轨迹、访问批次、主／子 agent 及内层位置对齐。分析分别报告预热、prefill、decode、混合执行及准备开销，单列纯 decode 窗口。达到短测上限的回放保留诊断数据，完成数量和累计输出率以实际请求窗口比较，完整任务分数需由完整回放验收。
+
 ## DSv4.1 A2 单流 decode（2026-10-28）
 
 八卡 Ascend 910B3、TP8，使用 DSv4.1 Flash-1017 原始 W4A8 checkpoint 和完整 40 层 `bench-ascend`。当前编译和运行统一使用 CANN 9.2，TileLang-Ascend 前端固定为 0.1.4（`d182ae8`）；下列历史测量包含 CANN 9.1 编译、CANN 9.2 运行的产物，其成绩保持原测试范围。保持原始 W4 bank、scale 和 assist，在线直接读取准备好的物理布局。
