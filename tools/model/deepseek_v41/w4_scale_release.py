@@ -11,8 +11,10 @@ from tools.model.deepseek_v41.export_release import TensorRelease
 from tools.model.deepseek_v41.weight_layout import transposed_nz_blocks
 
 
-def reconstruct_scales(scales, assist, fitted, sums, *, strength=1.0, changed_codes=None):
-    """Replace W1 scale words and nibble-offset compensation, preserving W3 bits."""
+def reconstruct_scales(
+    scales, assist, fitted, sums, *, strength=1.0, changed_codes=None, section=0
+):
+    """Replace one fused projection's scale and nibble-offset compensation."""
     scales, assist = np.array(scales), np.array(assist)
     fitted, sums = np.asarray(fitted), np.asarray(sums)
     if (
@@ -24,10 +26,11 @@ def reconstruct_scales(scales, assist, fitted, sums, *, strength=1.0, changed_co
         or scales.shape[2] % 2
     ):
         raise ValueError("Released W4 scale/assist geometry differs")
-    if np.any(scales >> 32) or not 0 < strength <= 1:
+    if np.any(scales >> 32) or not 0 < strength <= 1 or section not in (0, 1):
         raise ValueError("Require low FP32 scale bits and strength within (0,1]")
     width = scales.shape[2] // 2
-    original = scales[:, 0, :width].astype("<u4").view("<f4")
+    columns = slice(section * width, (section + 1) * width)
+    original = scales[:, 0, columns].astype("<u4").view("<f4")
     if (
         fitted.shape != original.shape
         or sums.shape != original.shape
@@ -47,9 +50,9 @@ def reconstruct_scales(scales, assist, fitted, sums, *, strength=1.0, changed_co
         if changed_codes.shape != changed.shape or changed_codes.dtype != np.dtype("bool"):
             raise ValueError("Changed-code mask must match W1 output channels")
         changed |= changed_codes
-    scales[:, 0, :width] = fitted.view("<u4").astype("<u8")
+    scales[:, 0, columns] = fitted.view("<u4").astype("<u8")
     bias = (sums.astype("f4") * np.float32(8)) * fitted
-    assist[:, :width][changed] = bias[changed]
+    assist[:, columns][changed] = bias[changed]
     return scales, assist, int(np.any(changed, axis=1).sum())
 
 

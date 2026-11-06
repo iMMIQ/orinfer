@@ -13,22 +13,39 @@ from tools.model.deepseek_v41.vision_attach import hardlinks
 from tools.model.publication import source_path
 
 
-def instrument(model, read_spec, *, layers=None, labels=None, expert_rows=None):
+def instrument(model, read_spec, *, layers=None, labels=None, expert_rows=None, roles=("target",)):
     """Retain numerical instructions; serialize branches for host snapshots."""
     model = deepcopy(model)
     layers = None if layers is None else set(layers)
     labels = None if labels is None else re.compile(labels)
+    roles = set(roles)
+    if not roles or not roles <= {"target", "draft"}:
+        raise ValueError("Select target and/or draft trace roles")
     if expert_rows is not None and expert_rows < 1:
         raise ValueError("Expert snapshot row limit must be positive")
     specs, points = {}, []
     for rank in model["ranks"]:
         definitions = {d["name"]: d for d in rank["buffers"]}
         for packet_index, packet in enumerate(rank["packets"]):
-            if packet.get("role", "target") != "target":
+            role = packet.get("role", "target")
+            if role not in roles:
                 continue
             capacity = packet["rows"]
+            selected = None
+            routing = None
+            for instruction in packet["body"]:
+                if instruction["op"] == "kernel":
+                    path = instruction["manifest"]
+                    if path not in specs:
+                        specs[path] = read_spec(path)
+                    description = specs[path]
+                    if description["op"] == "routing.route":
+                        selected = description["parameters"]["selected"]
+                        routing = {k: description["parameters"][k] for k in ("selected", "experts")}
+                        break
             layer = None
             steps = []
+            head_observed = set()
 
             def observe(label, buffer, *, fixed=False, projection=None):
                 if layers is not None and layer not in layers:
@@ -38,7 +55,12 @@ def instrument(model, read_spec, *, layers=None, labels=None, expert_rows=None):
                 definition = definitions[buffer]
                 captured_rows = None
                 if expert_rows is not None and label.startswith("expert.up."):
-                    routed_capacity = capacity * 6
+                    # Legacy unfused plans infer the same row multiplier from
+                    # their declared projection, rather than a model constant.
+                    multiplier = selected or step.get("rows", 0) // capacity
+                    if not multiplier:
+                        raise ValueError("Expert trace requires declared routed row geometry")
+                    routed_capacity = capacity * multiplier
                     if definition["bytes"] % routed_capacity:
                         raise ValueError("Expert snapshot requires a whole routed row stride")
                     captured_rows = min(expert_rows, routed_capacity)
@@ -64,6 +86,8 @@ def instrument(model, read_spec, *, layers=None, labels=None, expert_rows=None):
                     rank=rank["rank"],
                     packet=packet_index,
                     capacity=capacity,
+                    role=role,
+                    draft_block=packet.get("coordinates", {}).get("draft_block"),
                     name=name,
                     buffer=buffer,
                     definition=definition,
@@ -71,6 +95,8 @@ def instrument(model, read_spec, *, layers=None, labels=None, expert_rows=None):
                 )
                 if projection is not None:
                     point["projection"] = projection
+                if routing is not None:
+                    point["routing"] = routing
                 if captured_rows is not None:
                     point["captured_rows"] = captured_rows
                 points.append(point)
@@ -96,18 +122,20 @@ def instrument(model, read_spec, *, layers=None, labels=None, expert_rows=None):
                         specs[path] = read_spec(path)
                     spec, args = specs[path], step["buffers"]
                     for name in args:
-                        match = re.search(r"(?:parts\.)?w\.layers\.(\d+)\.", name)
+                        match = re.search(r"(?:parts\.)?w\.(layers|mtp)\.(\d+)\.", name)
                         if match:
-                            layer = int(match[1])
+                            layer = int(match[2]) + (40 if match[1] == "mtp" else 0)
                             break
-                    if layer is None or any("dspark" in name for name in args):
+                    if layer is None or (
+                        role == "target" and any("dspark" in name for name in args)
+                    ):
                         continue
                     kind = spec["op"]
                     if kind == "model_ops.norm":
-                        for role in ("attn", "ffn"):
-                            if f".{role}_norm." in args[1]:
-                                observe(f"{role}.norm.bf16", args[2])
-                                observe(f"{role}.norm.fp32", args[3])
+                        for norm_role in ("attn", "ffn"):
+                            if f".{norm_role}_norm." in args[1]:
+                                observe(f"{norm_role}.norm.bf16", args[2])
+                                observe(f"{norm_role}.norm.fp32", args[3])
                     elif kind == "dense.projection" and ".engram." not in args[1]:
                         label = re.sub(r"^w\.layers\.\d+\.", "", args[1]).split(".weight.")[0]
                         if label.startswith("w.shared."):
@@ -132,6 +160,17 @@ def instrument(model, read_spec, *, layers=None, labels=None, expert_rows=None):
                         observe("expert.gather", args[2])
                         observe("expert.input.i8", args[3])
                         observe("expert.input.scale", args[4])
+                    elif kind == "expert.gather_split":
+                        observe("expert.table.i8", args[0])
+                        observe("expert.table.scale", args[1])
+                        observe("routing.counts", args[3], fixed=True)
+                    elif (
+                        role == "draft"
+                        and kind == "topk.add_bias_argmax"
+                        and "base" not in head_observed
+                    ):
+                        observe("draft.base", args[0], fixed=True)
+                        head_observed.add("base")
                 elif step["op"] == "w4":
                     layer = int(re.search(r"\.L(\d+)\.", step["name"])[1])
                     label = "up" if step["output"] == 4608 else "down"
@@ -149,7 +188,91 @@ def instrument(model, read_spec, *, layers=None, labels=None, expert_rows=None):
                     if step.get("groups"):
                         observe("routing.counts", step["groups"], fixed=True)
             packet["body"] = steps
+            if role == "draft":
+                # Markov endpoints use a physical per-owner stride. Keep the
+                # small allocation intact; readers select actual owner slots.
+                for label, key in (
+                    ("draft.confidence", "confidence"),
+                    ("draft.tokens", "best_index"),
+                ):
+                    if key in packet:
+                        observe(label, packet[key], fixed=True)
+                packet["body"] = steps
     return model, dict(points=points, manifests=specs)
+
+
+def collect_routed(trace, metadata, samples, output, *, role="draft"):
+    """Collect declared routed tables with conversation-disjoint fold labels."""
+    import numpy as np
+
+    metadata = json.loads(Path(metadata).read_text())
+    samples = json.loads(Path(samples).read_text())["samples"]
+    fold_names = {"calibration": 0, "fit": 0, "tune": 1, "validation": 1, "test": 2}
+    owners, conversations = {}, {}
+    for index, sample in enumerate(samples):
+        owner = sample.get("owner", index)
+        fold = fold_names[sample["split"]]
+        conversation = sample["conversation"]
+        if owner in owners or conversations.setdefault(conversation, fold) != fold:
+            raise ValueError("Owner identity or conversation folds overlap")
+        owners[owner] = fold
+    points = {}
+    labels = ("expert.table.i8", "expert.table.scale", "routing.indices", "routing.weights")
+    for point in metadata["points"]:
+        if point["rank"] != 0 or point.get("role") != role:
+            continue
+        label = next((x for x in labels if point["name"].endswith("." + x)), None)
+        if label:
+            layer = int(point["name"].split(".L", 1)[1].split(".", 1)[0])
+            points.setdefault((point["packet"], layer), {})[label] = point
+    collected = {}
+    for frame in sorted(Path(trace).iterdir()):
+        if not frame.is_dir():
+            continue
+        segments = [tuple(map(int, value.split("-"))) for value in frame.name.split("_")]
+        row_owners = np.repeat([s[0] for s in segments], [s[2] for s in segments])
+        for (_, layer), bindings in points.items():
+            if set(bindings) != set(labels):
+                raise ValueError("Routed calibration points are incomplete")
+            table = bindings["expert.table.i8"]
+            first = frame / ("p0-" + table["name"] + ".bin")
+            if not first.exists():
+                continue
+            geometry = table["routing"]
+            selected, experts = geometry["selected"], geometry["experts"]
+            width = table["definition"]["bytes"] // table["capacity"]
+
+            def read(label, dtype):
+                return np.fromfile(frame / ("p0-" + bindings[label]["name"] + ".bin"), dtype=dtype)
+
+            inputs = read("expert.table.i8", "i1").reshape(-1, width)
+            scale = read("expert.table.scale", "<f4")
+            indices = read("routing.indices", "<i4").reshape(len(row_owners), -1)[:, :selected]
+            weights = read("routing.weights", "<f4").reshape(len(row_owners), -1)[:, :selected]
+            if (
+                len(inputs) != len(row_owners)
+                or len(scale) != len(inputs)
+                or np.any((indices < 0) | (indices >= experts))
+            ):
+                raise ValueError("Native trace differs from its declared routed geometry")
+            values = dict(
+                inputs=inputs,
+                scale=scale,
+                indices=indices,
+                weights=weights,
+                owner=row_owners,
+                fold=np.array([owners[int(owner)] for owner in row_owners]),
+                importance=np.concatenate([1 / (np.arange(s[2]) + 1) for s in segments]),
+            )
+            for key, value in values.items():
+                collected.setdefault(layer, {}).setdefault(key, []).append(value)
+    if not collected:
+        raise ValueError("No matching native routed frames")
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=False)
+    for layer, values in collected.items():
+        np.savez(output / f"layer{layer}.npz", **{k: np.concatenate(v) for k, v in values.items()})
+    return output
 
 
 def prepare(plan, output, **options):
@@ -190,6 +313,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="+")
     parser.add_argument("--labels", help="Full-match expression selecting observed tensor labels")
+    parser.add_argument("--roles", nargs="+", choices=["target", "draft"], default=["target"])
     parser.add_argument(
         "--expert-rows", type=int, help="Bound captured up-projection rows per rank"
     )
@@ -201,6 +325,7 @@ def main():
             layers=args.layers,
             labels=args.labels,
             expert_rows=args.expert_rows,
+            roles=args.roles,
         )
     )
 

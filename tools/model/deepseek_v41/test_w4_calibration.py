@@ -56,6 +56,15 @@ class W4ReconstructionTests(unittest.TestCase):
         self.assertEqual(bias[0, 1], assist[0, 1])
         self.assertEqual(assist[0, 0], np.float32(123.456))
 
+    def test_up_section_preserves_gate_scale_and_assist(self):
+        original, assist, fitted, sums = self.fixture()
+        scales, bias, count = reconstruct_scales(original, assist, fitted, sums, section=1)
+        self.assertEqual(count, 1)
+        np.testing.assert_array_equal(scales[:, :, :2], original[:, :, :2])
+        np.testing.assert_array_equal(bias[:, :2], assist[:, :2])
+        value = scales[:, 0, 2:].astype("<u4").view("<f4")
+        self.assertAlmostEqual(float(bias[0, 2]), float(8 * sums[0, 0] * value[0, 0]))
+
     def test_rejects_incompatible_scale_encoding_and_unbounded_adjustments(self):
         args = list(self.fixture())
         args[0][0, 0, 0] |= np.uint64(1) << np.uint64(32)

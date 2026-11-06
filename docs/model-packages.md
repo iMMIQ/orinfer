@@ -593,6 +593,28 @@ bash tools/operators/ascend/run.sh --without-devices \
 
 `--overlay` 提供独立的快速实验包，按四层打包覆盖权重；默认按原语义分片替换张量。两种模式与 W4 校准共用 `TensorRelease`，权重和执行资产仍分别导出。最终采用哪组投影，需要结合官方概率偏差、固定历史 NLL、任务质量、实际权重及对齐开销、完整请求性能评估。
 
+### A2 DSpark 草稿校准
+
+DSpark 的同格式专家校准使用 `tools.model.deepseek_v41.draft_calibration`。先用公共采集器选择 `--roles target draft --layers 40 41 42`，并选择 `ffn.norm.bf16|expert.table.*|routing.indices|routing.weights|draft.*` 标签。`--expert-rows 64` 同时缩小原层标记的诊断读回。输入采用真实 anchor/noise 的显式 draft frame，以及匹配 target 历史的验证 frame；采集计划用于离线诊断。权重与性能对照使用原始执行计划。
+
+```bash
+uv run --locked python -m tools.model.deepseek_v41.draft_calibration collect \
+  --trace /path/to/native-trace --points /path/to/calibration-points.json \
+  --samples /path/to/samples.json --output artifacts/draft-inputs
+bash tools/operators/ascend/run.sh --without-devices \
+  python3 -m tools.model.deepseek_v41.draft_calibration fit \
+  --inputs artifacts/draft-inputs --output artifacts/draft-fitted \
+  --official /path/to/official-checkpoint --integer-source /path/to/ascend-checkpoint
+uv run --locked python -m tools.model.deepseek_v41.draft_calibration export \
+  --source /path/to/release --source-execution /path/to/execution-cache \
+  --fitted artifacts/draft-fitted --output /path/to/new-weights \
+  --execution-output /path/to/new-execution-cache --overlay
+```
+
+`samples.json` 的 `samples` 列表包含 `owner`、`conversation`、`split`；省略 owner 时使用列表位置。`calibration`／`fit`、`tune`／`validation` 和 `test` 分别标记拟合、候选选择及最终保留集，同一会话必须属于同一组。采集器按声明的路由几何去除 padding，保留实际 owner 与逐位置权重。当前拟合支持 DSv4.1 的三个 draft 层、128 个专家、TP8；在真实 A8 输入上联合重建 W1/W3 的 BF16 SwiGLU 与 A8 边界，仅调整已有通道 scale，整数 bank、计算程序和全部状态保持原契约。更改 scale 同步更新 nibble 偏移补偿。源 draft 保持自身坐标，使用官方解码权重作局部参考；该参考仍包含官方原始量化误差。
+
+`tools.quantization.speculative` 提供与后端无关的逐位置温度拟合和累计前缀存活评分。它按实际连续接受长度构造累计标签，以 Brier 损失选择正温度；首个拒绝后的累计零值不作为独立条件拒绝标签。该接口用于离线评估，运行时继续使用已发布的接受率反馈策略。专家局部误差、confidence 预测误差、真实接受长度及完整请求性能分别记录；局部误差下降不能代替接受率验收。
+
 ### 源码入口
 
 统一源码入口：
