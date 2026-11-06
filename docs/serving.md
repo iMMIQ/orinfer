@@ -333,7 +333,7 @@ A2 准入同时检查每张卡的物理空闲显存与原生 session 分配余�
 
 A2 HTTP/JSONL 使用 `ASCEND_COREDUMP_SIGNAL=none`，由服务处理 SIGINT/SIGTERM 并回收资源。`serve`、`worker` 和 `batch` CLI 在创建线程前默认设置该值；直接调用 Rust API 时在进程启动环境中设置。A2 检测到缺失或冲突配置时在创建 GPU worker 前报错。[CANN 环境变量说明](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/800alpha002/apiref/envref/CANN%E7%A4%BE%E5%8C%BA%E7%89%88%208.0.0.alpha002%20%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F%E5%8F%82%E8%80%83%2001.pdf)说明了 trace 与业务信号捕获冲突时的配置；此设置关闭 CANN trace 的信号堆栈文件，Rust 错误报告及系统 core dump 配置继续生效。SIGINT/SIGTERM 会中断未完成请求，按 `--drain-timeout-ms` 等待 HTTP 响应及 worker 回收。
 
-A2 停机时，常驻 CPU 表等待所有读取者释放后回收，与 rank 和 bootstrap 原生资源的销毁重叠；两者完成后释放 GPU 锁。全量常驻大 CPU 表的部署使用 `--drain-timeout-ms 120000`，为内存释放和驱动清理保留余量，外部进程管理器的强制退出期限应大于此值。
+A2 停机时，常驻 CPU 表等待所有读取者释放后回收，与 rank 和 bootstrap 原生资源的销毁重叠；两者完成后释放 GPU 锁。Linux 上较大的常驻表按 128 MiB 的完整页区间退还物理页，再由原 Vec 释放映射，减少大块解除映射与 NPU 队列销毁争用地址空间写锁的等待。分配器边界及非整页尾部保留到正常释放，退页建议失败时沿用正常释放。加载、行读取和计算继续使用原来的连续存储。全量常驻大 CPU 表的部署使用 `--drain-timeout-ms 120000`，为内存释放和驱动清理保留余量，外部进程管理器的强制退出期限应大于此值。
 
 若启动或停机错误返回时仍有模型 worker 存活，CLI 记录错误后以退出码 1 直接终止进程，跳过会与原生线程竞争的第三方退出钩子，由操作系统回收进程资源。正常退出仍等待模型和 CPU 表完成销毁。Rust API 的 `has_live_model_workers()` 可供嵌入调用方判断后台资源是否仍在回收。
 

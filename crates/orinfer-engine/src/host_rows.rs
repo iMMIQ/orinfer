@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 mod cache;
+mod resident;
 pub mod validation;
 use cache::RowCache;
 
@@ -111,6 +112,13 @@ struct Plane {
     row_bytes: usize,
     rows: usize,
     resident: Option<(usize, Vec<u8>)>,
+}
+impl Drop for Plane {
+    fn drop(&mut self) {
+        if let Some((_, data)) = &mut self.resident {
+            resident::discard(data);
+        }
+    }
 }
 impl Plane {
     fn open(path: &Path, tensor: &str, dtype: Dtype) -> Result<Self> {
