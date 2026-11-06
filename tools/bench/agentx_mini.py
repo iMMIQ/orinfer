@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import tempfile
@@ -59,22 +60,32 @@ def command(args):
         "--max-context-length",
         "262144",
         "--request-count",
-        "64",
+        str(args.request_count),
         "--concurrency",
-        "16",
+        str(args.concurrency),
         "--random-seed",
         "42",
         "--warmup-requests-per-lane",
         "1",
         "--benchmark-duration",
-        "180",
+        str(args.benchmark_duration),
         "--benchmark-grace-period",
         "600",
         "--request-timeout-seconds",
         "1800",
         "--extra-inputs",
         json.dumps(
-            dict(temperature=0, **({"enable_thinking": True} if args.enable_thinking else {})),
+            dict(
+                temperature=0,
+                **(
+                    {
+                        "reasoning_effort": "high",
+                        "chat_template_kwargs": {"enable_thinking": True},
+                    }
+                    if args.enable_thinking
+                    else {}
+                ),
+            ),
             separators=(",", ":"),
         ),
         "--export-level",
@@ -105,14 +116,48 @@ def first_credit_ns(directory):
         return None
 
 
+def metric_total(metrics, name):
+    return sum(
+        float(line.split()[1])
+        for line in metrics.splitlines()
+        if re.match(re.escape(name) + r"(?:\{|\s)", line)
+    )
+
+
+def snapshot(args, model_info=None):
+    metrics = fetch(args.url + "/metrics")
+    if args.backend == "orinfer":
+        return json.loads(fetch(args.url + "/health")), metrics
+    fetch(args.url + "/health")
+    if model_info is None:
+        models = json.loads(fetch(args.url + "/v1/models"))["data"]
+        model_info = next(m for m in models if m["id"] == args.model)
+    return dict(
+        status="ready",
+        failure=None,
+        model=args.model,
+        max_context=model_info.get("max_model_len", 0),
+        backend="vllm",
+        active_requests=int(metric_total(metrics, "vllm:num_requests_running")),
+        queued_requests=int(metric_total(metrics, "vllm:num_requests_waiting")),
+    ), metrics
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("harness", "tokenizer", "dataset", "manifest", "service-model", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--url", default="http://127.0.0.1:18818")
     parser.add_argument("--model", default="deepseek-v41-flash-1017-w4a8")
+    parser.add_argument("--backend", choices=("orinfer", "vllm"), default="orinfer")
+    parser.add_argument(
+        "--deployment-spec", type=Path, help="Recorded reference server configuration"
+    )
     parser.add_argument("--service-pid", type=int, required=True)
     parser.add_argument("--wall-limit", type=int, default=900)
+    parser.add_argument("--request-count", type=int, default=64)
+    parser.add_argument("--concurrency", type=int, default=16)
+    parser.add_argument("--benchmark-duration", type=int, default=180)
     parser.add_argument(
         "--benchmark-id", help="Fixed cache-bust identity; defaults to source identity"
     )
@@ -123,15 +168,33 @@ def main():
     args = parser.parse_args()
     if not 60 <= args.wall_limit <= 1200:
         parser.error("Mini diagnostics require a 60..1200 second wall limit")
+    if min(args.request_count, args.concurrency, args.benchmark_duration) < 1:
+        parser.error("Replay count, concurrency and duration must be positive")
     args.url = args.url.rstrip("/")
-    health = json.loads(fetch(args.url + "/health"))
+    model_info = None
+    deployment = None
+    if args.backend == "vllm":
+        if args.deployment_spec is None:
+            parser.error("vLLM requires --deployment-spec to record DSpark and context settings")
+        deployment = json.loads(args.deployment_spec.read_text())
+        if (
+            deployment["method"] != "dspark"
+            or deployment["num_speculative_tokens"] != args.mtp_drafts
+        ):
+            raise ValueError("Reference DSpark configuration differs from --mtp-drafts")
+        models = json.loads(fetch(args.url + "/v1/models"))["data"]
+        model_info = next(m for m in models if m["id"] == args.model)
+    health, _ = snapshot(args, model_info)
     if health["status"] != "ready" or health["model"] != args.model:
         raise ValueError("The selected service is not ready for this model")
     if (
         health["max_context"] < 262144
         or args.mtp_drafts < 0
-        or health["mtp"]["max_drafts"] != args.mtp_drafts
-        or health["mtp"]["enabled"] != (args.mtp_drafts > 0)
+        or args.backend == "orinfer"
+        and (
+            health["mtp"]["max_drafts"] != args.mtp_drafts
+            or health["mtp"]["enabled"] != (args.mtp_drafts > 0)
+        )
     ):
         raise ValueError("Require 262K context and the selected --mtp-drafts limit")
     if health["active_requests"] or health["queued_requests"]:
@@ -194,6 +257,11 @@ def main():
             started_at=datetime.datetime.now().astimezone().isoformat(),
             command=invocation,
             wall_limit_s=args.wall_limit,
+            backend=args.backend,
+            deployment=deployment,
+            request_count=args.request_count,
+            concurrency=args.concurrency,
+            benchmark_duration_s=args.benchmark_duration,
             wall_limit_basis="first_request_credit",
             benchmark_id=args.benchmark_id,
             mtp_drafts=args.mtp_drafts,
@@ -204,7 +272,10 @@ def main():
             periodic_memory_source="proc/status",
             memory_before_s=memory_before_s,
             service_binary_sha256=file_hash(executable),
-            service_model_sha256=file_hash(args.service_model / "cache/model.json"),
+            service_model_sha256=file_hash(
+                args.service_model
+                / ("cache/model.json" if args.backend == "orinfer" else "config.json")
+            ),
             manifest_sha256=file_hash(args.manifest),
             inputs=inputs,
             input_identity=input_identity,
@@ -246,8 +317,7 @@ def main():
                     )
                     sample_start = time.monotonic()
                     try:
-                        record["health"] = json.loads(fetch(args.url + "/health"))
-                        record["metrics"] = fetch(args.url + "/metrics")
+                        record["health"], record["metrics"] = snapshot(args, model_info)
                         record["memory"] = (process / "status").read_text()
                         record["process_io"] = (process / "io").read_text()
                         record["process_stat"] = (process / "stat").read_text()
@@ -277,9 +347,11 @@ def main():
                 if line
             ]
             profiled = [r for r in rows if r["metadata"]["benchmark_phase"] == "profiling"]
+            result["profiled_requests"] = len(profiled)
+            result["returned_errors"] = sum(bool(r.get("error")) for r in rows)
             formal = json.loads((args.output / "profile_export_aiperf.json").read_text())
             complete = (
-                len(profiled) == 64
+                len(profiled) == args.request_count
                 and all(
                     not row.get("error")
                     and not row["metadata"].get("was_cancelled")
@@ -288,7 +360,6 @@ def main():
                 )
                 and formal.get("was_cancelled") is False
             )
-            result["profiled_requests"] = len(profiled)
         except (OSError, ValueError, KeyError) as error:
             complete = False
             result["validation_error"] = str(error)
@@ -296,7 +367,8 @@ def main():
         atomic_json(args.output / "runner-result.json", result)
         try:
             (args.output / "metrics-after.txt").write_text(fetch(args.url + "/metrics"))
-            atomic_json(args.output / "health-after.json", json.loads(fetch(args.url + "/health")))
+            after, _ = snapshot(args, model_info)
+            atomic_json(args.output / "health-after.json", after)
         except OSError as error:
             (args.output / "service-after-error.txt").write_text(str(error))
         print(json.dumps(result), flush=True)

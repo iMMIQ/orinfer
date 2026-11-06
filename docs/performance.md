@@ -4,6 +4,8 @@
 
 [Mini-Weka 调优短测](../tools/bench/agentx_mini.py) 从首个请求发放开始计算 `--wall-limit`，客户端初始化另行记录。配对比较在各自的新服务进程中使用相同源窗口、参数及由源身份生成的 `--benchmark-id`，使 AgentX 的 cache-bust 提示前缀保持一致；同进程重复执行按热缓存场景记录。原始请求导出保留实际输入；共同片段按轨迹、访问批次、主／子 agent 及内层位置对齐。分析分别报告预热、prefill、decode、混合执行及准备开销，单列纯 decode 窗口。达到短测上限的回放保留诊断数据，完成数量和累计输出率以实际请求窗口比较，完整任务分数需由完整回放验收。
 
+十分钟持续压力回放使用 `--wall-limit 600 --benchmark-duration 600 --request-count 100000 --concurrency 16`；较大的请求预算避免默认 64 个请求提前结束。总窗口包含冷请求 warmup，另行报告正式回放窗口；到点停止的在途请求单列。`--backend vllm --deployment-spec /path/to/deployment.json` 可对已运行的 vLLM 服务使用同一客户端；配置记录需包含 `method: "dspark"` 和与 `--mtp-drafts` 一致的 `num_speculative_tokens`，实际启用情况另由服务启动日志及投机计数确认。`--enable-thinking` 使用共同的 `reasoning_effort: "high"` 和 `chat_template_kwargs.enable_thinking: true`。部署参数、模型上下文、KV 精度与 CPU offload 预算分别记录；不同后端的进程采样只代表指定 PID。闭环回放后续循环的 lane 分配可能随速度改变，共同请求比较以导出的实际 payload 一致为准。
+
 ## DSv4.1 A2 单流 decode（2026-10-28）
 
 八卡 Ascend 910B3、TP8，使用 DSv4.1 Flash-1017 原始 W4A8 checkpoint 和完整 40 层 `bench-ascend`。当前编译和运行统一使用 CANN 9.2，TileLang-Ascend 前端固定为 0.1.4（`d182ae8`）；下列历史测量包含 CANN 9.1 编译、CANN 9.2 运行的产物，其成绩保持原测试范围。保持原始 W4 bank、scale 和 assist，在线直接读取准备好的物理布局。

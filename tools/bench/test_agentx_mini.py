@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import types
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,44 @@ from tools.bench import agentx_entry, agentx_mini
 
 
 class MiniIdentityTests(unittest.TestCase):
+    def test_duration_pressure_keeps_the_same_shared_request_contract(self):
+        args = SimpleNamespace(
+            harness=Path("/env/bin/agentx"),
+            benchmark_id="fixed-source",
+            url="http://localhost:18300",
+            model="deepseek-v41-w4a8",
+            tokenizer=Path("/tokenizer"),
+            dataset=Path("/dataset"),
+            output=Path("/output"),
+            request_count=100000,
+            concurrency=16,
+            benchmark_duration=600,
+            enable_thinking=True,
+        )
+        command = agentx_mini.command(args)
+        for flag, value in [
+            ("--request-count", "100000"),
+            ("--concurrency", "16"),
+            ("--benchmark-duration", "600"),
+        ]:
+            self.assertEqual(command[command.index(flag) + 1], value)
+        extra = json.loads(command[command.index("--extra-inputs") + 1])
+        self.assertEqual(extra["reasoning_effort"], "high")
+        self.assertTrue(extra["chat_template_kwargs"]["enable_thinking"])
+
+    def test_reference_snapshot_sums_engine_gauges_and_preserves_context(self):
+        metrics = (
+            'vllm:num_requests_running{engine="0"} 7\n'
+            'vllm:num_requests_running{engine="1"} 2\n'
+            'vllm:num_requests_waiting{engine="0"} 3\n'
+        )
+        args = SimpleNamespace(backend="vllm", url="http://localhost", model="test")
+        with patch.object(agentx_mini, "fetch", side_effect=[metrics, ""]):
+            health, raw = agentx_mini.snapshot(args, {"max_model_len": 262144})
+        self.assertEqual((health["active_requests"], health["queued_requests"]), (9, 3))
+        self.assertEqual(health["max_context"], 262144)
+        self.assertEqual(raw, metrics)
+
     def test_fixed_identity_reaches_the_installed_cli_without_changing_arguments(self):
         package = types.ModuleType("aiperf")
         runner = types.ModuleType("aiperf.cli_runner")
