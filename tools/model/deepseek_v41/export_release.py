@@ -16,6 +16,7 @@ import struct
 import numpy as np
 
 from tools.build.files import atomic_json, file_hash
+from tools.build.shared_json import decode
 from tools.model.safetensors_source import local_header, SIZES
 
 CHUNK = 8 << 20
@@ -53,17 +54,20 @@ def physical_contract(rank, package, specs=None):
     physical = {}
     for packet in rank["packets"]:
         for step in packet["body"] + packet["head"]:
-            if step["op"] == "w4":
+            if step["op"] in ("w4", "w8"):
                 e, k, n = step["experts"], step["input"], step["output"]
+                int8 = step["op"] == "w8"
+                if int8 and step.get("weight_layout", "nd") != "nd":
+                    raise ValueError("INT8 grouped weights require ND storage")
                 packed = (
                     [e, k // 64, n // 16, 16, 32]
                     if step.get("weight_layout") == "transposed_nz"
-                    else [e, k, n // 2]
+                    else [e, k, n if int8 else n // 2]
                 )
                 for name, dtype, shape in zip(
                     step["buffers"][1:4],
-                    ["I8", "U64", "F32"],
-                    [packed, [e, 1, n], [e, n]],
+                    ["I8", "BF16" if int8 else "U64", "F32"],
+                    [packed, [e, n] if int8 else [e, 1, n], [e, n]],
                     strict=True,
                 ):
                     physical[name] = dtype, shape
@@ -100,7 +104,7 @@ class Export:
             Path(source_execution) if source_execution else self.source / "cache/packages"
         )
         self.package = source_cache / descriptor["execution_package"]
-        self.model = deepcopy(json.loads((self.package / "model.json").read_text()))
+        self.model = deepcopy(decode(json.loads((self.package / "model.json").read_text())))
         self.old_index = json.loads((self.source / self.model["index"]["file"]).read_text())
         self.headers, self.entries, self.groups = {}, {}, defaultdict(list)
         self.index = dict(

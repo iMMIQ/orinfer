@@ -53,8 +53,8 @@ def partials(
     if output % 32 or reduction % splits or reduction // splits % block_k:
         raise ValueError("Floating Cube requires aligned output and split reduction tiles")
     parts = input_parts * weight_parts
-    if input_parts not in (1, 3) or weight_parts not in (1, 3) or parts not in (1, 3):
-        raise ValueError("Use BF16 operands or one FP32 operand with three BF16 parts")
+    if (input_parts, weight_parts) not in ((1, 1), (1, 2), (1, 3), (3, 1)):
+        raise ValueError("Use one BF16 operand and one operand with one, two or three BF16 parts")
     if variance and (input_parts != 1 or output != 32 or reduction % 256):
         raise ValueError("mHC variance requires one BF16 input and 32 output lanes")
     if tile_m not in (16, 32, 64, 128):

@@ -166,6 +166,7 @@ fn real_w4_capacity_descriptors_and_live_group_graph() {
                 }),
                 Some(&groups),
                 super::super::operators::GroupedConfig {
+                    weight_int8: false,
                     expected_rows: hint,
                     weight_layout: if nz && nz_dir.is_some() {
                         super::super::operators::W4Layout::TransposedNz

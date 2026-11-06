@@ -476,9 +476,26 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                     expected_expert_rows,
                     weight_layout,
                     ..
+                }
+                | Instruction::W8 {
+                    rows,
+                    input,
+                    output,
+                    experts,
+                    name,
+                    buffers: bindings,
+                    workspace,
+                    groups,
+                    expected_expert_rows,
+                    weight_layout,
+                    ..
                 } = instruction
                 {
                     let split_int4 = matches!(instruction, Instruction::W4A4 { .. });
+                    let weight_int8 = matches!(instruction, Instruction::W8 { .. });
+                    if weight_int8 && *weight_layout != W4Layout::Nd {
+                        return Err("INT8 grouped weights require ND storage".into());
+                    }
                     if split_int4 && (*weight_layout != W4Layout::TransposedNz || groups.is_none())
                     {
                         return Err(
@@ -519,7 +536,9 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                         return Err("Capacity W4 operands require dedicated allocations".into());
                     }
                     let packed_shape = match weight_layout {
-                        W4Layout::Nd => vec![*experts, *input, output / 2],
+                        W4Layout::Nd => {
+                            vec![*experts, *input, output / if weight_int8 { 1 } else { 2 }]
+                        }
                         W4Layout::TransposedNz => {
                             vec![*experts, input / 64, output / 16, 16, 32]
                         }
@@ -536,8 +555,8 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                     }
                     let extents = [
                         rows * input / if split_int4 { 2 } else { 1 },
-                        experts * input * output / 2,
-                        experts * output * 8,
+                        experts * input * output / if weight_int8 { 1 } else { 2 },
+                        experts * output * if weight_int8 { 2 } else { 8 },
                         experts * output * 4,
                         rows * 4,
                         rows * output * 2,
@@ -548,7 +567,7 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
                         .any(|(name, bytes)| buffers.get(name).copied() != Some(bytes))
                         || buffers.get(workspace).is_none_or(|&bytes| {
                             bytes
-                                < if *weight_layout == W4Layout::Nd {
+                                < if *weight_layout == W4Layout::Nd && !weight_int8 {
                                     100663808
                                 } else {
                                     1

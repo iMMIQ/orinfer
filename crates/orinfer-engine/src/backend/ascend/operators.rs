@@ -331,6 +331,8 @@ pub enum W4Layout {
 pub struct GroupedConfig {
     pub expected_rows: Option<usize>,
     pub weight_layout: W4Layout,
+    /// INT8 ND weights with BF16 per-channel scales and no W4 assist bias.
+    pub weight_int8: bool,
 }
 
 /// Signed INT4 weights with logical shape [experts,K,N], per-channel UINT64 dequant
@@ -494,6 +496,7 @@ impl GroupedW4A8 {
         config: GroupedConfig,
     ) -> Result<Self> {
         if config.weight_layout != W4Layout::TransposedNz
+            || config.weight_int8
             || !shape.rows.is_multiple_of(2)
             || ends.iter().any(|n| n % 2 != 0)
         {
@@ -562,6 +565,9 @@ impl GroupedW4A8 {
             experts: e,
         } = shape;
         let transposed_nz = config.weight_layout == W4Layout::TransposedNz;
+        if config.weight_int8 && transposed_nz {
+            return Err("INT8 grouped weights require the declared ND bank layout".into());
+        }
         let weight = if transposed_nz {
             // A8 uses the logical contiguous view with the V5 NZ tuning flag.
             // A4 exposes the same immutable NZ bank through transposed
@@ -575,6 +581,8 @@ impl GroupedW4A8 {
                 Some((&[e, k / 64, n / 16, 16, 64], 29)),
                 split_int4,
             )?
+        } else if config.weight_int8 {
+            Tensor::new(&api, input.weight, &[e, k, n], 2, 8)?
         } else {
             Tensor::new(&api, input.weight, &[e, k, n], 29, 4)?
         };
@@ -587,7 +595,11 @@ impl GroupedW4A8 {
                 if split_int4 { 4 } else { 8 },
             )?,
             weight,
-            Tensor::new(&api, input.weight_scale, &[e, 1, n], 10, 64)?,
+            if config.weight_int8 {
+                Tensor::new(&api, input.weight_scale, &[e, n], 27, 16)?
+            } else {
+                Tensor::new(&api, input.weight_scale, &[e, 1, n], 10, 64)?
+            },
             Tensor::new(&api, input.assist, &[e, n], 0, 32)?,
             Tensor::new(&api, input.token_scale, &[m], 0, 32)?,
             Tensor::new(
@@ -630,7 +642,7 @@ impl GroupedW4A8 {
                 (api.prepare)(
                     lists[0].handle,
                     lists[1].handle,
-                    if split_int4 {
+                    if split_int4 || config.weight_int8 {
                         ptr::null_mut()
                     } else {
                         lists[3].handle

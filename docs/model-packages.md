@@ -217,6 +217,10 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 同一入口的 `--compact-zero-planes` 会完整检查已发布输出头的两个 BF16 残差分量；确认全零且主分量有限时，只保留主 BF16 分量，并复用原投影 tile、BF16 激活及 FP32 归约边界。非零残差保持三分量。检查限定在离线预处理，在线直接加载物理权重。该模式与 `--markov-bias` 互斥，仅重写受影响的语义分片，其余分片复用硬链接。
 
+`--head-residual-parts 2` 从已发布的三分量输出头保留前两个 BF16 分量，并在权重元数据中记录 `bf16-residual2` 和非精确舍入。target、draft 及行数选择表中的全部消费者共用转换后的 bank 和原动态计算体，保留八段 FP32 累加与归约边界；同一浮点工厂的其他引用保持原参数重编译。每个完整输出头节省约 158 MiB／卡，target 与 draft 合计约 316 MiB／卡。该离线候选须用固定历史的完整词表概率、teacher-forced NLL 和真实请求性能验收后选用，原发布目录保持独立。
+
+`tools.model.deepseek_v41.expert_precision` 为显式选择的 target 层导出 INT8 up bank。`--prepare --official OFFICIAL --integer-source ASCEND --prepared DIR --layers 29` 按专家有界读取官方 FP4，沿原 FFN norm fold 和 checkpoint block-32 旋转基重建 w1，再按 BF16 通道 scale 选择 INT8 码；w3 保留 Ascend checkpoint 的原 INT4 码与 AWQ 输入基，存入同一 INT8 bank，其 scale 也舍入为 BF16。该方案每层约增加 540 MiB／卡的 up 权重，scale 字节变化另计；w2 保持原表示。`--source RELEASE --source-execution CACHE --output NEW_RELEASE --execution-output NEW_CACHE` 沿用层分片及四 GiB 上限，其余分片复用硬链接。普通、混合及验证 packet 复用原 A8 gather/GMM/SwiGLU 子图，原生 `w8` 指令共用现有 grouped-matmul 执行器及动态行缓存，使用匹配的新引擎加载。原发布权重和精度策略保持独立；局部激活误差、完整模型 NLL 与端到端速度分别记录。
+
 `tune_auxiliary --head-only --plan PLAN --model-dir RELEASE --output REPORT --rows 1 6 32 33 80 128 129 160 192 544 --calls-per-replay 16` 以实际发布的输出头库为冻结基线，读取已发布 safetensors bank，比较同源 M tile 与流水配置。候选保持输出列 tile、BF16 分量、八段 FP32 partial 布局和原归约库；词表末块只比较真实列，另查输出行尾部和改变输入后的 Graph replay。按实测生成共享 fallback 与大行数区间，默认每个测量点相对基线最多回退 10%。同一选择槽内的候选具有一致的源码、编译器、设备及物理 ABI，浮点 partial 只允许调整 M tile、流水与 grid 上限。冻结参考和新候选分别记录编译身份。调优只更新执行计划和库，权重保持原表示；输入采用尚无输出头行数选择的冻结计划，在独立构建目录运行，选定后发布被引用的资产并验收真实请求。
 
 该转换替换原 FP32 bank，新增的分量不与原 bank 同时常驻。TP8 target／draft 两个完整输出头均采用三分量时，每卡合计增加约 316 MiB；变更分片重新写出，其余分片复用硬链接。源与输出须位于同一文件系统及容器挂载点；可先在宿主机将发布目录硬链接到工作区，再在离线环境执行：

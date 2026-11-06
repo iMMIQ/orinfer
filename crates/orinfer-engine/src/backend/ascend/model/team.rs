@@ -718,6 +718,11 @@ impl Worker {
                     experts,
                     groups: Some(name),
                     ..
+                }
+                | super::Instruction::W8 {
+                    experts,
+                    groups: Some(name),
+                    ..
                 } = step
                     && groups.insert(name, *experts).is_some_and(|n| n != *experts)
                 {

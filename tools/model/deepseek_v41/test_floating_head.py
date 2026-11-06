@@ -136,6 +136,39 @@ def compact_fixture(root, exact=True):
 
 
 class CompactHeadTests(unittest.TestCase):
+    def test_two_parts_preserve_stored_planes_and_label_rounding(self):
+        with TemporaryDirectory() as directory:
+            job, source, _, _, _ = compact_fixture(Path(directory), exact=False)
+            job = CompactHeadRelease(
+                source,
+                Path(directory) / "two-planes",
+                source_execution=job.package.parent,
+                execution_output=job.execution_output,
+                build_dir=job.build_dir,
+                retained_parts=2,
+                require_exact=False,
+            ).plan()
+            self.assertEqual(len(job.calls), 2)
+            self.assertEqual(
+                job.manifest["head_rounding"], dict(source_parts=3, retained_parts=2, exact=False)
+            )
+            self.assertEqual(job.index["metadata"]["fp32_head_layout"], "bf16-residual2")
+            job.write_shard("layer.safetensors")
+            old_start, old = local_header(source / "layer.safetensors")
+            new_start, new = local_header(job.output / "layer.safetensors")
+            old_bank, new_bank = old["head.bf16_residual3"], new["head.bf16_residual2"]
+            self.assertEqual(new_bank["shape"], [2, 64, 1024])
+            with (source / "layer.safetensors").open("rb") as stream:
+                stream.seek(old_start + old_bank["data_offsets"][0])
+                reference = stream.read(2 * 64 * 1024 * 2)
+            with (job.output / "layer.safetensors").open("rb") as stream:
+                stream.seek(new_start + new_bank["data_offsets"][0])
+                self.assertEqual(stream.read(len(reference)), reference)
+            self.assertEqual(
+                job.model["ranks"][0]["buffers"][0]["prepared_tensor"]["shape"],
+                [2, 64, 1024],
+            )
+
     def test_complete_zero_proof_preserves_main_plane_and_other_tensors(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

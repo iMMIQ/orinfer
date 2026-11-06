@@ -10,6 +10,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", type=int, default=7)
+    p.add_argument("--two-part-head-only", action="store_true")
     args = p.parse_args()
     import torch
     import torch_npu  # noqa: F401
@@ -38,13 +39,17 @@ def main():
         call.restype = ctypes.c_int32
         return call
 
-    for ap, wp, variance, capacity, n, k, bk in [
+    cases = [
+        (1, 2, False, 129, 128, 5120, 128),
         (1, 3, False, 129, 64, 1024, 128),
         (3, 1, False, 129, 64, 1024, 128),
         (3, 1, False, 129, 384, 5120, 128),
         (1, 3, False, 129, 128, 5120, 128),
         (1, 3, True, 17, 32, 20480, 256),
-    ]:
+    ]
+    if args.two_part_head_only:
+        cases = cases[:1]
+    for ap, wp, variance, capacity, n, k, bk in cases:
         original_a = torch.randn(capacity, k) * 0.2
         original_w = torch.randn(n, k) * 0.02
         if ap == 1:
@@ -54,8 +59,8 @@ def main():
         if variance:
             original_w[24:].zero_()
         cpu_w = (
-            torch.from_numpy(bf16_parts(original_w.numpy())).view(torch.bfloat16)
-            if wp == 3
+            torch.from_numpy(bf16_parts(original_w.numpy())[:wp]).view(torch.bfloat16)
+            if wp > 1
             else original_w.bfloat16()[None]
         )
         device_a = torch.empty((ap * capacity * k,), dtype=torch.bfloat16, device="npu")
@@ -71,6 +76,8 @@ def main():
             variance=variance,
             block_k=bk,
         )
+        if wp == 2:
+            params.update(reuse_operand=True, tile_m=64, tile_n=128)
         specs = [
             operand("activation", "bf16", [ap, capacity, k]),
             operand("weight", "bf16", [wp, n, k]),
@@ -116,13 +123,15 @@ def main():
                     raise RuntimeError(f"FP32 projection launch failed: {status}")
 
             def expected():
-                result = torch.empty(rows, n // 32, 8, 32)
+                tile_n = params.get("tile_n", 32)
+                result = torch.empty(rows, n // tile_n, 8, tile_n)
+                reference_w = cpu_w.float().sum(0) if wp == 2 else original_w
                 for split in range(8):
                     begin, end = split * (k // 8), (split + 1) * (k // 8)
                     value = (
-                        original_a[:rows, begin:end].double() @ original_w[:, begin:end].double().T
+                        original_a[:rows, begin:end].double() @ reference_w[:, begin:end].double().T
                     ).float()
-                    result[:, :, split] = value.reshape(rows, n // 32, 32)
+                    result[:, :, split] = value.reshape(rows, n // tile_n, tile_n)
                     if variance:
                         square = (
                             original_a[:rows, begin:end].square().reshape(rows, 10, 256).sum(-1)

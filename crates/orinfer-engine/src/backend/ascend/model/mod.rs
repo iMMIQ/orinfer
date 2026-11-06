@@ -258,6 +258,21 @@ enum Instruction {
         #[serde(default)]
         weight_layout: W4Layout,
     },
+    /// Reuses the routed grouped-matmul executor with INT8 ND weights and BF16 scales.
+    W8 {
+        name: String,
+        rows: usize,
+        input: usize,
+        output: usize,
+        experts: usize,
+        buffers: [String; 6],
+        workspace: String,
+        groups: Option<String>,
+        #[serde(default)]
+        expected_expert_rows: Option<usize>,
+        #[serde(default)]
+        weight_layout: W4Layout,
+    },
     #[serde(rename = "w4_a4")]
     W4A4 {
         name: String,
@@ -469,6 +484,7 @@ struct W4Key {
     workspace: usize,
     expected_expert_rows: Option<usize>,
     weight_layout: W4Layout,
+    weight_int8: bool,
     split_int4: bool,
 }
 type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
@@ -977,9 +993,22 @@ impl Worker {
                 groups,
                 expected_expert_rows,
                 weight_layout,
+            }
+            | Instruction::W8 {
+                name,
+                rows,
+                input,
+                output,
+                experts,
+                buffers,
+                workspace,
+                groups,
+                expected_expert_rows,
+                weight_layout,
             } = instruction
             {
                 let split_int4 = matches!(instruction, Instruction::W4A4 { .. });
+                let weight_int8 = matches!(instruction, Instruction::W8 { .. });
                 let mut b = buffers
                     .iter()
                     .map(|n| self.row_buffer(n, active_rows))
@@ -1022,6 +1051,7 @@ impl Worker {
                     workspace: shared_workspace.pointer() as usize,
                     expected_expert_rows: *expected_expert_rows,
                     weight_layout: *weight_layout,
+                    weight_int8,
                     split_int4,
                 };
                 let plan = if let Some(plan) = self.w4.get(&key).and_then(Weak::upgrade) {
@@ -1055,6 +1085,7 @@ impl Worker {
                         GroupedConfig {
                             expected_rows: *expected_expert_rows,
                             weight_layout: *weight_layout,
+                            weight_int8,
                         },
                     )?);
                     self.phases.aclnn.0 += 1;
@@ -1143,6 +1174,7 @@ impl Worker {
                 | Instruction::Kernel { .. }
                 | Instruction::Reduce { .. }
                 | Instruction::W4 { .. }
+                | Instruction::W8 { .. }
                 | Instruction::W4A4 { .. } => unreachable!(),
             });
         }

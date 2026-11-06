@@ -1,4 +1,4 @@
-"""Prepare and compact exact output heads with the shared floating Cube factory."""
+"""Prepare output-head BF16 components with the shared floating Cube factory."""
 
 import argparse
 from copy import deepcopy
@@ -270,7 +270,14 @@ class HeadRelease(Export):
 
 
 class CompactHeadRelease(HeadRelease):
-    """Keep one exact BF16 plane when both published residual planes are zero."""
+    """Retain published head planes, with rounding explicitly requested offline."""
+
+    def __init__(self, *args, retained_parts=1, require_exact=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        if (retained_parts, require_exact) not in ((1, True), (2, False)):
+            raise ValueError("Use exact zero-plane compaction or explicitly rounded two-part heads")
+        self.weight_parts = retained_parts
+        self.require_exact = require_exact
 
     def plan(self):
         config = json.loads((self.source / self.model["config"]["file"]).read_text())
@@ -317,19 +324,21 @@ class CompactHeadRelease(HeadRelease):
                 raise ValueError("Published head header differs from its physical binding")
             values = self.array(name)
             planes = values.reshape(3, -1)
-            if any(
+            if self.require_exact and any(
                 np.any(plane[first : first + CHUNK // 2])
-                for plane in planes[1:]
+                for plane in planes[self.weight_parts :]
                 for first in range(0, plane.size, CHUNK // 2)
             ):
                 continue
             if any(
-                np.any((planes[0, first : first + CHUNK // 2] & 0x7F80) == 0x7F80)
+                np.any((plane[first : first + CHUNK // 2] & 0x7F80) == 0x7F80)
+                for plane in planes
                 for first in range(0, planes.shape[1], CHUNK // 2)
             ):
                 raise ValueError("Exact head requires finite BF16 weights")
             suffix = ".bf16_residual3"
-            replacement = name.removesuffix(suffix) + ".bf16_exact"
+            layout = "bf16_exact" if self.require_exact else f"bf16_residual{self.weight_parts}"
+            replacement = name.removesuffix(suffix) + "." + layout
             if replacement in self.old_index["weight_map"]:
                 raise ValueError("Exact head tensor name already exists")
             self.transforms[name] = replacement
@@ -343,8 +352,11 @@ class CompactHeadRelease(HeadRelease):
                 tensor = bank.get("prepared_tensor", {})
                 if tensor.get("name") in self.transforms:
                     changed.add(bank["name"])
-                    tensor.update(name=self.transforms[tensor["name"]], shape=[1, self.n, self.k])
-                    bank["bytes"] = self.n * self.k * 2
+                    tensor.update(
+                        name=self.transforms[tensor["name"]],
+                        shape=[self.weight_parts, self.n, self.k],
+                    )
+                    bank["bytes"] = self.weight_parts * self.n * self.k * 2
             if any(b.get("view", {}).get("parent") in changed for b in rank["buffers"]):
                 raise ValueError("Compacted head cannot have another buffer view")
             for pi, packet in enumerate(rank["packets"]):
@@ -361,7 +373,14 @@ class CompactHeadRelease(HeadRelease):
         source_package = self.manifest["source_package"]
         self.manifest.update(deepcopy(old))
         self.manifest.update(source_package=source_package, files={})
-        self.manifest["exact_bf16_heads"] = deepcopy(self.transforms)
+        if self.require_exact:
+            self.manifest["exact_bf16_heads"] = deepcopy(self.transforms)
+        else:
+            self.manifest["fp32_head_layout"] = f"bf16-residual{self.weight_parts}"
+            self.index["metadata"]["fp32_head_layout"] = self.manifest["fp32_head_layout"]
+            self.manifest["head_rounding"] = dict(
+                source_parts=3, retained_parts=self.weight_parts, exact=False
+            )
         for name, replacement in self.transforms.items():
             logical = self.manifest.get("logical_shapes", {})
             if name in logical:
@@ -381,7 +400,8 @@ class CompactHeadRelease(HeadRelease):
                 if name in self.transforms:
                     if dtype != "BF16" or shape != [3, self.n, self.k]:
                         raise ValueError("Compacted head differs from its published tensor")
-                    shape, size = [1, self.n, self.k], self.n * self.k * 2
+                    shape = [self.weight_parts, self.n, self.k]
+                    size = self.weight_parts * self.n * self.k * 2
                     replacement = self.transforms[name]
                     self.index["weight_map"][replacement] = self.index["weight_map"].pop(name)
                     name = replacement
@@ -402,14 +422,16 @@ class CompactHeadRelease(HeadRelease):
         else:
             publish_package(self.original_model, self.package, source)
         self.package = source
-        tasks, selected = {}, {}
+        tasks = {}
 
-        def rebuild(path):
+        def rebuild(path, convert=True):
             if path in tasks:
                 return
             spec = json.loads((source / path).read_text())
             p = spec["parameters"]
-            if spec["op"] != "floating.partials" or (
+            if spec["op"] != "floating.partials":
+                return
+            if convert and (
                 p.get("output"),
                 p.get("reduction"),
                 p.get("input_parts", 1),
@@ -417,14 +439,15 @@ class CompactHeadRelease(HeadRelease):
             ) != (self.n, self.k, 1, 3):
                 raise ValueError("Head variants must retain their original matrix contract")
             task = kernel_rebuild_task(deepcopy(spec), path)
-            task["arguments"]["weight_parts"] = 1
-            if task["specs"][1]["name"] != "weight" or task["specs"][1]["shape"] != [
-                3,
-                self.n,
-                self.k,
-            ]:
-                raise ValueError("Head variant physical weight geometry differs")
-            task["specs"][1]["shape"][0] = 1
+            if convert:
+                task["arguments"]["weight_parts"] = self.weight_parts
+                if task["specs"][1]["name"] != "weight" or task["specs"][1]["shape"] != [
+                    3,
+                    self.n,
+                    self.k,
+                ]:
+                    raise ValueError("Head variant physical weight geometry differs")
+                task["specs"][1]["shape"][0] = self.weight_parts
             tasks[path] = task
 
         for r, pi, program, i in self.calls:
@@ -434,20 +457,35 @@ class CompactHeadRelease(HeadRelease):
                     continue
                 rebuild(path)
                 if path in self.model.get("row_selections", {}):
-                    selected[path] = deepcopy(self.model["row_selections"][path])
-                    for variant in selected[path]:
+                    for variant in self.model["row_selections"][path]:
                         for kernel in variant["kernels"]:
                             rebuild(kernel)
-        compiled = dict(compile_task((task, source)) for task in tasks.values())
-        for r, pi, program, i in self.calls:
-            step = self.model["ranks"][r]["packets"][pi][program][i]
-            step["manifest"] = compiled[step["manifest"]]
-            if step.get("uncompacted_manifest"):
-                step["uncompacted_manifest"] = compiled[step["uncompacted_manifest"]]
-        for path, variants in selected.items():
+        # Publication pins a single source identity per operator. Rebuild the
+        # unchanged consumers of this factory too, retaining their arithmetic.
+        references = []
+        for step in self.model.get("vision", {}).get("body", []):
+            references.append((step, "manifest"))
+        for rank in self.model["ranks"]:
+            for packet in rank["packets"]:
+                for step in packet["body"] + packet["head"]:
+                    if step["op"] == "kernel":
+                        references.extend(
+                            (step, key)
+                            for key in ("manifest", "uncompacted_manifest")
+                            if step.get(key)
+                        )
+        for variants in self.model.get("row_selections", {}).values():
             for variant in variants:
-                variant["kernels"] = [compiled[k] for k in variant["kernels"]]
-            self.model["row_selections"][compiled[path]] = variants
+                references.extend((variant["kernels"], i) for i in range(len(variant["kernels"])))
+        for binding, key in references:
+            rebuild(binding[key], convert=False)
+        compiled = dict(compile_task((task, source)) for task in tasks.values())
+        for binding, key in references:
+            binding[key] = compiled.get(binding[key], binding[key])
+        self.model["row_selections"] = {
+            compiled.get(path, path): variants
+            for path, variants in self.model.get("row_selections", {}).items()
+        }
         used = {
             s[key]
             for rank in self.model["ranks"]
@@ -483,10 +521,22 @@ def main():
         action="store_true",
         help="Remove fully zero BF16 head residual planes without rounding weights",
     )
+    mode.add_argument(
+        "--head-residual-parts",
+        type=int,
+        choices=[2],
+        help="Round a published three-part head to two BF16 components; requires quality acceptance",
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
-    job = (CompactHeadRelease if args.compact_zero_planes else HeadRelease)(
+    compact = args.compact_zero_planes or args.head_residual_parts is not None
+    extra = (
+        dict(retained_parts=args.head_residual_parts, require_exact=False)
+        if args.head_residual_parts is not None
+        else {}
+    )
+    job = (CompactHeadRelease if compact else HeadRelease)(
         args.source,
         args.output,
         source_execution=args.source_execution,
@@ -495,6 +545,7 @@ def main():
         tile_m=args.tile_m,
         tile_n=args.tile_n,
         markov_bias=args.markov_bias,
+        **extra,
     ).plan()
     print(
         json.dumps(
@@ -502,7 +553,7 @@ def main():
                 head_banks=len(job.transforms),
                 calls=len(job.calls),
                 rewritten_shards=len(job.rewrite_groups),
-                tile="preserved" if args.compact_zero_planes else [args.tile_m, args.tile_n],
+                tile="preserved" if compact else [args.tile_m, args.tile_n],
             )
         ),
         flush=True,
