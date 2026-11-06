@@ -79,16 +79,23 @@ def prepare_execution(model, source, stage):
     )
 
 
-def publish_execution(source, cache, *, packet_boundary=None, model_dir=None):
+def publish_execution(
+    source, cache, *, packet_boundary=None, verification_capacity=None, model_dir=None
+):
     source, cache = Path(source).resolve(strict=True), Path(cache)
     package = json.loads((source / "package.json").read_text())
     if package.get("schema_version") != 1 or package.get("backend") != "ascend":
         raise ValueError("Expected native A2 schema-1 execution package")
     model = json.loads(AssetReader(source).read(package["plan"]))
-    if packet_boundary is not None:
+    if packet_boundary is not None or verification_capacity is not None:
         from tools.model.deepseek_v41.assembly import retarget_packet_boundary, validate_rows
 
-        model = retarget_packet_boundary(model, *packet_boundary)
+        if packet_boundary is not None:
+            model = retarget_packet_boundary(model, *packet_boundary)
+        if verification_capacity is not None:
+            if not model.get("batch"):
+                raise ValueError("Verification capacity requires a native batch contract")
+            model["batch"]["verification_capacity"] = verification_capacity
         validate_rows(model, source, model_dir=model_dir)
     cache.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".publish-", dir=cache) as temporary:
@@ -109,6 +116,7 @@ def main():
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output-cache", type=Path, required=True)
     parser.add_argument("--packet-boundary", type=int, nargs=2, metavar=("OLD", "NEW"))
+    parser.add_argument("--verification-capacity", type=int)
     parser.add_argument("--model-dir", type=Path)
     args = parser.parse_args()
     print(
@@ -116,6 +124,7 @@ def main():
             args.source,
             args.output_cache,
             packet_boundary=args.packet_boundary,
+            verification_capacity=args.verification_capacity,
             model_dir=args.model_dir,
         )
     )

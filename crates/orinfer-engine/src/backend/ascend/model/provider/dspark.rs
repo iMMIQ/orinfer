@@ -11,8 +11,8 @@ impl Runtime {
         maintenance: impl FnOnce(),
     ) -> Result<Vec<StepOutput>> {
         let round_started = Instant::now();
-        // Apply the model's verification domain to the whole mixed packet,
-        // including prefill rows, rather than only to the decoder-row budget.
+        // Bound decoder admission by the package's verification-row budget;
+        // mixed prefill still uses the shared packet capacity and scheduler.
         let bounded_options = scheduler::Options {
             max_batch_tokens: options
                 .max_batch_tokens
@@ -84,14 +84,13 @@ impl Runtime {
             .iter()
             .map(|&i| &requests[i].draft_feedback)
             .collect::<Vec<_>>();
-        // Keep automatic verification below the first cross-rank row exchange.
-        // Operator tuning may split that communication domain into smaller ranges.
+        // Use the package's validated verification capacity. Legacy packages
+        // retain their conservative boundary below the first row exchange.
         let row_budget = if options.max_speculative_tokens == 0 {
             self.team.verification_rows
         } else {
-            // This is an upper budget, not permission to cross the model's
-            // automatic verification communication domain. Large prefill
-            // packets keep their separate target execution contract.
+            // The CLI remains an upper budget within the published capability;
+            // the existing row dispatcher selects the measured compute plan.
             options
                 .max_speculative_tokens
                 .min(self.team.verification_rows)

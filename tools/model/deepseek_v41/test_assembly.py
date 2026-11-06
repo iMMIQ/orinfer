@@ -105,6 +105,24 @@ class OwnerRowDomainTests(unittest.TestCase):
 
 
 class PacketBoundaryTests(unittest.TestCase):
+    def test_explicit_verification_capacity_preserves_dispatch_and_checks_outputs(self):
+        model = dict(
+            batch=dict(owners=32, output_capacity=544, columns=[], pointers={}),
+            ranks=[dict(buffers=[], packets=[dict(rows=2048, body=[], head=[])])],
+        )
+        before = deepcopy(model["ranks"])
+        validate_rows(model, Path("."))
+        model["batch"]["verification_capacity"] = 192
+        validate_rows(model, Path("."))
+        self.assertEqual(model["ranks"], before)
+        for capacity in (0, True, 545, 2049):
+            model["batch"]["verification_capacity"] = capacity
+            with (
+                self.subTest(capacity=capacity),
+                self.assertRaisesRegex(ValueError, "Verification capacity"),
+            ):
+                validate_rows(model, Path("."))
+
     def fixture(self):
         packets = [
             dict(rows=32, min_rows=1, batch_decode=True),

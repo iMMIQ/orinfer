@@ -31,6 +31,9 @@ pub(super) struct Contract {
     pub owners: usize,
     #[serde(default)]
     pub output_capacity: usize,
+    /// Explicitly validated aggregate verification rows, independent of SP selection.
+    #[serde(default)]
+    pub verification_capacity: Option<usize>,
     pub columns: Vec<Column>,
     pub private: Vec<String>,
     pub pointers: BTreeMap<String, Vec<usize>>,
@@ -52,6 +55,15 @@ pub(super) struct Contract {
     pub decoder_replay: Option<super::replay::Contract>,
 }
 impl Contract {
+    pub(super) fn verification_rows(&self, legacy: usize, capacity: usize) -> Result<usize> {
+        match self.verification_capacity {
+            Some(rows) if rows == 0 || rows > capacity.min(self.output_capacity()) => {
+                Err("Verification capacity exceeds target rows or output capacity".into())
+            }
+            Some(rows) => Ok(rows),
+            None => Ok(legacy),
+        }
+    }
     pub(super) fn output_capacity(&self) -> usize {
         if self.output_capacity == 0 {
             self.owners
@@ -1437,6 +1449,7 @@ pub(super) fn validate(model: &super::Model) -> Result<()> {
             .collect::<Vec<_>>();
         let capacity = prefill[0].rows;
         super::validate_row_ranges(&prefill, 1, Some(capacity))?;
+        c.verification_rows(1, capacity)?;
         if !(1..=capacity).contains(&c.preferred_span()) {
             return Err("Invalid prefill scheduling quantum".into());
         }

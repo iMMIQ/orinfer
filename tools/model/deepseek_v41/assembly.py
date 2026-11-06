@@ -367,6 +367,22 @@ def validate_rows(model, base, *, model_dir=None):
     """Offline full-domain arithmetic and physical span checks, deduplicated."""
     if model.get("batch"):
         validate_owner_row_domains(model["batch"])
+        contract = model["batch"]
+        verification = contract.get("verification_capacity")
+        if verification is not None:
+            capacity = min(
+                min(
+                    max(
+                        p["rows"]
+                        for p in r["packets"]
+                        if p.get("role", "target") == "target" and not p.get("batch_decode")
+                    )
+                    for r in model["ranks"]
+                ),
+                contract.get("output_capacity") or contract["owners"],
+            )
+            if type(verification) is not int or not 1 <= verification <= capacity:
+                raise ValueError("Verification capacity exceeds target rows or output capacity")
     expressions, specs = {}, {}
     unit_scales = None
     sizes = dict(i8=1, u8=1, f16=2, bf16=2, f32=4, i32=4, i64=8, u64=8)

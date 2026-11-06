@@ -295,7 +295,9 @@ A2 的 `--graph off` 关闭主干、DSpark 和视觉的 Graph 捕获及 replay�
 
 A2 在加载 CANN 前自动安装按设备隔离的 HCOMM Graph 回调注册表，支持 CANN HCOMM 9.2.0。单进程多卡可以各自淘汰、重建 Graph，设备内重复的 modelId 分别注册和清理；原生 modelId、AICPU 元数据及通信参数保持原有语义。兼容组件随引擎编译，在线从密封匿名内存加载，无需编译器、额外部署文件或修改系统 CANN。组件在进程内保留至退出；HCOMM 已提前加载或组件 ABI 不匹配时，启动返回明确错误。`validate-hccl` 包含改变输入的 replay，以及各 rank 分别保留 1–4 个 Graph 的 12 轮捕获、执行和回收检查。 引擎及内置组件的 glibc 最低版本为 2.34；离线构建会检查内置组件的 ELF 版本依赖。
 
-A2 的自动草稿验证预算保持在 target 首次启用跨 rank 行交换之前；执行包没有行交换时使用 target 容量。草稿深度与聚合验证行数共同决定执行计划，算子调优的行数分段共用该通信预算。`--max-speculative-tokens N` 进一步限制行预算；自动验证保持在模型声明的通信域内，包括同包 prefill 行，独立 prefill 保持原有容量。状态 journal 汇总本包各 owner 的保存或恢复拷贝，通过同一 stream 提交并统一等待完成。
+A2 执行包可通过 `batch.verification_capacity` 声明自动草稿分配的 decoder 验证行预算，包含各 owner 的 anchor；离线构建和在线加载校验其处于 target 与输出容量范围内。`tools.model.deepseek_v41.publication --verification-capacity N` 复用已有动态计划发布该声明，行数调度继续选择原有计算和通信路径。发布前需完成对应容量下的验证、接受前缀恢复及请求隔离验收。未声明的执行包沿用首次跨 rank 行交换之前的保守预算；没有行交换时使用 target 容量。`--max-speculative-tokens N` 进一步限制 decoder 验证行预算；混合 prefill 行数由公共 packet 容量和调度预算约束，独立 prefill 使用原有容量。状态 journal 汇总本包各 owner 的保存或恢复拷贝，通过同一 stream 提交并统一等待完成。
+
+A2 自动草稿成本模型复用邻近行数的测量；向上预测限定在已测行数的两倍内。更大的未知 batch 使用现有的有界探索预算校准，收益和亏损仍记入同一模型级账户。这样可以避免将小 packet 的固定启动成本按请求数放大，长期阻止较大 batch 获得实测机会。
 
 A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和 PV 计算体，支持每 rank 8/16/32/64 个 head，保留 FP32 softmax 与 BF16 probability 边界。`tools.model.deepseek_v41.fuse_attention --selected-int8 --min-rows N` 按实测聚合行数拆分已有 target 执行域，小行数保留原算子；草稿与普通 decode 沿用各自的计划选择。主干全行与 decoder 保留窗口分别绑定 work 表，在线只消费离线生成的计划。
 

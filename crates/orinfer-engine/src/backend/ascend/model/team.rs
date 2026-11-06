@@ -175,6 +175,11 @@ impl Team {
             .map(|p| p.min_rows.saturating_sub(1))
             .min()
             .unwrap_or(rows);
+        let verification_rows = model
+            .batch
+            .as_ref()
+            .ok_or("Missing batch contract")?
+            .verification_rows(verification_rows, rows)?;
         let timeout = channel::command_timeout(
             std::env::var("ORINFER_A2_COMMAND_TIMEOUT_MS")
                 .ok()

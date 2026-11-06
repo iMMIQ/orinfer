@@ -822,6 +822,64 @@ mod tests {
         }
     }
     #[test]
+    fn single_owner_timings_do_not_prevent_bounded_c32_calibration() {
+        let mut p = Policy::default();
+        for _ in 0..4 {
+            p.baseline(32, false, false, 0.113);
+        }
+        for (stage, block, rows, seconds) in [
+            (Stage::Target, 0, 6, 0.110),
+            (Stage::Draft, 5, 1, 0.0125),
+            (Stage::Restore, 5, 1, 0.0003),
+        ] {
+            p.costs.observe(Point {
+                stage,
+                block,
+                full: false,
+                replay: false,
+                work: Work {
+                    rows,
+                    ..Work::default()
+                },
+                seconds,
+                setup_s: 0.,
+            });
+        }
+        let states = (0..32).map(|_| Feedback::default()).collect::<Vec<_>>();
+        let feedback = states.iter().collect::<Vec<_>>();
+        let selected = p
+            .select_requests(
+                false,
+                false,
+                Budget {
+                    uniform: true,
+                    ..budget(192)
+                },
+                &[5; 32],
+                &feedback,
+                &[5, 8, 16],
+            )
+            .unwrap();
+        assert_eq!(selected, vec![5; 32]);
+        // The same unknown shape cannot bypass the actual loss account.
+        p.ledger.balance = -1.;
+        assert_eq!(
+            p.select_requests(
+                false,
+                false,
+                Budget {
+                    uniform: true,
+                    ..budget(192)
+                },
+                &[5; 32],
+                &feedback,
+                &[5, 8, 16],
+            )
+            .unwrap(),
+            vec![0; 32]
+        );
+    }
+    #[test]
     fn ordinary_prices_include_host_commit_and_record_one_sample_per_round() {
         let mut p = Policy::default();
         let work = Work {

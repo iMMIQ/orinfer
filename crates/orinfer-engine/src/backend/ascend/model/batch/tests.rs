@@ -29,6 +29,21 @@ fn key(layout: &Layout) -> Key {
     .unwrap()
 }
 #[test]
+fn explicit_verification_capacity_keeps_legacy_selection_and_checks_head_bounds() {
+    let mut c = contract();
+    c.output_capacity = 544;
+    assert_eq!(c.verification_rows(127, 2048).unwrap(), 127);
+    assert_eq!(c.verification_rows(2048, 2048).unwrap(), 2048);
+    c.verification_capacity = Some(192);
+    assert_eq!(c.verification_rows(127, 2048).unwrap(), 192);
+    for rows in [0, 545, 2049] {
+        c.verification_capacity = Some(rows);
+        assert!(c.verification_rows(127, 2048).is_err());
+    }
+    c.verification_capacity = Some(256);
+    assert!(c.verification_rows(127, 255).is_err());
+}
+#[test]
 fn successful_shape_streaks_are_family_local_and_reset_on_eviction() {
     let mut runtime = Runtime::new(contract(), 32, &[], &BTreeSet::new());
     let a = key(&layout(&[16], &[7]).unwrap());

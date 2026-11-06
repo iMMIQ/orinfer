@@ -259,6 +259,10 @@ impl Model {
                     && f.2 == full
                     && f.3 == requested.3
                     && *mode == replay
+                    // Small packets include a large fixed launch cost. Do not
+                    // multiply a single-owner observation across a distant
+                    // batch; leave that cost unknown for bounded calibration.
+                    && work.rows <= rows.saturating_mul(2)
                     && (!comparable
                         || f.4.ilog2().abs_diff(requested.4.ilog2()) <= 1
                             && f.5.abs_diff(requested.5) <= 1
