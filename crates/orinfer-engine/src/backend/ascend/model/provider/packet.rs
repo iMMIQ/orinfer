@@ -1,6 +1,33 @@
 //! Shared native packet selection for ordinary and speculative target rows.
 use super::*;
 
+pub(super) fn readout(requests: &[&mut Request], full: bool) -> super::super::team::Readout {
+    super::super::team::Readout {
+        full,
+        full_owners: Some(
+            requests
+                .iter()
+                .filter(|r| r.prefilling || r.needs_logits())
+                .map(|r| r.slot)
+                .collect(),
+        ),
+        draws: requests
+            .iter()
+            .filter(|r| r.device_sample())
+            .map(|r| {
+                (
+                    r.slot,
+                    super::super::super::sampling::Draw {
+                        seed: r.sampling.seed,
+                        step: r.generated,
+                        temperature: r.sampling.temperature,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
 pub(super) struct Selection {
     pub layout: Layout,
     pub tokens: Vec<Vec<u32>>,

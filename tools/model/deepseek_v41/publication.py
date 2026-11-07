@@ -26,6 +26,11 @@ def manifests(model):
         for choice in choices:
             names.update(choice["kernels"])
     names.update(op["manifest"] for op in model.get("vision", {}).get("body", []))
+    names.update(
+        model.get("sampling", {}).get(k)
+        for k in ("local", "merge")
+        if model.get("sampling", {}).get(k)
+    )
     return sorted(names)
 
 

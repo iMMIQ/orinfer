@@ -152,6 +152,19 @@ impl Decoder {
         }
         Ok(())
     }
+    /// Commit device-selected tokens only while no mask is required. A control
+    /// transition ends this packet; its remaining model writes are rolled back.
+    pub fn consume_unconstrained_prefix(&mut self, tokens: &[u32]) -> Result<usize> {
+        let mut count = 0;
+        for &token in tokens {
+            if self.constrained() || self.finished() {
+                break;
+            }
+            self.consume(token)?;
+            count += 1;
+        }
+        Ok(count)
+    }
     pub fn commit(&mut self, token: u32, law: Law) -> Result<()> {
         self.consume(token)?;
         if let Some(reporting) = law.reporting {
@@ -220,6 +233,34 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn device_prefix_stops_before_a_new_masked_phase() {
+        #[derive(Clone)]
+        struct Phase(usize);
+        impl Constraint for Phase {
+            fn fork(&self) -> Box<dyn Constraint> {
+                Box::new(self.clone())
+            }
+            fn needs_mask(&self) -> bool {
+                self.0 == 0
+            }
+            fn mask(&mut self) -> Result<Vec<u32>> {
+                Ok(vec![1])
+            }
+            fn consume(&mut self, _: u32) -> Result<()> {
+                self.0 -= 1;
+                Ok(())
+            }
+            fn finished(&self) -> bool {
+                false
+            }
+        }
+        let mut decoder = Decoder::default();
+        decoder.set_constraint(Box::new(Phase(1)));
+        assert_eq!(decoder.consume_unconstrained_prefix(&[2, 3, 4]).unwrap(), 1);
+        assert!(decoder.constrained());
+        assert_eq!(decoder.consume_unconstrained_prefix(&[3]).unwrap(), 0);
+    }
     #[test]
     fn gpu_greedy_respects_masks_singletons_and_vocabulary_tail() {
         #[derive(Clone)]

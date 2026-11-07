@@ -76,7 +76,8 @@ def command(args):
         "--extra-inputs",
         json.dumps(
             dict(
-                temperature=0,
+                temperature=args.temperature,
+                top_p=args.top_p,
                 **(
                     {
                         "reasoning_effort": "high",
@@ -162,6 +163,8 @@ def main():
         "--benchmark-id", help="Fixed cache-bust identity; defaults to source identity"
     )
     parser.add_argument("--mtp-drafts", type=int, default=0, help="Expected service draft limit")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(
         "--enable-thinking", action="store_true", help="Enable thinking for all replay requests"
     )
@@ -170,6 +173,8 @@ def main():
         parser.error("Mini diagnostics require a 60..1200 second wall limit")
     if min(args.request_count, args.concurrency, args.benchmark_duration) < 1:
         parser.error("Replay count, concurrency and duration must be positive")
+    if not (0 <= args.temperature <= 2 and 0 < args.top_p <= 1):
+        parser.error("Require temperature in 0..2 and top_p in (0,1]")
     args.url = args.url.rstrip("/")
     model_info = None
     deployment = None
@@ -266,6 +271,8 @@ def main():
             benchmark_id=args.benchmark_id,
             mtp_drafts=args.mtp_drafts,
             enable_thinking=args.enable_thinking,
+            temperature=args.temperature,
+            top_p=args.top_p,
             service_pid=args.service_pid,
             service_command=service_command,
             service_environment=service_environment,

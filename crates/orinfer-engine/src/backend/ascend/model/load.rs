@@ -146,6 +146,16 @@ impl Worker {
         let needed = needed
             .checked_add(
                 model
+                    .sampling
+                    .as_ref()
+                    .map(|s| s.bytes())
+                    .transpose()?
+                    .unwrap_or(0),
+            )
+            .ok_or("Sampling workspace budget overflow")?;
+        let needed = needed
+            .checked_add(
+                model
                     .vision
                     .as_ref()
                     .map(vision::Program::device_bytes)
@@ -288,6 +298,11 @@ impl Worker {
             })
             .transpose()?;
         let mut worker = Self {
+            sampling: model
+                .sampling
+                .as_ref()
+                .map(|s| super::super::sampling::Categorical::load(&session, package, s))
+                .transpose()?,
             vision,
             growth,
             session,

@@ -144,6 +144,7 @@ pub(crate) struct Request {
     prefilling: bool,
     released: bool,
     sampling: crate::sampling::Options,
+    device_sampling: bool,
     decoder: Decoder,
     prefix: crate::prefix::Statistics,
     mtp: crate::mtp::Statistics,
@@ -165,13 +166,22 @@ impl Drop for Request {
     }
 }
 impl Request {
-    fn needs_logits(&self) -> bool {
+    fn host_sampling(&self) -> bool {
         !self.sampling.is_greedy()
             || self.sampling.top_logprobs.is_some()
             || self.decoder.constrained()
     }
+    fn device_sample(&self) -> bool {
+        self.device_sampling
+            && !self.prefilling
+            && self.sampling.device_categorical()
+            && !self.decoder.constrained()
+    }
+    fn needs_logits(&self) -> bool {
+        self.host_sampling() && !self.device_sample()
+    }
     fn accept_output(&mut self, output: &Output) -> Result<u32> {
-        let token = if self.needs_logits() {
+        let token = if self.host_sampling() && !(self.device_sample() && output.logits.is_empty()) {
             let law = self
                 .decoder
                 .law(&output.logits, &self.history, &self.sampling)?;
@@ -697,6 +707,7 @@ impl Runtime {
             prefilling: true,
             released: false,
             sampling: input.sampling,
+            device_sampling: self.team.model.sampling.is_some(),
             decoder: Default::default(),
             prefix,
             mtp: Default::default(),
@@ -1037,9 +1048,10 @@ impl Runtime {
         let capture = self
             .speculation_policy
             .target_budget(full, layout.decode, work, uses, slack);
+        let readout = packet::readout(requests, full);
         let (values, timing) =
             self.team
-                .forward_with(layout, tokens, full, Some(capture), maintenance)?;
+                .forward_with(layout, tokens, readout, Some(capture), maintenance)?;
         let seconds = timing.seconds;
         let preparation = timing.preparation;
         self.statistics.iterations += 1;

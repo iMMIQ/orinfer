@@ -1,4 +1,65 @@
 use super::*;
+
+#[test]
+fn sampling_rows_keep_owner_positions_and_select_only_raw_outputs() {
+    use orinfer_model_sdk::architecture::BatchSegment;
+    let draw = super::super::super::sampling::Draw {
+        seed: 20261002,
+        step: 4097,
+        temperature: 1.0,
+    };
+    let readout = Readout {
+        full: true,
+        draws: [(17, draw.clone())].into(),
+        full_owners: Some([7].into()),
+    };
+    let layout = Layout::verification(
+        vec![
+            BatchSegment {
+                slot: 17,
+                tokens: 3,
+            },
+            BatchSegment { slot: 7, tokens: 2 },
+        ],
+        8,
+        32,
+    )
+    .unwrap();
+    let controls = readout.controls(&layout).unwrap();
+    assert_eq!(
+        controls[..3],
+        [
+            draw.control(0).unwrap(),
+            draw.control(1).unwrap(),
+            draw.control(2).unwrap()
+        ]
+    );
+    assert_eq!(controls[3..], [[0; 3]; 2]);
+    let owners = [(0, 17), (1, 17), (2, 17), (3, 7), (4, 7)];
+    assert_eq!(readout.logit_ranges(owners.into_iter()), vec![3..5]);
+    assert_eq!(
+        Readout::from(true).logit_ranges(owners.into_iter()),
+        vec![0..5]
+    );
+    let reversed = Layout::verification(
+        vec![
+            BatchSegment { slot: 7, tokens: 2 },
+            BatchSegment {
+                slot: 17,
+                tokens: 3,
+            },
+        ],
+        8,
+        32,
+    )
+    .unwrap();
+    assert_eq!(&readout.controls(&reversed).unwrap()[2..], &controls[..3]);
+    let invalid = Readout {
+        full_owners: None,
+        ..readout
+    };
+    assert!(invalid.controls(&layout).is_err());
+}
 fn direct(uses: u8) -> CacheState {
     CacheState::Direct {
         uses,
@@ -126,7 +187,7 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
                     }
                     assert!(matches!(
                         commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                        Command::Forward(_, _, false, mode, _) if mode == cached_prepare.then_some(capture)
+                        Command::Forward(_, _, Readout { full: false, .. }, mode, _) if mode == cached_prepare.then_some(capture)
                     ));
                     // Workers cannot complete until host maintenance has run.
                     completed.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -149,7 +210,7 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
                     &peers,
                     layout,
                     vec![vec![0; if repeated { 1 } else { 2 }]],
-                    false,
+                    false.into(),
                     budget,
                     || {
                         for maintenance in maintained {

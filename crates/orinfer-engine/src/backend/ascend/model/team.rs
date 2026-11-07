@@ -15,7 +15,7 @@ mod preparation;
 use channel::{Peer, Transport, reply_channel};
 pub(super) use preparation::{CaptureBudget, capture_credit, capture_interval};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{Arc, mpsc},
     thread::JoinHandle,
@@ -39,7 +39,7 @@ pub(super) enum Command {
     Prepare(Layout, bool),
     Shared(Layout),
     CaptureShared(Layout, String),
-    Forward(Layout, Vec<Vec<u32>>, bool, Option<bool>, Vec<String>),
+    Forward(Layout, Vec<Vec<u32>>, Readout, Option<bool>, Vec<String>),
     BeginVerification(Vec<(usize, usize)>),
     RollbackVerification(Vec<(usize, usize)>),
     EndVerification,
@@ -97,6 +97,70 @@ pub(super) struct Output {
     pub token: u32,
     pub value: f32,
     pub logits: Vec<f32>,
+}
+#[derive(Clone, Default)]
+pub(super) struct Readout {
+    pub full: bool,
+    pub draws: BTreeMap<usize, super::super::sampling::Draw>,
+    /// None retains the benchmark/legacy full-packet diagnostic contract.
+    pub full_owners: Option<BTreeSet<usize>>,
+}
+impl From<bool> for Readout {
+    fn from(full: bool) -> Self {
+        Self {
+            full,
+            ..Self::default()
+        }
+    }
+}
+impl Readout {
+    pub fn wants_logits(&self, owner: usize) -> bool {
+        self.full
+            && self
+                .full_owners
+                .as_ref()
+                .is_none_or(|owners| owners.contains(&owner))
+    }
+    pub fn logit_ranges(
+        &self,
+        outputs: impl Iterator<Item = (usize, usize)>,
+    ) -> Vec<std::ops::Range<usize>> {
+        let mut ranges: Vec<std::ops::Range<usize>> = vec![];
+        for (row, owner) in outputs {
+            if self.wants_logits(owner) {
+                if let Some(last) = ranges.last_mut()
+                    && last.end == row
+                {
+                    last.end += 1;
+                } else {
+                    ranges.push(row..row + 1);
+                }
+            }
+        }
+        ranges
+    }
+    pub fn controls(&self, layout: &Layout) -> Result<Vec<[i32; 3]>> {
+        if self.draws.keys().any(|owner| self.wants_logits(*owner)) {
+            return Err("An owner cannot request sampled and raw outputs together".into());
+        }
+        let mut positions = BTreeMap::<usize, usize>::new();
+        layout
+            .outputs
+            .iter()
+            .map(|&lane| {
+                let slot = layout.segments[lane].slot;
+                let position = positions.entry(slot).or_default();
+                let value = self
+                    .draws
+                    .get(&slot)
+                    .map(|d| d.control(*position))
+                    .transpose()?
+                    .unwrap_or([0; 3]);
+                *position += 1;
+                Ok(value)
+            })
+            .collect()
+    }
 }
 pub(super) struct Team {
     peers: Transport,
@@ -482,10 +546,10 @@ impl Team {
                             Command::CaptureShared(layout, id) => {
                                 worker.capture_shared(&layout, &id).map(Reply::Shared)
                             }
-                            Command::Forward(layout, tokens, full, cached, shared) => cached
+                            Command::Forward(layout, tokens, readout, cached, shared) => cached
                                 .map_or(Ok(()), |capture| worker.prepare_batch(&layout, capture))
                                 .and_then(|()| worker.select_shared(&layout, &shared))
-                                .and_then(|()| worker.forward_batch(&layout, &tokens, full))
+                                .and_then(|()| worker.forward_batch(&layout, &tokens, &readout))
                                 .map(|values| {
                                     Reply::Outputs(
                                         values
@@ -575,7 +639,7 @@ impl Team {
         &self,
         layout: Layout,
         tokens: Vec<Vec<u32>>,
-        full: bool,
+        readout: impl Into<Readout>,
         budget: Option<CaptureBudget>,
         maintenance: impl FnOnce(),
     ) -> Result<(Vec<Output>, Timing)> {
@@ -583,7 +647,7 @@ impl Team {
             &self.peers,
             layout,
             tokens,
-            full,
+            readout.into(),
             budget,
             maintenance,
             self.graphs_enabled,
@@ -802,7 +866,15 @@ fn forward(
     full: bool,
     graphs_enabled: bool,
 ) -> Result<(Vec<Output>, f64, f64)> {
-    let (outputs, timing) = forward_with(peers, layout, tokens, full, None, || {}, graphs_enabled)?;
+    let (outputs, timing) = forward_with(
+        peers,
+        layout,
+        tokens,
+        full.into(),
+        None,
+        || {},
+        graphs_enabled,
+    )?;
     Ok((outputs, timing.seconds, timing.preparation))
 }
 #[cfg(test)]
@@ -815,7 +887,7 @@ fn forward_with(
     peers: &Transport,
     layout: Layout,
     tokens: Vec<Vec<u32>>,
-    full: bool,
+    readout: Readout,
     mut budget: Option<CaptureBudget>,
     maintenance: impl FnOnce(),
     graphs_enabled: bool,
@@ -909,7 +981,7 @@ fn forward_with(
     let command = Command::Forward(
         layout,
         tokens,
-        full,
+        readout,
         cached_prepare.then_some(capture),
         shared,
     );

@@ -616,6 +616,11 @@ def publish_package(model, base, destination):
         path = Path(operation["manifest"])
         assets.add(str(path))
         assets.add(str(path.parent / json.loads((base / path).read_text())["library"]["file"]))
+    for name in ("local", "merge"):
+        if model.get("sampling", {}).get(name):
+            path = Path(model["sampling"][name])
+            assets.add(str(path))
+            assets.add(str(path.parent / json.loads((base / path).read_text())["library"]["file"]))
     for variants in model.get("row_selections", {}).values():
         for variant in variants:
             for name in variant["kernels"]:

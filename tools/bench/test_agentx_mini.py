@@ -26,6 +26,8 @@ class MiniIdentityTests(unittest.TestCase):
             concurrency=16,
             benchmark_duration=600,
             enable_thinking=True,
+            temperature=1.0,
+            top_p=1.0,
         )
         command = agentx_mini.command(args)
         for flag, value in [
@@ -37,6 +39,11 @@ class MiniIdentityTests(unittest.TestCase):
         extra = json.loads(command[command.index("--extra-inputs") + 1])
         self.assertEqual(extra["reasoning_effort"], "high")
         self.assertTrue(extra["chat_template_kwargs"]["enable_thinking"])
+        self.assertEqual((extra["temperature"], extra["top_p"]), (1.0, 1.0))
+        args.temperature = 0.0
+        command = agentx_mini.command(args)
+        extra = json.loads(command[command.index("--extra-inputs") + 1])
+        self.assertEqual(extra["temperature"], 0.0)
 
     def test_reference_snapshot_sums_engine_gauges_and_preserves_context(self):
         metrics = (

@@ -261,7 +261,7 @@ impl Runtime {
         let (verified, verify_timing) = self.team.forward_with(
             layout,
             inputs,
-            full || packet_full,
+            packet::readout(requests, full || packet_full),
             Some(capture),
             maintenance,
         )?;
@@ -293,7 +293,9 @@ impl Runtime {
                     })
                 );
             }
-            let committed = if request.needs_logits() {
+            let committed = if request.host_sampling()
+                && !(request.device_sample() && target.iter().all(|o| o.logits.is_empty()))
+            {
                 let proposals = draft
                     .iter()
                     .map(|&token| {
@@ -317,13 +319,18 @@ impl Runtime {
                     129280,
                 )?
             } else {
-                let tokens = crate::mtp::greedy_commit(
+                // For a deterministic proposer, matching independently sampled
+                // target tokens accepts with p(draft); the first mismatch is
+                // already a draw from the correct positive residual law.
+                let mut tokens = crate::mtp::greedy_commit(
                     &draft,
                     &target.iter().map(|v| v.token).collect::<Vec<_>>(),
                 )?;
-                for &token in &tokens {
-                    request.decoder.consume(token)?;
+                let count = request.decoder.consume_unconstrained_prefix(&tokens)?;
+                if count == 0 {
+                    return Err("Empty unconstrained verification prefix".into());
                 }
+                tokens.truncate(count);
                 tokens
             };
             // The last output stays pending. Keep confirmed writes, restore

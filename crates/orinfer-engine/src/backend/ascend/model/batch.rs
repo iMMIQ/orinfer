@@ -1027,8 +1027,13 @@ impl Worker {
         &mut self,
         layout: &Layout,
         tokens: &[Vec<u32>],
-        full_logits: bool,
+        readout: &super::team::Readout,
     ) -> Result<Vec<(usize, super::packet::Best, Vec<f32>)>> {
+        if !readout.draws.is_empty()
+            && (self.sampling.is_none() || layout.role != super::PacketRole::Target)
+        {
+            return Err("Device sampling requires a target sampling program".into());
+        }
         if tokens.len() != layout.segments.len()
             || tokens
                 .iter()
@@ -1240,40 +1245,49 @@ impl Worker {
                 .map_or(layout.outputs.len(), |stride| {
                     layout.segments.len() * stride
                 });
-            let values = self.session.download(
-                &get(
+            let sampled = if readout.draws.is_empty() {
+                None
+            } else {
+                let source = get(
                     &self.buffers,
                     execution
                         .packet
-                        .confidence
+                        .logits
                         .as_ref()
-                        .unwrap_or(&execution.packet.best_value),
-                )?,
-                0,
-                count * 4,
-            )?;
-            let indices = self.session.download(
-                &get(&self.buffers, &execution.packet.best_index)?,
-                0,
-                count * 4,
-            )?;
-            let logits = if full_logits {
-                Some(
-                    self.session.download(
-                        &get(
-                            &self.buffers,
-                            execution
-                                .packet
-                                .logits
-                                .as_ref()
-                                .ok_or("Missing batch logits")?,
-                        )?,
-                        0,
-                        count * 16160 * 4,
-                    )?,
-                )
+                        .ok_or("Missing sampling logits")?,
+                )?;
+                Some(self.sampling.as_mut().unwrap().sample(
+                    &self.session,
+                    &source,
+                    execution.packet.vocab_first,
+                    &readout.controls(layout)?,
+                    execution.captured,
+                )?)
+            };
+            let values = if sampled.is_some() {
+                vec![]
             } else {
-                None
+                self.session.download(
+                    &get(
+                        &self.buffers,
+                        execution
+                            .packet
+                            .confidence
+                            .as_ref()
+                            .unwrap_or(&execution.packet.best_value),
+                    )?,
+                    0,
+                    count * 4,
+                )?
+            };
+            let indices = if sampled.is_some() {
+                vec![]
+            } else {
+                self.session.download(
+                    &get(&self.buffers, &execution.packet.best_index)?,
+                    0,
+                    count * 4,
+                )?
             };
             let outputs = if let Some(stride) = execution.packet.draft_stride {
                 layout
@@ -1292,9 +1306,46 @@ impl Worker {
                     .map(|(i, &lane)| (i, lane))
                     .collect()
             };
+            let mut logits = BTreeMap::new();
+            for range in readout.logit_ranges(
+                outputs
+                    .iter()
+                    .map(|&(row, lane)| (row, layout.segments[lane].slot)),
+            ) {
+                let source = get(
+                    &self.buffers,
+                    execution
+                        .packet
+                        .logits
+                        .as_ref()
+                        .ok_or("Missing batch logits")?,
+                )?;
+                let bytes = self.session.download(
+                    &source,
+                    range.start * 16160 * 4,
+                    range.len() * 16160 * 4,
+                )?;
+                for (offset, data) in bytes.as_chunks::<{ 16160 * 4 }>().0.iter().enumerate() {
+                    logits.insert(
+                        range.start + offset,
+                        data.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|v| f32::from_le_bytes(*v))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
             for (i, lane) in outputs {
-                let value = f32::from_le_bytes(values[i * 4..i * 4 + 4].try_into().unwrap());
-                let index = i32::from_le_bytes(indices[i * 4..i * 4 + 4].try_into().unwrap());
+                let (value, index) = if let Some(sampled) = &sampled {
+                    let &(value, index) = sampled.get(i).ok_or("Missing sampled row")?;
+                    (value, index as i32)
+                } else {
+                    (
+                        f32::from_le_bytes(values[i * 4..i * 4 + 4].try_into().unwrap()),
+                        i32::from_le_bytes(indices[i * 4..i * 4 + 4].try_into().unwrap()),
+                    )
+                };
                 let vocabulary = if execution.packet.replicated_output {
                     129280
                 } else {
@@ -1303,14 +1354,7 @@ impl Worker {
                 if !value.is_finite() || !(0..vocabulary).contains(&index) {
                     return Err("Invalid batched output".into());
                 }
-                let probs = logits.as_ref().map_or(vec![], |b| {
-                    b[i * 16160 * 4..(i + 1) * 16160 * 4]
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|v| f32::from_le_bytes(*v))
-                        .collect()
-                });
+                let probs = logits.remove(&i).unwrap_or_default();
                 output.push((
                     layout.segments[lane].slot,
                     super::packet::Best {

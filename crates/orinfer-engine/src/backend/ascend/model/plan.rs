@@ -45,6 +45,17 @@ pub(super) fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf
 /// Reject incomplete or mismatched packages before allocating resident weights.
 pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
     batch::validate(model)?;
+    if let Some(sampling) = &model.sampling {
+        sampling.preflight(base)?;
+        if sampling.vocab * model.ranks.len() != 129280
+            || model
+                .batch
+                .as_ref()
+                .is_none_or(|b| sampling.capacity < b.output_capacity())
+        {
+            return Err("Sampling capacity/vocabulary differs from the target contract".into());
+        }
+    }
     if let Some(vision) = &model.vision {
         vision.preflight(base)?;
     }

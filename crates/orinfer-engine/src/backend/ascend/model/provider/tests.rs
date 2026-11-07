@@ -37,6 +37,37 @@ fn output() -> Arc<Output> {
         logits: vec![-1., 0., 3., 1.],
     })
 }
+
+#[test]
+fn device_sampling_keeps_cached_heads_raw_and_respects_host_fallbacks() {
+    let mut request = request(output(), crate::sampling::Options::default());
+    request.device_sampling = true;
+    assert!(
+        request.needs_logits(),
+        "The first token and cached head retain raw logits"
+    );
+    request.prefilling = false;
+    assert!(!request.needs_logits());
+    let sampled = Output {
+        owner: request.slot,
+        token: 3,
+        value: 1.0,
+        logits: vec![],
+    };
+    assert_eq!(request.accept_output(&sampled).unwrap(), 3);
+    assert_eq!(request.history.last(), Some(&3));
+    request.sampling.top_p = 0.9;
+    assert!(request.needs_logits());
+    request.sampling.top_p = 1.0;
+    request.sampling.top_logprobs = Some(0);
+    assert!(request.needs_logits());
+    request.sampling.top_logprobs = None;
+    request.device_sampling = false;
+    assert!(
+        request.needs_logits(),
+        "Older execution packages keep the host sampler"
+    );
+}
 #[test]
 fn shared_banks_and_cpu_heads_are_charged_once_after_parent_eviction() {
     let mut cache = Cache::new(4096);
@@ -95,6 +126,7 @@ pub(super) fn request(output: Arc<Output>, sampling: crate::sampling::Options) -
         prefilling: true,
         released: false,
         sampling,
+        device_sampling: false,
         decoder: Default::default(),
         draft_feedback: Default::default(),
         shared_work: false,

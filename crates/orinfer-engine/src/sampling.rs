@@ -27,6 +27,23 @@ pub fn counter_uniform(seed: u64, request_id: u64, absolute_step: u64) -> f64 {
     bits as f64 * (1.0 / 9_007_199_254_740_992.0)
 }
 
+/// Row identity for the device categorical RNG. Independent of owner slots,
+/// packet shape, vocabulary partition and speculative verification depth.
+pub fn categorical_key(seed: u64, absolute_step: u64) -> [u32; 2] {
+    let key = splitmix64(splitmix64(seed) ^ absolute_step);
+    [key as u32, (key >> 32) as u32]
+}
+
+/// Random123 Philox2x32-10 reference for device validation and shared backends.
+pub fn categorical_bits(mut counter: [u32; 2], mut key: u32) -> [u32; 2] {
+    for _ in 0..10 {
+        let product = u64::from(counter[0]) * 0xd256_d193;
+        counter = [(product >> 32) as u32 ^ key ^ counter[1], product as u32];
+        key = key.wrapping_add(0x9e37_79b9);
+    }
+    counter
+}
+
 /// Host sampling of the resident model's logits. Greedy keeps the GPU fast path.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -57,6 +74,18 @@ impl Default for Options {
     }
 }
 impl Options {
+    /// Full categorical law without history processors or probability reports.
+    /// Grammar eligibility is checked separately against the request decoder.
+    pub fn device_categorical(&self) -> bool {
+        (1e-5..=2.0).contains(&self.temperature)
+            && self.top_p == 1.0
+            && self.top_k == 0
+            && self.presence_penalty == 0.0
+            && self.frequency_penalty == 0.0
+            && self.repetition_penalty == 1.0
+            && self.logit_bias.is_empty()
+            && self.top_logprobs.is_none()
+    }
     pub fn validate(&self) -> Result<(), String> {
         if !self.temperature.is_finite()
             || !(0.0..=2.0).contains(&self.temperature)
@@ -574,7 +603,27 @@ mod sampling_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{EVALUATION_SEED, counter_uniform};
+    use super::{EVALUATION_SEED, categorical_bits, categorical_key, counter_uniform};
+
+    #[test]
+    fn philox_matches_random123_known_answers() {
+        // DEShawResearch/random123 tests/kat_vectors, Philox2x32-10.
+        for (counter, key, expected) in [
+            ([0, 0], 0, [0xff1d_ae59, 0x6cd1_0df2]),
+            ([u32::MAX, u32::MAX], u32::MAX, [0x2c3f_628b, 0xab4f_d7ad]),
+            (
+                [0x243f_6a88, 0x85a3_08d3],
+                0x1319_8a2e,
+                [0xdd7c_e038, 0xf62a_4c12],
+            ),
+        ] {
+            assert_eq!(categorical_bits(counter, key), expected);
+        }
+        assert_ne!(
+            categorical_key(EVALUATION_SEED, 1),
+            categorical_key(EVALUATION_SEED, 2)
+        );
+    }
 
     #[test]
     fn matches_frozen_python_counter_contract() {
@@ -599,6 +648,41 @@ mod tests {
 #[cfg(test)]
 mod point_mass_tests {
     use super::*;
+    #[test]
+    fn sampled_target_prefix_commit_retains_categorical_law() {
+        let laws = [[0.2_f64, 0.3, 0.5], [0.6, 0.1, 0.3], [0.3, 0.4, 0.3]];
+        let mut first = [0usize; 3];
+        let mut accepted = [0usize; 2];
+        let n = 32768;
+        for seed in 0..n {
+            let targets = laws
+                .iter()
+                .enumerate()
+                .map(|(step, law)| {
+                    let key = categorical_key(seed as u64, step as u64);
+                    law.iter()
+                        .enumerate()
+                        .map(|(token, p)| {
+                            let bits = categorical_bits([token as u32, key[1]], key[0])[0];
+                            let u = (f64::from(bits >> 9) + 0.5) / 8388608.0;
+                            (token as u32, p.ln() - (-u.ln()).ln())
+                        })
+                        .max_by(|a, b| a.1.total_cmp(&b.1))
+                        .unwrap()
+                        .0
+                })
+                .collect::<Vec<_>>();
+            let committed = crate::mtp::greedy_commit(&[1, 0], &targets).unwrap();
+            first[committed[0] as usize] += 1;
+            accepted[0] += usize::from(committed.len() > 1);
+            accepted[1] += usize::from(committed.len() > 2);
+        }
+        for (observed, p) in first.into_iter().zip(laws[0]) {
+            assert!((observed as f64 / n as f64 - p).abs() < 0.02);
+        }
+        assert!((accepted[0] as f64 / n as f64 - 0.3).abs() < 0.02);
+        assert!((accepted[1] as f64 / n as f64 - 0.18).abs() < 0.02);
+    }
     #[test]
     fn deterministic_proposal_retains_exact_residual_sampling() {
         let q = Distribution::point_mass(1, 3).unwrap();

@@ -71,6 +71,8 @@ struct Model {
     batch: Option<batch::Contract>,
     #[serde(default)]
     vision: Option<vision::Program>,
+    #[serde(default)]
+    sampling: Option<super::sampling::Contract>,
     #[serde(skip)]
     graph_launches: std::collections::BTreeSet<batch::WorkLaunch>,
 }
@@ -489,6 +491,7 @@ struct W4Key {
 type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
 
 struct Worker {
+    sampling: Option<super::sampling::Categorical>,
     growth: BTreeMap<String, crate::backend::growth::TokenLayout>,
     session: Session,
     vision: Option<vision::Encoder>,

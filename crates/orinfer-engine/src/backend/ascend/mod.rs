@@ -6,6 +6,7 @@ pub mod kernels;
 pub mod model;
 pub mod operators;
 pub mod runtime;
+pub(crate) mod sampling;
 #[cfg(test)]
 mod tests;
 pub mod validation;
