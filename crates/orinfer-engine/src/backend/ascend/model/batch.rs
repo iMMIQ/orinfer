@@ -1029,10 +1029,8 @@ impl Worker {
         tokens: &[Vec<u32>],
         readout: &super::team::Readout,
     ) -> Result<Vec<(usize, super::packet::Best, Vec<f32>)>> {
-        if !readout.draws.is_empty()
-            && (self.sampling.is_none() || layout.role != super::PacketRole::Target)
-        {
-            return Err("Device sampling requires a target sampling program".into());
+        if !readout.draws.is_empty() && self.sampling.is_none() {
+            return Err("Device sampling requires a sampling program".into());
         }
         if tokens.len() != layout.segments.len()
             || tokens
@@ -1051,11 +1049,35 @@ impl Worker {
                 .ok_or("Batch must be prepared before forward")?,
         );
         let retained = self.update_batch_tables(layout, &execution.packet)?;
+        if !readout.draws.is_empty()
+            && layout.role == super::PacketRole::Draft
+            && execution.packet.sampling_controls.is_none()
+        {
+            return Err("Draft packet has no coupled sampling controls".into());
+        }
         let mut joined = vec![];
         let mut visual_rows = vec![];
         let mut hashes = vec![];
         let mut valid = vec![];
         let mut inputs = vec![];
+        if let Some(name) = &execution.packet.sampling_controls {
+            let stride = execution
+                .packet
+                .draft_stride
+                .ok_or("Sampling draft requires a physical owner stride")?;
+            let mut controls = vec![0u8; layout.segments.len() * stride * 16];
+            for (lane, segment) in layout.segments.iter().enumerate() {
+                if let Some(draw) = readout.draws.get(&segment.slot) {
+                    let bytes = draw.controls(self.rank * 16160, segment.tokens)?;
+                    let start = lane * stride * 16;
+                    controls[start..start + bytes.len()].copy_from_slice(&bytes);
+                }
+            }
+            inputs.push((
+                get(&self.buffers, name)?.slice(0, controls.len())?,
+                controls,
+            ));
+        }
         let image_input = |name: Option<&String>| -> Result<Option<(Buffer, Vec<u8>)>> {
             name.map(|name| {
                 let buffer = get(&self.buffers, name)?;
@@ -1245,7 +1267,7 @@ impl Worker {
                 .map_or(layout.outputs.len(), |stride| {
                     layout.segments.len() * stride
                 });
-            let sampled = if readout.draws.is_empty() {
+            let sampled = if readout.draws.is_empty() || layout.role == super::PacketRole::Draft {
                 None
             } else {
                 let source = get(

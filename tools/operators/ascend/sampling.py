@@ -228,3 +228,82 @@ def merge(rows, parts):
                 T.copy(pair[:, :2], output[row : row + 1, :])
 
     return main
+
+
+def markov(rows, vocab, block_size=16, tile=2048):
+    """Fuse shared target randomness into the existing sequential Markov head.
+
+    Controls are in the same physical owner/position order as the draft logits.
+    Each step sees only earlier sampled draft tokens through the Markov bias.
+    Zero inverse temperature retains the original greedy arithmetic and tie rule.
+    """
+    parts = (vocab + tile - 1) // tile
+
+    @T.prim_func
+    def main(
+        base: T.Tensor((rows * block_size, vocab), "float32"),
+        bias: T.Tensor((rows, vocab), "float32"),
+        proposals: T.Tensor((rows * block_size, vocab), "float32"),
+        packed: T.Tensor((parts, rows, 2), "float32"),
+        step_index: T.Tensor((1,), "int32"),
+        controls: T.Tensor((rows * block_size, 4), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(rows * parts, 2), is_npu=True) as (cid, vid):
+            scores = T.alloc_ub((1, tile), "float32")
+            bias_tile = T.alloc_ub((1, tile), "float32")
+            noise = T.alloc_ub((1, 1024), "float32")
+            chunk = T.alloc_ub((1, 1024), "float32")
+            indices = T.alloc_ub((1, tile), "float32")
+            mask = T.alloc_ub((tile // 8,), "uint8")
+            maximum = T.alloc_ub((1, 1), "float32")
+            minimum = T.alloc_ub((1, 1), "float32")
+            pair = T.alloc_ub((1, 8), "float32")
+            index = cid * 2 + vid
+            row, part = index // parts, index % parts
+            begin = part * tile
+            live = T.min(tile, vocab - begin)
+            if row < rows:
+                step = step_index[0]
+                position = row * block_size + step
+                T.tile.fill(scores, -T.infinity("float32"))
+                T.tile.fill(bias_tile, 0.0)
+                T.copy(base[position : position + 1, begin : begin + live], scores[:, :live])
+                T.copy(bias[row : row + 1, begin : begin + live], bias_tile[:, :live])
+                T.tile.add(scores, scores, bias_tile)
+                T.copy(scores[:, :live], proposals[position : position + 1, begin : begin + live])
+                inverse = T.reinterpret("float32", controls[position, 3])
+                if inverse > 0.0:
+                    # Keep the established 2048-wide candidate geometry while
+                    # bounding Philox scratch to the shared 1024-wide template.
+                    for half in T.serial(tile // 1024):
+                        uniform(
+                            noise,
+                            controls[position, 2] + begin + half * 1024,
+                            T.reinterpret("uint32", controls[position, 0]),
+                            T.reinterpret("uint32", controls[position, 1]),
+                        )
+                        T.tile.ln(noise, noise)
+                        T.tile.mul(noise, noise, -1.0)
+                        T.tile.ln(noise, noise)
+                        T.copy(scores[:, half * 1024 : (half + 1) * 1024], chunk)
+                        T.tile.mul(chunk, chunk, inverse)
+                        T.tile.sub(chunk, chunk, noise)
+                        T.copy(chunk, scores[:, half * 1024 : (half + 1) * 1024])
+                T.tile.createvecindex(indices, T.float32(0.0))
+                T.tile.compare(mask, indices, T.cast(live, "float32"), "LT")
+                T.tile.select(
+                    scores, mask, scores, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE"
+                )
+                T.reduce_max(scores, maximum, dim=1)
+                T.tile.add(indices, indices, T.cast(begin, "float32"))
+                T.tile.compare(mask, scores, maximum[0, 0], "EQ")
+                T.tile.select(
+                    indices, mask, indices, T.cast(vocab, "float32"), "VSEL_TENSOR_SCALAR_MODE"
+                )
+                T.reduce_min(indices, minimum, dim=1)
+                pair[0, 0] = maximum[0, 0]
+                pair[0, 1] = minimum[0, 0]
+                T.copy(pair[:, :2], packed[part, row : row + 1, :])
+                T.pipe_barrier("ALL")
+
+    return main

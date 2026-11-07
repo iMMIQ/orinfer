@@ -201,9 +201,20 @@ impl Runtime {
         let capture = self
             .speculation_policy
             .draft_budget(block, draft_owners.len(), uses, slack);
+        let readout = if self
+            .team
+            .model
+            .sampling
+            .as_ref()
+            .is_some_and(|s| s.coupled_draft)
+        {
+            packet::readout(requests, false)
+        } else {
+            false.into()
+        };
         let (proposals, draft_timing) =
             self.team
-                .forward_with(draft, inputs, false, Some(capture), || {})?;
+                .forward_with(draft, inputs, readout, Some(capture), || {})?;
         let draft_s = draft_timing.seconds;
         let draft_prepare = draft_timing.preparation;
         let mut inputs = BTreeMap::new();
@@ -319,9 +330,10 @@ impl Runtime {
                     129280,
                 )?
             } else {
-                // For a deterministic proposer, matching independently sampled
-                // target tokens accepts with p(draft); the first mismatch is
-                // already a draw from the correct positive residual law.
+                // Target draws use only their absolute position's randomness.
+                // A deterministic guess or a draft sharing that randomness can
+                // therefore reuse the matching prefix. Earlier decisions never
+                // inspect future draws; the first mismatch is the target draw.
                 let mut tokens = crate::mtp::greedy_commit(
                     &draft,
                     &target.iter().map(|v| v.token).collect::<Vec<_>>(),

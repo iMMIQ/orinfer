@@ -55,6 +55,30 @@ pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
         {
             return Err("Sampling capacity/vocabulary differs from the target contract".into());
         }
+        for rank in &model.ranks {
+            for packet in rank
+                .packets
+                .iter()
+                .filter(|p| p.role == super::PacketRole::Draft)
+            {
+                if sampling.coupled_draft != packet.sampling_controls.is_some() {
+                    return Err("Draft sampling capability differs from the packet".into());
+                }
+                if let Some(name) = &packet.sampling_controls {
+                    let stride = packet.draft_stride.ok_or("Sampling draft has no stride")?;
+                    let bytes = model.batch.as_ref().unwrap().owners * stride * 16;
+                    if !rank
+                        .buffers
+                        .iter()
+                        .any(|b| b.name == *name && b.bytes == bytes)
+                    {
+                        return Err(
+                            "Draft sampling controls differ from the physical layout".into()
+                        );
+                    }
+                }
+            }
+        }
     }
     if let Some(vision) = &model.vision {
         vision.preflight(base)?;

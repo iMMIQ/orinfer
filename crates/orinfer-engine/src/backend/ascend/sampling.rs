@@ -19,6 +19,8 @@ pub(crate) struct Contract {
     pub rng: String,
     pub local: String,
     pub merge: String,
+    #[serde(default)]
+    pub coupled_draft: bool,
 }
 impl Contract {
     pub fn manifests(&self) -> impl Iterator<Item = &str> {
@@ -92,6 +94,17 @@ impl Draw {
             .ok_or("Sampling position overflow")?;
         let key = categorical_key(self.seed, step as u64);
         Ok([key[0] as i32, key[1] as i32, inverse.to_bits() as i32])
+    }
+    pub fn controls(&self, origin: u32, count: usize) -> Result<Vec<u8>> {
+        (0..count)
+            .map(|offset| self.control(offset))
+            .collect::<Result<Vec<_>>>()
+            .map(|rows| {
+                rows.into_iter()
+                    .flat_map(|r| [r[0], r[1], origin as i32, r[2]])
+                    .flat_map(i32::to_le_bytes)
+                    .collect()
+            })
     }
 }
 pub(crate) struct Categorical {

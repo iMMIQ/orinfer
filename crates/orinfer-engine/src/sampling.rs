@@ -649,6 +649,56 @@ mod tests {
 mod point_mass_tests {
     use super::*;
     #[test]
+    fn shared_gumbel_draft_preserves_serial_autoregressive_samples() {
+        fn law(history: &[u32], draft: bool) -> [f64; 3] {
+            let last = history.last().copied().unwrap_or(0) as usize;
+            let weights = if draft {
+                [0.25, 0.4, 0.35]
+            } else {
+                [0.2, 0.3, 0.5]
+            };
+            std::array::from_fn(|i| weights[(i + last + history.len()) % 3])
+        }
+        fn sample(history: &[u32], seed: u64, draft: bool) -> u32 {
+            let key = categorical_key(seed, history.len() as u64);
+            law(history, draft)
+                .into_iter()
+                .enumerate()
+                .map(|(token, p)| {
+                    let bits = categorical_bits([token as u32, key[1]], key[0])[0];
+                    let u = (f64::from(bits >> 9) + 0.5) / 8388608.0;
+                    (token as u32, p.ln() - (-u.ln()).ln())
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap()
+                .0
+        }
+        for seed in 0..128 {
+            let mut serial = vec![];
+            for _ in 0..24 {
+                serial.push(sample(&serial, seed, false));
+            }
+            for block in [1, 2, 5, 8] {
+                let mut output = vec![];
+                while output.len() < serial.len() {
+                    let mut history = output.clone();
+                    let mut drafts = vec![];
+                    let mut targets = vec![];
+                    for _ in 0..block {
+                        targets.push(sample(&history, seed, false));
+                        let token = sample(&history, seed, true);
+                        drafts.push(token);
+                        history.push(token);
+                    }
+                    targets.push(sample(&history, seed, false));
+                    let committed = crate::mtp::greedy_commit(&drafts, &targets).unwrap();
+                    output.extend(committed.into_iter().take(serial.len() - output.len()));
+                }
+                assert_eq!(output, serial, "seed={seed}, block={block}");
+            }
+        }
+    }
+    #[test]
     fn sampled_target_prefix_commit_retains_categorical_law() {
         let laws = [[0.2_f64, 0.3, 0.5], [0.6, 0.1, 0.3], [0.3, 0.4, 0.3]];
         let mut first = [0usize; 3];

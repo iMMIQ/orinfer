@@ -144,6 +144,9 @@ struct Packet {
     /// Physical output stride of a shared-capacity draft template.
     #[serde(default)]
     draft_stride: Option<usize>,
+    /// Per-position sampling controls consumed inside the draft Markov head.
+    #[serde(default)]
+    sampling_controls: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]

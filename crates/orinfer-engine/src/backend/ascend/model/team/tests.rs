@@ -26,6 +26,14 @@ fn sampling_rows_keep_owner_positions_and_select_only_raw_outputs() {
     )
     .unwrap();
     let controls = readout.controls(&layout).unwrap();
+    let draft_controls = draw.controls(7 * 16160, 3).unwrap();
+    for (position, bytes) in draft_controls.as_chunks::<16>().0.iter().enumerate() {
+        let actual: [i32; 4] = std::array::from_fn(|i| {
+            i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+        });
+        let key = draw.control(position).unwrap();
+        assert_eq!(actual, [key[0], key[1], 7 * 16160, key[2]]);
+    }
     assert_eq!(
         controls[..3],
         [

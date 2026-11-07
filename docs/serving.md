@@ -84,6 +84,8 @@ DSv4.1 A2 新导出或前端升级的模型默认 `temperature=1、top_p=1`。�
 
 包含设备采样能力的 A2 执行包在温度 `1e-5..=2`、`top_p=1、top_k=0`、无惩罚及 bias、当前无需 grammar mask 且未请求概率报告时，普通 decode 和 DSpark 验证共享 NPU 采样。其他请求继续使用完整 logits；混合 batch 只读回这些请求的词表。首 token 和 prefix 缓存保留原始模型输出。设备采样以 seed、生成位置和全局 token ID 固定随机身份，同 seed 的具体输出可与旧 CPU 算法不同。未包含该能力的旧执行包继续使用原采样路径。
 
+声明 `coupled_draft` 的执行包在 DSpark Markov head 内复用 target 同一生成位置的 Gumbel 随机数，按顺序推进草稿条件，并复用现有匹配前缀提交与状态恢复。target 保持请求的采样概率律；草稿无需传回完整概率表。温度 0 以及不满足设备采样条件的请求使用贪心草稿。离线通过 `tools.model.deepseek_v41.sampling --couple-draft` 扩展已具备 target 采样能力的计划，所有并发与草稿长度共享一个动态 Markov 算子。
+
 默认关闭 thinking；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 开启后，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
 `chat_template_kwargs` 接受对象或 `null`，兼容 DSH、vLLM 客户端的模板参数。嵌套的 `enable_thinking`（或 `thinking`）、`reasoning_effort` 和 `thinking_token_budget` 与对应顶层控制一致；同名非空顶层值优先。`preserve_thinking` 控制模板中的历史推理保留，其余自定义变量传给模型模板；消息、工具、生成边界和运行时控制由服务端绑定。请求中的嵌套 thinking 设置会覆盖部署默认值中的顶层或嵌套 thinking 设置，模板默认变量按键补齐；显式 `chat_template_kwargs: null` 清除默认模板变量。thinking 开关必须为布尔值。接入配置见 [DeepSeek Harness](deepseek-harness.md)。

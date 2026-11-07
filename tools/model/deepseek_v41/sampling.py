@@ -65,11 +65,83 @@ def attach(model, base):
     return result
 
 
+def couple_draft(model, base):
+    """Reuse the Markov chain with the target's per-position Gumbel draws."""
+    from kernels.model.rows import row_count
+    from tools.operators.ascend import sampling
+    from tools.operators.ascend.build import compile_kernel, operand
+
+    if not model.get("sampling"):
+        raise ValueError("Coupled drafts require target device sampling")
+    owners, vocab = model["batch"]["owners"], model["sampling"]["vocab"]
+    compiled = {}
+    packets = 0
+    for rank in model["ranks"]:
+        name = "sampling.markov.controls"
+        strides = set()
+        for packet in rank["packets"]:
+            if packet.get("role") != "draft":
+                continue
+            if packet.get("sampling_controls"):
+                raise ValueError("Draft already has coupled sampling controls")
+            stride = packet.get("draft_stride")
+            if not stride or packet["rows"] != owners * stride:
+                raise ValueError("Coupled draft requires the shared physical Markov stride")
+            strides.add(stride)
+            steps = 0
+            for instruction in packet["body"]:
+                if instruction["op"] != "kernel":
+                    continue
+                path = instruction["manifest"]
+                spec = json.loads((base / path).read_text())
+                if spec["op"] != "topk.add_bias_argmax":
+                    continue
+                if (
+                    spec["parameters"]["block_size"] != stride
+                    or spec["parameters"]["vocab"] != vocab
+                    or len(instruction["buffers"]) != 5
+                    or len(spec["operands"]) != 5
+                ):
+                    raise ValueError("Markov head differs from the coupled sampling contract")
+                if stride not in compiled:
+                    ports = spec["operands"] + [
+                        dict(
+                            name="controls", dtype="i32", shape=[owners * stride, 4], access="read"
+                        )
+                    ]
+                    result = compile_kernel(
+                        sampling.markov(row_count(owners, True), vocab, stride),
+                        "sampling.markov",
+                        [operand(p["name"], p["dtype"], p["shape"], p["access"]) for p in ports],
+                        dict(vocab=vocab, block_size=stride),
+                        base / "cache",
+                        row_capacity=owners,
+                    )
+                    compiled[stride] = str(result.relative_to(base))
+                instruction["manifest"] = compiled[stride]
+                instruction["buffers"].append(name)
+                steps += 1
+            if steps != packet["coordinates"]["draft_block"]:
+                raise ValueError("Incomplete coupled Markov chain")
+            packet["sampling_controls"] = name
+            packets += 1
+        if len(strides) != 1:
+            raise ValueError("Publish one physical Markov stride per rank")
+        rank["buffers"].append(dict(name=name, bytes=owners * next(iter(strides)) * 16))
+    if packets == 0:
+        raise ValueError("No DSpark draft packets")
+    model["sampling"]["coupled_draft"] = True
+    return dict(packets=packets, kernels=compiled)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-workers", type=int, default=1)
+    parser.add_argument(
+        "--couple-draft", action="store_true", help="Extend existing target sampling"
+    )
     args = parser.parse_args()
     if (
         args.plan.parent.resolve() != args.output.parent.resolve()
@@ -77,7 +149,8 @@ def main():
     ):
         parser.error("Preserve the input and keep its asset directory")
     model = decode(json.loads(args.plan.read_text()))
-    print(json.dumps(attach(model, args.plan.parent)), flush=True)
+    transform = couple_draft if args.couple_draft else attach
+    print(json.dumps(transform(model, args.plan.parent)), flush=True)
     atomic_json(args.output, model)
 
 
