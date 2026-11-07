@@ -78,9 +78,9 @@ curl http://127.0.0.1:8088/v1/chat/completions \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"37×24−19×13等于多少？"}],"temperature":0,"max_tokens":512,"enable_thinking":true,"stream":true,"stream_options":{"include_usage":true}}'
 ```
 
-支持 `temperature`、`top_p`、`top_k`、presence/frequency/repetition penalties、有符号 64 位 `seed`、`logit_bias`、EOS 和 `stop`。temperature、top_p、top_k 和 repetition_penalty 默认采用模型的 generation config；presence/frequency penalties 默认 0。默认 seed 为 20261002。`logit_bias` 的 key 是 tokenizer 的 token ID，值范围为 −100 到 100。
+支持 `temperature`、`top_p`、`top_k`、presence/frequency/repetition penalties、有符号 64 位 `seed`、`logit_bias`、EOS 和 `stop`。temperature、top_p、top_k 和 repetition_penalty 默认采用模型的 generation config，DSv4.1 使用下述默认值；presence/frequency penalties 默认 0。未指定 seed 时，每个请求生成独立的 64 位随机种子，随请求保留并供 target、DSpark 与状态恢复共用。显式 seed 保持固定；负数按相同 64 位补码解释。验收请求显式设置 `seed=20261002`。`top_k=-1` 和 `top_k=0` 均关闭 top-k，正数范围为 1 到 2147483647。`logit_bias` 的 key 是 tokenizer 的 token ID，值范围为 −100 到 100。
 
-DSv4.1 A2 新导出或前端升级的模型默认 `temperature=1、top_p=1`。已发布模型保留原始文件；部署旧模型时使用 `--default-request-params '{"temperature":1,"top_p":1}'` 设置相同默认值。客户端显式提供的采样参数优先。
+DSv4.1 A2 的服务默认与 [DeepInfer SamplingParams](https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/sampling_params.py) 的采样配置一致：`temperature=1、top_p=1`、关闭 top-k、不施加重复惩罚、遇到 EOS 正常结束。旧模型文件中的 greedy 默认值也由前端采用此策略，无需修改已发布权重。部署时可用 `--default-request-params` 覆盖，客户端显式提供的参数优先。
 
 包含设备采样能力的 A2 执行包在温度 `1e-5..=2`、`top_p=1、top_k=0`、无惩罚及 bias、当前无需 grammar mask 且未请求概率报告时，普通 decode 和 DSpark 验证共享 NPU 采样。其他请求继续使用完整 logits；混合 batch 只读回这些请求的词表。首 token 和 prefix 缓存保留原始模型输出。设备采样以 seed、生成位置和全局 token ID 固定随机身份，同 seed 的具体输出可与旧 CPU 算法不同。未包含该能力的旧执行包继续使用原采样路径。
 
@@ -88,11 +88,13 @@ DSv4.1 A2 新导出或前端升级的模型默认 `temperature=1、top_p=1`。�
 
 默认关闭 thinking；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 开启后，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
+DSv4.1 使用本模型的 effort 编码：开启 thinking 后默认 `high=75`，`minimal/low=50`，`max/xhigh=100`。
+
 `chat_template_kwargs` 接受对象或 `null`，兼容 DSH、vLLM 客户端的模板参数。嵌套的 `enable_thinking`（或 `thinking`）、`reasoning_effort` 和 `thinking_token_budget` 与对应顶层控制一致；同名非空顶层值优先。`preserve_thinking` 控制模板中的历史推理保留，其余自定义变量传给模型模板；消息、工具、生成边界和运行时控制由服务端绑定。请求中的嵌套 thinking 设置会覆盖部署默认值中的顶层或嵌套 thinking 设置，模板默认变量按键补齐；显式 `chat_template_kwargs: null` 清除默认模板变量。thinking 开关必须为布尔值。接入配置见 [DeepSeek Harness](deepseek-harness.md)。
 
 `thinking_token_budget` 限制本轮初始思考段的 token 数，支持 0；到达上限时解码强制选择 `</think>`，随后继续回答或调用工具。结束标记仅计入 completion。预算自动缩小到总输出上限减 2，为结束标记和至少一个回答 token 留空间；开启 thinking 且指定此参数时，总输出预算至少为 2。该预算在 thinking 开启时生效。限制是请求私有状态，MTP 的草稿和 target 共同遵守。无惩罚、无概率报告的 greedy 请求在 GPU argmax 满足约束时直接复用结果；预算耗尽时可直接选择唯一的结束标记。其他约束选择保留 CPU 回退，随机采样保持相同目标分布。effort 控制思考倾向，`thinking_token_budget` 提供硬上限。
 
-默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限默认 32 MiB，通过 `--request-body-mib` 调整。
+默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。此处为 Chat API 的输出预算；DeepInfer 底层构造器的默认值为 16 tokens，调用方传入已编码 prompt，thinking 由外部模板决定。本服务的 thinking 开关沿用上面的请求控制。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限默认 32 MiB，通过 `--request-body-mib` 调整。
 
 上下文溢出返回 `error.code=context_length_exceeded`，客户端可据此压缩历史并重试；其他无效参数仍为 `invalid_request`。
 

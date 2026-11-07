@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 use tokenizers::Tokenizer;
 mod deepseek;
+#[cfg(test)]
+mod defaults_test;
 mod template_options;
 use super::output::ToolFormat;
 pub(super) use template_options::THINKING_FIELDS;
@@ -20,6 +22,14 @@ where
 }
 
 type Result<T> = std::result::Result<T, String>;
+
+fn normalize_top_k(value: i64) -> Result<usize> {
+    match value {
+        -1 | 0 => Ok(0),
+        1..=2_147_483_647 => Ok(value as usize),
+        _ => Err("top_k: Expected -1 or 0 (disabled), or 1..=2147483647".into()),
+    }
+}
 
 #[cfg(test)]
 mod mtp_fixture_export {
@@ -74,7 +84,7 @@ pub struct ChatRequest {
     pub parallel_tool_calls: Option<bool>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
-    pub top_k: Option<usize>,
+    pub top_k: Option<i64>,
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
     pub repetition_penalty: Option<f64>,
@@ -175,8 +185,8 @@ impl ChatCodec {
             temperature: generation["temperature"].as_f64().unwrap_or(1.0),
             top_p: generation["top_p"].as_f64().unwrap_or(1.0),
             top_k: generation["top_k"]
-                .as_u64()
-                .map(|n| usize::try_from(n).map_err(|e| e.to_string()))
+                .as_i64()
+                .map(normalize_top_k)
                 .transpose()?
                 .unwrap_or(0),
             repetition_penalty: generation["repetition_penalty"].as_f64().unwrap_or(1.0),
@@ -248,6 +258,12 @@ impl ChatCodec {
             None => ToolFormat::Qwen,
         };
         if tool_format == ToolFormat::DeepSeekV41 {
+            // Older exported checkpoints wrote greedy defaults. The frontend
+            // policy follows DeepInfer without modifying published assets.
+            sampling_defaults.temperature = 1.0;
+            sampling_defaults.top_p = 1.0;
+            sampling_defaults.top_k = 0;
+            sampling_defaults.repetition_penalty = 1.0;
             // Serving prepares the frontend alongside model loading. Share one
             // trie instead of building it on the first constrained request.
             grammar.prepare()?;
@@ -356,16 +372,27 @@ impl ChatCodec {
                 .temperature
                 .unwrap_or(self.sampling_defaults.temperature),
             top_p: request.top_p.unwrap_or(self.sampling_defaults.top_p),
-            top_k: request.top_k.unwrap_or(self.sampling_defaults.top_k),
+            top_k: request
+                .top_k
+                .map(normalize_top_k)
+                .transpose()?
+                .unwrap_or(self.sampling_defaults.top_k),
             repetition_penalty: request
                 .repetition_penalty
                 .unwrap_or(self.sampling_defaults.repetition_penalty),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
-            seed: request
-                .seed
-                .map(|s| s as u64)
-                .unwrap_or(orinfer_engine::sampling::EVALUATION_SEED),
+            // Resolve once into Prepared; target, draft, retry and prefix
+            // restoration retain this request's sampling identity.
+            seed: match request.seed {
+                Some(seed) => seed as u64,
+                None => {
+                    let mut bytes = [0; 8];
+                    getrandom::fill(&mut bytes)
+                        .map_err(|e| format!("Generate sampling seed: {e}"))?;
+                    u64::from_ne_bytes(bytes)
+                }
+            },
             logit_bias: request.logit_bias.unwrap_or_default(),
             top_logprobs: request
                 .logprobs
@@ -1038,7 +1065,7 @@ mod tests {
         let request = || {
             serde_json::from_value(json!({
                 "model":"test", "messages":[{"role":"user","content":"one two three"}],
-                "max_tokens":1
+                "max_tokens":1,"seed":20261002
             }))
             .unwrap()
         };

@@ -10,6 +10,7 @@ license.workspace = true
 multer = "=3.1.0"
 axum = "=0.8.9"
 futures-util = "=0.3.34"
+getrandom = "=0.3.4"
 libc = "=0.2.191"
 humantime = "=2.3.0"
 minijinja = { version = "=3.0.1", features = ["json", "serde"] }
