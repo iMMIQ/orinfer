@@ -61,6 +61,18 @@ def projection_configs(parameters, pipeline_only=False, wide_integer=False, join
                 )
                 if parameters["reduction"] % 512 == 0
             ]
+        if parameters["integer"]:
+            # Aligned divisors cover short/irregular K without a geometry-specific
+            # kernel. Keep the established long-K search and add a bounded set
+            # for K tiles absent from it.
+            represented = {c["block_k"] for c in configs}
+            configs += [
+                dict(baseline, tile_m=m, tile_n=128, block_k=k, pipeline_stages=s)
+                for k in range(32, min(parameters["reduction"], 512) + 1, 32)
+                if k not in represented and parameters["reduction"] % k == 0
+                for m, s in ((64, 0), (128, 0), (64, 2))
+                if s == 0 or parameters["reduction"] // k >= s
+            ]
     elif wide_integer:
         configs = [
             dict(baseline, tile_m=128, tile_n=256, pipeline_stages=s)
@@ -82,7 +94,19 @@ def projection_configs(parameters, pipeline_only=False, wide_integer=False, join
             for k in sorted({128, 256, 512, baseline["block_k"]})
             if parameters["reduction"] % k == 0
         ]
-    return [baseline] + [c for c in configs if c != baseline]
+    unique = [baseline]
+    for config in configs:
+        width = math.gcd(parameters["output"], config["tile_n"])
+        item_bytes = 1 if parameters["integer"] else 2
+        m, k, stages = config["tile_m"], config["block_k"], config["pipeline_stages"]
+        if (
+            config not in unique
+            and m * width * 4 <= 131072
+            and width * 128 * item_bytes <= 32768
+            and max(1, stages) * k * (m + width) * item_bytes <= 524032
+        ):
+            unique.append(config)
+    return unique
 
 
 def preserve_small_rows(existing, measured, variants, old, chosen, capacity):
@@ -304,6 +328,8 @@ def main():
             scale_sha256=file_hash_bytes(channel) if channel is not None else None,
             scale=scaling,
             existing_small_rows=selections.get(old, []),
+            published_manifest=old,
+            published_descriptor_sha256=file_hash(base / old),
             tuner_sha256=file_hash(Path(__file__)),
             assembly_sha256=file_hash(Path(__file__).with_name("assembly.py")),
             geometry_sha256=file_hash(Path(__file__).parents[2] / "operators/ascend/geometry.py"),
@@ -313,6 +339,16 @@ def main():
 
         def valid_record(record):
             names = {record["manifest"]} | {p for v in record["variants"] for p in v["kernels"]}
+            if record.get("unchanged"):
+                return (
+                    record["manifest"] == old
+                    and record["variants"] == identity["existing_small_rows"]
+                    and all(
+                        (descriptor := json.loads((base / name).read_text()))["library"]["sha256"]
+                        == file_hash((base / name).parent / "kernel.so")
+                        for name in names
+                    )
+                )
             for name in names:
                 selected = base / name
                 descriptor = json.loads(selected.read_text())
@@ -354,9 +390,11 @@ def main():
         n, k = parameters["output"], parameters["reduction"]
         integer = parameters["integer"]
         activation = (
-            torch.randint(-127, 128, (capacity, k), dtype=torch.int8)
+            torch.randint(
+                -127, 128, (capacity, parameters.get("activation_stride") or k), dtype=torch.int8
+            )
             if integer
-            else torch.randn(capacity, k).bfloat16()
+            else torch.randn(capacity, parameters.get("activation_stride") or k).bfloat16()
         ).npu()
         device_weight = bank.npu()
         device_weights = [device_weight] + [
@@ -459,9 +497,15 @@ def main():
             )
             for v in bounded_choices(measurements, str(selected), min(capacity, 128))
         ]
-        variants = preserve_small_rows(
-            selections.get(old, []), measured, variants, old, chosen, capacity
-        )
+        unchanged = selected == 0 and not variants
+        if unchanged:
+            # A tie/no-win must retain the deployed library and its existing
+            # small-row choices, rather than republishing a new baseline build.
+            chosen, variants = old, deepcopy(selections.get(old, []))
+        else:
+            variants = preserve_small_rows(
+                selections.get(old, []), measured, variants, old, chosen, capacity
+            )
         result = dict(
             identity=identity,
             measurements=measurements,
@@ -469,6 +513,7 @@ def main():
             config=legal[selected],
             manifest=chosen,
             variants=variants,
+            unchanged=unchanged,
         )
         atomic_json(record, result)
         replacements[old] = chosen

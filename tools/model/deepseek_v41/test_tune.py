@@ -71,6 +71,17 @@ class AuxiliaryHeadTests(unittest.TestCase):
 
 
 class ReleasedProjectionTests(unittest.TestCase):
+    def test_joint_search_covers_aligned_short_k_without_a_special_factory(self):
+        source = dict(integer=True, output=5120, reduction=288, block_k=32)
+        choices = projection_configs(source, joint=True)
+        self.assertEqual(choices[0]["block_k"], 32)
+        self.assertEqual({c["block_k"] for c in choices}, {32, 96, 288})
+        self.assertGreater(len(choices), 1)
+        for config in choices:
+            k, stages = config["block_k"], config["pipeline_stages"]
+            self.assertEqual(source["reduction"] % k, 0)
+            self.assertTrue(stages == 0 or source["reduction"] // k >= stages)
+
     def test_rectangular_integer_tiles_fit_shared_hardware_bounds(self):
         source = dict(integer=True, output=576, reduction=5120, tile_m=256, tile_n=128, block_k=512)
         choices = projection_configs(source, joint=True)

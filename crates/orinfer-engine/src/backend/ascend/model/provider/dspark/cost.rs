@@ -45,6 +45,10 @@ pub(super) struct Point {
     pub block: usize,
     pub full: bool,
     pub replay: bool,
+    #[serde(default)]
+    pub shared: bool,
+    #[serde(default)]
+    pub shared_setup_s: f64,
     pub work: Work,
     pub seconds: f64,
     pub setup_s: f64,
@@ -59,7 +63,7 @@ struct Profile {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Family(Stage, usize, bool, bool, usize, usize);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Key(Family, usize, bool);
+struct Key(Family, usize, bool, bool);
 struct Cell {
     time: crate::mtp::adaptive::Timing,
     prior: f64,
@@ -82,6 +86,7 @@ struct Cold {
 pub(super) struct Model {
     cells: BTreeMap<Key, Cell>,
     modes: BTreeMap<(Family, usize), bool>,
+    shared_modes: std::collections::BTreeSet<(Family, usize)>,
     trace: bool,
     cold: BTreeMap<(Family, usize), Cold>,
 }
@@ -153,13 +158,19 @@ impl Model {
     }
     fn insert(&mut self, point: Point, online: bool) {
         let group = family(point.stage, point.block, point.full, point.work);
-        let key = Key(group, point.work.rows, point.replay);
+        let key = Key(group, point.work.rows, point.replay, point.shared);
         // Offline priors describe costs, never residency in a live Graph cache.
         if online {
             if self.modes.len() >= 2048 && !self.modes.contains_key(&(group, point.work.rows)) {
                 self.modes.clear();
+                self.shared_modes.clear();
             }
             self.modes.insert((group, point.work.rows), point.replay);
+            if point.shared {
+                self.shared_modes.insert((group, point.work.rows));
+            } else {
+                self.shared_modes.remove(&(group, point.work.rows));
+            }
         }
         if self.cells.len() >= 2048 && !self.cells.contains_key(&key) {
             // Retain the bounded sparse surface; unseen shapes can still use it.
@@ -180,15 +191,16 @@ impl Model {
                 point.seconds
             };
         }
-        if point.setup_s > 0. {
+        let local_setup = (point.setup_s - point.shared_setup_s).max(0.);
+        if local_setup > 0. {
             // Host readback mode does not change the captured launch geometry.
             let cold_group = family(point.stage, point.block, false, point.work);
             if self.cold.len() < 2048 || self.cold.contains_key(&(cold_group, point.work.rows)) {
                 let cold = self.cold.entry((cold_group, point.work.rows)).or_default();
                 if point.replay {
-                    cold.capture.observe(point.setup_s);
+                    cold.capture.observe(local_setup);
                 } else {
-                    cold.build.observe(point.setup_s);
+                    cold.build.observe(local_setup);
                 }
             }
         }
@@ -239,36 +251,40 @@ impl Model {
     ) -> Option<Prediction> {
         let requested = family(stage, block, full, work);
         // Select a context/prompt-work neighborhood before interpolating rows.
+        let shared = !replay && self.shared_modes.contains(&(requested, work.rows));
         let group = self
             .cells
             .keys()
-            .filter(|Key(f, rows, mode)| {
+            .filter(|Key(f, rows, mode, shared_mode)| {
                 f.0 == stage
                     && f.1 == block
                     && f.2 == full
                     && f.3 == requested.3
                     && *mode == replay
+                    && *shared_mode == shared
                     // Small packets include a large fixed launch cost. Do not
                     // multiply a single-owner observation across a distant
                     // batch; leave that cost unknown for bounded calibration.
                     && work.rows <= rows.saturating_mul(2)
             })
-            .min_by_key(|Key(f, rows, _)| {
+            .min_by_key(|Key(f, rows, _, _)| {
                 (
                     rows.ilog2().abs_diff(work.rows.max(1).ilog2()) * 2
                         + f.4.ilog2().abs_diff(requested.4.ilog2()),
                     f.5.abs_diff(requested.5),
                 )
             })
-            .map(|Key(f, _, _)| *f)?;
+            .map(|Key(f, _, _, _)| *f)?;
         let points = self
             .cells
             .iter()
-            .filter(|(Key(f, _, mode), _)| *f == group && *mode == replay);
+            .filter(|(Key(f, _, mode, shared_mode), _)| {
+                *f == group && *mode == replay && *shared_mode == shared
+            });
         let mut lower = None;
         let mut previous = None;
         let mut upper = None;
-        for (Key(_, rows, _), cell) in points {
+        for (Key(_, rows, _, _), cell) in points {
             if *rows <= work.rows {
                 previous = lower;
                 lower = Some((*rows, cell));
@@ -396,7 +412,12 @@ impl Model {
             // than direct execution. Only the same work key prices payback.
             replay_s: self
                 .cells
-                .get(&Key(family(stage, block, full, work), work.rows, true))
+                .get(&Key(
+                    family(stage, block, full, work),
+                    work.rows,
+                    true,
+                    false,
+                ))
                 .map(Cell::mean),
             capture_s: self.cold_estimate(stage, block, work, true),
             slack_s,
@@ -443,6 +464,10 @@ fn valid(point: &Point) -> bool {
         && point.seconds > 0.
         && point.setup_s.is_finite()
         && point.setup_s >= 0.
+        && !(point.replay && point.shared)
+        && point.shared_setup_s.is_finite()
+        && point.shared_setup_s >= 0.
+        && point.shared_setup_s <= point.setup_s
 }
 
 #[cfg(test)]
@@ -529,6 +554,8 @@ mod tests {
     }
     fn point(rows: usize, replay: bool, seconds: f64) -> Point {
         Point {
+            shared: false,
+            shared_setup_s: 0.,
             stage: Stage::Target,
             block: 0,
             full: false,
@@ -541,6 +568,42 @@ mod tests {
             seconds,
             setup_s: 0.,
         }
+    }
+    #[test]
+    fn shared_execution_and_capture_cost_do_not_pollute_direct_or_full_modes() {
+        let mut model = Model::default();
+        let work = point(800, false, 0.).work;
+        model.observe(point(800, false, 0.10));
+        model.observe(Point {
+            shared: true,
+            shared_setup_s: 0.03,
+            setup_s: 0.05,
+            ..point(800, false, 0.07)
+        });
+        assert_eq!(
+            model
+                .predict(Stage::Target, 0, false, work)
+                .unwrap()
+                .seconds,
+            0.07
+        );
+        assert!((model.cold_estimate(Stage::Target, 0, work, false).unwrap() - 0.02).abs() < 1e-12);
+        model.observe(point(800, true, 0.05));
+        assert_eq!(
+            model
+                .predict(Stage::Target, 0, false, work)
+                .unwrap()
+                .seconds,
+            0.05
+        );
+        model.observe(point(800, false, 0.10));
+        assert_eq!(
+            model
+                .predict(Stage::Target, 0, false, work)
+                .unwrap()
+                .seconds,
+            0.10
+        );
     }
     #[test]
     fn captures_survive_zero_setup_replays_and_price_direct_transition() {
@@ -641,6 +704,8 @@ mod tests {
         };
         for (rows, replay, seconds, setup_s) in [(16, false, 0.014, 0.), (32, true, 0.022, 0.04)] {
             model.observe(Point {
+                shared: false,
+                shared_setup_s: 0.,
                 stage: Stage::Draft,
                 block: 5,
                 full: false,
@@ -666,6 +731,8 @@ mod tests {
                 .profitable(0)
         );
         model.observe(Point {
+            shared: false,
+            shared_setup_s: 0.,
             stage: Stage::Draft,
             block: 5,
             full: false,

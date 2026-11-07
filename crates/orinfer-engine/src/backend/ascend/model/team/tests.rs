@@ -126,11 +126,11 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
                     }
                     assert!(matches!(
                         commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                        Command::Forward(_, _, false, mode) if mode == cached_prepare.then_some(capture)
+                        Command::Forward(_, _, false, mode, _) if mode == cached_prepare.then_some(capture)
                     ));
                     // Workers cannot complete until host maintenance has run.
                     completed.recv_timeout(Duration::from_secs(5)).unwrap();
-                    reply.send(Ok(Reply::Outputs(vec![]))).unwrap();
+                    reply.send(Ok(Reply::Outputs(vec![], false))).unwrap();
                 });
             }
             let layout = Layout::new(

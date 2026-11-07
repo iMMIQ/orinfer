@@ -56,6 +56,7 @@ fn direct_segments_retain_parallel_resources_and_fence_partial_errors() {
         let parallel =
             Branches::new(&session, &depths, Box::new((Rc::clone(&ops), comm.clone()))).unwrap();
         let segment = Rc::new(Segment {
+            shared: vec![],
             ops,
             comm,
             parallel: Some(parallel),

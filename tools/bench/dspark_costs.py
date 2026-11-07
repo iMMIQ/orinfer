@@ -47,7 +47,18 @@ def profile(paths):
                     and point["setup_s"] >= 0
                 ):
                     raise ValueError("Invalid DSpark timing")
-                shape = {k: v for k, v in point.items() if k not in ("seconds", "setup_s")}
+                shared_setup = point.get("shared_setup_s", 0.0)
+                if not math.isfinite(shared_setup) or not 0 <= shared_setup <= point["setup_s"]:
+                    raise ValueError("Invalid shared Graph preparation timing")
+                if point.get("shared") and point["replay"]:
+                    raise ValueError("Shared Graph is not a full replay")
+                if not point.get("shared"):
+                    point.pop("shared", None)
+                shape = {
+                    k: v
+                    for k, v in point.items()
+                    if k not in ("seconds", "setup_s", "shared_setup_s")
+                }
                 work = shape["work"] = dict(point["work"])
                 work["context"] = 1 << (max(1, work["context"]) - 1).bit_length()
                 # The runtime uses the same context/prompt-work neighborhoods.
@@ -59,13 +70,24 @@ def profile(paths):
         raise ValueError("No identified DSpark cost observations")
     points = []
     for key, observations in sorted(groups.items()):
+        shared = [
+            p.get("shared_setup_s", 0.0) for p in observations if p.get("shared_setup_s", 0.0) > 0
+        ]
+        local = [
+            p["setup_s"] - p.get("shared_setup_s", 0.0)
+            for p in observations
+            if p["setup_s"] > p.get("shared_setup_s", 0.0)
+        ]
         points.append(
             dict(
-                {k: v for k, v in observations[0].items() if k not in ("seconds", "setup_s")},
+                {
+                    k: v
+                    for k, v in observations[0].items()
+                    if k not in ("seconds", "setup_s", "shared_setup_s")
+                },
                 seconds=median(p["seconds"] for p in observations),
-                setup_s=median(p["setup_s"] for p in observations if p["setup_s"] > 0)
-                if any(p["setup_s"] > 0 for p in observations)
-                else 0.0,
+                setup_s=(median(local) if local else 0.0) + (median(shared) if shared else 0.0),
+                **({"shared_setup_s": median(shared)} if shared else {}),
             )
         )
     if len(points) > 2048:

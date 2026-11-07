@@ -13,6 +13,7 @@ mod plan;
 pub(crate) mod provider;
 mod replay;
 mod row_contract;
+mod shared;
 mod state;
 mod team;
 pub(crate) mod validation;
@@ -435,6 +436,7 @@ struct Segment {
     ops: Rc<Vec<SegmentOp>>,
     comm: Communicator,
     parallel: Option<Rc<super::graph::Branches>>,
+    shared: Vec<shared::Piece>,
 }
 impl Segment {
     fn fence_result<T>(&self, result: Result<T>) -> Result<T> {
@@ -448,20 +450,17 @@ impl Segment {
         })
     }
     fn execute_on_stream(&self, stream: super::api::Handle) -> Result<()> {
-        self.fence_result(enqueue_segment(
-            &self.ops,
-            &self.comm,
-            self.parallel.as_deref(),
-            stream,
-        ))
+        self.fence_result(self.enqueue_shared(stream))
     }
     fn enqueue(self: &Rc<Self>, session: &Session) -> Result<Ticket> {
         // SAFETY: This bound segment owns every operand, executor, communicator
         // and branch. The completion retains it and fences partial submission.
         unsafe {
-            session.submit_compute(vec![], Box::new(Rc::clone(self)), |stream| {
-                self.execute_on_stream(stream)
-            })
+            session.submit_compute(
+                vec![],
+                Box::new((Rc::clone(self), self.shared_graphs())),
+                |stream| self.execute_on_stream(stream),
+            )
         }
     }
 }
@@ -515,6 +514,7 @@ struct Worker {
     phases: LoadPhases,
     steps: BTreeMap<usize, packet::StepStats>,
     batch: Option<batch::Runtime>,
+    shared: shared::Cache,
 }
 
 /// Per-phase cold-start accounting for one rank; every phase is wall time
@@ -629,7 +629,11 @@ impl Worker {
         let empty_decoder = decoder_layout.as_ref().is_some_and(|l| l.rows.total == 0);
         let mut current_layout = layout;
         let mut steps = vec![];
-        let mut pending: Vec<SegmentOp> = vec![];
+        let mut pending = shared::Pending::new(
+            self.shared.enabled
+                && self.session.graphs_enabled()
+                && layout.is_some_and(shared::eligible),
+        );
         let mut fork_count = 0;
         let mut fork_stack = Vec::new();
         let routed: std::collections::BTreeSet<_> = instructions
@@ -667,6 +671,7 @@ impl Worker {
             };
             match instruction {
                 Instruction::DecoderRows { .. } => {
+                    pending.common = false;
                     current_layout = decoder_layout.as_ref();
                     active_rows = current_layout.ok_or("Missing decoder layout")?.rows.total;
                     if active_rows == 0 {
@@ -1106,7 +1111,7 @@ impl Worker {
                 // enqueues. The surrounding kernels restore activation bytes:
                 // ACLNN's A8/W4 implementation transforms its input in place.
                 if capture_w4 {
-                    pending.push(SegmentOp::W4(plan));
+                    pending.push_w4(plan, name);
                 } else {
                     self.capture_pending(&mut pending, &mut steps, capture)?;
                     fork_count = 0;
@@ -1244,15 +1249,15 @@ impl Worker {
     /// replay output.
     fn capture_pending(
         &mut self,
-        pending: &mut Vec<SegmentOp>,
+        pending: &mut shared::Pending,
         steps: &mut Vec<Step>,
         capture: bool,
     ) -> Result<()> {
         let validation_started = Instant::now();
-        let depths = branches::validate(pending)?;
+        let depths = branches::validate(&pending.ops)?;
         self.phases.dependencies.0 += 1;
         self.phases.dependencies.1 += validation_started.elapsed().as_secs_f64();
-        let ops = Rc::new(pending.clone());
+        let ops = Rc::new(pending.ops.clone());
         let comm = self.comm.clone();
         let branch_started = Instant::now();
         let parallel = if depths.is_empty() {
@@ -1270,6 +1275,11 @@ impl Worker {
             ops,
             comm,
             parallel,
+            shared: if capture {
+                vec![]
+            } else {
+                self.shared.pieces(pending, &self.comm)?
+            },
         });
         steps.push(if capture {
             Step::Graph(Rc::new(self.capture_segment(segment)?))
@@ -1283,7 +1293,20 @@ impl Worker {
         let t = Instant::now();
         // Warm every bound segment immediately before capture, even when its
         // direct form has executed before: CANN lazy capture state requires it.
-        segment.enqueue(&self.session)?.wait()?;
+        // Warm the original operations, never an embedded shared Graph.
+        // SAFETY: the segment retains its complete native operands/branches.
+        unsafe {
+            self.session
+                .submit_compute(vec![], Box::new(Rc::clone(&segment)), |stream| {
+                    segment.fence_result(enqueue_segment(
+                        &segment.ops,
+                        &segment.comm,
+                        segment.parallel.as_deref(),
+                        stream,
+                    ))
+                })?
+        }
+        .wait()?;
         self.phases.warmups.0 += 1;
         self.phases.warmups.1 += t.elapsed().as_secs_f64();
         let t = Instant::now();

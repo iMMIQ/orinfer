@@ -313,6 +313,7 @@ impl Worker {
             phases,
             steps: BTreeMap::new(),
             batch,
+            shared: super::shared::Cache::new(),
         };
         if model.batch.is_some() {
             return Ok(worker);

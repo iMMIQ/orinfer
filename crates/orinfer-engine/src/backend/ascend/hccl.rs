@@ -153,7 +153,7 @@ impl RootInfo {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Element {
     Int8,
     Int32,

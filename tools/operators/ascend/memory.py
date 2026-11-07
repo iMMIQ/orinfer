@@ -189,14 +189,17 @@ def last_row(rows, width):
     return main
 
 
-def gather_quantized_rows(rows, table_rows, width):
+def gather_quantized_rows(rows, table_rows, width, table_stride=0):
     """Move one complete INT8 activation and its FP32 scale per owner."""
     if width % 32 or (isinstance(table_rows, int) and not 0 < table_rows <= 2147483647):
         raise ValueError("Quantized gather requires aligned width and positive table rows")
+    stride = table_stride or width
+    if stride < width or stride % 32:
+        raise ValueError("Quantized gather requires an aligned physical row stride")
 
     @T.prim_func
     def main(
-        table: T.Tensor((table_rows, width), "int8"),
+        table: T.Tensor((table_rows, stride), "int8"),
         scales: T.Tensor((table_rows,), "float32"),
         indices: T.Tensor((rows,), "int32"),
         out: T.Tensor((rows, width), "int8"),
@@ -215,7 +218,7 @@ def gather_quantized_rows(rows, table_rows, width):
                 T.tile.fill(zeros, 0)
                 T.tile.fill(scale, 0.0)
                 if index >= 0 and index < table_rows:
-                    T.copy(table[index, :], a)
+                    T.copy(table[index, :width], a)
                     T.copy(scales[index : index + 1], scale[:1])
                 T.copy(a, out[row, :])
                 T.copy(scale[:1], out_scales[row : row + 1])

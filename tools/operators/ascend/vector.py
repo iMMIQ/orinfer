@@ -8,6 +8,7 @@ import math
 
 import tilelang.language as T
 
+from tools.operators.ascend.quantization import row_quantizer
 from tools.operators.ascend.vector_math import (
     div_127_fp32,
     div_fp32_rows,
@@ -129,6 +130,7 @@ def quantize(rows, width, fp16_query_scale=False, tile_rows=1):
     if tile_rows != 1:
         return _quantize_rows(rows, width, fp16_query_scale, tile_rows)
     scale_dtype = "float16" if fp16_query_scale else "float32"
+    quantize_row = row_quantizer(width, fp16_query_scale)
 
     @T.prim_func
     def main(
@@ -138,61 +140,13 @@ def quantize(rows, width, fp16_query_scale=False, tile_rows=1):
     ):
         with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
             xb = T.alloc_ub((1, width), "bfloat16")
-            a = T.alloc_ub((1, width), "float32")
-            absolute = T.alloc_ub((1, width), "float32")
-            maximum = T.alloc_ub((1, 1), "float32")
             scale = T.alloc_ub((1, 1), "float32")
-            divisor = T.alloc_ub((1, 1), "float32")
-            scale_residual = T.alloc_ub((1, 1), "float32")
-            scale_negative = T.alloc_ub((1, 1), "float32")
-            scale_high = T.alloc_ub((1, 1), "float32")
-            scale_low = T.alloc_ub((1, 1), "float32")
             half_scale = T.alloc_ub((1, 1), "float16")
-            scale_tile = T.alloc_ub((1, width), "float32")
-            residual = T.alloc_ub((1, width), "float32")
-            quotient_low = T.alloc_ub((1, width), "float32")
-            product = T.alloc_ub((1, width), "float32")
-            rounded = T.alloc_ub((1, width), "float16")
             y = T.alloc_ub((1, width), "int8")
             row = cid * 2 + vid
             if row < rows:
                 T.copy(x[row : row + 1, :], xb)
-                T.tile.cast(a, xb, "CAST_NONE", width)
-                T.tile.abs(absolute, a)
-                T.reduce_max(absolute, maximum, dim=1)
-                T.tile.max(maximum, maximum, 1e-12)
-                T.tile.fill(divisor, 127.0)
-                div_127_fp32(maximum, divisor, scale, scale_negative, scale_residual)
-                if fp16_query_scale:
-                    # The pinned emitter truncates FP32 literals. Converting
-                    # through FP16 preserves this exact subnormal minimum.
-                    T.tile.fill(half_scale, 2.0**-24)
-                    T.tile.cast(scale_negative, half_scale, "CAST_NONE", 1)
-                    T.tile.cast(half_scale, scale, "CAST_RINT", 1)
-                    T.tile.cast(scale, half_scale, "CAST_NONE", 1)
-                    T.tile.max(scale, scale, scale_negative)
-                scale_high[0, 0] = T.reinterpret(
-                    "float32",
-                    T.bitwise_and(T.reinterpret("uint32", scale[0, 0]), T.uint32(4294963200)),
-                )
-                T.tile.sub(scale_low, scale, scale_high)
-                T.tile.broadcast(scale_tile, scale)
-                div_fp32_scalar(
-                    a,
-                    scale_tile,
-                    scale_high,
-                    scale_low,
-                    a,
-                    residual,
-                    absolute,
-                    quotient_low,
-                    product,
-                )
-                T.tile.min(a, a, 127.0)
-                T.tile.max(a, a, -127.0)
-                T.tile.round(a, a, width)
-                T.tile.cast(rounded, a, "CAST_RINT", width)
-                T.tile.cast(y, rounded, "CAST_RINT", width)
+                quantize_row(xb, y, scale, half_scale)
                 T.copy(y, out[row : row + 1, :])
                 if fp16_query_scale:
                     T.tile.cast(half_scale, scale, "CAST_RINT", 1)
@@ -200,7 +154,7 @@ def quantize(rows, width, fp16_query_scale=False, tile_rows=1):
                 else:
                     T.copy(scale, scales[row : row + 1])
 
-    return main
+    return main.with_attr("orinfer.component_sources", ["tools/operators/ascend/quantization.py"])
 
 
 def _quantize_rows(rows, width, fp16_query_scale, tile_rows):

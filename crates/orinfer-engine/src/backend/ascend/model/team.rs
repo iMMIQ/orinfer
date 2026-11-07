@@ -37,7 +37,9 @@ pub(super) enum Command {
     Cached(Layout),
     Invalidate(Layout),
     Prepare(Layout, bool),
-    Forward(Layout, Vec<Vec<u32>>, bool, Option<bool>),
+    Shared(Layout),
+    CaptureShared(Layout, String),
+    Forward(Layout, Vec<Vec<u32>>, bool, Option<bool>, Vec<String>),
     BeginVerification(Vec<(usize, usize)>),
     RollbackVerification(Vec<(usize, usize)>),
     EndVerification,
@@ -77,7 +79,8 @@ pub(super) enum Reply {
     Ready,
     Image(Option<super::vision::Encoded>),
     Cached(CacheState),
-    Outputs(Vec<Output>),
+    Outputs(Vec<Output>, bool),
+    Shared(Vec<super::shared::State>),
     Allocations(BTreeMap<u64, usize>),
     RoutingGroups(Vec<RoutingGroup>),
     Capacity(bool),
@@ -116,6 +119,8 @@ pub(super) struct Timing {
     pub preparation: f64,
     pub replay: bool,
     pub setup: f64,
+    pub shared: bool,
+    pub shared_setup: f64,
 }
 impl Team {
     pub fn load(plan: &Path, model_dir: &Path) -> Result<Self> {
@@ -471,8 +476,15 @@ impl Team {
                             Command::Prepare(layout, capture) => {
                                 worker.prepare_batch(&layout, capture).map(|_| Reply::Ready)
                             }
-                            Command::Forward(layout, tokens, full, cached) => cached
+                            Command::Shared(layout) => {
+                                worker.shared_state(&layout).map(Reply::Shared)
+                            }
+                            Command::CaptureShared(layout, id) => {
+                                worker.capture_shared(&layout, &id).map(Reply::Shared)
+                            }
+                            Command::Forward(layout, tokens, full, cached, shared) => cached
                                 .map_or(Ok(()), |capture| worker.prepare_batch(&layout, capture))
+                                .and_then(|()| worker.select_shared(&layout, &shared))
                                 .and_then(|()| worker.forward_batch(&layout, &tokens, full))
                                 .map(|values| {
                                     Reply::Outputs(
@@ -485,6 +497,7 @@ impl Team {
                                                 logits,
                                             })
                                             .collect(),
+                                        !shared.is_empty(),
                                     )
                                 }),
                             Command::Save {
@@ -856,17 +869,57 @@ fn forward_with(
     if !cached_prepare {
         exchange(peers, Command::Prepare(layout.clone(), capture))?;
     }
+    let mut shared = vec![];
+    let mut shared_setup = 0.;
+    if graphs_enabled && !capture && super::shared::eligible(&layout) && super::shared::enabled() {
+        let read = |replies: Vec<Reply>| -> Result<Vec<Vec<super::shared::State>>> {
+            replies
+                .into_iter()
+                .map(|r| match r {
+                    Reply::Shared(s) => Ok(s),
+                    _ => Err("Invalid shared Graph state reply".into()),
+                })
+                .collect()
+        };
+        let states = read(exchange(peers, Command::Shared(layout.clone()))?)?;
+        let slack = budget.map_or(f64::INFINITY, |b| b.slack_s - b.direct_s.unwrap_or(0.))
+            - started.elapsed().as_secs_f64();
+        let (ready, candidate) = super::shared::plan(&states, slack)?;
+        shared = ready;
+        if let Some(id) = candidate {
+            let capture_started = Instant::now();
+            let states = read(exchange(peers, Command::CaptureShared(layout.clone(), id))?)?;
+            shared_setup = capture_started.elapsed().as_secs_f64();
+            shared = super::shared::plan(&states, -1.)?.0;
+        }
+    }
     let prepare_s = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let replicated = layout.role == super::PacketRole::Draft;
-    let command = Command::Forward(layout, tokens, full, cached_prepare.then_some(capture));
+    let shared_mode = !shared.is_empty();
+    if shared_mode
+        && (budget.is_some_and(|b| b.trace)
+            || std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some())
+    {
+        eprintln!(
+            "A2_SHARED_PLAN {}",
+            serde_json::json!({"rows":layout.rows.total,"pieces":shared.len(),"setup_s":shared_setup})
+        );
+    }
+    let command = Command::Forward(
+        layout,
+        tokens,
+        full,
+        cached_prepare.then_some(capture),
+        shared,
+    );
     peers.send(command)?;
     maintenance();
     let results = peers.collect()?;
     let ranks = results
         .into_iter()
         .map(|reply| match reply {
-            Reply::Outputs(outputs) => Ok(outputs),
+            Reply::Outputs(outputs, actual_shared) if actual_shared == shared_mode => Ok(outputs),
             _ => Err("Invalid A2 output reply".into()),
         })
         .collect::<Result<Vec<_>>>()?;
@@ -899,7 +952,13 @@ fn forward_with(
             seconds: started.elapsed().as_secs_f64(),
             preparation: prepare_s,
             replay: capture,
-            setup: if cached_prepare { 0. } else { prepare_s },
+            shared: shared_mode,
+            shared_setup,
+            setup: if cached_prepare {
+                shared_setup
+            } else {
+                prepare_s
+            },
         },
     ))
 }

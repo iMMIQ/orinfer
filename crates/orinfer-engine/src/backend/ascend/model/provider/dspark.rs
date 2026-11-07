@@ -379,6 +379,8 @@ impl Runtime {
             Costs {
                 draft_replay: draft_timing.replay,
                 verify_replay: verify_timing.replay,
+                shared: [draft_timing.shared, verify_timing.shared],
+                shared_setup: [draft_timing.shared_setup, verify_timing.shared_setup],
                 work: verified_work,
                 setup: [draft_timing.setup, verify_timing.setup],
                 wall_s: Some(round_started.elapsed().as_secs_f64()),

@@ -291,6 +291,10 @@ A2 启用 DSpark 时，`scheduler_statistics.speculation` 同步发布模型级�
 
 A2 普通 decode、草稿和验证形状在所有 rank 累计成功执行两次后统一捕获 Graph，交替出现的形状沿用累计次数；prefill 保持八次阈值。草稿成本模型从实际 Graph replay 学习普通 decode、草稿和验证的稳态成本，直接执行仍更新接受率与准备次数。Graph 准备和直接执行的实际耗时完整计入请求及调度统计。
 
+`ORINFER_A2_SHARED_GRAPH=1` 启用大 target packet 的公共 FFN 片段缓存。512 行及以上、decoder replay 边界之前的片段按真实行数和物理绑定复用，保留完整 fork/join；请求私有操作继续使用原地址表。整包 Graph 命中优先。所有 rank 统一选择已驻留片段，每轮最多捕获一个已执行三次的缺失片段；捕获同时受延迟预算、缓存容量及正常 workspace 以外的 256 MiB 显存余量约束。淘汰后重新累计复用次数。该选项默认关闭，使用完整请求实测决定是否启用；`--graph off` 统一关闭捕获与 replay。
+
+A2 DSpark 分别学习直接提交、公共片段 replay 和整包 replay 的执行成本；公共捕获准备单独计费。`ORINFER_A2_DSPARK_POLICY_TRACE=1` 输出 `A2_SHARED_PLAN` 的行数、片段数及本轮准备耗时，以及 `DSPARK_COST` 的 `shared`、`shared_setup_s`。离线成本汇总保留三种模式，导入先验不代表本进程已经拥有相应 Graph。
+
 A2 的 `--graph off` 关闭主干、DSpark 和视觉的 Graph 捕获及 replay，并将模型中的独立分支按原计划顺序提交到同一计算 stream。权重、长上下文、prefix cache、工具协议和图片输入沿用相同实现；直接执行会增加主机提交成本。该模式用于规避和定位 Graph replay 或跨 stream 事件依赖故障。ACL 507047 表示完成事件在指定期限内尚未完成，需结合首次故障定位；发生设备故障后的团队仍会退出服务，重启进程后应用新的配置。
 
 A2 在加载 CANN 前自动安装按设备隔离的 HCOMM Graph 回调注册表，支持 CANN HCOMM 9.2.0。单进程多卡可以各自淘汰、重建 Graph，设备内重复的 modelId 分别注册和清理；原生 modelId、AICPU 元数据及通信参数保持原有语义。兼容组件随引擎编译，在线从密封匿名内存加载，无需编译器、额外部署文件或修改系统 CANN。组件在进程内保留至退出；HCOMM 已提前加载或组件 ABI 不匹配时，启动返回明确错误。`validate-hccl` 包含改变输入的 replay，以及各 rank 分别保留 1–4 个 Graph 的 12 轮捕获、执行和回收检查。 引擎及内置组件的 glibc 最低版本为 2.34；离线构建会检查内置组件的 ELF 版本依赖。
@@ -304,6 +308,8 @@ A2 草稿 Graph 按实际参与草稿的 decoder 请求估算复用次数，整�
 A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和 PV 计算体，支持每 rank 8/16/32/64 个 head，保留 FP32 softmax 与 BF16 probability 边界。`tools.model.deepseek_v41.fuse_attention --selected-int8 --min-rows N` 按实测聚合行数拆分已有 target 执行域，小行数保留原算子；草稿与普通 decode 沿用各自的计划选择。主干全行与 decoder 保留窗口分别绑定 work 表，在线只消费离线生成的计划。
 
 A2 专家 GMM 可通过 `tools.model.deepseek_v41.expert_fusion` 离线选择已有 target 行数区间，默认 `32..511`。gather 将完整 A8 无损拆成两行 signed INT4，复用发布的 NZ W4 bank 与原生 grouped matmul；GMM 在 FP16 部分积舍入前应用原权重 scale，后处理融合部分积合并、FP32 assist/token scale、BF16 SwiGLU 和 FP32 行量化。`--min-rows`、`--max-rows` 必须覆盖完整的已有 packet 区间；其他 packet、请求状态和权重文件沿用原契约。该计划使用显式 `w4_a4` 指令，需要支持它的引擎。执行包单独发布单位 token scale 常量及临时 workspace，权重包保持原样。
+
+`tools.model.deepseek_v41.fuse_ffn_collectives --plan PLAN --output OUTPUT --model-dir MODEL` 合并 sequence-parallel FFN 的四路 AllGather。行量化与路由数据打包共用原 FP32/A8 算术，收集后只拆分 scale 和路由元数据；共享专家投影与专家 gather 通过原工厂的物理行 stride 直接读取激活。构建器检查别名、后续读者和覆盖边界，保留专家行倍率及原有行数选择。新增布局和既有几何按算子族统一重建至同一源码身份；执行资产单独发布，权重和请求状态保持原契约。
 
 A2 mHC 可通过 `tools.model.deepseek_v41.fuse_hc --plan PLAN --output OUTPUT --model-dir MODEL` 离线融合八分片归一化与 Sinkhorn，保留 FP32 计算顺序及真实行表达式，支持 sequence-parallel 分片和 decoder 后缀。构建器复用同一个归一化宏与 Sinkhorn 计算体，每种物理容量发布一个动态入口；`--capacity-tiles FILE` 读取以容量为键的离线 tile 选择，例如 `{"256":8,"2048":32}`。该容量内的各实际 batch 和长度共享同一配置。`tools.operators.ascend.validate_hc_fused` 对已发布参考检查精确数值、尾部及变输入 Graph，`--benchmark` 复用公共 Graph 测量工具。执行资产单独发布，权重和请求状态布局沿用原契约。
 

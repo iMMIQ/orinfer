@@ -386,6 +386,17 @@ impl Kernel {
     pub fn template(&self) -> &Rc<Template> {
         &self.bound.template
     }
+    pub(super) fn binding_key(&self) -> (usize, usize, Vec<(usize, usize)>) {
+        (
+            Rc::as_ptr(&self.bound.template) as usize,
+            self.bound.rows,
+            self.bound
+                .buffers
+                .iter()
+                .map(|b| (b.pointer() as usize, b.bytes()))
+                .collect(),
+        )
+    }
     /// Submits this kernel on an explicit stream without a completion fence.
     /// Used by captured segments that replay the launch inside an ACL Graph.
     pub(super) fn launch_on_stream(&self, stream: Handle) -> Result<()> {

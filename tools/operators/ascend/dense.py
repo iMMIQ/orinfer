@@ -15,10 +15,14 @@ def projection(
     tile_m=16,
     pipeline_stages=0,
     unit_scale=False,
+    activation_stride=0,
 ):
     if integer and unit_scale:
         raise ValueError("Direct BF16 output requires a BF16 projection with unit scales")
     alignment = 32 if integer else 128
+    stride = activation_stride or reduction
+    if stride < reduction or stride % alignment:
+        raise ValueError("A2 projection activation stride must cover aligned K")
     if (isinstance(rows, int) and rows < 1) or output % 32 or reduction % alignment:
         raise ValueError("A2 projection requires positive rows and aligned N/K")
     if tile_n not in (32, 64, 96, 128, 192, 256):
@@ -47,7 +51,7 @@ def projection(
 
     @T.prim_func
     def main(
-        activation: T.Tensor((rows, reduction), input_dtype),
+        activation: T.Tensor((rows, stride), input_dtype),
         weight: T.Tensor((output, reduction), input_dtype),
         token_scale: T.Tensor((rows,), "float32"),
         channel_scale: T.Tensor((output,), "float32"),

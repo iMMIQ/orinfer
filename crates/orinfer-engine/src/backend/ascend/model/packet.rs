@@ -478,7 +478,7 @@ impl Worker {
         unsafe {
             self.session.submit_compute(
                 vec![],
-                Box::new((Rc::clone(&execution), retained)),
+                Box::new((Rc::clone(&execution), retained, execution.shared_graphs())),
                 |stream| {
                     let head = if logits {
                         execution.head.as_slice()

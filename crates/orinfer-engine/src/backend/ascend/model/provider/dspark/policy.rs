@@ -138,6 +138,8 @@ pub(in crate::backend::ascend::model::provider) struct Costs {
     pub stages: [f64; 4],
     pub draft_replay: bool,
     pub verify_replay: bool,
+    pub shared: [bool; 2],
+    pub shared_setup: [f64; 2],
     pub work: Work,
     pub setup: [f64; 2],
     pub wall_s: Option<f64>,
@@ -149,6 +151,8 @@ impl From<[f64; 4]> for Costs {
             stages,
             draft_replay: false,
             verify_replay: false,
+            shared: [false; 2],
+            shared_setup: [0.; 2],
             work: Work::default(),
             setup: [stages[3] * 0.5; 2],
             wall_s: None,
@@ -384,6 +388,8 @@ impl Policy {
             block: 0,
             full,
             replay: timing.replay,
+            shared: timing.shared,
+            shared_setup_s: timing.shared_setup,
             work,
             seconds: timing.seconds + timing.preparation - timing.setup,
             setup_s: timing.setup,
@@ -414,6 +420,8 @@ impl Policy {
             ..Work::default()
         };
         self.costs.observe(Point {
+            shared: false,
+            shared_setup_s: 0.,
             stage: if batch > 0 && work.prefill_rows == 0 {
                 Stage::Decode
             } else {
@@ -766,6 +774,8 @@ impl Policy {
                 block,
                 full: false,
                 replay: costs.draft_replay,
+                shared: costs.shared[0],
+                shared_setup_s: costs.shared_setup[0],
                 work: draft_work,
                 seconds: timing[0],
                 setup_s: costs.setup[0],
@@ -775,11 +785,15 @@ impl Policy {
                 block: 0,
                 full,
                 replay: costs.verify_replay,
+                shared: costs.shared[1],
+                shared_setup_s: costs.shared_setup[1],
                 work,
                 seconds: timing[1],
                 setup_s: costs.setup[1],
             },
             Point {
+                shared: false,
+                shared_setup_s: 0.,
                 stage: Stage::Restore,
                 block,
                 full,
@@ -862,6 +876,8 @@ mod tests {
                 (Stage::Restore, 5, 2, 0.0002),
             ] {
                 p.costs.observe(Point {
+                    shared: false,
+                    shared_setup_s: 0.,
                     stage,
                     block,
                     full: false,
@@ -904,6 +920,8 @@ mod tests {
             (Stage::Restore, 5, 1, 0.0003),
         ] {
             p.costs.observe(Point {
+                shared: false,
+                shared_setup_s: 0.,
                 stage,
                 block,
                 full: false,
@@ -966,6 +984,8 @@ mod tests {
                 true,
                 work,
                 &super::super::super::super::team::Timing {
+                    shared: false,
+                    shared_setup: 0.,
                     seconds: 0.069,
                     preparation: setup,
                     setup,
@@ -1133,6 +1153,8 @@ mod tests {
                 16,
                 (true, false, false),
                 Costs {
+                    shared: [false; 2],
+                    shared_setup: [0.; 2],
                     stages: [0.01, target, 0.001, 0.],
                     draft_replay: replay,
                     verify_replay: replay,
@@ -1199,6 +1221,8 @@ mod tests {
     fn cold_prefill_preparation_cannot_block_a_parallel_draft_probe() {
         let mut p = Policy::default();
         p.costs.observe(Point {
+            shared: false,
+            shared_setup_s: 0.,
             stage: Stage::Target,
             block: 0,
             full: true,
@@ -1221,6 +1245,8 @@ mod tests {
                     ..Work::default()
                 },
                 &super::super::super::super::team::Timing {
+                    shared: false,
+                    shared_setup: 0.,
                     seconds: 0.11,
                     preparation: 0.,
                     setup: 0.,
@@ -1348,6 +1374,8 @@ mod tests {
             // execution geometry. Supply the measured short verification cost.
             for _ in 0..4 {
                 policy.costs.observe(Point {
+                    shared: false,
+                    shared_setup_s: 0.,
                     stage: Stage::Target,
                     block: 0,
                     full: false,
@@ -1577,6 +1605,8 @@ mod tests {
                 false,
                 work,
                 &super::super::super::super::team::Timing {
+                    shared: false,
+                    shared_setup: 0.,
                     seconds: 0.1,
                     preparation: 0.01,
                     setup: 0.,
@@ -1592,6 +1622,8 @@ mod tests {
             16,
             (false, true, true),
             Costs {
+                shared: [false; 2],
+                shared_setup: [0.; 2],
                 stages: [0.01, 0.1, 0.001, 0.],
                 draft_replay: true,
                 verify_replay: false,

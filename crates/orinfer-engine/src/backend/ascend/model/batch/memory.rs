@@ -205,7 +205,7 @@ impl Worker {
                 return Ok(true);
             }
         }
-        Ok(tables_released)
+        Ok(self.shared.evict() || tables_released)
     }
     pub(in crate::backend::ascend::model) fn reserve_batch_memory(
         &mut self,

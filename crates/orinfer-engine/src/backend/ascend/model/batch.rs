@@ -172,7 +172,7 @@ pub(super) struct BoundTables {
 pub(super) struct Runtime {
     pub contract: Contract,
     pub owners: BTreeMap<usize, Owner>,
-    cache: BTreeMap<Key, Rc<Execution>>,
+    pub(super) cache: BTreeMap<Key, Rc<Execution>>,
     recent: BTreeMap<(super::PacketRole, bool, usize), (Key, u8)>,
     lru: VecDeque<Key>,
     capacity: usize,
@@ -190,6 +190,10 @@ struct TableUse {
     columns: Vec<bool>,
 }
 impl Runtime {
+    pub(super) fn touch_shared_packet(&mut self, key: Key) {
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+    }
     fn consecutive_uses(&self, key: &Key) -> u8 {
         self.recent
             .get(&key.family)
@@ -211,7 +215,7 @@ impl Runtime {
         }
         removed
     }
-    fn key(&self, layout: &Layout) -> Result<Key> {
+    pub(super) fn key(&self, layout: &Layout) -> Result<Key> {
         let (family, _) = self
             .families
             .iter()
@@ -1224,6 +1228,9 @@ impl Worker {
                 retained,
             )?
             .wait()?;
+        }
+        if !execution.captured {
+            execution.record_shared_use();
         }
         let mut output = vec![];
         if !layout.outputs.is_empty() {
