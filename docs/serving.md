@@ -80,6 +80,8 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 支持 `temperature`、`top_p`、`top_k`、presence/frequency/repetition penalties、有符号 64 位 `seed`、`logit_bias`、EOS 和 `stop`。temperature、top_p、top_k 和 repetition_penalty 默认采用模型的 generation config；presence/frequency penalties 默认 0。默认 seed 为 20261002。`logit_bias` 的 key 是 tokenizer 的 token ID，值范围为 −100 到 100。
 
+DSv4.1 A2 新导出或前端升级的模型默认 `temperature=1、top_p=1`。已发布模型保留原始文件；部署旧模型时使用 `--default-request-params '{"temperature":1,"top_p":1}'` 设置相同默认值。客户端显式提供的采样参数优先。
+
 默认关闭 thinking；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 开启后，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
 `chat_template_kwargs` 接受对象或 `null`，兼容 DSH、vLLM 客户端的模板参数。嵌套的 `enable_thinking`（或 `thinking`）、`reasoning_effort` 和 `thinking_token_budget` 与对应顶层控制一致；同名非空顶层值优先。`preserve_thinking` 控制模板中的历史推理保留，其余自定义变量传给模型模板；消息、工具、生成边界和运行时控制由服务端绑定。请求中的嵌套 thinking 设置会覆盖部署默认值中的顶层或嵌套 thinking 设置，模板默认变量按键补齐；显式 `chat_template_kwargs: null` 清除默认模板变量。thinking 开关必须为布尔值。接入配置见 [DeepSeek Harness](deepseek-harness.md)。

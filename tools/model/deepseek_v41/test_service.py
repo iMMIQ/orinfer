@@ -78,11 +78,20 @@ class FrontendPublicationTests(unittest.TestCase):
             }
             (source / "cache/model.json").write_text(json.dumps(descriptor))
             (source / "chat_template.jinja").write_text("old template")
+            generation = {"temperature": 0.0, "top_p": 0.95, "eos_token_id": [1, 2]}
+            (source / "generation_config.json").write_text(json.dumps(generation))
             weights = source / "layer.safetensors"
             weights.write_bytes(b"unchanged checkpoint payload")
             self.assertEqual(publish_frontend(source, output), "existing-package")
             self.assertEqual((output / weights.name).stat().st_ino, weights.stat().st_ino)
             self.assertEqual((source / "chat_template.jinja").read_text(), "old template")
+            self.assertEqual(
+                json.loads((source / "generation_config.json").read_text()), generation
+            )
+            self.assertEqual(
+                json.loads((output / "generation_config.json").read_text()),
+                dict(generation, temperature=1.0, top_p=1.0),
+            )
             self.assertEqual(json.loads((source / "cache/model.json").read_text()), descriptor)
             updated = json.loads((output / "cache/model.json").read_text())
             self.assertEqual(updated["metadata"]["chat_format"], "deepseek_v41")

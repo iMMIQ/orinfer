@@ -114,7 +114,7 @@ def publish(plan, checkpoint, output, share_prefix_banks=False):
             eos_token_id=added["<｜end▁of▁sentence｜>"],
             bos_token_id=added["<｜begin▁of▁sentence｜>"],
             pad_token_id=added["<｜end▁of▁sentence｜>"],
-            temperature=0.0,
+            temperature=1.0,
             top_p=1.0,
         )
         atomic_json(temporary / "generation_config.json", generation)
@@ -185,9 +185,15 @@ def publish_frontend(source, output):
             stream.write((Path(__file__).with_name("templates") / "chat.jinja").read_bytes())
             replacement = Path(stream.name)
         replacement.replace(temporary / "chat_template.jinja")
+        generation = json.loads((temporary / "generation_config.json").read_text())
+        generation.update(temperature=1.0, top_p=1.0)
+        atomic_json(temporary / "generation_config.json", generation)
         model["metadata"]["chat_format"] = "deepseek_v41"
         model["frontend_assets"]["chat_template.jinja"] = file_hash(
             temporary / "chat_template.jinja"
+        )
+        model["frontend_assets"]["generation_config.json"] = file_hash(
+            temporary / "generation_config.json"
         )
         atomic_json(temporary / "cache/model.json", model)
         temporary.rename(output)
