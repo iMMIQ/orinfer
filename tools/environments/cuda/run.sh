@@ -15,7 +15,8 @@ if [[ "$runner" == ../* || "$runner" != *.py || ! -f "$runner" ]]; then
     echo 'Runner must be a Python module within the repository.' >&2
     exit 2
 fi
-module="${runner%.py}"
+module="${runner#python/}"
+module="${module%.py}"
 module="${module//\//.}"
 if [[ "$output_arg" = /* ]]; then output_dir="$output_arg"; else output_dir="$repo_dir/$output_arg"; fi
 if [[ -e "$output_dir" && "$resume" != true ]]; then echo "Refusing existing output: $output_dir (use --resume to reuse an offline build)" >&2; exit 2; fi

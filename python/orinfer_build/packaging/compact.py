@@ -10,19 +10,16 @@ import json
 from pathlib import Path
 import shutil
 import struct
-import sys
 
-sys.path.insert(0, str(ROOT))
 
 from orinfer_build.packaging.publication import (
     AssetReader,
-    ROOT,
     load_model,
     source_path,
     staged_directory,
-)  # noqa: E402
-from orinfer_build.common.files import file_hash, write_json  # noqa: E402
-from orinfer_build.weights.safetensors_source import read_header  # noqa: E402
+)
+from orinfer_build.common.files import file_hash, write_json
+from orinfer_build.weights.safetensors_source import read_header
 
 
 def header(path):

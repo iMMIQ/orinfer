@@ -153,7 +153,7 @@ def main():
     import torch
     import torch_npu  # noqa: F401
     from kernels.shared.rows import row_count
-    from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+    from orinfer_build.tuning.ascend import npu_benchmark
     from orinfer_build.models.deepseek_v41.validate import reference
     from orinfer_build.compiler.ascend.build import compile_kernel, operand
     from kernels.ascend.indexer_cube import causal_logits

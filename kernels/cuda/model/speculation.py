@@ -28,37 +28,6 @@ def select_prefix(tokens: int, elements: int, dtype="float32", dynamic_rows: boo
 
 
 @orin_jit
-def conv_history_prefixes(tokens: int, channels: int = 10240):
-    """Save chronological raw width-4 convolution history for every prefix.
-
-    Snapshot before the regular convolution overwrites History. Logical
-    position zero ignores old history, exactly like gdn_conv_prep.
-    """
-    assert tokens > 0 and channels > 0
-
-    @T.prim_func
-    def kernel(
-        X: T.Tensor((tokens, channels), T.float16),
-        History: T.Tensor((3, channels), T.float16),
-        Position: T.Tensor((1,), T.int32),
-        Prefix: T.Tensor((tokens, 3, channels), T.float16),
-    ):
-        with T.Kernel(T.ceildiv(3 * channels, 256), tokens, threads=256) as (b, t):
-            for j in T.Parallel(256):
-                index = b * 256 + j
-                if index < 3 * channels:
-                    tap, channel = index // channels, index % channels
-                    source = t + 1 + tap - 3
-                    Prefix[t, tap, channel] = 0.0
-                    if source >= 0:
-                        Prefix[t, tap, channel] = X[source, channel]
-                    elif Position[0] + source >= 0:
-                        Prefix[t, tap, channel] = History[source + 3, channel]
-
-    return kernel
-
-
-@orin_jit
 def mtp_norm_concat(hidden: int, epsilon: float = 1e-6):
     """Normalize [embedding, normalized target hidden] then concatenate.
 

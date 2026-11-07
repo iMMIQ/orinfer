@@ -658,14 +658,14 @@ def main():
         del graph
         timing = None
         if name == "gather_attention":
-            from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+            from orinfer_build.tuning.ascend import npu_benchmark
 
             timing, measured = npu_benchmark(lambda: call(1, private_values(), m), 7, 2)
             del measured
         measurements = []
         identity = None
         if a.benchmark_rows:
-            from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+            from orinfer_build.tuning.ascend import npu_benchmark
             from orinfer_build.tuning.tuning import measure, read_record, record_path
 
             identity = dict(

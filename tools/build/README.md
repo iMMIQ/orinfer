@@ -45,7 +45,7 @@ ORINFER_CHECKPOINT_DIR=/path/to/converted \
 bash tools/environments/cuda/run.sh python/orinfer_build/common/smoke.py artifacts/build/compiler-smoke
 ```
 
-它从空缓存编译生产 norm 与动态行数 greedy 归约，检查非对齐尾部、3/7 行共用 cubin、标量 ABI、输出 guard 和改变输入的 Graph replay，并导出 AOT。算子数值和状态专项检查分别使用 `tools/operators` 中当前的验收入口。Ascend 使用独立的 CANN 工具链，入口与支持范围见[模型包文档](../../docs/model-packages.md)。
+它从空缓存编译生产 norm 与动态行数 greedy 归约，检查非对齐尾部、3/7 行共用 cubin、标量 ABI、输出 guard 和改变输入的 Graph replay，并导出 AOT。算子数值和状态专项检查分别使用 `tests/cuda/operators` 和 `tests/ascend/operators` 中的验收入口。Ascend 使用独立的 CANN 工具链，入口与支持范围见[模型包文档](../../docs/model-packages.md)。
 
 ## 自动检查
 

@@ -3,7 +3,6 @@
 from orinfer_build.common.paths import ROOT
 
 
-import hashlib
 import os
 import shutil
 import statistics
@@ -56,12 +55,6 @@ def orin_jit(function=None, *, pass_configs=None):
 def identity(path):
     path = Path(path)
     return {"path": str(path), "sha256": file_hash(path), "bytes": path.stat().st_size}
-
-
-def tensor_sha(tensor):
-    return hashlib.sha256(
-        tensor.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
-    ).hexdigest()
 
 
 def error(actual, reference):

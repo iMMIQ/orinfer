@@ -282,7 +282,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     import torch
     import torch_npu  # noqa: F401
-    from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+    from orinfer_build.tuning.ascend import npu_benchmark
     from orinfer_build.models.deepseek_v41.validate import reference
 
     torch.set_num_threads(4)

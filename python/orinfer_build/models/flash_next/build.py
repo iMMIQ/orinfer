@@ -13,12 +13,10 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
-import sys
 import time
 
-sys.path.insert(0, str(ROOT))
 
-from orinfer_build.compiler.build_cache import BuildCache, identity  # noqa: E402
+from orinfer_build.compiler.build_cache import BuildCache, identity
 from orinfer_build.models.flash_next.construction import (
     expert_matrices,
     fixed_extents,
@@ -26,16 +24,15 @@ from orinfer_build.models.flash_next.construction import (
     projection,
     select_projections,
     bounded_measurements,
-)  # noqa: E402
-from orinfer_build.compiler.host_compiler import Compiler  # noqa: E402
+)
+from orinfer_build.compiler.host_compiler import Compiler
 from orinfer_build.packaging.publication import (
-    ROOT,
     atomic_model,
     clone_model,
     load_model,
     source_path,
-)  # noqa: E402
-from orinfer_build.common.files import file_hash, write_json  # noqa: E402
+)
+from orinfer_build.common.files import file_hash, write_json
 
 
 def inventory(data, package, manifest, compiler):

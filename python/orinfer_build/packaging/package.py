@@ -12,9 +12,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-import sys
 
-sys.path.insert(0, str(ROOT))
 
 from orinfer_build.packaging.publication import AssetReader, generated_outputs, source_path
 from orinfer_build.common.files import file_hash

@@ -21,7 +21,6 @@ from orinfer_build.common.files import atomic_json, file_hash
 from orinfer_build.models.deepseek_v41.assembly import (
     canonical,
     publish_package,
-    run_transform,
     validate_rows,
 )
 from orinfer_build.contracts.row_contract import resolve
@@ -92,33 +91,30 @@ def build(
         current = output.with_name(output.stem + "-reference.json")
         atomic_json(current, model)
         if sequence_parallel:
+            from orinfer_build.models.deepseek_v41.sequence_parallel import build as build_sequence
+
             target = output.with_name(output.stem + "-sequence.json")
-            run_transform(
-                "sequence_parallel",
+            build_sequence(
                 current,
                 target,
-                workers,
-                ["--min-rows", "512"]
-                + (["--reduce-scatter"] if reduce_scatter else [])
-                + (["--shared-attention"] if shared_attention else []),
+                workers=workers,
+                min_rows=512,
+                reduce_scatter=reduce_scatter,
+                shared_attention=shared_attention,
             )
             current = target
         if fused_attention:
+            from orinfer_build.models.deepseek_v41.fuse_attention import build as build_attention
+
             target = output.with_name(output.stem + "-attention.json")
-            run_transform(
-                "fuse_attention",
+            build_attention(
                 current,
                 target,
-                workers,
-                [
-                    "--min-rows",
-                    "2",
-                    "--tile-m",
-                    "64",
-                    "--tile-k",
-                    "128",
-                    "--reuse-kv",
-                ],
+                workers=workers,
+                min_rows=2,
+                tile_m=64,
+                tile_k=128,
+                reuse_kv=True,
             )
             current = target
         model = json.loads(current.read_text())

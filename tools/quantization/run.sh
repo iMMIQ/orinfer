@@ -18,4 +18,4 @@ fi
 export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 PYTHONDONTWRITEBYTECODE=1
 export TILELANG_CACHE_DIR="$repo_dir/artifacts/quantization/compiler-cache"
 exec uv run --locked --project "$repo_dir/tools/environments/cuda" \
-    python -m "tools.quantization.$module" "$@"
+    python -m "orinfer_build.quantization.$module" "$@"

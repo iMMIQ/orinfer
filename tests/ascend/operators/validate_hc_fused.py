@@ -117,7 +117,7 @@ def main():
         result = dict(rows=rows, bitwise_equal=True, tail_preserved=True, changed_graph=True)
         if args.benchmark:
             from functools import partial as bind
-            from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+            from orinfer_build.tuning.ascend import npu_benchmark
             from orinfer_build.tuning.tuning import measure
 
             benchmark = bind(npu_benchmark, calls_per_replay=16)

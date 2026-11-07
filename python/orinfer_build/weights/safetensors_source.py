@@ -27,6 +27,8 @@ SIZES = {
     "I64": 8,
     "U64": 8,
     "BOOL": 1,
+    "F8_E4M3": 1,
+    "F8_E8M0": 1,
 }
 
 
@@ -61,13 +63,13 @@ def validate_header(header):
         end = stop
 
 
-def read_header(read, *, file_size=None):
+def read_header(read, *, file_size=None, max_header_bytes=64 * 1024**2):
     """Read bounded metadata; remote readers do not need a full model download."""
     prefix = read(0, 8)
     if len(prefix) != 8:
         raise ValueError("Truncated safetensors prefix")
     (size,) = struct.unpack("<Q", prefix)
-    if not 2 <= size <= 64 * 1024**2:
+    if not 2 <= size <= max_header_bytes:
         raise ValueError("Invalid safetensors header size")
     raw = read(8, size)
     if len(raw) != size:

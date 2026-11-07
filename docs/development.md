@@ -20,14 +20,21 @@ CANN 通信适配器由引擎的 `native/ascend` 构建，保留嵌入库的 gli
 | `python/orinfer_build/common` | 路径、文件身份、锁和测试发现 |
 | `tests/cuda`、`tests/ascend` | 设备验证程序 |
 | `tests/support` | 验证夹具 |
-| `tools` | 发布、压测、开发命令与原构建命令的薄入口 |
+| `tools` | 发布、压测、开发命令与环境脚本 |
 
 `make python-env` 安装可编辑的 `orinfer_build` 包及 CPU 依赖。CUDA 独立环境继续由
 `tools/environments/cuda` 管理，并引用同一源码包；CANN 9.2 编译前端由
 `tools/environments/ascend/run.sh` 管理。环境检查按后端选择模块。
 
-原模型构建和量化命令保留委托入口，内部调用使用 `orinfer_build`。历史执行契约中的
-Python factory 名由离线导入器映射到新模块，映射不进入 Rust 在线推理。
+模型构建、量化和算子验证使用 `python -m orinfer_build...` 或 `python -m tests...`。
+旧 `tools/model`、`tools/operators` 和 `tools/quantization` 委托入口已移除。
+历史执行契约中的 Python factory 模块名仍由离线导入器映射，映射不进入 Rust 在线推理。
+
+内部组装直接调用 transform/build 函数，投影调优接收显式的 `Options`；CLI 只解析参数。
+Ascend Graph 测量位于 `tuning/ascend.py`。本地权重读取复用 `weights/local.py` 的持久
+文件句柄、`pread` 和公共 safetensors 元数据契约，模型适配器负责物理布局与数值解码。
+执行包定位复用 `packaging.publication.resolve_package`，与 Rust 一样优先使用已安装缓存，
+缺失时读取模型自带包；存在但损坏的缓存报错。
 
 ## 工作区和数据
 

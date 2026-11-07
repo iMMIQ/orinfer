@@ -10,7 +10,7 @@ if [[ -d "$model_manifest" ]]; then model_manifest="$model_manifest/cache/model.
 if [[ "$output_arg" = /* ]]; then output_dir="$output_arg"; else output_dir="$repo_dir/$output_arg"; fi
 if [[ -e "$output_dir" ]]; then echo "Refusing existing output $output_dir" >&2; exit 2; fi
 mkdir -p "$output_dir/measurement-source"
-cp --parents "$model_manifest" "$(dirname -- "$model_manifest")/weights/model.safetensors.index.json" "$request_manifest" tools/model/{profile.sh,profile_summary.py} \
+cp --parents "$model_manifest" "$(dirname -- "$model_manifest")/weights/model.safetensors.index.json" "$request_manifest" tools/model/profile.sh python/orinfer_build/validation/profile_summary.py \
     crates/orinfer-engine/src/{model,artifact,weights,loader,operators}.rs crates/orinfer-cli/src/main.rs \
     "$output_dir/measurement-source/"
 cp "$request_manifest" "$output_dir/requests.json"
@@ -35,4 +35,4 @@ ORINFER_MODEL_PROGRESS="$output_dir/progress.json" nsys profile \
     "$output_dir/report.json" "$output_dir/run.log" > "$output_dir/nsys.log" 2>&1
 nsys export --type=sqlite --output "$output_dir/trace.sqlite" \
     "$output_dir/trace.nsys-rep" > "$output_dir/export.log" 2>&1
-python3 python/orinfer_build/validation/profile_summary.py "$output_dir" "$model_manifest"
+uv run --locked python -m orinfer_build.validation.profile_summary "$output_dir" "$model_manifest"

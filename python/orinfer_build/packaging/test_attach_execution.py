@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,6 +13,18 @@ from orinfer_build.packaging.attach_execution import attach
 
 
 class ExecutionReplacementTests(unittest.TestCase):
+    @patch("orinfer_build.packaging.publication.subprocess.run")
+    def test_attach_uses_installed_package_before_bundled_copy(self, check):
+        cache = self.root / "installed"
+        installed = cache / self.package.name
+        shutil.copytree(self.package, installed)
+        (self.package / "package.json").write_text("corrupt bundled copy")
+        with patch.dict(os.environ, ORINFER_EXECUTION_CACHE=str(cache)):
+            digest = attach(self.source, self.root / "new", self.library, Path("/bin/true"))
+        check.assert_called_once()
+        self.assertTrue((self.root / "new/cache/packages" / digest / "package.json").is_file())
+        self.assertTrue((installed / "package.json").read_bytes().startswith(b"{"))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -2,7 +2,7 @@
 
 Python 用于权重准备、TileLang 编译、调优和验证；在线加载、执行与服务由 Rust 完成。
 
-实现位于 `python/orinfer_build`，本目录保留原构建命令的薄入口。共享契约、编译、调优
+实现位于 `python/orinfer_build`，构建命令通过 `python -m orinfer_build...` 运行。共享契约、编译、调优
 和发布组件分别归入该包，目录与工作区约定见[开发说明](../../docs/development.md)。
 
 ## 支持的构建入口

@@ -331,50 +331,21 @@ def build_selected(
     return report
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--selected-int8", action="store_true")
-    parser.add_argument("--model-dir", type=Path)
-    parser.add_argument("--grid-limit", type=int, choices=(8, 16, 32, 64), default=64)
-    parser.add_argument("--softmax-heads", type=int, choices=(1, 4, 8), default=1)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--tile-m", type=int, choices=[16, 32, 64], default=32)
-    parser.add_argument("--tile-k", type=int, choices=[128, 256], default=128)
-    parser.add_argument("--reuse-kv", action="store_true")
-    parser.add_argument(
-        "--min-rows",
-        type=int,
-        default=2,
-        help="Fuse rows from this measured boundary; retain smaller target rows in the same family",
-    )
-    parser.add_argument("--compile-workers", type=int, default=3)
-    args = parser.parse_args()
-    if args.selected_int8:
-        print(
-            json.dumps(
-                build_selected(
-                    args.plan,
-                    args.output,
-                    args.compile_workers,
-                    args.min_rows,
-                    args.grid_limit,
-                    args.softmax_heads,
-                    args.model_dir,
-                )
-            )
-        )
-        return
-    if args.plan.parent.resolve() != args.output.parent.resolve():
-        parser.error("Input and output must share the asset directory")
-    if args.min_rows < 2:
-        parser.error("Fused prefill requires a minimum of two rows")
+def build(
+    plan: Path, output: Path, *, min_rows=2, workers=3, tile_m=32, tile_k=128, reuse_kv=False
+):
+    if tile_m not in (16, 32, 64) or tile_k not in (128, 256):
+        raise ValueError("Unsupported attention fusion tile")
+    if plan.parent.resolve() != output.parent.resolve():
+        raise ValueError("Input and output must share the asset directory")
+    if min_rows < 2:
+        raise ValueError("Fused prefill requires a minimum of two rows")
     from orinfer_build.models.deepseek_v41.build import compile_task
     from orinfer_build.compiler.ascend.build import operand
     from kernels.ascend.attention_fused import score_tiles
 
-    base = args.plan.parent
-    model = json.loads(args.plan.read_text())
+    base = plan.parent
+    model = json.loads(plan.read_text())
     tasks, descriptors = {}, {}
 
     def descriptor(step):
@@ -387,7 +358,7 @@ def main():
         definitions = {b["name"]: b for b in rank["buffers"]}
         converted = 0
         for packet in rank["packets"]:
-            if packet.get("min_rows", 0) < args.min_rows:
+            if packet.get("min_rows", 0) < min_rows:
                 continue
             body, old, index, count = [], packet["body"], 0, 0
             capacity = packet["rows"]
@@ -427,42 +398,42 @@ def main():
                 parameters = {
                     k: qk["parameters"][k] for k in ("rows", "capacity", "ratio", "compressed")
                 }
-                parameters["tile_m"] = args.tile_m
+                parameters["tile_m"] = tile_m
                 parameters["tile_k"] = (
-                    args.tile_k
+                    tile_k
                     if (
                         not parameters["compressed"]
-                        or (parameters["capacity"] // parameters["ratio"]) % args.tile_k == 0
+                        or (parameters["capacity"] // parameters["ratio"]) % tile_k == 0
                     )
                     else 128
                 )
-                parameters["reuse_kv"] = args.reuse_kv
+                parameters["reuse_kv"] = reuse_kv
                 c, m = parameters["capacity"], capacity
                 long_length, blocks = (
                     c // parameters["ratio"],
-                    (m * 8 + args.tile_m - 1) // args.tile_m,
+                    (m * 8 + tile_m - 1) // tile_m,
                 )
                 scratch, tile_k = [], parameters["tile_k"]
                 cached_tiles = score_tiles(
-                    c, parameters["ratio"], parameters["compressed"], args.tile_m, tile_k
+                    c, parameters["ratio"], parameters["compressed"], tile_m, tile_k
                 )
                 for name, dtype, shape, size in (
                     (
                         "scores",
                         "f32",
-                        [blocks, args.tile_m, cached_tiles * tile_k],
-                        blocks * cached_tiles * args.tile_m * tile_k * 4,
+                        [blocks, tile_m, cached_tiles * tile_k],
+                        blocks * cached_tiles * tile_m * tile_k * 4,
                     ),
                     (
                         "probabilities",
                         "bf16",
-                        [blocks, args.tile_m, tile_k],
-                        blocks * args.tile_m * tile_k * 2,
+                        [blocks, tile_m, tile_k],
+                        blocks * tile_m * tile_k * 2,
                     ),
-                    ("output", "f32", [blocks, args.tile_m, 512], blocks * args.tile_m * 512 * 4),
+                    ("output", "f32", [blocks, tile_m, 512], blocks * tile_m * 512 * 4),
                 ):
                     geometry = f"{cached_tiles}." if name == "scores" else ""
-                    name = f"attention.fused.{m}.{args.tile_m}.{tile_k}.{int(args.reuse_kv)}.{geometry}{name}"
+                    name = f"attention.fused.{m}.{tile_m}.{tile_k}.{int(reuse_kv)}.{geometry}{name}"
                     definition = dict(name=name, bytes=size)
                     if name not in definitions:
                         rank["buffers"].append(definition)
@@ -540,7 +511,7 @@ def main():
                 rank["buffers"].remove(definition)
     manifests = {}
     with ProcessPoolExecutor(
-        max_workers=args.compile_workers, mp_context=multiprocessing.get_context("spawn")
+        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
     ) as pool:
         for placeholder, path in pool.map(compile_task, [(t, str(base)) for t in tasks.values()]):
             manifests[placeholder] = path
@@ -550,7 +521,53 @@ def main():
             for step in packet["body"]:
                 if step["op"] == "kernel":
                     step["manifest"] = manifests.get(step["manifest"], step["manifest"])
-    atomic_json(args.output, model)
+    atomic_json(output, model)
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--selected-int8", action="store_true")
+    parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--grid-limit", type=int, choices=(8, 16, 32, 64), default=64)
+    parser.add_argument("--softmax-heads", type=int, choices=(1, 4, 8), default=1)
+    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--tile-m", type=int, choices=[16, 32, 64], default=32)
+    parser.add_argument("--tile-k", type=int, choices=[128, 256], default=128)
+    parser.add_argument("--reuse-kv", action="store_true")
+    parser.add_argument(
+        "--min-rows",
+        type=int,
+        default=2,
+        help="Fuse rows from this measured boundary; retain smaller target rows in the same family",
+    )
+    parser.add_argument("--compile-workers", type=int, default=3)
+    args = parser.parse_args()
+    if args.selected_int8:
+        print(
+            json.dumps(
+                build_selected(
+                    args.plan,
+                    args.output,
+                    args.compile_workers,
+                    args.min_rows,
+                    args.grid_limit,
+                    args.softmax_heads,
+                    args.model_dir,
+                )
+            )
+        )
+        return
+    return build(
+        args.plan,
+        args.output,
+        min_rows=args.min_rows,
+        workers=args.compile_workers,
+        tile_m=args.tile_m,
+        tile_k=args.tile_k,
+        reuse_kv=args.reuse_kv,
+    )
 
 
 if __name__ == "__main__":

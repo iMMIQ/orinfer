@@ -7,7 +7,6 @@ Weight shards and existing cubins are unchanged.
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 
@@ -17,6 +16,7 @@ from orinfer_build.packaging.publication import (
     atomic_model,
     clone_cpu_assets,
     link_or_copy,
+    resolve_package,
 )
 from orinfer_build.common.files import write_json
 
@@ -33,23 +33,7 @@ def attach(source, output, library, engine, package_name=None, version=None):
         version is not None and version != identity["version"]
     ):
         raise ValueError("Requested execution identity differs from the native library")
-    descriptor = json.loads((source / "cache/model.json").read_text())
-    if descriptor.get("schema_version") != 1:
-        raise ValueError("Expected model data schema 1")
-    digest = descriptor["execution_package"]
-    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-        raise ValueError("Malformed source package digest")
-    bundled = source / "cache/packages" / digest
-    if not bundled.exists():
-        default = (
-            Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "orinfer/packages"
-        )
-        bundled = Path(os.environ.get("ORINFER_EXECUTION_CACHE", str(default))) / digest
-    bundled = bundled.resolve(strict=True)
-    raw = (bundled / "package.json").read_bytes()
-    if hashlib.sha256(raw).hexdigest() != digest:
-        raise ValueError("Source package digest mismatch")
-    package = json.loads(raw)
+    descriptor, bundled, package = resolve_package(source, schema=1)
     verify_execution(package, bundled)
     reader = AssetReader(bundled)
     checked = set()

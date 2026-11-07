@@ -194,7 +194,7 @@ def main():
                 )
                 atomic_json(args.output / "validation.json", reports)
             if args.benchmark_rows:
-                from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+                from orinfer_build.tuning.ascend import npu_benchmark
                 from orinfer_build.tuning.tuning import measure
 
                 probability.fill_(1.0 / selected)

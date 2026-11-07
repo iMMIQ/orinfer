@@ -8,16 +8,12 @@ bind kernels, views and communication. No tuning or Python runs online.
 from orinfer_build.common.paths import ROOT
 
 
-from orinfer_build.common.modules import import_module
-
-
 import argparse
 from copy import deepcopy
 import json
 import math
 import struct
 from pathlib import Path
-import sys
 import tempfile
 
 from orinfer_build.common.files import atomic_json, file_hash, source_hash
@@ -662,25 +658,6 @@ def publish_package(model, base, destination):
     return len(assets)
 
 
-def run_transform(module, source, output, workers, options=()):
-    """Compose the existing offline transforms without another compiler path."""
-    previous = sys.argv
-    try:
-        sys.argv = [
-            module,
-            "--plan",
-            str(source),
-            "--output",
-            str(output),
-            "--compile-workers",
-            str(workers),
-            *options,
-        ]
-        import_module("orinfer_build.models.deepseek_v41." + module).main()
-    finally:
-        sys.argv = previous
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
@@ -734,54 +711,45 @@ def main():
     atomic_json(reference, model)
     current, stages = reference, []
 
-    def run(module, options):
+    from orinfer_build.models.deepseek_v41 import shard_indexer, sequence_parallel, fuse_attention
+
+    def run(module, transform, **options):
         nonlocal current
         output = prefix.with_name(prefix.name + f"-{len(stages)}.json")
-        run_transform(module, current, output, args.compile_workers, options)
+        transform(current, output, workers=args.compile_workers, **options)
         stages.append(dict(stage=module, sha256=file_hash(output)))
         current = output
 
-    run("shard_indexer", ["--min-rows", str(args.sequence_min_rows)])
+    run("shard_indexer", shard_indexer.build, min_rows=args.sequence_min_rows)
     run(
         "sequence_parallel",
-        ["--min-rows", str(args.sequence_min_rows)]
-        + (["--reduce-scatter"] if args.reduce_scatter else [])
-        + (["--shared-attention"] if args.shared_attention else []),
+        sequence_parallel.build,
+        min_rows=args.sequence_min_rows,
+        reduce_scatter=args.reduce_scatter,
+        shared_attention=args.shared_attention,
     )
     if args.fused_attention:
         run(
             "fuse_attention",
-            [
-                "--min-rows",
-                str(args.fused_min_rows),
-                "--tile-m",
-                "64",
-                "--tile-k",
-                "256",
-                "--reuse-kv",
-            ],
+            fuse_attention.build,
+            min_rows=args.fused_min_rows,
+            tile_m=64,
+            tile_k=256,
+            reuse_kv=True,
         )
     if args.tune_projections != "off":
-        previous = sys.argv
-        try:
-            sys.argv = [
-                "tune",
-                "--plan",
-                str(current),
-                "--model-dir",
-                str(args.model_dir),
-                "--output",
-                str(base / ".tuning-projections"),
-                "--joint",
-                "--compile-workers",
-                str(args.compile_workers),
-            ]
-            if args.tune_projections == "local":
-                sys.argv.append("--local-only")
-            import_module("orinfer_build.models.deepseek_v41.tune").main()
-        finally:
-            sys.argv = previous
-        current = current.with_name(current.stem + "-tuned.json")
+        from orinfer_build.models.deepseek_v41.tune import Options, tune
+
+        current = tune(
+            Options(
+                plan=current,
+                model_dir=args.model_dir,
+                output=base / ".tuning-projections",
+                joint=True,
+                compile_workers=args.compile_workers,
+                local_only=args.tune_projections == "local",
+            )
+        )
         stages.append(dict(stage="tune", sha256=file_hash(current)))
     model = json.loads(current.read_text())
     if args.fp32_sums:

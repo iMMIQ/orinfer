@@ -120,7 +120,7 @@ def compile_plan(plan, output, workers, minimum, model_dir=None):
 def select_plan(plan, output, device, minimum, model_dir=None):
     import torch
     import torch_npu
-    from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+    from orinfer_build.tuning.ascend import npu_benchmark
 
     torch.set_num_threads(4)
     torch.manual_seed(20261002)

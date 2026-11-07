@@ -4,9 +4,7 @@ W_ab and Y use a first (48 columns), b second (48 columns), unlike native
 vLLM in_proj_ba which emits b first. No bias or gate functions here.
 """
 
-from functools import wraps
-import torch
-import tilelang
+from orinfer_build.compiler.cuda.common import orin_jit
 import tilelang.language as T
 
 K_HIDDEN = 5120
@@ -14,28 +12,7 @@ HEADS = 48
 N_AB = 96
 
 
-def _orin_jit(function):
-    compiled = tilelang.jit(
-        out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"}
-    )(function)
-
-    @wraps(function)
-    def build(*args, **kwargs):
-        kernel = compiled(*args, **kwargs)
-        kernel.adapter.kernels = dict(kernel.adapter.kernels)
-
-        def launch(*inputs, stream=None):
-            if stream is None:
-                stream = torch.cuda.current_stream(inputs[0].device).cuda_stream
-            return kernel.adapter.func(*inputs, stream=stream)
-
-        kernel.torch_function = launch
-        return kernel
-
-    return build
-
-
-@_orin_jit
+@orin_jit
 def gdn_ab_tensorcore(
     M,
     dtype: str = "float16",

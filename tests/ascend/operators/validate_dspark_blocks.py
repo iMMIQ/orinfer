@@ -15,7 +15,7 @@ def main():
     args = parser.parse_args()
     import torch
     import torch_npu  # noqa: F401
-    from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+    from orinfer_build.tuning.ascend import npu_benchmark
 
     torch.manual_seed(20261002)
     torch.npu.set_device(7)

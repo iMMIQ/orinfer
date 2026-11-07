@@ -16,7 +16,7 @@ def main():
     from kernels.shared.rows import row_count
     from kernels.ascend import hc_prefill, vector
     from orinfer_build.compiler.ascend.build import compile_kernel, operand
-    from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+    from orinfer_build.tuning.ascend import npu_benchmark
 
     torch.manual_seed(20261002)
     torch.npu.set_device(args.device)

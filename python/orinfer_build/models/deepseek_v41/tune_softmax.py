@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from orinfer_build.common.files import atomic_json, file_hash
-from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+from orinfer_build.tuning.ascend import npu_benchmark
 from orinfer_build.contracts.row_selection import aggregate_winner
 from orinfer_build.tuning.tuning import measure, read_record, record_path
 

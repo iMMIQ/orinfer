@@ -19,7 +19,7 @@ def main():
     from kernels.shared.rows import row_count
     from kernels.ascend import routing
     from orinfer_build.compiler.ascend.build import compile_kernel, operand
-    from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+    from orinfer_build.tuning.ascend import npu_benchmark
 
     torch.set_num_threads(4)
     torch.manual_seed(20261002)

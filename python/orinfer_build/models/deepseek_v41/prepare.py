@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import struct
 import subprocess
 import tempfile
 import time
@@ -17,6 +16,7 @@ import time
 import numpy as np
 
 from orinfer_build.common.files import atomic_json
+from orinfer_build.weights.local import LocalSource
 
 
 class Transpose:
@@ -61,51 +61,22 @@ class Transpose:
         )
 
 
-class Checkpoint:
+class Checkpoint(LocalSource):
     def __init__(self, root, index, names):
-        self.root = root.resolve()
-        self.index = json.loads((root / index).read_text())["weight_map"]
-        self.files, self.headers, self.signatures = {}, {}, {}
+        super().__init__(root, index)
         try:
-            for name in sorted({self.index[n] for n in names}):
-                path = (self.root / name).resolve()
-                if not path.is_relative_to(self.root):
-                    raise ValueError("Checkpoint path leaves model directory")
-                fd = os.open(path, os.O_RDONLY)
-                self.files[name] = fd
-                header = os.pread(fd, 8, 0)
-                length = struct.unpack("<Q", header)[0]
-                if length > 256 << 20:
-                    raise ValueError("Unbounded safetensors header")
-                data = os.pread(fd, length, 8)
-                self.headers[name] = (8 + length, json.loads(data))
-                stat = os.fstat(fd)
-                self.signatures[name] = [stat.st_size, stat.st_mtime_ns, stat.st_ino]
+            for name in sorted(set(names)):
+                self.tensor(name)
         except BaseException:
             self.close()
             raise
 
-    def close(self):
-        for fd in self.files.values():
-            os.close(fd)
-        self.files.clear()
-
     def read(self, name, kind, shape=None):
-        file = self.index[name]
-        start, headers = self.headers[file]
-        tensor = headers[name]
+        tensor = self.metadata(name)
         if tensor["dtype"] != kind or (shape is not None and tensor["shape"] != list(shape)):
             raise ValueError(f"{name}: unexpected checkpoint dtype/shape")
-        begin, end = tensor["data_offsets"]
         dtype = {"I8": np.uint8, "F32": np.dtype("<f4")}[kind]
-        expected = int(np.prod(tensor["shape"])) * np.dtype(dtype).itemsize
-        if not 0 <= begin <= end or end - begin != expected:
-            raise ValueError(f"{name}: invalid tensor extent")
-        # pread avoids ZFS mmap page-fault contention during strided transpose.
-        data = os.pread(self.files[file], end - begin, start + begin)
-        if len(data) != end - begin:
-            raise ValueError(f"{name}: truncated tensor payload")
-        return np.frombuffer(data, dtype=dtype).reshape(tensor["shape"])
+        return np.frombuffer(self.read_rows(name), dtype=dtype).reshape(tensor["shape"])
 
 
 def tensor_names(weight):

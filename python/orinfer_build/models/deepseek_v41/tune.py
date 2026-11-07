@@ -9,6 +9,7 @@ from orinfer_build.common.paths import ROOT
 
 
 import argparse
+from dataclasses import MISSING, dataclass, fields
 import ctypes
 from copy import deepcopy
 from functools import partial
@@ -17,6 +18,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from orinfer_build.tuning.ascend import npu_benchmark
 from orinfer_build.common.files import atomic_json, file_hash
 from orinfer_build.models.deepseek_v41.assembly import unit_scale_manifests
 from orinfer_build.contracts.row_selection import bounded_choices, guarded_winner, samples
@@ -139,67 +141,42 @@ def preserve_small_rows(existing, measured, variants, old, chosen, capacity):
     return result
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--plan", type=Path, required=True)
-    p.add_argument("--model-dir", type=Path, required=True)
-    p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--package-output", type=Path, help="Publish only selected native assets")
-    p.add_argument("--rows", type=int, nargs="+")
-    p.add_argument("--maximum-regression", type=float, default=0.05)
-    p.add_argument(
-        "--weight-buffers",
-        type=int,
-        default=1,
-        help="Rotate distinct copies of the real weight bank during Graph measurement",
-    )
-    p.add_argument("--device", type=int, default=7)
-    p.add_argument("--compile-workers", type=int, default=4)
-    p.add_argument(
-        "--geometry",
-        type=int,
-        nargs=2,
-        action="append",
-        metavar=("N", "K"),
-        help="Limit tuning to these measured output/reduction geometries",
-    )
-    p.add_argument(
-        "--local-only",
-        action="store_true",
-        help="Tune only dynamic projection kernels with an explicit local row binding",
-    )
-    p.add_argument("--decode-only", action="store_true", help="Tune the shared batch decode family")
-    p.add_argument(
-        "--min-capacity",
-        type=int,
-        default=1,
-        help="Limit tuning to physical row capacities at least this large",
-    )
-    search = p.add_mutually_exclusive_group()
-    search.add_argument(
-        "--grid-only", action="store_true", help="Measure same-source 64/128/256 CTA bounds"
-    )
-    search.add_argument("--pipeline-only", action="store_true")
-    search.add_argument(
-        "--bf16-output",
-        action="store_true",
-        help="Compare shared BF16 Vector and direct Fixpipe output after verifying unit scales",
-    )
-    search.add_argument("--joint", action="store_true", help="Joint M/N/K/pipeline candidates")
-    search.add_argument(
-        "--wide-integer",
-        action="store_true",
-        help="Compare the current INT8 schedule with M128/N256 and legal pipeline stages",
-    )
-    args = p.parse_args()
+@dataclass(frozen=True)
+class Options:
+    plan: Path
+    model_dir: Path
+    output: Path
+    package_output: Path | None = None
+    rows: list[int] | None = None
+    maximum_regression: float = 0.05
+    weight_buffers: int = 1
+    device: int = 7
+    compile_workers: int = 4
+    geometry: list[list[int]] | None = None
+    local_only: bool = False
+    decode_only: bool = False
+    min_capacity: int = 1
+    grid_only: bool = False
+    pipeline_only: bool = False
+    bf16_output: bool = False
+    joint: bool = False
+    wide_integer: bool = False
+
+
+def tune(args: Options):
+    if (
+        sum((args.grid_only, args.pipeline_only, args.bf16_output, args.joint, args.wide_integer))
+        > 1
+    ):
+        raise ValueError("Choose one projection search mode")
     if not 1 <= args.compile_workers <= 8:
-        p.error("compile workers must be in 1..8")
+        raise ValueError("compile workers must be in 1..8")
     if not 1 <= args.min_capacity <= 4096:
-        p.error("minimum capacity must be in 1..4096")
+        raise ValueError("minimum capacity must be in 1..4096")
     if not 1 <= args.weight_buffers <= 64:
-        p.error("weight buffers must be in 1..64")
+        raise ValueError("weight buffers must be in 1..64")
     if not math.isfinite(args.maximum_regression) or not 0 <= args.maximum_regression <= 1:
-        p.error("maximum regression must be finite, within 0..1")
+        raise ValueError("maximum regression must be finite, within 0..1")
     args.output.mkdir(parents=True, exist_ok=True)
     import torch
     import torch_npu  # noqa: F401
@@ -549,6 +526,61 @@ def main():
     if args.package_output:
         count = publish_package(model, base, args.package_output)
         print(json.dumps(dict(package=str(args.package_output), assets=count)), flush=True)
+    return args.plan.with_name(args.plan.stem + "-tuned.json")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--plan", type=Path, required=True)
+    p.add_argument("--model-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--package-output", type=Path, help="Publish only selected native assets")
+    p.add_argument("--rows", type=int, nargs="+")
+    p.add_argument("--maximum-regression", type=float)
+    p.add_argument(
+        "--weight-buffers",
+        type=int,
+        help="Rotate distinct copies of the real weight bank during Graph measurement",
+    )
+    p.add_argument("--device", type=int)
+    p.add_argument("--compile-workers", type=int)
+    p.add_argument(
+        "--geometry",
+        type=int,
+        nargs=2,
+        action="append",
+        metavar=("N", "K"),
+        help="Limit tuning to these measured output/reduction geometries",
+    )
+    p.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Tune only dynamic projection kernels with an explicit local row binding",
+    )
+    p.add_argument("--decode-only", action="store_true", help="Tune the shared batch decode family")
+    p.add_argument(
+        "--min-capacity",
+        type=int,
+        help="Limit tuning to physical row capacities at least this large",
+    )
+    search = p.add_mutually_exclusive_group()
+    search.add_argument(
+        "--grid-only", action="store_true", help="Measure same-source 64/128/256 CTA bounds"
+    )
+    search.add_argument("--pipeline-only", action="store_true")
+    search.add_argument(
+        "--bf16-output",
+        action="store_true",
+        help="Compare shared BF16 Vector and direct Fixpipe output after verifying unit scales",
+    )
+    search.add_argument("--joint", action="store_true", help="Joint M/N/K/pipeline candidates")
+    search.add_argument(
+        "--wide-integer",
+        action="store_true",
+        help="Compare the current INT8 schedule with M128/N256 and legal pipeline stages",
+    )
+    p.set_defaults(**{f.name: f.default for f in fields(Options) if f.default is not MISSING})
+    return tune(Options(**vars(p.parse_args())))
 
 
 def read_weight(root, index, weight):
@@ -637,34 +669,6 @@ def file_hash_bytes(tensor):
     return hashlib.sha256(
         tensor.view(-1).view(__import__("torch").uint8).numpy().tobytes()
     ).hexdigest()
-
-
-def npu_benchmark(run, repetitions, warmup, *, calls_per_replay=1):
-    """Time each call, amortizing host submission for independent projections."""
-    import statistics
-    import torch
-
-    if type(calls_per_replay) is not int or not 1 <= calls_per_replay <= 64:
-        raise ValueError("NPU replay call count must be in 1..64")
-    for _ in range(warmup):
-        run()
-    torch.npu.synchronize()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        for _ in range(calls_per_replay):
-            run()
-    for _ in range(2):
-        graph.replay()
-    torch.npu.synchronize()
-    values = []
-    for _ in range(repetitions):
-        start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-        start.record()
-        graph.replay()
-        end.record()
-        end.synchronize()
-        values.append(start.elapsed_time(end) / calls_per_replay)
-    return dict(median_ms=statistics.median(values)), graph
 
 
 if __name__ == "__main__":

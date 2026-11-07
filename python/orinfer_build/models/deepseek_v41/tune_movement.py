@@ -25,7 +25,7 @@ def main():
     import torch
     import torch_npu  # noqa: F401
     from orinfer_build.models.deepseek_v41.build import compile_task
-    from orinfer_build.models.deepseek_v41.tune import npu_benchmark
+    from orinfer_build.tuning.ascend import npu_benchmark
 
     torch.set_num_threads(4)
     torch.manual_seed(20261002)

@@ -1,11 +1,15 @@
 """Regression checks for native dynamic rows, mixed views and thin publication."""
 
 from copy import deepcopy
+from contextlib import redirect_stdout
+import io
 import json
 import math
 from pathlib import Path
 import tempfile
+import sys
 import unittest
+from unittest.mock import patch
 
 from orinfer_build.models.deepseek_v41.assembly import (
     compact_buffers,
@@ -21,6 +25,90 @@ from orinfer_build.models.deepseek_v41.private_schedule import (
     reusable_long_gathers,
     select_schedule,
 )
+
+
+class PipelineTests(unittest.TestCase):
+    def test_transforms_and_tuning_preserve_arguments_source_and_stage_order(self):
+        from orinfer_build.models.deepseek_v41 import assembly
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / "input.json", root / "output.json"
+            model = dict(
+                schema_version=1,
+                layers=40,
+                capacity=2048,
+                ranks=[
+                    dict(
+                        buffers=[],
+                        packets=[
+                            dict(min_rows=0, body=[], head=[], coordinates={}, reset=[]),
+                            dict(min_rows=2, rows=2048, body=[], head=[], coordinates={}, reset=[]),
+                        ],
+                    )
+                    for _ in range(8)
+                ],
+            )
+            original = json.dumps(model)
+            source.write_text(original)
+            arguments = [
+                "assembly",
+                "--plan",
+                str(source),
+                "--output",
+                str(target),
+                "--shared-attention",
+                "--fused-attention",
+                "--tune-projections",
+                "local",
+                "--model-dir",
+                str(root),
+                "--compile-workers",
+                "3",
+            ]
+            order = []
+
+            def transform(name):
+                def run(before, after, **options):
+                    self.assertEqual(sys.argv, arguments)
+                    self.assertEqual(options["workers"], 3)
+                    payload = json.loads(before.read_text())
+                    payload.setdefault("stages", []).append(name)
+                    order.append(name)
+                    after.write_text(json.dumps(payload))
+
+                return run
+
+            def tune(options):
+                self.assertEqual(sys.argv, arguments)
+                self.assertTrue(options.local_only and options.joint)
+                self.assertEqual(options.compile_workers, 3)
+                after = options.plan.with_name(options.plan.stem + "-tuned.json")
+                transform("tune")(options.plan, after, workers=options.compile_workers)
+                return after
+
+            with (
+                patch.object(sys, "argv", arguments),
+                patch(
+                    "orinfer_build.models.deepseek_v41.shard_indexer.build",
+                    side_effect=transform("index"),
+                ),
+                patch(
+                    "orinfer_build.models.deepseek_v41.sequence_parallel.build",
+                    side_effect=transform("sequence"),
+                ),
+                patch(
+                    "orinfer_build.models.deepseek_v41.fuse_attention.build",
+                    side_effect=transform("attention"),
+                ),
+                patch("orinfer_build.models.deepseek_v41.tune.tune", side_effect=tune),
+                patch.object(assembly, "validate_rows", return_value={}),
+                redirect_stdout(io.StringIO()),
+            ):
+                assembly.main()
+            self.assertEqual(order, ["index", "sequence", "attention", "tune"])
+            self.assertEqual(json.loads(target.read_text())["stages"], order)
+            self.assertEqual(source.read_text(), original)
 
 
 class HcFusionTests(unittest.TestCase):

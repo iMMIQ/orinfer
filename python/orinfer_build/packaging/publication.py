@@ -115,9 +115,12 @@ def clone_cpu_assets(source, destination):
         )
 
 
-def load_model(model, *, plan=None):
+def resolve_package(model, *, schema=None):
+    """Read package metadata with the runtime's installed-before-bundled order."""
     model = model.resolve(strict=True)
     data = json.loads((model / "cache/model.json").read_text())
+    if schema is not None and data.get("schema_version") != schema:
+        raise ValueError(f"Expected model data schema {schema}")
     digest = data["execution_package"]
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise ValueError("Invalid operator package digest")
@@ -137,6 +140,11 @@ def load_model(model, *, plan=None):
     if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError("Source operator package digest mismatch")
     package = json.loads(raw)
+    return data, origin, package
+
+
+def load_model(model, *, plan=None):
+    data, origin, package = resolve_package(model)
     if "catalog" in package:
         # Offline tools reuse the registered Rust binding generator. This is
         # compiler staging data, never an alternative online package format.

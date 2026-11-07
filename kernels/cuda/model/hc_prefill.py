@@ -16,26 +16,6 @@ from kernels.cuda.model.half_math import SOURCE as HALF_MATH, stream_sigmoid
 
 
 @orin_jit
-def hc_input_bf16(M: int, K: int, dynamic_rows: bool = False):
-    """Materialize the original FP16-to-BF16 MMA operand once per matrix."""
-    if any(type(n) is not int or n <= 0 for n in (M, K)):
-        raise ValueError("Invalid HC operand geometry")
-    M = row_count(M, dynamic_rows)
-
-    @T.prim_func
-    def hc_input_cast(
-        Input: T.Tensor((M, K), T.float16),
-        Output: T.Tensor((M, K), T.bfloat16),
-    ):
-        with T.Kernel(T.ceildiv(M, 4), T.ceildiv(K, 256), threads=128) as (bm, bk):
-            for i, j in T.Parallel(4, 256):
-                if bm * 4 + i < M and bk * 256 + j < K:
-                    Output[bm * 4 + i, bk * 256 + j] = Input[bm * 4 + i, bk * 256 + j]
-
-    return hc_input_cast
-
-
-@orin_jit
 def hc_norm_prefill(
     M: int,
     H: int,

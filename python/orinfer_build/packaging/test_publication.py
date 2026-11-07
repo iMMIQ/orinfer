@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,10 +16,22 @@ from orinfer_build.packaging.publication import (
     load_model,
     link_or_copy,
     seed_compile_cache,
+    resolve_package,
 )
 
 
 class PublicationTests(unittest.TestCase):
+    def test_installed_package_precedes_bundle_and_corruption_does_not_fall_back(self):
+        cache = self.root / "cache" / self.operator.name
+        shutil.copytree(self.operator, cache)
+        data, origin, package = resolve_package(self.source)
+        self.assertEqual(data, self.data)
+        self.assertEqual(origin, cache)
+        self.assertEqual(package, self.package)
+        (cache / "package.json").write_text("{}")
+        with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            resolve_package(self.source)
+
     def test_compile_cache_seeding_preserves_platform_and_live_entries(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

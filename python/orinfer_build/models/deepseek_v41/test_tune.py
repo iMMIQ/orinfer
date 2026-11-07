@@ -7,6 +7,8 @@ import numpy as np
 from safetensors.numpy import save_file
 
 from orinfer_build.models.deepseek_v41.tune import (
+    Options,
+    tune,
     preserve_small_rows,
     projection_configs,
     read_prepared_bank,
@@ -19,6 +21,15 @@ from orinfer_build.models.deepseek_v41.tune_auxiliary import (
 
 
 class AuxiliaryHeadTests(unittest.TestCase):
+    def test_library_search_options_are_checked_before_device_setup(self):
+        for options in [
+            dict(joint=True, pipeline_only=True),
+            dict(compile_workers=0),
+            dict(maximum_regression=float("nan")),
+        ]:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                tune(Options(Path("plan"), Path("model"), Path("output"), **options))
+
     def test_dynamic_head_keeps_small_rows_and_does_not_mix_compilers(self):
         records = [
             dict(rows=6, times={"0": 1.0, "1": 1.01, "2": 1.18}),

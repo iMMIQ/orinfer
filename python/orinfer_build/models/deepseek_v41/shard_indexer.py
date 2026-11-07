@@ -356,27 +356,22 @@ def build_private(plan, output, workers=4):
     )
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--min-rows", type=int)
-    parser.add_argument("--compile-workers", type=int, default=4)
-    args = parser.parse_args()
-    if json.loads(args.plan.read_text()).get("batch"):
-        if args.min_rows not in (None, 1):
-            parser.error("Private query partition uses the complete dynamic row domain")
-        print(json.dumps(build_private(args.plan, args.output, args.compile_workers)), flush=True)
-        return
-    args.min_rows = args.min_rows or 512
-    if args.output.parent.resolve() != args.plan.parent.resolve():
-        parser.error("Output must share the input plan's asset directory")
+def build(plan: Path, output: Path, *, min_rows=None, workers=4):
+    if json.loads(plan.read_text()).get("batch"):
+        if min_rows not in (None, 1):
+            raise ValueError("Private query partition uses the complete dynamic row domain")
+        result = build_private(plan, output, workers)
+        print(json.dumps(result), flush=True)
+        return result
+    min_rows = min_rows or 512
+    if output.parent.resolve() != plan.parent.resolve():
+        raise ValueError("Output must share the input plan's asset directory")
     from orinfer_build.models.deepseek_v41.build import compile_task
     from kernels.ascend import memory
     from orinfer_build.compiler.ascend.build import operand
 
-    model = json.loads(args.plan.read_text())
-    base = args.plan.parent
+    model = json.loads(plan.read_text())
+    base = plan.parent
     compiled = {}
     sizes = {"i8": 1, "i32": 4, "f16": 2, "bf16": 2, "f32": 4}
     names = {"i8": "int8", "i32": "int32", "f16": "float16", "bf16": "bfloat16"}
@@ -400,12 +395,12 @@ def main():
             raise ValueError("Expected one original decode and prefill packet")
         fallback = rank["packets"][1]
         capacity = fallback["rows"]
-        if capacity % 8 or not 2 < args.min_rows <= capacity:
+        if capacity % 8 or not 2 < min_rows <= capacity:
             raise ValueError("Expected TP8-divisible capacity and a nonempty short fallback")
         count = capacity // 8
         local = deepcopy(fallback)
-        fallback["max_rows"] = args.min_rows - 1
-        local["min_rows"] = args.min_rows
+        fallback["max_rows"] = min_rows - 1
+        local["min_rows"] = min_rows
         definitions = {d["name"]: d for d in rank["buffers"]}
 
         def temp(name, shape, dtype):
@@ -548,7 +543,7 @@ def main():
         )
     manifests = {}
     with ProcessPoolExecutor(
-        max_workers=args.compile_workers, mp_context=multiprocessing.get_context("spawn")
+        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
     ) as pool:
         for placeholder, path in pool.map(
             compile_task, [(task, str(base)) for task in compiled.values()]
@@ -560,7 +555,18 @@ def main():
             for step in packet["body"] + packet["head"]:
                 if step["op"] == "kernel":
                     step["manifest"] = manifests.get(step["manifest"], step["manifest"])
-    atomic_json(args.output, model)
+    atomic_json(output, model)
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--min-rows", type=int)
+    parser.add_argument("--compile-workers", type=int, default=4)
+    args = parser.parse_args()
+    return build(args.plan, args.output, min_rows=args.min_rows, workers=args.compile_workers)
 
 
 if __name__ == "__main__":

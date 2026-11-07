@@ -49,24 +49,24 @@ def external_reads(program, candidates, descriptor):
     return required
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--compile-workers", type=int, default=4)
-    parser.add_argument("--min-rows", type=int, default=512)
-    parser.add_argument("--reduce-scatter", action="store_true")
-    parser.add_argument("--shared-attention", action="store_true")
-    args = parser.parse_args()
-    if args.output.parent.resolve() != args.plan.parent.resolve():
-        parser.error("Input and output must share their asset directory")
+def build(
+    plan: Path,
+    output: Path,
+    *,
+    min_rows=512,
+    workers=4,
+    reduce_scatter=False,
+    shared_attention=False,
+):
+    if output.parent.resolve() != plan.parent.resolve():
+        raise ValueError("Input and output must share their asset directory")
     from orinfer_build.models.deepseek_v41.build import compile_task
     from orinfer_build.compiler.ascend.build import operand
     from orinfer_build.contracts.ascend.geometry import physical_shapes
     from kernels.shared.rows import row_count
 
-    base = args.plan.parent
-    model = json.loads(args.plan.read_text())
+    base = plan.parent
+    model = json.loads(plan.read_text())
     tasks, descriptors = {}, {}
     geometries = {}
 
@@ -105,13 +105,13 @@ def main():
             raise ValueError("Expected one selected large-row packet")
         packet = packets[0]
         capacity = packet["rows"]
-        if not packet["min_rows"] <= args.min_rows <= capacity:
+        if not packet["min_rows"] <= min_rows <= capacity:
             raise ValueError("Selected minimum must lie inside the original large packet")
-        if args.min_rows > packet["min_rows"]:
+        if min_rows > packet["min_rows"]:
             fallback = deepcopy(packet)
-            fallback["max_rows"] = args.min_rows - 1
+            fallback["max_rows"] = min_rows - 1
             rank["packets"].insert(rank["packets"].index(packet), fallback)
-            packet["min_rows"] = args.min_rows
+            packet["min_rows"] = min_rows
         if capacity % 8:
             raise ValueError("Sequence capacity must be divisible by eight")
         count = capacity // 8
@@ -270,7 +270,7 @@ def main():
                     raise ValueError("Unexpected sequence reduction geometry")
                 dtype = "f32" if step["fp32"] else "bf16"
                 destination = step["destination"]
-                if args.reduce_scatter:
+                if reduce_scatter:
                     body.append(zero_tail(step["source"], 5120, dtype))
                     mapping[destination] = temp(destination, count * 5120 * SIZES[dtype])
                     collective = dict(
@@ -338,7 +338,7 @@ def main():
         if reductions != (80):
             raise ValueError("Expected all 80 body reductions")
         body.append(gather(packet["head"][0]["buffers"][0], "bf16", 5120))
-        if args.shared_attention:
+        if shared_attention:
             shared_body, index, shared_groups = [], 0, 0
             # Each KV/Qa projection and both norm weights refer to the same
             # checkpoint ranges on all ranks; Qb remains tensor-parallel.
@@ -460,13 +460,13 @@ def main():
                 local_kernels=local_kernels,
                 reductions=reductions,
                 tasks=len(tasks),
-                reduce_scatter=args.reduce_scatter,
+                reduce_scatter=reduce_scatter,
             ),
             flush=True,
         )
     manifests = {}
     with ProcessPoolExecutor(
-        max_workers=args.compile_workers, mp_context=multiprocessing.get_context("spawn")
+        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
     ) as pool:
         for placeholder, path in pool.map(compile_task, [(t, str(base)) for t in tasks.values()]):
             manifests[placeholder] = path
@@ -476,7 +476,27 @@ def main():
             for step in packet["body"] + packet["head"]:
                 if step["op"] == "kernel":
                     step["manifest"] = manifests.get(step["manifest"], step["manifest"])
-    atomic_json(args.output, model)
+    atomic_json(output, model)
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--compile-workers", type=int, default=4)
+    parser.add_argument("--min-rows", type=int, default=512)
+    parser.add_argument("--reduce-scatter", action="store_true")
+    parser.add_argument("--shared-attention", action="store_true")
+    args = parser.parse_args()
+    return build(
+        args.plan,
+        args.output,
+        min_rows=args.min_rows,
+        workers=args.compile_workers,
+        reduce_scatter=args.reduce_scatter,
+        shared_attention=args.shared_attention,
+    )
 
 
 if __name__ == "__main__":

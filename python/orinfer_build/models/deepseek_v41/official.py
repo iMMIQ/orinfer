@@ -6,11 +6,12 @@ import json
 import os
 from pathlib import Path
 import platform
-import struct
 import subprocess
 import tempfile
 
 import numpy as np
+
+from orinfer_build.weights.local import LocalSource
 
 
 def e4m3_table():
@@ -89,9 +90,9 @@ class Decoder:
         return out
 
 
-class Checkpoint:
+class Checkpoint(LocalSource):
     def __init__(self, directory, decoder=None):
-        self.directory = Path(directory).resolve()
+        super().__init__(directory)
         self.decoder = decoder
         config = json.loads((self.directory / "config.json").read_text())
         quant = config["quantization_config"]
@@ -101,61 +102,15 @@ class Checkpoint:
             or quant.get("weight_block_size") != [32, 32]
         ):
             raise ValueError("Expected the official FP4/FP8 mixed checkpoint with E8M0 scales")
-        self.index = json.loads((self.directory / "model.safetensors.index.json").read_text())[
-            "weight_map"
-        ]
-        self.files, self.headers = {}, {}
-
-    def close(self):
-        for fd, _ in self.files.values():
-            os.close(fd)
-        self.files.clear()
-
-    def metadata(self, name):
-        filename = self.index[name]
-        if filename not in self.files:
-            path = (self.directory / filename).resolve()
-            if not path.is_relative_to(self.directory):
-                raise ValueError("Official tensor path leaves checkpoint directory")
-            fd = os.open(path, os.O_RDONLY)
-            try:
-                length_bytes = os.pread(fd, 8, 0)
-                if len(length_bytes) != 8:
-                    raise ValueError("Truncated official safetensors header")
-                length = struct.unpack("<Q", length_bytes)[0]
-                if length > 256 << 20:
-                    raise ValueError("Unbounded official safetensors header")
-                payload = os.pread(fd, length, 8)
-                self.headers[filename] = json.loads(payload)
-                self.files[filename] = (fd, 8 + length)
-            except BaseException:
-                os.close(fd)
-                raise
-        return self.headers[filename][name]
 
     def read(self, name, first_row=0, rows=None, max_bytes=4 << 30):
         meta = self.metadata(name)
         shape = meta["shape"]
         count = shape[0] - first_row if rows is None else rows
-        if not 0 <= first_row <= shape[0] or not 0 <= count <= shape[0] - first_row:
-            raise ValueError("Official tensor row range is invalid")
         dtype = meta["dtype"]
-        element = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1, "I8": 1}.get(dtype)
-        if element is None:
+        if dtype not in {"BF16", "F32", "F8_E4M3", "F8_E8M0", "I8"}:
             raise ValueError(f"Unsupported official tensor dtype: {dtype}")
-        stride = int(np.prod(shape[1:])) * element
-        begin, end = meta["data_offsets"]
-        fd, offset = self.files[self.index[name]]
-        if (
-            not 0 <= begin <= end
-            or end - begin != shape[0] * stride
-            or offset + end > os.fstat(fd).st_size
-            or count * stride > max_bytes
-        ):
-            raise ValueError("Official tensor extent or bounded read budget differs")
-        data = os.pread(fd, count * stride, offset + begin + first_row * stride)
-        if len(data) != count * stride:
-            raise ValueError("Truncated official tensor payload")
+        data = self.read_rows(name, first_row, count, max_bytes=max_bytes)
         storage = {"BF16": "<u2", "F32": "<f4"}.get(dtype, "u1")
         value = np.frombuffer(data, dtype=storage).reshape(count, *shape[1:])
         if dtype == "BF16":

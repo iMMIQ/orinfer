@@ -33,24 +33,6 @@ def split_row(x, packed, row, reduction):
     T.copy(low_bytes, packed[row * 2 + 1, :])
 
 
-def split_activation(rows, reduction):
-    """Standalone wrapper for validating the shared decomposition arithmetic."""
-
-    @T.prim_func
-    def main(
-        source: T.Tensor((rows, reduction), "int8"),
-        packed: T.Tensor((rows * 2, reduction // 2), "int8"),
-    ):
-        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
-            x = T.alloc_ub((reduction,), "int8")
-            row = cid * 2 + vid
-            if row < rows:
-                T.copy(source[row, :], x)
-                split_row(x, packed, row, reduction)
-
-    return main
-
-
 def gather_split(rows, table_rows, width, experts):
     """Gather live rows directly into paired signed INT4 planes and counts."""
     if width % 64 or experts < 1 or experts % 4:

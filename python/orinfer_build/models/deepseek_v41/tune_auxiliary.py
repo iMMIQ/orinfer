@@ -142,7 +142,8 @@ def main():
     import torch_npu  # noqa: F401
     from kernels.shared.rows import row_count
     from orinfer_build.models.deepseek_v41.floating import bf16_parts
-    from orinfer_build.models.deepseek_v41.tune import file_hash_bytes, npu_benchmark, read_bank
+    from orinfer_build.tuning.ascend import npu_benchmark
+    from orinfer_build.models.deepseek_v41.tune import file_hash_bytes, read_bank
     from kernels.ascend import attention_prefill, dense, floating, model_ops, moe, vector
     from orinfer_build.compiler.ascend.build import compile_kernel
 
