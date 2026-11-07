@@ -22,7 +22,7 @@ bin/orinfer package install \
 工具前端需要模型 `cache/model.json` 声明 `metadata.chat_format=deepseek_v41`。已有模型可通过包内离线工具生成新目录，保留旧目录用于回滚；同一文件系统上的权重使用硬链接：
 
 ```bash
-uv run --locked python -m tools.model.deepseek_v41.service --frontend-only \
+uv run --locked python -m orinfer_build.models.deepseek_v41.service --frontend-only \
   --model-dir /data/model/current --output /data/model/dsv41-v0.3.3
 
 hf download immiq/DeepSeek-V4.1-Flash-1017-Orinfer-A2-W4A8 \

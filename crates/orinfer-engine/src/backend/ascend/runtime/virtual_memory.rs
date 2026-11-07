@@ -690,13 +690,10 @@ impl MappingOps for Ops<'_> {
     }
 }
 impl Buffer {
-    pub(in crate::backend::ascend) fn demand_mapped(&self) -> bool {
+    pub(crate) fn demand_mapped(&self) -> bool {
         self.offset == 0 && self.allocation.virtual_memory.is_some()
     }
-    pub(in crate::backend::ascend) fn kv_preview(
-        &self,
-        bytes: usize,
-    ) -> Result<Vec<kv::Published>> {
+    pub(crate) fn kv_preview(&self, bytes: usize) -> Result<Vec<kv::Published>> {
         MemoryRange { offset: 0, bytes }.within(self.bytes)?;
         if self.offset != 0 {
             return Err("Shared KV publication requires a root buffer".into());
@@ -714,10 +711,7 @@ impl Buffer {
             MemoryRange { offset: 0, bytes },
         )
     }
-    pub(in crate::backend::ascend) fn kv_writable_bytes(
-        &self,
-        range: MemoryRange,
-    ) -> Result<usize> {
+    pub(crate) fn kv_writable_bytes(&self, range: MemoryRange) -> Result<usize> {
         range.within(self.bytes)?;
         if let Some(memory) = &self.allocation.virtual_memory {
             kv::writable_bytes(
@@ -733,11 +727,7 @@ impl Buffer {
     }
 }
 impl Session {
-    pub(in crate::backend::ascend) fn publish_kv(
-        &self,
-        buffer: &Buffer,
-        bytes: usize,
-    ) -> Result<Vec<kv::Published>> {
+    pub(crate) fn publish_kv(&self, buffer: &Buffer, bytes: usize) -> Result<Vec<kv::Published>> {
         self.require(buffer)?;
         buffer.kv_preview(bytes)?;
         let _current = self.context.enter()?;
@@ -760,10 +750,7 @@ impl Session {
         result
     }
     /// One producer fence and one completion fence cover every private tail copy.
-    pub(in crate::backend::ascend) fn make_kv_writable(
-        &self,
-        writes: &[(Buffer, MemoryRange)],
-    ) -> Result<()> {
+    pub(crate) fn make_kv_writable(&self, writes: &[(Buffer, MemoryRange)]) -> Result<()> {
         let mut needed = false;
         for (buffer, range) in writes {
             self.require(buffer)?;
@@ -812,7 +799,7 @@ impl Session {
         }
         result
     }
-    pub(in crate::backend::ascend) fn restore_kv(
+    pub(crate) fn restore_kv(
         &self,
         buffer: &Buffer,
         pieces: &[crate::backend::snapshot::Piece],
@@ -887,7 +874,7 @@ impl Session {
 }
 
 impl Session {
-    pub(in crate::backend::ascend) fn snapshot_allocation(
+    pub(crate) fn snapshot_allocation(
         &self,
         buffer: &Buffer,
         id: u64,
@@ -908,7 +895,7 @@ impl Session {
 impl Session {
     /// Re-residency preserves the logical page identity. Native allocations and
     /// aliases are implementation details and do not consume new logical IDs.
-    pub(in crate::backend::ascend) fn host_kv(
+    pub(crate) fn host_kv(
         &self,
         bank: &crate::backend::kv::host::HostBank,
     ) -> Result<Rc<SharedAllocation>> {

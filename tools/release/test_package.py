@@ -141,7 +141,7 @@ class ExecutionAssetsTests(unittest.TestCase):
                 (package / "lib/model.so").write_bytes(header)
                 suffix = ".tar.gz" if architecture == "qwen3_5" else ".tar.xz"
                 path = root / (f"{architecture}-{index}" + suffix)
-                from tools.model.package import archive as archive_package
+                from orinfer_build.packaging.package import archive as archive_package
 
                 if suffix == ".tar.gz":
                     with tarfile.open(path, "w:gz") as stream:
@@ -166,7 +166,7 @@ class ExecutionAssetsTests(unittest.TestCase):
                     [a["metadata"]["architecture"] for a in assets],
                     ["qwen3_5", "flash_next", "qwen3_5"],
                 )
-                from tools.model.package import install
+                from orinfer_build.packaging.package import install
 
                 for asset in assets:
                     output = root / asset["metadata"]["file"]

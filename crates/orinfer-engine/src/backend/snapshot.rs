@@ -5,10 +5,10 @@ pub(crate) use orinfer_device::MemoryRange as Range;
 use std::{collections::BTreeMap, rc::Rc};
 #[derive(Clone)]
 pub(crate) struct Piece {
-    pub(super) allocation: Rc<Allocation>,
-    pub(super) name: String,
-    pub(super) range: Range,
-    pub(super) source: usize,
+    pub(crate) allocation: Rc<Allocation>,
+    pub(crate) name: String,
+    pub(crate) range: Range,
+    pub(crate) source: usize,
 }
 #[derive(Clone)]
 pub(crate) struct Snapshot {

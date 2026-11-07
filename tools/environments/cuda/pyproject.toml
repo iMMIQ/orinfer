@@ -17,7 +17,7 @@ package = false
 environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
 
 [tool.uv.sources]
-orinfer-tools = { path = "../../.." }
+orinfer-tools = { path = "../../..", editable = true }
 torch = { url = "https://github.com/iMMIQ/pytorch/releases/download/jetson-v2.14.1-orinfer1-cu126-cp312-sm87/torch-2.14.1%2Borinfer1-cp312-cp312-linux_aarch64.whl" }
 torchvision = { url = "https://github.com/iMMIQ/pytorch/releases/download/jetson-v2.14.1-orinfer1-cu126-cp312-sm87/torchvision-0.29.1%2Borinfer1-cp312-cp312-linux_aarch64.whl" }
 

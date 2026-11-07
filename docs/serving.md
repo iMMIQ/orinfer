@@ -16,7 +16,7 @@
 
 正常加载消费已声明的资产身份，不计算内容 SHA256；`validate-model` 完整校验执行包及 kernel 资产。普通文本、配置的 MTP、视觉及小 batch 计划预加载 CUDA 模块，其余计划在首次使用时加载，并在 CUDA Graph 捕获前完成绑定。延迟加载的形状会在首次执行时承担模块加载开销。
 
-模型准备时封存上述前端文件的 SHA256。需要有意修改时，先确认它们与 checkpoint 的 token 映射和语义一致，再执行 `python3 tools/model/package.py pin-assets MODEL_DIR` 重新封存前端身份；权重保持原样。加载期间应保持模型文件内容稳定。
+模型准备时封存上述前端文件的 SHA256。需要有意修改时，先确认它们与 checkpoint 的 token 映射和语义一致，再执行 `python3 python/orinfer_build/packaging/package.py pin-assets MODEL_DIR` 重新封存前端身份；权重保持原样。加载期间应保持模型文件内容稳定。
 
 先查共享执行包缓存中的 `<digest>`，缺失时再查模型内的 `cache/packages/<digest>`。`ORINFER_EXECUTION_CACHE` 可覆盖共享缓存位置；默认目录是 `$XDG_CACHE_HOME/orinfer/packages`，XDG 采用系统默认值时为 `~/.cache/orinfer/packages`。存在但损坏的包会报错。专用 safetensors 布局沿用 `orin.layout.<tensor>` 标识，执行包 digest 固定原生执行逻辑与 kernel。
 
@@ -84,7 +84,7 @@ DSv4.1 A2 的服务默认与 [DeepInfer SamplingParams](https://github.com/deeps
 
 包含设备采样能力的 A2 执行包在温度 `1e-5..=2`、`top_p=1、top_k=0`、无惩罚及 bias、当前无需 grammar mask 且未请求概率报告时，普通 decode 和 DSpark 验证共享 NPU 采样。其他请求继续使用完整 logits；混合 batch 只读回这些请求的词表。首 token 和 prefix 缓存保留原始模型输出。设备采样以 seed、生成位置和全局 token ID 固定随机身份，同 seed 的具体输出可与旧 CPU 算法不同。未包含该能力的旧执行包继续使用原采样路径。
 
-声明 `coupled_draft` 的执行包在 DSpark Markov head 内复用 target 同一生成位置的 Gumbel 随机数，按顺序推进草稿条件，并复用现有匹配前缀提交与状态恢复。target 保持请求的采样概率律；草稿无需传回完整概率表。温度 0 以及不满足设备采样条件的请求使用贪心草稿。离线通过 `tools.model.deepseek_v41.sampling --couple-draft` 扩展已具备 target 采样能力的计划，所有并发与草稿长度共享一个动态 Markov 算子。
+声明 `coupled_draft` 的执行包在 DSpark Markov head 内复用 target 同一生成位置的 Gumbel 随机数，按顺序推进草稿条件，并复用现有匹配前缀提交与状态恢复。target 保持请求的采样概率律；草稿无需传回完整概率表。温度 0 以及不满足设备采样条件的请求使用贪心草稿。离线通过 `orinfer_build.models.deepseek_v41.sampling --couple-draft` 扩展已具备 target 采样能力的计划，所有并发与草稿长度共享一个动态 Markov 算子。
 
 默认关闭 thinking；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 开启后，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
@@ -307,19 +307,19 @@ A2 的 `--graph off` 关闭主干、DSpark 和视觉的 Graph 捕获及 replay�
 
 A2 在加载 CANN 前自动安装按设备隔离的 HCOMM Graph 回调注册表，支持 CANN HCOMM 9.2.0。单进程多卡可以各自淘汰、重建 Graph，设备内重复的 modelId 分别注册和清理；原生 modelId、AICPU 元数据及通信参数保持原有语义。兼容组件随引擎编译，在线从密封匿名内存加载，无需编译器、额外部署文件或修改系统 CANN。组件在进程内保留至退出；HCOMM 已提前加载或组件 ABI 不匹配时，启动返回明确错误。`validate-hccl` 包含改变输入的 replay，以及各 rank 分别保留 1–4 个 Graph 的 12 轮捕获、执行和回收检查。 引擎及内置组件的 glibc 最低版本为 2.34；离线构建会检查内置组件的 ELF 版本依赖。
 
-A2 执行包可通过 `batch.verification_capacity` 声明自动草稿分配的 decoder 验证行预算，包含各 owner 的 anchor；离线构建和在线加载校验其处于 target 与输出容量范围内。`tools.model.deepseek_v41.publication --verification-capacity N` 复用已有动态计划发布该声明，行数调度继续选择原有计算和通信路径。发布前需完成对应容量下的验证、接受前缀恢复及请求隔离验收。未声明的执行包沿用首次跨 rank 行交换之前的保守预算；没有行交换时使用 target 容量。`--max-speculative-tokens N` 进一步限制 decoder 验证行预算；混合 prefill 行数由公共 packet 容量和调度预算约束，独立 prefill 使用原有容量。状态 journal 汇总本包各 owner 的保存或恢复拷贝，通过同一 stream 提交并统一等待完成。
+A2 执行包可通过 `batch.verification_capacity` 声明自动草稿分配的 decoder 验证行预算，包含各 owner 的 anchor；离线构建和在线加载校验其处于 target 与输出容量范围内。`orinfer_build.models.deepseek_v41.publication --verification-capacity N` 复用已有动态计划发布该声明，行数调度继续选择原有计算和通信路径。发布前需完成对应容量下的验证、接受前缀恢复及请求隔离验收。未声明的执行包沿用首次跨 rank 行交换之前的保守预算；没有行交换时使用 target 容量。`--max-speculative-tokens N` 进一步限制 decoder 验证行预算；混合 prefill 行数由公共 packet 容量和调度预算约束，独立 prefill 使用原有容量。状态 journal 汇总本包各 owner 的保存或恢复拷贝，通过同一 stream 提交并统一等待完成。
 
 A2 自动草稿成本模型复用邻近行数的测量；向上预测限定在已测行数的两倍内。更大的未知 batch 使用现有的有界探索预算校准，收益和亏损仍记入同一模型级账户。这样可以避免将小 packet 的固定启动成本按请求数放大，长期阻止较大 batch 获得实测机会。
 
 A2 草稿 Graph 按实际参与草稿的 decoder 请求估算复用次数，整包 decoder 的 deadline 继续约束准备时间。相同缓存形状的真实命中可为跨请求复用提供有界预测；新形状保留直接执行的预热。Graph 捕获收益使用相同工作量的 replay 测量，其他行数的保守价格用于执行成本预测，本地捕获通过受预算约束的探测建立价格。
 
-A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和 PV 计算体，支持每 rank 8/16/32/64 个 head，保留 FP32 softmax 与 BF16 probability 边界。`tools.model.deepseek_v41.fuse_attention --selected-int8 --min-rows N` 按实测聚合行数拆分已有 target 执行域，小行数保留原算子；草稿与普通 decode 沿用各自的计划选择。主干全行与 decoder 保留窗口分别绑定 work 表，在线只消费离线生成的计划。
+A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和 PV 计算体，支持每 rank 8/16/32/64 个 head，保留 FP32 softmax 与 BF16 probability 边界。`orinfer_build.models.deepseek_v41.fuse_attention --selected-int8 --min-rows N` 按实测聚合行数拆分已有 target 执行域，小行数保留原算子；草稿与普通 decode 沿用各自的计划选择。主干全行与 decoder 保留窗口分别绑定 work 表，在线只消费离线生成的计划。
 
-A2 专家 GMM 可通过 `tools.model.deepseek_v41.expert_fusion` 离线选择已有 target 行数区间，默认 `32..511`。gather 将完整 A8 无损拆成两行 signed INT4，复用发布的 NZ W4 bank 与原生 grouped matmul；GMM 在 FP16 部分积舍入前应用原权重 scale，后处理融合部分积合并、FP32 assist/token scale、BF16 SwiGLU 和 FP32 行量化。`--min-rows`、`--max-rows` 必须覆盖完整的已有 packet 区间；其他 packet、请求状态和权重文件沿用原契约。该计划使用显式 `w4_a4` 指令，需要支持它的引擎。执行包单独发布单位 token scale 常量及临时 workspace，权重包保持原样。
+A2 专家 GMM 可通过 `orinfer_build.models.deepseek_v41.expert_fusion` 离线选择已有 target 行数区间，默认 `32..511`。gather 将完整 A8 无损拆成两行 signed INT4，复用发布的 NZ W4 bank 与原生 grouped matmul；GMM 在 FP16 部分积舍入前应用原权重 scale，后处理融合部分积合并、FP32 assist/token scale、BF16 SwiGLU 和 FP32 行量化。`--min-rows`、`--max-rows` 必须覆盖完整的已有 packet 区间；其他 packet、请求状态和权重文件沿用原契约。该计划使用显式 `w4_a4` 指令，需要支持它的引擎。执行包单独发布单位 token scale 常量及临时 workspace，权重包保持原样。
 
-`tools.model.deepseek_v41.fuse_ffn_collectives --plan PLAN --output OUTPUT --model-dir MODEL` 合并 sequence-parallel FFN 的四路 AllGather。行量化与路由数据打包共用原 FP32/A8 算术，收集后只拆分 scale 和路由元数据；共享专家投影与专家 gather 通过原工厂的物理行 stride 直接读取激活。构建器检查别名、后续读者和覆盖边界，保留专家行倍率及原有行数选择。新增布局和既有几何按算子族统一重建至同一源码身份；执行资产单独发布，权重和请求状态保持原契约。
+`orinfer_build.models.deepseek_v41.fuse_ffn_collectives --plan PLAN --output OUTPUT --model-dir MODEL` 合并 sequence-parallel FFN 的四路 AllGather。行量化与路由数据打包共用原 FP32/A8 算术，收集后只拆分 scale 和路由元数据；共享专家投影与专家 gather 通过原工厂的物理行 stride 直接读取激活。构建器检查别名、后续读者和覆盖边界，保留专家行倍率及原有行数选择。新增布局和既有几何按算子族统一重建至同一源码身份；执行资产单独发布，权重和请求状态保持原契约。
 
-A2 mHC 可通过 `tools.model.deepseek_v41.fuse_hc --plan PLAN --output OUTPUT --model-dir MODEL` 离线融合八分片归一化与 Sinkhorn，保留 FP32 计算顺序及真实行表达式，支持 sequence-parallel 分片和 decoder 后缀。构建器复用同一个归一化宏与 Sinkhorn 计算体，每种物理容量发布一个动态入口；`--capacity-tiles FILE` 读取以容量为键的离线 tile 选择，例如 `{"256":8,"2048":32}`。该容量内的各实际 batch 和长度共享同一配置。`tools.operators.ascend.validate_hc_fused` 对已发布参考检查精确数值、尾部及变输入 Graph，`--benchmark` 复用公共 Graph 测量工具。执行资产单独发布，权重和请求状态布局沿用原契约。
+A2 mHC 可通过 `orinfer_build.models.deepseek_v41.fuse_hc --plan PLAN --output OUTPUT --model-dir MODEL` 离线融合八分片归一化与 Sinkhorn，保留 FP32 计算顺序及真实行表达式，支持 sequence-parallel 分片和 decoder 后缀。构建器复用同一个归一化宏与 Sinkhorn 计算体，每种物理容量发布一个动态入口；`--capacity-tiles FILE` 读取以容量为键的离线 tile 选择，例如 `{"256":8,"2048":32}`。该容量内的各实际 batch 和长度共享同一配置。`tests.ascend.operators.validate_hc_fused` 对已发布参考检查精确数值、尾部及变输入 Graph，`--benchmark` 复用公共 Graph 测量工具。执行资产单独发布，权重和请求状态布局沿用原契约。
 
 HTTP 在加载模型前绑定监听地址，端口被占用时立即退出；模型和预热完成后开始处理 HTTP。就绪探针使用 `/health` 的 HTTP 200，TCP 连通只表示监听地址已绑定。A2 全量常驻 CPU 表的启动可能需要数分钟，部署时为启动探针预留足够时间，例如 600 秒。正常退出及启动失败会清理本服务创建的 Unix socket；已有 socket 绑定失败时保留原文件。
 
@@ -403,7 +403,7 @@ UUID 在当前模型服务内解析，使用每份图片独立的随机 UUID；�
 新构建的 Qwen3.5 执行包按上下文声明图片总特征容量，单图 patch 容量和文本 packet 行数保持原有契约。特征 bank 启动时仅分配一行，每个请求按实际视觉 token 数租用；提高上限不会预先分配完整 bank。已有 Qwen3.5／Flash Next 执行包可离线升级总容量：
 
 ```bash
-bash tools/operators/run.sh tools/model/vision_capacity.py artifacts/vision-capacity-build \
+bash tools/environments/cuda/run.sh python/orinfer_build/packaging/vision_capacity.py artifacts/vision-capacity-build \
   --model /path/to/model --model-output /path/to/upgraded-model
 ```
 

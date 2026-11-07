@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 import statistics
 
-from tools.build.files import atomic_json, file_hash
+from orinfer_build.common.files import atomic_json, file_hash
 
 
 def summarize(inputs, report, maximum_regression=0.10, minimum_samples=5):

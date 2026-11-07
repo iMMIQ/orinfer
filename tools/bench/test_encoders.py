@@ -3,7 +3,7 @@
 import copy
 import unittest
 
-from encoders import compare, outputs, prompt_tokens, request
+from tools.bench.encoders import compare, outputs, prompt_tokens, request
 
 
 class EncoderBenchTests(unittest.TestCase):

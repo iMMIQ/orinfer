@@ -295,7 +295,7 @@ dependencies = [
 requires-dist = [
     { name = "cuda-python", specifier = ">=12.6.2.post1,<13" },
     { name = "nvidia-nccl-cu12", specifier = ">=2.27.7" },
-    { name = "orinfer-tools", virtual = "../../../" },
+    { name = "orinfer-tools", editable = "../../../" },
     { name = "tilelang", specifier = ">=0.1.15" },
     { name = "torch", url = "https://github.com/iMMIQ/pytorch/releases/download/jetson-v2.14.1-orinfer1-cu126-cp312-sm87/torch-2.14.1%2Borinfer1-cp312-cp312-linux_aarch64.whl" },
     { name = "torchvision", url = "https://github.com/iMMIQ/pytorch/releases/download/jetson-v2.14.1-orinfer1-cu126-cp312-sm87/torchvision-0.29.1%2Borinfer1-cp312-cp312-linux_aarch64.whl" },
@@ -305,7 +305,7 @@ requires-dist = [
 [[package]]
 name = "orinfer-tools"
 version = "0.3.3"
-source = { virtual = "../../../" }
+source = { editable = "../../../" }
 dependencies = [
     { name = "numpy" },
     { name = "pillow" },

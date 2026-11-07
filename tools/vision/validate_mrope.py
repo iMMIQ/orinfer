@@ -3,9 +3,9 @@
 import argparse
 from pathlib import Path
 import torch
-from kernels.model import qsa, flash_next
-from kernels.vision.features import overlay
-from tools.operators.common import configure, error, write_json
+from kernels.cuda.model import qsa, flash_next
+from kernels.cuda.vision.features import overlay
+from orinfer_build.compiler.cuda.common import configure, error, write_json
 
 
 def rotated(x, weight, coords):

@@ -4,7 +4,7 @@ from functools import lru_cache
 import os
 from pathlib import Path
 
-from tools.build.files import file_hash
+from orinfer_build.common.files import file_hash
 
 
 ROOT = Path(__file__).resolve().parents[1]

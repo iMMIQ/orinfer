@@ -94,7 +94,7 @@ pub fn resolve_manifest(path: &Path) -> Result<PathBuf> {
         path.to_owned()
     };
     manifest.canonicalize().map_err(|e| format!(
-        "{}: {e}; build a native model with tools/model/qwen35/build.py or tools/model/flash_next/build.py",
+        "{}: {e}; build a native model with python/orinfer_build/models/qwen35/build.py or python/orinfer_build/models/flash_next/build.py",
         manifest.display()))
 }
 
@@ -119,8 +119,8 @@ pub fn inspect_execution_library(path: &Path) -> Result<orinfer_model_sdk::abi::
 pub fn validate_model(path: &Path) -> Result<ValidationReport> {
     let descriptor = resolve_manifest(path)?;
     let raw = read(&descriptor)?;
-    if crate::backend::ascend::model::provider::Runtime::recognizes(&raw) {
-        return crate::backend::ascend::model::validation::validate(&descriptor);
+    if crate::models::deepseek_v41::provider::Runtime::recognizes(&raw) {
+        return crate::models::deepseek_v41::validation::validate(&descriptor);
     }
     let start = Instant::now();
     let prepared = crate::loader::load(path, true)?;
@@ -195,7 +195,7 @@ pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
 /// Thread-affine resident model. All CUDA resources remain on the creating thread.
 enum Implementation {
     Cuda(Box<crate::runtime::ModelRuntime>),
-    Ascend(Box<crate::backend::ascend::model::provider::Runtime>),
+    Ascend(Box<crate::models::deepseek_v41::provider::Runtime>),
 }
 pub struct Model(Implementation);
 mod request;
@@ -416,8 +416,8 @@ impl Model {
     pub fn load_with_options(path: &Path, options: LoadOptions) -> Result<Self> {
         let descriptor = resolve_manifest(path)?;
         let raw: serde_json::Value = read(&descriptor)?;
-        if crate::backend::ascend::model::provider::Runtime::recognizes(&raw) {
-            crate::backend::ascend::model::provider::Runtime::load(path, options)
+        if crate::models::deepseek_v41::provider::Runtime::recognizes(&raw) {
+            crate::models::deepseek_v41::provider::Runtime::load(path, options)
                 .map(|inner| Self(Implementation::Ascend(Box::new(inner))))
         } else {
             crate::runtime::ModelRuntime::load_with_options(path, options)

@@ -1,8 +1,8 @@
 use std::{env, path::PathBuf};
 
 fn main() {
-    println!("cargo:rerun-if-changed=../../tools/operators/ascend/hccl_graph_registry.cc");
-    println!("cargo:rerun-if-changed=../../tools/operators/ascend/hccl_graph_registry_abi.h");
+    println!("cargo:rerun-if-changed=native/ascend/hccl_graph_registry.cc");
+    println!("cargo:rerun-if-changed=native/ascend/hccl_graph_registry_abi.h");
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("liborinfer_hccl_registry.so");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         let compiler = cc::Build::new().cpp(true).get_compiler();
@@ -22,7 +22,7 @@ fn main() {
                 "-Wall",
                 "-Wextra",
                 "-Werror",
-                "../../tools/operators/ascend/hccl_graph_registry.cc",
+                "native/ascend/hccl_graph_registry.cc",
                 "-ldl",
                 "-lpthread",
                 "-o",

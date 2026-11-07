@@ -36,7 +36,7 @@ Flash Next 的 HC 无损缓存指数和 QSA radix shift 通过已有 ABI 的整�
 
 Qwen MTP 执行包可声明 `mtp.packet_table`，将验证、提交、草稿、接受后补算和草稿输出中的请求私有操作数放入固定地址表。包装保持原 kernel 的计算体、grid、标量与共享 workspace 字节视图；Rust 每轮更新当前请求地址，完整 packet Graph 按执行阶段和实际执行形状跨请求复用。提交的缓存行数按请求数计，命中仍要求实际 kernel、grid 和标量一致；验证与补算保留各段实际长度、动态参数和混合角色边界。单请求沿用相同 packet；未声明该契约的包继续使用原有执行方式。启用该能力需重新构建匹配的模型数据与执行包，并验证改变输入、替换请求和 Graph replay 后的全部私有状态。
 
-原生 Qwen 构建入口自动生成该地址表。已有 dense Qwen 执行包采用 sequential prefill、dense decode GDN 且尚无地址表时，可通过 `tools/model/qwen35/rebuild_mtp.py --model 原模型目录 --target 新模型目录` 增量构建，保留原权重与矩阵实现。该入口由 `bash tools/operators/run.sh tools/model/qwen35/rebuild_mtp.py 输出目录` 调用，并在末尾传入上述模型参数；发布前验证模型计划与实际 host ABI。
+原生 Qwen 构建入口自动生成该地址表。已有 dense Qwen 执行包采用 sequential prefill、dense decode GDN 且尚无地址表时，可通过 `python/orinfer_build/models/qwen35/rebuild_mtp.py --model 原模型目录 --target 新模型目录` 增量构建，保留原权重与矩阵实现。该入口由 `bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen35/rebuild_mtp.py 输出目录` 调用，并在末尾传入上述模型参数；发布前验证模型计划与实际 host ABI。
 
 地址表的列序、kernel 映射及标量映射作为共享的不可变描述保存，逐轮复制 MTP 策略时只复制其引用。实际请求地址每轮独立刷新，JSON 格式和 C ABI 保持不变。
 
@@ -90,23 +90,23 @@ Session 缓存最多 64 个 pinned 缓冲，按实际物理容量计入预算。
 orinfer validate-ascend --device 0
 ```
 
-此命令有界验证异步上传/读回、W4A8 数值、改变输入后的 executor 复用和 Graph 重放；包含单行、16 行及空专家分组。测试显存预算为 512 MiB，workspace 额外检查至少保留 256 MiB 空闲 HBM。输出的 wall time 包含提交和完成等待，只作诊断，不代表模型性能。已在 910B3 上验证；完整模型、CSA2、prefix 恢复及通信与模型的集成仍需后续接入及验收。
+此命令有界验证异步上传/读回、W4A8 数值、改变输入后的 executor 复用和 Graph 重放；包含单行、16 行及空专家分组。测试显存预算为 512 MiB，workspace 额外检查至少保留 256 MiB 空闲 HBM。输出的 wall time 包含提交和完成等待，只作诊断，不代表模型性能。已在 910B3 上验证。完整 DSv4.1 模型、prefix 恢复和通信集成使用后文的原生服务入口，诊断结果与完整请求性能分别报告。
 
 新增 A2 文本主干算子位于 `tools/operators/ascend`，由 TileLang-Ascend 离线编译。它们覆盖 RMSNorm、动态 A8、限幅 SwiGLU、W8/BF16 与 FP32 敏感投影、mHC、复数 RoPE、Engram 旋转与门控、MoE 路由和还原、KV 行搬运、稀疏索引与 attention、C2 池化及 32 行 FP32 ring 提交。索引 TopK 采用分块选择与分层归并，保留 FP32 分数；K 为 512 或 2048。FP32-sensitive 投影和稀疏 attention 当前采用 Vector 正确性基线。
 
-local TopK 的空块使用交错的 `(-inf, -1)` 候选对。`tools.operators.ascend.validate_topk_empty --baseline BASE_PLAN --plan PLAN --output REPORT` 对照发布库的完整候选 buffer，覆盖空／短／完整前缀、并列分数、行尾及改变分数和长度后的 Graph replay；报告另含短、长上下文的算子耗时。
+local TopK 的空块使用交错的 `(-inf, -1)` 候选对。`tests.ascend.operators.validate_topk_empty --baseline BASE_PLAN --plan PLAN --output REPORT` 对照发布库的完整候选 buffer，覆盖空／短／完整前缀、并列分数、行尾及改变分数和长度后的 Graph replay；报告另含短、长上下文的算子耗时。
 
-`tools.model.deepseek_v41.fuse_topk --plan PLAN --output OUTPUT` 将已有 32／64 个候选块的三层四路归并收敛为一次 query 内的 UB 滚动归并，默认用于 `min_rows >= 512` 的 packet family。它与独立归并共享计算组件，保留逐层输入顺序和 FP32 候选对。每行从现有分片长度列读取有效块数，跳过整棵空子树；生产者必须是已将空候选规范化为 `(-inf,-1)` 的融合索引器。构建器验证生产者、物理分片和中间结果的存活范围，省去两级 GM 中间结果的读写，不增加 owner 私有状态。`tools.operators.ascend.validate_topk_tree --baseline BASE_PLAN --plan PLAN --output REPORT` 对照已发布的三次归并，覆盖并列分数、空／完整上下文、非对齐 query 行、未使用尾部及改变输入和长度后的 Graph replay。
+`orinfer_build.models.deepseek_v41.fuse_topk --plan PLAN --output OUTPUT` 将已有 32／64 个候选块的三层四路归并收敛为一次 query 内的 UB 滚动归并，默认用于 `min_rows >= 512` 的 packet family。它与独立归并共享计算组件，保留逐层输入顺序和 FP32 候选对。每行从现有分片长度列读取有效块数，跳过整棵空子树；生产者必须是已将空候选规范化为 `(-inf,-1)` 的融合索引器。构建器验证生产者、物理分片和中间结果的存活范围，省去两级 GM 中间结果的读写，不增加 owner 私有状态。`tests.ascend.operators.validate_topk_tree --baseline BASE_PLAN --plan PLAN --output REPORT` 对照已发布的三次归并，覆盖并列分数、空／完整上下文、非对齐 query 行、未使用尾部及改变输入和长度后的 Graph replay。
 
-`tools.model.deepseek_v41.tune_attention --plan PLAN --output OUTPUT --compile-only` 为已有 TP8 H64、256 行查询容量的融合 selected attention 离线构建 1／4／8-head tile，直接保留输入包的当前配置作为基线。`--model-dir MODEL_DIR` 为计划校验提供已准备的权重布局。去掉 `--compile-only` 后，在设备上对照已发布库，检查完整融合算子的 BF16 概率、输出、尾部及改变输入后的 Graph replay；测量同时覆盖随机选中索引、连续 SWA 窗口及环形边界，汇总多个实际 query 行数，为大行数 family 选择一个统一 tile。共享 softmax 组件保留逐行 FP32 归约、sink、标量倒数乘法及归一化后的 BF16 边界；sink 按 tile 连续读取。SWA、长 KV 首次读取和长 KV 复用使用相同模板及现有 owner ABI。数值不匹配的候选在全部几何中剔除。选择要求几何平均耗时至少减少 2%，并保持逐采样点至多 10% 回退；收益不足时保留当前基线。缓存固定算子、编译器、设备、测量模式和工具身份，最终 `OUTPUT/package/model.json` 仅引用被选择的库。完整请求和 Mini 性能另行验收。
+`orinfer_build.models.deepseek_v41.tune_attention --plan PLAN --output OUTPUT --compile-only` 为已有 TP8 H64、256 行查询容量的融合 selected attention 离线构建 1／4／8-head tile，直接保留输入包的当前配置作为基线。`--model-dir MODEL_DIR` 为计划校验提供已准备的权重布局。去掉 `--compile-only` 后，在设备上对照已发布库，检查完整融合算子的 BF16 概率、输出、尾部及改变输入后的 Graph replay；测量同时覆盖随机选中索引、连续 SWA 窗口及环形边界，汇总多个实际 query 行数，为大行数 family 选择一个统一 tile。共享 softmax 组件保留逐行 FP32 归约、sink、标量倒数乘法及归一化后的 BF16 边界；sink 按 tile 连续读取。SWA、长 KV 首次读取和长 KV 复用使用相同模板及现有 owner ABI。数值不匹配的候选在全部几何中剔除。选择要求几何平均耗时至少减少 2%，并保持逐采样点至多 10% 回退；收益不足时保留当前基线。缓存固定算子、编译器、设备、测量模式和工具身份，最终 `OUTPUT/package/model.json` 仅引用被选择的库。完整请求和 Mini 性能另行验收。
 
-已有原生计划可使用 `tools.model.deepseek_v41.build --rebuild-plan PLAN --rebuild-op topk.local` 只重建相关算子，输出同目录的 `PLAN-selected.json`。`--rebuild-op` 可重复提供，未出现在计划中的算子名会报错；未选中的库和权重保持原引用。重建复用公共编译任务及内容缓存，最终部署仍需发布新的执行包。
+已有原生计划可使用 `orinfer_build.models.deepseek_v41.build --rebuild-plan PLAN --rebuild-op topk.local` 只重建相关算子，输出同目录的 `PLAN-selected.json`。`--rebuild-op` 可重复提供，未出现在计划中的算子名会报错；未选中的库和权重保持原引用。重建复用公共编译任务及内容缓存，最终部署仍需发布新的执行包。
 
-当前 A2 编译和运行统一支持 CANN 9.2。离线镜像面向 aarch64，包含 Python 3.12、PyTorch、torch_npu 和固定版本与 SHA256 的 TileLang-Ascend 前端；wheel 文件名中的 `cann910` 是上游发布名称。`run.sh` 挂载本机 `/usr/local/Ascend/cann-9.2.0` 并加载其环境，实际编译器与运行库均来自该目录，可通过 `ORINFER_ASCEND_CANN_ROOT` 指定另一份 CANN 9.2 安装。编译记录包含安装版本及 Bisheng 身份；发布要求全部引用算子具有同一 CANN 9.2 工具链身份。已有执行计划通过 `tools.model.deepseek_v41.build --rebuild-plan PLAN` 全量重建，保持权重和执行边界，合并同契约的编译任务，再发布引用到的库。
+当前 A2 编译和运行统一支持 CANN 9.2。离线镜像面向 aarch64，包含 Python 3.12、PyTorch、torch_npu 和固定版本与 SHA256 的 TileLang-Ascend 前端；wheel 文件名中的 `cann910` 是上游发布名称。`run.sh` 挂载本机 `/usr/local/Ascend/cann-9.2.0` 并加载其环境，实际编译器与运行库均来自该目录，可通过 `ORINFER_ASCEND_CANN_ROOT` 指定另一份 CANN 9.2 安装。编译记录包含安装版本及 Bisheng 身份；发布要求全部引用算子具有同一 CANN 9.2 工具链身份。已有执行计划通过 `orinfer_build.models.deepseek_v41.build --rebuild-plan PLAN` 全量重建，保持权重和执行边界，合并同契约的编译任务，再发布引用到的库。
 
-DSpark Markov 的步号通过只读 INT32 表绑定，argmax、confidence 和 rank reduce 各复用一个动态算子。5／8／16 长度别名只截取公共 Markov 调用序列。专家融合使用实际专家路由倍率，`tools.model.deepseek_v41.expert_fusion --role target|draft` 共用 gather、A4 GMM 和激活边界的构建流程；所有者行数、专家数和路由倍率共同确定几何。
+DSpark Markov 的步号通过只读 INT32 表绑定，argmax、confidence 和 rank reduce 各复用一个动态算子。5／8／16 长度别名只截取公共 Markov 调用序列。专家融合使用实际专家路由倍率，`orinfer_build.models.deepseek_v41.expert_fusion --role target|draft` 共用 gather、A4 GMM 和激活边界的构建流程；所有者行数、专家数和路由倍率共同确定几何。
 
-已有双 INT4 平面专家程序的执行包可用 `tools.model.deepseek_v41.expert_fusion --reuse-published --plan PLAN --output OUT --min-rows 128 --max-rows 2048 --model-dir MODEL` 将完整选中区间复用到相同几何的融合程序。工具逐层匹配权重、路由计数、物理容量、输入输出绑定和 workspace，保留 decoder 行边界及其他角色；缺少匹配程序或仍有中间结果读者时拒绝导出。该操作复用已有动态 kernel 和单份 W4 bank，不编译新算子，也不改写权重；A8 分解、FP16 部分积重组及两处 BF16 舍入沿用原融合算术。实际启用区间由完整请求测量选择。
+已有双 INT4 平面专家程序的执行包可用 `orinfer_build.models.deepseek_v41.expert_fusion --reuse-published --plan PLAN --output OUT --min-rows 128 --max-rows 2048 --model-dir MODEL` 将完整选中区间复用到相同几何的融合程序。工具逐层匹配权重、路由计数、物理容量、输入输出绑定和 workspace，保留 decoder 行边界及其他角色；缺少匹配程序或仍有中间结果读者时拒绝导出。该操作复用已有动态 kernel 和单份 W4 bank，不编译新算子，也不改写权重；A8 分解、FP16 部分积重组及两处 BF16 舍入沿用原融合算术。实际启用区间由完整请求测量选择。
 
 设置 `ORINFER_A2_DSPARK_POLICY_TRACE=1` 后，A2 模型在标准错误输出普通执行的 direct／replay 状态、耗时及 DSpark 决策的样本数、行预算、请求深度和成本曲线。该开关在模型创建时读取，默认关闭。记录可用于区分样本不足、行预算、短尾和成本评分引起的关闭；计时诊断需计入日志开销。
 
@@ -120,21 +120,21 @@ A2 DSpark 复用公共投机控制器的条件接受率、吞吐／延迟收益�
 
 ```bash
 ORINFER_ASCEND_BASE_IMAGE='your-torch-npu-frontend:py312' \
-  bash tools/operators/ascend/run.sh build
+  bash tools/environments/ascend/run.sh build
 # 先在不映射 NPU 的容器编译，再在相同 cache 中执行板上验收：
-bash tools/operators/ascend/run.sh --without-devices python3 -m tools.operators.ascend.validate \
+bash tools/environments/ascend/run.sh --without-devices python3 -m tests.ascend.operators.validate \
   --compile-only --output artifacts/ascend-runtime/attention-cpu \
   --rows 16 --attention-selected 128 --only sparse_attention
-bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate \
+bash tools/environments/ascend/run.sh python3 -m tests.ascend.operators.validate \
   --output artifacts/ascend-runtime/attention-cpu \
   --rows 16 --attention-selected 128 --only sparse_attention
-bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate \
+bash tools/environments/ascend/run.sh python3 -m tests.ascend.operators.validate \
   --output artifacts/ascend-runtime/aot --rows 16 --width 5120
 # BF16 尾数覆盖与动态 A8 舍入边界：
-bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate \
+bash tools/environments/ascend/run.sh python3 -m tests.ascend.operators.validate \
   --output artifacts/ascend-runtime/a8-grid --rows 128 --width 512 --quant-grid --only quantize
 # 专家行重排、空路由与异常索引的精确检查：
-bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate \
+bash tools/environments/ascend/run.sh python3 -m tests.ascend.operators.validate \
   --output artifacts/ascend-runtime/route --rows 3 --only regroup
 flock -w 5 artifacts/gpu-experiment.lock orinfer validate-ascend-kernels \
   --device 7 --fixtures artifacts/ascend-runtime/aot/fixtures.json
@@ -160,7 +160,7 @@ DSv4.1 Engram 的 CPU 路径使用离线导出的 tokenizer 压缩映射、确�
 在离线工具环境安装 NumPy 和模型 tokenizer 对应的 `tokenizers` 后导出元数据；导出器验证 compressed vocabulary 与桶数，元数据固定配置和 tokenizer 的 SHA256：
 
 ```bash
-python -m tools.model.deepseek_v41.export_engram \
+python -m orinfer_build.models.deepseek_v41.export_engram \
   --model /path/to/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
   --output artifacts/engram-metadata.json
 orinfer validate-engram --metadata artifacts/engram-metadata.json \
@@ -184,15 +184,15 @@ CPU 验收读取真实表的小批量行，检查所有 token 分块边界的 ha
 `ORINFER_ASCEND_IMAGE` 可选择编译镜像，`ORINFER_ASCEND_DRIVER_ROOT` 可选择主机驱动目录。编译 runner 将主机 `/data/models` 只读挂载到相同路径；其他模型根目录通过 `ORINFER_ASCEND_MODEL_ROOT` 指定绝对路径。在 CANN 和离线编译镜像准备完成后，先导出上述 Engram 元数据，再构建实验计划和固定 token 输入：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.build \
+bash tools/environments/ascend/run.sh --without-devices python3 -m orinfer_build.models.deepseek_v41.build \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
   --engram-metadata artifacts/engram-metadata.json \
   --output artifacts/ascend-model --compile-workers 8
-python -m tools.model.deepseek_v41.prepare \
+python -m orinfer_build.models.deepseek_v41.prepare \
   --plan artifacts/ascend-model/model.json \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
   --output artifacts/ascend-model/model-prepared.json --workers 16
-bash tools/operators/ascend/run.sh python3 -m tools.bench.ascend_single \
+bash tools/environments/ascend/run.sh python3 -m tools.bench.ascend_single \
   --prepare artifacts/ascend-inputs.json \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
 HCCL_DETERMINISTIC=true HCCL_OP_EXPANSION_MODE=AIV HCCL_NPU_SOCKET_PORT_RANGE=auto \
@@ -205,9 +205,9 @@ HCCL_DETERMINISTIC=true HCCL_OP_EXPANSION_MODE=AIV HCCL_NPU_SOCKET_PORT_RANGE=au
 大块 prefill 在构建时增加 `--strategy optimized --prefill-capacity 2048`。整数/BF16 投影可从同一模板离线测量多个真实长度，复用公共候选构建、Graph 测量及汇总选择，只替换每种几何的一个动态 fallback；decode AOT 保留原绑定：
 
 ```bash
-bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate_rows \
+bash tools/environments/ascend/run.sh python3 -m tests.ascend.operators.validate_rows \
   --output artifacts/ascend-row-validation
-bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
+bash tools/environments/ascend/run.sh python3 -m orinfer_build.models.deepseek_v41.tune \
   --plan artifacts/ascend-model/model.json \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
   --output artifacts/ascend-model/tuning --rows 17 128 512 2048
@@ -217,21 +217,21 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.tune \
 
 投影调优也支持最终发布目录中的 `prepared_tensor`：按索引读取所选 safetensors 张量，校验物理 dtype、shape 和字节范围，列 scale 可作为连续向量读取。每个投影测量 Graph 包含 16 次独立调用，耗时按单次调用归一，摊薄主机 replay 与计时事件的开销；缓存身份包含调用次数。其他使用共享测量函数的有状态算子保持原调用次数。
 
-`tools.model.deepseek_v41.floating_head` 将已发布的 FP32 target／DSpark 输出头离线转换为三个精确 BF16 残差分量，复用 `floating.partials` 与 FP32 八段归约。一个动态 tile 配置覆盖普通 decode、验证与 draft 的实际输出行数；库描述保留各 family 的物理容量。宽列 tile 支持 32 列对齐的词表尾部，partial workspace 按 tile 补齐，归约只写真实词表列。权重值无损，MMA 的 FP32 累加与旧 Vector 求和可能存在微小舍入差异，发布前比较固定历史概率和完整请求性能。
+`orinfer_build.models.deepseek_v41.floating_head` 将已发布的 FP32 target／DSpark 输出头离线转换为三个精确 BF16 残差分量，复用 `floating.partials` 与 FP32 八段归约。一个动态 tile 配置覆盖普通 decode、验证与 draft 的实际输出行数；库描述保留各 family 的物理容量。宽列 tile 支持 32 列对齐的词表尾部，partial workspace 按 tile 补齐，归约只写真实词表列。权重值无损，MMA 的 FP32 累加与旧 Vector 求和可能存在微小舍入差异，发布前比较固定历史概率和完整请求性能。
 
 同一入口的 `--compact-zero-planes` 会完整检查已发布输出头的两个 BF16 残差分量；确认全零且主分量有限时，只保留主 BF16 分量，并复用原投影 tile、BF16 激活及 FP32 归约边界。非零残差保持三分量。检查限定在离线预处理，在线直接加载物理权重。该模式与 `--markov-bias` 互斥，仅重写受影响的语义分片，其余分片复用硬链接。
 
 `--head-residual-parts 2` 从已发布的三分量输出头保留前两个 BF16 分量，并在权重元数据中记录 `bf16-residual2` 和非精确舍入。target、draft 及行数选择表中的全部消费者共用转换后的 bank 和原动态计算体，保留八段 FP32 累加与归约边界；同一浮点工厂的其他引用保持原参数重编译。每个完整输出头节省约 158 MiB／卡，target 与 draft 合计约 316 MiB／卡。该离线候选须用固定历史的完整词表概率、teacher-forced NLL 和真实请求性能验收后选用，原发布目录保持独立。
 
-`tools.model.deepseek_v41.expert_precision` 为显式选择的 target 层导出 INT8 up bank。`--prepare --official OFFICIAL --integer-source ASCEND --prepared DIR --layers 29` 按专家有界读取官方 FP4，沿原 FFN norm fold 和 checkpoint block-32 旋转基重建 w1，再按 BF16 通道 scale 选择 INT8 码；w3 保留 Ascend checkpoint 的原 INT4 码与 AWQ 输入基，存入同一 INT8 bank，其 scale 也舍入为 BF16。该方案每层约增加 540 MiB／卡的 up 权重，scale 字节变化另计；w2 保持原表示。`--source RELEASE --source-execution CACHE --output NEW_RELEASE --execution-output NEW_CACHE` 沿用层分片及四 GiB 上限，其余分片复用硬链接。普通、混合及验证 packet 复用原 A8 gather/GMM/SwiGLU 子图，原生 `w8` 指令共用现有 grouped-matmul 执行器及动态行缓存，使用匹配的新引擎加载。原发布权重和精度策略保持独立；局部激活误差、完整模型 NLL 与端到端速度分别记录。
+`orinfer_build.models.deepseek_v41.expert_precision` 为显式选择的 target 层导出 INT8 up bank。`--prepare --official OFFICIAL --integer-source ASCEND --prepared DIR --layers 29` 按专家有界读取官方 FP4，沿原 FFN norm fold 和 checkpoint block-32 旋转基重建 w1，再按 BF16 通道 scale 选择 INT8 码；w3 保留 Ascend checkpoint 的原 INT4 码与 AWQ 输入基，存入同一 INT8 bank，其 scale 也舍入为 BF16。该方案每层约增加 540 MiB／卡的 up 权重，scale 字节变化另计；w2 保持原表示。`--source RELEASE --source-execution CACHE --output NEW_RELEASE --execution-output NEW_CACHE` 沿用层分片及四 GiB 上限，其余分片复用硬链接。普通、混合及验证 packet 复用原 A8 gather/GMM/SwiGLU 子图，原生 `w8` 指令共用现有 grouped-matmul 执行器及动态行缓存，使用匹配的新引擎加载。原发布权重和精度策略保持独立；局部激活误差、完整模型 NLL 与端到端速度分别记录。
 
 `tune_auxiliary --head-only --plan PLAN --model-dir RELEASE --output REPORT --rows 1 6 32 33 80 128 129 160 192 544 --calls-per-replay 16` 以实际发布的输出头库为冻结基线，读取已发布 safetensors bank，比较同源 M tile 与流水配置。候选保持输出列 tile、BF16 分量、八段 FP32 partial 布局和原归约库；词表末块只比较真实列，另查输出行尾部和改变输入后的 Graph replay。按实测生成共享 fallback 与大行数区间，默认每个测量点相对基线最多回退 10%。同一选择槽内的候选具有一致的源码、编译器、设备及物理 ABI，浮点 partial 只允许调整 M tile、流水与 grid 上限。冻结参考和新候选分别记录编译身份。调优只更新执行计划和库，权重保持原表示；输入采用尚无输出头行数选择的冻结计划，在独立构建目录运行，选定后发布被引用的资产并验收真实请求。
 
 该转换替换原 FP32 bank，新增的分量不与原 bank 同时常驻。TP8 target／draft 两个完整输出头均采用三分量时，每卡合计增加约 316 MiB；变更分片重新写出，其余分片复用硬链接。源与输出须位于同一文件系统及容器挂载点；可先在宿主机将发布目录硬链接到工作区，再在离线环境执行：
 
 ```bash
-ORINFER_ASCEND_MODEL_ROOT=/data bash tools/operators/ascend/run.sh --without-devices \
-  python3 -m tools.model.deepseek_v41.floating_head \
+ORINFER_ASCEND_MODEL_ROOT=/data bash tools/environments/ascend/run.sh --without-devices \
+  python3 -m orinfer_build.models.deepseek_v41.floating_head \
   --source artifacts/models/DSV41_RELEASE \
   --source-execution artifacts/execution-packages/DSV41_RELEASE \
   --output artifacts/models/DSV41_HEAD_CUBE \
@@ -243,17 +243,17 @@ ORINFER_ASCEND_MODEL_ROOT=/data bash tools/operators/ascend/run.sh --without-dev
 
 同一转换器的 `--markov-bias` 按 checkpoint 的 `dspark_markov_rank` 选择 DSpark Markov 修正投影，只有 FP32 bank 中的每个值均能精确还原为 BF16 时才导出单份 BF16 bank，否则报错。该模式复用同一个 `floating.partials` 计算体与 FP32 八段归约，保留 FP32 bias 输出；其他输出头保持原布局。当前 256 维 Markov bank 的权重字节数减半，普通及非对齐 owner 数使用同一个动态 tile。离线测量选择 `--tile-m` 和 `--tile-n`，并以完整 thinking/code 请求及 Mini agent 短测验收收益。
 
-`tools.model.deepseek_v41.export_release --source SERVICE --output RELEASE --execution-output EXECUTION_CACHE --attribution CHECKPOINT` 将已验收的 A2 服务导出为原生物理布局 safetensors。GPU bank 按 rank 和连续四层分片，共享参数及 CPU embedding 单独保存；Engram 按层、哈希头和半头连续行段分片，标准索引的 `row_shards` 扩展保持原全局行号。每片最大 4 GiB，导出前可用 `--plan-only` 查看文件规划。剩余矩阵切片、BF16→FP32、padding 与通道乘积在离线物化；执行计划以 `prepared_tensor` 声明张量名、物理 dtype 和 shape，加载时按容器范围读取并复用文件句柄。权重目录只保留数据、索引与前端资产；算子和执行计划单独发布到 `EXECUTION_CACHE`，运行时通过 `ORINFER_EXECUTION_CACHE` 查找 digest。原始 checkpoint 留在离线归档。导出目录的 `export-state.json` 与 `release-manifest.json` 记录完成状态及文件／张量校验和；该格式使用支持分片主机表和 prepared_tensor 的 orinfer 引擎。
+`orinfer_build.models.deepseek_v41.export_release --source SERVICE --output RELEASE --execution-output EXECUTION_CACHE --attribution CHECKPOINT` 将已验收的 A2 服务导出为原生物理布局 safetensors。GPU bank 按 rank 和连续四层分片，共享参数及 CPU embedding 单独保存；Engram 按层、哈希头和半头连续行段分片，标准索引的 `row_shards` 扩展保持原全局行号。每片最大 4 GiB，导出前可用 `--plan-only` 查看文件规划。剩余矩阵切片、BF16→FP32、padding 与通道乘积在离线物化；执行计划以 `prepared_tensor` 声明张量名、物理 dtype 和 shape，加载时按容器范围读取并复用文件句柄。权重目录只保留数据、索引与前端资产；算子和执行计划单独发布到 `EXECUTION_CACHE`，运行时通过 `ORINFER_EXECUTION_CACHE` 查找 digest。原始 checkpoint 留在离线归档。导出目录的 `export-state.json` 与 `release-manifest.json` 记录完成状态及文件／张量校验和；该格式使用支持分片主机表和 prepared_tensor 的 orinfer 引擎。
 
-`tools.model.deepseek_v41.prepack_release --source RELEASE --source-execution EXECUTION_CACHE --output NZ_WEIGHTS --execution-output NZ_EXECUTION_CACHE` 将已导出的 ND 权重转换为 A2 transposed-NZ。INT4 元素先转置再重打包，物理字节 shape 为 `[E,K/64,N/16,16,32]`；scale、assist 和通道顺序保持不变。所有 batch 读取同一份 W4 bank，加载时直接上传该布局。匹配执行包通过 `weight_layout=transposed_nz` 声明布局并保持 ACL 的逻辑 `[E,K,N]` 视图。转换器限定于已测量的 TP8、48 专家、两类专家矩阵及 hint16；其他几何报错。80 个 GPU 分片重写，98 个未变分片以硬链接复用，源权重目录应保持只读。`--plan-only` 只列出转换范围。权重与执行输出目录必须分离；在线校验物理 dtype、shape 与容器边界，不执行转置。
+`orinfer_build.models.deepseek_v41.prepack_release --source RELEASE --source-execution EXECUTION_CACHE --output NZ_WEIGHTS --execution-output NZ_EXECUTION_CACHE` 将已导出的 ND 权重转换为 A2 transposed-NZ。INT4 元素先转置再重打包，物理字节 shape 为 `[E,K/64,N/16,16,32]`；scale、assist 和通道顺序保持不变。所有 batch 读取同一份 W4 bank，加载时直接上传该布局。匹配执行包通过 `weight_layout=transposed_nz` 声明布局并保持 ACL 的逻辑 `[E,K,N]` 视图。转换器限定于已测量的 TP8、48 专家、两类专家矩阵及 hint16；其他几何报错。80 个 GPU 分片重写，98 个未变分片以硬链接复用，源权重目录应保持只读。`--plan-only` 只列出转换范围。权重与执行输出目录必须分离；在线校验物理 dtype、shape 与容器边界，不执行转置。
 
-`tools.model.deepseek_v41.pack_host_release --source NZ_WEIGHTS --source-execution NZ_EXECUTION_CACHE --output PACKED_WEIGHTS --execution-output PACKED_EXECUTION_CACHE` 继续合并 Engram 的行内数据。每行将原 INT8 值与 group-32 FP32 scale 连续存为具名 U8 tensor，不增加行 padding；索引的 `row_records` 以 `i8-f32-g32-v1` 固定格式及全局行分片顺序。共享主机表、按行缓存和请求 packet 继续使用相同接口，文件读取和全量常驻各只需一次行读取／拷贝。96 个主机分片重写，其余 82 个分片复用。两种转换均保留原目录作为对照，输出需要匹配支持该布局的引擎及独立执行包。
+`orinfer_build.models.deepseek_v41.pack_host_release --source NZ_WEIGHTS --source-execution NZ_EXECUTION_CACHE --output PACKED_WEIGHTS --execution-output PACKED_EXECUTION_CACHE` 继续合并 Engram 的行内数据。每行将原 INT8 值与 group-32 FP32 scale 连续存为具名 U8 tensor，不增加行 padding；索引的 `row_records` 以 `i8-f32-g32-v1` 固定格式及全局行分片顺序。共享主机表、按行缓存和请求 packet 继续使用相同接口，文件读取和全量常驻各只需一次行读取／拷贝。96 个主机分片重写，其余 82 个分片复用。两种转换均保留原目录作为对照，输出需要匹配支持该布局的引擎及独立执行包。
 
 
 
-`tools.model.deepseek_v41.w4_capacity --plan PLAN --package-output DIR --expected-expert-rows N` 将已测量的 CANN 每专家行数提示写入 W4 指令。执行器以固定容量和地址复用 repeatable ACLNN 计划，实际计算范围继续由设备路由计数决定。该转换要求独立分配的操作数和设备路由；旧计划继续使用实际行数描述。提示需按真实矩阵、均匀和偏斜路由测量，再验收完整请求和 Mini；小 tile 与集中路由之间存在性能取舍。该参数不改变整数精度或权重表示。
+`orinfer_build.models.deepseek_v41.w4_capacity --plan PLAN --package-output DIR --expected-expert-rows N` 将已测量的 CANN 每专家行数提示写入 W4 指令。执行器以固定容量和地址复用 repeatable ACLNN 计划，实际计算范围继续由设备路由计数决定。该转换要求独立分配的操作数和设备路由；旧计划继续使用实际行数描述。提示需按真实矩阵、均匀和偏斜路由测量，再验收完整请求和 Mini；小 tile 与集中路由之间存在性能取舍。该参数不改变整数精度或权重表示。
 
-`tools.model.deepseek_v41.tune_auxiliary` 接受同样的 `--plan`、`--model-dir` 和 `--output`，离线选择 mHC post/pre 的列块与 FP32 分解投影的行块。后者读取计划中已准备的真实 BF16 分量，候选保持原 K 累加顺序；所有候选检查逐元素一致、尾部及改变输入后的 Graph replay。输出计划名增加 `-aux-tuned`。两种调优缓存均固定当前源码、编译器、设备、测量长度和真实权重身份，并校验被选库的内容。
+`orinfer_build.models.deepseek_v41.tune_auxiliary` 接受同样的 `--plan`、`--model-dir` 和 `--output`，离线选择 mHC post/pre 的列块与 FP32 分解投影的行块。后者读取计划中已准备的真实 BF16 分量，候选保持原 K 累加顺序；所有候选检查逐元素一致、尾部及改变输入后的 Graph replay。输出计划名增加 `-aux-tuned`。两种调优缓存均固定当前源码、编译器、设备、测量长度和真实权重身份，并校验被选库的内容。
 
 辅助算子的测量 Graph 默认包含 16 次调用，耗时归一到单次调用，摊薄主机提交和计时事件的开销。`--calls-per-replay` 可设置为 1–64，调用次数计入缓存身份；采样重复次数按 Graph 的总成本选择，保持原有的目标测量预算。数值、输出尾部和改变输入后的重放检查继续使用相同契约。
 
@@ -269,35 +269,35 @@ ORINFER_ASCEND_MODEL_ROOT=/data bash tools/operators/ascend/run.sh --without-dev
 
 `tune_auxiliary --reuse-operand-only` 在 FP32 三分量投影的每个 K 块内复用不随分量变化的 L1 操作数，比较当前配置与零／两级／三级流水线。三个 BF16 乘积及 K 累加顺序保持一致；已有宽列块的基线和选中结果均按各自物理布局检查，配套归约也使用对应的列块。
 
-`tune_auxiliary --quantize-only` 为不超过 256 列的动态量化比较当前行块与 8／16／32 行候选，保持原 FP32 除法残差修正、scale 位拆分及 INT8 舍入。query 的 32 个 head 按物理行数 `32*m` 参与编译和范围检查，ABI 仍接收实际 packet 行数 `m`。FP16 scale 下限从精确的 FP16 值转换，避免固定编译器截短 FP32 常量；静态 query 量化同步重建该下限，保留逐行调度。`tools.operators.ascend.validate_quantize` 独立以 FP64 除法检查 INT8 码和 scale，覆盖 FP16／FP32 scale、零值、小值、半整数、最小次正规 scale、非对齐尾部和改输入后的 Graph replay。可先用 `--compile-only` 离线预编译候选，再进行设备检查与完整请求验收。
+`tune_auxiliary --quantize-only` 为不超过 256 列的动态量化比较当前行块与 8／16／32 行候选，保持原 FP32 除法残差修正、scale 位拆分及 INT8 舍入。query 的 32 个 head 按物理行数 `32*m` 参与编译和范围检查，ABI 仍接收实际 packet 行数 `m`。FP16 scale 下限从精确的 FP16 值转换，避免固定编译器截短 FP32 常量；静态 query 量化同步重建该下限，保留逐行调度。`tests.ascend.operators.validate_quantize` 独立以 FP64 除法检查 INT8 码和 scale，覆盖 FP16／FP32 scale、零值、小值、半整数、最小次正规 scale、非对齐尾部和改输入后的 Graph replay。可先用 `--compile-only` 离线预编译候选，再进行设备检查与完整请求验收。
 
-`tune_auxiliary --mask-only` 比较当前 selected mask 与显式同步下的 1／8／16／32 项写入循环，保留有符号索引范围检查和 I32 的 0／1 输出。该算子为 DMA、Scalar、Vector 和 UB 复用声明配对事件；`orinfer.explicit_sync` 使编译器保留这些依赖并跳过自动同步插入，AOT 编译身份记录 `pipeline_sync=explicit-v1`。此属性限定为单个原生 stage，多 stage 编译返回错误。`tools.operators.ascend.validate_selected_mask` 验证该限制，并以独立整数参考覆盖重复索引、全无效索引、I32 极值、动态尾部及修改输入和行顺序后的 Graph replay。设备调优后还需完整模型请求验收。
+`tune_auxiliary --mask-only` 比较当前 selected mask 与显式同步下的 1／8／16／32 项写入循环，保留有符号索引范围检查和 I32 的 0／1 输出。该算子为 DMA、Scalar、Vector 和 UB 复用声明配对事件；`orinfer.explicit_sync` 使编译器保留这些依赖并跳过自动同步插入，AOT 编译身份记录 `pipeline_sync=explicit-v1`。此属性限定为单个原生 stage，多 stage 编译返回错误。`tests.ascend.operators.validate_selected_mask` 验证该限制，并以独立整数参考覆盖重复索引、全无效索引、I32 极值、动态尾部及修改输入和行顺序后的 Graph replay。设备调优后还需完整模型请求验收。
 
 `bench-ascend` 可通过 `ORINFER_A2_WORKER_CPUS` 按 rank 指定 worker 的 CPU 列表，八组以分号分隔，组内支持逗号和闭区间。按设备的 PCIe NUMA 拓扑选择列表；配置在创建原生 session 前应用，仅绑定本进程拥有的 worker 线程，测量报告记录所选 CPU。未设置时沿用进程的亲和性；无效列表、超出当前可用集合的 CPU 和设置失败均返回错误。此选项在 Linux 上支持。
 
 `tune_indexer --vector-only` 保留输入计划的 query／key tile、scale 和 mask 策略，比较直接读取 UB head 切片累加及提前加载 scale、权重和索引的组合。32 个 head 保持顺序执行 FP32 加法；当前配置参与基线测量，多种行数汇总代价后选择发布候选。`validate_indexer --direct-sum --prefetch-inputs` 以独立参考检查该组合，并在同一 Graph 中改变 query、scale、权重和因果 mask。生产选择和完整请求验收沿用离线调优流程。
 
-`tools.model.deepseek_v41.tune_softmax` 为 compact、live-bucket prefill 比较原 softmax 与共享 head 的实现。`--plan`、`--output`、`--rows` 和 `--compile-only` 沿用离线调优约定；默认 `--head-tiles 4 2 1` 分别用于结束位置不超过 2048、不超过 4096 和更长的前缀桶。各桶发布独立内核并在设备上检查位置，互斥写入同一概率缓冲，保留 FP32 倒数、归约和 BF16 概率边界。测量在前缀起点 0 汇总指定长度的代价；数值检查覆盖上下文末端，并在同一 Graph 中改变分数、位置、选择 mask 和前缀桶。候选通过逐位一致和尾部检查后，按测量结果发布原实现或整组分桶实现，输出计划名增加 `-softmax-tuned`。更改执行计划后仍需完整模型请求验收。
+`orinfer_build.models.deepseek_v41.tune_softmax` 为 compact、live-bucket prefill 比较原 softmax 与共享 head 的实现。`--plan`、`--output`、`--rows` 和 `--compile-only` 沿用离线调优约定；默认 `--head-tiles 4 2 1` 分别用于结束位置不超过 2048、不超过 4096 和更长的前缀桶。各桶发布独立内核并在设备上检查位置，互斥写入同一概率缓冲，保留 FP32 倒数、归约和 BF16 概率边界。测量在前缀起点 0 汇总指定长度的代价；数值检查覆盖上下文末端，并在同一 Graph 中改变分数、位置、选择 mask 和前缀桶。候选通过逐位一致和尾部检查后，按测量结果发布原实现或整组分桶实现，输出计划名增加 `-softmax-tuned`。更改执行计划后仍需完整模型请求验收。
 
-`--sinkhorn-only` 选择每组 1/2/4/8/16/32 行的 mHC Sinkhorn 实现。批量版本按 path-major 布局承载独立的 4×4 矩阵，沿用四列行归约、四路列归约和原迭代顺序；UB 别名的跨引擎传输与向量依赖显式同步。候选逐位对照单行实现，并检查动态尾部与改变输入后的 Graph replay。`tools.operators.ascend.validate_sinkhorn --tile-rows N` 另行验证 FP64 参考及重复 Graph。
+`--sinkhorn-only` 选择每组 1/2/4/8/16/32 行的 mHC Sinkhorn 实现。批量版本按 path-major 布局承载独立的 4×4 矩阵，沿用四列行归约、四路列归约和原迭代顺序；UB 别名的跨引擎传输与向量依赖显式同步。候选逐位对照单行实现，并检查动态尾部与改变输入后的 Graph replay。`tests.ascend.operators.validate_sinkhorn --tile-rows N` 另行验证 FP64 参考及重复 Graph。
 
-`tools.model.deepseek_v41.tune_indexer --plan PLAN --output DIR --rows 2048` 对因果索引器联合选择 query 行块与 key 列块，输出计划名增加 `-indexer-tuned`。它复用公共候选、测量和汇总选择组件，以原逐头顺序为参考，保持 INT32 点积、FP16 权重缩放和 FP32 累加顺序；另检查短尾、上下文末端及改变输入后的 Graph replay。`--compile-only` 可通过 `run.sh --without-devices` 预编译候选，实际选择仍须设备测量。
+`orinfer_build.models.deepseek_v41.tune_indexer --plan PLAN --output DIR --rows 2048` 对因果索引器联合选择 query 行块与 key 列块，输出计划名增加 `-indexer-tuned`。它复用公共候选、测量和汇总选择组件，以原逐头顺序为参考，保持 INT32 点积、FP16 权重缩放和 FP32 累加顺序；另检查短尾、上下文末端及改变输入后的 Graph replay。`--compile-only` 可通过 `run.sh --without-devices` 预编译候选，实际选择仍须设备测量。
 
 `tune_indexer --mask-only` 在既定行列块下比较标量与向量因果掩码，以逐位输出一致和设备测量选择实现。向量掩码保留原逐头求和顺序，支持部分 key 块及全掩蔽行。
 
-`tools.model.deepseek_v41.tune_prefill_qk --plan PLAN --output DIR` 为 `min_rows>=512` 的 prefill packet 选择 QK 遍历方式，输出同一资产目录的 `*-qk-tuned.json`。候选按当前 SWA 窗口和长 KV 前缀枚举有效块，对早晚 query 块折叠排列，并比较 key 分块数与物理 grid；共享同一 BF16 MMA 和 FP32 累加计算体。离线调优包含原库与新默认实现，逐位检查全部分数和未写区域，在同一 Graph 中同时改变 query 与位置，并抽查独立 FP32 点积。512 行和容量上限的测量经几何平均选择每种几何的一个实现；短片段复用原计划的行数选择范围。`--compile-only --compile-workers N` 通过现有 `build.compile_task` 预编译候选，后续测量按源码、编译器、设备和库身份缓存；输出计划只引用选定实现。完整请求另验收 2K、分块、4K／8K 和全部请求状态。
+`orinfer_build.models.deepseek_v41.tune_prefill_qk --plan PLAN --output DIR` 为 `min_rows>=512` 的 prefill packet 选择 QK 遍历方式，输出同一资产目录的 `*-qk-tuned.json`。候选按当前 SWA 窗口和长 KV 前缀枚举有效块，对早晚 query 块折叠排列，并比较 key 分块数与物理 grid；共享同一 BF16 MMA 和 FP32 累加计算体。离线调优包含原库与新默认实现，逐位检查全部分数和未写区域，在同一 Graph 中同时改变 query 与位置，并抽查独立 FP32 点积。512 行和容量上限的测量经几何平均选择每种几何的一个实现；短片段复用原计划的行数选择范围。`--compile-only --compile-workers N` 通过现有 `build.compile_task` 预编译候选，后续测量按源码、编译器、设备和库身份缓存；输出计划只引用选定实现。完整请求另验收 2K、分块、4K／8K 和全部请求状态。
 
-`tools.model.deepseek_v41.shard_indexer --plan PLAN --output PLAN_SHARDED --min-rows 512` 为 TP8 动态 prefill 计划生成交错分行的 indexer 和 TopK 路径，输出与输入位于同一资产目录。真实行数为 `M` 时，每卡打包 `rank + 8*i` 的 `ceil(M/8)` 行，复用原 INT32 点积和逐头 FP32 累加，再以相同真实行数做 INT32 AllGather 和交错还原；权重和请求私有状态保持原布局。局部行容量为 packet 容量的八分之一，尾部填充行的选择长度为零。较短片段复用原 packet 的物理容量和算子，以独立的 `min_rows`／`max_rows` 范围选择；加载时拒绝间断或重叠的范围。AOT 容量和逐操作数字节数继续严格匹配。
+`orinfer_build.models.deepseek_v41.shard_indexer --plan PLAN --output PLAN_SHARDED --min-rows 512` 为 TP8 动态 prefill 计划生成交错分行的 indexer 和 TopK 路径，输出与输入位于同一资产目录。真实行数为 `M` 时，每卡打包 `rank + 8*i` 的 `ceil(M/8)` 行，复用原 INT32 点积和逐头 FP32 累加，再以相同真实行数做 INT32 AllGather 和交错还原；权重和请求私有状态保持原布局。局部行容量为 packet 容量的八分之一，尾部填充行的选择长度为零。较短片段复用原 packet 的物理容量和算子，以独立的 `min_rows`／`max_rows` 范围选择；加载时拒绝间断或重叠的范围。AOT 容量和逐操作数字节数继续严格匹配。
 
-`tools.model.deepseek_v41.sequence_parallel --plan PLAN --output PLAN_PARTITIONED --min-rows 512` 在已有 TP8 大行数 packet 上复用本地行模板，输出与输入位于同一资产目录。每卡持续保存连续八分之一行的残差，mHC、归一化、FP32 路由和 A8 量化复用原计算体与归约顺序。默认保留原 AllReduce，将结果的本卡行视图交给局部后处理；全局注意力和专家投影读取 AllGather 汇总的归一化输入、A8/scale 以及路由结果。A8 通过四字节 INT32 视图无损传输。两处 Engram 和最终输出头沿用汇总后的原计算；层快照启用时才汇总完整残差。较短 packet 保留原实现，范围由 `--min-rows` 分开。
+`orinfer_build.models.deepseek_v41.sequence_parallel --plan PLAN --output PLAN_PARTITIONED --min-rows 512` 在已有 TP8 大行数 packet 上复用本地行模板，输出与输入位于同一资产目录。每卡持续保存连续八分之一行的残差，mHC、归一化、FP32 路由和 A8 量化复用原计算体与归约顺序。默认保留原 AllReduce，将结果的本卡行视图交给局部后处理；全局注意力和专家投影读取 AllGather 汇总的归一化输入、A8/scale 以及路由结果。A8 通过四字节 INT32 视图无损传输。两处 Engram 和最终输出头沿用汇总后的原计算；层快照启用时才汇总完整残差。较短 packet 保留原实现，范围由 `--min-rows` 分开。
 
 分片的容量只决定分配大小。真实 packet 行数为 `M` 时，每卡执行 `ceil(M/8)` 行，动态视图、AllGather 和 ReduceScatter 使用相同的行数表达式，填充量最多为七行。`--reduce-scatter` 生成原生 ReduceScatter 的实验候选，未使用的尾行在计算流上清零。原生接口检查源／目标范围、跨 rank 输入容量和资源生存期，支持改变输入后的 ACL Graph replay。此集合通信与 AllReduce 的浮点求和顺序可能不同；该候选的模型质量需要通过相同 teacher 历史的官方对照验收，默认使用 AllReduce 路径。
 
-`tools.model.deepseek_v41.assembly` 从一个保留 `min_rows=2` 未分片动态主体的原生计划生成收敛包，统一调用现有 indexer 分片、序列分片、融合 attention 和投影调优工具。大行数 indexer 的分片在规范化主体之后重建，保留已有优化；打包、局部计算、集合通信和还原共用真实局部行数。输出计划与输入共用资产目录；`--package-output` 原子发布只含被引用资产的独立目录，准备好的权重 bank 通过硬链接复用，发布目录与资产目录需位于同一文件系统。源计划保留完整 decoder；owner-row bounded replay 使用下文的独立构建入口。基础构建命令为：
+`orinfer_build.models.deepseek_v41.assembly` 从一个保留 `min_rows=2` 未分片动态主体的原生计划生成收敛包，统一调用现有 indexer 分片、序列分片、融合 attention 和投影调优工具。大行数 indexer 的分片在规范化主体之后重建，保留已有优化；打包、局部计算、集合通信和还原共用真实局部行数。输出计划与输入共用资产目录；`--package-output` 原子发布只含被引用资产的独立目录，准备好的权重 bank 通过硬链接复用，发布目录与资产目录需位于同一文件系统。源计划保留完整 decoder；owner-row bounded replay 使用下文的独立构建入口。基础构建命令为：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices \
-  python3 -m tools.model.deepseek_v41.assembly \
+bash tools/environments/ascend/run.sh --without-devices \
+  python3 -m orinfer_build.models.deepseek_v41.assembly \
   --plan ASSET_DIR/model-kv-int8.json \
   --output ASSET_DIR/model-converged.json \
   --package-output artifacts/ascend-runtime/converged
@@ -307,7 +307,7 @@ bash tools/operators/ascend/run.sh --without-devices \
 
 设备调优时去掉 `--without-devices`，增加 `--shared-attention --tune-projections local --model-dir MODEL_DIR`。调优使用真实权重，默认覆盖局部容量内的所有 1–128 行和更大行数采样，检查输出尾部、scratch 边界及改变输入后的 Graph replay。共享选择组件按逐测量点至多 5% 回退的限制选择一个通用配置；只有完整测量全部整数的短行区间才生成局部 `row_selections`。相邻区间仅在实现相同时合并，发布前再按 packet 的实际调度范围和截短边界裁掉不可达的选择与库。执行器复用 SDK 的 `KernelVariant` 和行数算术，在准备 Graph 时消费选择表；在线执行保持编译好的同源实现。替换实现必须保持源码、编译器、权重、dtype、scale、数学参数和非 scratch 操作数一致，scratch 可以使用已分配范围内的较小视图。
 
-独立投影调优入口 `tools.model.deepseek_v41.tune` 支持用 `--geometry N K --min-capacity M --rows ...` 限定矩阵和容量。只测量大行数时保留已发布的 1–128 行选择及默认回退，较大行数共同选择一个动态配置。`--joint` 为满足几何的整数投影增加 96／192 列 tile，沿用同一计算体与舍入边界。`--weight-buffers 16` 轮换同值、不同地址的真实权重副本，使 Graph 测量覆盖多层权重工作集；副本仅用于离线测量，配置和副本数计入调优缓存身份。最终执行包只发布被选择的库，完整请求与 Mini 收益另行验收。
+独立投影调优入口 `orinfer_build.models.deepseek_v41.tune` 支持用 `--geometry N K --min-capacity M --rows ...` 限定矩阵和容量。只测量大行数时保留已发布的 1–128 行选择及默认回退，较大行数共同选择一个动态配置。`--joint` 为满足几何的整数投影增加 96／192 列 tile，沿用同一计算体与舍入边界。`--weight-buffers 16` 轮换同值、不同地址的真实权重副本，使 Graph 测量覆盖多层权重工作集；副本仅用于离线测量，配置和副本数计入调优缓存身份。最终执行包只发布被选择的库，完整请求与 Mini 收益另行验收。
 
 `--packet-cache-capacity N` 限制每个 rank 的 Graph 形状缓存，默认 64、范围 4–4096；普通单行 decode 常驻，其余按最近使用顺序淘汰。相同几何和 GPU 指针的 ACLNN W4 计划由仍存活的 Graph 共享；Graph 和完成事件持有原生资源。请求重置按模板中声明的状态去重，与缓存过多少种形状无关。离线构建穷举行数表达式和物理范围，在线保留实际行数、操作数和 ABI 校验。
 
@@ -317,13 +317,13 @@ bash tools/operators/ascend/run.sh --without-devices \
 
 ### A2 原生多请求 batch
 
-`tools.model.deepseek_v41.batch` 从保留 `min_rows=2` 完整未分片主体的 INT8-KV 计划构建多请求执行包。投影、HC、路由和专家合并执行 `M=sum(q_i)` 行；attention、KV、索引缓存和 C2 环通过请求地址表调用同源算子。执行包提供一个动态 prefill 家族和一个动态 decode 家族，支持容量内的任意整数 batch；默认最多 128 个 resident owner、每轮 2048 token 行、每请求 4096 上下文位置。实际准入同时受设备内存预算限制。
+`orinfer_build.models.deepseek_v41.batch` 从保留 `min_rows=2` 完整未分片主体的 INT8-KV 计划构建多请求执行包。投影、HC、路由和专家合并执行 `M=sum(q_i)` 行；attention、KV、索引缓存和 C2 环通过请求地址表调用同源算子。执行包提供一个动态 prefill 家族和一个动态 decode 家族，支持容量内的任意整数 batch；默认最多 128 个 resident owner、每轮 2048 token 行、每请求 4096 上下文位置。实际准入同时受设备内存预算限制。
 
 默认构建复用现有 `sequence_parallel` 与 `fuse_attention` 离线变换，保留动态行表达式及共享 buffer 的视图偏移。Prefill 按总行数使用连续的短行／序列分片区间，大行数同时复用共享 KV/Qa 投影与 ReduceScatter；当前序列变换要求行容量与输入计划一致。各 owner 的 prefill attention 复用一个融合计算体，保持全局归一化后的 BF16 概率与连续 FP32 PV 累积；独立的 `prefill_quantum` 控制序列分片调度。Decode 投影与 PV 保留同源融合 Cube/Vector 模板及显式完成握手。各 batch 通过真实行数和离线配置选择复用这些计算体。原完整参考可用 `--no-sequence-parallel --no-shared-attention --no-reduce-scatter --no-fused-attention` 构建。
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 \
-  -m tools.model.deepseek_v41.batch \
+bash tools/environments/ascend/run.sh --without-devices python3 \
+  -m orinfer_build.models.deepseek_v41.batch \
   --plan artifacts/ascend-model/model-kv-int8.json \
   --output artifacts/ascend-model/model-batch.json \
   --package-output artifacts/ascend-model/batch-package \
@@ -338,8 +338,8 @@ orinfer bench-ascend-batch \
 可选的小行数调优使用现有真实权重、Graph 测量和共享选择表组件，比较同源 64/128/256 CTA 边界。默认完整覆盖 1–128 行及各几何的大行数采样；发布阶段保留间接地址表声明的 owner 状态、视图及工作区，只包含最终选中的实现：
 
 ```bash
-bash tools/operators/ascend/run.sh python3 \
-  -m tools.model.deepseek_v41.tune \
+bash tools/environments/ascend/run.sh python3 \
+  -m orinfer_build.models.deepseek_v41.tune \
   --plan artifacts/ascend-model/model-batch.json \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
   --output artifacts/ascend-model/batch-tuning \
@@ -365,7 +365,7 @@ bash tools/operators/ascend/run.sh python3 \
 
 混合验证帧设置 `verification:true` 和 `verification_requests:N`：前 N 个请求返回全部验证位置并进入状态 journal，其余请求沿用普通 prefill 的 Producer／Final 角色和末位置输出约定。省略 N 时验证全部请求。混合帧使用显式输入，不启用自动 decode 或 serial 对照；报告以 `mixed_s`、`mixed_prefill_tokens` 和 `mixed_decode_tokens` 单独计量共享执行时间与两类 token，避免混入纯 prefill／decode TPS。
 
-A2 离线 assembly 的 `--fp32-sums` 可将 BF16 AllReduce／ReduceScatter 提升为 FP32 求和，再舍入回原 BF16 边界；沿用各自的分区、补齐和行数表达式。转换复用 `model_ops.convert` 动态模板，scratch 跨层与 packet 复用，不改变权重或请求私有状态。默认关闭；启用后须验收工具质量、Graph replay 与完整请求性能。也可用 `python -m tools.model.deepseek_v41.sum_precision --plan PLAN --model-dir MODEL --output NEW_DIRECTORY` 从现有执行计划创建独立候选包。
+A2 离线 assembly 的 `--fp32-sums` 可将 BF16 AllReduce／ReduceScatter 提升为 FP32 求和，再舍入回原 BF16 边界；沿用各自的分区、补齐和行数表达式。转换复用 `model_ops.convert` 动态模板，scratch 跨层与 packet 复用，不改变权重或请求私有状态。默认关闭；启用后须验收工具质量、Graph replay 与完整请求性能。也可用 `python -m orinfer_build.models.deepseek_v41.sum_precision --plan PLAN --model-dir MODEL --output NEW_DIRECTORY` 从现有执行计划创建独立候选包。
 
 `compare_serial` 使用 batch 实际生成的固定历史，按相同计算家族逐请求重放，比较完整词表概率和 greedy 输出。它验证请求隔离及批量算术，不替代官方 BF16/FP8 质量对照。报告区分 forward 时间与执行计划准备时间；完整请求吞吐包含 CPU 坐标、Engram 查找、传输、计算、HCCL、输出头和同步，预热测量排除加载、准入、重置与 Graph 捕获。
 
@@ -374,13 +374,13 @@ A2 离线 assembly 的 `--fp32-sums` 可将 BF16 AllReduce／ReduceScatter 提�
 可选的 decode router 分片复用现有 `dense.fp32_partials`、`dense.fp32_reduce` 和 `memory.gather_columns`。各 rank 计算连续的输出列，AllGather 后恢复完整 FP32 logits，再执行原来的 TopK。TP8 的 384 个专家按每 rank 48 个逻辑列分配，投影使用 64 列对齐视图，末端重叠列在恢复时裁剪；权重值、K 归约顺序和专家布局保持原契约。该转换作用于 `batch_decode` packet，prefill 继续使用完整投影。
 
 ```bash
-bash tools/operators/ascend/run.sh python3 \
-  -m tools.model.deepseek_v41.router_sharding \
+bash tools/environments/ascend/run.sh python3 \
+  -m orinfer_build.models.deepseek_v41.router_sharding \
   --plan artifacts/ascend-model/batch-selected/model.json \
   --output artifacts/ascend-model/router-sharded
 ```
 
-输出计划位于 `router-sharded/package/model.json`。单算子验收可运行 `tools.operators.ascend.validate_router_sharding --baseline BASE_PLAN --plan SHARDED_PLAN --output REPORT`，比较同一输入的完整／分片 FP32 投影、非对齐行尾和改变输入后的 Graph replay。完整请求另测固定历史概率及实际吞吐；默认高性能通信下，各 rank 输入的数值差异仍需纳入跨包概率对照。
+输出计划位于 `router-sharded/package/model.json`。单算子验收可运行 `tests.ascend.operators.validate_router_sharding --baseline BASE_PLAN --plan SHARDED_PLAN --output REPORT`，比较同一输入的完整／分片 FP32 投影、非对齐行尾和改变输入后的 Graph replay。完整请求另测固定历史概率及实际吞吐；默认高性能通信下，各 rank 输入的数值差异仍需纳入跨包概率对照。
 
 `compare_whole_prompt:true` 配合 `compare_serial:true`，对 `requests` 使用单请求最大容量分块作为参考，检查批量自动分块及后续 teacher-forced decode 的状态一致性。显式 `frames` 沿用原片段边界。设置 `ORINFER_A2_BATCH_LOGITS_DIR` 时，首次预热各输出位置的完整 FP32 logits 按 case、frame 和 owner 写入指定目录，供跨包概率／NLL 对照；独立导出不要求启用逐请求串行重放。
 
@@ -391,8 +391,8 @@ Graph 按计算家族、片段长度集合与输出数缓存，地址表和位�
 query/head 交换的宽 BF16 行重排可通过现有 `memory.partition_rows` 和 `memory.interleave_rows` 的 `tile_columns` 参数调优。离线工具比较 256/1024/4096 列连续搬运，共用原来的动态行、rank 排列及补齐语义；每种几何只发布一个配置。选择器汇总 1、32、511、512 和容量边界的实际测量，要求各采样点相对原配置回退不超过 10%。测量前后检查逐元素相等、未使用行和改变输入后的 Graph replay；一个 Graph 内重复调用以摊薄主机 replay 开销，结果按每次搬运报告。编译及测量缓存包含算子、编译器、设备、共享测量组件和选择器身份。
 
 ```bash
-bash tools/operators/ascend/run.sh python3 \
-  -m tools.model.deepseek_v41.tune_movement \
+bash tools/environments/ascend/run.sh python3 \
+  -m orinfer_build.models.deepseek_v41.tune_movement \
   --plan artifacts/ascend-model/router-sharded/package/model.json \
   --output artifacts/ascend-model/movement-tuned
 ```
@@ -406,8 +406,8 @@ KV gather 验证可通过 `--op kv_int8.gather_attention --kv-slot-tiles 16` 指
 查询分片后的 selected INT8 attention 可将相邻的 gather、QK、softmax 和 PV 合并为一次 paired-core 调用：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 \
-  -m tools.model.deepseek_v41.fuse_attention --selected-int8 \
+bash tools/environments/ascend/run.sh --without-devices python3 \
+  -m orinfer_build.models.deepseek_v41.fuse_attention --selected-int8 \
   --plan QUERY_PARTITIONED_PLAN --output artifacts/a2-selected-attention \
   --min-rows 512 --compile-workers 4
 ```
@@ -417,8 +417,8 @@ bash tools/operators/ascend/run.sh --without-devices python3 \
 稀疏索引器可以继续将 INT8 打分、32 头 FP32 加权归约和局部 TopK 合并，只输出原有候选格式：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 \
-  -m tools.model.deepseek_v41.fuse_indexer \
+bash tools/environments/ascend/run.sh --without-devices python3 \
+  -m orinfer_build.models.deepseek_v41.fuse_indexer \
   --plan QUERY_PARTITIONED_PLAN --output artifacts/a2-fused-indexer \
   --min-rows 512 --tile-rows 8
 ```
@@ -428,8 +428,8 @@ bash tools/operators/ascend/run.sh --without-devices python3 \
 TP8 大 prefill 的 Engram 可以将投影列分片直接交换为已有的连续序列分片：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 \
-  -m tools.model.deepseek_v41.engram_sequence \
+bash tools/environments/ascend/run.sh --without-devices python3 \
+  -m orinfer_build.models.deepseek_v41.engram_sequence \
   --plan SEQUENCE_PARTITIONED_PLAN --output artifacts/a2-engram-sequence
 ```
 
@@ -438,8 +438,8 @@ bash tools/operators/ascend/run.sh --without-devices python3 \
 selected attention 的 SWA 解量化可以按当前窗口准备一次，并由同一 packet 内的查询共享：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 \
-  -m tools.model.deepseek_v41.kv_staging \
+bash tools/environments/ascend/run.sh --without-devices python3 \
+  -m orinfer_build.models.deepseek_v41.kv_staging \
   --plan SELECTED_ATTENTION_PLAN --output artifacts/a2-kv-staging
 ```
 
@@ -450,21 +450,21 @@ bash tools/operators/ascend/run.sh --without-devices python3 \
 融合 selected attention 的多 slot INT8 gather 支持 `async_gather=true` 离线调度。使用 `private_schedule --operator attention_fused.selected_int8 --parameters '{"async_gather":true}' --match-parameters '{"heads":8}' --model-dir MODEL_DIR` 可重建已有 H8 绑定；相同 launch 几何直接保留原 owner work 表及其 source／bounded decoder 角色。共享 TileLang 计算体保持所有精度边界，独立 slot 的 DMA 在一个 tile 内连续提交，tile 两端保留完整同步。编译后的调度收敛只移除声明区间内多余的全流水屏障；无法识别标记、出现向量算术、GM 写入或其他未声明操作时拒绝构建。该配置要求多 slot tile，最终包仅收录选中的库；完整请求收益通过独立短测确定。
 
 
-`tools.model.deepseek_v41.quantize_kv --plan BF16_PLAN --output INT8_PLAN` 将尚未量化 KV 的 DSv4.1 TP8 原生计划转换为 INT8 缓存，输出与输入共用资产目录。40 层 SWA 和四个共享压缩 KV bank 均按每 64 个值使用一个 FP16 scale，512 维每行共 528 字节。写入按实际存储的 FP16 scale 做对称舍入，整数范围为 −127..127；scale 下限为 FP16 最小正数，上限为 65504。零组写零，`-1` 位置跳过写入，其他越界位置设置错误标志。压缩器的 FP32 ring 状态和索引器现有 INT8 格式保持各自的契约。
+`orinfer_build.models.deepseek_v41.quantize_kv --plan BF16_PLAN --output INT8_PLAN` 将尚未量化 KV 的 DSv4.1 TP8 原生计划转换为 INT8 缓存，输出与输入共用资产目录。40 层 SWA 和四个共享压缩 KV bank 均按每 64 个值使用一个 FP16 scale，512 维每行共 528 字节。写入按实际存储的 FP16 scale 做对称舍入，整数范围为 −127..127；scale 下限为 FP16 最小正数，上限为 65504。零组写零，`-1` 位置跳过写入，其他越界位置设置错误标志。压缩器的 FP32 ring 状态和索引器现有 INT8 格式保持各自的契约。
 
 prefill 使用一个 SWA 和一个压缩 KV 的共享 BF16 工作区，仅解码当前窗口／前缀；同一压缩 source 的后续层复用已经解码的值。decode 将选中行读取与 group64 解量化融合，后续 QK／PV 继续使用 BF16 输入与原 FP32 累加边界。工作区属于计算暂存，不保留逐层 BF16 缓存副本。`--reference-bf16` 生成保存相同 INT8 舍入值的 BF16 对照计划，用于核对实际存储布局和状态，不用于部署。
 
-`tools.operators.ascend.validate_kv_int8 --plan INT8_PLAN --reference REFERENCE_PLAN --output REPORT` 通过固定编译镜像运行数值验收，覆盖独立 FP64 编码参考、FP16 scale、舍入边界、跳过／越界写入、动态尾部、选择读取、前缀及改变输入和位置后的 Graph replay。完整模型另用固定历史比较概率／NLL、分块与长上下文状态，并以完整请求测量性能。
+`tests.ascend.operators.validate_kv_int8 --plan INT8_PLAN --reference REFERENCE_PLAN --output REPORT` 通过固定编译镜像运行数值验收，覆盖独立 FP64 编码参考、FP16 scale、舍入边界、跳过／越界写入、动态尾部、选择读取、前缀及改变输入和位置后的 Graph replay。完整模型另用固定历史比较概率／NLL、分块与长上下文状态，并以完整请求测量性能。
 
-`tools.model.deepseek_v41.fuse_attention --plan PLAN --output FUSED_PLAN` 生成融合 prefill attention 实验计划，使用分块在线 softmax 与同一次 launch 内的 Cube／Vector 交换，代替完整 scores／probabilities 矩阵。`--tile-m` 选择 16／32／64 个 query-head 行；`--tile-k` 选择 128／256 个 key 行，压缩 bank 不满足 256 对齐时使用 128。`--reuse-kv` 在 L1 保留 query，并让 QK／PV 共用同一份 KV tile。`--min-rows 512` 只转换声明最小行数至少为 512 的 packet，较短 packet 继续复用原实现。A2 的存储与计算边界仍为 INT8 缓存解码后的 BF16；在线 softmax 改变浮点归约和概率舍入位置，需要完整模型质量对照。`tools.operators.ascend.validate_attention_fused --manifest KERNEL_JSON --output REPORT` 检查独立 FP64 参考、尾部、长上下文以及改变数据和位置后的 Graph replay。
+`orinfer_build.models.deepseek_v41.fuse_attention --plan PLAN --output FUSED_PLAN` 生成融合 prefill attention 实验计划，使用分块在线 softmax 与同一次 launch 内的 Cube／Vector 交换，代替完整 scores／probabilities 矩阵。`--tile-m` 选择 16／32／64 个 query-head 行；`--tile-k` 选择 128／256 个 key 行，压缩 bank 不满足 256 对齐时使用 128。`--reuse-kv` 在 L1 保留 query，并让 QK／PV 共用同一份 KV tile。`--min-rows 512` 只转换声明最小行数至少为 512 的 packet，较短 packet 继续复用原实现。A2 的存储与计算边界仍为 INT8 缓存解码后的 BF16；在线 softmax 改变浮点归约和概率舍入位置，需要完整模型质量对照。`tests.ascend.operators.validate_attention_fused --manifest KERNEL_JSON --output REPORT` 检查独立 FP64 参考、尾部、长上下文以及改变数据和位置后的 Graph replay。
 
-`tools.model.deepseek_v41.tune --joint --geometry N K` 在真实权重上联合测量 M／N／K tile 和流水候选；`--geometry` 可重复，只发布跨所选行数的胜出配置。ReduceScatter 在序列分片构建时通过 `--reduce-scatter` 选择，复用相同的动态行和消费视图契约。
+`orinfer_build.models.deepseek_v41.tune --joint --geometry N K` 在真实权重上联合测量 M／N／K tile 和流水候选；`--geometry` 可重复，只发布跨所选行数的胜出配置。ReduceScatter 在序列分片构建时通过 `--reduce-scatter` 选择，复用相同的动态行和消费视图契约。
 
 
 当前原生多 owner 计划通过同一入口构建 bounded replay 包：
 
 ```bash
-uv run --locked python -m tools.model.deepseek_v41.decoder_rows \
+uv run --locked python -m orinfer_build.models.deepseek_v41.decoder_rows \
   --plan SHARED_ROWS_PLAN --keep 128 --output artifacts/a2-decoder-replay
 ```
 
@@ -478,11 +478,11 @@ uv run --locked python -m tools.model.deepseek_v41.decoder_rows \
 
 `--source-kv-boundary` 将行选择边界提前到第 20 层共享 KV/index key 写完之后。构建器先闭合 mHC 系数分支，再选择跨边界的 residual、归一化输入、mHC 系数和 Q-A 整数输入；Q-B、query RoPE、索引查询、attention 及 FFN 复用原算子，仅处理保留行。第 20 层的 SWA 写入仍覆盖完整输入，选中 query 使用该层完整 SWA 历史；21–39 层保持原有 bounded replay 策略。首次 attention 直接准备所选行的长 KV 工作区，后续同源消费者复用它。中间 producer packet 在共享写入处结束，普通 decode 的执行计划与 owner 私有状态布局保持相同。该选项使用现有动态行选择及 TileLang 算子，执行包声明独立的共享写入边界，加载时检查其位置与分支闭合。
 
-`tools.model.deepseek_v41.local_indexer --plan OWNER_PLAN --output artifacts/a2-local-indexer` 为已有 TP8 query 分片前移索引器的输入分片。默认处理 `min_rows >= 512` 的 packet family：先按 rank 选取 Q-A 的 INT8 值、FP32 scale、hidden 和 RoPE 坐标，再调用原有投影、RoPE、量化及 weights projection，将结果直接写入原索引器地址表。各 rank 处理 `ceil(实际 token 行数 / 8)` 行，量化在同一算子内展开 32 个 head；真实 owner 行的 INT8 query、FP16 scale 和 BF16 weights 保持原始舍入边界。未分配给 owner 的尾部不参与索引评分。小行数 family、普通 decode、KV 与请求状态契约保持相同。
+`orinfer_build.models.deepseek_v41.local_indexer --plan OWNER_PLAN --output artifacts/a2-local-indexer` 为已有 TP8 query 分片前移索引器的输入分片。默认处理 `min_rows >= 512` 的 packet family：先按 rank 选取 Q-A 的 INT8 值、FP32 scale、hidden 和 RoPE 坐标，再调用原有投影、RoPE、量化及 weights projection，将结果直接写入原索引器地址表。各 rank 处理 `ceil(实际 token 行数 / 8)` 行，量化在同一算子内展开 32 个 head；真实 owner 行的 INT8 query、FP16 scale 和 BF16 weights 保持原始舍入边界。未分配给 owner 的尾部不参与索引评分。小行数 family、普通 decode、KV 与请求状态契约保持相同。
 
 `local_indexer`、`fuse_indexer` 与 `fuse_topk` 共用 `--min-rows`／`--max-rows` 选择 target 行数区间，在区间边界拆分已有 family 并保留原物理容量。可用 `--min-rows 32 --max-rows 511` 将同源局部投影、因果 TopK 和归并应用到已有 indexer query 分片的 head 并行 family；区间外的 target、普通 decode 与 draft 保留原程序。已发布 safetensors 计划通过 `--model-dir` 读取只读单位 scale，沿用原 BF16 输出契约检查。
 
-构建器通过 `--query-tile-m` 选择同源整数投影 tile，默认 128；动态表达式和 AOT 描述显式区分 token 行与 head 行，scale 常量复用共享只读资产的有界视图。`tools.operators.ascend.validate_local_indexer --baseline BASE_PLAN --plan LOCAL_PLAN --model-dir CHECKPOINT --output DIR` 使用真实权重比较有效 query 行，在 rank 0/7 验证非对齐尾部、改输入后的 Graph replay，并测量完整前处理链。完整请求与 Mini 继续单独验收。
+构建器通过 `--query-tile-m` 选择同源整数投影 tile，默认 128；动态表达式和 AOT 描述显式区分 token 行与 head 行，scale 常量复用共享只读资产的有界视图。`tests.ascend.operators.validate_local_indexer --baseline BASE_PLAN --plan LOCAL_PLAN --model-dir CHECKPOINT --output DIR` 使用真实权重比较有效 query 行，在 rank 0/7 验证非对齐尾部、改输入后的 Graph replay，并测量完整前处理链。完整请求与 Mini 继续单独验收。
 
 新构建的最终窗口包另行声明 `decoder_state`，用于完整 prompt 检查点。服务在目标头完成、采样开始前保存 producer 状态、decoder SWA 和未处理的目标 logits；后者计入缓存预算。完全相同的 token 输入命中有效目标头时，恢复全部状态并按当前请求的 seed、采样参数、logprob 和约束处理首 token，随后沿用普通 decode；首 token 复用无需模型 forward。混合请求中的其他 owner 仍正常执行，同一请求每轮只提交一次输出。扩展或改变输入时继续遵守普通 prefix 的回退窗口，重新构建新的 decoder 窗口。旧包缺少该声明时沿用原策略；关闭 prefix cache 同时关闭完整头缓存。这里复用公共 prefix 索引的 `logits_valid` 契约，执行包的算子、行选择和 owner 常驻分配保持相同。
 
@@ -490,13 +490,13 @@ uv run --locked python -m tools.model.deepseek_v41.decoder_rows \
 
 
 
-上述工具可通过 `run.sh --without-devices` 离线编译。`tools.operators.ascend.validate_sharded_indexer --baseline PLAN --plan PLAN_SHARDED --output DIR` 在设备上逐卡比较原始分数、TopK、填充行和索引重排，以独立参考抽查分数，并验证修改输入后的 Graph replay。完整请求另用 `bench-ascend` 验证分块、缓存状态、输出与 TPS。
+上述工具可通过 `run.sh --without-devices` 离线编译。`tests.ascend.operators.validate_sharded_indexer --baseline PLAN --plan PLAN_SHARDED --output DIR` 在设备上逐卡比较原始分数、TopK、填充行和索引重排，以独立参考抽查分数，并验证修改输入后的 Graph replay。完整请求另用 `bench-ascend` 验证分块、缓存状态、输出与 TPS。
 
 `--fast-engram` 为动态 prefill 启用批量 32 阶蝶形旋转。构建器要求 checkpoint 的旋转块恰为标准顺序、统一幅值、带行符号的 Walsh 矩阵；不匹配时构建失败。计算读取原始 FP32 系数，保留输入乘系数与输出 FP32 边界。`validate_rotation` 检查原 bank、FP64 参考误差、动态尾部和改变输入后的 Graph replay；单行 decode 保留通用旋转。
 
-`--parallel-regroup` 为 prefill 生成稳定的分块专家分组：每个 32-token 块按路由位置排序，再计算专家与块的前缀和，写回 gather 和 restore。专家、token、路由 lane 的顺序与串行扫描一致；六个有效路由之外的 padding 及最后一个块中超出真实 token 行数的位置均不参与分组。`tools.operators.ascend.validate_regroup --base 0` 覆盖 expert 0 的短尾，默认的 `--base 144` 覆盖中间 rank；验证包含重复路由、空专家、异常索引和改变输入后的 Graph replay。
+`--parallel-regroup` 为 prefill 生成稳定的分块专家分组：每个 32-token 块按路由位置排序，再计算专家与块的前缀和，写回 gather 和 restore。专家、token、路由 lane 的顺序与串行扫描一致；六个有效路由之外的 padding 及最后一个块中超出真实 token 行数的位置均不参与分组。`tests.ascend.operators.validate_regroup --base 0` 覆盖 expert 0 的短尾，默认的 `--base 144` 覆盖中间 rank；验证包含重复路由、空专家、异常索引和改变输入后的 Graph replay。
 
-`--vector-prefix` 在 `--parallel-regroup` 上为动态 prefill 启用有界向量前缀和。扫描容量由 packet 的行数上限固定，计数及其中间和不超过 6×4096，FP32 表示保持整数精确性；单行 decode 保留原扫描。`validate_regroup --vector-prefix` 验证完整分组，`tools.operators.ascend.validate_prefix` 覆盖 4096 行上限、分组 padding、错误标志、未写尾部和改变输入后的 Graph replay。
+`--vector-prefix` 在 `--parallel-regroup` 上为动态 prefill 启用有界向量前缀和。扫描容量由 packet 的行数上限固定，计数及其中间和不超过 6×4096，FP32 表示保持整数精确性；单行 decode 保留原扫描。`validate_regroup --vector-prefix` 验证完整分组，`tests.ascend.operators.validate_prefix` 覆盖 4096 行上限、分组 padding、错误标志、未写尾部和改变输入后的 Graph replay。
 
 实验参数 `--fp32-cube` 将 prefill 的敏感投影改为三个 BF16 分量的 Cube 乘积，保留 FP32 partial 和原有归约边界。权重分量离线准备，路由输入分量由设备生成；原始 W4 专家 bank 保持单份。该路径改变浮点累加顺序，启用前需单独比较任务质量、teacher-forced 概率和状态。默认继续使用原 FP32 投影。
 
@@ -510,7 +510,7 @@ uv run --locked python -m tools.model.deepseek_v41.decoder_rows \
 
 `ORINFER_A2_LOGITS_DIR=目录` 在普通 Graph 完成后保存各 rank 的 FP32 输出头分片，文件名携带 rank、前缀位置和本次行数，重复执行覆盖同名文件。输入计划须声明 `logits` buffer；每个固定历史使用独立目录。该诊断保持原 Graph 分段，报告标记 `logits_dump: true`，耗时包含额外读回和文件写入，供概率对照使用。
 
-`tools.model.deepseek_v41.compare_logits` 用 `--reference` 指定官方 `reference` 输出目录，`--inputs` 和按位置排序的 `--cases` 指定原 prompt 加 teacher token 的完整历史，`--logits` 指定原生分片目录，`--output` 保存 NLL、argmax 和 KL。`--baseline-logits` 可同时比较同权重基线。每个 case 使用单个 prefill packet；工具核对 prompt 和 teacher 身份、历史、分片长度及有限值。少量位置的概率对照用于诊断，任务质量与长上下文仍需单独验收。
+`orinfer_build.models.deepseek_v41.compare_logits` 用 `--reference` 指定官方 `reference` 输出目录，`--inputs` 和按位置排序的 `--cases` 指定原 prompt 加 teacher token 的完整历史，`--logits` 指定原生分片目录，`--output` 保存 NLL、argmax 和 KL。`--baseline-logits` 可同时比较同权重基线。每个 case 使用单个 prefill packet；工具核对 prompt 和 teacher 身份、历史、分片长度及有限值。少量位置的概率对照用于诊断，任务质量与长上下文仍需单独验收。
 
 构建器引用原 checkpoint。离线 `prepare` 使用 NumPy、系统 C 编译器与 ARM NEON 8×8 转置，将 W4 bank、ND per-channel scale 和辅助 bias 写入物理布局文件。数值与尾部检查放在独立 CPU 测试，批量转换只执行 NEON 转置和顺序写盘。通过顺序 `pread` 读取单个专家，以有界 bank 缓冲写盘，避免对 ZFS 映射做逐字节转置。此转换保持原始 INT4 nibble，准备产物保留 W4，每卡在线仍只加载一份 W4；原 checkpoint 保留用于参考和其余张量。断点续转核对原文件的大小/mtime/inode、转换器身份、产物长度与完成标记；权重准备和在线加载均不扫描 payload 计算哈希。全部 bank 完成后原子发布准备计划，现有 AOT 与资产共享同一目录。加载前核对配置、tokenizer、Engram、AOT 库和绑定身份；设备分配使用大页优先策略及独立会话预算。
 
@@ -520,10 +520,10 @@ uv run --locked python -m tools.model.deepseek_v41.decoder_rows \
 
 Graph 分支在捕获前校验实际 buffer 字节范围的读写依赖，禁止并行分支写入重叠视图，HCCL 保持在主分支。每个 fork／join 使用独立的捕获事件，Graph 持有辅助 stream、事件、通信组和所有算子资源；改变输入后的重放属于原生验收。
 
-官方混合精度参考使用原始 FP4 专家和 FP8 主干 checkpoint。`tools.model.deepseek_v41.reference` 复用该目录的 `inference/model.py`，有界解码原始权重，保留官方激活和 KV 量化、RoPE、mHC 及 attention 的概率舍入边界。该离线工具使用软件解码后的矩阵计算；输出身份明确记录其数值路径，性能验收仍使用原生 Rust 执行器。
+官方混合精度参考使用原始 FP4 专家和 FP8 主干 checkpoint。`orinfer_build.models.deepseek_v41.reference` 复用该目录的 `inference/model.py`，有界解码原始权重，保留官方激活和 KV 量化、RoPE、mHC 及 attention 的概率舍入边界。该离线工具使用软件解码后的矩阵计算；输出身份明确记录其数值路径，性能验收仍使用原生 Rust 执行器。
 
 ```bash
-bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.reference \
+bash tools/environments/ascend/run.sh python3 -m orinfer_build.models.deepseek_v41.reference \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017 \
   --inputs artifacts/ascend-inputs.json --teacher artifacts/ascend-result.json \
   --case p1024 --positions 129 --device npu:0 \
@@ -541,7 +541,7 @@ bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.reference
 以已发布引擎、权重和执行包为冻结基线，使用固定输入 token ID 采集基线完整 logits。离线生成独立的只读诊断计划：
 
 ```bash
-uv run --locked python -m tools.model.deepseek_v41.calibration \
+uv run --locked python -m orinfer_build.models.deepseek_v41.calibration \
   --plan /path/to/installed-execution/model.json \
   --output artifacts/calibration/new-package
 
@@ -558,7 +558,7 @@ orinfer bench-ascend-batch \
 
 采集沿用原算子与权重，host 快照将分支串行化；本轮固定 B4、512 token 的验证在 strict 通信下与冻结基线完整 logits 逐位一致。默认高性能通信可能受调度及浮点求和顺序影响，应先核对采集前后的完整概率，再做误差归因。strict 用于校准的数值对齐，性能及候选质量仍回到实际部署配置验证。采集耗时不作为推理性能。
 
-`tools.quantization.activation` 提供 CPU 通用的激活统计、样本协方差加权输出误差及独立训练／保留行的 clipping 筛选。BF16→W8A8 的候选同时计入新增 A8 激活误差；权重误差与激活误差分别报告。候选 shadow 使用 FP32 scale，实际 dtype、舍入与算子边界另行验收。输入窗口、路由专家覆盖和局部输出误差只用于筛选，最终精度策略使用独立任务、固定历史 target NLL／KL 和实际请求性能选择。
+`orinfer_build.quantization.activation` 提供 CPU 通用的激活统计、样本协方差加权输出误差及独立训练／保留行的 clipping 筛选。BF16→W8A8 的候选同时计入新增 A8 激活误差；权重误差与激活误差分别报告。候选 shadow 使用 FP32 scale，实际 dtype、舍入与算子边界另行验收。输入窗口、路由专家覆盖和局部输出误差只用于筛选，最终精度策略使用独立任务、固定历史 target NLL／KL 和实际请求性能选择。
 
 ### A2 固定 W4 布局校准
 
@@ -567,12 +567,12 @@ orinfer bench-ascend-batch \
 `w4_calibration` 消费每 owner 一个 2048-token prefill 的 `p0-P3` 专家快照，使用显式 owner 列表指定局部验证会话。例如每会话两个 owner、前六个会话拟合、后两个会话验证：
 
 ```bash
-OPENBLAS_NUM_THREADS=8 uv run --locked python -m tools.model.deepseek_v41.w4_calibration \
+OPENBLAS_NUM_THREADS=8 uv run --locked python -m orinfer_build.models.deepseek_v41.w4_calibration \
   --trace artifacts/calibration/activations --output artifacts/calibration/fitted \
   --official /path/to/official-checkpoint --integer-source /path/to/ascend-checkpoint \
   --layers 23 29 30 --validation-owners 12 13 14 15 --minimum-rows 64 --workers 8
 
-uv run --locked python -m tools.model.deepseek_v41.w4_scale_release \
+uv run --locked python -m orinfer_build.models.deepseek_v41.w4_scale_release \
   --source /path/to/release --source-execution /path/to/execution-cache \
   --fitted artifacts/calibration/fitted --layers 29 --strength 0.5 \
   --output /path/to/new-weights --execution-output /path/to/new-execution-cache
@@ -584,11 +584,11 @@ uv run --locked python -m tools.model.deepseek_v41.w4_scale_release \
 
 ### A2 Q/KV 精度保护
 
-`tools.model.deepseek_v41.projection_precision` 从官方 FP4/FP8 checkpoint 恢复所选主干 Q/KV 投影，沿源 Ascend 包的 norm、QuaRot 和 SmoothQuant 基生成 BF16 权重，输入直接使用已有 BF16 norm 输出。默认选择全部 40 层的 `wq_a`、`wkv`；`--parts` 和 `--layers` 用于独立评估。主干专家、Q 后续投影、DSpark、INT8 KV 及请求状态保持源包策略。
+`orinfer_build.models.deepseek_v41.projection_precision` 从官方 FP4/FP8 checkpoint 恢复所选主干 Q/KV 投影，沿源 Ascend 包的 norm、QuaRot 和 SmoothQuant 基生成 BF16 权重，输入直接使用已有 BF16 norm 输出。默认选择全部 40 层的 `wq_a`、`wkv`；`--parts` 和 `--layers` 用于独立评估。主干专家、Q 后续投影、DSpark、INT8 KV 及请求状态保持源包策略。
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices \
-  python3 -m tools.model.deepseek_v41.projection_precision \
+bash tools/environments/ascend/run.sh --without-devices \
+  python3 -m orinfer_build.models.deepseek_v41.projection_precision \
   --source /path/to/release --source-execution /path/to/execution-cache \
   --official /path/to/official-checkpoint --integer-source /path/to/ascend-checkpoint \
   --output /path/to/new-weights --execution-output /path/to/new-execution-cache \
@@ -601,17 +601,17 @@ bash tools/operators/ascend/run.sh --without-devices \
 
 ### A2 DSpark 草稿校准
 
-DSpark 的同格式专家校准使用 `tools.model.deepseek_v41.draft_calibration`。先用公共采集器选择 `--roles target draft --layers 40 41 42`，并选择 `ffn.norm.bf16|expert.table.*|routing.indices|routing.weights|draft.*` 标签。`--expert-rows 64` 同时缩小原层标记的诊断读回。输入采用真实 anchor/noise 的显式 draft frame，以及匹配 target 历史的验证 frame；采集计划用于离线诊断。权重与性能对照使用原始执行计划。
+DSpark 的同格式专家校准使用 `orinfer_build.models.deepseek_v41.draft_calibration`。先用公共采集器选择 `--roles target draft --layers 40 41 42`，并选择 `ffn.norm.bf16|expert.table.*|routing.indices|routing.weights|draft.*` 标签。`--expert-rows 64` 同时缩小原层标记的诊断读回。输入采用真实 anchor/noise 的显式 draft frame，以及匹配 target 历史的验证 frame；采集计划用于离线诊断。权重与性能对照使用原始执行计划。
 
 ```bash
-uv run --locked python -m tools.model.deepseek_v41.draft_calibration collect \
+uv run --locked python -m orinfer_build.models.deepseek_v41.draft_calibration collect \
   --trace /path/to/native-trace --points /path/to/calibration-points.json \
   --samples /path/to/samples.json --output artifacts/draft-inputs
-bash tools/operators/ascend/run.sh --without-devices \
-  python3 -m tools.model.deepseek_v41.draft_calibration fit \
+bash tools/environments/ascend/run.sh --without-devices \
+  python3 -m orinfer_build.models.deepseek_v41.draft_calibration fit \
   --inputs artifacts/draft-inputs --output artifacts/draft-fitted \
   --official /path/to/official-checkpoint --integer-source /path/to/ascend-checkpoint
-uv run --locked python -m tools.model.deepseek_v41.draft_calibration export \
+uv run --locked python -m orinfer_build.models.deepseek_v41.draft_calibration export \
   --source /path/to/release --source-execution /path/to/execution-cache \
   --fitted artifacts/draft-fitted --output /path/to/new-weights \
   --execution-output /path/to/new-execution-cache --overlay
@@ -619,7 +619,7 @@ uv run --locked python -m tools.model.deepseek_v41.draft_calibration export \
 
 `samples.json` 的 `samples` 列表包含 `owner`、`conversation`、`split`；省略 owner 时使用列表位置。`calibration`／`fit`、`tune`／`validation` 和 `test` 分别标记拟合、候选选择及最终保留集，同一会话必须属于同一组。采集器按声明的路由几何去除 padding，保留实际 owner 与逐位置权重。当前拟合支持 DSv4.1 的三个 draft 层、128 个专家、TP8；在真实 A8 输入上联合重建 W1/W3 的 BF16 SwiGLU 与 A8 边界，仅调整已有通道 scale，整数 bank、计算程序和全部状态保持原契约。更改 scale 同步更新 nibble 偏移补偿。源 draft 保持自身坐标，使用官方解码权重作局部参考；该参考仍包含官方原始量化误差。
 
-`tools.quantization.speculative` 提供与后端无关的逐位置温度拟合和累计前缀存活评分。它按实际连续接受长度构造累计标签，以 Brier 损失选择正温度；首个拒绝后的累计零值不作为独立条件拒绝标签。该接口用于离线评估，运行时继续使用已发布的接受率反馈策略。专家局部误差、confidence 预测误差、真实接受长度及完整请求性能分别记录；局部误差下降不能代替接受率验收。
+`orinfer_build.quantization.speculative` 提供与后端无关的逐位置温度拟合和累计前缀存活评分。它按实际连续接受长度构造累计标签，以 Brier 损失选择正温度；首个拒绝后的累计零值不作为独立条件拒绝标签。该接口用于离线评估，运行时继续使用已发布的接受率反馈策略。专家局部误差、confidence 预测误差、真实接受长度及完整请求性能分别记录；局部误差下降不能代替接受率验收。
 
 ### 源码入口
 
@@ -645,13 +645,13 @@ cargo build --release --locked --offline -p orinfer-models
 在保留权重和 cubin 的情况下，重建原生库和目录：
 
 ```bash
-uv run --locked python -m tools.model.catalog \
+uv run --locked python -m orinfer_build.contracts.catalog \
   --model /path/to/prepared-model --output /path/to/rebuilt-model
 ```
 
 工具需要项目固定 Rust 工具链及已缓存的 Cargo 依赖，使用 `--locked --offline` 构建；同文件系统的不可变权重通过 hardlink 复用，模型描述和 `.so` 使用独立文件。构建输出经加载器验证后原子发布到新目录，源目录保持原样。普通在线启动直接使用已发布的二进制包。
 
-`tools.model.attach_execution` 要求替换库与原包具有**相同绑定注册表和目录身份**，并在替换前校验这些条件。更新注册模型逻辑后优先使用上述重建工具。
+`orinfer_build.packaging.attach_execution` 要求替换库与原包具有**相同绑定注册表和目录身份**，并在替换前校验这些条件。更新注册模型逻辑后优先使用上述重建工具。
 
 在线数据与包统一使用 schema 1、`catalog` 及原生绑定导出接口。离线构建输入仍可包含展开的 bindings，用于精确对照与生成 Rust 模块。
 
@@ -688,7 +688,7 @@ orinfer validate-model /path/to/prepared-model
 模型构建者使用 Python 工具生成 `.tar.xz` 执行包，供部署时安装：
 
 ```bash
-uv run --locked python -m tools.model.package archive /path/to/package /path/to/package.tar.xz
+uv run --locked python -m orinfer_build.packaging.package archive /path/to/package /path/to/package.tar.xz
 ```
 
 ## 合并发布布局
@@ -696,7 +696,7 @@ uv run --locked python -m tools.model.package archive /path/to/package /path/to/
 离线调优结束后，将 GPU 权重合并成约 2 GiB 的标准 safetensors 分片，CPU 查表按连续编码段合并。张量名称、物理布局、量化位模式及 CPU 行序保持不变；更新索引、CPU 文件偏移与身份 hash。模型目录只包含模型数据，匹配的执行包独立写入指定缓存：
 
 ```bash
-uv run --locked python -m tools.model.compact \
+uv run --locked python -m orinfer_build.packaging.compact \
   --model /path/to/prepared-model --output /path/to/compact-model \
   --package-cache ~/.cache/orinfer/packages
 orinfer validate-model /path/to/compact-model
@@ -705,7 +705,7 @@ orinfer validate-model /path/to/compact-model
 Flash Next 的正式权重发布采用稳定的组件和层组名称：主模型专家每三层一片，其余原权重每八层一片，Q4 投影、输出头、HC 无损压缩表示、MTP 和视觉各自独立；CPU 表复用已合并的连续行分片。单片上限默认为 2 GiB，超限会返回发布错误。重打包直接复用每个张量的量化字节、布局、身份和已编译 kernel：
 
 ```bash
-uv run --locked python -m tools.model.flash_next.repack \
+uv run --locked python -m orinfer_build.models.flash_next.repack \
   --model /path/to/optimized-model --output /path/to/published-model
 orinfer validate-model /path/to/published-model
 ```
@@ -723,12 +723,12 @@ orinfer validate-model /path/to/published-model
 通用加载链的 GPU 夹具可独立运行：
 
 ```bash
-bash tools/operators/run.sh tools/model/validate_model_package_gpu.py artifacts/model-package/check01
+bash tools/environments/cuda/run.sh python/orinfer_build/validation/validate_model_package_gpu.py artifacts/model-package/check01
 ```
 
 夹具验证三种 Graph 模式、输入变化和完整 logits；真实模型质量与性能另行验收。
 
-Flash Next 的当前原生包可通过 `tools/model/flash_next/build.py` 重新生成整数投影与执行包。该入口读取模型固定的架构绑定契约，按真实矩阵调优，支持内容校验与断点恢复；状态、浮点归约和联合专家组合保持输入中的已验证实现。输入须为当前原生模型并包含匹配的执行包；量化中间权重需先完成模型组装。用法见 [Flash Next 构建](../tools/model/flash_next/README.md)。
+Flash Next 的当前原生包可通过 `python/orinfer_build/models/flash_next/build.py` 重新生成整数投影与执行包。该入口读取模型固定的架构绑定契约，按真实矩阵调优，支持内容校验与断点恢复；状态、浮点归约和联合专家组合保持输入中的已验证实现。输入须为当前原生模型并包含匹配的执行包；量化中间权重需先完成模型组装。用法见 [Flash Next 构建](../tools/model/flash_next/README.md)。
 
 ### A2 文本服务与长上下文
 
@@ -737,10 +737,10 @@ Flash Next 的当前原生包可通过 `tools/model/flash_next/build.py` 重新�
 离线生成 262K 计划并发布服务目录：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.long_context \
+bash tools/environments/ascend/run.sh --without-devices python3 -m orinfer_build.models.deepseek_v41.long_context \
   --plan /path/to/prepared-int8/model.json --output artifacts/a2-long \
   --capacity 262144 --owners 32 --length-input --gather-slots 16
-python3 -m tools.model.deepseek_v41.service \
+python3 -m orinfer_build.models.deepseek_v41.service \
   --plan artifacts/a2-long/package/model.json --model-dir /path/to/original-checkpoint \
   --output artifacts/models/dsv41-a2-service
 source /usr/local/Ascend/cann/set_env.sh
@@ -775,7 +775,7 @@ A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 own
 
 DSv4.1 视觉的权重、Q/K、残差和 aligner 保持 BF16；softmax 使用 FP32，概率按当前前缀归一化后以 FP16 执行 PV，并以 FP32 累加、BF16 输出。V 先保留原始 BF16 边界，再转为 FP16；离线导出及构建依据实际 checkpoint 的 RMSNorm 和 QKV 权重证明幅值范围，超出范围时拒绝构建。同一套动态 TileLang 算子处理实际 patch 数和非对齐尾部。图缓存复用稳定输入地址；网格及二维 RoPE 由实际长宽更新。请求间将图片分配到现有 rank 并行编码，各请求的图片顺序、绝对 token 位置和视觉路由 bias 保持独立。有活动 decode 时，编码器依据实测 patch 成本和输出延迟预算合并离线声明的层段，再让出执行机会；没有 decode 时连续执行剩余层段。同一组算子和稳定地址同时用于完整执行及分段 Graph replay。冷图片按可并行编码的 rank 数组成准入批次，owner 数、显存及 decode 剩余时间仍共同约束准入。特征完成后按图片内容身份绑定请求，取消和 owner 复用不会安装旧请求的图片；关闭特征缓存时同样保留已完成的请求私有特征。prefix 身份同时包含图片内容与网格，替换图片不会复用旧图的 KV。每张图片至多 1024 个视觉 token。原生 A2 的请求图片历史按模型上下文校验，单图 encoder 容量与历史总量分开；运行时将已有包的历史总量声明提升到上下文容量，保留原算子和物理 workspace。编码只准备当前 prefill 范围内的图片，图片行消费后释放对应 owner 的特征；`image_processing` 可进一步限制图片数、像素、固定单图及合计 token 预算。
 
-视觉权重单独存放在 `vision.safetensors`，与执行库、算子和计划分开发布。该分片必须与语言权重采用相同的 Ascend 预处理基；原始 BF16 checkpoint 的 aligner 输出不能直接替换。离线导出、编译、接入和重打包分别使用 `tools.model.deepseek_v41.vision`、`vision_build`、`vision_attach` 和 `vision_release`。`validate-ascend-vision` 对完整编码器与固定 checkpoint 参考特征进行数值及耗时对照；它不代替 HTTP 图片任务和并发性能验收。设置 `ORINFER_A2_VISION_PROFILE=1` 可记录每轮图片分配、上传、编码、读回和 Graph 复用耗时。
+视觉权重单独存放在 `vision.safetensors`，与执行库、算子和计划分开发布。该分片必须与语言权重采用相同的 Ascend 预处理基；原始 BF16 checkpoint 的 aligner 输出不能直接替换。离线导出、编译、接入和重打包分别使用 `orinfer_build.models.deepseek_v41.vision`、`vision_build`、`vision_attach` 和 `vision_release`。`validate-ascend-vision` 对完整编码器与固定 checkpoint 参考特征进行数值及耗时对照；它不代替 HTTP 图片任务和并发性能验收。设置 `ORINFER_A2_VISION_PROFILE=1` 可记录每轮图片分配、上传、编码、读回和 Graph 复用耗时。
 
 `vision_build --source CONFIG_DIR --weights PREPARED_VISION_DIR --output BUILD_DIR` 在离线 CANN 9.2 / TileLang 环境构建编码器；`--weights` 提供已导出的视觉分片以分析 V 的数值范围。对已有视觉计划运行 `vision_attach` 时，前端与 VL 路由契约须保持相同；工具替换视觉程序，按既有 source/decoder 行域重绑图片 mask，并复用已验证的语言算术组件。`--workspace-slots` 在离线阶段选择持久任务数和 attention scratch 容量，按目标设备及多个图像长度测量后只发布选中的配置；它对所有实际 patch 行数共用。发布重打包只保留最终计划引用的算子资产。
 
@@ -788,26 +788,26 @@ DSv4.1 视觉的权重、Q/K、残差和 aligner 保持 BF16；softmax 使用 FP
 已有 A2 模型使用以下离线命令生成新前端目录。新旧目录须位于同一文件系统；权重和现有资产使用硬链接，模板和描述原子替换，执行包 digest 保持不变。旧目录保留用于回滚；正常加载不增加权重哈希扫描：
 
 ```bash
-uv run --locked python -m tools.model.deepseek_v41.service --frontend-only \
+uv run --locked python -m orinfer_build.models.deepseek_v41.service --frontend-only \
   --model-dir /path/to/current-model --output /path/to/model-with-dsml
 ```
 
 共享 KV 回收事件按完成顺序计入一次请求统计；evictions、host_stores 和 host_evictions 汇总时不会被并发请求的私有统计覆盖。这些共享缓存事件不表示完成请求自身的 KV 被逐出。
 
-DSpark 包复用 target 的动态行验证程序和整数投影。三个 draft 层使用同一动态行计算体，Markov head 依次生成候选。默认构建容量为 5；`tools.model.deepseek_v41.dspark --block-size 16` 可发布容量 16 和实际 5／8／16 行的轻量程序别名。别名共享投影、attention 和 Markov 算子，仅改变实际噪声行数及执行的 Markov 前缀。Markov 边界使用同源动态搬运模板将实际行写入固定 stride workspace。Ascend checkpoint 的 target 使用 QuaRot 坐标，draft 使用独立的原始坐标 embedding 与输出头；main_proj 已离线包含 target 坐标到 draft 坐标的变换。target 37／38／39 层的 attention 输入按 HC 分支取均值；token 分片从真实局部 residual 收集三个特征段，再用一次 AllGather 恢复原行序，投影后更新各 owner 的 draft SWA。Markov 加偏置与分块 argmax 融合，8 卡交换小候选。draft KV 使用 group-64 INT8 和 FP16 scale，逻辑窗口为 128，物理历史环为 256 行；噪声 KV 保持独立的 128 行 bank。最多 32 行验证保留完整已确认历史，公共 journal 自动跳过不覆盖历史的写入，拒绝后按接受长度截断。旧 128 行执行包继续使用原 journal 语义。验证返回每个位置的 target 输出；提交保留已接受的写入，并恢复被拒绝候选覆盖的有效窗口槽位。C2 的 32 槽环只读取相邻历史位置，通过逻辑长度保留正确前缀。
+DSpark 包复用 target 的动态行验证程序和整数投影。三个 draft 层使用同一动态行计算体，Markov head 依次生成候选。默认构建容量为 5；`orinfer_build.models.deepseek_v41.dspark --block-size 16` 可发布容量 16 和实际 5／8／16 行的轻量程序别名。别名共享投影、attention 和 Markov 算子，仅改变实际噪声行数及执行的 Markov 前缀。Markov 边界使用同源动态搬运模板将实际行写入固定 stride workspace。Ascend checkpoint 的 target 使用 QuaRot 坐标，draft 使用独立的原始坐标 embedding 与输出头；main_proj 已离线包含 target 坐标到 draft 坐标的变换。target 37／38／39 层的 attention 输入按 HC 分支取均值；token 分片从真实局部 residual 收集三个特征段，再用一次 AllGather 恢复原行序，投影后更新各 owner 的 draft SWA。Markov 加偏置与分块 argmax 融合，8 卡交换小候选。draft KV 使用 group-64 INT8 和 FP16 scale，逻辑窗口为 128，物理历史环为 256 行；噪声 KV 保持独立的 128 行 bank。最多 32 行验证保留完整已确认历史，公共 journal 自动跳过不覆盖历史的写入，拒绝后按接受长度截断。旧 128 行执行包继续使用原 journal 语义。验证返回每个位置的 target 输出；提交保留已接受的写入，并恢复被拒绝候选覆盖的有效窗口槽位。C2 的 32 槽环只读取相邻历史位置，通过逻辑长度保留正确前缀。
 
 `--mtp-drafts` 在执行包容量内设置上限，`0` 使用普通 decode；默认使用执行包中最短的草稿块。容量 16 的共享包默认 5，显式 `--mtp-drafts 16` 启用更大范围的动态选择；需用同一 agent 回放确认收益。A2 当前 C2 状态恢复最多容纳含 anchor 的 32 行，因此候选上限为 31；更高配置在加载时拒绝。DSpark 支持纯 decode 及混合 prefill／验证轮次。公共 packet 选择器先为 decoder 预留验证行，再将剩余 token 预算分配给 prefill，保留 checkpoint 与末尾窗口边界；decoder 返回所有验证位置，完成 prefill 的 owner 只返回末位置。journal 只保护 decoder owner，新输入的状态按公共提交流程保存。draft 与纯验证沿用 decode 的 Graph 提升时机，混合轮次保留 prefill 的捕获摊销门槛。策略分别记录并发、完整 logits、混合模式和物理草稿块的成本；Graph 准备成本按剩余输出摊销，验证挤占的 prefill 工作计入代价；默认范围沿用共同深度选择以复用热态 Graph；显式提高上限后，根据较早置信度选择总验证行预算，再以各请求最新置信度分配不同深度。两种分配分别累计成本并共享执行模板。请求反馈按物理草稿块隔离，随 owner 释放；模型状态和 prefix 身份保持独立。各块先采集直跑、捕获与热态样本，普通 decode 定期补充基线；上下文与剩余输出限制实际候选数，并遵守 `--max-speculative-tokens` 验证行预算。当前 proposer 对 Markov 分数取确定性候选；采样、惩罚和约束请求复用 target 的拒绝采样与正残差纠偏，q 使用该确定性候选的点质量分布。
 
 离线输入是已发布的 target 模型、对应执行包和包含 `mtp.*` 的 Ascend 转换 checkpoint。构建复用公共 A2 算子与 owner 包装器；导出只增加三个 draft 层的 rank 分片与共享分片，原 target 分片保持字节并复用硬链接。已有 DSpark 包调整容量时，按 rank、tensor 语义及物理几何绑定现有 draft bank，仅重建执行资产。W4 转置 NZ、norm 的 FP32 展开和全部物理 tensor 均在离线完成。权重与执行包写入不同目录：
 
 ```bash
-ORINFER_ASCEND_MODEL_ROOT=/data bash tools/operators/ascend/run.sh --without-devices \
-  python3 -m tools.model.deepseek_v41.dspark \
+ORINFER_ASCEND_MODEL_ROOT=/data bash tools/environments/ascend/run.sh --without-devices \
+  python3 -m orinfer_build.models.deepseek_v41.dspark \
   --base-plan artifacts/execution-packages/BASE_DIGEST/model.json \
   --base-model /data/model/TARGET_MODEL \
   --checkpoint /data/models/ASCEND_CHECKPOINT \
   --output artifacts/dspark/build/model.json --workers 16
-uv run --locked python -m tools.model.deepseek_v41.dspark_export \
+uv run --locked python -m orinfer_build.models.deepseek_v41.dspark_export \
   --plan artifacts/dspark/build/model.json --base-model /data/model/TARGET_MODEL \
   --checkpoint /data/models/ASCEND_CHECKPOINT --output /data/model/DSPARK_MODEL \
   --execution-output artifacts/execution-packages/dspark
@@ -822,7 +822,7 @@ ORINFER_EXECUTION_CACHE="$PWD/artifacts/execution-packages/dspark" \
 在 Ascend 离线编译环境中，已有 DSpark 执行包可通过下列入口调整物理历史环；工具同时重建 warm 写入与 draft 读取的现有算子，固定 128 行读窗口和噪声 bank，保留全部权重：
 
 ```bash
-python3 -m tools.model.deepseek_v41.dspark_state \
+python3 -m orinfer_build.models.deepseek_v41.dspark_state \
   --plan artifacts/dspark/package/model.json \
   --model-dir /data/model/deepseek-v41-a2 \
   --output artifacts/dspark/history256 --storage-rows 256 --workers 4
@@ -830,7 +830,7 @@ python3 -m tools.model.deepseek_v41.dspark_state \
 
 DSpark 需要本次引擎及配套执行包；v0.3.0 target 包继续使用普通 decode。构建和发布保持 schema 1，正常加载执行结构与范围检查，内容完整性使用独立 `validate-model` 命令。
 
-发布阶段使用 `python -m tools.model.deepseek_v41.publication --source PACKAGE_DIR --output-cache OUTPUT_CACHE` 整理已有执行包。导出与整理共用引用收集流程，只保留计划引用的算子与资产，并保留许可证；算子库移除静态符号表，逐库比较所有运行时段及设备代码字节；计划采用紧凑 JSON，重新固定库与包身份，权重 payload 保持原样。
+发布阶段使用 `python -m orinfer_build.models.deepseek_v41.publication --source PACKAGE_DIR --output-cache OUTPUT_CACHE` 整理已有执行包。导出与整理共用引用收集流程，只保留计划引用的算子与资产，并保留许可证；算子库移除静态符号表，逐库比较所有运行时段及设备代码字节；计划采用紧凑 JSON，重新固定库与包身份，权重 payload 保持原样。
 
 已有动态 target 家族的选择边界可通过 `--packet-boundary OLD NEW --model-dir MODEL_DIR` 离线调整。例如 `--packet-boundary 512 128` 让原有 query／序列分片模板从 128 个聚合 token 行开始执行。整理器要求各 rank 的两个家族相邻、容量及覆盖范围一致，保留两侧完整程序、算子与请求状态绑定，再校验动态行表达式及物理范围。新包的 digest 需同步写入模型描述。边界按完整请求测量选择；此操作复用已编译的动态算子。
 
@@ -854,7 +854,7 @@ A2 的 Engram CPU 行表使用共 2 GiB 的跨 packet 行缓存，由各 rank �
 私有算子的离线调度重建可直接复用已编译计划：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.private_schedule \
+bash tools/environments/ascend/run.sh --without-devices python3 -m orinfer_build.models.deepseek_v41.private_schedule \
   --plan /path/to/native-batch/model.json --output artifacts/a2-kv-schedule \
   --operator kv_int8.gather_attention --parameters '{"tile_slots":16,"bulk_store":true}'
 ```
@@ -868,11 +868,11 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 Cube PV 的输出列 tile 通过同一算子工厂与离线测量选择。下面的验证对照原 32 维 tile，检查完整输出、FP32 workspace、反向 owner、原地址数据改变和 Graph replay；测量覆盖连续 1–128 行、容量上限及常见大分块两侧：
 
 ```bash
-bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate_private_rows \
+bash tools/environments/ascend/run.sh python3 -m tests.ascend.operators.validate_private_rows \
   --output PV_TUNING --op attention_cube.pv --owners 3 --rows 1 17 129 \
   --pv-tile-d 32 64 128 256 \
   --benchmark-rows {1..129} 255 256 257 511 512 513 799 800 801 1023 1024 1025 2047 2048
-bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.private_schedule \
+bash tools/environments/ascend/run.sh --without-devices python3 -m orinfer_build.models.deepseek_v41.private_schedule \
   --plan PLAN --output OUTPUT --operator attention_cube.pv \
   --tuning-record PV_TUNING/result.json --tuning-parameter tile_d --maximum-regression 0.1
 ```
@@ -884,7 +884,7 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 已收敛的 DSv4.1 计划可分片上传 embedding 列，并融合四路 mHC 展开：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.embedding_columns \
+bash tools/environments/ascend/run.sh --without-devices python3 -m orinfer_build.models.deepseek_v41.embedding_columns \
   --plan PLAN --output artifacts/a2-embedding-columns --compile-workers 4
 ```
 
@@ -893,7 +893,7 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 owner-private 计划可复用查询行分片构建器：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.shard_indexer \
+bash tools/environments/ascend/run.sh --without-devices python3 -m orinfer_build.models.deepseek_v41.shard_indexer \
   --plan PLAN --output artifacts/a2-query-partition --compile-workers 4
 ```
 
@@ -904,7 +904,7 @@ bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deep
 完整 attention 可继续沿用查询分片，并复用现有 Cube QK、softmax、PV 和私有 KV gather 工厂：
 
 ```bash
-bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.query_attention \
+bash tools/environments/ascend/run.sh --without-devices python3 -m orinfer_build.models.deepseek_v41.query_attention \
   --plan QUERY_PARTITIONED_PLAN --output artifacts/a2-query-attention \
   --min-rows 512 --pv-tile-d 256 --compile-workers 4
 ```

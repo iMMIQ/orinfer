@@ -1,0 +1,1042 @@
+//! Thread-affine TP workers shared by benchmarks and continuous generation.
+use super::{
+    Model, SharedTables, Worker, affinity,
+    batch::{CacheState, Layout},
+    load_spec,
+};
+use crate::backend::ascend::{
+    hccl::RootInfo,
+    runtime::{Limits, Session},
+};
+use crate::{artifact::Result, error::EngineError};
+mod channel;
+mod host_release;
+mod preparation;
+use channel::{Peer, Transport, reply_channel};
+pub(super) use preparation::{CaptureBudget, capture_credit, capture_interval};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::{Arc, mpsc},
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone)]
+pub(super) enum Command {
+    Admit(Vec<usize>),
+    BeginImages(Arc<Vec<crate::vision::ImageInput>>),
+    AdvanceImages(usize),
+    CancelImages,
+    InstallImages(usize, Arc<Vec<super::vision::Span>>),
+    Limit(usize, usize),
+    GrowCached(Layout),
+    OwnerRequirement(usize, usize),
+    Reset(Vec<usize>),
+    Release(Option<usize>),
+    Cached(Layout),
+    Invalidate(Layout),
+    Prepare(Layout, bool),
+    Shared(Layout),
+    CaptureShared(Layout, String),
+    Forward(Layout, Vec<Vec<u32>>, Readout, Option<bool>, Vec<String>),
+    BeginVerification(Vec<(usize, usize)>),
+    RollbackVerification(Vec<(usize, usize)>),
+    EndVerification,
+    Save {
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    },
+    Restore {
+        owner: usize,
+        snapshot: u64,
+    },
+    Evict(u64),
+    Offload(u64),
+    PlanOffload(u64),
+    SaveHost {
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    },
+    PlanHost {
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    },
+    Budget(super::memory::Requirement),
+    Reclaim,
+    PlanSnapshot {
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    },
+    RoutingGroups(bool),
+    Stop,
+}
+pub(super) enum Reply {
+    Ready,
+    Image(Option<super::vision::Encoded>),
+    Cached(CacheState),
+    Outputs(Vec<Output>, bool),
+    Shared(Vec<super::shared::State>),
+    Allocations(BTreeMap<u64, usize>),
+    RoutingGroups(Vec<RoutingGroup>),
+    Capacity(bool),
+    Requirement(super::memory::Requirement),
+}
+#[derive(serde::Serialize)]
+pub(super) struct RoutingGroup {
+    pub buffer: String,
+    pub counts: Vec<i64>,
+}
+#[derive(Clone)]
+pub(super) struct Output {
+    pub owner: usize,
+    pub token: u32,
+    pub value: f32,
+    pub logits: Vec<f32>,
+}
+#[derive(Clone, Default)]
+pub(super) struct Readout {
+    pub full: bool,
+    pub draws: BTreeMap<usize, crate::backend::ascend::sampling::Draw>,
+    /// None retains the benchmark/legacy full-packet diagnostic contract.
+    pub full_owners: Option<BTreeSet<usize>>,
+}
+impl From<bool> for Readout {
+    fn from(full: bool) -> Self {
+        Self {
+            full,
+            ..Self::default()
+        }
+    }
+}
+impl Readout {
+    pub fn wants_logits(&self, owner: usize) -> bool {
+        self.full
+            && self
+                .full_owners
+                .as_ref()
+                .is_none_or(|owners| owners.contains(&owner))
+    }
+    pub fn logit_ranges(
+        &self,
+        outputs: impl Iterator<Item = (usize, usize)>,
+    ) -> Vec<std::ops::Range<usize>> {
+        let mut ranges: Vec<std::ops::Range<usize>> = vec![];
+        for (row, owner) in outputs {
+            if self.wants_logits(owner) {
+                if let Some(last) = ranges.last_mut()
+                    && last.end == row
+                {
+                    last.end += 1;
+                } else {
+                    ranges.push(row..row + 1);
+                }
+            }
+        }
+        ranges
+    }
+    pub fn controls(&self, layout: &Layout) -> Result<Vec<[i32; 3]>> {
+        if self.draws.keys().any(|owner| self.wants_logits(*owner)) {
+            return Err("An owner cannot request sampled and raw outputs together".into());
+        }
+        let mut positions = BTreeMap::<usize, usize>::new();
+        layout
+            .outputs
+            .iter()
+            .map(|&lane| {
+                let slot = layout.segments[lane].slot;
+                let position = positions.entry(slot).or_default();
+                let value = self
+                    .draws
+                    .get(&slot)
+                    .map(|d| d.control(*position))
+                    .transpose()?
+                    .unwrap_or([0; 3]);
+                *position += 1;
+                Ok(value)
+            })
+            .collect()
+    }
+}
+pub(super) struct Team {
+    peers: Transport,
+    graphs_enabled: bool,
+    handles: Vec<JoinHandle<()>>,
+    pub model: Arc<Model>,
+    pub load_s: f64,
+    pub rows: usize,
+    pub verification_rows: usize,
+    pub draft_blocks: Vec<usize>,
+    pub strided_draft: bool,
+    // Drop worker contexts and communication groups before the bootstrap context.
+    _bootstrap: Option<Session>,
+    host_tables: Option<Arc<SharedTables>>,
+}
+
+/// Execution mode and preparation are measured separately; direct is a valid steady path.
+pub(super) struct Timing {
+    pub seconds: f64,
+    pub preparation: f64,
+    pub replay: bool,
+    pub setup: f64,
+    pub shared: bool,
+    pub shared_setup: f64,
+}
+impl Team {
+    pub fn load(plan: &Path, model_dir: &Path) -> Result<Self> {
+        Self::load_with_drafts(plan, model_dir, None, true)
+    }
+    pub fn load_with_drafts(
+        plan: &Path,
+        model_dir: &Path,
+        requested: Option<usize>,
+        graphs_enabled: bool,
+    ) -> Result<Self> {
+        let model_dir = model_dir
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let (mut model, package, layout) = load_spec(plan, &model_dir)?;
+        if model.batch.is_none() {
+            return Err("A2 service requires a native rows plan".into());
+        }
+        let draft_capacity = model.ranks[0]
+            .packets
+            .iter()
+            .filter(|p| p.role == super::PacketRole::Draft)
+            .filter_map(|p| p.coordinates.draft_block)
+            .max()
+            .unwrap_or(0);
+        if requested.is_some_and(|limit| limit > draft_capacity) {
+            return Err("Requested A2 drafts exceed the execution package capacity".into());
+        }
+        let mut draft_blocks = model.ranks[0]
+            .packets
+            .iter()
+            .filter(|p| p.role == super::PacketRole::Draft)
+            .filter_map(|p| p.coordinates.draft_block)
+            .collect::<Vec<_>>();
+        draft_blocks.sort_unstable();
+        draft_blocks.dedup();
+        let strided_draft = model.ranks[0]
+            .packets
+            .iter()
+            .any(|p| p.draft_stride.is_some());
+        let rows = model.ranks[0]
+            .packets
+            .iter()
+            .filter(|p| p.role == super::PacketRole::Target && !p.batch_decode)
+            .map(|p| p.rows)
+            .max()
+            .ok_or("Missing A2 prefill rows")?;
+        let verification_rows = model.ranks[0]
+            .packets
+            .iter()
+            .filter(|p| p.role == super::PacketRole::Target && !p.batch_decode)
+            .filter(|p| {
+                p.body
+                    .iter()
+                    .any(|step| matches!(step, super::Instruction::Exchange { .. }))
+            })
+            .map(|p| p.min_rows.saturating_sub(1))
+            .min()
+            .unwrap_or(rows);
+        let verification_rows = model
+            .batch
+            .as_ref()
+            .ok_or("Missing batch contract")?
+            .verification_rows(verification_rows, rows)?;
+        let timeout = channel::command_timeout(
+            std::env::var("ORINFER_A2_COMMAND_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        )?;
+        let ranks = std::mem::take(&mut model.ranks);
+        let snapshots = std::env::var_os("ORINFER_A2_BATCH_TRACE").is_some();
+        let cpus = affinity::from_env(ranks.len())?;
+        let started = Instant::now();
+        let bootstrap = Session::new(0, Limits::default())?;
+        let root = RootInfo::new(&bootstrap, ranks.len() as u32)?;
+        let shared = Arc::new(SharedTables::new());
+        let model = Arc::new(model);
+        let mut team = Self {
+            peers: Transport::new(timeout),
+            graphs_enabled,
+            handles: vec![],
+            model: Arc::clone(&model),
+            load_s: 0.,
+            rows,
+            verification_rows,
+            draft_blocks,
+            strided_draft,
+            _bootstrap: Some(bootstrap),
+            host_tables: Some(shared),
+        };
+        // One shared CPU load owns no ACL handles. Join it with rank workers
+        // on every startup/teardown path, including partial rank failures.
+        let table_shared = Arc::clone(team.host_tables.as_ref().unwrap());
+        let table_dir = model_dir.to_owned();
+        let table_index = model.index.file.clone();
+        let table_layout = layout.clone();
+        team.handles.push(
+            std::thread::Builder::new()
+                .name("orinfer-a2-tables".into())
+                .spawn(move || {
+                    table_shared.get_or_init(|| {
+                        super::load::tables(&table_dir, &table_index, &table_layout)
+                    });
+                })
+                .map_err(|e| e.to_string())?,
+        );
+        for rank in ranks {
+            let cpus = cpus.as_ref().map(|v| v[rank.rank as usize].clone());
+            let root = root.clone();
+            let shared = Arc::clone(team.host_tables.as_ref().unwrap());
+            let model = Arc::clone(&model);
+            let package = package.clone();
+            let layout = layout.clone();
+            let model_dir = model_dir.to_owned();
+            let (send, commands) = mpsc::channel();
+            let (reply, receive) = reply_channel();
+            let index = rank.rank;
+            let handle = std::thread::Builder::new()
+                .name(format!("orinfer-a2-{index}"))
+                .spawn(move || {
+                    let result = (|| {
+                        if let Some(cpus) = cpus.as_deref() {
+                            affinity::apply(cpus)?;
+                        }
+                        let session = Session::new(
+                            index,
+                            Limits {
+                                device_bytes: 58 << 30,
+                                pinned_bytes: 64 << 20,
+                                timeout_ms: timeout.as_millis() as i32,
+                            },
+                        )?;
+                        session.set_graphs_enabled(graphs_enabled);
+                        Worker::load(
+                            session, &root, rank, &model, &model_dir, &package, layout, snapshots,
+                            &shared,
+                        )
+                    })();
+                    // Keep the table owner on Team, rather than extending its
+                    // lifetime through the rank closure's native destructors.
+                    drop(shared);
+                    let mut worker = match result {
+                        Ok(worker) => worker,
+                        Err(error) => {
+                            let _ = reply.send(Err(EngineError::take(error, true)));
+                            return;
+                        }
+                    };
+                    if reply.send(Ok(Reply::Ready)).is_err() {
+                        return;
+                    }
+                    let mut snapshots = BTreeMap::new();
+                    let mut lineage = BTreeMap::new();
+                    let mut host_snapshots = BTreeMap::new();
+                    let mut host_pool = super::state::HostPool::default();
+                    let mut journal = BTreeMap::new();
+                    let mut journal_pool = BTreeMap::new();
+                    while let Ok(command) = commands.recv() {
+                        let result = match command {
+                            Command::Stop => break,
+                            Command::BeginVerification(owners) => {
+                                journal.clear();
+                                let mut copies = vec![];
+                                owners
+                                    .into_iter()
+                                    .try_for_each(|(id, rows)| {
+                                        journal.insert(
+                                            id,
+                                            worker.save_mutable(
+                                                id,
+                                                rows,
+                                                journal_pool.remove(&id),
+                                                &mut copies,
+                                            )?,
+                                        );
+                                        Ok(())
+                                    })
+                                    .and_then(|_| {
+                                        if !copies.is_empty() {
+                                            worker.session.copy_many(&copies)?.wait()?;
+                                        }
+                                        Ok(Reply::Ready)
+                                    })
+                            }
+                            Command::RollbackVerification(owners) => {
+                                let mut copies = vec![];
+                                owners
+                                    .into_iter()
+                                    .try_for_each(|(id, keep)| {
+                                        worker.restore_mutable(
+                                            id,
+                                            journal
+                                                .get(&id)
+                                                .ok_or("Missing DSpark state journal")?,
+                                            keep,
+                                            &mut copies,
+                                        )
+                                    })
+                                    .and_then(|_| {
+                                        if !copies.is_empty() {
+                                            worker.session.copy_many(&copies)?.wait()?;
+                                        }
+                                        Ok(Reply::Ready)
+                                    })
+                            }
+                            Command::EndVerification => {
+                                journal_pool.append(&mut journal);
+                                Ok(Reply::Ready)
+                            }
+                            Command::Budget(requirement) => worker
+                                .available_memory()
+                                .map(|m| Reply::Capacity(requirement.fits(m.0, m.1))),
+                            Command::Reclaim => worker.evict_batch_program().map(Reply::Capacity),
+                            Command::PlanSnapshot {
+                                owner,
+                                snapshot,
+                                complete,
+                            } => {
+                                let parent = lineage.get(&owner).and_then(|id| snapshots.get(id));
+                                worker
+                                    .plan_owner_snapshot(owner, complete, snapshot, parent)
+                                    .map(Reply::Allocations)
+                            }
+                            Command::PlanHost {
+                                owner,
+                                snapshot,
+                                complete,
+                            } => {
+                                let parent =
+                                    lineage.get(&owner).and_then(|id| host_snapshots.get(id));
+                                worker
+                                    .plan_host_snapshot(owner, complete, snapshot, parent)
+                                    .map(Reply::Allocations)
+                            }
+                            Command::SaveHost {
+                                owner,
+                                snapshot,
+                                complete,
+                            } => {
+                                let parent =
+                                    lineage.get(&owner).and_then(|id| host_snapshots.get(id));
+                                worker
+                                    .save_host_snapshot(
+                                        owner,
+                                        complete,
+                                        snapshot,
+                                        parent,
+                                        &mut host_pool,
+                                    )
+                                    .map(|saved| {
+                                        let allocations = saved.allocations();
+                                        host_snapshots.insert(snapshot, saved);
+                                        lineage.insert(owner, snapshot);
+                                        Reply::Allocations(allocations)
+                                    })
+                            }
+                            Command::PlanOffload(id) => snapshots
+                                .get(&id)
+                                .ok_or_else(|| "Missing A2 offload plan".into())
+                                .map(|s: &super::state::Snapshot| {
+                                    Reply::Allocations(s.host_allocations())
+                                }),
+                            Command::Offload(id) => snapshots
+                                .get(&id)
+                                .ok_or_else(|| "Missing A2 offload snapshot".into())
+                                .and_then(|saved| {
+                                    super::state::HostSnapshot::offload(
+                                        &worker.session,
+                                        saved,
+                                        &mut host_pool,
+                                    )
+                                })
+                                .map(|saved| {
+                                    host_snapshots.insert(id, saved);
+                                    snapshots.remove(&id);
+                                    Reply::Ready
+                                }),
+                            Command::InstallImages(owner, spans) => worker
+                                .batch
+                                .as_mut()
+                                .ok_or_else(|| "Missing batch runtime".to_owned())
+                                .and_then(|batch| {
+                                    batch
+                                        .owners
+                                        .get_mut(&owner)
+                                        .ok_or_else(|| "Missing image owner".to_owned())
+                                })
+                                .map(|owner| {
+                                    owner.vision = spans;
+                                    Reply::Ready
+                                }),
+                            Command::BeginImages(images) => {
+                                match images.get(worker.rank as usize) {
+                                    Some(image) => worker
+                                        .vision
+                                        .as_mut()
+                                        .ok_or_else(|| "Missing native vision encoder".to_owned())
+                                        .and_then(|encoder| encoder.begin(&worker.session, image))
+                                        .map(|()| Reply::Ready),
+                                    None => Ok(Reply::Ready),
+                                }
+                            }
+                            Command::AdvanceImages(segments) => worker
+                                .vision
+                                .as_mut()
+                                .ok_or_else(|| "Missing native vision encoder".to_owned())
+                                .and_then(|encoder| encoder.advance(&worker.session, segments))
+                                .map(Reply::Image),
+                            Command::CancelImages => {
+                                if let Some(encoder) = &mut worker.vision {
+                                    encoder.cancel();
+                                }
+                                Ok(Reply::Ready)
+                            }
+                            Command::Admit(ids) => worker.admit(&ids).map(|_| Reply::Ready),
+                            Command::Limit(id, tokens) => {
+                                worker.limit_owner(id, tokens).map(|_| Reply::Ready)
+                            }
+                            Command::GrowCached(layout) => worker
+                                .grow_batch(&layout)
+                                .and_then(|()| worker.batch_cached(&layout))
+                                .map(Reply::Cached),
+                            Command::OwnerRequirement(tokens, reserve) => worker
+                                .owner_requirement(tokens, reserve)
+                                .map(Reply::Requirement),
+                            Command::Reset(ids) => ids
+                                .into_iter()
+                                .try_for_each(|id| {
+                                    journal_pool.remove(&id);
+                                    journal.remove(&id);
+                                    lineage.remove(&id);
+                                    worker.reset_owner(id)
+                                })
+                                .map(|_| Reply::Ready),
+                            Command::Release(None) => {
+                                journal_pool.clear();
+                                journal.clear();
+                                lineage.clear();
+                                worker.release_owners().map(|_| Reply::Ready)
+                            }
+                            Command::Release(Some(owner)) => {
+                                journal_pool.remove(&owner);
+                                journal.remove(&owner);
+                                lineage.remove(&owner);
+                                worker.release_owner(owner).map(|_| Reply::Ready)
+                            }
+                            Command::Cached(layout) => {
+                                worker.batch_cached(&layout).map(Reply::Cached)
+                            }
+                            Command::Invalidate(layout) => {
+                                worker.invalidate_batch(&layout).map(|_| Reply::Ready)
+                            }
+                            Command::Prepare(layout, capture) => {
+                                worker.prepare_batch(&layout, capture).map(|_| Reply::Ready)
+                            }
+                            Command::Shared(layout) => {
+                                worker.shared_state(&layout).map(Reply::Shared)
+                            }
+                            Command::CaptureShared(layout, id) => {
+                                worker.capture_shared(&layout, &id).map(Reply::Shared)
+                            }
+                            Command::Forward(layout, tokens, readout, cached, shared) => cached
+                                .map_or(Ok(()), |capture| worker.prepare_batch(&layout, capture))
+                                .and_then(|()| worker.select_shared(&layout, &shared))
+                                .and_then(|()| worker.forward_batch(&layout, &tokens, &readout))
+                                .map(|values| {
+                                    Reply::Outputs(
+                                        values
+                                            .into_iter()
+                                            .map(|(owner, best, logits)| Output {
+                                                owner,
+                                                token: best.token,
+                                                value: best.value,
+                                                logits,
+                                            })
+                                            .collect(),
+                                        !shared.is_empty(),
+                                    )
+                                }),
+                            Command::Save {
+                                owner,
+                                snapshot,
+                                complete,
+                            } => {
+                                let parent = lineage.get(&owner).and_then(|id| snapshots.get(id));
+                                worker
+                                    .save_owner(owner, complete, snapshot, parent)
+                                    .map(|saved| {
+                                        let allocations = saved.allocations();
+                                        snapshots.insert(snapshot, saved);
+                                        lineage.insert(owner, snapshot);
+                                        Reply::Allocations(allocations)
+                                    })
+                            }
+                            Command::Restore { owner, snapshot } => {
+                                let restored = if let Some(saved) = snapshots.get(&snapshot) {
+                                    worker.restore_owner(owner, saved)
+                                } else if let Some(saved) = host_snapshots.get(&snapshot) {
+                                    worker.restore_host_snapshot(owner, saved)
+                                } else {
+                                    Err("Missing A2 prefix snapshot".into())
+                                };
+                                restored.map(|_| {
+                                    lineage.insert(owner, snapshot);
+                                    Reply::Ready
+                                })
+                            }
+                            Command::Evict(snapshot) => {
+                                snapshots.remove(&snapshot);
+                                host_snapshots.remove(&snapshot);
+                                lineage.retain(|_, id| *id != snapshot);
+                                Ok(Reply::Ready)
+                            }
+                            Command::RoutingGroups(decode) => {
+                                worker.routing_groups(decode).map(Reply::RoutingGroups)
+                            }
+                        };
+                        let result = result.map_err(|error| EngineError::take(error, true));
+                        let failed = result.is_err();
+                        if let Err(error) = &result {
+                            eprintln!("A2 rank {index}: {error}");
+                        }
+                        if reply.send(result).is_err() || failed {
+                            break;
+                        }
+                    }
+                    let _ = worker.session.synchronize();
+                })
+                .map_err(|error| error.to_string())?;
+            team.handles.push(handle);
+            team.peers.push(Peer { send, receive });
+        }
+        let ready = team.peers.receive(Duration::from_secs(1800))?;
+        if ready.iter().any(|reply| !matches!(reply, Reply::Ready)) {
+            return Err("Invalid A2 startup reply".into());
+        }
+        team.load_s = started.elapsed().as_secs_f64();
+        Ok(team)
+    }
+    pub fn exchange(&self, command: Command) -> Result<Vec<Reply>> {
+        exchange(&self.peers, command)
+    }
+    pub fn forward(
+        &self,
+        layout: Layout,
+        tokens: Vec<Vec<u32>>,
+        full: bool,
+    ) -> Result<(Vec<Output>, f64, f64)> {
+        forward(&self.peers, layout, tokens, full, self.graphs_enabled)
+    }
+    pub fn forward_with(
+        &self,
+        layout: Layout,
+        tokens: Vec<Vec<u32>>,
+        readout: impl Into<Readout>,
+        budget: Option<CaptureBudget>,
+        maintenance: impl FnOnce(),
+    ) -> Result<(Vec<Output>, Timing)> {
+        forward_with(
+            &self.peers,
+            layout,
+            tokens,
+            readout.into(),
+            budget,
+            maintenance,
+            self.graphs_enabled,
+        )
+    }
+
+    pub fn offload_allocations(&self, id: u64) -> Result<BTreeMap<u64, usize>> {
+        self.allocations(Command::PlanOffload(id))
+    }
+    pub fn ranks(&self) -> usize {
+        self.peers.iter().count()
+    }
+    pub fn host_allocations(
+        &self,
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+        plan: bool,
+    ) -> Result<BTreeMap<u64, usize>> {
+        self.allocations(if plan {
+            Command::PlanHost {
+                owner,
+                snapshot,
+                complete,
+            }
+        } else {
+            Command::SaveHost {
+                owner,
+                snapshot,
+                complete,
+            }
+        })
+    }
+    pub fn snapshot_allocations(
+        &self,
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    ) -> Result<BTreeMap<u64, usize>> {
+        self.allocations(Command::Save {
+            owner,
+            snapshot,
+            complete,
+        })
+    }
+    pub fn plan_snapshot_allocations(
+        &self,
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    ) -> Result<BTreeMap<u64, usize>> {
+        self.allocations(Command::PlanSnapshot {
+            owner,
+            snapshot,
+            complete,
+        })
+    }
+    pub fn has_budget(&self, requirement: super::memory::Requirement) -> Result<bool> {
+        Ok(self
+            .capacities(Command::Budget(requirement))?
+            .into_iter()
+            .all(|v| v))
+    }
+    pub fn needs_preparation(&self, layout: &Layout) -> Result<bool> {
+        Ok(!self
+            .exchange(Command::Cached(layout.clone()))?
+            .into_iter()
+            .all(|reply| matches!(reply, Reply::Cached(CacheState::Graph))))
+    }
+    pub fn owner_requirement(
+        &self,
+        tokens: usize,
+        reserve: usize,
+    ) -> Result<super::memory::Requirement> {
+        let mut maximum = super::memory::Requirement {
+            device: 0,
+            session: 0,
+        };
+        for reply in self.exchange(Command::OwnerRequirement(tokens, reserve))? {
+            let Reply::Requirement(required) = reply else {
+                return Err("Invalid A2 owner requirement reply".into());
+            };
+            maximum.device = maximum.device.max(required.device);
+            maximum.session = maximum.session.max(required.session);
+        }
+        Ok(maximum)
+    }
+    pub fn reclaim_programs(&self) -> Result<bool> {
+        Ok(self.capacities(Command::Reclaim)?.into_iter().any(|v| v))
+    }
+    fn capacities(&self, command: Command) -> Result<Vec<bool>> {
+        self.exchange(command)?
+            .into_iter()
+            .map(|reply| match reply {
+                Reply::Capacity(value) => Ok(value),
+                _ => Err("Invalid A2 capacity reply".into()),
+            })
+            .collect()
+    }
+    fn allocations(&self, command: Command) -> Result<BTreeMap<u64, usize>> {
+        let mut result: Option<BTreeMap<u64, usize>> = None;
+        for (rank, reply) in self.exchange(command)?.into_iter().enumerate() {
+            let Reply::Allocations(allocations) = reply else {
+                return Err("Invalid A2 snapshot allocation reply".into());
+            };
+            if let Some(combined) = &mut result {
+                if !combined.keys().eq(allocations.keys()) {
+                    let missing = combined
+                        .keys()
+                        .filter(|k| !allocations.contains_key(k))
+                        .take(8)
+                        .collect::<Vec<_>>();
+                    let extra = allocations
+                        .keys()
+                        .filter(|k| !combined.contains_key(k))
+                        .take(8)
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "TP snapshot allocation lineage differs on rank {rank}: missing {missing:?}, extra {extra:?}"
+                    ));
+                }
+                for (id, bytes) in allocations {
+                    *combined.get_mut(&id).unwrap() = combined[&id].max(bytes);
+                }
+            } else {
+                result = Some(allocations);
+            }
+        }
+        result.ok_or_else(|| "Empty A2 snapshot team".into())
+    }
+}
+
+impl Worker {
+    /// Benchmark diagnostics read completed groups on their owning worker.
+    /// The online request path never sends this command.
+    fn routing_groups(&self, decode: bool) -> Result<Vec<RoutingGroup>> {
+        let mut groups = BTreeMap::new();
+        for packet in self
+            .packet_templates
+            .iter()
+            .filter(|p| p.role == super::PacketRole::Target && p.batch_decode == decode)
+        {
+            for step in &packet.body {
+                if let super::Instruction::W4 {
+                    experts,
+                    groups: Some(name),
+                    ..
+                }
+                | super::Instruction::W8 {
+                    experts,
+                    groups: Some(name),
+                    ..
+                } = step
+                    && groups.insert(name, *experts).is_some_and(|n| n != *experts)
+                {
+                    return Err("Routing group expert counts differ across consumers".into());
+                }
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(name, experts)| {
+                let buffer = super::get(&self.buffers, name)?;
+                if experts.checked_mul(8) != Some(buffer.bytes()) {
+                    return Err("Routing group buffer extent differs from its W4 contract".into());
+                }
+                let bytes = self.session.download(&buffer, 0, buffer.bytes())?;
+                let counts = bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| i64::from_le_bytes(*b))
+                    .collect::<Vec<_>>();
+                if counts.iter().any(|&n| n < 0) {
+                    return Err("Routing group contains a negative count".into());
+                }
+                Ok(RoutingGroup {
+                    buffer: name.clone(),
+                    counts,
+                })
+            })
+            .collect()
+    }
+}
+impl Drop for Team {
+    fn drop(&mut self) {
+        for peer in self.peers.iter() {
+            let _ = peer.send.send(Command::Stop);
+        }
+        let host_release = self.host_tables.take().and_then(host_release::start);
+        for handle in self.handles.drain(..) {
+            if handle.join().is_err() {
+                eprintln!("A2 worker panicked during teardown");
+            }
+        }
+        // CPU table reclamation owns no ACL/HCCL state and overlaps both rank
+        // teardown and the final bootstrap context. Join before releasing the
+        // model owner's GPU lock or returning from destruction.
+        drop(self._bootstrap.take());
+        if let Some(handle) = host_release
+            && handle.join().is_err()
+        {
+            eprintln!("CPU table release thread panicked during teardown");
+        }
+    }
+}
+
+fn exchange(peers: &Transport, command: Command) -> Result<Vec<Reply>> {
+    peers.exchange(command)
+}
+
+fn forward(
+    peers: &Transport,
+    layout: Layout,
+    tokens: Vec<Vec<u32>>,
+    full: bool,
+    graphs_enabled: bool,
+) -> Result<(Vec<Output>, f64, f64)> {
+    let (outputs, timing) = forward_with(
+        peers,
+        layout,
+        tokens,
+        full.into(),
+        None,
+        || {},
+        graphs_enabled,
+    )?;
+    Ok((outputs, timing.seconds, timing.preparation))
+}
+#[cfg(test)]
+fn preparation(states: &[CacheState], repeated: bool) -> Result<(bool, bool)> {
+    let plan = preparation::plan(states, repeated, None)?;
+    Ok((plan.invalidate, plan.capture()))
+}
+
+fn forward_with(
+    peers: &Transport,
+    layout: Layout,
+    tokens: Vec<Vec<u32>>,
+    readout: Readout,
+    mut budget: Option<CaptureBudget>,
+    maintenance: impl FnOnce(),
+    graphs_enabled: bool,
+) -> Result<(Vec<Output>, Timing)> {
+    let started = Instant::now();
+    let cached = exchange(peers, Command::GrowCached(layout.clone()))?;
+    let states = cached
+        .into_iter()
+        .map(|reply| match reply {
+            Reply::Cached(state) => Ok(state),
+            _ => Err("Invalid A2 cache state reply".to_string()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let repeated = layout.decode
+        || layout.role == super::PacketRole::Draft
+        || layout.outputs.len() > layout.segments.len()
+            && layout
+                .decoder_roles
+                .iter()
+                .all(|r| *r == super::replay::Role::Continue);
+    if let Some(budget) = &mut budget {
+        budget.slack_s -= started.elapsed().as_secs_f64();
+    }
+    let plan = if graphs_enabled {
+        preparation::plan(&states, repeated, budget)?
+    } else {
+        preparation::direct_plan(&states)?
+    };
+    let invalidate = plan.invalidate;
+    let capture = plan.capture();
+    if budget.is_some_and(|b| b.trace) {
+        eprintln!(
+            "A2_EXECUTION_PLAN {}",
+            serde_json::json!({
+                "role":format!("{:?}",layout.role), "rows":layout.rows.total,
+                "mode":plan.mode,"reason":plan.reason,"invalidate":invalidate,
+                "budget":budget,
+            })
+        );
+    }
+    if invalidate {
+        exchange(peers, Command::Invalidate(layout.clone()))?;
+    }
+    // Only a cache miss or promotion can allocate/capture. Keep its global
+    // preparation barrier; a cache hit only refreshes host-side LRU state and
+    // can do that on the owning worker with the forward command.
+    let cached_prepare = !invalidate
+        && states
+            .iter()
+            .all(|state| matches!(state, CacheState::Graph) == capture);
+    if !cached_prepare {
+        exchange(peers, Command::Prepare(layout.clone(), capture))?;
+    }
+    let mut shared = vec![];
+    let mut shared_setup = 0.;
+    if graphs_enabled && !capture && super::shared::eligible(&layout) && super::shared::enabled() {
+        let read = |replies: Vec<Reply>| -> Result<Vec<Vec<super::shared::State>>> {
+            replies
+                .into_iter()
+                .map(|r| match r {
+                    Reply::Shared(s) => Ok(s),
+                    _ => Err("Invalid shared Graph state reply".into()),
+                })
+                .collect()
+        };
+        let states = read(exchange(peers, Command::Shared(layout.clone()))?)?;
+        let slack = budget.map_or(f64::INFINITY, |b| b.slack_s - b.direct_s.unwrap_or(0.))
+            - started.elapsed().as_secs_f64();
+        let (ready, candidate) = super::shared::plan(&states, slack)?;
+        shared = ready;
+        if let Some(id) = candidate {
+            let capture_started = Instant::now();
+            let states = read(exchange(peers, Command::CaptureShared(layout.clone(), id))?)?;
+            shared_setup = capture_started.elapsed().as_secs_f64();
+            shared = super::shared::plan(&states, -1.)?.0;
+        }
+    }
+    let prepare_s = started.elapsed().as_secs_f64();
+    let started = Instant::now();
+    let replicated = layout.role == super::PacketRole::Draft;
+    let shared_mode = !shared.is_empty();
+    if shared_mode
+        && (budget.is_some_and(|b| b.trace)
+            || std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some())
+    {
+        eprintln!(
+            "A2_SHARED_PLAN {}",
+            serde_json::json!({"rows":layout.rows.total,"pieces":shared.len(),"setup_s":shared_setup})
+        );
+    }
+    let command = Command::Forward(
+        layout,
+        tokens,
+        readout,
+        cached_prepare.then_some(capture),
+        shared,
+    );
+    peers.send(command)?;
+    maintenance();
+    let results = peers.collect()?;
+    let ranks = results
+        .into_iter()
+        .map(|reply| match reply {
+            Reply::Outputs(outputs, actual_shared) if actual_shared == shared_mode => Ok(outputs),
+            _ => Err("Invalid A2 output reply".into()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut outputs = ranks.first().cloned().ok_or("Missing A2 TP output")?;
+    if ranks.iter().any(|rank| rank.len() != outputs.len()) {
+        return Err("A2 TP output count differs".into());
+    }
+    for (i, output) in outputs.iter_mut().enumerate() {
+        output.logits.clear();
+        for rank in &ranks {
+            let value = rank.get(i).ok_or("A2 TP output count differs")?;
+            if value.owner != output.owner {
+                return Err("A2 TP output owner differs".into());
+            }
+            if replicated && value.token != output.token {
+                return Err("DSpark TP proposal pools disagree".into());
+            }
+            if value.value > output.value
+                || value.value == output.value && value.token < output.token
+            {
+                output.token = value.token;
+                output.value = value.value;
+            }
+            output.logits.extend_from_slice(&value.logits);
+        }
+    }
+    Ok((
+        outputs,
+        Timing {
+            seconds: started.elapsed().as_secs_f64(),
+            preparation: prepare_s,
+            replay: capture,
+            shared: shared_mode,
+            shared_setup,
+            setup: if cached_prepare {
+                shared_setup
+            } else {
+                prepare_s
+            },
+        },
+    ))
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod state_tests;

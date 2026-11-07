@@ -101,10 +101,10 @@ fn validate(root: &Path, digest: &str) -> Result<()> {
     }
     let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
     if value["backend"] == "ascend" {
-        let package: crate::backend::ascend::model::provider::Package =
+        let package: crate::models::deepseek_v41::provider::Package =
             serde_json::from_value(value).map_err(|e| e.to_string())?;
         super::generated::materialize(root, &package.generated_assets)?;
-        return crate::backend::ascend::model::validation::validate_package(root, &package);
+        return crate::models::deepseek_v41::validation::validate_package(root, &package);
     }
     let package: ExecutionPackage = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
     package.validate_metadata()?;

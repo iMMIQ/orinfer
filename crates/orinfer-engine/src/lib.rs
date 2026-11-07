@@ -13,6 +13,7 @@ pub mod host_rows;
 mod loader;
 pub mod model;
 mod model_package;
+pub mod models;
 pub mod mtp;
 pub mod operators;
 pub mod prefix;

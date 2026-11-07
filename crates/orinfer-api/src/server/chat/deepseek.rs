@@ -226,7 +226,9 @@ mod tests {
         let mut env = Environment::new();
         env.add_template(
             "chat",
-            include_str!("../../../../../tools/model/deepseek_v41/templates/chat.jinja"),
+            include_str!(
+                "../../../../../python/orinfer_build/models/deepseek_v41/templates/chat.jinja"
+            ),
         )
         .unwrap();
         for case in fixtures["cases"].as_array().unwrap() {

@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const CAPACITY: usize = 4096;
 const LANES: usize = 128;
-// Appended after the layer state table; tools/model/qwen35/packet.py shares this order.
+// Appended after the layer state table; python/orinfer_build/models/qwen35/packet.py shares this order.
 const PACKET_COLUMNS: &[&str] = &[
     "Input",
     "Token",

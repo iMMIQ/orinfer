@@ -1,9 +1,9 @@
 //! Device implementation boundary for model execution and diagnostics.
-mod arena;
+pub(crate) mod arena;
 pub mod ascend;
 pub(crate) mod cuda;
 mod executor;
-mod growth;
+pub(crate) mod growth;
 pub(crate) mod kv;
 pub(crate) mod report;
 pub(crate) mod snapshot;

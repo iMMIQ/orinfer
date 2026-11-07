@@ -10,14 +10,14 @@
 
 ```sh
 ORINFER_CHECKPOINT_DIR="$PWD/artifacts/nemotron-source" \
-  bash tools/operators/run.sh tools/quantization/nemotron_embed.py \
+  bash tools/environments/cuda/run.sh python/orinfer_build/quantization/nemotron_embed.py \
   artifacts/nemotron-converted \
   --source-dir "$PWD/artifacts/nemotron-source" \
   --gpu-lock /tmp/nemotron-encoder.lock
 
 make build
 ORINFER_CHECKPOINT_DIR="$PWD/artifacts/nemotron-converted" \
-  bash tools/operators/run.sh tools/model/nemotron_embed/build.py \
+  bash tools/environments/cuda/run.sh python/orinfer_build/models/nemotron_embed/build.py \
   artifacts/nemotron-build \
   --source "$PWD/artifacts/nemotron-converted" \
   --model-output "$PWD/artifacts/nemotron-build/model" \
@@ -31,7 +31,7 @@ operator wrapper 持有公共 GPU 锁，转换器的内部锁因此使用独立�
 已有完成的 E8P checkpoint 可从同一 BF16 来源提升该层精度，复用其余压缩值：
 
 ```sh
-uv run --locked --project tools/environments/cuda python -m tools.quantization.nemotron_embed \
+uv run --locked --project tools/environments/cuda python -m orinfer_build.quantization.nemotron_embed \
   --source-dir artifacts/nemotron-source --upgrade-from artifacts/nemotron-converted \
   --output artifacts/nemotron-converted-quality
 ```
@@ -78,11 +78,11 @@ target/release/orinfer embed-model artifacts/nemotron-build/model requests.json 
 ## 验证
 
 ```sh
-bash tools/operators/run.sh tools/model/nemotron_embed/check_kernels.py artifacts/nemotron-kernels
+bash tools/environments/cuda/run.sh python/orinfer_build/models/nemotron_embed/check_kernels.py artifacts/nemotron-kernels
 
 ORINFER_REFERENCE_CHECKPOINT="$PWD/artifacts/nemotron-source" \
 ORINFER_CHECKPOINT_DIR="$PWD/artifacts/nemotron-build/model" \
-  bash tools/operators/run.sh tools/model/nemotron_embed/check_model.py artifacts/nemotron-quality \
+  bash tools/environments/cuda/run.sh python/orinfer_build/models/nemotron_embed/check_model.py artifacts/nemotron-quality \
   --original "$PWD/artifacts/nemotron-source" \
   --model "$PWD/artifacts/nemotron-build/model" \
   --engine "$PWD/target/release/orinfer"

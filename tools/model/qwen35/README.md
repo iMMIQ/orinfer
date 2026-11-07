@@ -2,7 +2,7 @@
 
 当前基线是官方 27B 的 beam8 重新编码、两级 E8P Q4A8 量化目录。它使用 signed-block128 旋转、两级固定整数码表和输出行 scale；Embedding、mixer 输出投影和 MTP 草稿矩阵保留 W8，敏感小权重及视觉保留浮点。本机量化产物为 `artifacts/quantization/qwen35-e8p-beam8-20261016/converted`，完整模型为 `artifacts/models/qwen3.8-27b-e8p-q4a8-current`。
 
-同一构建入口也支持 Index-Translate-2B 的 24 层和 Index-Translate-9B 的 32 层架构，使用 `tools/quantization/qwen_e8p.py` 从固定 BF16 来源编码。GDN/GQA、FFN、视觉、MTP、动态行及状态控制按配置复用同一执行流程。9B 使用独立的 embedding 和输出头 E8P Q4 bank。2B 的 embedding 和输出头共享一份 E8P Q4 bank：embedding 按需解码并逆旋转所选行，输出头复用相同压缩权重和旋转 A8 投影。视觉大矩阵也使用相同 Q4A8 投影，bias/GELU 保留原 FP16 边界；patch、位置表、norm 等小参数保留浮点，敏感输出/MTP 矩阵保留 W8。主干使用相同的两级 E8P Q4A8 契约，实际平均位数包含这些高精度例外。
+同一构建入口也支持 Index-Translate-2B 的 24 层和 Index-Translate-9B 的 32 层架构，使用 `python/orinfer_build/quantization/qwen_e8p.py` 从固定 BF16 来源编码。GDN/GQA、FFN、视觉、MTP、动态行及状态控制按配置复用同一执行流程。9B 使用独立的 embedding 和输出头 E8P Q4 bank。2B 的 embedding 和输出头共享一份 E8P Q4 bank：embedding 按需解码并逆旋转所选行，输出头复用相同压缩权重和旋转 A8 投影。视觉大矩阵也使用相同 Q4A8 投影，bias/GELU 保留原 FP16 边界；patch、位置表、norm 等小参数保留浮点，敏感输出/MTP 矩阵保留 W8。主干使用相同的两级 E8P Q4A8 契约，实际平均位数包含这些高精度例外。
 
 两级 E8P-Q4 的数据契约为 `quant_method=orinfer_e8p_q4_int8`、`coefficients=[4,1]`、`basis_tensor=orinfer.e8p_q4.basis`、`layout=u32-low-coarse-high-residual`。输入压缩矩阵为 U32 `[N,K/8]`，构建时无损重排为 `[K/128,N,16]`，每个输出行一个 F16 scale。它复用原生执行计划、公共整数计算和离线 tile 调优。非零 basis 经验证后，直接 INT4 MMA 将完整 A8 拆成两个位平面，恢复相同的 INT32 点积；与 INT8 解码路径读取同一份压缩权重，由自动调优选择。
 
@@ -10,7 +10,7 @@ Qwen3.5-4B 同样复用此入口，按官方配置使用 2560 hidden、9216 FFN�
 
 ```bash
 make build
-bash tools/operators/run.sh tools/model/qwen35/build.py artifacts/qwen35-build \
+bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen35/build.py artifacts/qwen35-build \
   --source /path/to/converted --model-output artifacts/models/qwen35-q4a8 \
   --gpu-lock-held
 ```
@@ -42,7 +42,7 @@ E8P 的 INT8 Tensor Core 路径先将压缩 K128 slab 异步读入 CTA 共享内
 对已发布、使用紧凑单行 decode tile 和共享验证工作区的 Qwen 包，可只重建短段 attention 与原生计划：
 
 ```bash
-bash tools/operators/run.sh tools/model/qwen35/rebuild_attention.py \
+bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen35/rebuild_attention.py \
   artifacts/qwen35-attention-rebuild --model /path/to/model \
   --target artifacts/models/qwen35-attention-fixed
 ```
@@ -51,22 +51,22 @@ bash tools/operators/run.sh tools/model/qwen35/rebuild_attention.py \
 
 整数投影保留一个大行数动态 fallback 与常用精确 AOT；128 行内非 AOT packet 的 tile 由离线测量选择，有界动态特化按真实行数执行。选择区间排除固定 AOT 点，复用同一投影计算体，部署包保留选中的实现。
 
-上述流水线通过 `tools/model/row_tuning.py` 离线选择 tile，复用 Flash Next 的相邻选择区间合并规则；执行包只包含被选中的候选。各 batch 与上下文长度复用动态 cubin，运行时显式传入真实行数与 KV 长度。共享 workspace 保存临时旋转区和有界注意力部分结果；权重保持压缩表示。
+上述流水线通过 `python/orinfer_build/tuning/row_tuning.py` 离线选择 tile，复用 Flash Next 的相邻选择区间合并规则；执行包只包含被选中的候选。各 batch 与上下文长度复用动态 cubin，运行时显式传入真实行数与 KV 长度。共享 workspace 保存临时旋转区和有界注意力部分结果；权重保持压缩表示。
 
 图片和多图使用共享 ViT 算子，一个动态 patch 模板覆盖 4–32768 patches，merger 按实际 patch 数除以 4。量化、执行和视觉均按真实 checkpoint 语义校验。
 
-两级 E8P 的整数、尾部和 Graph 检查可运行 `tools/quantization/check_e8p_q4.py` 与 `tools/quantization/check_e8p_direct.py`（通过同一个 GPU 包装器）。
+两级 E8P 的整数、尾部和 Graph 检查可运行 `python/orinfer_build/quantization/check_e8p_q4.py` 与 `python/orinfer_build/quantization/check_e8p_direct.py`（通过同一个 GPU 包装器）。
 
 卷积的 1/2/4/8/16 时间 tile 由离线测量选择，共用八个 K 部分和、十六 lane 归约及原有 FP16 边界；MTP、prefill 短尾和大块使用同一计算体，配置由离线测量选择。普通 decode 的私有卷积在缓存旧尾部后原地提交历史；批量请求按地址表分别完成计算与历史提交。E8P 的符号与 parity 合并为最终 XOR，保持全部码字和 INT32 点积一致。
 
 算子检查：
 
 ```bash
-bash tools/operators/run.sh tools/model/qwen35/check_kernels.py artifacts/qwen35-kernels \
+bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen35/check_kernels.py artifacts/qwen35-kernels \
   --gpu-lock-held
-bash tools/operators/run.sh tools/model/qwen35/check_rows.py artifacts/qwen35-rows
-bash tools/operators/run.sh tools/model/qwen35/check_decode.py artifacts/qwen35-decode
-bash tools/operators/run.sh tools/model/qwen35/check_causal_attention.py artifacts/qwen35-causal-attention
+bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen35/check_rows.py artifacts/qwen35-rows
+bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen35/check_decode.py artifacts/qwen35-decode
+bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen35/check_causal_attention.py artifacts/qwen35-causal-attention
 ```
 
 构建缓存默认位于 `artifacts/build-cache/qwen35`。失败可用包装器 `--resume` 重跑，已校验编译对象会复用。算子检查验证局部数值与 ABI；新执行包还须完成真实模型加载、生成、prefix 恢复、并发和 MTP 验收。

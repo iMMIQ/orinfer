@@ -2,7 +2,7 @@
 
 import copy
 import unittest
-from config import validate_vision
+from orinfer_build.contracts.vision import validate_vision
 
 
 class AdapterCompatibility(unittest.TestCase):

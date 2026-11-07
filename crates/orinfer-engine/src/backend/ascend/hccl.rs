@@ -7,7 +7,7 @@ use super::{
 use crate::artifact::Result;
 use libloading::Library;
 use std::{ffi::c_void, path::Path, ptr, rc::Rc, sync::Arc};
-pub(super) mod graph_registry;
+pub(crate) mod graph_registry;
 pub mod validation;
 
 pub const ROOT_BYTES: usize = 4108;
@@ -144,11 +144,11 @@ impl RootInfo {
         self.ranks
     }
     #[cfg(test)]
-    pub(super) fn fixture(session: &Session, path: &Path) -> Result<Self> {
+    pub(crate) fn fixture(session: &Session, path: &Path) -> Result<Self> {
         Self::fixture_ranks(session, path, 1)
     }
     #[cfg(test)]
-    pub(super) fn fixture_ranks(session: &Session, path: &Path, ranks: u32) -> Result<Self> {
+    pub(crate) fn fixture_ranks(session: &Session, path: &Path, ranks: u32) -> Result<Self> {
         Self::with_api(session, ranks, Api::from_path(path)?)
     }
 }
@@ -171,7 +171,7 @@ impl Element {
             Self::Bfloat16 => 11,
         }
     }
-    pub(super) fn bytes(self) -> u64 {
+    pub(crate) fn bytes(self) -> u64 {
         match self {
             Self::Int8 => 1,
             Self::Bfloat16 => 2,
@@ -380,7 +380,7 @@ impl Communicator {
         }
     }
 
-    pub(super) fn validate_scatter(
+    pub(crate) fn validate_scatter(
         &self,
         session: &Session,
         source: &Buffer,
@@ -408,7 +408,7 @@ impl Communicator {
         Ok(())
     }
 
-    pub(super) fn scatter_on_stream(
+    pub(crate) fn scatter_on_stream(
         &self,
         stream: Handle,
         source: &Buffer,
@@ -473,7 +473,7 @@ impl Communicator {
         }
     }
 
-    pub(super) fn gather_on_stream(
+    pub(crate) fn gather_on_stream(
         &self,
         stream: Handle,
         source: &Buffer,
@@ -499,7 +499,7 @@ impl Communicator {
     }
     /// Submits one validated SUM collective on an explicit stream. Used by
     /// captured segments that replay the collective inside an ACL Graph.
-    pub(super) fn reduce_on_stream(
+    pub(crate) fn reduce_on_stream(
         &self,
         stream: super::api::Handle,
         source: &Buffer,
@@ -538,7 +538,7 @@ impl Communicator {
             .enqueue(session)
     }
 
-    pub(super) fn prepare_exchange(
+    pub(crate) fn prepare_exchange(
         &self,
         session: &Session,
         source: &Buffer,
@@ -566,7 +566,7 @@ impl Communicator {
 /// Validated exchange bindings, including stable host count/displacement arrays.
 /// Both ordinary submissions and Graph segments retain the same owned operation.
 #[derive(Clone)]
-pub(super) struct Exchange {
+pub(crate) struct Exchange {
     native: Rc<NativeComm>,
     source: Buffer,
     destination: Buffer,
@@ -574,13 +574,13 @@ pub(super) struct Exchange {
     element: Element,
 }
 impl Exchange {
-    pub(super) fn branch_accesses(&self) -> Vec<(Buffer, bool)> {
+    pub(crate) fn branch_accesses(&self) -> Vec<(Buffer, bool)> {
         vec![
             (self.source.clone(), false),
             (self.destination.clone(), true),
         ]
     }
-    pub(super) fn execute_on_stream(&self, stream: Handle) -> Result<()> {
+    pub(crate) fn execute_on_stream(&self, stream: Handle) -> Result<()> {
         // SAFETY: prepare_exchange checked context, datatype and disjoint extents.
         // The enclosing completion/Graph retains this operation, its count arrays,
         // communicator and buffers; the supplied stream belongs to that context.

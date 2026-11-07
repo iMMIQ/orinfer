@@ -47,15 +47,15 @@ impl Default for Limits {
 /// One thread owns a context and two ordered streams. Buffers and completions
 /// retain the context, and Rc intentionally prevents moving it to another thread.
 pub struct Session {
-    pub(super) context: Rc<Context>,
+    pub(crate) context: Rc<Context>,
     pending: RefCell<Vec<Rc<Completion>>>,
     // Session ownership avoids a Context -> Pinned -> Context Rc cycle.
     // Physical idle capacity remains charged to the pinned-memory budget.
     pinned_cache: RefCell<Vec<Rc<Pinned>>>,
 }
-pub(super) struct Context {
-    pub driver: Arc<DriverLease>,
-    pub api: Api,
+pub(crate) struct Context {
+    pub(super) driver: Arc<DriverLease>,
+    pub(super) api: Api,
     pub handle: Handle,
     compute: Handle,
     transfer: Handle,
@@ -72,19 +72,19 @@ pub(super) struct Context {
     completion_events: RefCell<Vec<Handle>>,
 }
 
-pub(super) struct Current<'a> {
+pub(crate) struct Current<'a> {
     context: &'a Context,
     previous: Handle,
 }
 impl Context {
-    pub(super) fn retire(&self) {
+    pub(crate) fn retire(&self) {
         self.poisoned.set(true);
         QUARANTINED.store(true, Ordering::Release);
     }
-    pub(super) fn compute_stream(&self) -> Handle {
+    pub(crate) fn compute_stream(&self) -> Handle {
         self.compute
     }
-    pub(super) fn timeout_ms(&self) -> i32 {
+    pub(crate) fn timeout_ms(&self) -> i32 {
         self.limits.timeout_ms
     }
     pub fn enter(&self) -> Result<Current<'_>> {
@@ -189,7 +189,7 @@ impl Buffer {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
-    pub(super) fn pointer(&self) -> Handle {
+    pub(crate) fn pointer(&self) -> Handle {
         // SAFETY: Every view is checked against its retained allocation.
         unsafe { self.allocation.pointer.cast::<u8>().add(self.offset).cast() }
     }
@@ -205,7 +205,7 @@ impl Buffer {
             bytes,
         })
     }
-    pub(super) fn overlaps(&self, other: &Self) -> bool {
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.allocation, &other.allocation)
             && self.offset < other.offset + other.bytes
             && other.offset < self.offset + self.bytes
@@ -354,10 +354,10 @@ impl Ticket {
 }
 
 impl Session {
-    pub(in crate::backend::ascend) fn set_graphs_enabled(&self, enabled: bool) {
+    pub(crate) fn set_graphs_enabled(&self, enabled: bool) {
         self.context.graphs_enabled.set(enabled);
     }
-    pub(in crate::backend::ascend) fn graphs_enabled(&self) -> bool {
+    pub(crate) fn graphs_enabled(&self) -> bool {
         self.context.graphs_enabled.get()
     }
     pub fn new(device: u32, limits: Limits) -> Result<Self> {
@@ -444,10 +444,10 @@ impl Session {
         )?;
         Ok((free, total))
     }
-    pub(super) fn compute_stream(&self) -> Handle {
+    pub(crate) fn compute_stream(&self) -> Handle {
         self.context.compute
     }
-    pub(super) fn same_context(&self, context: &Rc<Context>) -> Result<()> {
+    pub(crate) fn same_context(&self, context: &Rc<Context>) -> Result<()> {
         self.context.ready()?;
         if !Rc::ptr_eq(&self.context, context) {
             return Err("Ascend operation belongs to another session".into());
@@ -473,7 +473,7 @@ impl Session {
             .borrow_mut()
             .retain(|host| Rc::strong_count(host) != 1);
     }
-    pub(super) fn require(&self, buffer: &Buffer) -> Result<()> {
+    pub(crate) fn require(&self, buffer: &Buffer) -> Result<()> {
         self.context.ready()?;
         self.context.owner.require(buffer.allocation.context.owner)
     }
@@ -752,7 +752,7 @@ impl Session {
     /// Copy complete inputs into bounded pinned slabs. Each slab's completion
     /// owns its DMA backing; pressure waits for the oldest submitted upload.
     /// Compute-stream order protects earlier readers of reused device inputs.
-    pub(super) fn upload_inputs(&self, inputs: &[(Buffer, Vec<u8>)]) -> Result<Ticket> {
+    pub(crate) fn upload_inputs(&self, inputs: &[(Buffer, Vec<u8>)]) -> Result<Ticket> {
         for (buffer, data) in inputs {
             if data.len() != buffer.bytes() {
                 return Err("Model input upload byte extent differs".into());
@@ -766,7 +766,7 @@ impl Session {
         )
     }
     /// Upload borrowed regions in compute order, retaining only bounded pinned slabs.
-    pub(super) fn upload_regions(&self, inputs: &[(Buffer, usize, &[u8])]) -> Result<Ticket> {
+    pub(crate) fn upload_regions(&self, inputs: &[(Buffer, usize, &[u8])]) -> Result<Ticket> {
         let mut bytes = 0usize;
         for (buffer, offset, data) in inputs {
             self.require(buffer)?;
@@ -973,7 +973,7 @@ impl Session {
     }
     /// Validate every span before submission and retain the whole ordered copy
     /// batch through one completion. Cross-stream producers need a dependency.
-    pub(super) fn copy_many(
+    pub(crate) fn copy_many(
         &self,
         copies: &[(Buffer, usize, Buffer, usize, usize)],
     ) -> Result<Ticket> {
@@ -1033,7 +1033,7 @@ impl Session {
     }
     /// Submit a backend-owned operation. The caller proves all pointers passed
     /// to enqueue are covered by buffers and extra, which are retained to a fence.
-    pub(super) unsafe fn submit_compute(
+    pub(crate) unsafe fn submit_compute(
         &self,
         buffers: Vec<Buffer>,
         extra: Box<dyn Any>,

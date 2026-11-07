@@ -5,13 +5,13 @@ use super::{
 use libloading::Library;
 use std::{path::Path, sync::Arc};
 
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     _dir: tempfile::TempDir,
     library: Library,
     driver: Option<Arc<DriverLease>>,
 }
 impl Fixture {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("libacl-fixture.so");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ascend_runtime.c");
@@ -37,13 +37,13 @@ impl Fixture {
             driver: Some(driver),
         }
     }
-    pub(super) fn session(&self) -> Session {
+    pub(crate) fn session(&self) -> Session {
         self.session_with_limits(Limits::default())
     }
-    pub(super) fn session_with_limits(&self, limits: Limits) -> Session {
+    pub(crate) fn session_with_limits(&self, limits: Limits) -> Session {
         Session::with_driver(Arc::clone(self.driver.as_ref().unwrap()), 0, limits).unwrap()
     }
-    pub(super) fn aot(&self) -> (std::path::PathBuf, super::kernels::Spec) {
+    pub(crate) fn aot(&self) -> (std::path::PathBuf, super::kernels::Spec) {
         use super::kernels::{Access, Operand, Spec};
         use crate::artifact::{Dtype, FileIdentity};
         let library = self._dir.path().join("libacl-fixture.so");
@@ -91,7 +91,7 @@ impl Fixture {
         std::fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
         (path, spec)
     }
-    pub(super) fn counter(&self, index: i32) -> i32 {
+    pub(crate) fn counter(&self, index: i32) -> i32 {
         // SAFETY: Fixture declares this function with the exact C signature.
         unsafe {
             self.library
@@ -99,7 +99,7 @@ impl Fixture {
                 .unwrap()(index)
         }
     }
-    pub(super) fn failure(&self, index: i32) {
+    pub(crate) fn failure(&self, index: i32) {
         // SAFETY: Fixture declares this function with the exact C signature.
         unsafe {
             self.library
@@ -107,7 +107,7 @@ impl Fixture {
                 .unwrap()(index);
         }
     }
-    pub(super) fn pending_jobs(&self) -> i32 {
+    pub(crate) fn pending_jobs(&self) -> i32 {
         // SAFETY: The private CPU fixture exports this exact zero-argument ABI.
         unsafe {
             self.library
@@ -115,7 +115,7 @@ impl Fixture {
                 .unwrap()()
         }
     }
-    pub(super) fn assert_clean(&mut self) {
+    pub(crate) fn assert_clean(&mut self) {
         self.driver.take();
         for index in 0..5 {
             assert_eq!(self.counter(index), 0, "resource counter {index}");

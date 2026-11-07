@@ -4,7 +4,7 @@ import argparse
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from tools.eval.scoring_common import SEED, pair_probes, validate_probes
+from orinfer_build.validation.scoring_common import SEED, pair_probes, validate_probes
 from tools.eval.quick_quality import analyze
 
 TARGETS = {

@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 from statistics import median
 
-from tools.build.files import atomic_json
+from orinfer_build.common.files import atomic_json
 
 
 def profile(paths):

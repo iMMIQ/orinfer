@@ -94,7 +94,7 @@ make check
 ```
 
 - [Serving](docs/serving.md) · [Offline JSONL](docs/batch.md) · [Performance](docs/performance.md).
-- [Build and release](tools/build/README.md) · [Model packages](docs/model-packages.md).
+- [Development layout](docs/development.md) · [Build and release](tools/build/README.md) · [Model packages](docs/model-packages.md).
 - [Model builders](tools/model/README.md) · [GPU kernels](kernels/README.md) · [Quality evaluation](tools/eval/README.md).
 
 Additional guides are available in Chinese.

@@ -10,7 +10,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from tools.eval.scoring_common import execution_identity
+from orinfer_build.validation.scoring_common import execution_identity
 
 SEED = 20261002
 

@@ -1,4 +1,5 @@
 /target/
+*.egg-info/
 /artifacts/*
 !/artifacts/.gitkeep
 __pycache__/

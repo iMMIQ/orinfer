@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools.eval.offline_quality import add_queries, compare, prepare
-from tools.eval.scoring_common import SEED, context_hash, image_patches
+from orinfer_build.validation.scoring_common import SEED, context_hash, image_patches
 
 
 def reports():

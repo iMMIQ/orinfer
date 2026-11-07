@@ -2,6 +2,9 @@
 
 Python 用于权重准备、TileLang 编译、调优和验证；在线加载、执行与服务由 Rust 完成。
 
+实现位于 `python/orinfer_build`，本目录保留原构建命令的薄入口。共享契约、编译、调优
+和发布组件分别归入该包，目录与工作区约定见[开发说明](../../docs/development.md)。
+
 ## 支持的构建入口
 
 | 模型 | 输入 | 构建入口 |
@@ -11,20 +14,21 @@ Python 用于权重准备、TileLang 编译、调优和验证；在线加载、�
 | Nemotron-3.5-Embed-1B | 文本和视觉 E8P Q4A8 checkpoint | [nemotron_embed/build.py](../../docs/embeddings.md) |
 | Qwen3-Reranker-0.6B | 因果文本 E8P Q4A8、双行原始分类头 checkpoint | [qwen_reranker/build.py](../../docs/reranking.md) |
 | Qwen3.8-Flash-Next | 当前 schema-1 模型及其匹配执行包 | [flash_next/build.py](flash_next/README.md) |
+| DSv4.1 Flash-1017 / A2 | 当前计划及已预处理 W4A8 权重 | `python -m orinfer_build.models.deepseek_v41.build --rebuild-plan PLAN`，使用 CANN 9.2 前端 |
 
 27B 的当前部署方案为两级整数 E8P Q4A8。Flash Next 使用 E8P Q2A8 专家及质量优先的混合精度。量化组件与存储约定见[量化说明](../quantization/README.md)。
 
 ```bash
 make python-env
 make build
-bash tools/operators/run.sh tools/model/qwen35/build.py artifacts/qwen35-build \
+bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen35/build.py artifacts/qwen35-build \
   --source /path/to/converted --model-output artifacts/models/qwen35-ready \
   --gpu-lock-held
-bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-build \
+bash tools/environments/cuda/run.sh python/orinfer_build/models/flash_next/build.py artifacts/flash-build \
   --model /path/to/native-flash-model --model-output artifacts/models/flash-ready
 ```
 
-编译环境固定为 `orinfer-compiler:0.1.3`，使用 Python 3.12 和 CUDA 12.6，配方和挂载方式见[编译说明](../build/README.md)。外部输入通过 `ORINFER_CHECKPOINT_DIR` 只读挂载。所有 GPU 工作共用 `artifacts/gpu-experiment.lock`；构建输出使用新目录，已发布产物保持不可变。
+CUDA 编译使用物理机 CUDA 12.6 和独立 uv 环境，A2 使用固定的 CANN 9.2 前端；环境说明见[编译说明](../build/README.md)。外部输入通过 `ORINFER_CHECKPOINT_DIR` 只读挂载。所有 GPU 工作共用 `artifacts/gpu-experiment.lock`；构建输出使用新目录，已发布产物保持不可变。
 
 ## 产物与公共组件
 
@@ -45,7 +49,7 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-buil
 已有 Qwen、Flash Next 或 ASR 原生包可单独迁移公共 packet 地址表，复用原有权重和算术：
 
 ```bash
-bash tools/operators/run.sh tools/model/packet_graph.py artifacts/packet-build \
+bash tools/environments/cuda/run.sh python/orinfer_build/compiler/packet_graph.py artifacts/packet-build \
   --model /path/to/prepared-model --target artifacts/models/packet-ready
 ```
 
@@ -69,7 +73,7 @@ make check-gpu MODEL=/path/to/prepared-model OUTPUT=artifacts/check-gpu/new-run
 共享 GPU 采样由 Qwen3_5 与 Flash Next 正式构建器发布，也可只重建现有原生包的采样部分，保持权重与前端资源：
 
 ```bash
-bash tools/operators/run.sh tools/model/sampling.py artifacts/sampling-build \
+bash tools/environments/cuda/run.sh python/orinfer_build/models/sampling.py artifacts/sampling-build \
   --model artifacts/models/source-model \
   --model-output artifacts/models/model-with-gpu-sampling
 ```

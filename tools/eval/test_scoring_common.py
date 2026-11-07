@@ -3,7 +3,7 @@
 import copy
 import unittest
 
-from scoring_common import (
+from orinfer_build.validation.scoring_common import (
     SEED,
     context_hash,
     pair_probes,

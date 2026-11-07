@@ -1,14 +1,16 @@
 //! CANN discovery and thread-affine native execution resources.
-mod api;
+pub(crate) mod api;
 pub mod graph;
 pub mod hccl;
 pub mod kernels;
-pub mod model;
+// Retain the published native diagnostic path while the implementation lives
+// with the other model-specific providers.
+pub use crate::models::deepseek_v41 as model;
 pub mod operators;
 pub mod runtime;
 pub(crate) mod sampling;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub mod validation;
 use super::Inventory;
 use crate::artifact::Result;
@@ -26,7 +28,7 @@ type Finalize = unsafe extern "C" fn() -> i32;
 type Count = unsafe extern "C" fn(*mut u32) -> i32;
 type Soc = unsafe extern "C" fn() -> *const c_char;
 
-struct Driver {
+pub(crate) struct Driver {
     // AscendC stubs register process-wide profiler callbacks. Background CANN
     // threads can invoke them after the last kernel/Graph fence, including
     // during HCCL teardown. Keep their code until ACL finalization completes.

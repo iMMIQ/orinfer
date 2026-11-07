@@ -228,7 +228,7 @@ wheels = [
 [[package]]
 name = "orinfer-tools"
 version = "0.3.3"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "pillow" },

@@ -22,7 +22,7 @@ import tempfile
 import time
 import urllib.request
 
-from tools.build.files import atomic_json, file_hash
+from orinfer_build.common.files import atomic_json, file_hash
 
 
 def command(args):

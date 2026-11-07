@@ -1,5 +1,5 @@
 //! Backend-neutral request handle consumed by the shared continuous worker.
-use crate::backend::ascend::model::provider::Request as Ascend;
+use crate::models::deepseek_v41::provider::Request as Ascend;
 use crate::runtime::requests::RequestState as Cuda;
 enum Implementation {
     Cuda(Box<Cuda>),

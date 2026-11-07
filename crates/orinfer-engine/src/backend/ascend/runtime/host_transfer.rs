@@ -4,7 +4,7 @@ use super::*;
 impl Session {
     /// Call after synchronizing producers. Regions may leave holes in the host bank.
     /// Each completed slab is copied before reuse; failed DMA retains native backing.
-    pub(in crate::backend::ascend) fn download_regions(
+    pub(crate) fn download_regions(
         &self,
         regions: &[(Buffer, usize, usize, usize)],
         output: &mut [u8],

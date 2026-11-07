@@ -10,7 +10,7 @@
 
 `sample_machine.py` 和 `sample_continuous.py` 以只读方式记录机器温度、频率、内存和功耗，保持全局设置。GPU 运行入口共享 `artifacts/gpu-experiment.lock`。
 
-`bash tools/operators/run.sh tools/operators/sampling.py NEW_OUTPUT --batch-only` 对照同源单请求采样，覆盖不同 seed/参数、非对齐词表、1–128 行、owner 换序、空行、无效行隔离和改变输入后的 Graph replay。`--sanitizer` 缩小诊断集合，配合 `ORINFER_OPERATOR_SANITIZER=memcheck` 检查设备访存。
+`bash tools/environments/cuda/run.sh tests/cuda/operators/sampling.py NEW_OUTPUT --batch-only` 对照同源单请求采样，覆盖不同 seed/参数、非对齐词表、1–128 行、owner 换序、空行、无效行隔离和改变输入后的 Graph replay。`--sanitizer` 缩小诊断集合，配合 `ORINFER_OPERATOR_SANITIZER=memcheck` 检查设备访存。
 
 完整请求验收 `validate_batched_gpu_sampling_requests` 使用下方 `ORINFER_BATCH_FIXTURE`，需要包含批量采样程序的新模型包；`batches` 默认 1/3/8。它比较逐请求／批量 GPU 采样的完整 token 和因果状态，覆盖混合 greedy、不同参数、grammar 解除、反向 owner 以及取消后的 arena 复用。`validate_lazy_workspace_requests` 需要同一夹具内的纯文本和图像／音频 case，检查先文本、首次媒体、再文本时的结果、状态与虚拟地址。按本轮构建返回的实际测试可执行文件运行并核对测试数；吞吐比较使用 release 完整请求。
 

@@ -14,9 +14,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 # Support direct script invocation before loading project modules.
 sys.path.insert(0, str(ROOT))
-from tools.model.package import execution_identity, install  # noqa: E402
-from tools.model.publication import generated_outputs  # noqa: E402
-from tools.build.files import file_hash  # noqa: E402
+from orinfer_build.packaging.package import execution_identity, install  # noqa: E402
+from orinfer_build.packaging.publication import generated_outputs  # noqa: E402
+from orinfer_build.common.files import file_hash  # noqa: E402
 
 
 def command(*args, cwd=ROOT):
@@ -220,7 +220,17 @@ def build(args):
                 shutil.copyfile(ROOT / name, bundle / name)
         # Ship complete offline tools and their imports; only tracked files are included.
         for name in command(
-            "git", "ls-files", "docs", "examples", "tools", "kernels", "configs", "fixtures"
+            "git",
+            "ls-files",
+            "docs",
+            "examples",
+            "tools",
+            "kernels",
+            "python",
+            "tests",
+            "setup.py",
+            "configs",
+            "fixtures",
         ).splitlines():
             (bundle / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, bundle / name)

@@ -187,7 +187,7 @@ mod tests {
                     "-Wl,--exclude-libs,ALL",
                     "-I",
                 ])
-                .arg(manifest.join("../../tools/operators/ascend"))
+                .arg(manifest.join("native/ascend"))
                 .arg(manifest.join("tests/fixtures/hccl_graph_registry.cc"))
                 .arg("-o")
                 .arg(&library)

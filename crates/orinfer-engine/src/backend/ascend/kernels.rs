@@ -119,7 +119,7 @@ impl Spec {
         }
         Ok(total)
     }
-    pub(super) fn identity(&self) -> serde_json::Value {
+    pub(crate) fn identity(&self) -> serde_json::Value {
         serde_json::json!({"target": self.target, "op": self.op,
             "operands": self.operands, "parameters": self.parameters,
             "compiler": self.compiler, "source_sha256": self.source_sha256})
@@ -354,7 +354,7 @@ impl Kernel {
     pub fn spec(&self) -> &Spec {
         &self.bound.template.spec
     }
-    pub(super) fn accesses(&self) -> impl Iterator<Item = (&Buffer, bool)> {
+    pub(crate) fn accesses(&self) -> impl Iterator<Item = (&Buffer, bool)> {
         self.bound
             .buffers
             .iter()
@@ -369,7 +369,7 @@ impl Kernel {
     /// Logical pointee ranges for an address-table kernel. Actual owner arenas
     /// are retained by the enclosing frame; these ranges preserve alias/fork
     /// dependencies when the table's addresses change between replays.
-    pub(super) fn with_hazards(
+    pub(crate) fn with_hazards(
         mut self,
         session: &Session,
         hazards: Vec<(Buffer, bool)>,
@@ -386,7 +386,7 @@ impl Kernel {
     pub fn template(&self) -> &Rc<Template> {
         &self.bound.template
     }
-    pub(super) fn binding_key(&self) -> (usize, usize, Vec<(usize, usize)>) {
+    pub(crate) fn binding_key(&self) -> (usize, usize, Vec<(usize, usize)>) {
         (
             Rc::as_ptr(&self.bound.template) as usize,
             self.bound.rows,
@@ -399,7 +399,7 @@ impl Kernel {
     }
     /// Submits this kernel on an explicit stream without a completion fence.
     /// Used by captured segments that replay the launch inside an ACL Graph.
-    pub(super) fn launch_on_stream(&self, stream: Handle) -> Result<()> {
+    pub(crate) fn launch_on_stream(&self, stream: Handle) -> Result<()> {
         self.bound.launch(stream)
     }
     pub fn enqueue(&self, session: &Session) -> Result<Ticket> {

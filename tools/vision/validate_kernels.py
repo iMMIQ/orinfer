@@ -6,8 +6,8 @@ import math
 from pathlib import Path
 import torch
 import torch.nn.functional as F
-from tools.operators.common import configure, error, export_kernel, write_json
-from kernels.vision.encoder import linear, layer_norm, add, position, qkv_rope, attention
+from orinfer_build.compiler.cuda.common import configure, error, export_kernel, write_json
+from kernels.cuda.vision.encoder import linear, layer_norm, add, position, qkv_rope, attention
 
 
 def main():

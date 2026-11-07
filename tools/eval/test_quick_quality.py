@@ -4,7 +4,7 @@ import copy
 import math
 import unittest
 
-from quick_quality import SEED, analyze
+from tools.eval.quick_quality import SEED, analyze
 
 
 def record():

@@ -6,8 +6,8 @@ from pathlib import Path
 import tempfile
 import urllib.request
 
-from tools.build.files import file_hash, write_json
-from tools.model.safetensors_source import Source
+from orinfer_build.common.files import file_hash, write_json
+from orinfer_build.weights.safetensors_source import Source
 
 
 def fetch_processor(repo, revision, destination):

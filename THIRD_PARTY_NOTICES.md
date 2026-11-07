@@ -10,11 +10,11 @@ upstream revisions, NVIDIA toolchain image, and pinned dependencies.
 The wheels retain their upstream BSD licenses and bundled third-party notices.
 
 The Engram tokenizer-normalization and addressing rules in
-`tools/model/deepseek_v41/export_engram.py`, the DSv4.1 chat template and
+`python/orinfer_build/models/deepseek_v41/export_engram.py`, the DSv4.1 chat template and
 `fixtures/chat/deepseek-v41.json`, the DeepSeek image geometry and
 `fixtures/vision/deepseek-v41.json` are adapted from DeepSeek's V4.1
 reference inference implementation, Copyright (c) 2023 DeepSeek, under the MIT
-License. The full license is in `tools/model/deepseek_v41/LICENSE`.
+License. The full license is in `python/orinfer_build/models/deepseek_v41/LICENSE`.
 
 The A2 offline compiler uses [TileLang-Ascend](https://github.com/tile-ai/tilelang-ascend),
 Copyright (c) Tile-AI, under the MIT License. The A2 projection and vector
@@ -24,7 +24,7 @@ generated AOT libraries include its templates. The license is retained in
 and its SHA256; CANN and Catlass retain their upstream notices in that image.
 
 The CANN 9.2 HCOMM Graph registry ABI declaration in
-`tools/operators/ascend/hccl_graph_registry_abi.h` is adapted from
+`crates/orinfer-engine/native/ascend/hccl_graph_registry_abi.h` is adapted from
 [CANN HCOMM v9.2.0](https://gitcode.com/cann/hcomm/tree/v9.2.0),
 Copyright (c) 2025 Huawei Technologies Co., Ltd., under the CANN Open Software
 License Agreement Version 2.0. Its full license is retained in

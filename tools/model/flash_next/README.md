@@ -8,7 +8,7 @@
 
 ```bash
 make build
-bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-build \
+bash tools/environments/cuda/run.sh python/orinfer_build/models/flash_next/build.py artifacts/flash-build \
   --model /path/to/native-model --model-output artifacts/models/flash-ready
 ```
 
@@ -18,10 +18,10 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-buil
 
 专家的路由、上投影和下投影共同使用输入中已验证的联合 tile 选择表。构建另外读取真实专家 bank，在完整 E/N/K 几何上验证两种合法行 tile、2/4 级流水线、短尾与最大容量。整数投影重建保留 HC、QSA、视觉和因果状态实现的固定身份。
 
-缓存默认在 `artifacts/build-cache/flash-next`，可用 `--cache` 指定。键包含构造参数、真实权重身份、源码、编译器、CUDA 和设备；内容校验失败自动重建该项。单项完成后原子发布，整个模型在 Rust 计划检查通过后发布。失败可重跑同一条命令，只需在包装器上增加 `--resume`：
+缓存默认在工作数据根目录的 `cache/build/flash-next`，可用 `--cache` 指定。键包含构造参数、真实权重身份、源码、编译器、CUDA 和设备；内容校验失败自动重建该项。单项完成后原子发布，整个模型在 Rust 计划检查通过后发布。失败可重跑同一条命令，只需在包装器上增加 `--resume`：
 
 ```bash
-bash tools/operators/run.sh --resume tools/model/flash_next/build.py artifacts/flash-build \
+bash tools/environments/cuda/run.sh --resume python/orinfer_build/models/flash_next/build.py artifacts/flash-build \
   --model /path/to/native-model --model-output artifacts/models/flash-ready
 ```
 
@@ -30,7 +30,7 @@ bash tools/operators/run.sh --resume tools/model/flash_next/build.py artifacts/f
 `--projection-kinds w8` 可只重建 W8 投影；`--projection-shape N K` 按输出、输入维度进一步限定范围，可重复指定多个几何，并可与 `--prefill-only` 组合。其他投影、专家和辅助绑定沿用输入包。例如，只重建 640→2560 的 W8 投影：
 
 ```bash
-bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-w8-build \
+bash tools/environments/cuda/run.sh python/orinfer_build/models/flash_next/build.py artifacts/flash-w8-build \
   --model /path/to/native-model --model-output artifacts/models/flash-w8-ready \
   --projection-kinds w8 --projection-shape 2560 640
 ```
@@ -42,7 +42,7 @@ W8 调优包含寄存器 scale 复用和按行 tile 遍历的候选；它们读�
 在 CPU 上清点构造契约：
 
 ```bash
-uv run --locked --project tools/environments/cuda python -m tools.model.flash_next.build \
+uv run --locked --project tools/environments/cuda python -m orinfer_build.models.flash_next.build \
   --model /path/to/native-model --model-output artifacts/models/flash-ready \
   --output artifacts/flash-plan --plan-only
 ```
@@ -79,7 +79,7 @@ bash tools/quantization/run_flash_next.sh \
   --revision SOURCE_COMMIT_SHA --stage all \
   --output artifacts/quantization/flash-next/converted
 
-uv run --locked --project tools/environments/cuda python -m tools.model.flash_next.weights \
+uv run --locked --project tools/environments/cuda python -m orinfer_build.models.flash_next.weights \
   --converted artifacts/quantization/flash-next/converted \
   --index /path/to/original/model.safetensors.index.json \
   --config /path/to/original/config.json --frontend /path/to/original \

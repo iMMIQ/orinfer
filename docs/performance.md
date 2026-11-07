@@ -56,7 +56,7 @@ Attention 保留 16-token 块的 FP32 打分、在线 softmax 和逐块累积，
 
 普通推理使用默认 HCCL 通信，`strict` 保留为显式复现选项。TP8 为当前接通模型的并行方案，后续按显存、通信与完整请求性能选择。动态投影和 attention PV 使用同源融合 Cube/Vector 模板，显式跨核完成握手保护逻辑块循环中的缓冲复用；关闭这类模板的自动跨核同步和作用域合并，保持声明的同步协议。设备 kernel 启动数恢复为每卡每 token **1668**。
 
-离线复用 `tools/model/deepseek_v41/tune.py --decode-only --grid-only`，在真实权重上测量同源 64/128/256 CTA 边界配置。小行数连续覆盖 1–128，另覆盖各几何的容量与公共采样点；校验尾部、改变输入和 Graph 重放，按共享选择规则生成局部选择表。最终包仅包含被引用的 **220** 个 kernel 库和 **227** 个选择区间，覆盖 **11** 种投影几何。
+离线复用 `python/orinfer_build/models/deepseek_v41/tune.py --decode-only --grid-only`，在真实权重上测量同源 64/128/256 CTA 边界配置。小行数连续覆盖 1–128，另覆盖各几何的容量与公共采样点；校验尾部、改变输入和 Graph 重放，按共享选择规则生成局部选择表。最终包仅包含被引用的 **220** 个 kernel 库和 **227** 个选择区间，覆盖 **11** 种投影几何。
 
 运行时复用稳定布局的 owner 地址表、工作表和输出索引，缓存键包含执行家族、片段长度、owner 顺序与输出位置；准入和释放使缓存失效，完成事件持有全部引用资源。稳定 decode 每步省去 **108** 张地址表、**8** 张工作表和 **1** 张输出索引表的重复上传。Graph 仍按可共享形状缓存，地址表缓存独立保留 owner 和输出顺序。
 
@@ -276,7 +276,7 @@ Rust release `run-model`，`decode_only`、greedy、seed `20261002`、prefix 关
 
 ## Flash Next HC combine-norm 融合（2026-10-27）
 
-新增 `--hc-combine-norm` 构建开关：把 decode 程序中 94 对相邻的 HC combine 与 norm 绑定替换为位等价的融合 kernel（`kernels/model/hyperconnection.py` 的 `hc_combine_norm`，流 dtype FP16；融合版在 M=1..4096 全部行数与分开链逐位一致）。Rust 侧 `decode_fusions` 按符号 `hc_combine_norm_kernel` 注册融合：校验 host ABI 顺序（Block, Inject, Normed, Output, Residual, Weight）、几何与 buffer dtype/尺寸后删除相邻 norm 操作；decode 程序 1772 → 1678 op。融合 kernel 实测 6.0 μs/次（0.56 ms/步）。
+新增 `--hc-combine-norm` 构建开关：把 decode 程序中 94 对相邻的 HC combine 与 norm 绑定替换为位等价的融合 kernel（`kernels/cuda/model/hyperconnection.py` 的 `hc_combine_norm`，流 dtype FP16；融合版在 M=1..4096 全部行数与分开链逐位一致）。Rust 侧 `decode_fusions` 按符号 `hc_combine_norm_kernel` 注册融合：校验 host ABI 顺序（Block, Inject, Normed, Output, Residual, Weight）、几何与 buffer dtype/尺寸后删除相邻 norm 操作；decode 程序 1772 → 1678 op。融合 kernel 实测 6.0 μs/次（0.56 ms/步）。
 
 宿主机复刻编译工具链（`artifacts/host-compiler`，与 orinfer-compiler:0.1.3 同版本：Python 3.12.15/torch 2.14.1+orinfer1/tilelang 0.1.15/sm87）完成本次重建：`--hc-combine-norm --projection-kinds w8 --projection-shape 2560 640` 过滤重建约 10 分钟，发布通过 Rust 计划检查。
 

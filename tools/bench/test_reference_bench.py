@@ -5,7 +5,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from reference_bench import sse_events, stream_request
+from tools.bench.reference_bench import sse_events, stream_request
 
 
 class TimingProtocolTests(unittest.TestCase):
@@ -26,8 +26,14 @@ class TimingProtocolTests(unittest.TestCase):
         ]
         wire = "".join("data: " + json.dumps(x) + "\n\n" for x in chunks) + "data: [DONE]\n\n"
         with (
-            patch("reference_bench.urllib.request.urlopen", return_value=io.BytesIO(wire.encode())),
-            patch("reference_bench.time.perf_counter", side_effect=[0, 1, 4, 7, 7.1, 7.2, 7.3]),
+            patch(
+                "tools.bench.reference_bench.urllib.request.urlopen",
+                return_value=io.BytesIO(wire.encode()),
+            ),
+            patch(
+                "tools.bench.reference_bench.time.perf_counter",
+                side_effect=[0, 1, 4, 7, 7.1, 7.2, 7.3],
+            ),
         ):
             result = stream_request(
                 {"url": "http://127.0.0.1:1", "served_model": "test"}, [1, 2], 4

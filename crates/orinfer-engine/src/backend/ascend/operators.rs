@@ -408,7 +408,7 @@ pub struct GroupedW4A8 {
     last: RefCell<Option<Ticket>>,
 }
 impl GroupedW4A8 {
-    pub(super) fn branch_accesses(&self) -> Vec<(Buffer, bool)> {
+    pub(crate) fn branch_accesses(&self) -> Vec<(Buffer, bool)> {
         self.prepared
             ._lists
             .iter()
@@ -748,7 +748,7 @@ impl GroupedW4A8 {
             .upload(&self.prepared._groups.buffer, 0, &data)?
             .wait()
     }
-    pub(super) fn workspace(&self) -> Option<Buffer> {
+    pub(crate) fn workspace(&self) -> Option<Buffer> {
         self.prepared.workspace.clone()
     }
     pub fn capture(&self, session: &Session) -> Result<super::graph::Graph> {
@@ -809,7 +809,7 @@ impl GroupedW4A8 {
     /// Submits the repeatable executor on an explicit stream without a
     /// completion fence. Used by captured segments that replay the grouped
     /// matmul inside an ACL Graph.
-    pub(super) fn execute_on_stream(&self, stream: super::api::Handle) -> Result<()> {
+    pub(crate) fn execute_on_stream(&self, stream: super::api::Handle) -> Result<()> {
         let prepared = &self.prepared;
         let workspace = prepared
             .workspace

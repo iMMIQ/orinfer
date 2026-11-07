@@ -62,11 +62,11 @@
 - 先用 rg 检查调用者和依赖；保持修改小而完整。subagent 仅在用户或适用指令明确要求时启动。
 - 每轮性能优化采用分阶段检查：候选阶段只做相关算子数值和 Graph 验证、2K/2049、一个代表性 batch 及固定历史 decode 短测；契约未变时复用已通过的验证。确认收益后运行一次 240 秒 Mini，与冻结基线比较；仅在波动或疑似超过 10% 回退时补充配对复测。提交前统一运行一次 `make check`；状态、prefix 和隔离检查限定于实际改动的契约，架构首次验收完成后不随每个 tile 候选重复。禁止过度检查拖慢迭代，不因外部 CPU 活动阻塞测试。
 - 模型 packet 通过公共 Rows、视图及地址表绑定组件计算行布局；模型声明 owner 角色候选、计算顺序与状态边界。普通、混合、验证和 draft 复用这些组件。
-- 离线编译复用 compile/private_rows，调优复用 tuning 的候选、缓存及 Graph 测量；文件身份、原子元数据和共享 GPU 锁位于 tools/build。共享组件源码计入消费者缓存身份。
-- CPU Python 依赖由根目录 `pyproject.toml`/`uv.lock` 管理，CUDA 离线依赖由 `tools/environments/cuda` 中的独立 uv 项目管理；分别用 `make python-env` 和 `make cuda-env` 同步，工具通过 `uv run --locked` 执行。`make check` 执行 Rust 格式/编译/clippy/测试及 CPU 评测检查；CUDA GPU 验证用 `bash tools/operators/run.sh`，直接使用当前物理机的 CUDA 工具链和独立 uv 环境。
-- GPU 工作通过 `artifacts/gpu-experiment.lock` 串行，保留其他服务，并保持全局频率、功耗和缓存设置。
+- 离线编译复用 `python/orinfer_build/compiler`，调优复用 `python/orinfer_build/tuning`；文件身份、原子元数据、路径和共享 GPU 锁位于 `python/orinfer_build/common`。生产 kernel 位于 `kernels/cuda`、`kernels/ascend` 与 `kernels/shared`，设备验证程序位于 `tests`。共享组件源码计入消费者缓存身份。
+- CPU Python 依赖由根目录 `pyproject.toml`/`uv.lock` 管理，CUDA 离线依赖由 `tools/environments/cuda` 中的独立 uv 项目管理；分别用 `make python-env` 和 `make cuda-env` 同步，工具通过 `uv run --locked` 执行。`make check` 执行 Rust 格式/编译/clippy/测试及 CPU 评测检查；CUDA GPU 验证用 `bash tools/environments/cuda/run.sh`，直接使用当前物理机的 CUDA 工具链和独立 uv 环境。
+- 开发 worktree 位于仓库外；通过 `tools.dev.workspace` 初始化独立构建目录及共享缓存、记录、发布目录。GPU 工作使用 common.paths 解析的共享锁，原 `artifacts/gpu-experiment.lock` 链接保留同一锁 inode；保留其他服务，并保持全局频率、功耗和缓存设置。
 - GPU 单测使用本轮构建输出的测试可执行文件，核对测试确实执行，并从本轮构建结果解析实际可执行文件路径。
-- 当前原生 Flash Next 的整数算子重建使用 `tools/model/flash_next/build.py`：从权重几何和 host ABI 读取构造契约，真实权重调优，编译对象按内容校验并原子缓存，最终模型经 Rust 计划检查后原子发布。其输入为模型固定的执行契约；HC/QSA/状态及专家联合选择表保留输入已验证实现，专家真实几何另行验证。正式重建统一使用该入口。
+- 当前原生 Flash Next 的整数算子重建使用 `python/orinfer_build/models/flash_next/build.py`：从权重几何和 host ABI 读取构造契约，真实权重调优，编译对象按内容校验并原子缓存，最终模型经 Rust 计划检查后原子发布。其输入为模型固定的执行契约；HC/QSA/状态及专家联合选择表保留输入已验证实现，专家真实几何另行验证。正式重建统一使用该入口。
 - 可变的 HC 无损指数、QSA radix shift 使用 ABI 标量复用 cubin；私有状态包装器必须保留标量、列 stride 及字节偏移。QSA 条带数离线测量；动态整数投影调优覆盖多个实际行数及容量上限。选择区间仅在连续相邻且完整参数/launch 契约一致时合并，保持专家路由 tile。
 - 新 kernel 验证数值、非对齐尾部和实际 graph replay；状态改动另测分块、恢复和请求隔离。
 - 投影组件按权重读取、计算调度、输出处理组合：W8/Q4 及融合 SwiGLU 复用 integer_core，BF16 矩阵复用 floating_core，E8P 的位平面、双 INT4 乘积和输出复用 e8p_core。这些编译期组件供各模型的 prefill/decode 和 MTP 共享计算循环；访存调度、浮点归约和舍入契约显式保留。27B 两级 E8P Q4A8 同样复用 e8p_core，直接 INT4 与 INT8 回退读取同一份 K128 压缩权重。调优缓存必须包含内联组件源码身份。

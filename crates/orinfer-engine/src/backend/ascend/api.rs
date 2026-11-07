@@ -3,7 +3,7 @@ use super::Driver;
 use crate::artifact::Result;
 use std::ffi::c_void;
 
-pub(super) type Handle = *mut c_void;
+pub(crate) type Handle = *mut c_void;
 
 impl Api {
     pub fn current(&self) -> Result<Handle> {

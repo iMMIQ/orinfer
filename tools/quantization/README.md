@@ -26,9 +26,9 @@ E8P Q2 编解码、GPU 算子、Q2_K 对比及两级 Q4 扩展见[量化技术 W
 调用者按输出行分块持有原始权重，例如每次 128 行；`raw` 必须直接读取原始 BF16/FP8 权重。存储、FP16 scale、旋转和系数均须与执行包匹配。
 
 ```bash
-uv run --locked python -m unittest tools.quantization.test_e8p tools.quantization.test_e8p_q4
-bash tools/operators/run.sh tools/quantization/check_e8p_q4.py artifacts/check-e8p-q4
-bash tools/operators/run.sh tools/quantization/check_e8p_search.py artifacts/check-e8p-search
+uv run --locked python -m unittest orinfer_build.quantization.test_e8p orinfer_build.quantization.test_e8p_q4
+bash tools/environments/cuda/run.sh python/orinfer_build/quantization/check_e8p_q4.py artifacts/check-e8p-q4
+bash tools/environments/cuda/run.sh python/orinfer_build/quantization/check_e8p_search.py artifacts/check-e8p-search
 ```
 
 `check_e8p_direct.py` 验证完整 A8 位平面和两个 INT4 Tensor Core 点积恢复完整 A8 的原始 INT32 点积。`evaluate_e8p_q4.py` 比较有原始权重来源的组件夹具，输出重构误差与投影时延；模型 NLL 和完整请求性能另外测量。

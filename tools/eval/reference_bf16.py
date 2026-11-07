@@ -18,8 +18,13 @@ import torch
 from safetensors import safe_open
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5 import modeling_qwen3_5 as modeling
-from tools.eval.scoring_common import SEED, context_hash, image_fingerprints, image_patches
-from tools.model.safetensors_source import Source, SIZES
+from orinfer_build.validation.scoring_common import (
+    SEED,
+    context_hash,
+    image_fingerprints,
+    image_patches,
+)
+from orinfer_build.weights.safetensors_source import Source, SIZES
 
 
 def configure_torch_reference(backend=modeling):

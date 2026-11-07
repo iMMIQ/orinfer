@@ -35,4 +35,4 @@ ORINFER_MODEL_PROGRESS="$output_dir/progress.json" nsys profile \
     "$output_dir/report.json" "$output_dir/run.log" > "$output_dir/nsys.log" 2>&1
 nsys export --type=sqlite --output "$output_dir/trace.sqlite" \
     "$output_dir/trace.nsys-rep" > "$output_dir/export.log" 2>&1
-python3 tools/model/profile_summary.py "$output_dir" "$model_manifest"
+python3 python/orinfer_build/validation/profile_summary.py "$output_dir" "$model_manifest"

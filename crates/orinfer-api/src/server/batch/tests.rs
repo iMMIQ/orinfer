@@ -1,5 +1,5 @@
 use super::*;
-use std::{fs, io::Write, path::PathBuf, sync::atomic::AtomicUsize};
+use std::{fs, io::Write, path::PathBuf, sync::atomic::AtomicUsize, time::Duration};
 
 static SERIAL: AtomicUsize = AtomicUsize::new(0);
 struct Directory(PathBuf);
@@ -26,6 +26,25 @@ impl Drop for Directory {
 fn response(id: &str, reason: &str) -> Value {
     json!({"custom_id":id,"response":{"status_code":200,"body":{
         "choices":[{"finish_reason":reason,"message":{"role":"assistant","content":"译文"}}]}},"error":null})
+}
+
+// Other tests spawn workers concurrently. A forked child can briefly retain a
+// CLOEXEC descriptor until exec, after its owner in this process has closed it.
+// Only post-close resume assertions wait; live-owner exclusion stays immediate.
+fn reopen_after_close(path: &std::path::Path, identity: &Value, input: &Input) -> Journal {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match Journal::open(path, true, identity, input) {
+            Ok(journal) => return journal,
+            Err(error)
+                if error == "Batch output is locked by another process"
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("Reopen closed journal: {error}"),
+        }
+    }
 }
 
 #[test]
@@ -79,7 +98,7 @@ fn resume_retries_errors_retains_truncation_and_repairs_only_uncommitted_tail() 
         .write_all(b"{\"custom_id\":")
         .unwrap();
     {
-        let mut journal = Journal::open(&path, true, &identity, &input).unwrap();
+        let mut journal = reopen_after_close(&path, &identity, &input);
         assert!(journal.done("line-1"));
         assert!(!journal.done("line-2"));
         assert!(journal.done("line-3"));
@@ -88,7 +107,7 @@ fn resume_retries_errors_retains_truncation_and_repairs_only_uncommitted_tail() 
         assert!(Journal::open(&path, true, &identity, &input).is_err());
         journal.append(&response("line-2", "stop")).unwrap();
     }
-    let journal = Journal::open(&path, true, &identity, &input).unwrap();
+    let journal = reopen_after_close(&path, &identity, &input);
     assert!(journal.done("line-2"));
     assert_eq!(journal.states.len(), 3);
 }
@@ -190,6 +209,6 @@ async fn queued_results_are_drained_before_resume() {
     }
     writer.finish().await.unwrap();
     drop(journal);
-    let journal = Journal::open(&path, true, &identity, &input).unwrap();
+    let journal = reopen_after_close(&path, &identity, &input);
     assert_eq!(journal.states.len(), 3);
 }

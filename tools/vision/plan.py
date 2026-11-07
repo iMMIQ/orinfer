@@ -6,9 +6,9 @@ from pathlib import Path
 import subprocess
 import torch
 from safetensors import safe_open
-from tools.operators.common import export_kernel
-from tools.operators.abi import parse_host, evaluate
-from kernels.vision import encoder
+from orinfer_build.compiler.cuda.common import export_kernel
+from orinfer_build.contracts.abi import parse_host, evaluate
+from kernels.cuda.vision import encoder
 
 
 class EncoderBuilder:

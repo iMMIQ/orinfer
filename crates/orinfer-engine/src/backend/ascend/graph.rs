@@ -6,7 +6,7 @@ use super::{
     runtime::{Context, Session, Ticket},
 };
 use crate::artifact::Result;
-pub(super) use branches::Branches;
+pub(crate) use branches::Branches;
 use std::{any::Any, cell::RefCell, ptr, rc::Rc};
 struct Api {
     begin: unsafe extern "C" fn(Handle, i32) -> i32,
@@ -56,7 +56,7 @@ pub struct Graph {
 impl Graph {
     /// The caller retains this graph through an enclosing compute completion
     /// and serializes invocations on the owning session's compute stream.
-    pub(super) unsafe fn execute_on_stream(&self, stream: Handle) -> Result<()> {
+    pub(crate) unsafe fn execute_on_stream(&self, stream: Handle) -> Result<()> {
         super::hccl::graph_registry::check()?;
         check(
             // SAFETY: The caller supplies this graph's owned stream and retains
@@ -67,7 +67,7 @@ impl Graph {
     }
     /// Caller guarantees stable addresses and retains every native resource used
     /// by enqueue in keepalive. Allocation and preparation happen before capture.
-    pub(super) unsafe fn capture(
+    pub(crate) unsafe fn capture(
         session: &Session,
         keepalive: Box<dyn Any>,
         enqueue: impl FnOnce(Handle) -> Result<()>,

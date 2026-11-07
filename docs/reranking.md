@@ -8,13 +8,13 @@
 
 ```sh
 ORINFER_CHECKPOINT_DIR="$PWD/artifacts/reranker-source" \
-  bash tools/operators/run.sh tools/quantization/qwen_reranker.py \
+  bash tools/environments/cuda/run.sh python/orinfer_build/quantization/qwen_reranker.py \
   artifacts/reranker-converted --source-dir "$PWD/artifacts/reranker-source" \
   --gpu-lock /tmp/qwen-reranker-encoder.lock
 
 make build
 ORINFER_CHECKPOINT_DIR="$PWD/artifacts/reranker-converted" \
-  bash tools/operators/run.sh tools/model/qwen_reranker/build.py \
+  bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen_reranker/build.py \
   artifacts/reranker-build --source "$PWD/artifacts/reranker-converted" \
   --model-output "$PWD/artifacts/reranker-build/model" --gpu-lock-held
 ```
@@ -23,7 +23,7 @@ operator wrapper 持有公共 GPU 锁，转换器的内部锁使用独立路径�
 
 主矩阵和 embedding 使用两级 E8P Q4、系数 `[4,1]`、beam8 搜索、signed-block128 旋转和 FP16 输出行 scale，激活使用 A8。attention 输出投影保留 W8；前 4 层及第 9 层（索引 0/1/2/3/8）的 Q/K/V 与 FFN 使用相同输入旋转基下的 W8，保护自定义指令和较长文档的相关性概率。norm 与原始 `no`、`yes` 两行输出权重保留 FP16。输出头占用 4096 字节，主 embedding 保持单份 K128 压缩表示。
 
-已有完整 E8P 转换可用 `python -m tools.quantization.qwen_reranker --source-dir 原始BF16目录 --upgrade-from 已转换目录 --output 新目录` 按行块提升敏感矩阵精度，其余压缩值和二分类头保持原始字节，校验来源后原子发布。
+已有完整 E8P 转换可用 `python -m orinfer_build.quantization.qwen_reranker --source-dir 原始BF16目录 --upgrade-from 已转换目录 --output 新目录` 按行块提升敏感矩阵精度，其余压缩值和二分类头保持原始字节，校验来源后原子发布。
 
 每个查询与文档对保持独立的完整因果序列。同一请求内的多个文档共享投影执行，Q/K/V 与 gate/up 权重按输出行无损拼接。各序列按 32 行对齐，attention、RoPE 和最后位置输出使用各自的真实边界，填充不计入输入；改变边界后可复用同一容量的 Graph。超过单个 packet 行容量时按文档边界分包，结果保持输入索引。默认容量为 32768 token；`--context` 可设置 512–32768 内的 32 倍数。旧执行包仍可逐序列运行。模型配置、原始 yes/no ID 和前端资源固定并校验。
 
@@ -52,17 +52,17 @@ target/release/orinfer rerank-model artifacts/reranker-build/model requests.json
 
 ```sh
 ORINFER_CHECKPOINT_DIR="$PWD/artifacts/reranker-source" \
-  bash tools/operators/run.sh tools/model/qwen_reranker/check_kernels.py \
+  bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen_reranker/check_kernels.py \
   artifacts/reranker-kernels --original "$PWD/artifacts/reranker-source"
 
 ORINFER_REFERENCE_CHECKPOINT="$PWD/artifacts/reranker-source" \
 ORINFER_CHECKPOINT_DIR="$PWD/artifacts/reranker-build/model" \
-  bash tools/operators/run.sh tools/model/qwen_reranker/check_model.py \
+  bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen_reranker/check_model.py \
   artifacts/reranker-quality --original "$PWD/artifacts/reranker-source" \
   --model "$PWD/artifacts/reranker-build/model" --engine "$PWD/target/release/orinfer"
 ```
 
-共享独立行 kernel 可通过 `bash tools/operators/run.sh tools/model/check_encoder_rows.py artifacts/encoder-rows-check` 验证不同 owner、填充与改变边界后的 Graph replay。
+共享独立行 kernel 可通过 `bash tools/environments/cuda/run.sh python/orinfer_build/validation/check_encoder_rows.py artifacts/encoder-rows-check` 验证不同 owner、填充与改变边界后的 Graph replay。
 
 GPU 验证覆盖因果 GQA 非对齐尾部、未来 token 隔离、Q/K norm＋RoPE、最后位置二分类头及改变输入后的 Graph replay。完整请求对照原始 BF16 的二分类概率、KL 和排序，覆盖中英文、代码检索、自定义指令、较长文档、重复与反向输入、Graph/direct 一致性。这些用例用于接入验收，目标语料上的完整重排质量需另行评测。
 

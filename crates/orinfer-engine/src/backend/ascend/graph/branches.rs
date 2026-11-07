@@ -7,7 +7,7 @@ use super::super::{
 use crate::artifact::Result;
 use std::{any::Any, ptr, rc::Rc};
 
-pub(in crate::backend::ascend) struct Branches {
+pub(crate) struct Branches {
     context: Rc<Context>,
     streams: Vec<Handle>,
     depths: Vec<usize>,
@@ -18,7 +18,7 @@ pub(in crate::backend::ascend) struct Branches {
 impl Branches {
     /// A persistent direct segment can fail before its join is submitted.
     /// Fence its auxiliary work before the enclosing packet releases operands.
-    pub(in crate::backend::ascend) fn fence(&self) -> Result<()> {
+    pub(crate) fn fence(&self) -> Result<()> {
         let result = (|| {
             let _current = self.context.enter()?;
             for stream in
@@ -38,7 +38,7 @@ impl Branches {
         result
     }
 
-    pub(in crate::backend::ascend) fn new(
+    pub(crate) fn new(
         session: &Session,
         depths: &[usize],
         keepalive: Box<dyn Any>,
@@ -83,7 +83,7 @@ impl Branches {
         Ok(Rc::new(branches))
     }
 
-    pub(in crate::backend::ascend) fn fork(&self, index: usize, main: Handle) -> Result<Handle> {
+    pub(crate) fn fork(&self, index: usize, main: Handle) -> Result<Handle> {
         let pair = self
             .events
             .get(index)
@@ -109,7 +109,7 @@ impl Branches {
         Ok(stream)
     }
 
-    pub(in crate::backend::ascend) fn switch(&self, index: usize) -> Result<()> {
+    pub(crate) fn switch(&self, index: usize) -> Result<()> {
         let pair = self
             .events
             .get(index)
@@ -121,7 +121,7 @@ impl Branches {
         )
     }
 
-    pub(in crate::backend::ascend) fn join(&self, index: usize, main: Handle) -> Result<()> {
+    pub(crate) fn join(&self, index: usize, main: Handle) -> Result<()> {
         let pair = self
             .events
             .get(index)
