@@ -6,7 +6,11 @@ import unittest
 import numpy as np
 from safetensors.numpy import save_file
 
-from tools.model.deepseek_v41.tune import read_prepared_bank
+from tools.model.deepseek_v41.tune import (
+    preserve_small_rows,
+    projection_configs,
+    read_prepared_bank,
+)
 from tools.model.deepseek_v41.tune_auxiliary import (
     canonical_partials,
     head_configs,
@@ -67,6 +71,31 @@ class AuxiliaryHeadTests(unittest.TestCase):
 
 
 class ReleasedProjectionTests(unittest.TestCase):
+    def test_rectangular_integer_tiles_fit_shared_hardware_bounds(self):
+        source = dict(integer=True, output=576, reduction=5120, tile_m=256, tile_n=128, block_k=512)
+        choices = projection_configs(source, joint=True)
+        self.assertEqual({c["tile_n"] for c in choices} & {96, 192}, {96, 192})
+        for config in choices:
+            self.assertLessEqual(config["tile_m"] * config["tile_n"] * 4, 131072)
+            self.assertLessEqual(config["tile_n"] * 128, 32768)
+        source["integer"] = False
+        self.assertFalse({c["tile_n"] for c in projection_configs(source, joint=True)} & {96, 192})
+
+    def test_large_row_tuning_preserves_small_fallback_holes_and_specializations(self):
+        prior = [dict(min_rows=4, max_rows=8, multiple_of=2, kernels=["small"])]
+        variants = preserve_small_rows(prior, [129, 800, 2048], [], "old", "new", 2048)
+        for rows in range(1, 129):
+            selected = next(
+                v["kernels"] for v in variants if v["min_rows"] <= rows <= v["max_rows"]
+            )
+            self.assertEqual(selected, ["small" if rows in (4, 6, 8) else "old"])
+        self.assertEqual(variants[-1]["max_rows"], 128)
+        measured = list(range(1, 129))
+        new = [dict(min_rows=1, max_rows=8, kernels=["new-small"])]
+        self.assertEqual(preserve_small_rows(prior, measured, new, "old", "new", 2048), new)
+        with self.assertRaisesRegex(ValueError, "Incomplete"):
+            preserve_small_rows(prior, [4, 8], new, "old", "new", 2048)
+
     def test_reads_selected_weight_and_flattens_column_scales(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

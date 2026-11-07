@@ -1286,6 +1286,95 @@ class ConvergenceTests(unittest.TestCase):
 
 
 class ExpertFusionContractTests(unittest.TestCase):
+    def published_fixture(self):
+        _, source, specs = self.fixture()
+        source[1].update(name="m32.L0.up", workspace="workspace")
+        cube = deepcopy(source[1])
+        cube.update(op="w4_a4", rows=384, groups="split_groups")
+        cube["buffers"][4:] = ["ones", "partials"]
+        replacement = [
+            dict(
+                op="kernel",
+                manifest="split",
+                buffers=["x", "xs", "ids", "groups", "input", "scale", "errors", "split_groups"],
+            ),
+            cube,
+            dict(
+                op="kernel",
+                manifest="finish",
+                buffers=["partials", "assist", "scale", "groups", "out", "out_scale"],
+            ),
+        ]
+        specs.update(
+            split=dict(
+                op="expert.gather_split",
+                parameters=dict(rows=192, table_rows=32, width=5120, experts=48, _row_capacity=32),
+            ),
+            finish=dict(
+                op="expert.finish",
+                parameters=dict(rows=192, width=2304, experts=48, _row_capacity=32),
+            ),
+        )
+        return source, replacement, specs
+
+    def test_published_fusion_requires_identical_weights_counts_and_row_domain(self):
+        from tools.model.deepseek_v41.expert_fusion import published_chain
+
+        source, replacement, specs = self.published_fixture()
+
+        def describe(step):
+            return specs.get(step.get("manifest"))
+
+        result = published_chain(source, replacement, describe)
+        self.assertEqual(result, replacement)
+        self.assertIsNot(result, replacement)
+        for slot, port, value in [
+            (0, 3, "other_groups"),
+            (1, 1, "other_weight"),
+            (2, 3, "split_groups"),
+        ]:
+            candidate = deepcopy(replacement)
+            candidate[slot]["buffers"][port] = value
+            with (
+                self.subTest(slot=slot, port=port),
+                self.assertRaisesRegex(ValueError, "routed boundary"),
+            ):
+                published_chain(source, candidate, describe)
+        specs["split"]["parameters"]["_row_capacity"] = 256
+        with self.assertRaisesRegex(ValueError, "physical domain"):
+            published_chain(source, replacement, describe)
+
+    def test_reuse_preserves_packet_roles_decoder_marker_and_head_readers(self):
+        from tools.model.deepseek_v41.expert_fusion import reuse_published
+
+        source, replacement, specs = self.published_fixture()
+        marker = dict(op="decoder_rows", keep=128, prepare=0, select=0)
+        packet = dict(rows=32, min_rows=16, body=[marker, *source], head=[])
+        model = dict(
+            batch={},
+            ranks=[
+                dict(
+                    buffers=[],
+                    packets=[
+                        dict(rows=32, min_rows=1, max_rows=15, body=replacement, head=[]),
+                        packet,
+                        dict(packet, role="draft"),
+                    ],
+                )
+            ],
+        )
+        original = deepcopy(model)
+
+        def describe(step):
+            return specs.get(step.get("manifest"))
+
+        self.assertEqual(reuse_published(model, describe, minimum=16, maximum=32), 1)
+        self.assertEqual(packet["body"], [marker, *replacement])
+        self.assertEqual(model["ranks"][0]["packets"][2], original["ranks"][0]["packets"][2])
+        original["ranks"][0]["packets"][1]["head"] = [dict(op="snapshot", buffer="packed")]
+        with self.assertRaisesRegex(ValueError, "still has a reader"):
+            reuse_published(original, describe, minimum=16, maximum=32)
+
     def fixture(self):
         from tools.model.deepseek_v41.expert_fusion import selected_chain
 

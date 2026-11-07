@@ -49,6 +49,18 @@ def projection_configs(parameters, pipeline_only=False, wide_integer=False, join
             )
             if parameters["reduction"] % k == 0 and (s == 0 or parameters["reduction"] // k >= s)
         ]
+        if parameters["integer"] and parameters["output"] % 192 == 0:
+            configs += [
+                dict(baseline, tile_m=m, tile_n=n, block_k=512, pipeline_stages=s)
+                for m, n, s in (
+                    (256, 96, 0),
+                    (256, 96, 2),
+                    (128, 192, 0),
+                    (128, 192, 2),
+                    (64, 192, 2),
+                )
+                if parameters["reduction"] % 512 == 0
+            ]
     elif wide_integer:
         configs = [
             dict(baseline, tile_m=128, tile_n=256, pipeline_stages=s)
@@ -73,6 +85,33 @@ def projection_configs(parameters, pipeline_only=False, wide_integer=False, join
     return [baseline] + [c for c in configs if c != baseline]
 
 
+def preserve_small_rows(existing, measured, variants, old, chosen, capacity):
+    """Keep the published small-row computation when tuning only larger packets."""
+    limit = min(capacity, 128)
+    if set(range(1, limit + 1)) <= set(measured):
+        return variants
+    if variants:
+        raise ValueError("Incomplete small-row tuning cannot replace published choices")
+    result = []
+    for rows in range(1, limit + 1):
+        selected = next(
+            (
+                item["kernels"]
+                for item in existing
+                if item["min_rows"] <= rows <= item["max_rows"]
+                and rows % item.get("multiple_of", 1) == 0
+            ),
+            [old],
+        )
+        if selected == [chosen]:
+            continue
+        if result and result[-1]["max_rows"] + 1 == rows and result[-1]["kernels"] == selected:
+            result[-1]["max_rows"] = rows
+        else:
+            result.append(dict(min_rows=rows, max_rows=rows, multiple_of=1, kernels=list(selected)))
+    return result
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--plan", type=Path, required=True)
@@ -81,6 +120,12 @@ def main():
     p.add_argument("--package-output", type=Path, help="Publish only selected native assets")
     p.add_argument("--rows", type=int, nargs="+")
     p.add_argument("--maximum-regression", type=float, default=0.05)
+    p.add_argument(
+        "--weight-buffers",
+        type=int,
+        default=1,
+        help="Rotate distinct copies of the real weight bank during Graph measurement",
+    )
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--compile-workers", type=int, default=4)
     p.add_argument(
@@ -97,6 +142,12 @@ def main():
         help="Tune only dynamic projection kernels with an explicit local row binding",
     )
     p.add_argument("--decode-only", action="store_true", help="Tune the shared batch decode family")
+    p.add_argument(
+        "--min-capacity",
+        type=int,
+        default=1,
+        help="Limit tuning to physical row capacities at least this large",
+    )
     search = p.add_mutually_exclusive_group()
     search.add_argument(
         "--grid-only", action="store_true", help="Measure same-source 64/128/256 CTA bounds"
@@ -116,6 +167,10 @@ def main():
     args = p.parse_args()
     if not 1 <= args.compile_workers <= 8:
         p.error("compile workers must be in 1..8")
+    if not 1 <= args.min_capacity <= 4096:
+        p.error("minimum capacity must be in 1..4096")
+    if not 1 <= args.weight_buffers <= 64:
+        p.error("weight buffers must be in 1..64")
     if not math.isfinite(args.maximum_regression) or not 0 <= args.maximum_regression <= 1:
         p.error("maximum regression must be finite, within 0..1")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -139,11 +194,15 @@ def main():
     for packet in model["ranks"][0]["packets"]:
         if args.decode_only and not packet.get("batch_decode", False):
             continue
+        if args.rows and packet.get("max_rows", packet["rows"]) < min(args.rows):
+            continue
         for step in packet["body"] + packet["head"]:
             if step["op"] != "kernel" or step["manifest"] in groups:
                 continue
             manifest = json.loads((base / step["manifest"]).read_text())
             if manifest["op"] == "dense.projection" and "_row_capacity" in manifest["parameters"]:
+                if manifest["parameters"]["_row_capacity"] < args.min_capacity:
+                    continue
                 if args.bf16_output and step["manifest"] not in unit_scales:
                     continue
                 if (
@@ -237,12 +296,14 @@ def main():
             configs=configs,
             samples=measured,
             maximum_regression=args.maximum_regression,
-            calls_per_replay=16,
+            calls_per_replay=max(16, args.weight_buffers),
+            weight_buffers=args.weight_buffers,
             seed=20261002,
             weight=weight,
             weight_sha256=file_hash_bytes(bank),
             scale_sha256=file_hash_bytes(channel) if channel is not None else None,
             scale=scaling,
+            existing_small_rows=selections.get(old, []),
             tuner_sha256=file_hash(Path(__file__)),
             assembly_sha256=file_hash(Path(__file__).with_name("assembly.py")),
             geometry_sha256=file_hash(Path(__file__).parents[2] / "operators/ascend/geometry.py"),
@@ -298,6 +359,10 @@ def main():
             else torch.randn(capacity, k).bfloat16()
         ).npu()
         device_weight = bank.npu()
+        device_weights = [device_weight] + [
+            device_weight.clone() for _ in range(args.weight_buffers - 1)
+        ]
+        weight_cursor = 0
         token_scale = (torch.rand(capacity) * 0.01 if integer else torch.ones(capacity)).npu()
         channel_scale = (channel if integer else torch.ones(n)).npu()
         out = torch.empty((capacity + 64, n), dtype=torch.bfloat16, device="npu")
@@ -314,6 +379,9 @@ def main():
         for rows in measured:
 
             def launch(index):
+                nonlocal weight_cursor
+                pointers[1] = device_weights[weight_cursor].data_ptr()
+                weight_cursor = (weight_cursor + 1) % len(device_weights)
                 status = entries[index](
                     pointers, len(tensors), rows, torch.npu.current_stream()._as_parameter_
                 )
@@ -360,7 +428,9 @@ def main():
                         max_repetitions=32,
                         change=change,
                         check=check,
-                        benchmark=partial(npu_benchmark, calls_per_replay=16),
+                        benchmark=partial(
+                            npu_benchmark, calls_per_replay=max(16, args.weight_buffers)
+                        ),
                     )
                 except AssertionError as error:
                     if i == 0:
@@ -389,6 +459,9 @@ def main():
             )
             for v in bounded_choices(measurements, str(selected), min(capacity, 128))
         ]
+        variants = preserve_small_rows(
+            selections.get(old, []), measured, variants, old, chosen, capacity
+        )
         result = dict(
             identity=identity,
             measurements=measurements,
@@ -407,6 +480,7 @@ def main():
             bank
         ) = None
         torch.npu.synchronize()
+        device_weights = None
         torch.npu.empty_cache()
     for rank in model["ranks"]:
         for packet in rank["packets"]:

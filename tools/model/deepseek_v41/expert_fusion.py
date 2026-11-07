@@ -8,6 +8,7 @@ import multiprocessing
 from pathlib import Path
 
 from tools.build.files import atomic_json, file_hash
+from tools.build.shared_json import decode
 from tools.model.deepseek_v41.assembly import (
     check_intermediate_liveness,
     publish_package,
@@ -56,6 +57,141 @@ def selected_chain(program, index, describe):
     ):
         raise ValueError("Expert fusion geometry or dataflow differs")
     return chain, (capacity, rows, reduction, columns // 2, experts)
+
+
+def published_chain(source, replacement, describe):
+    """Reuse an existing bit-plane program only at the identical routed boundary."""
+    (gather, up, activation), geometry = selected_chain(source, 0, describe)
+    if len(replacement) != 3:
+        raise ValueError("Incomplete published expert fusion")
+    split, cube, finish = replacement
+    g, f = describe(split), describe(finish)
+    capacity, rows, reduction, width, experts = geometry
+    if (
+        not g
+        or not f
+        or g["op"] != "expert.gather_split"
+        or f["op"] != "expert.finish"
+        or set(split) != {"op", "manifest", "buffers"}
+        or set(finish) != {"op", "manifest", "buffers"}
+        or cube["op"] != "w4_a4"
+        or any(
+            cube.get(k) != up.get(k)
+            for k in ("name", "input", "output", "experts", "workspace", "weight_layout")
+        )
+        or cube["rows"] != rows * 2
+        or split["buffers"][:3] != gather["buffers"][:3]
+        or split["buffers"][3] != up["groups"]
+        or split["buffers"][4:7] != gather["buffers"][3:6]
+        or split["buffers"][7] != cube["groups"]
+        or cube["buffers"][:4] != up["buffers"][:4]
+        or finish["buffers"]
+        != [cube["buffers"][5], *up["buffers"][3:5], up["groups"], *activation["buffers"][1:3]]
+        or any(
+            g["parameters"].get(k) != v
+            for k, v in dict(
+                rows=rows,
+                table_rows=capacity,
+                width=reduction,
+                experts=experts,
+                _row_capacity=capacity,
+            ).items()
+        )
+        or any(
+            f["parameters"].get(k) != v
+            for k, v in dict(
+                rows=rows, width=width, experts=experts, _row_capacity=capacity
+            ).items()
+        )
+    ):
+        raise ValueError("Published expert fusion changes the routed boundary or physical domain")
+    return deepcopy(replacement)
+
+
+def reuse_published(model, describe, *, minimum=128, maximum=2048, role="target"):
+    """Converge selected packet ranges onto already published dynamic kernels."""
+    if not 1 <= minimum <= maximum <= 4096 or role not in ("target", "draft"):
+        raise ValueError("Invalid expert fusion row interval or role")
+    changed = 0
+    for rank in model["ranks"]:
+        templates = {}
+        for packet in rank["packets"]:
+            if packet.get("role", "target") != role:
+                continue
+            for index, step in enumerate(packet["body"]):
+                if step["op"] != "w4_a4" or index == 0:
+                    continue
+                candidate = packet["body"][index - 1 : index + 2]
+                split = describe(candidate[0])
+                if len(candidate) != 3 or not split or split["op"] != "expert.gather_split":
+                    continue
+                key = (packet["rows"], step["name"])
+                if key in templates and templates[key] != candidate:
+                    raise ValueError("Ambiguous published expert fusion")
+                templates[key] = candidate
+        definitions = {d["name"]: d for d in rank["buffers"]}
+        for packet in rank["packets"]:
+            low, high = packet.get("min_rows", 1), packet.get("max_rows", packet["rows"])
+            if (
+                packet.get("role", "target") != role
+                or packet.get("batch_decode")
+                or high < minimum
+                or low > maximum
+            ):
+                continue
+            if low < minimum or high > maximum:
+                raise ValueError("Select complete existing packet intervals")
+            program, result, index = packet["body"], [], 0
+            while index < len(program):
+                step = program[index]
+                spec = describe(step)
+                if not spec or spec["op"] != "memory.gather_quantized_rows":
+                    result.append(step)
+                    index += 1
+                    continue
+                source, _ = selected_chain(program, index, describe)
+                key = (packet["rows"], source[1]["name"])
+                if key not in templates:
+                    raise ValueError("Missing published expert fusion for selected packet")
+                replacement = published_chain(source, templates[key], describe)
+                check_intermediate_liveness(
+                    program[index + 3 :] + packet["head"],
+                    [source[1]["buffers"][0], source[1]["buffers"][5]],
+                    describe,
+                    model["batch"],
+                    definitions,
+                )
+                result.extend(replacement)
+                index += 3
+                changed += 1
+            packet["body"] = result
+    if not changed:
+        raise ValueError("No matching published expert fusion boundaries")
+    return changed
+
+
+def reuse(plan, output, minimum=128, maximum=2048, role="target", model_dir=None):
+    """Publish a converged plan without compiling kernels or rewriting weights."""
+    if output.exists():
+        raise ValueError("Require a new expert fusion output directory")
+    model = decode(json.loads(plan.read_text()))
+    descriptions = {}
+
+    def describe(step):
+        if step.get("op") != "kernel":
+            return None
+        name = step["manifest"]
+        if name not in descriptions:
+            descriptions[name] = json.loads((plan.parent / name).read_text())
+        return descriptions[name]
+
+    changed = reuse_published(model, describe, minimum=minimum, maximum=maximum, role=role)
+    validate_rows(model, plan.parent, model_dir=model_dir)
+    assets = publish_package(model, plan.parent, output / "package")
+    atomic_json(
+        output / "result.json", dict(changed_chains=changed, compiled_kernels=0, assets=assets)
+    )
+    return output / "package" / "model.json"
 
 
 def build(
@@ -260,7 +396,17 @@ def main():
     parser.add_argument("--epilogue-tile", type=int, default=2304)
     parser.add_argument("--expected-expert-rows", type=int)
     parser.add_argument("--role", choices=("target", "draft"), default="target")
+    parser.add_argument(
+        "--reuse-published",
+        action="store_true",
+        help="Reuse matching dynamic bit-plane kernels from another packet in the same plan",
+    )
     args = parser.parse_args()
+    if args.reuse_published:
+        print(
+            reuse(args.plan, args.output, args.min_rows, args.max_rows, args.role, args.model_dir)
+        )
+        return
     print(
         build(
             args.plan,

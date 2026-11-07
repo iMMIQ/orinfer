@@ -106,11 +106,15 @@ local TopK 的空块使用交错的 `(-inf, -1)` 候选对。`tools.operators.as
 
 DSpark Markov 的步号通过只读 INT32 表绑定，argmax、confidence 和 rank reduce 各复用一个动态算子。5／8／16 长度别名只截取公共 Markov 调用序列。专家融合使用实际专家路由倍率，`tools.model.deepseek_v41.expert_fusion --role target|draft` 共用 gather、A4 GMM 和激活边界的构建流程；所有者行数、专家数和路由倍率共同确定几何。
 
+已有双 INT4 平面专家程序的执行包可用 `tools.model.deepseek_v41.expert_fusion --reuse-published --plan PLAN --output OUT --min-rows 128 --max-rows 2048 --model-dir MODEL` 将完整选中区间复用到相同几何的融合程序。工具逐层匹配权重、路由计数、物理容量、输入输出绑定和 workspace，保留 decoder 行边界及其他角色；缺少匹配程序或仍有中间结果读者时拒绝导出。该操作复用已有动态 kernel 和单份 W4 bank，不编译新算子，也不改写权重；A8 分解、FP16 部分积重组及两处 BF16 舍入沿用原融合算术。实际启用区间由完整请求测量选择。
+
 设置 `ORINFER_A2_DSPARK_POLICY_TRACE=1` 后，A2 模型在标准错误输出普通执行的 direct／replay 状态、耗时及 DSpark 决策的样本数、行预算、请求深度和成本曲线。该开关在模型创建时读取，默认关闭。记录可用于区分样本不足、行预算、短尾和成本评分引起的关闭；计时诊断需计入日志开销。
 
 A2 DSpark 复用公共投机控制器的条件接受率、吞吐／延迟收益评分、热态采样与实际损失账本。昇腾适配层提供合法的 5／8／16 物理草稿档位、聚合验证行数和 target／draft／状态恢复的稀疏成本曲线，分别记录 direct 与 Graph replay；实际执行所选的最小档位必须与定价档位一致。校准按物理档位从小到大推进，同档位先校准预算内的最大验证包，较短前缀复用已测成本参与收益评分；探测准备费只引用相近的工作形状，prefill 冷构建样本不用于阻止小型验证计划。普通混合执行可以直接提供成本样本，新 batch 复用邻近行数和上下文区间的已测数据。首次探测前先取得普通执行当前模式的三个耗时样本；各阶段共用公共预热采样器，direct／replay 分别排除首样本，再合计保留的热样本；原始观测数与保留的热样本分别记录。定价和 Graph 就绪仍保持各自模式，避免切换模式后逐个前缀重复校准。探测由公共模型级账本约束，实际收益可供新 batch／context 复用。A2 启动池最多四个 `target_tpot_ms`，覆盖公共校准窗口；batch／成员／context 变化不重新发放额度。普通执行的成本样本在整轮完成后记录，包含 CPU 采样、约束及提交，冷准备独立计费且每轮仅记一次样本。在整轮结束后按实际耗时及本轮 decoder 的实际提交量结算；零提交也记损失，选择候选、切换 context 或逐出成本条目均不重置额度。策略 trace 的 `DSPARK_SETTLE` 包含本轮提交量、余额和启动池累计支出。缺少 Graph 先验的长稳定段允许有界预热。成本评分计入实际 prompt 行数、验证挤出的 prefill 工作和准备成本的摊销；公共条件接受率 EMA 按实际验证的 owner 数更新，同一成本 cohort 的已测接受率可初始化新请求；导入先验不计为该请求的样本，已有请求的拒绝历史继续独立保留。该 EMA 决定预计提交量，草稿置信度仅用于分配请求前缀，避免把 q 的自身置信度当成目标接受概率。普通执行、draft 和 verify 共享捕获准入：工作区增长后读取全部 rank 的真实缓存状态，已有 Graph 直接 replay；新捕获需满足预热条件、剩余同形状执行次数的回本条件及延迟预算。一次性构建和捕获成本独立于稳态执行模式保存。解码步节省的时间可积累为捕获额度，额度至多一个 `target_tpot_ms`，超支从实际整步耗时扣回；空闲请求集合清零。候选选择与捕获准入使用同一个按预期提交量计算、至多两倍 TPOT 的解码时间窗。TPOT 是软目标，额度允许有界的一次性捕获延迟，避免略超目标便始终无法捕获。
 
 对代表性短负载开启上述 trace 后，运行 `uv run --locked python -m tools.bench.dspark_costs --log SERVICE_LOG --output COSTS_JSON` 生成性能先验。通过 `ORINFER_A2_DSPARK_COST_MODEL=COSTS_JSON` 在服务启动时读取；文件位于独立调优缓存，与权重分开保存。先验固定执行包、目标设备、CANN 9.2 和 TP rank 数，身份不匹配或数据无效时返回加载错误。稳态耗时与正的冷准备事件分别聚合，普通 replay 的零准备耗时不计入捕获成本中位数。先验只描述耗时，不计入本进程的热样本或观测次数，也不表示当前 Graph 已缓存；在线执行继续修正估计。缺少先验时使用运行中收集的数据，不在启动时扫描权重或遍历全部形状测量。
+
+纯 decode 的新并发档位先取得本地普通执行样本，再用共享成本曲线选择投机深度，避免较大 batch 的 direct 耗时高估当前普通 decode 并阻止其采样。owner 身份和上下文变化继续复用该并发档位的样本；target／draft 证据、接受率与全局损失账本继续复用。
 
 `run.sh` 将所选基础镜像解析为本地不可变镜像 ID；板上运行时串行取得 GPU 实验锁，无卡编译使用 `--without-devices`。编译产物、参考数据和缓存保存在 `artifacts`：
 
@@ -302,6 +306,8 @@ bash tools/operators/ascend/run.sh --without-devices \
 `--shared-attention` 将跨 rank 相同的 KV/Qa 投影和归一化复用到局部行模板，Qb 保留原 TP 分片；构建时检查权重身份及局部输出在下一次覆盖前的全部消费者。INT8 KV 的写入与原有 dtype 边界保持不变。局部几何直接读取实际算子工厂，包含按 Cube tile 填充的 scratch，分配大小不再直接按八分之一推导。
 
 设备调优时去掉 `--without-devices`，增加 `--shared-attention --tune-projections local --model-dir MODEL_DIR`。调优使用真实权重，默认覆盖局部容量内的所有 1–128 行和更大行数采样，检查输出尾部、scratch 边界及改变输入后的 Graph replay。共享选择组件按逐测量点至多 5% 回退的限制选择一个通用配置；只有完整测量全部整数的短行区间才生成局部 `row_selections`。相邻区间仅在实现相同时合并，发布前再按 packet 的实际调度范围和截短边界裁掉不可达的选择与库。执行器复用 SDK 的 `KernelVariant` 和行数算术，在准备 Graph 时消费选择表；在线执行保持编译好的同源实现。替换实现必须保持源码、编译器、权重、dtype、scale、数学参数和非 scratch 操作数一致，scratch 可以使用已分配范围内的较小视图。
+
+独立投影调优入口 `tools.model.deepseek_v41.tune` 支持用 `--geometry N K --min-capacity M --rows ...` 限定矩阵和容量。只测量大行数时保留已发布的 1–128 行选择及默认回退，较大行数共同选择一个动态配置。`--joint` 为满足几何的整数投影增加 96／192 列 tile，沿用同一计算体与舍入边界。`--weight-buffers 16` 轮换同值、不同地址的真实权重副本，使 Graph 测量覆盖多层权重工作集；副本仅用于离线测量，配置和副本数计入调优缓存身份。最终执行包只发布被选择的库，完整请求与 Mini 收益另行验收。
 
 `--packet-cache-capacity N` 限制每个 rank 的 Graph 形状缓存，默认 64、范围 4–4096；普通单行 decode 常驻，其余按最近使用顺序淘汰。相同几何和 GPU 指针的 ACLNN W4 计划由仍存活的 Graph 共享；Graph 和完成事件持有原生资源。请求重置按模板中声明的状态去重，与缓存过多少种形状无关。离线构建穷举行数表达式和物理范围，在线保留实际行数、操作数和 ABI 校验。
 

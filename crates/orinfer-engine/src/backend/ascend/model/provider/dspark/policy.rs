@@ -465,6 +465,17 @@ impl Policy {
             budget.work
         };
         let stage = if mixed { Stage::Target } else { Stage::Decode };
+        // Neighboring direct batches can overprice a smaller ordinary decode.
+        // Sample its real execution mode before speculation can monopolize it;
+        // owner/context changes still reuse the cohort, costs and loss ledger.
+        if !mixed
+            && self
+                .curves
+                .get(&(batch, full, mixed))
+                .is_none_or(|curve| curve.baseline_samples == 0)
+        {
+            return Ok(ordinary);
+        }
         let Some(normal) = self.costs.predict(stage, 0, full, work) else {
             return Ok(ordinary);
         };
@@ -820,6 +831,66 @@ mod tests {
             uniform: false,
             ..Budget::default()
         }
+    }
+    #[test]
+    fn uncalibrated_mixed_selection_keeps_feedback_cohort_uninitialized() {
+        let mut p = Policy::default();
+        let feedback = Feedback::default();
+        let limits = Budget {
+            work: Work {
+                rows: 800,
+                prefill_rows: 798,
+                context: 131072,
+            },
+            ..budget(128)
+        };
+        assert_eq!(
+            p.select_requests(false, true, limits, &[5; 2], &[&feedback; 2], &[5])
+                .unwrap(),
+            vec![0; 2]
+        );
+        assert!(!p.curves.contains_key(&(2, false, true)));
+    }
+    #[test]
+    fn shrinking_batch_samples_ordinary_decode_before_borrowing_its_price() {
+        let mut p = Policy::default();
+        for _ in 0..6 {
+            p.baseline(4, false, false, 0.12);
+            for (stage, block, rows, seconds) in [
+                (Stage::Target, 0, 12, 0.10),
+                (Stage::Draft, 5, 2, 0.006),
+                (Stage::Restore, 5, 2, 0.0002),
+            ] {
+                p.costs.observe(Point {
+                    stage,
+                    block,
+                    full: false,
+                    replay: false,
+                    work: Work {
+                        rows,
+                        ..Work::default()
+                    },
+                    seconds,
+                    setup_s: 0.,
+                });
+            }
+        }
+        let feedback = Feedback::default();
+        // Four-owner direct execution overprices the unseen two-owner decode.
+        // Reusing target/draft evidence must leave an ordinary sample possible.
+        assert_eq!(
+            p.select_requests(false, false, budget(12), &[5; 2], &[&feedback; 2], &[5])
+                .unwrap(),
+            vec![0; 2]
+        );
+        for _ in 0..6 {
+            p.baseline(2, false, false, 0.02);
+        }
+        assert_eq!(
+            p.select_requests(false, false, budget(12), &[5; 2], &[&feedback; 2], &[5])
+                .unwrap(),
+            vec![0; 2]
+        );
     }
     #[test]
     fn single_owner_timings_do_not_prevent_bounded_c32_calibration() {

@@ -21,8 +21,8 @@ def projection(
     alignment = 32 if integer else 128
     if (isinstance(rows, int) and rows < 1) or output % 32 or reduction % alignment:
         raise ValueError("A2 projection requires positive rows and aligned N/K")
-    if tile_n not in (32, 64, 128, 256):
-        raise ValueError("A2 projection N tile must be 32, 64, 128 or 256")
+    if tile_n not in (32, 64, 96, 128, 192, 256):
+        raise ValueError("A2 projection N tile must be 32, 64, 96, 128, 192 or 256")
     if tile_m not in (16, 32, 64, 128, 256) or (tile_m == 256 and not integer):
         raise ValueError("A2 projection M tile must fit the INT8/BF16 L0A slot")
     block_m, block_n = tile_m, math.gcd(output, tile_n)
