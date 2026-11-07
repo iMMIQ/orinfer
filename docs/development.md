@@ -65,6 +65,30 @@ uv run --locked python -m tools.dev.workspace inventory
 
 ## 检查与缓存
 
+Rust 工具链和 workspace 最低版本统一为稳定版 1.99.1。依赖更新要求发布满 7 天，
+覆盖 Cargo 直接与传递依赖、两个 uv 环境的实际锁定文件、构建依赖、CI actions/uv、
+Jetson PyTorch wheel 和 Ascend TileLang wheel。uv 通过 `exclude-newer = "7 days"`
+在解析时过滤新文件；Rust 精确版本及完整锁文件的发布时间记录在
+`configs/dependency-releases.json`，由官方 registry、Rust 发布元数据和 GitHub Release 生成。
+
+更新 Cargo 精确版本与锁文件后，运行以下流程：
+
+```bash
+uv lock --upgrade
+uv lock --upgrade --project tools/environments/cuda
+python3 -m tools.dev.dependencies refresh
+make python-env
+cargo fetch --locked
+make check
+```
+
+`refresh` 只读取发布元数据，拒绝未满 7 天、缺少日期、被撤回或来源不匹配的版本。
+Cargo 的版本解析不会执行依赖代码；锁定版本通过发布时间审计后再下载和构建。
+被拒绝的传递版本可用 `cargo update -p NAME --precise VERSION` 选择已满等待期的版本，再重新审计。
+`make python-env`、`make cuda-env`、`make build`、`make check` 和发行构建先离线核对
+锁文件及依赖声明与发布时间记录。输入变动后须重新审计；常规检查不联网。
+设备绑定的 wheel、CANN 9.2 和已有算子数值/ABI 契约保持显式固定，升级后按实际契约验证。
+
 `make check` 执行统一 CPU 检查。Python 单测按 `test_*.py` 自动发现，默认进入 CPU
 组；需要离线 CUDA 环境的文件声明 `TEST_ENVIRONMENT = "cuda"`。`make check-offline`
 执行 CUDA 离线检查，`make check-ascend-offline` 在无设备容器中执行 Ascend 导入检查。

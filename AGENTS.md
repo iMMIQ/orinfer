@@ -57,6 +57,8 @@
 
 ## 开发
 
+- 工具链及依赖采用发布满 7 天的稳定版本。两个 uv 项目保持 `exclude-newer = "7 days"`；更新 Cargo/uv 锁文件、构建依赖、CI 或设备 wheel 后，先用 `python3 -m tools.dev.dependencies refresh` 从官方发布元数据生成 `configs/dependency-releases.json`，审计通过后再下载和构建。常规 Make 和发行检查离线核对该记录；保持运行时加载流程独立于此项构建检查。
+
 - 文档直接说明功能、用法、条件和验证范围，优先使用清晰的肯定句；技术限制按准确的支持范围和错误行为表述。
 
 - 先用 rg 检查调用者和依赖；保持修改小而完整。subagent 仅在用户或适用指令明确要求时启动。

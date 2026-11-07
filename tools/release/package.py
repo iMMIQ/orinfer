@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 from orinfer_build.packaging.package import execution_identity, install  # noqa: E402
 from orinfer_build.packaging.publication import generated_outputs  # noqa: E402
 from orinfer_build.common.files import file_hash  # noqa: E402
+from tools.dev.dependencies import check as check_dependency_age  # noqa: E402
 
 
 def command(*args, cwd=ROOT):
@@ -167,6 +168,7 @@ def execution_assets(archives, cache, binary, tag):
 
 
 def build(args):
+    check_dependency_age(ROOT)
     revision = command("git", "rev-parse", "HEAD")
     if command("git", "status", "--porcelain", "--untracked-files=normal"):
         raise ValueError("Release requires a clean worktree, including new source files")

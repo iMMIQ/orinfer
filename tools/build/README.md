@@ -20,7 +20,11 @@ uv run --locked python -m orinfer_build.contracts.catalog --help
 uv run --locked --project tools/environments/cuda python -c 'import torch; print(torch.__version__)'
 ```
 
-`uv sync --locked` 按提交的锁文件同步，`uv run --locked` 执行工具。新增依赖时修改实际使用它的项目；更新依赖使用对应项目的 `uv lock --upgrade`，随后执行该环境的检查。常规安装和验收保持锁文件不变。
+`make python-env` 和 `make cuda-env` 先验证发布等待期，再按锁文件同步；`uv run --locked` 执行工具。
+依赖须发布满 7 天，两个 uv 项目通过原生 `exclude-newer` 过滤新文件。
+新增或更新依赖后先运行对应项目的 `uv lock --upgrade`、`python3 -m tools.dev.dependencies refresh`，
+再下载和检查。Cargo 也须先完成发布时间审计，再运行 `cargo fetch --locked`；完整流程见[开发约定](../../docs/development.md)。
+常规安装和验收保持锁文件不变。
 
 ## 物理机 CUDA 工具链
 

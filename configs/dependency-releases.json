@@ -1,0 +1,1797 @@
+{
+  "schema": 1,
+  "minimum_age_days": 7,
+  "files": {
+    ".github/workflows/check.yml": "ee51369f2f0d8e41897d9cefaa1974e22a97b7fef03ed6cd6d7214c3a6e389f5",
+    "Cargo.lock": "412d4bebf016df2d9335bdfc8b3a4faa304dc062730476fcd7924ccd780e0074",
+    "Cargo.toml": "d5839605d03cea62906be2a6e33e9238288b4753901698f78492093c6cb225ef",
+    "crates/orinfer-api/Cargo.toml": "4468804dbcebd698e4fb36514837eba18c4132b05ba000a8b5d31718c85dd16f",
+    "crates/orinfer-cli/Cargo.toml": "e82066f8646b3da4bfe4e52dbfa0a375e61591c1640391a326752de13c5f4c97",
+    "crates/orinfer-device/Cargo.toml": "8218a7da5e10a7d5d8ce3edc624bf21836f5bd7e414bd4879b4380d59bcf00e1",
+    "crates/orinfer-engine/Cargo.toml": "f51a4dbf1b2b50d2b8acd351cc45dfd0fc0a5af24e8dbf112406484a6a44b8b8",
+    "crates/orinfer-model-sdk/Cargo.toml": "eb920bb9790a8373ccb936ba6a0d60e4137be4f22aff82bd4a5600bc394896fe",
+    "crates/orinfer-models/Cargo.toml": "063350fde5ba0c4e9ecac33778ecdb06c453dae0702d144df25718384e6d8a61",
+    "pyproject.toml": "8353d154b59f80eca67ad14b36ed5f09d18bdcc67c179eed30dd4b3fcd6e878e",
+    "rust-toolchain.toml": "b9c8d2d59f6f46474c0cfa0b8b77bea21d94fc73a30ad93d5bf6385c422197d2",
+    "tools/build/jetson_wheels.json": "435e70191f25563446812566da873e69200bd0471958b0adaa021026fc5ab4b4",
+    "tools/environments/ascend/Dockerfile": "bd7f5808824f17306b0bfc3752bd658610fce22126aa8ee151c44952a131b5ca",
+    "tools/environments/ascend/run.sh": "6ed71b8f0e46130e12e692b3b8d6c73417c2f4d14a145f6f68e07e36168784b6",
+    "tools/environments/cuda/pyproject.toml": "72f196c9294d4a918a2027a02bebcf4d09e79a9169026e1630c6d23511910284",
+    "tools/environments/cuda/uv.lock": "37c5076c58f740429f37825bc283454c8c9c63c68b16cbd94d20186c1b560f97",
+    "uv.lock": "b65f02824c50a96dcf83464e671e216808ad89af2542fa5ff9e9bcb8fc0f6171"
+  },
+  "releases": {
+    "action/actions/checkout@v7.0.1": {
+      "published": "2026-07-20T15:10:05Z",
+      "url": "https://api.github.com/repos/actions/checkout/releases/tags/v7.0.1"
+    },
+    "action/actions/setup-python@v7.1.0": {
+      "published": "2026-10-22T02:56:04Z",
+      "url": "https://api.github.com/repos/actions/setup-python/releases/tags/v7.1.0"
+    },
+    "action/astral-sh/setup-uv@v10.3.3": {
+      "published": "2026-10-28T14:35:19Z",
+      "url": "https://api.github.com/repos/astral-sh/setup-uv/releases/tags/v10.3.3"
+    },
+    "ascend/tilelang-wheel": {
+      "published": "2026-09-09T07:20:07Z",
+      "url": "https://api.github.com/repos/tile-ai/tilelang-ascend/releases/tags/TileLang-ascend-v0.1.2.000-release"
+    },
+    "build/setuptools@84.2.1": {
+      "published": "2026-10-20T19:01:37.742699Z",
+      "url": "https://pypi.org/pypi/setuptools/84.2.1/json"
+    },
+    "cargo/adler2@2.0.1": {
+      "published": "2025-06-09T22:31:53Z",
+      "url": "https://index.crates.io/ad/le/adler2"
+    },
+    "cargo/ahash@0.8.12": {
+      "published": "2025-05-08T05:05:32Z",
+      "url": "https://index.crates.io/ah/as/ahash"
+    },
+    "cargo/aho-corasick@1.1.5": {
+      "published": "2026-08-03T11:44:11Z",
+      "url": "https://index.crates.io/ah/o-/aho-corasick"
+    },
+    "cargo/allocator-api2@0.2.21": {
+      "published": "2024-12-01T14:49:16Z",
+      "url": "https://index.crates.io/al/lo/allocator-api2"
+    },
+    "cargo/anstream@1.0.0": {
+      "published": "2026-02-11T13:23:11Z",
+      "url": "https://index.crates.io/an/st/anstream"
+    },
+    "cargo/anstyle-parse@1.0.0": {
+      "published": "2026-02-11T13:23:08Z",
+      "url": "https://index.crates.io/an/st/anstyle-parse"
+    },
+    "cargo/anstyle-query@1.1.5": {
+      "published": "2025-11-13T17:30:22Z",
+      "url": "https://index.crates.io/an/st/anstyle-query"
+    },
+    "cargo/anstyle-wincon@3.0.11": {
+      "published": "2025-11-13T17:30:26Z",
+      "url": "https://index.crates.io/an/st/anstyle-wincon"
+    },
+    "cargo/anstyle@1.0.14": {
+      "published": "2026-03-13T18:59:28Z",
+      "url": "https://index.crates.io/an/st/anstyle"
+    },
+    "cargo/anyhow@1.0.104": {
+      "published": "2026-07-18T20:59:37Z",
+      "url": "https://index.crates.io/an/yh/anyhow"
+    },
+    "cargo/atomic-waker@1.1.2": {
+      "published": "2023-09-25T17:45:09Z",
+      "url": "https://index.crates.io/at/om/atomic-waker"
+    },
+    "cargo/audio-codec-algorithms@0.8.1": {
+      "published": "2026-08-18T06:53:52Z",
+      "url": "https://index.crates.io/au/di/audio-codec-algorithms"
+    },
+    "cargo/audioadapter-buffers@5.2.0": {
+      "published": "2026-08-20T20:55:29Z",
+      "url": "https://index.crates.io/au/di/audioadapter-buffers"
+    },
+    "cargo/audioadapter-sample@5.2.0": {
+      "published": "2026-08-20T20:55:27Z",
+      "url": "https://index.crates.io/au/di/audioadapter-sample"
+    },
+    "cargo/audioadapter@5.0.0": {
+      "published": "2026-07-31T21:34:42Z",
+      "url": "https://index.crates.io/au/di/audioadapter"
+    },
+    "cargo/autocfg@1.5.1": {
+      "published": "2026-05-22T11:03:04Z",
+      "url": "https://index.crates.io/au/to/autocfg"
+    },
+    "cargo/aws-lc-rs@1.19.0": {
+      "published": "2026-10-28T15:48:44Z",
+      "url": "https://index.crates.io/aw/s-/aws-lc-rs"
+    },
+    "cargo/aws-lc-sys@0.47.0": {
+      "published": "2026-10-28T15:43:12Z",
+      "url": "https://index.crates.io/aw/s-/aws-lc-sys"
+    },
+    "cargo/axum-core@0.5.6": {
+      "published": "2025-12-27T09:19:34Z",
+      "url": "https://index.crates.io/ax/um/axum-core"
+    },
+    "cargo/axum@0.8.9": {
+      "published": "2026-04-14T07:55:20Z",
+      "url": "https://index.crates.io/ax/um/axum"
+    },
+    "cargo/base64@0.13.1": {
+      "published": "2022-10-21T13:10:12Z",
+      "url": "https://index.crates.io/ba/se/base64"
+    },
+    "cargo/base64@0.23.1": {
+      "published": "2026-08-04T12:34:31Z",
+      "url": "https://index.crates.io/ba/se/base64"
+    },
+    "cargo/bit-set@0.8.0": {
+      "published": "2024-07-16T17:18:45Z",
+      "url": "https://index.crates.io/bi/t-/bit-set"
+    },
+    "cargo/bit-vec@0.8.0": {
+      "published": "2024-07-16T17:14:52Z",
+      "url": "https://index.crates.io/bi/t-/bit-vec"
+    },
+    "cargo/bitflags@2.13.2": {
+      "published": "2026-09-10T01:11:38Z",
+      "url": "https://index.crates.io/bi/tf/bitflags"
+    },
+    "cargo/block-buffer@0.12.1": {
+      "published": "2026-06-11T15:40:05Z",
+      "url": "https://index.crates.io/bl/oc/block-buffer"
+    },
+    "cargo/borrow-or-share@0.2.4": {
+      "published": "2025-11-02T17:53:51Z",
+      "url": "https://index.crates.io/bo/rr/borrow-or-share"
+    },
+    "cargo/bumpalo@3.20.3": {
+      "published": "2026-05-22T14:59:11Z",
+      "url": "https://index.crates.io/bu/mp/bumpalo"
+    },
+    "cargo/bytecount@0.6.9": {
+      "published": "2025-06-03T06:59:49Z",
+      "url": "https://index.crates.io/by/te/bytecount"
+    },
+    "cargo/bytemuck@1.25.2": {
+      "published": "2026-07-19T19:36:16Z",
+      "url": "https://index.crates.io/by/te/bytemuck"
+    },
+    "cargo/bytemuck_derive@1.12.1": {
+      "published": "2026-09-11T20:47:15Z",
+      "url": "https://index.crates.io/by/te/bytemuck_derive"
+    },
+    "cargo/byteorder-lite@0.1.0": {
+      "published": "2024-04-07T19:09:06Z",
+      "url": "https://index.crates.io/by/te/byteorder-lite"
+    },
+    "cargo/bytes@1.12.1": {
+      "published": "2026-07-08T10:01:28Z",
+      "url": "https://index.crates.io/by/te/bytes"
+    },
+    "cargo/castaway@0.2.4": {
+      "published": "2025-07-12T16:49:05Z",
+      "url": "https://index.crates.io/ca/st/castaway"
+    },
+    "cargo/cc@1.10.0": {
+      "published": "2026-10-23T08:35:43Z",
+      "url": "https://index.crates.io/2/cc"
+    },
+    "cargo/cfg-if@1.0.5": {
+      "published": "2026-09-16T17:36:11Z",
+      "url": "https://index.crates.io/cf/g-/cfg-if"
+    },
+    "cargo/cfg_aliases@0.2.2": {
+      "published": "2026-07-16T14:57:16Z",
+      "url": "https://index.crates.io/cf/g_/cfg_aliases"
+    },
+    "cargo/chacha20@0.10.2": {
+      "published": "2026-08-27T17:51:13Z",
+      "url": "https://index.crates.io/ch/ac/chacha20"
+    },
+    "cargo/clap@4.6.7": {
+      "published": "2026-09-14T18:40:28Z",
+      "url": "https://index.crates.io/cl/ap/clap"
+    },
+    "cargo/clap_builder@4.6.7": {
+      "published": "2026-09-14T18:40:26Z",
+      "url": "https://index.crates.io/cl/ap/clap_builder"
+    },
+    "cargo/clap_derive@4.6.7": {
+      "published": "2026-09-14T18:40:23Z",
+      "url": "https://index.crates.io/cl/ap/clap_derive"
+    },
+    "cargo/clap_lex@1.1.1": {
+      "published": "2026-09-14T18:40:24Z",
+      "url": "https://index.crates.io/cl/ap/clap_lex"
+    },
+    "cargo/cmake@0.1.58": {
+      "published": "2026-03-26T17:58:29Z",
+      "url": "https://index.crates.io/cm/ak/cmake"
+    },
+    "cargo/colorchoice@1.0.5": {
+      "published": "2026-03-13T18:59:29Z",
+      "url": "https://index.crates.io/co/lo/colorchoice"
+    },
+    "cargo/combine@4.6.9": {
+      "published": "2026-10-15T13:17:58Z",
+      "url": "https://index.crates.io/co/mb/combine"
+    },
+    "cargo/compact_str@0.9.1": {
+      "published": "2026-05-27T03:28:38Z",
+      "url": "https://index.crates.io/co/mp/compact_str"
+    },
+    "cargo/const-oid@0.10.2": {
+      "published": "2026-01-07T23:11:57Z",
+      "url": "https://index.crates.io/co/ns/const-oid"
+    },
+    "cargo/core-foundation-sys@0.8.7": {
+      "published": "2024-08-11T00:48:27Z",
+      "url": "https://index.crates.io/co/re/core-foundation-sys"
+    },
+    "cargo/core-foundation@0.10.1": {
+      "published": "2025-05-26T12:40:41Z",
+      "url": "https://index.crates.io/co/re/core-foundation"
+    },
+    "cargo/core_detect@1.0.0": {
+      "published": "2021-05-09T16:36:07Z",
+      "url": "https://index.crates.io/co/re/core_detect"
+    },
+    "cargo/cpufeatures@0.3.1": {
+      "published": "2026-08-26T18:39:59Z",
+      "url": "https://index.crates.io/cp/uf/cpufeatures"
+    },
+    "cargo/crc32fast@1.5.3": {
+      "published": "2026-10-20T13:35:21Z",
+      "url": "https://index.crates.io/cr/c3/crc32fast"
+    },
+    "cargo/crossbeam-deque@0.8.8": {
+      "published": "2026-09-05T17:47:08Z",
+      "url": "https://index.crates.io/cr/os/crossbeam-deque"
+    },
+    "cargo/crossbeam-epoch@0.9.21": {
+      "published": "2026-09-05T17:46:49Z",
+      "url": "https://index.crates.io/cr/os/crossbeam-epoch"
+    },
+    "cargo/crossbeam-utils@0.8.23": {
+      "published": "2026-09-05T17:46:14Z",
+      "url": "https://index.crates.io/cr/os/crossbeam-utils"
+    },
+    "cargo/crunchy@0.2.4": {
+      "published": "2025-06-25T12:54:43Z",
+      "url": "https://index.crates.io/cr/un/crunchy"
+    },
+    "cargo/crypto-common@0.2.2": {
+      "published": "2026-05-19T16:01:22Z",
+      "url": "https://index.crates.io/cr/yp/crypto-common"
+    },
+    "cargo/cudarc@0.19.10": {
+      "published": "2026-09-24T14:27:42Z",
+      "url": "https://index.crates.io/cu/da/cudarc"
+    },
+    "cargo/daachorse@3.0.3": {
+      "published": "2026-07-12T09:43:31Z",
+      "url": "https://index.crates.io/da/ac/daachorse"
+    },
+    "cargo/darling@0.20.11": {
+      "published": "2025-03-28T20:05:16Z",
+      "url": "https://index.crates.io/da/rl/darling"
+    },
+    "cargo/darling_core@0.20.11": {
+      "published": "2025-03-28T20:05:00Z",
+      "url": "https://index.crates.io/da/rl/darling_core"
+    },
+    "cargo/darling_macro@0.20.11": {
+      "published": "2025-03-28T20:05:07Z",
+      "url": "https://index.crates.io/da/rl/darling_macro"
+    },
+    "cargo/dary_heap@0.3.9": {
+      "published": "2026-04-16T20:05:45Z",
+      "url": "https://index.crates.io/da/ry/dary_heap"
+    },
+    "cargo/data-encoding@2.11.1": {
+      "published": "2026-08-03T10:39:52Z",
+      "url": "https://index.crates.io/da/ta/data-encoding"
+    },
+    "cargo/derive_builder@0.20.2": {
+      "published": "2024-10-08T16:55:17Z",
+      "url": "https://index.crates.io/de/ri/derive_builder"
+    },
+    "cargo/derive_builder_core@0.20.2": {
+      "published": "2024-10-08T16:54:04Z",
+      "url": "https://index.crates.io/de/ri/derive_builder_core"
+    },
+    "cargo/derive_builder_macro@0.20.2": {
+      "published": "2024-10-08T16:54:13Z",
+      "url": "https://index.crates.io/de/ri/derive_builder_macro"
+    },
+    "cargo/derivre@0.3.13": {
+      "published": "2026-09-01T15:59:39Z",
+      "url": "https://index.crates.io/de/ri/derivre"
+    },
+    "cargo/digest@0.11.3": {
+      "published": "2026-05-03T12:54:48Z",
+      "url": "https://index.crates.io/di/ge/digest"
+    },
+    "cargo/displaydoc@0.2.7": {
+      "published": "2026-07-28T13:58:21Z",
+      "url": "https://index.crates.io/di/sp/displaydoc"
+    },
+    "cargo/dunce@1.0.5": {
+      "published": "2024-08-04T01:36:46Z",
+      "url": "https://index.crates.io/du/nc/dunce"
+    },
+    "cargo/either@1.19.0": {
+      "published": "2026-10-06T18:29:04Z",
+      "url": "https://index.crates.io/ei/th/either"
+    },
+    "cargo/email_address@0.2.9": {
+      "published": "2024-07-31T22:44:11Z",
+      "url": "https://index.crates.io/em/ai/email_address"
+    },
+    "cargo/encoding_rs@0.8.44": {
+      "published": "2026-10-30T14:56:20Z",
+      "url": "https://index.crates.io/en/co/encoding_rs"
+    },
+    "cargo/equivalent@1.0.3": {
+      "published": "2026-10-13T23:06:49Z",
+      "url": "https://index.crates.io/eq/ui/equivalent"
+    },
+    "cargo/errno@0.3.14": {
+      "published": "2025-09-09T04:35:15Z",
+      "url": "https://index.crates.io/er/rn/errno"
+    },
+    "cargo/esaxx-rs@0.1.10": {
+      "published": "2023-10-05T13:12:19Z",
+      "url": "https://index.crates.io/es/ax/esaxx-rs"
+    },
+    "cargo/extended@0.1.0": {
+      "published": "2022-05-27T14:13:39Z",
+      "url": "https://index.crates.io/ex/te/extended"
+    },
+    "cargo/fancy-regex@0.17.0": {
+      "published": "2025-12-13T03:45:38Z",
+      "url": "https://index.crates.io/fa/nc/fancy-regex"
+    },
+    "cargo/fancy-regex@0.19.2": {
+      "published": "2026-09-13T02:28:32Z",
+      "url": "https://index.crates.io/fa/nc/fancy-regex"
+    },
+    "cargo/fastrand@2.5.0": {
+      "published": "2026-07-19T12:40:53Z",
+      "url": "https://index.crates.io/fa/st/fastrand"
+    },
+    "cargo/fdeflate@0.3.7": {
+      "published": "2024-12-06T03:16:12Z",
+      "url": "https://index.crates.io/fd/ef/fdeflate"
+    },
+    "cargo/filetime@0.2.29": {
+      "published": "2026-05-12T22:38:22Z",
+      "url": "https://index.crates.io/fi/le/filetime"
+    },
+    "cargo/find-msvc-tools@0.1.15": {
+      "published": "2026-10-19T07:39:37Z",
+      "url": "https://index.crates.io/fi/nd/find-msvc-tools"
+    },
+    "cargo/flate2@1.1.10": {
+      "published": "2026-08-28T04:35:22Z",
+      "url": "https://index.crates.io/fl/at/flate2"
+    },
+    "cargo/fluent-uri@0.4.1": {
+      "published": "2025-11-04T16:55:20Z",
+      "url": "https://index.crates.io/fl/ue/fluent-uri"
+    },
+    "cargo/fnv@1.0.7": {
+      "published": "2020-05-14T16:06:29Z",
+      "url": "https://index.crates.io/3/f/fnv"
+    },
+    "cargo/foldhash@0.2.0": {
+      "published": "2025-08-23T19:14:01Z",
+      "url": "https://index.crates.io/fo/ld/foldhash"
+    },
+    "cargo/form_urlencoded@1.2.2": {
+      "published": "2025-08-21T08:47:43Z",
+      "url": "https://index.crates.io/fo/rm/form_urlencoded"
+    },
+    "cargo/fraction@0.17.0": {
+      "published": "2026-08-22T19:46:13Z",
+      "url": "https://index.crates.io/fr/ac/fraction"
+    },
+    "cargo/fs_extra@1.3.0": {
+      "published": "2023-02-03T17:59:27Z",
+      "url": "https://index.crates.io/fs/_e/fs_extra"
+    },
+    "cargo/futures-channel@0.3.34": {
+      "published": "2026-08-11T12:13:10Z",
+      "url": "https://index.crates.io/fu/tu/futures-channel"
+    },
+    "cargo/futures-core@0.3.34": {
+      "published": "2026-08-11T12:13:01Z",
+      "url": "https://index.crates.io/fu/tu/futures-core"
+    },
+    "cargo/futures-io@0.3.34": {
+      "published": "2026-08-11T12:13:03Z",
+      "url": "https://index.crates.io/fu/tu/futures-io"
+    },
+    "cargo/futures-macro@0.3.34": {
+      "published": "2026-08-11T12:13:14Z",
+      "url": "https://index.crates.io/fu/tu/futures-macro"
+    },
+    "cargo/futures-sink@0.3.34": {
+      "published": "2026-08-11T12:13:06Z",
+      "url": "https://index.crates.io/fu/tu/futures-sink"
+    },
+    "cargo/futures-task@0.3.34": {
+      "published": "2026-08-11T12:13:07Z",
+      "url": "https://index.crates.io/fu/tu/futures-task"
+    },
+    "cargo/futures-util@0.3.34": {
+      "published": "2026-08-11T12:13:19Z",
+      "url": "https://index.crates.io/fu/tu/futures-util"
+    },
+    "cargo/getrandom@0.2.17": {
+      "published": "2026-01-11T21:09:53Z",
+      "url": "https://index.crates.io/ge/tr/getrandom"
+    },
+    "cargo/getrandom@0.3.4": {
+      "published": "2025-10-14T17:47:36Z",
+      "url": "https://index.crates.io/ge/tr/getrandom"
+    },
+    "cargo/getrandom@0.4.3": {
+      "published": "2026-06-17T18:01:59Z",
+      "url": "https://index.crates.io/ge/tr/getrandom"
+    },
+    "cargo/half@2.7.1": {
+      "published": "2025-10-14T03:59:26Z",
+      "url": "https://index.crates.io/ha/lf/half"
+    },
+    "cargo/hashbrown@0.16.1": {
+      "published": "2025-11-20T16:47:18Z",
+      "url": "https://index.crates.io/ha/sh/hashbrown"
+    },
+    "cargo/hashbrown@0.17.1": {
+      "published": "2026-05-09T04:35:04Z",
+      "url": "https://index.crates.io/ha/sh/hashbrown"
+    },
+    "cargo/heck@0.5.0": {
+      "published": "2024-03-12T22:42:23Z",
+      "url": "https://index.crates.io/he/ck/heck"
+    },
+    "cargo/hex@0.4.3": {
+      "published": "2021-03-03T10:48:58Z",
+      "url": "https://index.crates.io/3/h/hex"
+    },
+    "cargo/http-body-util@0.1.5": {
+      "published": "2026-08-12T15:22:21Z",
+      "url": "https://index.crates.io/ht/tp/http-body-util"
+    },
+    "cargo/http-body@1.1.0": {
+      "published": "2026-07-13T17:25:06Z",
+      "url": "https://index.crates.io/ht/tp/http-body"
+    },
+    "cargo/http@1.5.0": {
+      "published": "2026-07-29T14:57:21Z",
+      "url": "https://index.crates.io/ht/tp/http"
+    },
+    "cargo/httparse@1.10.1": {
+      "published": "2025-03-03T14:44:09Z",
+      "url": "https://index.crates.io/ht/tp/httparse"
+    },
+    "cargo/httpdate@1.0.3": {
+      "published": "2023-08-13T10:55:54Z",
+      "url": "https://index.crates.io/ht/tp/httpdate"
+    },
+    "cargo/humantime@2.4.0": {
+      "published": "2026-07-02T11:38:57Z",
+      "url": "https://index.crates.io/hu/ma/humantime"
+    },
+    "cargo/hybrid-array@0.4.15": {
+      "published": "2026-09-08T18:21:39Z",
+      "url": "https://index.crates.io/hy/br/hybrid-array"
+    },
+    "cargo/hyper-rustls@0.27.10": {
+      "published": "2026-09-20T18:30:18Z",
+      "url": "https://index.crates.io/hy/pe/hyper-rustls"
+    },
+    "cargo/hyper-util@0.1.21": {
+      "published": "2026-09-24T17:47:59Z",
+      "url": "https://index.crates.io/hy/pe/hyper-util"
+    },
+    "cargo/hyper@1.12.0": {
+      "published": "2026-10-06T15:57:18Z",
+      "url": "https://index.crates.io/hy/pe/hyper"
+    },
+    "cargo/icu_collections@2.4.0": {
+      "published": "2026-10-22T08:56:10Z",
+      "url": "https://index.crates.io/ic/u_/icu_collections"
+    },
+    "cargo/icu_locale_core@2.4.0": {
+      "published": "2026-10-22T08:51:54Z",
+      "url": "https://index.crates.io/ic/u_/icu_locale_core"
+    },
+    "cargo/icu_normalizer@2.4.0": {
+      "published": "2026-10-22T08:56:44Z",
+      "url": "https://index.crates.io/ic/u_/icu_normalizer"
+    },
+    "cargo/icu_normalizer_data@2.4.0": {
+      "published": "2026-10-22T08:56:37Z",
+      "url": "https://index.crates.io/ic/u_/icu_normalizer_data"
+    },
+    "cargo/icu_properties@2.4.0": {
+      "published": "2026-10-22T08:56:21Z",
+      "url": "https://index.crates.io/ic/u_/icu_properties"
+    },
+    "cargo/icu_properties_data@2.4.0": {
+      "published": "2026-10-22T08:56:15Z",
+      "url": "https://index.crates.io/ic/u_/icu_properties_data"
+    },
+    "cargo/icu_provider@2.4.0": {
+      "published": "2026-10-22T08:52:08Z",
+      "url": "https://index.crates.io/ic/u_/icu_provider"
+    },
+    "cargo/ident_case@1.0.1": {
+      "published": "2019-03-18T20:07:20Z",
+      "url": "https://index.crates.io/id/en/ident_case"
+    },
+    "cargo/idna@1.1.0": {
+      "published": "2025-08-21T08:48:20Z",
+      "url": "https://index.crates.io/id/na/idna"
+    },
+    "cargo/idna_adapter@1.2.2": {
+      "published": "2026-04-27T17:45:54Z",
+      "url": "https://index.crates.io/id/na/idna_adapter"
+    },
+    "cargo/image-webp@0.2.4": {
+      "published": "2025-08-27T01:41:15Z",
+      "url": "https://index.crates.io/im/ag/image-webp"
+    },
+    "cargo/image@0.25.10": {
+      "published": "2026-03-10T16:29:18Z",
+      "url": "https://index.crates.io/im/ag/image"
+    },
+    "cargo/indexmap@2.14.2": {
+      "published": "2026-09-05T01:53:48Z",
+      "url": "https://index.crates.io/in/de/indexmap"
+    },
+    "cargo/ipnet@2.12.2": {
+      "published": "2026-09-06T05:45:08Z",
+      "url": "https://index.crates.io/ip/ne/ipnet"
+    },
+    "cargo/is_terminal_polyfill@1.70.2": {
+      "published": "2025-10-21T17:00:14Z",
+      "url": "https://index.crates.io/is/_t/is_terminal_polyfill"
+    },
+    "cargo/itertools@0.14.0": {
+      "published": "2024-12-31T12:32:06Z",
+      "url": "https://index.crates.io/it/er/itertools"
+    },
+    "cargo/itoa@1.0.18": {
+      "published": "2026-03-20T00:12:37Z",
+      "url": "https://index.crates.io/it/oa/itoa"
+    },
+    "cargo/jni-macros@0.22.4": {
+      "published": "2026-03-16T13:29:39Z",
+      "url": "https://index.crates.io/jn/i-/jni-macros"
+    },
+    "cargo/jni-sys-macros@0.4.1": {
+      "published": "2026-01-09T00:23:44Z",
+      "url": "https://index.crates.io/jn/i-/jni-sys-macros"
+    },
+    "cargo/jni-sys@0.4.1": {
+      "published": "2026-01-09T00:33:31Z",
+      "url": "https://index.crates.io/jn/i-/jni-sys"
+    },
+    "cargo/jni@0.22.4": {
+      "published": "2026-03-16T15:38:08Z",
+      "url": "https://index.crates.io/3/j/jni"
+    },
+    "cargo/jobserver@0.1.35": {
+      "published": "2026-07-06T01:43:15Z",
+      "url": "https://index.crates.io/jo/bs/jobserver"
+    },
+    "cargo/js-sys@0.3.107": {
+      "published": "2026-10-30T06:15:06Z",
+      "url": "https://index.crates.io/js/-s/js-sys"
+    },
+    "cargo/jsonschema-regex@0.60.2": {
+      "published": "2026-10-26T22:26:23Z",
+      "url": "https://index.crates.io/js/on/jsonschema-regex"
+    },
+    "cargo/jsonschema-value@0.60.2": {
+      "published": "2026-10-26T22:26:20Z",
+      "url": "https://index.crates.io/js/on/jsonschema-value"
+    },
+    "cargo/jsonschema@0.60.2": {
+      "published": "2026-10-26T22:27:27Z",
+      "url": "https://index.crates.io/js/on/jsonschema"
+    },
+    "cargo/lazy_static@1.5.1": {
+      "published": "2026-10-01T07:18:53Z",
+      "url": "https://index.crates.io/la/zy/lazy_static"
+    },
+    "cargo/libc@0.2.191": {
+      "published": "2026-10-16T22:56:46Z",
+      "url": "https://index.crates.io/li/bc/libc"
+    },
+    "cargo/libloading@0.9.0": {
+      "published": "2025-11-05T23:15:12Z",
+      "url": "https://index.crates.io/li/bl/libloading"
+    },
+    "cargo/linux-raw-sys@0.12.1": {
+      "published": "2025-12-23T00:00:07Z",
+      "url": "https://index.crates.io/li/nu/linux-raw-sys"
+    },
+    "cargo/litemap@0.8.3": {
+      "published": "2026-08-13T23:27:57Z",
+      "url": "https://index.crates.io/li/te/litemap"
+    },
+    "cargo/llguidance@1.9.1": {
+      "published": "2026-09-30T19:13:39Z",
+      "url": "https://index.crates.io/ll/gu/llguidance"
+    },
+    "cargo/lock_api@0.4.14": {
+      "published": "2025-10-03T23:33:12Z",
+      "url": "https://index.crates.io/lo/ck/lock_api"
+    },
+    "cargo/log@0.4.35": {
+      "published": "2026-10-30T21:36:19Z",
+      "url": "https://index.crates.io/3/l/log"
+    },
+    "cargo/lru-slab@0.1.3": {
+      "published": "2026-09-13T19:19:47Z",
+      "url": "https://index.crates.io/lr/u-/lru-slab"
+    },
+    "cargo/lzma-rust2@0.24.0": {
+      "published": "2026-10-25T16:37:19Z",
+      "url": "https://index.crates.io/lz/ma/lzma-rust2"
+    },
+    "cargo/macro_rules_attribute-proc_macro@0.2.3": {
+      "published": "2026-07-29T15:38:18Z",
+      "url": "https://index.crates.io/ma/cr/macro_rules_attribute-proc_macro"
+    },
+    "cargo/macro_rules_attribute@0.2.3": {
+      "published": "2026-07-29T15:38:21Z",
+      "url": "https://index.crates.io/ma/cr/macro_rules_attribute"
+    },
+    "cargo/matchit@0.8.4": {
+      "published": "2024-07-11T07:22:03Z",
+      "url": "https://index.crates.io/ma/tc/matchit"
+    },
+    "cargo/memchr@2.8.3": {
+      "published": "2026-07-08T00:49:54Z",
+      "url": "https://index.crates.io/me/mc/memchr"
+    },
+    "cargo/memmap2@0.9.12": {
+      "published": "2026-10-21T17:56:30Z",
+      "url": "https://index.crates.io/me/mm/memmap2"
+    },
+    "cargo/micromap@0.3.0": {
+      "published": "2026-03-11T12:04:41Z",
+      "url": "https://index.crates.io/mi/cr/micromap"
+    },
+    "cargo/mime@0.3.17": {
+      "published": "2023-03-20T15:05:04Z",
+      "url": "https://index.crates.io/mi/me/mime"
+    },
+    "cargo/mime_guess@2.0.5": {
+      "published": "2024-06-29T07:32:21Z",
+      "url": "https://index.crates.io/mi/me/mime_guess"
+    },
+    "cargo/minijinja-contrib@3.0.5": {
+      "published": "2026-10-29T23:48:37Z",
+      "url": "https://index.crates.io/mi/ni/minijinja-contrib"
+    },
+    "cargo/minijinja@3.0.5": {
+      "published": "2026-10-29T23:48:31Z",
+      "url": "https://index.crates.io/mi/ni/minijinja"
+    },
+    "cargo/minimal-lexical@0.2.1": {
+      "published": "2021-10-04T10:48:13Z",
+      "url": "https://index.crates.io/mi/ni/minimal-lexical"
+    },
+    "cargo/miniz_oxide@0.8.9": {
+      "published": "2025-06-09T22:26:12Z",
+      "url": "https://index.crates.io/mi/ni/miniz_oxide"
+    },
+    "cargo/miniz_oxide@0.9.1": {
+      "published": "2026-03-13T00:19:26Z",
+      "url": "https://index.crates.io/mi/ni/miniz_oxide"
+    },
+    "cargo/mio@1.2.4": {
+      "published": "2026-10-03T16:33:10Z",
+      "url": "https://index.crates.io/3/m/mio"
+    },
+    "cargo/monostate-impl@0.1.18": {
+      "published": "2025-09-29T01:20:47Z",
+      "url": "https://index.crates.io/mo/no/monostate-impl"
+    },
+    "cargo/monostate@0.1.18": {
+      "published": "2025-09-29T01:20:55Z",
+      "url": "https://index.crates.io/mo/no/monostate"
+    },
+    "cargo/moxcms@0.8.1": {
+      "published": "2026-03-07T15:47:14Z",
+      "url": "https://index.crates.io/mo/xc/moxcms"
+    },
+    "cargo/multer@3.1.0": {
+      "published": "2024-05-04T01:46:11Z",
+      "url": "https://index.crates.io/mu/lt/multer"
+    },
+    "cargo/multiversion_no_op@1.0.0": {
+      "published": "2026-07-30T13:20:49Z",
+      "url": "https://index.crates.io/mu/lt/multiversion_no_op"
+    },
+    "cargo/nom@7.1.3": {
+      "published": "2023-01-15T21:06:03Z",
+      "url": "https://index.crates.io/3/n/nom"
+    },
+    "cargo/num-bigint@0.4.8": {
+      "published": "2026-07-05T01:20:47Z",
+      "url": "https://index.crates.io/nu/m-/num-bigint"
+    },
+    "cargo/num-cmp@0.1.0": {
+      "published": "2017-03-02T12:27:31Z",
+      "url": "https://index.crates.io/nu/m-/num-cmp"
+    },
+    "cargo/num-complex@0.4.6": {
+      "published": "2024-05-07T23:51:24Z",
+      "url": "https://index.crates.io/nu/m-/num-complex"
+    },
+    "cargo/num-integer@0.1.47": {
+      "published": "2026-08-12T00:11:57Z",
+      "url": "https://index.crates.io/nu/m-/num-integer"
+    },
+    "cargo/num-iter@0.1.46": {
+      "published": "2026-07-07T19:51:46Z",
+      "url": "https://index.crates.io/nu/m-/num-iter"
+    },
+    "cargo/num-rational@0.4.2": {
+      "published": "2024-05-08T02:55:34Z",
+      "url": "https://index.crates.io/nu/m-/num-rational"
+    },
+    "cargo/num-traits@0.2.19": {
+      "published": "2024-05-03T21:27:39Z",
+      "url": "https://index.crates.io/nu/m-/num-traits"
+    },
+    "cargo/num@0.4.3": {
+      "published": "2024-05-08T16:40:50Z",
+      "url": "https://index.crates.io/3/n/num"
+    },
+    "cargo/once_cell@1.21.4": {
+      "published": "2026-03-12T10:59:52Z",
+      "url": "https://index.crates.io/on/ce/once_cell"
+    },
+    "cargo/once_cell_polyfill@1.70.2": {
+      "published": "2025-10-21T16:41:12Z",
+      "url": "https://index.crates.io/on/ce/once_cell_polyfill"
+    },
+    "cargo/openssl-probe@0.2.2": {
+      "published": "2026-10-26T16:29:20Z",
+      "url": "https://index.crates.io/op/en/openssl-probe"
+    },
+    "cargo/outref@0.5.2": {
+      "published": "2025-01-15T09:06:04Z",
+      "url": "https://index.crates.io/ou/tr/outref"
+    },
+    "cargo/parking_lot@0.12.5": {
+      "published": "2025-10-03T23:34:14Z",
+      "url": "https://index.crates.io/pa/rk/parking_lot"
+    },
+    "cargo/parking_lot_core@0.9.12": {
+      "published": "2025-10-03T23:33:43Z",
+      "url": "https://index.crates.io/pa/rk/parking_lot_core"
+    },
+    "cargo/paste@1.0.15": {
+      "published": "2024-05-07T01:50:22Z",
+      "url": "https://index.crates.io/pa/st/paste"
+    },
+    "cargo/pastey@0.2.3": {
+      "published": "2026-05-20T05:43:36Z",
+      "url": "https://index.crates.io/pa/st/pastey"
+    },
+    "cargo/percent-encoding@2.3.2": {
+      "published": "2025-08-21T08:46:50Z",
+      "url": "https://index.crates.io/pe/rc/percent-encoding"
+    },
+    "cargo/pin-project-lite@0.2.17": {
+      "published": "2026-02-27T15:19:08Z",
+      "url": "https://index.crates.io/pi/n-/pin-project-lite"
+    },
+    "cargo/pkg-config@0.3.34": {
+      "published": "2026-08-14T08:27:51Z",
+      "url": "https://index.crates.io/pk/g-/pkg-config"
+    },
+    "cargo/png@0.18.1": {
+      "published": "2026-02-14T16:24:10Z",
+      "url": "https://index.crates.io/3/p/png"
+    },
+    "cargo/potential_utf@0.1.6": {
+      "published": "2026-08-13T23:28:14Z",
+      "url": "https://index.crates.io/po/te/potential_utf"
+    },
+    "cargo/ppv-lite86@0.2.21": {
+      "published": "2025-03-09T20:01:40Z",
+      "url": "https://index.crates.io/pp/v-/ppv-lite86"
+    },
+    "cargo/primal-check@0.3.4": {
+      "published": "2024-06-07T23:00:11Z",
+      "url": "https://index.crates.io/pr/im/primal-check"
+    },
+    "cargo/proc-macro2@1.0.107": {
+      "published": "2026-07-19T00:18:25Z",
+      "url": "https://index.crates.io/pr/oc/proc-macro2"
+    },
+    "cargo/pxfm@0.1.30": {
+      "published": "2026-07-06T06:43:55Z",
+      "url": "https://index.crates.io/px/fm/pxfm"
+    },
+    "cargo/quick-error@2.0.1": {
+      "published": "2021-05-07T12:10:10Z",
+      "url": "https://index.crates.io/qu/ic/quick-error"
+    },
+    "cargo/quinn-proto@0.11.19": {
+      "published": "2026-09-30T09:13:59Z",
+      "url": "https://index.crates.io/qu/in/quinn-proto"
+    },
+    "cargo/quinn-udp@0.5.16": {
+      "published": "2026-09-30T09:14:07Z",
+      "url": "https://index.crates.io/qu/in/quinn-udp"
+    },
+    "cargo/quinn@0.11.12": {
+      "published": "2026-09-14T10:08:47Z",
+      "url": "https://index.crates.io/qu/in/quinn"
+    },
+    "cargo/quote@1.0.47": {
+      "published": "2026-07-19T00:16:57Z",
+      "url": "https://index.crates.io/qu/ot/quote"
+    },
+    "cargo/r-efi@5.3.0": {
+      "published": "2025-06-17T09:12:38Z",
+      "url": "https://index.crates.io/r-/ef/r-efi"
+    },
+    "cargo/r-efi@6.0.0": {
+      "published": "2026-02-03T09:53:46Z",
+      "url": "https://index.crates.io/r-/ef/r-efi"
+    },
+    "cargo/rand@0.10.3": {
+      "published": "2026-09-20T06:37:47Z",
+      "url": "https://index.crates.io/ra/nd/rand"
+    },
+    "cargo/rand@0.9.5": {
+      "published": "2026-07-11T11:16:46Z",
+      "url": "https://index.crates.io/ra/nd/rand"
+    },
+    "cargo/rand_chacha@0.9.0": {
+      "published": "2025-01-27T13:38:26Z",
+      "url": "https://index.crates.io/ra/nd/rand_chacha"
+    },
+    "cargo/rand_core@0.10.1": {
+      "published": "2026-04-13T15:26:43Z",
+      "url": "https://index.crates.io/ra/nd/rand_core"
+    },
+    "cargo/rand_core@0.9.5": {
+      "published": "2026-01-13T09:22:22Z",
+      "url": "https://index.crates.io/ra/nd/rand_core"
+    },
+    "cargo/rand_pcg@0.10.2": {
+      "published": "2026-04-11T13:36:48Z",
+      "url": "https://index.crates.io/ra/nd/rand_pcg"
+    },
+    "cargo/rayon-cond@0.4.0": {
+      "published": "2025-03-12T18:53:34Z",
+      "url": "https://index.crates.io/ra/yo/rayon-cond"
+    },
+    "cargo/rayon-core@1.13.0": {
+      "published": "2025-08-12T23:21:51Z",
+      "url": "https://index.crates.io/ra/yo/rayon-core"
+    },
+    "cargo/rayon@1.12.0": {
+      "published": "2026-04-14T00:56:56Z",
+      "url": "https://index.crates.io/ra/yo/rayon"
+    },
+    "cargo/realfft@3.5.1": {
+      "published": "2026-10-26T20:26:23Z",
+      "url": "https://index.crates.io/re/al/realfft"
+    },
+    "cargo/redox_syscall@0.5.18": {
+      "published": "2025-10-04T14:57:04Z",
+      "url": "https://index.crates.io/re/do/redox_syscall"
+    },
+    "cargo/ref-cast-impl@1.0.27": {
+      "published": "2026-08-19T04:27:24Z",
+      "url": "https://index.crates.io/re/f-/ref-cast-impl"
+    },
+    "cargo/ref-cast@1.0.27": {
+      "published": "2026-08-19T04:27:28Z",
+      "url": "https://index.crates.io/re/f-/ref-cast"
+    },
+    "cargo/referencing@0.60.2": {
+      "published": "2026-10-26T22:26:15Z",
+      "url": "https://index.crates.io/re/fe/referencing"
+    },
+    "cargo/regex-automata@0.4.18": {
+      "published": "2026-08-04T13:10:37Z",
+      "url": "https://index.crates.io/re/ge/regex-automata"
+    },
+    "cargo/regex-lite@0.1.9": {
+      "published": "2026-02-03T13:47:43Z",
+      "url": "https://index.crates.io/re/ge/regex-lite"
+    },
+    "cargo/regex-syntax@0.8.11": {
+      "published": "2026-06-09T15:00:25Z",
+      "url": "https://index.crates.io/re/ge/regex-syntax"
+    },
+    "cargo/regex@1.13.1": {
+      "published": "2026-07-15T20:19:35Z",
+      "url": "https://index.crates.io/re/ge/regex"
+    },
+    "cargo/reqwest@0.13.5": {
+      "published": "2026-09-08T20:55:26Z",
+      "url": "https://index.crates.io/re/qw/reqwest"
+    },
+    "cargo/ring@0.17.14": {
+      "published": "2025-03-11T19:42:03Z",
+      "url": "https://index.crates.io/ri/ng/ring"
+    },
+    "cargo/rubato@5.0.1": {
+      "published": "2026-10-01T07:02:32Z",
+      "url": "https://index.crates.io/ru/ba/rubato"
+    },
+    "cargo/rustc-hash@2.1.3": {
+      "published": "2026-07-02T19:13:03Z",
+      "url": "https://index.crates.io/ru/st/rustc-hash"
+    },
+    "cargo/rustc_version@0.4.1": {
+      "published": "2024-08-28T09:21:22Z",
+      "url": "https://index.crates.io/ru/st/rustc_version"
+    },
+    "cargo/rustfft@6.4.1": {
+      "published": "2025-09-18T03:59:45Z",
+      "url": "https://index.crates.io/ru/st/rustfft"
+    },
+    "cargo/rustix@1.1.6": {
+      "published": "2026-10-27T00:49:03Z",
+      "url": "https://index.crates.io/ru/st/rustix"
+    },
+    "cargo/rustls-native-certs@0.8.5": {
+      "published": "2026-10-13T09:30:35Z",
+      "url": "https://index.crates.io/ru/st/rustls-native-certs"
+    },
+    "cargo/rustls-pki-types@1.15.1": {
+      "published": "2026-07-23T09:56:11Z",
+      "url": "https://index.crates.io/ru/st/rustls-pki-types"
+    },
+    "cargo/rustls-platform-verifier-android@0.2.0": {
+      "published": "2026-09-24T20:38:29Z",
+      "url": "https://index.crates.io/ru/st/rustls-platform-verifier-android"
+    },
+    "cargo/rustls-platform-verifier@0.7.1": {
+      "published": "2026-09-24T20:39:00Z",
+      "url": "https://index.crates.io/ru/st/rustls-platform-verifier"
+    },
+    "cargo/rustls-webpki@0.103.16": {
+      "published": "2026-10-20T08:58:28Z",
+      "url": "https://index.crates.io/ru/st/rustls-webpki"
+    },
+    "cargo/rustls@0.23.46": {
+      "published": "2026-10-14T09:54:15Z",
+      "url": "https://index.crates.io/ru/st/rustls"
+    },
+    "cargo/rustversion@1.0.23": {
+      "published": "2026-07-07T02:10:26Z",
+      "url": "https://index.crates.io/ru/st/rustversion"
+    },
+    "cargo/ryu@1.0.23": {
+      "published": "2026-02-08T20:34:03Z",
+      "url": "https://index.crates.io/3/r/ryu"
+    },
+    "cargo/safetensors@0.8.0": {
+      "published": "2026-06-09T08:34:43Z",
+      "url": "https://index.crates.io/sa/fe/safetensors"
+    },
+    "cargo/same-file@1.0.6": {
+      "published": "2020-01-11T17:02:30Z",
+      "url": "https://index.crates.io/sa/me/same-file"
+    },
+    "cargo/schannel@0.1.30": {
+      "published": "2026-10-16T16:28:12Z",
+      "url": "https://index.crates.io/sc/ha/schannel"
+    },
+    "cargo/scopeguard@1.2.0": {
+      "published": "2023-07-17T13:47:53Z",
+      "url": "https://index.crates.io/sc/op/scopeguard"
+    },
+    "cargo/security-framework-sys@2.17.0": {
+      "published": "2026-02-20T00:27:26Z",
+      "url": "https://index.crates.io/se/cu/security-framework-sys"
+    },
+    "cargo/security-framework@3.7.0": {
+      "published": "2026-02-20T00:28:54Z",
+      "url": "https://index.crates.io/se/cu/security-framework"
+    },
+    "cargo/semver@1.0.28": {
+      "published": "2026-04-04T00:25:14Z",
+      "url": "https://index.crates.io/se/mv/semver"
+    },
+    "cargo/serde@1.0.229": {
+      "published": "2026-07-18T23:05:13Z",
+      "url": "https://index.crates.io/se/rd/serde"
+    },
+    "cargo/serde_core@1.0.229": {
+      "published": "2026-07-18T23:05:10Z",
+      "url": "https://index.crates.io/se/rd/serde_core"
+    },
+    "cargo/serde_derive@1.0.229": {
+      "published": "2026-07-18T23:05:07Z",
+      "url": "https://index.crates.io/se/rd/serde_derive"
+    },
+    "cargo/serde_json@1.0.154": {
+      "published": "2026-10-11T15:31:46Z",
+      "url": "https://index.crates.io/se/rd/serde_json"
+    },
+    "cargo/serde_path_to_error@0.1.20": {
+      "published": "2025-09-15T15:05:54Z",
+      "url": "https://index.crates.io/se/rd/serde_path_to_error"
+    },
+    "cargo/serde_urlencoded@0.7.1": {
+      "published": "2022-01-17T11:26:21Z",
+      "url": "https://index.crates.io/se/rd/serde_urlencoded"
+    },
+    "cargo/sha2@0.11.1": {
+      "published": "2026-10-12T18:58:22Z",
+      "url": "https://index.crates.io/sh/a2/sha2"
+    },
+    "cargo/shlex@2.0.1": {
+      "published": "2026-05-17T18:56:12Z",
+      "url": "https://index.crates.io/sh/le/shlex"
+    },
+    "cargo/signal-hook-registry@1.4.8": {
+      "published": "2025-12-25T17:35:43Z",
+      "url": "https://index.crates.io/si/gn/signal-hook-registry"
+    },
+    "cargo/simd-adler32@0.3.10": {
+      "published": "2026-07-14T17:42:45Z",
+      "url": "https://index.crates.io/si/md/simd-adler32"
+    },
+    "cargo/simd_cesu8@1.2.0": {
+      "published": "2026-07-13T21:51:49Z",
+      "url": "https://index.crates.io/si/md/simd_cesu8"
+    },
+    "cargo/simdutf8@0.1.5": {
+      "published": "2024-09-22T09:18:22Z",
+      "url": "https://index.crates.io/si/md/simdutf8"
+    },
+    "cargo/slab@0.4.12": {
+      "published": "2026-01-31T12:59:22Z",
+      "url": "https://index.crates.io/sl/ab/slab"
+    },
+    "cargo/smallvec@1.16.4": {
+      "published": "2026-10-23T17:08:24Z",
+      "url": "https://index.crates.io/sm/al/smallvec"
+    },
+    "cargo/socket2@0.6.5": {
+      "published": "2026-07-13T19:45:58Z",
+      "url": "https://index.crates.io/so/ck/socket2"
+    },
+    "cargo/spin@0.9.9": {
+      "published": "2026-07-13T19:44:05Z",
+      "url": "https://index.crates.io/sp/in/spin"
+    },
+    "cargo/spm_precompiled@0.1.4": {
+      "published": "2022-05-30T12:08:06Z",
+      "url": "https://index.crates.io/sp/m_/spm_precompiled"
+    },
+    "cargo/stable_deref_trait@1.2.1": {
+      "published": "2025-10-09T05:24:54Z",
+      "url": "https://index.crates.io/st/ab/stable_deref_trait"
+    },
+    "cargo/static_assertions@1.1.0": {
+      "published": "2019-11-03T17:02:11Z",
+      "url": "https://index.crates.io/st/at/static_assertions"
+    },
+    "cargo/strength_reduce@0.2.4": {
+      "published": "2022-11-08T03:46:49Z",
+      "url": "https://index.crates.io/st/re/strength_reduce"
+    },
+    "cargo/strsim@0.11.1": {
+      "published": "2024-04-02T22:18:09Z",
+      "url": "https://index.crates.io/st/rs/strsim"
+    },
+    "cargo/strum@0.28.0": {
+      "published": "2026-02-22T15:46:16Z",
+      "url": "https://index.crates.io/st/ru/strum"
+    },
+    "cargo/strum_macros@0.28.0": {
+      "published": "2026-02-22T15:46:01Z",
+      "url": "https://index.crates.io/st/ru/strum_macros"
+    },
+    "cargo/subtle@2.6.1": {
+      "published": "2024-06-24T17:25:24Z",
+      "url": "https://index.crates.io/su/bt/subtle"
+    },
+    "cargo/symphonia-bundle-flac@0.6.1": {
+      "published": "2026-08-13T03:18:25Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-bundle-flac"
+    },
+    "cargo/symphonia-bundle-mp3@0.6.1": {
+      "published": "2026-08-13T03:18:27Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-bundle-mp3"
+    },
+    "cargo/symphonia-codec-aac@0.6.1": {
+      "published": "2026-08-13T03:18:30Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-codec-aac"
+    },
+    "cargo/symphonia-codec-adpcm@0.6.1": {
+      "published": "2026-08-13T03:18:21Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-codec-adpcm"
+    },
+    "cargo/symphonia-codec-alac@0.6.1": {
+      "published": "2026-08-13T03:18:23Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-codec-alac"
+    },
+    "cargo/symphonia-codec-pcm@0.6.1": {
+      "published": "2026-08-13T03:18:32Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-codec-pcm"
+    },
+    "cargo/symphonia-codec-vorbis@0.6.1": {
+      "published": "2026-08-13T03:18:35Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-codec-vorbis"
+    },
+    "cargo/symphonia-common@0.6.1": {
+      "published": "2026-08-13T03:18:18Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-common"
+    },
+    "cargo/symphonia-core@0.6.1": {
+      "published": "2026-08-13T03:18:12Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-core"
+    },
+    "cargo/symphonia-format-caf@0.6.1": {
+      "published": "2026-08-13T03:18:46Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-format-caf"
+    },
+    "cargo/symphonia-format-isomp4@0.6.1": {
+      "published": "2026-08-13T03:18:39Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-format-isomp4"
+    },
+    "cargo/symphonia-format-mkv@0.6.1": {
+      "published": "2026-08-13T03:18:42Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-format-mkv"
+    },
+    "cargo/symphonia-format-ogg@0.6.1": {
+      "published": "2026-08-13T03:18:36Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-format-ogg"
+    },
+    "cargo/symphonia-format-riff@0.6.1": {
+      "published": "2026-08-13T03:18:44Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-format-riff"
+    },
+    "cargo/symphonia-metadata@0.6.1": {
+      "published": "2026-08-13T03:18:16Z",
+      "url": "https://index.crates.io/sy/mp/symphonia-metadata"
+    },
+    "cargo/symphonia@0.6.1": {
+      "published": "2026-08-13T03:18:51Z",
+      "url": "https://index.crates.io/sy/mp/symphonia"
+    },
+    "cargo/syn@2.0.119": {
+      "published": "2026-07-15T00:23:48Z",
+      "url": "https://index.crates.io/3/s/syn"
+    },
+    "cargo/syn@3.0.9": {
+      "published": "2026-10-12T15:04:09Z",
+      "url": "https://index.crates.io/3/s/syn"
+    },
+    "cargo/sync_wrapper@1.0.2": {
+      "published": "2024-11-20T16:29:59Z",
+      "url": "https://index.crates.io/sy/nc/sync_wrapper"
+    },
+    "cargo/synstructure@0.14.0": {
+      "published": "2026-07-30T19:43:04Z",
+      "url": "https://index.crates.io/sy/ns/synstructure"
+    },
+    "cargo/tar@0.4.46": {
+      "published": "2026-05-18T19:12:11Z",
+      "url": "https://index.crates.io/3/t/tar"
+    },
+    "cargo/tempfile@3.27.0": {
+      "published": "2026-03-11T00:20:04Z",
+      "url": "https://index.crates.io/te/mp/tempfile"
+    },
+    "cargo/thiserror-impl@2.0.21": {
+      "published": "2026-09-23T20:24:05Z",
+      "url": "https://index.crates.io/th/is/thiserror-impl"
+    },
+    "cargo/thiserror@2.0.21": {
+      "published": "2026-09-23T20:24:07Z",
+      "url": "https://index.crates.io/th/is/thiserror"
+    },
+    "cargo/tinystr@0.8.5": {
+      "published": "2026-10-22T08:51:49Z",
+      "url": "https://index.crates.io/ti/ny/tinystr"
+    },
+    "cargo/tinyvec@1.13.3": {
+      "published": "2026-09-13T23:30:12Z",
+      "url": "https://index.crates.io/ti/ny/tinyvec"
+    },
+    "cargo/tokenizers@0.23.2": {
+      "published": "2026-09-03T08:49:28Z",
+      "url": "https://index.crates.io/to/ke/tokenizers"
+    },
+    "cargo/tokio-macros@2.7.2": {
+      "published": "2026-07-29T13:15:27Z",
+      "url": "https://index.crates.io/to/ki/tokio-macros"
+    },
+    "cargo/tokio-rustls@0.26.6": {
+      "published": "2026-09-28T09:18:10Z",
+      "url": "https://index.crates.io/to/ki/tokio-rustls"
+    },
+    "cargo/tokio-util@0.7.20": {
+      "published": "2026-10-09T11:02:11Z",
+      "url": "https://index.crates.io/to/ki/tokio-util"
+    },
+    "cargo/tokio@1.54.1": {
+      "published": "2026-10-21T21:05:43Z",
+      "url": "https://index.crates.io/to/ki/tokio"
+    },
+    "cargo/toktrie@1.9.1": {
+      "published": "2026-09-30T19:12:30Z",
+      "url": "https://index.crates.io/to/kt/toktrie"
+    },
+    "cargo/tower-http@0.6.11": {
+      "published": "2026-05-18T12:51:03Z",
+      "url": "https://index.crates.io/to/we/tower-http"
+    },
+    "cargo/tower-layer@0.3.3": {
+      "published": "2024-08-13T16:53:54Z",
+      "url": "https://index.crates.io/to/we/tower-layer"
+    },
+    "cargo/tower-service@0.3.3": {
+      "published": "2024-08-13T16:23:33Z",
+      "url": "https://index.crates.io/to/we/tower-service"
+    },
+    "cargo/tower@0.5.3": {
+      "published": "2026-01-12T18:43:05Z",
+      "url": "https://index.crates.io/to/we/tower"
+    },
+    "cargo/tracing-core@0.1.36": {
+      "published": "2025-12-18T14:13:04Z",
+      "url": "https://index.crates.io/tr/ac/tracing-core"
+    },
+    "cargo/tracing@0.1.44": {
+      "published": "2025-12-18T14:26:12Z",
+      "url": "https://index.crates.io/tr/ac/tracing"
+    },
+    "cargo/transpose@0.2.3": {
+      "published": "2024-02-20T03:58:36Z",
+      "url": "https://index.crates.io/tr/an/transpose"
+    },
+    "cargo/try-lock@0.2.5": {
+      "published": "2023-12-07T16:13:16Z",
+      "url": "https://index.crates.io/tr/y-/try-lock"
+    },
+    "cargo/typenum@1.20.1": {
+      "published": "2026-05-29T16:00:41Z",
+      "url": "https://index.crates.io/ty/pe/typenum"
+    },
+    "cargo/unicase@2.10.0": {
+      "published": "2026-10-05T13:11:23Z",
+      "url": "https://index.crates.io/un/ic/unicase"
+    },
+    "cargo/unicode-general-category@1.1.0": {
+      "published": "2025-09-16T00:44:45Z",
+      "url": "https://index.crates.io/un/ic/unicode-general-category"
+    },
+    "cargo/unicode-ident@1.0.27": {
+      "published": "2026-10-12T04:20:27Z",
+      "url": "https://index.crates.io/un/ic/unicode-ident"
+    },
+    "cargo/unicode-normalization-alignments@0.1.12": {
+      "published": "2019-12-30T17:10:56Z",
+      "url": "https://index.crates.io/un/ic/unicode-normalization-alignments"
+    },
+    "cargo/unicode-segmentation@1.13.3": {
+      "published": "2026-06-01T15:58:43Z",
+      "url": "https://index.crates.io/un/ic/unicode-segmentation"
+    },
+    "cargo/unicode_categories@0.1.1": {
+      "published": "2016-10-22T17:57:09Z",
+      "url": "https://index.crates.io/un/ic/unicode_categories"
+    },
+    "cargo/untrusted@0.9.0": {
+      "published": "2021-07-13T22:13:26Z",
+      "url": "https://index.crates.io/un/tr/untrusted"
+    },
+    "cargo/url@2.5.8": {
+      "published": "2026-01-05T22:14:31Z",
+      "url": "https://index.crates.io/3/u/url"
+    },
+    "cargo/utf8_iter@1.1.0": {
+      "published": "2026-10-29T18:47:53Z",
+      "url": "https://index.crates.io/ut/f8/utf8_iter"
+    },
+    "cargo/utf8parse@0.2.2": {
+      "published": "2024-06-08T07:07:41Z",
+      "url": "https://index.crates.io/ut/f8/utf8parse"
+    },
+    "cargo/utf_types@1.0.0": {
+      "published": "2026-10-29T18:41:43Z",
+      "url": "https://index.crates.io/ut/f_/utf_types"
+    },
+    "cargo/uuid-simd@0.8.0": {
+      "published": "2022-12-28T03:07:07Z",
+      "url": "https://index.crates.io/uu/id/uuid-simd"
+    },
+    "cargo/version_check@0.9.5": {
+      "published": "2024-07-25T23:38:14Z",
+      "url": "https://index.crates.io/ve/rs/version_check"
+    },
+    "cargo/visibility@0.1.1": {
+      "published": "2024-08-13T12:40:03Z",
+      "url": "https://index.crates.io/vi/si/visibility"
+    },
+    "cargo/vsimd@0.8.0": {
+      "published": "2022-12-28T03:06:21Z",
+      "url": "https://index.crates.io/vs/im/vsimd"
+    },
+    "cargo/walkdir@2.5.0": {
+      "published": "2024-03-01T17:55:09Z",
+      "url": "https://index.crates.io/wa/lk/walkdir"
+    },
+    "cargo/want@0.3.2": {
+      "published": "2026-10-05T23:37:04Z",
+      "url": "https://index.crates.io/wa/nt/want"
+    },
+    "cargo/wasi@0.11.1+wasi-snapshot-preview1": {
+      "published": "2025-06-10T14:23:45Z",
+      "url": "https://index.crates.io/wa/si/wasi"
+    },
+    "cargo/wasip2@1.0.4+wasi-0.2.12": {
+      "published": "2026-06-12T17:42:43Z",
+      "url": "https://index.crates.io/wa/si/wasip2"
+    },
+    "cargo/wasm-bindgen-futures@0.4.80": {
+      "published": "2026-10-30T06:15:11Z",
+      "url": "https://index.crates.io/wa/sm/wasm-bindgen-futures"
+    },
+    "cargo/wasm-bindgen-macro-support@0.2.130": {
+      "published": "2026-10-30T06:15:00Z",
+      "url": "https://index.crates.io/wa/sm/wasm-bindgen-macro-support"
+    },
+    "cargo/wasm-bindgen-macro@0.2.130": {
+      "published": "2026-10-30T06:15:02Z",
+      "url": "https://index.crates.io/wa/sm/wasm-bindgen-macro"
+    },
+    "cargo/wasm-bindgen-shared@0.2.130": {
+      "published": "2026-10-30T06:14:57Z",
+      "url": "https://index.crates.io/wa/sm/wasm-bindgen-shared"
+    },
+    "cargo/wasm-bindgen@0.2.130": {
+      "published": "2026-10-30T06:15:04Z",
+      "url": "https://index.crates.io/wa/sm/wasm-bindgen"
+    },
+    "cargo/wasm-streams@0.5.0": {
+      "published": "2026-01-22T08:14:59Z",
+      "url": "https://index.crates.io/wa/sm/wasm-streams"
+    },
+    "cargo/web-sys@0.3.107": {
+      "published": "2026-10-30T06:15:08Z",
+      "url": "https://index.crates.io/we/b-/web-sys"
+    },
+    "cargo/web-time@1.1.0": {
+      "published": "2024-03-01T10:51:46Z",
+      "url": "https://index.crates.io/we/b-/web-time"
+    },
+    "cargo/webpki-root-certs@1.0.11": {
+      "published": "2026-10-23T08:25:18Z",
+      "url": "https://index.crates.io/we/bp/webpki-root-certs"
+    },
+    "cargo/winapi-util@0.1.11": {
+      "published": "2025-09-07T12:24:31Z",
+      "url": "https://index.crates.io/wi/na/winapi-util"
+    },
+    "cargo/windowfunctions@0.1.1": {
+      "published": "2025-02-21T21:30:51Z",
+      "url": "https://index.crates.io/wi/nd/windowfunctions"
+    },
+    "cargo/windows-link@0.2.1": {
+      "published": "2025-10-06T17:35:08Z",
+      "url": "https://index.crates.io/wi/nd/windows-link"
+    },
+    "cargo/windows-sys@0.52.0": {
+      "published": "2023-11-15T18:55:55Z",
+      "url": "https://index.crates.io/wi/nd/windows-sys"
+    },
+    "cargo/windows-sys@0.61.2": {
+      "published": "2025-10-06T19:18:30Z",
+      "url": "https://index.crates.io/wi/nd/windows-sys"
+    },
+    "cargo/windows-targets@0.52.6": {
+      "published": "2024-07-03T19:44:18Z",
+      "url": "https://index.crates.io/wi/nd/windows-targets"
+    },
+    "cargo/windows_aarch64_gnullvm@0.52.6": {
+      "published": "2024-07-03T19:43:36Z",
+      "url": "https://index.crates.io/wi/nd/windows_aarch64_gnullvm"
+    },
+    "cargo/windows_aarch64_msvc@0.52.6": {
+      "published": "2024-07-03T19:43:40Z",
+      "url": "https://index.crates.io/wi/nd/windows_aarch64_msvc"
+    },
+    "cargo/windows_i686_gnu@0.52.6": {
+      "published": "2024-07-03T19:43:46Z",
+      "url": "https://index.crates.io/wi/nd/windows_i686_gnu"
+    },
+    "cargo/windows_i686_gnullvm@0.52.6": {
+      "published": "2024-07-03T19:43:50Z",
+      "url": "https://index.crates.io/wi/nd/windows_i686_gnullvm"
+    },
+    "cargo/windows_i686_msvc@0.52.6": {
+      "published": "2024-07-03T19:43:54Z",
+      "url": "https://index.crates.io/wi/nd/windows_i686_msvc"
+    },
+    "cargo/windows_x86_64_gnu@0.52.6": {
+      "published": "2024-07-03T19:43:58Z",
+      "url": "https://index.crates.io/wi/nd/windows_x86_64_gnu"
+    },
+    "cargo/windows_x86_64_gnullvm@0.52.6": {
+      "published": "2024-07-03T19:44:03Z",
+      "url": "https://index.crates.io/wi/nd/windows_x86_64_gnullvm"
+    },
+    "cargo/windows_x86_64_msvc@0.52.6": {
+      "published": "2024-07-03T19:44:07Z",
+      "url": "https://index.crates.io/wi/nd/windows_x86_64_msvc"
+    },
+    "cargo/wit-bindgen@0.57.1": {
+      "published": "2026-04-17T17:49:55Z",
+      "url": "https://index.crates.io/wi/t-/wit-bindgen"
+    },
+    "cargo/writeable@0.6.4": {
+      "published": "2026-08-13T23:28:09Z",
+      "url": "https://index.crates.io/wr/it/writeable"
+    },
+    "cargo/yoke-derive@0.8.4": {
+      "published": "2026-09-30T13:19:39Z",
+      "url": "https://index.crates.io/yo/ke/yoke-derive"
+    },
+    "cargo/yoke@0.8.4": {
+      "published": "2026-10-22T08:51:34Z",
+      "url": "https://index.crates.io/yo/ke/yoke"
+    },
+    "cargo/zerocopy-derive@0.8.63": {
+      "published": "2026-10-13T20:01:58Z",
+      "url": "https://index.crates.io/ze/ro/zerocopy-derive"
+    },
+    "cargo/zerocopy@0.8.63": {
+      "published": "2026-10-13T20:03:04Z",
+      "url": "https://index.crates.io/ze/ro/zerocopy"
+    },
+    "cargo/zerofrom-derive@0.1.8": {
+      "published": "2026-09-15T21:39:20Z",
+      "url": "https://index.crates.io/ze/ro/zerofrom-derive"
+    },
+    "cargo/zerofrom@0.1.8": {
+      "published": "2026-05-12T09:08:18Z",
+      "url": "https://index.crates.io/ze/ro/zerofrom"
+    },
+    "cargo/zeroize@1.9.1": {
+      "published": "2026-10-06T17:49:21Z",
+      "url": "https://index.crates.io/ze/ro/zeroize"
+    },
+    "cargo/zerotrie@0.2.5": {
+      "published": "2026-08-13T23:28:19Z",
+      "url": "https://index.crates.io/ze/ro/zerotrie"
+    },
+    "cargo/zerovec-derive@0.11.7": {
+      "published": "2026-10-22T08:51:38Z",
+      "url": "https://index.crates.io/ze/ro/zerovec-derive"
+    },
+    "cargo/zerovec@0.11.9": {
+      "published": "2026-10-22T08:51:43Z",
+      "url": "https://index.crates.io/ze/ro/zerovec"
+    },
+    "cargo/zlib-rs@0.6.8": {
+      "published": "2026-09-15T13:10:00Z",
+      "url": "https://index.crates.io/zl/ib/zlib-rs"
+    },
+    "cargo/zmij@1.0.23": {
+      "published": "2026-07-13T12:58:53Z",
+      "url": "https://index.crates.io/zm/ij/zmij"
+    },
+    "cargo/zune-core@0.5.3": {
+      "published": "2026-08-07T20:55:44Z",
+      "url": "https://index.crates.io/zu/ne/zune-core"
+    },
+    "cargo/zune-jpeg@0.5.15": {
+      "published": "2026-03-26T21:57:53Z",
+      "url": "https://index.crates.io/zu/ne/zune-jpeg"
+    },
+    "rust/1.99.1": {
+      "published": "2026-10-15T23:59:59Z",
+      "url": "https://static.rust-lang.org/dist/channel-rust-1.99.1.toml"
+    },
+    "tools/environments/cuda/uv.lock/annotated-doc@0.0.5": {
+      "published": "2026-07-28T13:50:58.129724Z",
+      "url": "https://pypi.org/pypi/annotated-doc/0.0.5/json"
+    },
+    "tools/environments/cuda/uv.lock/anyio@4.15.1": {
+      "published": "2026-09-05T10:42:39.440376Z",
+      "url": "https://pypi.org/pypi/anyio/4.15.1/json"
+    },
+    "tools/environments/cuda/uv.lock/apache-tvm-ffi@0.1.12": {
+      "published": "2026-06-09T18:17:31.680145Z",
+      "url": "https://pypi.org/pypi/apache-tvm-ffi/0.1.12/json"
+    },
+    "tools/environments/cuda/uv.lock/click@8.5.0": {
+      "published": "2026-08-26T13:33:14.560531Z",
+      "url": "https://pypi.org/pypi/click/8.5.0/json"
+    },
+    "tools/environments/cuda/uv.lock/cloudpickle@3.1.2": {
+      "published": "2025-11-03T09:25:26.604186Z",
+      "url": "https://pypi.org/pypi/cloudpickle/3.1.2/json"
+    },
+    "tools/environments/cuda/uv.lock/cuda-bindings@12.9.10": {
+      "published": "2026-10-15T14:12:01.260953Z",
+      "url": "https://pypi.org/pypi/cuda-bindings/12.9.10/json"
+    },
+    "tools/environments/cuda/uv.lock/cuda-pathfinder@1.8.5": {
+      "published": "2026-10-29T19:15:06.747373Z",
+      "url": "https://pypi.org/pypi/cuda-pathfinder/1.8.5/json"
+    },
+    "tools/environments/cuda/uv.lock/cuda-python@12.9.10": {
+      "published": "2026-10-15T14:19:36.449996Z",
+      "url": "https://pypi.org/pypi/cuda-python/12.9.10/json"
+    },
+    "tools/environments/cuda/uv.lock/filelock@4.2.6": {
+      "published": "2026-10-31T15:10:16.889404Z",
+      "url": "https://pypi.org/pypi/filelock/4.2.6/json"
+    },
+    "tools/environments/cuda/uv.lock/fsspec@2026.9.0": {
+      "published": "2026-09-18T17:50:42.825364Z",
+      "url": "https://pypi.org/pypi/fsspec/2026.9.0/json"
+    },
+    "tools/environments/cuda/uv.lock/h11@0.16.0": {
+      "published": "2025-04-24T03:35:25.427659Z",
+      "url": "https://pypi.org/pypi/h11/0.16.0/json"
+    },
+    "tools/environments/cuda/uv.lock/hf-xet@1.8.0": {
+      "published": "2026-10-30T10:04:33.741898Z",
+      "url": "https://pypi.org/pypi/hf-xet/1.8.0/json"
+    },
+    "tools/environments/cuda/uv.lock/httpcore2@2.16.0": {
+      "published": "2026-10-21T07:09:45.310470Z",
+      "url": "https://pypi.org/pypi/httpcore2/2.16.0/json"
+    },
+    "tools/environments/cuda/uv.lock/httpx2@2.16.0": {
+      "published": "2026-10-21T07:09:46.348194Z",
+      "url": "https://pypi.org/pypi/httpx2/2.16.0/json"
+    },
+    "tools/environments/cuda/uv.lock/huggingface-hub@2.4.0": {
+      "published": "2026-10-29T15:30:12.321608Z",
+      "url": "https://pypi.org/pypi/huggingface-hub/2.4.0/json"
+    },
+    "tools/environments/cuda/uv.lock/idna@3.20": {
+      "published": "2026-09-17T14:11:04.752193Z",
+      "url": "https://pypi.org/pypi/idna/3.20/json"
+    },
+    "tools/environments/cuda/uv.lock/jinja2@3.1.6": {
+      "published": "2025-03-05T20:05:02.478302Z",
+      "url": "https://pypi.org/pypi/jinja2/3.1.6/json"
+    },
+    "tools/environments/cuda/uv.lock/markdown-it-py@4.2.0": {
+      "published": "2026-05-07T12:08:28.360612Z",
+      "url": "https://pypi.org/pypi/markdown-it-py/4.2.0/json"
+    },
+    "tools/environments/cuda/uv.lock/markupsafe@3.0.4": {
+      "published": "2026-10-02T23:07:22.290270Z",
+      "url": "https://pypi.org/pypi/markupsafe/3.0.4/json"
+    },
+    "tools/environments/cuda/uv.lock/mdurl@0.1.2": {
+      "published": "2022-08-14T12:40:10.846281Z",
+      "url": "https://pypi.org/pypi/mdurl/0.1.2/json"
+    },
+    "tools/environments/cuda/uv.lock/ml-dtypes@0.6.0": {
+      "published": "2026-08-13T14:14:40.215279Z",
+      "url": "https://pypi.org/pypi/ml-dtypes/0.6.0/json"
+    },
+    "tools/environments/cuda/uv.lock/mpmath@1.3.0": {
+      "published": "2023-03-07T16:47:11.061515Z",
+      "url": "https://pypi.org/pypi/mpmath/1.3.0/json"
+    },
+    "tools/environments/cuda/uv.lock/networkx@3.7": {
+      "published": "2026-09-21T16:45:16.974517Z",
+      "url": "https://pypi.org/pypi/networkx/3.7/json"
+    },
+    "tools/environments/cuda/uv.lock/numpy@2.5.4": {
+      "published": "2026-10-10T20:05:31.422199Z",
+      "url": "https://pypi.org/pypi/numpy/2.5.4/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-nccl-cu12@2.32.3": {
+      "published": "2026-09-22T08:31:48.829969Z",
+      "url": "https://pypi.org/pypi/nvidia-nccl-cu12/2.32.3/json"
+    },
+    "tools/environments/cuda/uv.lock/packaging@26.3": {
+      "published": "2026-08-04T18:15:28.737071Z",
+      "url": "https://pypi.org/pypi/packaging/26.3/json"
+    },
+    "tools/environments/cuda/uv.lock/pillow@13.0.0": {
+      "published": "2026-10-16T22:18:09.718711Z",
+      "url": "https://pypi.org/pypi/pillow/13.0.0/json"
+    },
+    "tools/environments/cuda/uv.lock/psutil@7.2.2": {
+      "published": "2026-01-28T18:15:29.342891Z",
+      "url": "https://pypi.org/pypi/psutil/7.2.2/json"
+    },
+    "tools/environments/cuda/uv.lock/pygments@2.21.0": {
+      "published": "2026-08-17T08:02:48.824391Z",
+      "url": "https://pypi.org/pypi/pygments/2.21.0/json"
+    },
+    "tools/environments/cuda/uv.lock/pyyaml@6.0.3": {
+      "published": "2025-09-25T21:33:16.546886Z",
+      "url": "https://pypi.org/pypi/pyyaml/6.0.3/json"
+    },
+    "tools/environments/cuda/uv.lock/regex@2026.9.29": {
+      "published": "2026-09-29T00:49:58.298089Z",
+      "url": "https://pypi.org/pypi/regex/2026.9.29/json"
+    },
+    "tools/environments/cuda/uv.lock/rich@15.0.0": {
+      "published": "2026-04-12T08:24:02.830783Z",
+      "url": "https://pypi.org/pypi/rich/15.0.0/json"
+    },
+    "tools/environments/cuda/uv.lock/safetensors@0.8.0": {
+      "published": "2026-06-09T07:52:25.563398Z",
+      "url": "https://pypi.org/pypi/safetensors/0.8.0/json"
+    },
+    "tools/environments/cuda/uv.lock/setuptools@84.2.1": {
+      "published": "2026-10-20T19:01:37.742699Z",
+      "url": "https://pypi.org/pypi/setuptools/84.2.1/json"
+    },
+    "tools/environments/cuda/uv.lock/shellingham@1.5.4": {
+      "published": "2023-10-24T04:13:40.426335Z",
+      "url": "https://pypi.org/pypi/shellingham/1.5.4/json"
+    },
+    "tools/environments/cuda/uv.lock/sympy@1.14.0": {
+      "published": "2025-04-27T18:05:01.611132Z",
+      "url": "https://pypi.org/pypi/sympy/1.14.0/json"
+    },
+    "tools/environments/cuda/uv.lock/tilelang@0.1.15": {
+      "published": "2026-09-30T00:52:56.713486Z",
+      "url": "https://pypi.org/pypi/tilelang/0.1.15/json"
+    },
+    "tools/environments/cuda/uv.lock/tokenizers@0.23.3": {
+      "published": "2026-10-09T10:16:55.759046Z",
+      "url": "https://pypi.org/pypi/tokenizers/0.23.3/json"
+    },
+    "tools/environments/cuda/uv.lock/torch-c-dlpack-ext@0.1.5": {
+      "published": "2026-01-12T11:25:08.484157Z",
+      "url": "https://pypi.org/pypi/torch-c-dlpack-ext/0.1.5/json"
+    },
+    "tools/environments/cuda/uv.lock/torch@2.14.1+orinfer1": {
+      "published": "2026-10-22T03:38:18Z",
+      "url": "https://api.github.com/repos/iMMIQ/pytorch/releases/tags/jetson-v2.14.1-orinfer1-cu126-cp312-sm87"
+    },
+    "tools/environments/cuda/uv.lock/torchvision@0.29.1+orinfer1": {
+      "published": "2026-10-22T03:38:18Z",
+      "url": "https://api.github.com/repos/iMMIQ/pytorch/releases/tags/jetson-v2.14.1-orinfer1-cu126-cp312-sm87"
+    },
+    "tools/environments/cuda/uv.lock/tqdm@4.70.1": {
+      "published": "2026-09-11T07:25:16.601180Z",
+      "url": "https://pypi.org/pypi/tqdm/4.70.1/json"
+    },
+    "tools/environments/cuda/uv.lock/transformers@5.22.1": {
+      "published": "2026-10-30T07:48:03.721714Z",
+      "url": "https://pypi.org/pypi/transformers/5.22.1/json"
+    },
+    "tools/environments/cuda/uv.lock/truststore@0.10.5": {
+      "published": "2026-10-12T22:27:31.808128Z",
+      "url": "https://pypi.org/pypi/truststore/0.10.5/json"
+    },
+    "tools/environments/cuda/uv.lock/typer@0.27.3": {
+      "published": "2026-10-06T17:24:16.610941Z",
+      "url": "https://pypi.org/pypi/typer/0.27.3/json"
+    },
+    "tools/environments/cuda/uv.lock/typing-extensions@4.16.0": {
+      "published": "2026-07-02T08:40:05.920538Z",
+      "url": "https://pypi.org/pypi/typing-extensions/4.16.0/json"
+    },
+    "tools/environments/cuda/uv.lock/z3-solver@4.15.4.0": {
+      "published": "2025-10-29T18:12:03.062278Z",
+      "url": "https://pypi.org/pypi/z3-solver/4.15.4.0/json"
+    },
+    "uv.lock/anyio@4.15.1": {
+      "published": "2026-09-05T10:42:39.440376Z",
+      "url": "https://pypi.org/pypi/anyio/4.15.1/json"
+    },
+    "uv.lock/click@8.5.0": {
+      "published": "2026-08-26T13:33:14.560531Z",
+      "url": "https://pypi.org/pypi/click/8.5.0/json"
+    },
+    "uv.lock/colorama@0.4.6": {
+      "published": "2022-10-25T02:36:22.414799Z",
+      "url": "https://pypi.org/pypi/colorama/0.4.6/json"
+    },
+    "uv.lock/filelock@4.2.6": {
+      "published": "2026-10-31T15:10:16.889404Z",
+      "url": "https://pypi.org/pypi/filelock/4.2.6/json"
+    },
+    "uv.lock/fsspec@2026.9.0": {
+      "published": "2026-09-18T17:50:42.825364Z",
+      "url": "https://pypi.org/pypi/fsspec/2026.9.0/json"
+    },
+    "uv.lock/h11@0.16.0": {
+      "published": "2025-04-24T03:35:25.427659Z",
+      "url": "https://pypi.org/pypi/h11/0.16.0/json"
+    },
+    "uv.lock/hf-xet@1.8.0": {
+      "published": "2026-10-30T10:04:33.741898Z",
+      "url": "https://pypi.org/pypi/hf-xet/1.8.0/json"
+    },
+    "uv.lock/httpcore2@2.16.0": {
+      "published": "2026-10-21T07:09:45.310470Z",
+      "url": "https://pypi.org/pypi/httpcore2/2.16.0/json"
+    },
+    "uv.lock/httpx2-jsfetch@1.0": {
+      "published": "2026-08-07T00:13:07.492048Z",
+      "url": "https://pypi.org/pypi/httpx2-jsfetch/1.0/json"
+    },
+    "uv.lock/httpx2@2.16.0": {
+      "published": "2026-10-21T07:09:46.348194Z",
+      "url": "https://pypi.org/pypi/httpx2/2.16.0/json"
+    },
+    "uv.lock/huggingface-hub@2.4.0": {
+      "published": "2026-10-29T15:30:12.321608Z",
+      "url": "https://pypi.org/pypi/huggingface-hub/2.4.0/json"
+    },
+    "uv.lock/idna@3.20": {
+      "published": "2026-09-17T14:11:04.752193Z",
+      "url": "https://pypi.org/pypi/idna/3.20/json"
+    },
+    "uv.lock/numpy@2.5.4": {
+      "published": "2026-10-10T20:05:31.422199Z",
+      "url": "https://pypi.org/pypi/numpy/2.5.4/json"
+    },
+    "uv.lock/packaging@26.3": {
+      "published": "2026-08-04T18:15:28.737071Z",
+      "url": "https://pypi.org/pypi/packaging/26.3/json"
+    },
+    "uv.lock/pillow@13.0.0": {
+      "published": "2026-10-16T22:18:09.718711Z",
+      "url": "https://pypi.org/pypi/pillow/13.0.0/json"
+    },
+    "uv.lock/pyyaml@6.0.3": {
+      "published": "2025-09-25T21:33:16.546886Z",
+      "url": "https://pypi.org/pypi/pyyaml/6.0.3/json"
+    },
+    "uv.lock/ruff@0.17.3": {
+      "published": "2026-10-27T00:34:05.914554Z",
+      "url": "https://pypi.org/pypi/ruff/0.17.3/json"
+    },
+    "uv.lock/safetensors@0.8.0": {
+      "published": "2026-06-09T07:52:28.895289Z",
+      "url": "https://pypi.org/pypi/safetensors/0.8.0/json"
+    },
+    "uv.lock/tokenizers@0.23.3": {
+      "published": "2026-10-09T10:16:55.759046Z",
+      "url": "https://pypi.org/pypi/tokenizers/0.23.3/json"
+    },
+    "uv.lock/tqdm@4.70.1": {
+      "published": "2026-09-11T07:25:16.601180Z",
+      "url": "https://pypi.org/pypi/tqdm/4.70.1/json"
+    },
+    "uv.lock/truststore@0.10.5": {
+      "published": "2026-10-12T22:27:31.808128Z",
+      "url": "https://pypi.org/pypi/truststore/0.10.5/json"
+    },
+    "uv.lock/typing-extensions@4.16.0": {
+      "published": "2026-07-02T08:40:05.920538Z",
+      "url": "https://pypi.org/pypi/typing-extensions/4.16.0/json"
+    },
+    "uv/0.13.6": {
+      "published": "2026-10-27T00:47:49Z",
+      "url": "https://api.github.com/repos/astral-sh/uv/releases/tags/0.13.6"
+    }
+  }
+}

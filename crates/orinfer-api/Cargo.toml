@@ -10,12 +10,12 @@ license.workspace = true
 multer = "=3.1.0"
 axum = "=0.8.9"
 futures-util = "=0.3.34"
-getrandom = "=0.3.4"
+getrandom = "=0.4.3"
 libc = "=0.2.191"
-humantime = "=2.3.0"
-minijinja = { version = "=3.0.1", features = ["json", "serde"] }
-minijinja-contrib = { version = "=3.0.1", features = ["pycompat"] }
-jsonschema = { version = "=0.59.0", default-features = false }
+humantime = "=2.4.0"
+minijinja = { version = "=3.0.5", features = ["json", "serde"] }
+minijinja-contrib = { version = "=3.0.5", features = ["pycompat"] }
+jsonschema = { version = "=0.60.2", default-features = false }
 orinfer-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,7 +23,7 @@ sha2.workspace = true
 hex.workspace = true
 serde_path_to_error = "=0.1.20"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
-tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time", "process"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time", "process"] }
 
 base64 = "=0.23.1"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }

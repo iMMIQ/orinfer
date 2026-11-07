@@ -1,20 +1,23 @@
-.PHONY: check check-locks fmt lint build info python-env cuda-env check-offline check-ascend-offline check-gpu
+.PHONY: check check-locks check-dependency-age fmt lint build info python-env cuda-env check-offline check-ascend-offline check-gpu
 
 UV ?= uv
 PYTHON = $(UV) run --locked python
 CUDA_PYTHON = $(UV) run --locked --project tools/environments/cuda python
 
-python-env:
+python-env: check-dependency-age
 	$(UV) sync --locked
 
-cuda-env:
+cuda-env: check-dependency-age
 	$(UV) sync --locked --project tools/environments/cuda
 
-check-locks:
+check-dependency-age:
+	python3 -m tools.dev.dependencies check
+
+check-locks: check-dependency-age
 	$(UV) lock --check --offline
 	$(UV) lock --check --offline --project tools/environments/cuda
 
-build:
+build: check-dependency-age
 	cargo build --release --locked --offline
 
 fmt:
