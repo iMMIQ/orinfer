@@ -18,6 +18,17 @@
 
 `validate_plan.py` 校验 benchmark 与快速评测配置，输出 CPU 配置检查结果。
 
+`output_stress.py` 对已启动的 Chat 服务执行定时混合负载，复用 `concurrency.py` 的 SSE 客户端，按 usage 统计真实输出 token。默认依次运行 1/8/16/32 并发，共发放请求 600 秒，每段结束等待在途请求完成；实际总时长含各段排空。输入为 `{"cases":[{"id":"math","request":{"model":"example","messages":[{"role":"user","content":"1+1，只输出JSON对象，字段value为整数。"}]},"checks":{"json_equals":{"value":2}}}]}`；`checks.contains` 可指定答案必须包含的字符串。请求原样保留采样参数和 EOS 设置，省略 seed 时使用服务默认行为。
+
+```bash
+uv run --locked python -m tools.bench.output_stress \
+  --cases artifacts/output-cases.json --tokenizer /path/to/model/tokenizer.json \
+  --base-url http://127.0.0.1:8088/v1 --output artifacts/output-pressure \
+  --phases 1:30 8:120 16:210 32:240
+```
+
+新输出目录保留完整请求、逐请求正文及 thinking、usage、首输出及流间隔、循环片段诊断和每 5 秒的 health 采样。请求错误、答案检查失败或 health 错误使工具返回非零退出码。384-token 以上的三次连续循环作为异常线索；长度截断单独统计。自然语言、代码正确性、循环误报及性能长尾需结合保留的回答和相同配置基线复核，工具退出成功只表示这些自动检查通过。
+
 `code_generation.py` 用相同 Chat 请求测量 thinking、MTP 和 prefix cache 的组合，输入采用下方 `concurrency.py` 的 cases 格式：
 
 ```bash
