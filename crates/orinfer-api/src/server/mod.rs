@@ -312,7 +312,7 @@ async fn health(State(state): State<Service>) -> Response {
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
             "tools":{"function":state.codec.tools_supported,"strict":state.codec.tools_supported,"required":state.codec.tools_supported,"incremental_arguments":state.codec.tools_supported},
             "logprobs":true,"max_top_logprobs":20,"logit_bias":true,"stored_completions":false,
-            "images":state.vision.is_some(),"video":false,"audio":state.codec.audio.is_some(),"default_max_completion_tokens":state.default_request_params.get("max_completion_tokens").and_then(Value::as_u64).or_else(|| state.default_request_params.get("max_tokens").and_then(Value::as_u64)).unwrap_or(8192),
+            "images":state.vision.is_some(),"video":false,"audio":state.codec.audio.is_some(),"default_max_completion_tokens":state.default_request_params.get("max_completion_tokens").and_then(Value::as_u64).or_else(|| state.default_request_params.get("max_tokens").and_then(Value::as_u64)).unwrap_or(state.codec.default_max_tokens() as u64),
             "thinking_token_budget":true,"chat_template_kwargs":true,"prompt_cache":{"key":true,"retention":["in-memory","24h"],"persistent":false,"ttl_guaranteed":false}},
         "mtp":{"enabled":state.mtp_drafts>0,"max_drafts":state.mtp_drafts},
         "prompt_lookup":{"enabled":state.prompt_lookup && state.mtp_drafts>0},

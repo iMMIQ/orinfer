@@ -7,6 +7,24 @@ use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::White
 static SERIAL: AtomicUsize = AtomicUsize::new(0);
 
 fn codec(deepseek: bool) -> ChatCodec {
+    configured_codec(
+        json!({"temperature":0,"top_p":0.95,"top_k":20,"repetition_penalty":1.05}),
+        if deepseek {
+            json!({"chat_format":"deepseek_v41"})
+        } else {
+            json!({})
+        },
+        Value::Null,
+        "{{ messages[0].content }}",
+    )
+}
+
+fn configured_codec(
+    mut generation: Value,
+    metadata: Value,
+    config: Value,
+    template: &str,
+) -> ChatCodec {
     let directory = std::env::temp_dir().join(format!(
         "orinfer-defaults-{}-{}",
         std::process::id(),
@@ -15,9 +33,13 @@ fn codec(deepseek: bool) -> ChatCodec {
     std::fs::create_dir_all(directory.join("cache")).unwrap();
     let model = WordLevel::builder()
         .vocab(
-            [("[UNK]".into(), 0), ("one".into(), 1)]
-                .into_iter()
-                .collect(),
+            [
+                "[UNK]", "one", "off", "on", "xhigh", "medium", "low", "kept", "dropped",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(id, token)| (token.to_string(), id as u32))
+            .collect(),
         )
         .unk_token("[UNK]".into())
         .build()
@@ -28,21 +50,28 @@ fn codec(deepseek: bool) -> ChatCodec {
     tokenizer
         .save(directory.join("tokenizer.json"), false)
         .unwrap();
+    generation
+        .as_object_mut()
+        .unwrap()
+        .insert("eos_token_id".into(), json!(0));
+    if !config.is_null() {
+        std::fs::write(
+            directory.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+    }
     std::fs::write(
         directory.join("generation_config.json"),
-        r#"{"eos_token_id":0,"temperature":0,"top_p":0.95,"top_k":20,"repetition_penalty":1.05}"#,
+        serde_json::to_vec(&generation).unwrap(),
     )
     .unwrap();
-    std::fs::write(
-        directory.join("chat_template.jinja"),
-        "{{ messages[0].content }}",
-    )
-    .unwrap();
+    std::fs::write(directory.join("chat_template.jinja"), template).unwrap();
     std::fs::write(
         directory.join("cache/model.json"),
         serde_json::to_vec(&json!({
             "frontend_assets":{},
-            "metadata": if deepseek {json!({"chat_format":"deepseek_v41"})} else {json!({})}
+            "metadata": metadata
         }))
         .unwrap(),
     )
@@ -132,4 +161,147 @@ fn deepinfer_top_k_alias_and_invalid_values() {
     for value in [-2, i64::from(i32::MAX) + 1] {
         assert!(prepare(&codec, json!({"top_k":value}), 100).is_err());
     }
+}
+
+const MODE_TEMPLATE: &str = "{{ messages[0].content }} {% if enable_thinking %}on{% else %}off{% endif %} {{ reasoning_effort }} {% if preserve_thinking %}kept{% else %}dropped{% endif %}";
+
+#[test]
+fn qwen_defaults_and_mode_switches_reach_sampling_and_template() {
+    for (source, presence) in [
+        ("Qwen3.8-27B-Q4A8", 0.0),
+        ("Qwen3.8-Flash-Next", 0.0),
+        ("Qwen/Qwen3.5-4B-e8p_q4-A8", 1.5),
+    ] {
+        let codec = configured_codec(
+            json!({}),
+            json!({"model":source}),
+            Value::Null,
+            MODE_TEMPLATE,
+        );
+        let default = prepare(&codec, json!({}), 10_000).unwrap();
+        assert!(default.thinking, "{source}");
+        assert_eq!(default.input, [1, 3, 4, 7]);
+        assert_eq!(default.sampling.temperature, 1.0);
+        assert_eq!(default.sampling.top_p, 0.95);
+        assert_eq!(default.sampling.top_k, 20);
+        assert_eq!(default.sampling.presence_penalty, presence);
+        assert_eq!(default.sampling.repetition_penalty, 1.0);
+        assert_eq!(default.max_tokens, 8192);
+        for control in [
+            json!({"enable_thinking":false}),
+            json!({"reasoning_effort":"none"}),
+            json!({"chat_template_kwargs":{"enable_thinking":false}}),
+            json!({"chat_template_kwargs":{"thinking":false}}),
+        ] {
+            let off = prepare(&codec, control, 10_000).unwrap();
+            assert!(!off.thinking);
+            assert_eq!(off.input, [1, 2, 4, 7]);
+            assert_eq!(off.sampling.temperature, 0.7);
+            assert_eq!(off.sampling.top_p, 0.8);
+            assert_eq!(off.sampling.top_k, 20);
+            assert_eq!(off.sampling.presence_penalty, 1.5);
+        }
+        let medium = prepare(&codec, json!({"reasoning_effort":"medium"}), 100).unwrap();
+        assert!(medium.thinking);
+        assert_eq!(medium.input, [1, 3, 5, 7]);
+        assert_eq!(medium.sampling.presence_penalty, presence);
+        assert!(
+            prepare(
+                &codec,
+                json!({"enable_thinking":true,"reasoning_effort":"none"}),
+                100
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn source_identity_and_explicit_controls_override_model_defaults() {
+    let codec = configured_codec(
+        json!({"temperature":0.9,"top_p":0.92,"top_k":17,"repetition_penalty":1.1}),
+        json!({"model":"unrelated-deployment-name"}),
+        json!({"quantization_config":{"source":"Qwen/Qwen3.8-27B"}}),
+        MODE_TEMPLATE,
+    );
+    let inherited = prepare(&codec, json!({}), 100).unwrap();
+    assert!(inherited.thinking);
+    assert_eq!(inherited.sampling.temperature, 0.9);
+    assert_eq!(inherited.sampling.top_p, 0.92);
+    assert_eq!(inherited.sampling.top_k, 17);
+    assert_eq!(inherited.sampling.repetition_penalty, 1.1);
+    let body = json!({"model":"test","messages":[{"role":"user","content":"one"}],
+        "chat_template_kwargs":{"enable_thinking":false},"temperature":0,
+        "presence_penalty":0,"max_tokens":32});
+    let defaults = json!({"enable_thinking":true,"temperature":0.5,"top_p":0.6,"top_k":7,
+        "presence_penalty":1,"max_completion_tokens":64});
+    let request = crate::server::defaults::decode(body, defaults.as_object().unwrap()).unwrap();
+    let prepared = codec
+        .prepare(request, "test", 100, None, &mut Context::unbounded())
+        .unwrap();
+    assert!(!prepared.thinking);
+    assert_eq!(prepared.input, [1, 2, 4, 7]);
+    assert_eq!(prepared.sampling.temperature, 0.0);
+    assert_eq!(prepared.sampling.top_p, 0.6);
+    assert_eq!(prepared.sampling.top_k, 7);
+    assert_eq!(prepared.sampling.presence_penalty, 0.0);
+    assert_eq!(prepared.max_tokens, 32);
+}
+
+#[test]
+fn index_defaults_are_greedy_for_all_sizes_with_bounded_output() {
+    for source in [
+        "IndexTeam/Index-Translate-2B-e8p_q4-A8",
+        "IndexTeam/Index-Translate-9B-e8p_q4-A8",
+        "IndexTeam/Index-Translate-35B-A3B-preview-e8p_q4-A8",
+    ] {
+        let codec = configured_codec(
+            json!({}),
+            json!({"model":source}),
+            Value::Null,
+            "{{ messages[0].content }}",
+        );
+        let default = prepare(&codec, json!({}), 10_000).unwrap();
+        assert!(!default.thinking);
+        assert!(default.sampling.is_greedy());
+        assert_eq!(default.sampling.top_p, 1.0);
+        assert_eq!(default.sampling.top_k, 0);
+        assert_eq!(default.max_tokens, 1024);
+        assert_eq!(codec.default_max_tokens(), 1024);
+        assert_eq!(prepare(&codec, json!({}), 100).unwrap().max_tokens, 99);
+        let explicit = prepare(
+            &codec,
+            json!({"temperature":0.8,"max_completion_tokens":2048}),
+            10_000,
+        )
+        .unwrap();
+        assert_eq!(explicit.sampling.temperature, 0.8);
+        assert_eq!(explicit.max_tokens, 2048);
+        assert!(prepare(&codec, json!({"max_tokens":100}), 100).is_err());
+    }
+}
+
+#[test]
+fn configured_penalties_and_greedy_semantics_are_inherited() {
+    let codec = configured_codec(
+        json!({"do_sample":false,"temperature":0.000001,"presence_penalty":0.3,"frequency_penalty":0.2}),
+        json!({"model":"Qwen/Qwen3-ASR-1.7B-hf-e8p_q4-A8"}),
+        Value::Null,
+        "{{ messages[0].content }}",
+    );
+    let default = prepare(&codec, json!({}), 10_000).unwrap();
+    assert!(!default.thinking);
+    assert_eq!(default.sampling.temperature, 0.0);
+    assert_eq!(default.sampling.presence_penalty, 0.3);
+    assert_eq!(default.sampling.frequency_penalty, 0.2);
+    assert_eq!(default.max_tokens, 8192);
+    let explicit = prepare(
+        &codec,
+        json!({"temperature":0.5,"presence_penalty":0,"frequency_penalty":0}),
+        100,
+    )
+    .unwrap();
+    assert_eq!(explicit.sampling.temperature, 0.5);
+    assert_eq!(explicit.sampling.presence_penalty, 0.0);
+    assert_eq!(explicit.sampling.frequency_penalty, 0.0);
 }

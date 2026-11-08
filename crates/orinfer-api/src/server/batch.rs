@@ -43,7 +43,9 @@ pub fn run(config: BatchConfig) -> Result<BatchReport> {
     let mut input = Input::open(&config.input)?;
     let descriptor = std::fs::read(config.model_dir.join("cache/model.json"))
         .map_err(|e| format!("Read model identity: {e}"))?;
-    let identity = json!({"schema":1,"input_sha256":input.sha256,
+    // Version the resolved model-default policy as well as explicit overrides.
+    // Old journals must not mix prior defaults with newly prepared requests.
+    let identity = json!({"schema":2,"input_sha256":input.sha256,
         "model_sha256":orinfer_engine::artifact::sha256(&descriptor),"model":config.model,
         "default_request_params":defaults,"mtp_drafts":config.load.mtp_drafts,
         "prompt_lookup":config.load.prompt_lookup});

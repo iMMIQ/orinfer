@@ -78,7 +78,19 @@ curl http://127.0.0.1:8088/v1/chat/completions \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"37×24−19×13等于多少？"}],"temperature":0,"max_tokens":512,"enable_thinking":true,"stream":true,"stream_options":{"include_usage":true}}'
 ```
 
-支持 `temperature`、`top_p`、`top_k`、presence/frequency/repetition penalties、有符号 64 位 `seed`、`logit_bias`、EOS 和 `stop`。temperature、top_p、top_k 和 repetition_penalty 默认采用模型的 generation config，DSv4.1 使用下述默认值；presence/frequency penalties 默认 0。未指定 seed 时，每个请求生成独立的 64 位随机种子，随请求保留并供 target、DSpark 与状态恢复共用。显式 seed 保持固定；负数按相同 64 位补码解释。验收请求显式设置 `seed=20261002`。`top_k=-1` 和 `top_k=0` 均关闭 top-k，正数范围为 1 到 2147483647。`logit_bias` 的 key 是 tokenizer 的 token ID，值范围为 −100 到 100。
+支持 `temperature`、`top_p`、`top_k`、presence/frequency/repetition penalties、有符号 64 位 `seed`、`logit_bias`、EOS 和 `stop`。默认参数按模型来源和本轮 thinking 模式选择，客户端显式值优先于部署默认值，部署默认值优先于模型默认值。模型身份来自包内 `config.json` 的量化来源或 `metadata.model`，与 HTTP 模型别名无关。未指定 seed 时，每个请求生成独立的 64 位随机种子，随请求保留并供 target、DSpark 与状态恢复共用。显式 seed 保持固定；负数按相同 64 位补码解释。验收请求显式设置 `seed=20261002`。`top_k=-1` 和 `top_k=0` 均关闭 top-k，正数范围为 1 到 2147483647。`logit_bias` 的 key 是 tokenizer 的 token ID，值范围为 −100 到 100。
+
+| 模型 | 默认 thinking | temperature / top_p / top_k / presence_penalty | 默认输出预算 |
+| --- | --- | --- | --- |
+| Qwen3.8-27B、Qwen3.8-Flash-Next | 开启 | `1 / 0.95 / 20 / 0` | 8192 |
+| Qwen3.5-4B | 开启 | `1 / 0.95 / 20 / 1.5` | 8192 |
+| Index-Translate-2B/9B/35B | 关闭 | `0 / 1 / 0 / 0`（贪心） | 1024 |
+| Qwen3-ASR-1.7B | 关闭 | `0 / 1 / 0 / 0`（贪心） | 8192 |
+| DSv4.1 | 关闭 | `1 / 1 / 0 / 0` | 8192 |
+
+Qwen3.8 和 Qwen3.5-4B 关闭 thinking 时，未显式提供的采样参数使用 `temperature=0.7、top_p=0.8、top_k=20、presence_penalty=1.5`。thinking 模式下，`generation_config.json` 中显式提供的采样和惩罚值覆盖模型推荐值；其他模型继承本模型的生成配置，缺失值使用通用默认值。`do_sample=false` 采用贪心语义；Index 使用官方翻译客户端的贪心默认值，DSv4.1 使用下面的 DeepInfer 策略。repetition_penalty 默认 1，frequency_penalty 默认 0。`top_k=0/-1` 都表示关闭截断。
+
+这些参数分别依据 [Qwen3.8](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices)、[Flash Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#best-practices)、[Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B#best-practices) 的通用任务建议，以及 [Index 官方客户端默认配置](https://huggingface.co/IndexTeam/Index-Translate-2B#default-settings)。任务专用的编码或推理采样参数通过请求或部署默认值指定。
 
 DSv4.1 A2 的服务默认与 [DeepInfer SamplingParams](https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/sampling_params.py) 的采样配置一致：`temperature=1、top_p=1`、关闭 top-k、不施加重复惩罚、遇到 EOS 正常结束。旧模型文件中的 greedy 默认值也由前端采用此策略，无需修改已发布权重。部署时可用 `--default-request-params` 覆盖，客户端显式提供的参数优先。
 
@@ -90,7 +102,7 @@ HTTP 与 JSONL batch 共用跨步输出流水。引擎先提交已接受 token �
 
 声明 `coupled_draft` 的执行包在 DSpark Markov head 内复用 target 同一生成位置的 Gumbel 随机数，按顺序推进草稿条件，并复用现有匹配前缀提交与状态恢复。target 保持请求的采样概率律；草稿无需传回完整概率表。温度 0 以及不满足设备采样条件的请求使用贪心草稿。离线通过 `orinfer_build.models.deepseek_v41.sampling --couple-draft` 扩展已具备 target 采样能力的计划，所有并发与草稿长度共享一个动态 Markov 算子。
 
-默认关闭 thinking；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 开启后，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
+thinking 默认值见上表；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 可显式开启，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
 DSv4.1 使用本模型的 effort 编码：开启 thinking 后默认 `high=75`，`minimal/low=50`，`max/xhigh=100`。
 
@@ -108,7 +120,7 @@ Responses 和 Messages 由 [Estuary](https://github.com/iMMIQ/estuary) 转换为
 
 Estuary 节点选用 `openai` provider，上游填写 orinfer 的 `/v1` 地址。该模式沿用网关的通用负载和近似前缀路由；orinfer 的 `/metrics` 使用自身指标名，真实缓存事件与 vLLM 专用路由协议另行对接。多模态 token ID 不构成图片缓存身份。
 
-默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。此处为 Chat API 的输出预算；DeepInfer 底层构造器的默认值为 16 tokens，调用方传入已编码 prompt，thinking 由外部模板决定。本服务的 thinking 开关沿用上面的请求控制。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限默认 32 MiB，通过 `--request-body-mib` 调整。
+默认输出预算见上表，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。此处为 Chat API 的输出预算；DeepInfer 底层构造器的默认值为 16 tokens，调用方传入已编码 prompt，thinking 由外部模板决定。本服务的 thinking 开关沿用上面的请求控制。除 Index 外，8192 是服务输出预算，不继承 `generation_config.json.max_new_tokens`；ASR 转录入口同样使用此预算，以容纳长录音。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限默认 32 MiB，通过 `--request-body-mib` 调整。
 
 上下文溢出返回 `error.code=context_length_exceeded`，客户端可据此压缩历史并重试；其他无效参数仍为 `invalid_request`。
 

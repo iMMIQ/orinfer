@@ -7,6 +7,7 @@ use tokenizers::Tokenizer;
 mod deepseek;
 #[cfg(test)]
 mod defaults_test;
+mod generation_defaults;
 mod template_options;
 use super::output::ToolFormat;
 pub(super) use template_options::{BUDGET_FIELDS, THINKING_FIELDS};
@@ -149,7 +150,7 @@ pub struct ChatCodec {
     pub asset_hashes: std::collections::BTreeMap<String, String>,
     template: Environment<'static>,
     pub eos: BTreeSet<u32>,
-    sampling_defaults: Options,
+    defaults: generation_defaults::Defaults,
     pub grammar: super::grammar::Factory,
 }
 impl ChatCodec {
@@ -182,18 +183,6 @@ impl ChatCodec {
         let generation: Value =
             serde_json::from_slice(&assets["generation_config.json"]).map_err(|e| e.to_string())?;
         let ids = &generation["eos_token_id"];
-        let mut sampling_defaults = Options {
-            temperature: generation["temperature"].as_f64().unwrap_or(1.0),
-            top_p: generation["top_p"].as_f64().unwrap_or(1.0),
-            top_k: generation["top_k"]
-                .as_i64()
-                .map(normalize_top_k)
-                .transpose()?
-                .unwrap_or(0),
-            repetition_penalty: generation["repetition_penalty"].as_f64().unwrap_or(1.0),
-            ..Options::default()
-        };
-        sampling_defaults.validate()?;
         let eos: BTreeSet<u32> = if let Some(id) = ids.as_u64() {
             [u32::try_from(id).map_err(|e| e.to_string())?]
                 .into_iter()
@@ -242,9 +231,6 @@ impl ChatCodec {
             .map(serde_json::from_value)
             .transpose()
             .map_err(|e| e.to_string())?;
-        if audio.is_some() && generation["do_sample"] == false {
-            sampling_defaults.temperature = 0.;
-        }
         let tool_format = match descriptor["metadata"]["chat_format"].as_str() {
             Some("deepseek_v41") => ToolFormat::DeepSeekV41,
             Some(other) => return Err(format!("Unsupported chat format: {other}")),
@@ -265,23 +251,18 @@ impl ChatCodec {
             )
             .map_err(|e| e.to_string())?;
         if tool_format == ToolFormat::DeepSeekV41 {
-            // Older exported checkpoints wrote greedy defaults. The frontend
-            // policy follows DeepInfer without modifying published assets.
-            sampling_defaults.temperature = 1.0;
-            sampling_defaults.top_p = 1.0;
-            sampling_defaults.top_k = 0;
-            sampling_defaults.repetition_penalty = 1.0;
             // Serving prepares the frontend alongside model loading. Share one
             // trie instead of building it on the first constrained request.
             grammar.prepare()?;
         }
+        let defaults = generation_defaults::Defaults::load(directory, &descriptor, &generation)?;
         Ok(Self {
             boundary,
             tool_format,
             tools_supported: tool_format == ToolFormat::DeepSeekV41
                 || descriptor["metadata"]["target"] != "ascend910b",
             audio,
-            sampling_defaults,
+            defaults,
             tokenizer,
             asset_hashes,
             template: environment,
@@ -289,6 +270,10 @@ impl ChatCodec {
             grammar,
         })
     }
+    pub fn default_max_tokens(&self) -> usize {
+        self.defaults.max_tokens
+    }
+
     pub fn prepare(
         &self,
         mut request: ChatRequest,
@@ -371,25 +356,50 @@ impl ChatCodec {
         let mut max_tokens = request
             .max_completion_tokens
             .or(request.max_tokens)
-            .unwrap_or(8192);
+            .unwrap_or(self.default_max_tokens());
         if max_tokens == 0 {
             return Err("max_completion_tokens: Output-token limit must be positive".into());
         }
+        let effort = match request.reasoning_effort.as_deref() {
+            None | Some("high" | "xhigh" | "max") => "xhigh",
+            Some("minimal" | "low") => "low",
+            Some("medium") => "medium",
+            Some("none") => "xhigh",
+            _ => {
+                return Err(
+                    "reasoning_effort: Expected none/minimal/low/medium/high/xhigh/max".into(),
+                );
+            }
+        };
+        if request.reasoning_effort.as_deref() == Some("none")
+            && request.enable_thinking == Some(true)
+        {
+            return Err("enable_thinking: Conflicts with reasoning_effort=none".into());
+        }
+        let thinking = request.enable_thinking.unwrap_or(
+            request
+                .reasoning_effort
+                .as_ref()
+                .map_or(self.defaults.thinking, |s| s != "none"),
+        );
+        let sampling_defaults = self.defaults.sampling(thinking);
         let sampling = Options {
-            temperature: request
-                .temperature
-                .unwrap_or(self.sampling_defaults.temperature),
-            top_p: request.top_p.unwrap_or(self.sampling_defaults.top_p),
+            temperature: request.temperature.unwrap_or(sampling_defaults.temperature),
+            top_p: request.top_p.unwrap_or(sampling_defaults.top_p),
             top_k: request
                 .top_k
                 .map(normalize_top_k)
                 .transpose()?
-                .unwrap_or(self.sampling_defaults.top_k),
+                .unwrap_or(sampling_defaults.top_k),
             repetition_penalty: request
                 .repetition_penalty
-                .unwrap_or(self.sampling_defaults.repetition_penalty),
-            presence_penalty: request.presence_penalty.unwrap_or(0.0),
-            frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
+                .unwrap_or(sampling_defaults.repetition_penalty),
+            presence_penalty: request
+                .presence_penalty
+                .unwrap_or(sampling_defaults.presence_penalty),
+            frequency_penalty: request
+                .frequency_penalty
+                .unwrap_or(sampling_defaults.frequency_penalty),
             // Resolve once into Prepared; target, draft, retry and prefix
             // restoration retain this request's sampling identity.
             seed: match request.seed {
@@ -436,28 +446,6 @@ impl ChatCodec {
                 .token_bytes(0)
                 .map_err(|e| format!("logprobs: {e}"))?;
         }
-        let effort = match request.reasoning_effort.as_deref() {
-            None | Some("high" | "xhigh" | "max") => "xhigh",
-            Some("minimal" | "low") => "low",
-            Some("medium") => "medium",
-            Some("none") => "xhigh",
-            _ => {
-                return Err(
-                    "reasoning_effort: Expected none/minimal/low/medium/high/xhigh/max".into(),
-                );
-            }
-        };
-        if request.reasoning_effort.as_deref() == Some("none")
-            && request.enable_thinking == Some(true)
-        {
-            return Err("enable_thinking: Conflicts with reasoning_effort=none".into());
-        }
-        let thinking = request.enable_thinking.unwrap_or(
-            request
-                .reasoning_effort
-                .as_ref()
-                .is_some_and(|s| s != "none"),
-        );
         let stops = match request.stop {
             None | Some(Value::Null) => vec![],
             Some(Value::String(s)) => vec![s],
