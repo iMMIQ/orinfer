@@ -104,6 +104,8 @@ HTTP 与 JSONL batch 共用跨步输出流水。引擎先提交已接受 token �
 
 `/health.output_pipeline_statistics` 提供延迟包数、token 数、维护回调和边界排空次数，以及后处理 CPU 用时。`maintenance_postprocess_s` 表示维护回调内的 CPU 用时，包含 Graph 准备前的排空，不能直接视为设备耗时的减少。诊断对照可在启动前设置 `ORINFER_ASYNC_OUTPUT=0` 使用即时输出。采样、DSpark 接受前缀、KV 和 Graph 的状态提交仍保持现有依赖顺序。
 
+A2 的模型、设备采样和小结果读回按计算流顺序提交，读回完成事件统一确认其前置计算。草稿分数与 token ID 合并读回。资源回收使用同一条流上最后一个已完成事件的硬同步确认此前提交完成；无关传输流继续持有自己的资源，跨流通用下载仍确认两条流。事件查询本身不能代替完成确认，失败时保留原有隔离和清理顺序。
+
 声明 `coupled_draft` 的执行包在 DSpark Markov head 内复用 target 同一生成位置的 Gumbel 随机数，按顺序推进草稿条件，并复用现有匹配前缀提交与状态恢复。target 保持请求的采样概率律；草稿无需传回完整概率表。温度 0、当前需要 grammar mask 以及不满足设备采样条件的请求使用贪心草稿。离线通过 `orinfer_build.models.deepseek_v41.sampling --couple-draft` 扩展已具备 target 采样能力的计划，所有并发与草稿长度共享一个动态 Markov 算子。
 
 thinking 默认值见上表；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 可显式开启，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。

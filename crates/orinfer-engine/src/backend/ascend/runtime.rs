@@ -255,6 +255,7 @@ struct Retained {
 }
 struct Completion {
     context: Rc<Context>,
+    stream: Handle,
     event: Handle,
     complete: Cell<bool>,
     retained: RefCell<Option<Retained>>,
@@ -587,17 +588,30 @@ impl Session {
     }
     pub fn reap(&self) -> Result<()> {
         let mut pending = self.pending.borrow_mut();
-        let mut index = 0;
-        while index < pending.len() {
-            if pending[index].done()? {
-                // A ready query does not replace the hard completion fence
-                // required before releasing retained DMA backing.
-                pending[index].wait()?;
-                pending.swap_remove(index);
-            } else {
-                index += 1;
+        let mut fences = [None, None];
+        // Submission order is retained in this vector. One ready completion
+        // on a stream can hard-fence every earlier generation on that stream.
+        for (index, completion) in pending.iter().enumerate().rev() {
+            let slot = usize::from(completion.stream == self.context.transfer);
+            if fences[slot].is_none() && completion.done()? {
+                fences[slot] = Some(index);
             }
         }
+        for index in fences.into_iter().flatten() {
+            let stream = pending[index].stream;
+            pending[index].wait()?;
+            for completion in &pending[..=index] {
+                if completion.stream == stream {
+                    completion.complete.set(true);
+                }
+            }
+        }
+        // Mark covered generations before releasing nested ticket owners. A
+        // ready query alone never permits releasing an unfenced DMA backing.
+        for completion in pending.iter().filter(|c| c.complete.get()) {
+            completion.wait()?;
+        }
+        pending.retain(|c| !c.complete.get());
         Ok(())
     }
     pub fn synchronize(&self) -> Result<()> {
@@ -674,6 +688,7 @@ impl Session {
         }
         let completion = Rc::new(Completion {
             context: Rc::clone(&self.context),
+            stream,
             event,
             complete: Cell::new(false),
             retained: RefCell::new(Some(retained)),
@@ -896,6 +911,93 @@ impl Session {
         }
         self.reap()?;
         Ok(out)
+    }
+    /// Read outputs produced on the compute stream through one ordered DMA fence.
+    /// Transfer-stream producers require an explicit dependency before this call.
+    pub(crate) fn download_compute_many(
+        &self,
+        inputs: &[(&Buffer, usize, usize)],
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut total = 0usize;
+        let mut spans = Vec::with_capacity(inputs.len());
+        for &(buffer, offset, bytes) in inputs {
+            self.require(buffer)?;
+            let source = buffer.range(offset, bytes)?;
+            if bytes == 0 {
+                return Err("Compute readback requires nonempty spans".into());
+            }
+            let start = total;
+            total = total
+                .checked_add(bytes)
+                .ok_or("Compute readback overflow")?;
+            spans.push((source, start, bytes));
+        }
+        if total == 0 || total > self.context.limits.pinned_bytes {
+            return Err("Compute readback exceeds pinned staging budget".into());
+        }
+        let host = self.input_pinned(total)?;
+        let ticket = self.submit(
+            self.context.compute,
+            Retained {
+                _buffers: inputs.iter().map(|(b, _, _)| (*b).clone()).collect(),
+                _host: Some(Rc::clone(&host)),
+                _extra: None,
+            },
+            |stream| {
+                for &(source, start, bytes) in &spans {
+                    check(
+                        // SAFETY: Validated source spans and disjoint pinned destinations
+                        // remain retained until the ordered compute completion; D2H=2.
+                        unsafe {
+                            (self.context.api.memcpy)(
+                                host.pointer.cast::<u8>().add(start).cast(),
+                                bytes,
+                                source,
+                                bytes,
+                                2,
+                                stream,
+                            )
+                        },
+                        "ACL compute readback",
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        ticket.wait()?;
+        // The hard readback fence covers every preceding compute submission.
+        // Mark all covered generations before releasing nested ticket owners;
+        // unrelated transfer-stream work retains its own completion lifetime.
+        for completion in self.pending.borrow().iter() {
+            if completion.stream == self.context.compute {
+                completion.complete.set(true);
+            }
+        }
+        let mut outputs = Vec::with_capacity(spans.len());
+        for &(_, start, bytes) in &spans {
+            let mut data = vec![0; bytes];
+            // SAFETY: The DMA fence completed before reading its pinned destination.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    host.pointer.cast::<u8>().add(start),
+                    data.as_mut_ptr(),
+                    bytes,
+                );
+            }
+            outputs.push(data);
+        }
+        self.reap()?;
+        Ok(outputs)
+    }
+    pub(crate) fn download_compute(
+        &self,
+        buffer: &Buffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<Vec<u8>> {
+        Ok(self
+            .download_compute_many(&[(buffer, offset, bytes)])?
+            .remove(0))
     }
     pub fn fill(&self, buffer: &Buffer, value: u8) -> Result<Ticket> {
         self.fill_many(std::slice::from_ref(buffer), value)

@@ -194,11 +194,11 @@ impl Processed {
         }
         session.upload_inputs(&inputs)?;
         if capture {
-            self.graph.as_ref().unwrap().enqueue(session)?.wait()?;
+            self.graph.as_ref().unwrap().enqueue(session)?;
         } else {
-            self.program.enqueue(session)?.wait()?;
+            self.program.enqueue(session)?;
         }
-        let bytes = session.download(&self.output, 0, parameters.len() * WIDTH * 4)?;
+        let bytes = session.download_compute(&self.output, 0, parameters.len() * WIDTH * 4)?;
         bytes
             .as_chunks::<{ WIDTH * 4 }>()
             .0

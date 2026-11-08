@@ -78,6 +78,7 @@ def command(args):
             dict(
                 temperature=args.temperature,
                 top_p=args.top_p,
+                seed=args.sampling_seed,
                 **(
                     {
                         "reasoning_effort": "high",
@@ -165,6 +166,12 @@ def main():
     parser.add_argument("--mtp-drafts", type=int, default=0, help="Expected service draft limit")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--sampling-seed",
+        type=int,
+        default=20261002,
+        help="Model sampling seed; trace order still uses seed 42",
+    )
     parser.add_argument(
         "--enable-thinking", action="store_true", help="Enable thinking for all replay requests"
     )
@@ -273,6 +280,7 @@ def main():
             enable_thinking=args.enable_thinking,
             temperature=args.temperature,
             top_p=args.top_p,
+            sampling_seed=args.sampling_seed,
             service_pid=args.service_pid,
             service_command=service_command,
             service_environment=service_environment,

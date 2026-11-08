@@ -1216,7 +1216,7 @@ impl Worker {
             inputs.push((get(&self.buffers, name)?.slice(0, bytes.len())?, bytes));
         }
         self.session.upload_inputs(&inputs)?;
-        if let Some(trace) = std::env::var_os("ORINFER_A2_BATCH_TRACE") {
+        let sampled = if let Some(trace) = std::env::var_os("ORINFER_A2_BATCH_TRACE") {
             let name = layout
                 .segments
                 .iter()
@@ -1242,6 +1242,7 @@ impl Worker {
                 &visual_rows,
             )?;
             self.trace_rings(&path, "after")?;
+            self.sample_batch(&execution, layout, readout)?
         } else {
             let pending = self.enqueue_packet_retained(
                 Rc::clone(&execution),
@@ -1254,12 +1255,15 @@ impl Worker {
                 !layout.outputs.is_empty(),
                 retained,
             )?;
-            let prepared = readout.parameters.get();
-            // Even a failed grammar preparation must retain native resources
-            // and let every rank finish the already-submitted collective order.
+            let sampled = readout.parameters.get().and_then(|_| {
+                // Model, sampling and readback are ordered on the same stream.
+                self.sample_batch(&execution, layout, readout)
+            });
+            // Errors still drain every rank's submitted collective order. On
+            // success the sampling readback has already fenced the model.
             pending.wait()?;
-            prepared?;
-        }
+            sampled?
+        };
         if !execution.captured {
             execution.record_shared_use();
         }
@@ -1271,50 +1275,23 @@ impl Worker {
                 .map_or(layout.outputs.len(), |stride| {
                     layout.segments.len() * stride
                 });
-            let sampled = if readout.draws.is_empty() || layout.role == super::PacketRole::Draft {
-                None
+            let (values, indices) = if sampled.is_some() {
+                (vec![], vec![])
             } else {
-                let source = get(
+                let values = get(
                     &self.buffers,
                     execution
                         .packet
-                        .logits
+                        .confidence
                         .as_ref()
-                        .ok_or("Missing sampling logits")?,
+                        .unwrap_or(&execution.packet.best_value),
                 )?;
-                Some(self.sampling.as_mut().unwrap().sample(
-                    &self.session,
-                    &source,
-                    execution.packet.vocab_first,
-                    &readout.controls(layout)?,
-                    &readout.row_parameters(layout)?,
-                    execution.captured,
-                )?)
-            };
-            let values = if sampled.is_some() {
-                vec![]
-            } else {
-                self.session.download(
-                    &get(
-                        &self.buffers,
-                        execution
-                            .packet
-                            .confidence
-                            .as_ref()
-                            .unwrap_or(&execution.packet.best_value),
-                    )?,
-                    0,
-                    count * 4,
-                )?
-            };
-            let indices = if sampled.is_some() {
-                vec![]
-            } else {
-                self.session.download(
-                    &get(&self.buffers, &execution.packet.best_index)?,
-                    0,
-                    count * 4,
-                )?
+                let indices = get(&self.buffers, &execution.packet.best_index)?;
+                let mut outputs = self
+                    .session
+                    .download_compute_many(&[(&values, 0, count * 4), (&indices, 0, count * 4)])?
+                    .into_iter();
+                (outputs.next().unwrap(), outputs.next().unwrap())
             };
             let outputs = if let Some(stride) = execution.packet.draft_stride {
                 layout
@@ -1416,6 +1393,35 @@ impl Worker {
         }
         self.batch.as_mut().unwrap().record_use(key);
         Ok(output)
+    }
+    fn sample_batch(
+        &mut self,
+        execution: &Execution,
+        layout: &Layout,
+        readout: &super::team::Readout,
+    ) -> Result<Option<Vec<crate::backend::ascend::sampling::Sample>>> {
+        if layout.outputs.is_empty()
+            || readout.draws.is_empty()
+            || layout.role == super::PacketRole::Draft
+        {
+            return Ok(None);
+        }
+        let source = get(
+            &self.buffers,
+            execution
+                .packet
+                .logits
+                .as_ref()
+                .ok_or("Missing sampling logits")?,
+        )?;
+        Ok(Some(self.sampling.as_mut().unwrap().sample(
+            &self.session,
+            &source,
+            execution.packet.vocab_first,
+            &readout.controls(layout)?,
+            &readout.row_parameters(layout)?,
+            execution.captured,
+        )?))
     }
 }
 

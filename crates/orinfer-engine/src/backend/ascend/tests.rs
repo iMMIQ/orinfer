@@ -349,6 +349,74 @@ fn input_slabs_split_buffers_and_backpressure_within_the_pinned_budget() {
 }
 
 #[test]
+fn completed_compute_fence_retires_earlier_tickets_without_repeating_waits() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let input = session.allocate(4).unwrap();
+    let output = session.allocate(4).unwrap();
+    let pending = (0..8)
+        .map(|_| session.copy(&input, 0, &output, 0, 4).unwrap())
+        .collect::<Vec<_>>();
+    pending.last().unwrap().wait().unwrap();
+    let fences = fixture.counter(13);
+    session.reap().unwrap();
+    assert_eq!(
+        fixture.counter(13),
+        fences,
+        "reuse the existing hard stream fence"
+    );
+    assert!(pending.iter().all(|p| p.is_ready().unwrap()));
+    drop((pending, input, output, session));
+    fixture.assert_clean();
+}
+
+#[test]
+fn compute_readback_batches_outputs_without_fencing_unrelated_transfers() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let transfer = session.allocate(4).unwrap();
+    let input = session.allocate(6).unwrap();
+    let output = session.allocate(6).unwrap();
+    let unrelated = session.upload(&transfer, 0, &[9; 4]).unwrap();
+    let uploaded = session
+        .upload_inputs(&[(input.clone(), vec![1, 2, 3, 4, 5, 6])])
+        .unwrap();
+    let copied = session.copy(&input, 0, &output, 0, 6).unwrap();
+    let jobs = fixture.pending_jobs();
+    assert!(
+        session
+            .download_compute_many(&[(&output, 0, 4), (&output, 5, 2)])
+            .is_err()
+    );
+    assert_eq!(
+        fixture.pending_jobs(),
+        jobs,
+        "validate all spans before enqueue"
+    );
+    assert!(session.download_compute_many(&[]).is_err());
+    let fences = fixture.counter(13);
+    let syncs = fixture.counter(12);
+    assert_eq!(
+        session
+            .download_compute_many(&[(&output, 1, 3), (&input, 4, 2)])
+            .unwrap(),
+        [vec![2, 3, 4], vec![5, 6]],
+    );
+    assert_eq!(fixture.counter(13) - fences, 1, "one result fence");
+    assert_eq!(fixture.counter(12), syncs, "no stream-wide synchronization");
+    assert!(
+        !unrelated.is_ready().unwrap(),
+        "unrelated transfer stays asynchronous"
+    );
+    assert!(uploaded.is_ready().unwrap());
+    assert!(copied.is_ready().unwrap());
+    drop((
+        unrelated, uploaded, copied, transfer, input, output, session,
+    ));
+    fixture.assert_clean();
+}
+
+#[test]
 fn input_batch_copies_host_data_and_preserves_compute_reader_order() {
     let mut fixture = Fixture::new();
     let session = fixture.session();

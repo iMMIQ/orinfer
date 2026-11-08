@@ -849,7 +849,7 @@ A2 的 Engram CPU 行表使用共 2 GiB 的跨 packet 行缓存，由各 rank �
 
 主机内存充足时，可用 `ORINFER_A2_HOST_TABLE_MIB` 设置 Engram 完整常驻预算，例如 DSv4.1 当前 INT8 表使用 `212000` MiB。非零预算须容纳全部表及分配元数据，不足时在分配前报错；启动通过现有 Rayon 工作池按 32 MiB 块读取各表，rank 共享唯一常驻副本，后续行读取直接复制内存字节，并关闭重复的行缓存。该模式额外使用约 206 GiB 主机内存，读取成本计入模型启动时间，原生统计的 `resident_bytes` 报告实际保留量。默认 `0` 保持文件读取与有界行缓存；表常驻和行缓存均保留原始 INT8／FP32 字节，设备 staging 沿用已有边界。
 
-`python3 -m tools.bench.agentx_mini --help` 提供固定 Mini-Weka 短测入口：保留原始 16 个窗口、64 个 profiling 请求、并发 16、seed 42、180 秒 profiling 和每 lane 一次 warmup，记录输入哈希、服务二进制、A2 主机预算与 HCCL 参数、健康状态及 metrics。计时区间内通过 `/proc/status` 采样 RSS，PSS 在启动回放前单独记录，并保存采样耗时及进程 I/O、CPU 计数。默认要求关闭投机；DSpark 短测显式传入 `--mtp-drafts 5` 并校验服务配置。代码 agent 的 thinking 回放使用 `--enable-thinking`，输入身份及该开关写入 provenance；与同样开启 thinking 的基线比较。默认总时限 900 秒，到时终止本轮客户端并保留诊断；中断结果不能作为通过的短测分数。该入口连接已运行服务，不部署后端或修改设备设置。
+`python3 -m tools.bench.agentx_mini --help` 提供固定 Mini-Weka 短测入口：保留原始 16 个窗口、64 个 profiling 请求、并发 16、回放顺序 seed 42、模型采样 seed `20261002`、180 秒 profiling 和每 lane 一次 warmup，记录输入哈希、服务二进制、A2 主机预算与 HCCL 参数、健康状态及 metrics。模型采样 seed 可通过 `--sampling-seed` 指定，配对时保持一致。计时区间内通过 `/proc/status` 采样 RSS，PSS 在启动回放前单独记录，并保存采样耗时及进程 I/O、CPU 计数。默认要求关闭投机；DSpark 短测显式传入 `--mtp-drafts 5` 并校验服务配置。代码 agent 的 thinking 回放使用 `--enable-thinking`，输入身份及该开关写入 provenance；与同样开启 thinking 的基线比较。默认总时限 900 秒，到时终止本轮客户端并保留诊断；中断结果不能作为通过的短测分数。该入口连接已运行服务，不部署后端或修改设备设置。
 
 私有算子的离线调度重建可直接复用已编译计划：
 

@@ -291,11 +291,11 @@ impl Categorical {
                 );
         }
         if capture {
-            self.graph.as_ref().unwrap().enqueue(session)?.wait()?;
+            self.graph.as_ref().unwrap().enqueue(session)?;
         } else {
-            self.program.enqueue(session)?.wait()?;
+            self.program.enqueue(session)?;
         }
-        let bytes = session.download(&self.output, 0, rows.len() * 8)?;
+        let bytes = session.download_compute(&self.output, 0, rows.len() * 8)?;
         bytes
             .as_chunks::<8>()
             .0

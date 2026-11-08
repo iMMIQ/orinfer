@@ -4,6 +4,8 @@
 
 [Mini-Weka 调优短测](../tools/bench/agentx_mini.py) 从首个请求发放开始计算 `--wall-limit`，客户端初始化另行记录。配对比较在各自的新服务进程中使用相同源窗口、参数及由源身份生成的 `--benchmark-id`，使 AgentX 的 cache-bust 提示前缀保持一致；同进程重复执行按热缓存场景记录。原始请求导出保留实际输入；共同片段按轨迹、访问批次、主／子 agent 及内层位置对齐。分析分别报告预热、prefill、decode、混合执行及准备开销，单列纯 decode 窗口。达到短测上限的回放保留诊断数据，完成数量和累计输出率以实际请求窗口比较，完整任务分数需由完整回放验收。
 
+回放顺序使用 seed 42；模型采样通过 `--sampling-seed` 单独固定，默认 `20261002`，实际值写入请求和 provenance。配对时两个 seed 均保持一致。早期未指定模型 seed 的回放只能用于诊断，不能把自然生成、草稿接受率和验证轮数的差异直接归因于代码。默认高性能通信仍可能使不同 batch 的数值和输出轨迹不同，性能对比同时记录接受率、执行轮数及缓存命中。
+
 十分钟持续压力回放使用 `--wall-limit 600 --benchmark-duration 600 --request-count 100000 --concurrency 16`；较大的请求预算避免默认 64 个请求提前结束。总窗口包含冷请求 warmup，另行报告正式回放窗口；到点停止的在途请求单列。`--backend vllm --deployment-spec /path/to/deployment.json` 可对已运行的 vLLM 服务使用同一客户端；配置记录需包含 `method: "dspark"` 和与 `--mtp-drafts` 一致的 `num_speculative_tokens`，实际启用情况另由服务启动日志及投机计数确认。`--enable-thinking` 使用共同的 `reasoning_effort: "high"` 和 `chat_template_kwargs.enable_thinking: true`。部署参数、模型上下文、KV 精度与 CPU offload 预算分别记录；不同后端的进程采样只代表指定 PID。闭环回放后续循环的 lane 分配可能随速度改变，共同请求比较以导出的实际 payload 一致为准。
 
 ## DSv4.1 A2 单流 decode（2026-10-28）
