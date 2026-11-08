@@ -76,7 +76,19 @@ pub(super) fn text_parts(messages: &mut [Value]) -> Result<()> {
 pub(super) fn prepare(
     mut messages: Vec<Value>,
     tools: &[Value],
+    boundary: Option<&super::super::token_boundary::Boundary>,
 ) -> Result<(Vec<Value>, Vec<String>)> {
+    let dsml = if messages
+        .iter()
+        .any(|m| m["tool_calls"].as_array().is_some_and(|c| !c.is_empty()))
+    {
+        boundary
+            .map(|b| b.control("｜DSML｜"))
+            .transpose()?
+            .unwrap_or_else(|| "｜DSML｜".into())
+    } else {
+        "｜DSML｜".into()
+    };
     let schemas = tools
         .iter()
         .map(|tool| {
@@ -149,14 +161,14 @@ pub(super) fn prepare(
                 .enumerate()
                 .map(|(i, c)| (c["id"].as_str().unwrap().to_owned(), i))
                 .collect();
-            let mut encoded = String::from("\n\n<｜DSML｜ calls>\n");
+            let mut encoded = format!("\n\n<{dsml} calls>\n");
             for (index, call) in calls.iter().enumerate() {
                 if index > 0 {
                     encoded.push('\n');
                 }
                 let function = &call["function"];
                 encoded.push_str(&format!(
-                    "<｜DSML｜ invoke name=\"{}\">\n",
+                    "<{dsml} invoke name=\"{}\">\n",
                     function["name"].as_str().unwrap()
                 ));
                 let arguments = function["arguments"]
@@ -175,11 +187,11 @@ pub(super) fn prepare(
                     } else {
                         python_json(value)?
                     };
-                    encoded.push_str(&format!("<｜DSML｜ parameter name=\"{key}\" string=\"{string}\">{value}</｜DSML｜ parameter>"));
+                    encoded.push_str(&format!("<{dsml} parameter name=\"{key}\" string=\"{string}\">{value}</{dsml} parameter>"));
                 }
-                encoded.push_str("\n</｜DSML｜ invoke>");
+                encoded.push_str(&format!("\n</{dsml} invoke>"));
             }
-            encoded.push_str("\n</｜DSML｜ calls>");
+            encoded.push_str(&format!("\n</{dsml} calls>"));
             if !calls.is_empty() {
                 message["dsml_calls"] = json!(encoded);
             }
@@ -244,7 +256,7 @@ mod tests {
             assert!(images.is_empty());
             let messages = normalize_messages_for(raw, ToolFormat::DeepSeekV41).unwrap();
             let tools = request["tools"].as_array().cloned().unwrap_or_default();
-            let (messages, schemas) = prepare(messages, &tools).unwrap();
+            let (messages, schemas) = prepare(messages, &tools, None).unwrap();
             let effort = match request["reasoning_effort"].as_str() {
                 Some("low") => 50,
                 Some("max") => 100,

@@ -3,6 +3,7 @@ use super::{ChatRequest, Result};
 
 pub(in crate::server) const THINKING_FIELDS: &[&str] =
     &["enable_thinking", "thinking", "reasoning_effort"];
+pub(in crate::server) const BUDGET_FIELDS: &[&str] = &["thinking_token_budget", "thinking_budget"];
 
 impl ChatRequest {
     pub(super) fn template_bool(&self, key: &str) -> Result<Option<bool>> {
@@ -39,18 +40,22 @@ impl ChatRequest {
                 self.reasoning_effort = Some(value.to_owned());
             }
         }
-        if let Some(value) = self
-            .chat_template_kwargs
-            .get("thinking_token_budget")
-            .filter(|v| !v.is_null())
-        {
-            let value = value.as_u64().and_then(|v| usize::try_from(v).ok()).ok_or(
-                "chat_template_kwargs.thinking_token_budget: Expected a nonnegative integer",
-            )?;
-            if self.thinking_token_budget.is_none() {
-                self.thinking_token_budget = Some(value);
+        let mut budget = None;
+        for &key in BUDGET_FIELDS {
+            if let Some(value) = self.chat_template_kwargs.get(key).filter(|v| !v.is_null()) {
+                let value = value
+                    .as_u64()
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| {
+                        format!("chat_template_kwargs.{key}: Expected a nonnegative integer")
+                    })?;
+                if self.thinking_token_budget.is_none() && budget.is_some_and(|b| b != value) {
+                    return Err("chat_template_kwargs.thinking_budget: Conflicts with thinking_token_budget".into());
+                }
+                budget = Some(value);
             }
         }
+        self.thinking_token_budget = self.thinking_token_budget.or(budget);
         Ok(())
     }
 }

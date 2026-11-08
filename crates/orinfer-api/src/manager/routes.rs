@@ -53,6 +53,17 @@ async fn transcriptions(
 ) -> Response {
     gateway_request(manager, headers, body, None, true, None).await
 }
+async fn render(State(manager): State<Arc<Manager>>, headers: HeaderMap, body: Body) -> Response {
+    gateway_request(
+        manager,
+        headers,
+        body,
+        None,
+        false,
+        Some("/v1/chat/completions/render"),
+    )
+    .await
+}
 
 async fn embeddings(
     State(manager): State<Arc<Manager>>,
@@ -189,7 +200,7 @@ async fn gateway_request(
             );
         }
     }
-    if scoring.is_none()
+    if (scoring.is_none() || scoring == Some("/v1/chat/completions/render"))
         && let Err(message) =
             crate::server::defaults::merge(&mut request, &record.options.default_request_params)
     {
@@ -197,23 +208,25 @@ async fn gateway_request(
     }
     request["model"] = json!(lease.0.model);
     let started = Instant::now();
-    loop {
-        match manager
-            .reserve_request_with_eviction(&record, &request, input_bytes)
-            .await
-        {
-            Ok(budget) => {
-                lease.1 = Some(budget);
-                break;
-            }
-            Err(message) => {
-                if !message.starts_with("Insufficient unified memory")
-                    || manager.stopping.load(Ordering::Acquire)
-                    || started.elapsed() >= Duration::from_secs(manager.config.load_timeout_s)
-                {
-                    return error(StatusCode::SERVICE_UNAVAILABLE, message);
+    if scoring != Some("/v1/chat/completions/render") {
+        loop {
+            match manager
+                .reserve_request_with_eviction(&record, &request, input_bytes)
+                .await
+            {
+                Ok(budget) => {
+                    lease.1 = Some(budget);
+                    break;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                Err(message) => {
+                    if !message.starts_with("Insufficient unified memory")
+                        || manager.stopping.load(Ordering::Acquire)
+                        || started.elapsed() >= Duration::from_secs(manager.config.load_timeout_s)
+                    {
+                        return error(StatusCode::SERVICE_UNAVAILABLE, message);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     }
@@ -580,6 +593,7 @@ pub(super) fn public_router(manager: Arc<Manager>) -> Router {
         )
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(completions))
+        .route("/v1/chat/completions/render", post(render))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/rerank", post(rerank))
         .route("/rerank", post(rerank))
@@ -603,6 +617,7 @@ pub(super) async fn serve(manager: Arc<Manager>) -> Result<()> {
         .route("/ps", get(ps))
         .route("/show", get(show))
         .route("/v1/chat/completions", post(completions))
+        .route("/v1/chat/completions/render", post(render))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/rerank", post(rerank))
         .route("/rerank", post(rerank))

@@ -11,6 +11,7 @@ pub(super) struct Budget {
     tokens: Arc<Vec<Vec<u8>>>,
     suffix: Vec<u8>,
     eos: Vec<u32>,
+    token_boundaries: bool,
 }
 impl Budget {
     pub fn new(
@@ -29,7 +30,12 @@ impl Budget {
             tokens,
             suffix: vec![],
             eos,
+            token_boundaries: false,
         }
+    }
+    pub fn with_token_boundaries(mut self, enabled: bool) -> Self {
+        self.token_boundaries = enabled;
+        self
     }
 }
 impl Constraint for Budget {
@@ -46,6 +52,7 @@ impl Constraint for Budget {
             tokens: Arc::clone(&self.tokens),
             suffix: self.suffix.clone(),
             eos: self.eos.clone(),
+            token_boundaries: self.token_boundaries,
         })
     }
     fn mask(&mut self) -> Result<Vec<u32>, String> {
@@ -81,21 +88,23 @@ impl Constraint for Budget {
                     .remaining
                     .checked_sub(1)
                     .ok_or("Token exceeded thinking budget")?;
-                let bytes = self
-                    .tokens
-                    .get(token as usize)
-                    .ok_or("Token outside tokenizer")?;
-                self.suffix.extend_from_slice(
-                    bytes
-                        .strip_prefix(&[llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER])
-                        .unwrap_or(bytes),
-                );
-                const END: &[u8] = b"</think>";
-                if self.suffix.windows(END.len()).any(|v| v == END) {
-                    self.thinking = false;
+                if !self.token_boundaries {
+                    let bytes = self
+                        .tokens
+                        .get(token as usize)
+                        .ok_or("Token outside tokenizer")?;
+                    self.suffix.extend_from_slice(
+                        bytes
+                            .strip_prefix(&[llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER])
+                            .unwrap_or(bytes),
+                    );
+                    const END: &[u8] = b"</think>";
+                    if self.suffix.windows(END.len()).any(|v| v == END) {
+                        self.thinking = false;
+                    }
+                    let keep = self.suffix.len().saturating_sub(END.len() - 1);
+                    self.suffix.drain(..keep);
                 }
-                let keep = self.suffix.len().saturating_sub(END.len() - 1);
-                self.suffix.drain(..keep);
             }
         }
         if let Some(inner) = &mut self.inner {
@@ -112,6 +121,21 @@ impl Constraint for Budget {
 mod tests {
     use super::*;
     use orinfer_engine::sampling::{Decoder, Options, verify};
+    #[test]
+    fn literal_delimiter_cannot_end_a_token_bounded_thinking_budget() {
+        let tokens = Arc::new(vec![
+            b"</thi".to_vec(),
+            b"nk>".to_vec(),
+            b"</think>".to_vec(),
+        ]);
+        let mut budget = Budget::new(None, 2, 2, tokens, vec![]).with_token_boundaries(true);
+        budget.consume(0).unwrap();
+        budget.consume(1).unwrap();
+        assert!(budget.needs_mask());
+        assert_eq!(budget.mask().unwrap(), [4]);
+        budget.consume(2).unwrap();
+        assert!(!budget.needs_mask());
+    }
     #[test]
     fn target_and_mtp_draft_cross_the_budget_without_sharing_state() {
         let mut live = Decoder::default();

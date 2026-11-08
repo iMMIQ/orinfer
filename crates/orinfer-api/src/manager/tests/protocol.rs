@@ -70,6 +70,28 @@ async fn unloaded_models_are_listed_without_starting_a_worker() {
     assert_eq!(fixture.manager.body_memory.available_permits(), 512);
     assert_eq!(fixture.starts(), 0);
 }
+#[tokio::test]
+async fn render_forwards_defaults_and_aliases_without_generation_memory_reservation() {
+    let fixture = Fixture::new();
+    drop(fixture.manager.acquire("fixture:2b").await.unwrap());
+    fixture
+        .alias("render", |record| {
+            record.sequence_bytes = usize::MAX / 4;
+            record
+                .options
+                .default_request_params
+                .insert("enable_thinking".into(), json!(true));
+        })
+        .await;
+    let http = Http::new(Arc::clone(&fixture.manager)).await;
+    let response = http.client.post(format!("{}/v1/chat/completions/render", http.url)).json(&json!({"model":"render","messages":[{"role":"user","content":"hello"}],"chat_template_kwargs":{"thinking_budget":8}})).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["enable_thinking"], true);
+    assert_eq!(body["chat_template_kwargs"]["thinking_budget"], 8);
+    assert_ne!(body["model"], "render");
+    fixture.unload().await;
+}
 
 #[tokio::test]
 async fn ollama_request_vectors_survive_the_http_gateway_and_alias_rewrite() {

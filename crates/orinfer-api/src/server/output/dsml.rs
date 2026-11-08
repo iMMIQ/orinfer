@@ -1,5 +1,5 @@
 //! DSv4.1 wire syntax. Values are consumed once; only a closing-tag suffix waits.
-use super::Result;
+use super::{Controls, Result, find_marker, marker_at};
 use std::collections::BTreeSet;
 
 pub(super) const OPEN: &str = "<｜DSML｜ calls>";
@@ -31,7 +31,11 @@ pub(super) struct Call {
     header: Header,
 }
 impl Call {
-    pub fn advance(&mut self, input: &str) -> Result<(usize, Option<Event>)> {
+    pub fn advance(
+        &mut self,
+        input: &str,
+        controls: Controls<'_>,
+    ) -> Result<(usize, Option<Event>)> {
         match self.stage {
             Stage::Name => {
                 let Some((length, attributes)) = self.header.advance(input)? else {
@@ -54,7 +58,7 @@ impl Call {
             Stage::Parameter => {
                 let rest = input.trim_start();
                 let space = input.len() - rest.len();
-                if rest.starts_with(END) {
+                if rest.starts_with(END) && marker_at(controls, space, END) {
                     self.stage = Stage::End;
                     return Ok((space + END.len(), Some(Event::Arguments("}".into()))));
                 }
@@ -64,6 +68,9 @@ impl Call {
                 let Some(body) = rest.strip_prefix(PARAMETER) else {
                     return Err("Expected DSML parameter or closing invoke".into());
                 };
+                if !marker_at(controls, space, PARAMETER) {
+                    return Err("Expected a DSML control token".into());
+                }
                 let Some((length, attributes)) = self.header.advance(body)? else {
                     return Ok((space, None));
                 };
@@ -91,7 +98,7 @@ impl Call {
                 ))
             }
             Stage::Value(string) => {
-                let end = input.find(PARAMETER_END);
+                let end = find_marker(input, controls, PARAMETER_END);
                 let count = end.unwrap_or_else(|| input.len() - suffix(input, PARAMETER_END));
                 let value = &input[..count];
                 let fragment = if string {
@@ -109,7 +116,7 @@ impl Call {
                 Ok((count, Some(Event::Arguments(fragment))))
             }
             Stage::CloseValue(string) => {
-                if !input.starts_with(PARAMETER_END) {
+                if !input.starts_with(PARAMETER_END) || !marker_at(controls, 0, PARAMETER_END) {
                     return Err("Missing DSML parameter terminator".into());
                 }
                 self.stage = Stage::Parameter;

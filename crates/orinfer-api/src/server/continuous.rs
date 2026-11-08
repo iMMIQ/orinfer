@@ -192,6 +192,9 @@ impl<'a> Active<'a> {
         parser.tool_format(job.prepared.tool_format);
         parser.structured_json(job.prepared.structured);
         parser.constrained_tools(job.prepared.constrained_tools);
+        if codec.boundary.is_some() {
+            parser.token_boundaries();
+        }
         let queue_s = job.queued.elapsed().as_secs_f64();
         Self {
             retain_image_memory: has_images,
@@ -247,7 +250,15 @@ impl<'a> Active<'a> {
                 .decoder
                 .step(token)
                 .map_err(|e| e.to_string())
-                .and_then(|text| self.parser.push(text.as_deref().unwrap_or(""), false));
+                .and_then(|text| {
+                    self.parser.push_token(
+                        text.as_deref().unwrap_or(""),
+                        codec
+                            .boundary
+                            .as_ref()
+                            .and_then(|b| b.output_control(token)),
+                    )
+                });
             match parsed {
                 Ok(deltas) => {
                     if (was_reasoning && codec.tokenizer.token_to_id("</think>") != Some(token))

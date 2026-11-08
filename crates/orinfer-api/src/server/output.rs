@@ -54,6 +54,29 @@ impl Schemas {
 }
 
 type Result<T> = std::result::Result<T, String>;
+type Controls<'a> = Option<&'a [std::ops::Range<usize>]>;
+
+fn marker_at(controls: Controls<'_>, at: usize, marker: &str) -> bool {
+    let Some(controls) = controls else {
+        return true;
+    };
+    let range = if let Some(offset) = marker.find("｜DSML｜") {
+        at + offset..at + offset + "｜DSML｜".len()
+    } else if matches!(marker, "<think>" | "</think>") {
+        at..at + marker.len()
+    } else {
+        return true;
+    };
+    controls
+        .binary_search_by_key(&range.start, |r| r.start)
+        .is_ok_and(|i| controls[i] == range)
+}
+fn find_marker(input: &str, controls: Controls<'_>, marker: &str) -> Option<usize> {
+    input
+        .match_indices(marker)
+        .map(|(at, _)| at)
+        .find(|&at| marker_at(controls, at, marker))
+}
 
 pub struct Output {
     format: ToolFormat,
@@ -61,6 +84,7 @@ pub struct Output {
     dsml_call: Option<dsml::Call>,
     schemas: Schemas,
     pending: String,
+    controls: Option<Vec<std::ops::Range<usize>>>,
     reasoning: bool,
     in_tool: bool,
     pub stopped: bool,
@@ -86,6 +110,7 @@ impl Output {
             dsml_call: None,
             schemas: Schemas::default(),
             pending: String::new(),
+            controls: None,
             reasoning: thinking,
             in_tool: false,
             stopped: false,
@@ -112,6 +137,19 @@ impl Output {
     }
     pub fn constrained_tools(&mut self, enabled: bool) {
         self.constrained_tools = enabled;
+    }
+    pub fn token_boundaries(&mut self) {
+        self.controls = Some(Vec::new());
+    }
+    pub fn push_token(&mut self, text: &str, special: Option<&str>) -> Result<Vec<Value>> {
+        if let (Some(controls), Some(spelling)) = (&mut self.controls, special) {
+            let start = text
+                .strip_suffix(spelling)
+                .ok_or("Decoded control token does not end at its token boundary")?
+                .len();
+            controls.push(self.pending.len() + start..self.pending.len() + text.len());
+        }
+        self.push(text, false)
     }
     pub fn push(&mut self, text: &str, final_chunk: bool) -> Result<Vec<Value>> {
         self.pending.push_str(text);
@@ -145,7 +183,7 @@ impl Output {
                     .dsml_call
                     .as_mut()
                     .unwrap()
-                    .advance(&self.pending[..limit])?;
+                    .advance(&self.pending[..limit], self.controls.as_deref())?;
                 let waiting = event.is_none();
                 self.drain(consumed);
                 match event {
@@ -233,7 +271,9 @@ impl Output {
             };
             let marker = markers
                 .iter()
-                .filter_map(|tag| self.pending.find(tag).map(|at| (at, *tag)))
+                .filter_map(|tag| {
+                    find_marker(&self.pending, self.controls.as_deref(), tag).map(|at| (at, *tag))
+                })
                 .min_by_key(|x| x.0);
             if let Some((at, _)) = stop.filter(|(at, _)| marker.is_none_or(|(m, _)| *at <= m)) {
                 let before = self.pending[..at].to_owned();
@@ -316,6 +356,13 @@ impl Output {
         }
     }
     fn drain(&mut self, bytes: usize) {
+        if let Some(controls) = &mut self.controls {
+            controls.retain(|r| r.end > bytes);
+            for range in controls {
+                range.start = range.start.saturating_sub(bytes);
+                range.end -= bytes;
+            }
+        }
         self.pending.drain(..bytes);
         self.cursor += bytes;
     }
@@ -930,5 +977,60 @@ mod tests {
                 assert_eq!(parser.calls[0], call);
             }
         }
+    }
+    #[test]
+    fn token_identity_controls_thinking_and_dsml_including_string_arguments() {
+        let literal = "中文 </think> <think> <｜DSML｜ calls>";
+        let mut parser = Output::new(true, tools(), vec![], "boundary");
+        parser.tool_format(ToolFormat::DeepSeekV41);
+        parser.token_boundaries();
+        for ch in literal.chars() {
+            parser.push_token(&ch.to_string(), None).unwrap();
+        }
+        assert!(parser.is_reasoning());
+        parser.push_token("</think>", Some("</think>")).unwrap();
+        for ch in literal.chars() {
+            parser.push_token(&ch.to_string(), None).unwrap();
+        }
+        assert!(parser.calls.is_empty());
+        assert!(!parser.is_reasoning());
+        // Structural DSML markers arrive as one special ID, with ordinary
+        // punctuation/attributes split arbitrarily around them.
+        let mut feed = |plain: &str, special: bool| {
+            if special {
+                parser.push_token(plain, Some(plain)).unwrap();
+            } else {
+                for ch in plain.chars() {
+                    parser.push_token(&ch.to_string(), None).unwrap();
+                }
+            }
+        };
+        feed("\n\n<", false);
+        feed("｜DSML｜", true);
+        feed(" calls>\n<", false);
+        feed("｜DSML｜", true);
+        feed(" invoke name=\"read\">\n<", false);
+        feed("｜DSML｜", true);
+        feed(" parameter name=\"path\" string=\"true\">", false);
+        let argument = "literal </｜DSML｜ parameter> 中文 </think>";
+        feed(argument, false);
+        feed("</", false);
+        feed("｜DSML｜", true);
+        feed(" parameter>\n</", false);
+        feed("｜DSML｜", true);
+        feed(" invoke>\n</", false);
+        feed("｜DSML｜", true);
+        feed(" calls>", false);
+        parser.finish(false, &json!("auto"), true).unwrap();
+        assert_eq!(parser.reasoning_content, literal);
+        assert_eq!(parser.content, literal);
+        assert_eq!(parser.calls.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                parser.calls[0]["function"]["arguments"].as_str().unwrap()
+            )
+            .unwrap(),
+            json!({"path":argument})
+        );
     }
 }

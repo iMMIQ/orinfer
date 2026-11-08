@@ -9,7 +9,7 @@ mod deepseek;
 mod defaults_test;
 mod template_options;
 use super::output::ToolFormat;
-pub(super) use template_options::THINKING_FIELDS;
+pub(super) use template_options::{BUDGET_FIELDS, THINKING_FIELDS};
 #[cfg(test)]
 mod tool_generation_test;
 
@@ -141,6 +141,7 @@ pub struct Prepared {
 }
 
 pub struct ChatCodec {
+    pub boundary: Option<super::token_boundary::Boundary>,
     pub tool_format: ToolFormat,
     pub tools_supported: bool,
     pub audio: Option<orinfer_engine::audio::AudioSpec>,
@@ -225,14 +226,6 @@ impl ChatCodec {
                 ))
             },
         );
-        environment
-            .add_template_owned(
-                "chat",
-                template
-                    .replace("{% generation %}", "")
-                    .replace("{% endgeneration %}", ""),
-            )
-            .map_err(|e| e.to_string())?;
         let grammar = super::grammar::Factory::new(
             assets.remove("tokenizer.json").unwrap(),
             eos.iter().copied().collect(),
@@ -257,6 +250,20 @@ impl ChatCodec {
             Some(other) => return Err(format!("Unsupported chat format: {other}")),
             None => ToolFormat::Qwen,
         };
+        let boundary = (tool_format == ToolFormat::DeepSeekV41)
+            .then(|| super::token_boundary::Boundary::new(&tokenizer))
+            .transpose()?;
+        let template = template
+            .replace("{% generation %}", "")
+            .replace("{% endgeneration %}", "");
+        environment
+            .add_template_owned(
+                "chat",
+                boundary
+                    .as_ref()
+                    .map_or_else(|| template.clone(), |b| b.template(&template)),
+            )
+            .map_err(|e| e.to_string())?;
         if tool_format == ToolFormat::DeepSeekV41 {
             // Older exported checkpoints wrote greedy defaults. The frontend
             // policy follows DeepInfer without modifying published assets.
@@ -269,6 +276,7 @@ impl ChatCodec {
             grammar.prepare()?;
         }
         Ok(Self {
+            boundary,
             tool_format,
             tools_supported: tool_format == ToolFormat::DeepSeekV41
                 || descriptor["metadata"]["target"] != "ascend910b",
@@ -608,8 +616,28 @@ impl ChatCodec {
             }
         }
         preparation.checkpoint(0)?;
+        let mut render_tools = tools.clone();
+        if let Some(boundary) = &self.boundary {
+            for message in &mut messages {
+                boundary.escape_value(message);
+            }
+            for tool in &mut render_tools {
+                boundary.escape_value(tool);
+            }
+            for value in request.chat_template_kwargs.values_mut() {
+                boundary.escape_value(value);
+            }
+            if !images.is_empty() {
+                let marker = boundary.control("<｜deepseek_image｜>")?;
+                for message in &mut messages {
+                    if let Some(text) = message["content"].as_str() {
+                        message["content"] = json!(text.replace("<｜deepseek_image｜>", &marker));
+                    }
+                }
+            }
+        }
         let (messages, tool_schemas) = if self.tool_format == ToolFormat::DeepSeekV41 {
-            deepseek::prepare(messages, &tools)?
+            deepseek::prepare(messages, &render_tools, self.boundary.as_ref())?
         } else {
             (messages, Vec::new())
         };
@@ -621,7 +649,7 @@ impl ChatCodec {
         let preserve_thinking = preserve_thinking_override
             .unwrap_or(self.tool_format != ToolFormat::DeepSeekV41 || !tools.is_empty());
         let controlled = context! {
-            messages => Serde(&messages), tools => Serde(&tools), add_generation_prompt => true,
+            messages => Serde(&messages), tools => Serde(&render_tools), add_generation_prompt => true,
             enable_thinking => thinking, thinking => thinking, reasoning_effort => effort,
             preserve_thinking => preserve_thinking,
             tool_schemas => Serde(&tool_schemas), deepseek_effort => deepseek_effort,
@@ -643,12 +671,15 @@ impl ChatCodec {
                 super::audio::language(&language)?
             ));
         }
-        let input = self
-            .tokenizer
-            .encode(rendered, false)
-            .map_err(|e| e.to_string())?
-            .get_ids()
-            .to_vec();
+        let input = if let Some(boundary) = &self.boundary {
+            boundary.encode(&rendered)?
+        } else {
+            self.tokenizer
+                .encode(rendered, false)
+                .map_err(|e| e.to_string())?
+                .get_ids()
+                .to_vec()
+        };
         let input = if let Some(v) = vision {
             v.expand(&input, &images, context_limit)?
         } else {
@@ -698,13 +729,16 @@ impl ChatCodec {
                 .tokenizer
                 .token_to_id("</think>")
                 .ok_or("thinking_token_budget: Tokenizer has no </think> token")?;
-            constraint = Some(Box::new(super::thinking::Budget::new(
-                constraint,
-                budget.min(max_tokens - 2),
-                close,
-                self.grammar.token_table()?,
-                self.eos.iter().copied().collect(),
-            )));
+            constraint = Some(Box::new(
+                super::thinking::Budget::new(
+                    constraint,
+                    budget.min(max_tokens - 2),
+                    close,
+                    self.grammar.token_table()?,
+                    self.eos.iter().copied().collect(),
+                )
+                .with_token_boundaries(self.boundary.is_some()),
+            ));
         }
         let include_usage = request
             .stream_options

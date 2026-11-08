@@ -410,13 +410,28 @@ mod tests {
 
 #[derive(Clone)]
 pub(super) struct Ingress {
-    pub slot: Arc<tokio::sync::OwnedSemaphorePermit>,
+    pub slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub body: Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 pub(super) async fn ingress(
     State(state): State<Service>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    ingress_inner(state, request, next, true).await
+}
+pub(super) async fn render_ingress(
+    State(state): State<Service>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    ingress_inner(state, request, next, false).await
+}
+async fn ingress_inner(
+    state: Service,
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
+    generation: bool,
 ) -> Response {
     if !authorized(&state, request.headers()) {
         return error(StatusCode::UNAUTHORIZED, "Invalid API key");
@@ -424,9 +439,13 @@ pub(super) async fn ingress(
     if !state.activity.lifecycle.is_ready() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker is not ready");
     }
-    let slot = match Arc::clone(&state.slots).try_acquire_owned() {
-        Ok(v) => v,
-        Err(_) => return error(StatusCode::TOO_MANY_REQUESTS, "Request queue is full"),
+    let slot = if generation {
+        match Arc::clone(&state.slots).try_acquire_owned() {
+            Ok(v) => Some(Arc::new(v)),
+            Err(_) => return error(StatusCode::TOO_MANY_REQUESTS, "Request queue is full"),
+        }
+    } else {
+        None
     };
     let body = match Arc::clone(&state.preparation.bodies).acquire_owned().await {
         Ok(v) => v,
@@ -438,7 +457,7 @@ pub(super) async fn ingress(
         }
     };
     request.extensions_mut().insert(Ingress {
-        slot: Arc::new(slot),
+        slot,
         body: Arc::new(body),
     });
     next.run(request).await

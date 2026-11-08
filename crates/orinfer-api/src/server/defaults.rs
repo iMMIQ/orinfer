@@ -56,7 +56,11 @@ pub(crate) fn merge(body: &mut Value, defaults: &Map<String, Value>) -> Result<(
                 .any(|name| k.contains_key(*name))
         });
     let budget_override = request.contains_key("thinking_token_budget")
-        || kwargs.is_some_and(|k| k.contains_key("thinking_token_budget"));
+        || kwargs.is_some_and(|k| {
+            super::chat::BUDGET_FIELDS
+                .iter()
+                .any(|key| k.contains_key(*key))
+        });
     let stream_disabled = request
         .get("stream")
         .is_some_and(|v| v == false || v.is_null());
@@ -80,7 +84,7 @@ pub(crate) fn merge(body: &mut Value, defaults: &Map<String, Value>) -> Result<(
             };
             for (key, value) in defaults {
                 if thinking_override && super::chat::THINKING_FIELDS.contains(&key.as_str())
-                    || budget_override && key == "thinking_token_budget"
+                    || budget_override && super::chat::BUDGET_FIELDS.contains(&key.as_str())
                 {
                     continue;
                 }
@@ -138,6 +142,29 @@ mod tests {
         assert_eq!(r.temperature, None);
         assert!(!r.stream);
         assert_eq!(request(json!({}), json!({})).enable_thinking, None);
+    }
+    #[test]
+    fn estuary_budget_alias_overrides_both_deployment_default_spellings() {
+        for defaults in [
+            json!({"thinking_token_budget":512}),
+            json!({"chat_template_kwargs":{"thinking_token_budget":512}}),
+            json!({"chat_template_kwargs":{"thinking_budget":512}}),
+        ] {
+            for name in ["thinking_budget", "thinking_token_budget"] {
+                let r = request(json!({"chat_template_kwargs":{name:0}}), defaults.clone());
+                assert_eq!(r.thinking_token_budget, Some(0));
+            }
+        }
+        let r = request(
+            json!({"thinking_token_budget":4,"chat_template_kwargs":{"thinking_budget":8,"thinking_token_budget":16}}),
+            json!({}),
+        );
+        assert_eq!(r.thinking_token_budget, Some(4));
+        for bad in [json!(-1), json!(true), json!(1.5), json!("8")] {
+            let mut body = json!({"model":"test","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"thinking_budget":bad}});
+            assert!(decode(body.take(), &Map::new()).is_err());
+        }
+        assert!(decode(json!({"model":"test","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"thinking_budget":8,"thinking_token_budget":4}}), &Map::new()).is_err());
     }
 
     #[test]

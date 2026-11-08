@@ -11,8 +11,11 @@ mod listener;
 mod metrics;
 mod output;
 mod preparation;
+#[cfg(test)]
+mod render_test;
 pub(crate) mod startup;
 mod thinking;
+mod token_boundary;
 
 use axum::{
     Json, Router,
@@ -116,22 +119,19 @@ pub fn run(settings: Settings) -> Result<()> {
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
     result
 }
-async fn serve(settings: Settings) -> Result<()> {
-    let started = Instant::now();
-    let (listener, _socket_path) = listener::bind(&settings.listen)
-        .await
-        .map_err(|error| format!("Listener bind failed: {error}"))?;
-    let worker = startup::start(&settings).await?;
-    let state = worker.state.clone();
-    let shutdown = Arc::clone(&worker.shutdown);
-    let lifecycle = Arc::clone(&state.activity.lifecycle);
-    let context = state.context;
-    let scheduler = state.scheduler;
+fn router(state: Service) -> Router {
     let limits = state.limits;
-    let router = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics::endpoint))
         .route("/v1/models", get(models))
+        .route(
+            "/v1/chat/completions/render",
+            post(render).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                preparation::render_ingress,
+            )),
+        )
         .route(
             "/v1/chat/completions",
             post(completions).layer(axum::middleware::from_fn_with_state(
@@ -155,7 +155,21 @@ async fn serve(settings: Settings) -> Result<()> {
             state.clone(),
             request_id,
         ))
-        .with_state(state);
+        .with_state(state)
+}
+async fn serve(settings: Settings) -> Result<()> {
+    let started = Instant::now();
+    let (listener, _socket_path) = listener::bind(&settings.listen)
+        .await
+        .map_err(|error| format!("Listener bind failed: {error}"))?;
+    let worker = startup::start(&settings).await?;
+    let state = worker.state.clone();
+    let shutdown = Arc::clone(&worker.shutdown);
+    let lifecycle = Arc::clone(&state.activity.lifecycle);
+    let context = state.context;
+    let scheduler = state.scheduler;
+    let limits = state.limits;
+    let router = router(state);
     eprintln!(
         "API READY http://{}/v1; context {context}; continuous_batching=true, max_active={}, queue 128; startup={:.3}s",
         settings.listen,
@@ -320,11 +334,39 @@ async fn completions(
     axum::Extension(admission): axum::Extension<preparation::Ingress>,
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    prepare_chat(state, admission, body, false).await
+}
+async fn render(
+    State(state): State<Service>,
+    axum::Extension(admission): axum::Extension<preparation::Ingress>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    prepare_chat(state, admission, body, true).await
+}
+async fn prepare_chat(
+    state: Service,
+    admission: preparation::Ingress,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+    render: bool,
+) -> Response {
     let request = match body {
-        Ok(Json(v)) => match defaults::decode(v, &state.default_request_params) {
-            Ok(request) => request,
-            Err(e) => return error(StatusCode::BAD_REQUEST, e),
-        },
+        Ok(Json(mut v)) => {
+            if render {
+                match v.as_object_mut().and_then(|o| o.remove("return_mm_kwargs")) {
+                    None | Some(Value::Null | Value::Bool(false)) => {}
+                    _ => {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "return_mm_kwargs: Only false is supported; render returns token IDs without tensors",
+                        );
+                    }
+                }
+            }
+            match defaults::decode(v, &state.default_request_params) {
+                Ok(request) => request,
+                Err(e) => return error(StatusCode::BAD_REQUEST, e),
+            }
+        }
         Err(e) => {
             return error(
                 if e.status() == StatusCode::UNPROCESSABLE_ENTITY {
@@ -399,6 +441,15 @@ async fn completions(
     if !state.activity.lifecycle.is_ready() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker is not ready");
     }
+    if render {
+        return retain_output_memory(Json(json!({"model":state.model.as_ref(),"token_ids":prepared.input,"token_count":prepared.input.len(),"multimodal":!prepared.images.is_empty() || !prepared.audios.is_empty()})).into_response(), memory);
+    }
+    let Some(slot) = slot else {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Generation admission is missing",
+        );
+    };
     let stream = prepared.stream;
     let (events, mut responses) = mpsc::channel(64);
     let created = SystemTime::now()

@@ -94,6 +94,16 @@ DSv4.1 使用本模型的 effort 编码：开启 thinking 后默认 `high=75`，
 
 `thinking_token_budget` 限制本轮初始思考段的 token 数，支持 0；到达上限时解码强制选择 `</think>`，随后继续回答或调用工具。结束标记仅计入 completion。预算自动缩小到总输出上限减 2，为结束标记和至少一个回答 token 留空间；开启 thinking 且指定此参数时，总输出预算至少为 2。该预算在 thinking 开启时生效。限制是请求私有状态，MTP 的草稿和 target 共同遵守。无惩罚、无概率报告的 greedy 请求在 GPU argmax 满足约束时直接复用结果；预算耗尽时可直接选择唯一的结束标记。其他约束选择保留 CPU 回退，随机采样保持相同目标分布。effort 控制思考倾向，`thinking_token_budget` 提供硬上限。
 
+`chat_template_kwargs.thinking_budget` 是同一硬预算的兼容别名，支持 Estuary 的 Messages 转换。顶层 `thinking_token_budget` 优先；没有顶层值时，两个嵌套别名若同时给出须相同。请求任一别名均覆盖部署默认预算，`0` 与 `null` 保留显式语义。
+
+DSv4.1 编码区分 checkpoint 模板产生的控制标记和正文。用户、工具结果、历史工具参数及工具 schema 中同名的特殊标记按普通文字编码。流式输出与 thinking 硬预算以实际控制 token ID 识别边界，普通 token 拼出的 `</think>` 或 DSML 标签保留为文字。图片占位继续由媒体前端生成并校验。
+
+### Estuary 网关
+
+Responses 和 Messages 由 [Estuary](https://github.com/iMMIQ/estuary) 转换为 `/v1/chat/completions`。orinfer 提供 `POST /v1/chat/completions/render`，接受相同 Chat 请求、鉴权与部署默认参数，返回 `model`、最终 `token_ids`、`token_count` 和 `multimodal`。渲染选项 `return_mm_kwargs` 支持省略或 `false`，返回范围为 token 和计数，不序列化媒体张量。它复用实际请求的模板、编码、图片前处理和占位展开，供网关计数；请求受前处理并发、内存及 body 预算限制，不占用生成队列槽位或 NPU owner，也不执行视觉编码器或模型推理。多模型管理入口同时转发此路径，渲染不预留生成状态内存。
+
+Estuary 节点选用 `openai` provider，上游填写 orinfer 的 `/v1` 地址。该模式沿用网关的通用负载和近似前缀路由；orinfer 的 `/metrics` 使用自身指标名，真实缓存事件与 vLLM 专用路由协议另行对接。多模态 token ID 不构成图片缓存身份。
+
 默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。此处为 Chat API 的输出预算；DeepInfer 底层构造器的默认值为 16 tokens，调用方传入已编码 prompt，thinking 由外部模板决定。本服务的 thinking 开关沿用上面的请求控制。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限默认 32 MiB，通过 `--request-body-mib` 调整。
 
 上下文溢出返回 `error.code=context_length_exceeded`，客户端可据此压缩历史并重试；其他无效参数仍为 `invalid_request`。
