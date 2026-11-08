@@ -1050,7 +1050,20 @@ impl Runtime {
         {
             return self.advance_dspark(requests, options, maintenance);
         }
-        let Some(packet::Selection {
+        let Some(selection) = self.select_packet(requests, options, None)? else {
+            maintenance();
+            return cached_outputs(requests);
+        };
+        self.advance_selection(selection, requests, options, maintenance)
+    }
+    fn advance_selection(
+        &mut self,
+        selection: packet::Selection,
+        requests: &mut [&mut Request],
+        options: &scheduler::Options,
+        maintenance: impl FnOnce(),
+    ) -> Result<Vec<StepOutput>> {
+        let packet::Selection {
             layout,
             tokens,
             selected,
@@ -1058,11 +1071,8 @@ impl Runtime {
             batch,
             prefill_rows,
             prefill_requests,
-        }) = self.select_packet(requests, options, None)?
-        else {
-            maintenance();
-            return cached_outputs(requests);
-        };
+            ..
+        } = selection;
         if self.team.needs_preparation(&layout)?
             && !memory::ensure_budget(self, memory::Requirement::workspace())?
         {

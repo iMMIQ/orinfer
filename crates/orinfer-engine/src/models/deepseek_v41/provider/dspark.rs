@@ -157,11 +157,9 @@ impl Runtime {
             .entry(selected.iter().map(|(_, count)| *count).max().unwrap_or(0))
             .or_default() += 1;
         if selected.iter().all(|(_, k)| *k == 0) {
-            let limit = self.draft_limit;
-            self.draft_limit = 0;
-            let result = self.advance_packet(requests, options, maintenance);
-            self.draft_limit = limit;
-            return result;
+            // Execute the packet whose ordinary price was requested. A second
+            // selection can change its admissions and invalidate calibration.
+            return self.advance_selection(baseline, requests, options, maintenance);
         }
         let maximum = selected.iter().map(|(_, count)| *count).max().unwrap();
         self.speculation_policy.begin_round(
@@ -276,8 +274,9 @@ impl Runtime {
             batch: packet_batch,
             prefill_rows,
             prefill_requests,
+            ..
         } = self
-            .select_packet(requests, options, Some(&inputs))?
+            .packet_for_budget(requests, Some(&inputs), baseline.budget, mixed)?
             .ok_or("Missing DSpark verification packet")?;
         if self.team.needs_preparation(&layout)?
             && !memory::ensure_budget(self, memory::Requirement::workspace())?

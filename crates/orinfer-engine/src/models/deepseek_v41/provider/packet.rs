@@ -84,6 +84,7 @@ pub(super) fn draft_readout(requests: &[&mut Request]) -> super::super::team::Re
 }
 
 pub(super) struct Selection {
+    pub budget: usize,
     pub layout: Layout,
     pub tokens: Vec<Vec<u32>>,
     pub selected: Vec<(usize, usize)>,
@@ -220,7 +221,7 @@ impl Runtime {
         let has_decode = requests
             .iter()
             .any(|r| !r.is_finished() && r.ready_output.is_none() && !r.prefilling);
-        let mut budget = if has_prefill {
+        let budget = if has_prefill {
             if has_decode {
                 ((options.prefill_budget_ms / 1000. * self.prefill_tokens_per_s) as usize)
                     .clamp(1, self.team.rows)
@@ -240,11 +241,23 @@ impl Runtime {
                 .owners
                 .min(options.max_batch_tokens)
         };
+        self.packet_for_budget(requests, decode_inputs, budget, has_prefill)
+    }
+
+    pub(super) fn packet_for_budget(
+        &self,
+        requests: &[&mut Request],
+        decode_inputs: Option<&BTreeMap<usize, Vec<u32>>>,
+        mut budget: usize,
+        has_prefill: bool,
+    ) -> Result<Option<Selection>> {
         if let Some(inputs) = decode_inputs {
             // Reserve verified decoder rows before admitting prefill work.
-            let reserved = inputs.values().map(Vec::len).sum::<usize>();
-            budget = budget.max(reserved).min(self.team.rows);
+            budget = budget
+                .max(inputs.values().map(Vec::len).sum::<usize>())
+                .min(self.team.rows);
         }
+        let packet_budget = budget;
         let mut segments = vec![];
         let mut tokens = vec![];
         let mut outputs = vec![];
@@ -369,6 +382,7 @@ impl Runtime {
             }
         }
         Ok(Some(Selection {
+            budget: packet_budget,
             layout,
             tokens,
             selected,
