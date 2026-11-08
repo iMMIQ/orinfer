@@ -892,6 +892,7 @@ fn forward_with(
     maintenance: impl FnOnce(),
     graphs_enabled: bool,
 ) -> Result<(Vec<Output>, Timing)> {
+    let mut maintenance = Some(maintenance);
     let started = Instant::now();
     let cached = exchange(peers, Command::GrowCached(layout.clone()))?;
     let states = cached
@@ -928,9 +929,6 @@ fn forward_with(
             })
         );
     }
-    if invalidate {
-        exchange(peers, Command::Invalidate(layout.clone()))?;
-    }
     // Only a cache miss or promotion can allocate/capture. Keep its global
     // preparation barrier; a cache hit only refreshes host-side LRU state and
     // can do that on the owning worker with the forward command.
@@ -938,6 +936,14 @@ fn forward_with(
         && states
             .iter()
             .all(|state| matches!(state, CacheState::Graph) == capture);
+    // A deferred response must not wait behind a new graph's warmup/capture.
+    // Stable shapes run this callback after submission, below.
+    if !cached_prepare && let Some(maintenance) = maintenance.take() {
+        maintenance();
+    }
+    if invalidate {
+        exchange(peers, Command::Invalidate(layout.clone()))?;
+    }
     if !cached_prepare {
         exchange(peers, Command::Prepare(layout.clone(), capture))?;
     }
@@ -959,6 +965,9 @@ fn forward_with(
         let (ready, candidate) = super::shared::plan(&states, slack)?;
         shared = ready;
         if let Some(id) = candidate {
+            if let Some(maintenance) = maintenance.take() {
+                maintenance();
+            }
             let capture_started = Instant::now();
             let states = read(exchange(peers, Command::CaptureShared(layout.clone(), id))?)?;
             shared_setup = capture_started.elapsed().as_secs_f64();
@@ -986,7 +995,9 @@ fn forward_with(
         shared,
     );
     peers.send(command)?;
-    maintenance();
+    if let Some(maintenance) = maintenance {
+        maintenance();
+    }
     let results = peers.collect()?;
     let ranks = results
         .into_iter()

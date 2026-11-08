@@ -319,6 +319,7 @@ async fn health(State(state): State<Service>) -> Response {
         "continuous_batching":true,"scheduler":state.scheduler,
         "scheduler_statistics":state.activity.statistics.lock().ok().map(|s| s.clone()),
         "admission_statistics":state.activity.admission.lock().ok().map(|s| s.clone()),
+        "output_pipeline_statistics":state.activity.output_pipeline.lock().ok().map(|s| s.clone()),
         "active_requests":state.activity.active.load(Ordering::Relaxed),
         "queued_requests":state.activity.queued.load(Ordering::Relaxed)}),
     )).into_response()

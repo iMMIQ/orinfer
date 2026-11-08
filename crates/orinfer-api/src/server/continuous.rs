@@ -6,6 +6,8 @@ use orinfer_engine::{
 };
 use std::{collections::VecDeque, sync::atomic::AtomicUsize};
 
+mod pipeline;
+
 #[derive(Default)]
 pub(super) struct Activity {
     pub lifecycle: Arc<lifecycle::Lifecycle>,
@@ -13,6 +15,7 @@ pub(super) struct Activity {
     pub queued: AtomicUsize,
     pub statistics: std::sync::Mutex<scheduler::Statistics>,
     pub admission: std::sync::Mutex<AdmissionStatistics>,
+    pub output_pipeline: std::sync::Mutex<pipeline::Statistics>,
     pub measurements: std::sync::Mutex<super::metrics::Measurements>,
 }
 
@@ -167,6 +170,10 @@ impl Ending {
 struct Active<'a> {
     retain_image_memory: bool,
     request: RequestState,
+    output: Response<'a>,
+}
+struct Response<'a> {
+    pending: Option<pipeline::Tokens>,
     mailbox: Mailbox,
     parser: output::Output,
     decoder: Decoder<'a>,
@@ -183,6 +190,18 @@ struct Active<'a> {
 }
 impl<'a> Active<'a> {
     fn new(request: RequestState, job: Job, codec: &'a ChatCodec, has_images: bool) -> Self {
+        Self {
+            retain_image_memory: has_images,
+            request,
+            output: Response::new(job, codec),
+        }
+    }
+    fn finished(&self) -> bool {
+        self.request.is_finished() || self.output.ending.is_some()
+    }
+}
+impl<'a> Response<'a> {
+    fn new(job: Job, codec: &'a ChatCodec) -> Self {
         let mut parser = output::Output::new(
             job.prepared.thinking,
             job.prepared.tools.clone(),
@@ -197,8 +216,7 @@ impl<'a> Active<'a> {
         }
         let queue_s = job.queued.elapsed().as_secs_f64();
         Self {
-            retain_image_memory: has_images,
-            request,
+            pending: None,
             mailbox: Mailbox::new(job),
             parser,
             decoder: codec.tokenizer.decode_stream(false),
@@ -214,14 +232,14 @@ impl<'a> Active<'a> {
             content_scores: vec![],
         }
     }
-    fn consume(&mut self, tokens: &[u32], codec: &ChatCodec, model: &str) {
+    fn consume(&mut self, packet: pipeline::Tokens, codec: &ChatCodec, model: &str) {
+        let pipeline::Tokens { tokens, scores } = packet;
         if !tokens.is_empty() && self.first_token_s.is_none() {
             self.first_token_s = Some(self.mailbox.job.queued.elapsed().as_secs_f64());
         }
         if !tokens.is_empty() {
             self.last_token_s = Some(self.mailbox.job.queued.elapsed().as_secs_f64());
         }
-        let scores = self.request.take_logprobs();
         for (index, &token) in tokens.iter().enumerate() {
             if self.mailbox.job.events.is_closed() || self.mailbox.failed {
                 self.ending = Some(Ending::Cancelled);
@@ -336,11 +354,9 @@ impl<'a> Active<'a> {
         }
         Some(json!({"content":content,"refusal":null}))
     }
-    fn finished(&self) -> bool {
-        self.request.is_finished() || self.ending.is_some()
-    }
-    fn finish(&mut self, model: &str) -> Result<()> {
-        if let Some(error) = self.request.failure() {
+    fn finish(&mut self, request: &RequestState, model: &str) -> Result<()> {
+        debug_assert!(self.pending.is_none());
+        if let Some(error) = request.failure() {
             return Err(error.into());
         }
         match &self.ending {
@@ -350,7 +366,7 @@ impl<'a> Active<'a> {
         }
         let exhausted = self.ending.is_none()
             && self.count == self.mailbox.job.prepared.max_tokens
-            && !self.request.constraint_finished();
+            && !request.constraint_finished();
         for delta in self.parser.finish(
             exhausted,
             &self.mailbox.job.prepared.tool_choice,
@@ -366,7 +382,7 @@ impl<'a> Active<'a> {
         let usage = json!({"prompt_tokens":job.prepared.input.len(),"completion_tokens":self.count,
             "total_tokens":job.prepared.input.len()+self.count,
             "completion_tokens_details":{"reasoning_tokens":self.reasoning_tokens},
-            "prompt_tokens_details":{"cached_tokens":self.request.prefix_statistics().cached_tokens}});
+            "prompt_tokens_details":{"cached_tokens":request.prefix_statistics().cached_tokens}});
         let logprobs = job
             .prepared
             .sampling
@@ -402,9 +418,8 @@ impl<'a> Active<'a> {
         eprintln!(
             "{}: prefix {}; MTP {}",
             self.mailbox.job.id,
-            serde_json::to_string(self.request.prefix_statistics()).map_err(|e| e.to_string())?,
-            serde_json::to_string(self.request.speculation_statistics())
-                .map_err(|e| e.to_string())?
+            serde_json::to_string(request.prefix_statistics()).map_err(|e| e.to_string())?,
+            serde_json::to_string(request.speculation_statistics()).map_err(|e| e.to_string())?
         );
         Ok(())
     }
@@ -426,53 +441,72 @@ pub(super) fn worker(
     let mut memory_guard: Option<String> = None;
     let latency = options.policy == scheduler::Policy::Latency;
     let mut output_lengths = scheduler::OutputLengths::default();
+    let defer_output = std::env::var("ORINFER_ASYNC_OUTPUT").as_deref() != Ok("0");
+    let mut output_pipeline = pipeline::Statistics::default();
     loop {
         if shutdown.load(Ordering::Relaxed) || !lifecycle.is_ready() {
             break;
         }
         completed.retain_mut(|box_| box_.flush() && !box_.pending.is_empty());
         receive_waiting(&mut waiting, &mut jobs);
+        let barrier = !waiting.is_empty()
+            || active.iter().any(|a| {
+                a.finished()
+                    || a.request.has_pending_host_images()
+                    || (a.request.is_prefilling()
+                        && !a.output.mailbox.job.prepared.audios.is_empty())
+            });
         for a in &mut active {
-            if !a.mailbox.flush() || a.mailbox.failed || shutdown.load(Ordering::Relaxed) {
-                a.ending = Some(Ending::Cancelled);
+            if !a.output.mailbox.flush()
+                || a.output.mailbox.failed
+                || shutdown.load(Ordering::Relaxed)
+            {
+                a.output.ending = Some(Ending::Cancelled);
+            }
+            // Admission can restore a long prefix or prepare an encoder. Do
+            // not hold a completed response behind that work. Pending state
+            // belongs to this request, never to an index in the active vector.
+            if barrier || a.finished() {
+                a.output.drain(false, codec, model_id, &mut output_pipeline);
             }
         }
         let mut index = 0;
         while index < active.len() {
             if active[index].finished() {
                 let mut a = active.remove(index);
-                if !latency && a.ending.as_ref().is_some_and(Ending::cacheable) {
-                    output_lengths.observe(a.mailbox.job.prepared.input.len(), a.count);
+                if !latency && a.output.ending.as_ref().is_some_and(Ending::cacheable) {
+                    output_lengths
+                        .observe(a.output.mailbox.job.prepared.input.len(), a.output.count);
                 }
-                let cache = a.ending.as_ref().is_none_or(Ending::cacheable)
-                    && a.count == a.request.generated_tokens()
+                let cache = a.output.ending.as_ref().is_none_or(Ending::cacheable)
+                    && a.output.count == a.request.generated_tokens()
                     && a.request.failure().is_none();
                 if lifecycle.is_ready()
                     && let Err(error) = model.finish_request(&mut a.request, cache)
                 {
                     let failure = orinfer_engine::error::EngineError::take(error.clone(), true);
                     lifecycle.fail(failure);
-                    a.ending = Some(Ending::Failed(error));
+                    a.output.ending = Some(Ending::Failed(error));
                 }
-                if let Err(error) = a.finish(model_id) {
-                    a.mailbox.send(ModelEvent::Failed(error));
-                } else if !matches!(a.ending, Some(Ending::Cancelled | Ending::Failed(_)))
-                    && let Some(first_s) = a.first_token_s
+                if let Err(error) = a.output.finish(&a.request, model_id) {
+                    a.output.mailbox.send(ModelEvent::Failed(error));
+                } else if !matches!(a.output.ending, Some(Ending::Cancelled | Ending::Failed(_)))
+                    && let Some(first_s) = a.output.first_token_s
                     && let Ok(mut measurements) = activity.measurements.lock()
                 {
                     measurements.observe(
                         super::metrics::Completed {
-                            queue_s: a.queue_s,
+                            queue_s: a.output.queue_s,
                             first_s,
-                            last_s: a.last_token_s.unwrap_or(first_s),
-                            complete_s: a.mailbox.job.queued.elapsed().as_secs_f64(),
-                            prompt_tokens: a.mailbox.job.prepared.input.len(),
-                            output_tokens: a.count,
+                            last_s: a.output.last_token_s.unwrap_or(first_s),
+                            complete_s: a.output.mailbox.job.queued.elapsed().as_secs_f64(),
+                            prompt_tokens: a.output.mailbox.job.prepared.input.len(),
+                            output_tokens: a.output.count,
                         },
                         a.request.prefix_statistics(),
                     );
                 }
-                completed.push(a.mailbox);
+                completed.push(a.output.mailbox);
             } else {
                 index += 1;
             }
@@ -550,9 +584,9 @@ pub(super) fn worker(
                     .iter()
                     .map(|a| {
                         (output_lengths.estimate(
-                            a.mailbox.job.prepared.input.len(),
-                            a.mailbox.job.prepared.max_tokens,
-                        ) - a.count as f64)
+                            a.output.mailbox.job.prepared.input.len(),
+                            a.output.mailbox.job.prepared.max_tokens,
+                        ) - a.output.count as f64)
                             .max(1.)
                     })
                     .collect();
@@ -687,7 +721,8 @@ pub(super) fn worker(
                                 cached_text = text_only
                                     && request.prefix_statistics().cached_tokens == prompt_tokens;
                                 let mut a = Active::new(request, job, codec, has_images);
-                                a.mailbox
+                                a.output
+                                    .mailbox
                                     .delta(model_id, json!({"role":"assistant","content":""}));
                                 active.push(a);
                             }
@@ -793,33 +828,51 @@ pub(super) fn worker(
             break;
         }
         if !active.is_empty() {
-            let (mut requests, mut mailboxes): (Vec<_>, Vec<_>) = active
+            let (mut requests, mut responses): (Vec<_>, Vec<_>) = active
                 .iter_mut()
-                .map(|a| (&mut a.request, &mut a.mailbox))
+                .map(|a| (&mut a.request, &mut a.output))
                 .unzip();
-            // No CUDA/model state enters this callback. Queue expiry and bounded
-            // output draining overlap the current packet, before its readback.
+            // Engine state is already committed. Only the preceding packet's
+            // response work is delayed; the next forward consumes the exact
+            // accepted token/history and retains the usual device lifetimes.
             let result = model.advance_requests_with(&mut requests, &options, || {
                 completed.retain_mut(|box_| box_.flush() && !box_.pending.is_empty());
                 receive_waiting(&mut waiting, &mut jobs);
-                for mailbox in &mut mailboxes {
-                    mailbox.flush();
+                for response in &mut responses {
+                    response.drain(true, codec, model_id, &mut output_pipeline);
+                    response.mailbox.flush();
                 }
             });
             drop(requests);
-            drop(mailboxes);
+            // Empty/cached packets and failures before submission need not run
+            // maintenance. Drain once here as well, before publishing new data.
+            for response in &mut responses {
+                response.drain(false, codec, model_id, &mut output_pipeline);
+            }
+            drop(responses);
             match result {
                 Ok(outputs) => {
                     for a in &mut active {
                         if a.retain_image_memory && !a.request.has_pending_host_images() {
-                            if let Some(memory) = &a.mailbox.job._memory {
+                            if let Some(memory) = &a.output.mailbox.job._memory {
                                 memory.release_images();
                             }
                             a.retain_image_memory = false;
                         }
                     }
                     for output in outputs {
-                        active[output.request].consume(&output.tokens, codec, model_id);
+                        let a = &mut active[output.request];
+                        let packet = pipeline::Tokens {
+                            tokens: output.tokens,
+                            scores: a.request.take_logprobs(),
+                        };
+                        a.output.deliver(
+                            packet,
+                            defer_output && !a.request.is_finished(),
+                            codec,
+                            model_id,
+                            &mut output_pipeline,
+                        );
                     }
                 }
                 Err(error) => {
@@ -828,13 +881,16 @@ pub(super) fn worker(
                         true,
                     ));
                     for a in &mut active {
-                        a.ending = Some(Ending::Failed(error.clone()));
+                        a.output.ending = Some(Ending::Failed(error.clone()));
                     }
                 }
             }
             let after = model.scheduler_statistics();
             if let Ok(mut statistics) = activity.statistics.lock() {
                 *statistics = after;
+            }
+            if let Ok(mut statistics) = activity.output_pipeline.lock() {
+                *statistics = output_pipeline.clone();
             }
         } else if waiting.is_empty() && completed.is_empty() {
             let Some(job) = jobs.blocking_recv() else {
@@ -855,12 +911,16 @@ pub(super) fn worker(
             .try_send(ModelEvent::Unavailable("GPU worker stopped".into()));
     }
     for mut a in active.drain(..) {
+        // Shutdown discards outstanding presentation work; no pending packet
+        // may keep an owner alive or emit after its terminal error.
+        a.output.pending = None;
         if lifecycle.name() != "failed"
             && let Err(error) = model.finish_request(&mut a.request, false)
         {
             lifecycle.fail(orinfer_engine::error::EngineError::take(error, true));
         }
         let _ = a
+            .output
             .mailbox
             .job
             .events
@@ -873,6 +933,9 @@ pub(super) fn worker(
     activity.queued.store(0, Ordering::Relaxed);
     if let Ok(stats) = serde_json::to_string(&model.scheduler_statistics()) {
         eprintln!("SCHEDULER {stats}");
+    }
+    if let Ok(stats) = serde_json::to_string(&output_pipeline) {
+        eprintln!("OUTPUT_PIPELINE {stats}");
     }
 }
 
@@ -899,7 +962,7 @@ fn receive_waiting(waiting: &mut Vec<Job>, jobs: &mut mpsc::Receiver<Job>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn mailbox() -> (Mailbox, mpsc::Receiver<ModelEvent>) {
+    pub(super) fn mailbox() -> (Mailbox, mpsc::Receiver<ModelEvent>) {
         let (events, receiver) = mpsc::channel(1);
         let job = Job {
             _slot: Arc::new(

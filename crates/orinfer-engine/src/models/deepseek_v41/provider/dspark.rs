@@ -214,7 +214,7 @@ impl Runtime {
         };
         let (proposals, draft_timing) =
             self.team
-                .forward_with(draft, inputs, readout, Some(capture), || {})?;
+                .forward_with(draft, inputs, readout, Some(capture), maintenance)?;
         let draft_s = draft_timing.seconds;
         let draft_prepare = draft_timing.preparation;
         let mut inputs = BTreeMap::new();
@@ -274,7 +274,7 @@ impl Runtime {
             inputs,
             packet::readout(requests, full || packet_full),
             Some(capture),
-            maintenance,
+            || {},
         )?;
         let verify_s = verify_timing.seconds;
         let verify_prepare = verify_timing.preparation;
