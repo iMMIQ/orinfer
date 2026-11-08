@@ -25,7 +25,61 @@ pub(super) fn readout(requests: &[&mut Request], full: bool) -> super::super::te
                 )
             })
             .collect(),
+        parameters: Default::default(),
     }
+}
+
+pub(super) fn target_readout(
+    requests: &[&mut Request],
+    full: bool,
+    proposals: &BTreeMap<usize, Vec<u32>>,
+    vocab: usize,
+    selected: &[(usize, usize)],
+) -> Result<super::super::team::Readout> {
+    use rayon::prelude::*;
+    let mut result = readout(requests, full);
+    if vocab == 0 {
+        return Err("Missing sampling vocabulary".into());
+    }
+    let jobs = requests
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| {
+            selected.iter().any(|(index, _)| index == i)
+                && r.device_sample()
+                && r.processed_sampling
+                && (r.sampling.top_logprobs.is_some() || r.decoder.has_constraint())
+        })
+        .map(|(i, r)| {
+            (
+                r.slot,
+                r.decoder.fork(),
+                r.sampling.top_logprobs,
+                proposals.get(&i).cloned().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !jobs.is_empty() {
+        result.parameters = Arc::new(crate::sampling::Prepared::new(move || {
+            jobs.into_par_iter()
+                .map(|(slot, decoder, top_logprobs, tokens)| {
+                    Ok((slot, decoder.proposed_rows(&tokens, vocab, top_logprobs)?))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()
+        }));
+    }
+
+    Ok(result)
+}
+
+pub(super) fn draft_readout(requests: &[&mut Request]) -> super::super::team::Readout {
+    let mut result = readout(requests, false);
+    result.draws.retain(|owner, _| {
+        requests
+            .iter()
+            .any(|r| r.slot == *owner && !r.decoder.constrained())
+    });
+    result
 }
 
 pub(super) struct Selection {

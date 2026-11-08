@@ -35,6 +35,7 @@ fn output() -> Arc<Output> {
         token: 2,
         value: 3.,
         logits: vec![-1., 0., 3., 1.],
+        ..Default::default()
     })
 }
 
@@ -53,6 +54,7 @@ fn device_sampling_keeps_cached_heads_raw_and_respects_host_fallbacks() {
         token: 3,
         value: 1.0,
         logits: vec![],
+        ..Default::default()
     };
     assert_eq!(request.accept_output(&sampled).unwrap(), 3);
     assert_eq!(request.history.last(), Some(&3));
@@ -127,6 +129,7 @@ pub(super) fn request(output: Arc<Output>, sampling: crate::sampling::Options) -
         released: false,
         sampling,
         device_sampling: false,
+        processed_sampling: false,
         decoder: Default::default(),
         draft_feedback: Default::default(),
         shared_work: false,
@@ -329,4 +332,92 @@ fn shared_scheduling_membership_survives_a_single_owner_tail() {
     assert!(packet::mark_shared(&[(0, 1)], &mut [&mut a]));
     let mut fresh = request(output(), Default::default());
     assert!(!packet::mark_shared(&[(0, 1)], &mut [&mut fresh]));
+}
+
+#[derive(Clone)]
+struct Steps(usize);
+impl Constraint for Steps {
+    fn fork(&self) -> Box<dyn Constraint> {
+        Box::new(self.clone())
+    }
+    fn mask(&mut self) -> Result<Vec<u32>> {
+        Ok(vec![match self.0 {
+            0 => 1 << 2,
+            1 => 1 << 3,
+            _ => 0,
+        }])
+    }
+    fn consume(&mut self, token: u32) -> Result<()> {
+        if token != 2 + self.0 as u32 {
+            return Err("Invalid step token".into());
+        }
+        self.0 += 1;
+        Ok(())
+    }
+    fn finished(&self) -> bool {
+        self.0 == 2
+    }
+}
+
+#[test]
+fn processed_masks_follow_proposals_without_mutating_the_live_decoder() {
+    let mut r = request(output(), Default::default());
+    r.device_sampling = true;
+    r.processed_sampling = true;
+    r.prefilling = false;
+    r.set_constraint(Box::new(Steps(0))).unwrap();
+    assert!(!r.needs_logits());
+    for (draft, expected) in [
+        (vec![2, 3], vec![Some(4), Some(8), None]),
+        (vec![1, 3], vec![Some(4), None, None]),
+    ] {
+        let readout =
+            packet::target_readout(&[&mut r], false, &[(0, draft)].into(), 4, &[(0, 3)]).unwrap();
+        let rows = readout.parameters.get().unwrap();
+        assert_eq!(
+            rows[&r.slot]
+                .iter()
+                .map(|p| p.mask.as_ref().map(|m| m[0]))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(r.decoder.gpu_mask().unwrap(), Some(vec![4]));
+    }
+}
+
+#[test]
+fn verification_commits_only_accepted_device_reports_and_grammar_states() {
+    let make = |token| Output {
+        token,
+        report: Some(TokenLogprob {
+            token,
+            logprob: -0.5,
+            top: vec![(token, -0.5)],
+        }),
+        ..Default::default()
+    };
+    let values = [make(2), make(3), make(0)];
+    for (draft, accepted) in [(vec![1, 3], vec![2]), (vec![2, 3], vec![2, 3])] {
+        let mut r = request(
+            output(),
+            crate::sampling::Options {
+                top_logprobs: Some(1),
+                ..Default::default()
+            },
+        );
+        r.set_constraint(Box::new(Steps(0))).unwrap();
+        assert_eq!(
+            r.verify_device(&draft, &values.iter().collect::<Vec<_>>())
+                .unwrap(),
+            accepted
+        );
+        assert_eq!(
+            r.take_logprobs()
+                .iter()
+                .map(|v| v.token)
+                .collect::<Vec<_>>(),
+            accepted
+        );
+        assert_eq!(r.decoder.finished(), accepted.len() == 2);
+    }
 }

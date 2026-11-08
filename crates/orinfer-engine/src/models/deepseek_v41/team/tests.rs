@@ -12,6 +12,7 @@ fn sampling_rows_keep_owner_positions_and_select_only_raw_outputs() {
         full: true,
         draws: [(17, draw.clone())].into(),
         full_owners: Some([7].into()),
+        ..Default::default()
     };
     let layout = Layout::verification(
         vec![

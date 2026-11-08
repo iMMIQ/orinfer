@@ -119,6 +119,7 @@ def compile_kernel(
             "f16": "float16",
             "f32": "float32",
             "i8": "int8",
+            "u8": "uint8",
             "i32": "int32",
             "i64": "int64",
             "u64": "uint64",

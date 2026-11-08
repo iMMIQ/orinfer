@@ -96,11 +96,15 @@ DSv4.1 A2 的服务默认与 [DeepInfer SamplingParams](https://github.com/deeps
 
 包含设备采样能力的 A2 执行包在温度 `1e-5..=2`、`top_p=1、top_k=0`、无惩罚及 bias、当前无需 grammar mask 且未请求概率报告时，普通 decode 和 DSpark 验证共享 NPU 采样。其他请求继续使用完整 logits；混合 batch 只读回这些请求的词表。首 token 和 prefix 缓存保留原始模型输出。设备采样以 seed、生成位置和全局 token ID 固定随机身份，同 seed 的具体输出可与旧 CPU 算法不同。未包含该能力的旧执行包继续使用原采样路径。
 
+声明 `processed_local/processed_merge` 的 A2 执行包还支持上述参数下的 grammar mask、`logprobs` 和最多 20 项 `top_logprobs`，并支持温度 0。CPU 按请求快照准备每个 target 位置的 mask，与本轮模型计算重叠；NPU 执行 masked argmax/采样及概率统计，每个 rank 每行只返回 48 个数。TP 汇总使用各分片的 log-sum-exp 统计计算完整词表概率。DSpark 仅提交实际接受前缀及首个拒绝位置的 parser 和概率记录，完成后的尾部不再推进请求状态。没有约束或概率报告的请求继续使用原有采样程序。
+
+离线通过 `orinfer_build.models.deepseek_v41.sampling --processed` 扩展已有设备采样计划，再重打包并安装执行包；权重内容保持不变。新增算子使用同一动态行模板覆盖并发及验证长度。`/health.scheduler_statistics` 的 `sampling_mask_rows`、`sampling_report_rows` 记录设备处理的行数，`sampling_prepare_s` 记录快照准备的 CPU 用时；该用时可能与设备执行重叠。`mtp_budget_calls/mtp_budget_s` 记录 DSpark 自动预算决策的 CPU 成本。
+
 HTTP 与 JSONL batch 共用跨步输出流水。引擎先提交已接受 token 的请求状态，下一轮设备计算期间处理上一包的文本解码、工具参数、概率报告和输出发送；每个请求最多保留一包。普通 decode、混合文本包与 DSpark 共用这条路径，DSpark 从草稿计算开始执行后处理。首包、EOS、生成上限、grammar 完成及带自定义 `stop` 的请求即时处理；新请求准入、媒体编码、完成回收和 A2 Graph 准备前排空已有输出。取消、错误及关闭时保持 owner 的完成和回收顺序。
 
 `/health.output_pipeline_statistics` 提供延迟包数、token 数、维护回调和边界排空次数，以及后处理 CPU 用时。`maintenance_postprocess_s` 表示维护回调内的 CPU 用时，包含 Graph 准备前的排空，不能直接视为设备耗时的减少。诊断对照可在启动前设置 `ORINFER_ASYNC_OUTPUT=0` 使用即时输出。采样、DSpark 接受前缀、KV 和 Graph 的状态提交仍保持现有依赖顺序。
 
-声明 `coupled_draft` 的执行包在 DSpark Markov head 内复用 target 同一生成位置的 Gumbel 随机数，按顺序推进草稿条件，并复用现有匹配前缀提交与状态恢复。target 保持请求的采样概率律；草稿无需传回完整概率表。温度 0 以及不满足设备采样条件的请求使用贪心草稿。离线通过 `orinfer_build.models.deepseek_v41.sampling --couple-draft` 扩展已具备 target 采样能力的计划，所有并发与草稿长度共享一个动态 Markov 算子。
+声明 `coupled_draft` 的执行包在 DSpark Markov head 内复用 target 同一生成位置的 Gumbel 随机数，按顺序推进草稿条件，并复用现有匹配前缀提交与状态恢复。target 保持请求的采样概率律；草稿无需传回完整概率表。温度 0、当前需要 grammar mask 以及不满足设备采样条件的请求使用贪心草稿。离线通过 `orinfer_build.models.deepseek_v41.sampling --couple-draft` 扩展已具备 target 采样能力的计划，所有并发与草稿长度共享一个动态 Markov 算子。
 
 thinking 默认值见上表；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 可显式开启，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 

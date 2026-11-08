@@ -23,6 +23,18 @@ pub struct TokenLogprob {
     pub top: Vec<(u32, f64)>,
 }
 
+/// Logical target-row policy, independent of CUDA/NPU memory layout.
+#[derive(Clone, Default)]
+pub(crate) struct RowParameters {
+    pub mask: Option<std::sync::Arc<[u32]>>,
+    pub top_logprobs: Option<usize>,
+}
+impl RowParameters {
+    pub fn processed(&self) -> bool {
+        self.mask.is_some() || self.top_logprobs.is_some()
+    }
+}
+
 pub struct Law {
     pub distribution: Distribution,
     reporting: Option<super::reporting::Report>,
@@ -39,6 +51,9 @@ impl Decoder {
     }
     pub fn constrained(&self) -> bool {
         self.constraint.as_ref().is_some_and(|c| c.needs_mask())
+    }
+    pub(crate) fn has_constraint(&self) -> bool {
+        self.constraint.is_some()
     }
     pub fn finished(&self) -> bool {
         self.failure.is_some() || self.constraint.as_ref().is_some_and(|c| c.finished())
@@ -143,6 +158,57 @@ impl Decoder {
             reporting,
         })
     }
+    /// Consume an owned parser fork along the proposal prefix. After an illegal
+    /// proposal or termination, remaining rows are unused and need no reports.
+    pub(crate) fn proposed_rows(
+        mut self,
+        tokens: &[u32],
+        vocab: usize,
+        top_logprobs: Option<usize>,
+    ) -> Result<Vec<RowParameters>> {
+        let mut ignored = false;
+        let mut rows = Vec::with_capacity(tokens.len() + 1);
+        for position in 0..=tokens.len() {
+            let mask = if !ignored && self.constrained() {
+                self.gpu_mask()?
+            } else {
+                None
+            };
+            if let Some(mask) = &mask {
+                let tail = vocab % 32;
+                if !(mask.iter().take(vocab / 32).any(|&b| b != 0)
+                    || (tail != 0
+                        && mask
+                            .get(vocab / 32)
+                            .is_some_and(|b| b & ((1u32 << tail) - 1) != 0)))
+                {
+                    return Err("Grammar permits no tokens".into());
+                }
+            }
+            let allowed = tokens.get(position).is_none_or(|&id| {
+                mask.as_ref().is_none_or(|m| {
+                    m.get(id as usize / 32)
+                        .is_some_and(|b| b & (1 << (id % 32)) != 0)
+                })
+            });
+            rows.push(RowParameters {
+                mask: mask.map(Into::into),
+                top_logprobs: if ignored { None } else { top_logprobs },
+            });
+            if let Some(&token) = tokens.get(position)
+                && !ignored
+            {
+                if !allowed || self.finished() {
+                    ignored = true;
+                } else {
+                    self.consume(token)?;
+                    ignored = self.finished();
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     pub fn consume(&mut self, token: u32) -> Result<()> {
         if let Some(c) = self.constraint.as_mut()
             && let Err(error) = c.consume(token)
@@ -169,6 +235,22 @@ impl Decoder {
         self.consume(token)?;
         if let Some(reporting) = law.reporting {
             self.records.push(reporting.record(token));
+        }
+        Ok(())
+    }
+    pub(crate) fn commit_device(&mut self, token: u32, report: Option<TokenLogprob>) -> Result<()> {
+        if report.as_ref().is_some_and(|r| {
+            r.token != token
+                || !r.logprob.is_finite()
+                || r.logprob > 0.0
+                || r.top.len() > 20
+                || r.top.iter().any(|v| !v.1.is_finite() || v.1 > 0.0)
+        }) {
+            return Err("Invalid device probability record".into());
+        }
+        self.consume(token)?;
+        if let Some(report) = report {
+            self.records.push(report);
         }
         Ok(())
     }

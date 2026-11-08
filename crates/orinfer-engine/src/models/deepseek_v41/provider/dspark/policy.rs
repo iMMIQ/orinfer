@@ -990,6 +990,7 @@ mod tests {
                     preparation: setup,
                     setup,
                     replay: true,
+                    ..Default::default()
                 },
             );
             if round == 0 {
@@ -1251,6 +1252,7 @@ mod tests {
                     preparation: 0.,
                     setup: 0.,
                     replay: false,
+                    ..Default::default()
                 },
             );
         }
@@ -1611,6 +1613,7 @@ mod tests {
                     preparation: 0.01,
                     setup: 0.,
                     replay: false,
+                    ..Default::default()
                 },
             );
         }

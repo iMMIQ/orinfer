@@ -145,6 +145,7 @@ pub(crate) struct Request {
     released: bool,
     sampling: crate::sampling::Options,
     device_sampling: bool,
+    processed_sampling: bool,
     decoder: Decoder,
     prefix: crate::prefix::Statistics,
     mtp: crate::mtp::Statistics,
@@ -174,11 +175,32 @@ impl Request {
     fn device_sample(&self) -> bool {
         self.device_sampling
             && !self.prefilling
-            && self.sampling.device_categorical()
-            && !self.decoder.constrained()
+            && ((self.sampling.device_categorical() && !self.decoder.constrained())
+                || (self.processed_sampling
+                    && self.host_sampling()
+                    && self.sampling.device_untruncated()))
     }
     fn needs_logits(&self) -> bool {
         self.host_sampling() && !self.device_sample()
+    }
+    fn accept_device(&mut self, output: &Output) -> Result<u32> {
+        if self.sampling.top_logprobs.is_some() != output.report.is_some() {
+            return Err("Device sampling probability record differs from request".into());
+        }
+        self.decoder
+            .commit_device(output.token, output.report.clone())?;
+        Ok(output.token)
+    }
+    fn verify_device(&mut self, draft: &[u32], target: &[&Output]) -> Result<Vec<u32>> {
+        let mut tokens = Vec::with_capacity(target.len());
+        for (position, output) in target.iter().enumerate() {
+            let token = self.accept_device(output)?;
+            tokens.push(token);
+            if draft.get(position) != Some(&token) || self.decoder.finished() {
+                break;
+            }
+        }
+        Ok(tokens)
     }
     fn accept_output(&mut self, output: &Output) -> Result<u32> {
         let token = if self.host_sampling() && !(self.device_sample() && output.logits.is_empty()) {
@@ -193,8 +215,7 @@ impl Request {
             self.decoder.commit(token, law)?;
             token
         } else {
-            self.decoder.consume(output.token)?;
-            output.token
+            self.accept_device(output)?
         };
         self.history.push(token);
         self.generated += 1;
@@ -708,6 +729,12 @@ impl Runtime {
             released: false,
             sampling: input.sampling,
             device_sampling: self.team.model.sampling.is_some(),
+            processed_sampling: self
+                .team
+                .model
+                .sampling
+                .as_ref()
+                .is_some_and(|s| s.processed_local.is_some()),
             decoder: Default::default(),
             prefix,
             mtp: Default::default(),
@@ -1048,11 +1075,15 @@ impl Runtime {
         let capture = self
             .speculation_policy
             .target_budget(full, layout.decode, work, uses, slack);
-        let readout = packet::readout(requests, full);
+        let readout =
+            packet::target_readout(requests, full, &BTreeMap::new(), self.vocab(), &selected)?;
         let (values, timing) =
             self.team
                 .forward_with(layout, tokens, readout, Some(capture), maintenance)?;
         let seconds = timing.seconds;
+        self.statistics.sampling_mask_rows += timing.mask_rows;
+        self.statistics.sampling_report_rows += timing.report_rows;
+        self.statistics.sampling_prepare_s += timing.mask_prepare_s;
         let preparation = timing.preparation;
         self.statistics.iterations += 1;
         self.statistics.compute_s += seconds;

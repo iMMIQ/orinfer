@@ -1028,7 +1028,7 @@ impl Worker {
         layout: &Layout,
         tokens: &[Vec<u32>],
         readout: &super::team::Readout,
-    ) -> Result<Vec<(usize, super::packet::Best, Vec<f32>)>> {
+    ) -> Result<Vec<super::team::Output>> {
         if !readout.draws.is_empty() && self.sampling.is_none() {
             return Err("Device sampling requires a sampling program".into());
         }
@@ -1243,7 +1243,7 @@ impl Worker {
             )?;
             self.trace_rings(&path, "after")?;
         } else {
-            self.enqueue_packet_retained(
+            let pending = self.enqueue_packet_retained(
                 Rc::clone(&execution),
                 super::packet::Inputs {
                     tokens: &joined,
@@ -1253,8 +1253,12 @@ impl Worker {
                 },
                 !layout.outputs.is_empty(),
                 retained,
-            )?
-            .wait()?;
+            )?;
+            let prepared = readout.parameters.get();
+            // Even a failed grammar preparation must retain native resources
+            // and let every rank finish the already-submitted collective order.
+            pending.wait()?;
+            prepared?;
         }
         if !execution.captured {
             execution.record_shared_use();
@@ -1283,6 +1287,7 @@ impl Worker {
                     &source,
                     execution.packet.vocab_first,
                     &readout.controls(layout)?,
+                    &readout.row_parameters(layout)?,
                     execution.captured,
                 )?)
             };
@@ -1360,8 +1365,8 @@ impl Worker {
             }
             for (i, lane) in outputs {
                 let (value, index) = if let Some(sampled) = &sampled {
-                    let &(value, index) = sampled.get(i).ok_or("Missing sampled row")?;
-                    (value, index as i32)
+                    let sample = sampled.get(i).ok_or("Missing sampled row")?;
+                    (sample.score, sample.token as i32)
                 } else {
                     (
                         f32::from_le_bytes(values[i * 4..i * 4 + 4].try_into().unwrap()),
@@ -1373,18 +1378,20 @@ impl Worker {
                 } else {
                     16160
                 };
-                if !value.is_finite() || !(0..vocabulary).contains(&index) {
+                if !(value.is_finite() || (sampled.is_some() && value == f32::NEG_INFINITY))
+                    || !(0..vocabulary).contains(&index)
+                {
                     return Err("Invalid batched output".into());
                 }
                 let probs = logits.remove(&i).unwrap_or_default();
-                output.push((
-                    layout.segments[lane].slot,
-                    super::packet::Best {
-                        value,
-                        token: execution.packet.vocab_first + index as u32,
-                    },
-                    probs,
-                ));
+                output.push(super::team::Output {
+                    owner: layout.segments[lane].slot,
+                    value,
+                    token: execution.packet.vocab_first + index as u32,
+                    logits: probs,
+                    summary: sampled.as_ref().and_then(|s| s[i].summary.clone()),
+                    report: None,
+                });
             }
         }
         for (segment, input) in layout

@@ -10,6 +10,8 @@ use crate::{
 };
 use serde::Deserialize;
 use std::path::Path;
+mod processed;
+pub(crate) use processed::{Parameters, Sample, Summary, report};
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,20 +23,40 @@ pub(crate) struct Contract {
     pub merge: String,
     #[serde(default)]
     pub coupled_draft: bool,
+    #[serde(default)]
+    pub processed_local: Option<String>,
+    #[serde(default)]
+    pub processed_merge: Option<String>,
 }
 impl Contract {
     pub fn manifests(&self) -> impl Iterator<Item = &str> {
-        [self.local.as_str(), self.merge.as_str()].into_iter()
+        [
+            Some(self.local.as_str()),
+            Some(self.merge.as_str()),
+            self.processed_local.as_deref(),
+            self.processed_merge.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
     }
     pub fn bytes(&self) -> Result<usize> {
         if !(2..=4096).contains(&self.capacity)
             || self.vocab == 0
             || self.vocab >= 1 << 24
             || self.rng != "philox2x32-10-v1"
+            || self.processed_local.is_some() != self.processed_merge.is_some()
         {
             return Err("Invalid A2 categorical sampling contract".into());
         }
-        Ok(self.capacity * (self.vocab * 4 + 16 + self.vocab.div_ceil(1024) * 8 + 8) + 4)
+        let extra = if self.processed_local.is_some() {
+            self.capacity
+                * (processed::mask_stride(self.vocab)
+                    + 8
+                    + (self.vocab.div_ceil(1024) + 1) * processed::WIDTH * 4)
+        } else {
+            0
+        };
+        Ok(self.capacity * (self.vocab * 4 + 16 + self.vocab.div_ceil(1024) * 8 + 8) + 4 + extra)
     }
     pub fn preflight(&self, base: &Path) -> Result<()> {
         self.bytes()?;
@@ -70,6 +92,58 @@ impl Contract {
                 return Err("A2 categorical operand/row contract differs".into());
             }
         }
+        if let (Some(local), Some(merge)) = (&self.processed_local, &self.processed_merge) {
+            let base_operands = vec![
+                (Dtype::F32, vec![self.capacity, self.vocab], Access::Read),
+                (Dtype::I32, vec![self.capacity, 4], Access::Read),
+                (Dtype::I32, vec![1], Access::Read),
+                (
+                    Dtype::U8,
+                    vec![self.capacity, processed::mask_stride(self.vocab)],
+                    Access::Read,
+                ),
+                (Dtype::I32, vec![self.capacity, 2], Access::Read),
+                (
+                    Dtype::F32,
+                    vec![self.capacity, parts, processed::WIDTH],
+                    Access::Write,
+                ),
+            ];
+            let merge_operands = vec![
+                (
+                    Dtype::F32,
+                    vec![self.capacity, parts, processed::WIDTH],
+                    Access::Read,
+                ),
+                (Dtype::I32, vec![1], Access::Read),
+                (Dtype::I32, vec![self.capacity, 2], Access::Read),
+                (
+                    Dtype::F32,
+                    vec![self.capacity, processed::WIDTH],
+                    Access::Write,
+                ),
+            ];
+            for (name, op, expected) in [
+                (local, "sampling_processed.local", base_operands),
+                (merge, "sampling_processed.merge", merge_operands),
+            ] {
+                let spec: Spec = crate::model::read(&resolve_file(base, name)?)?;
+                spec.validate()?;
+                if spec.op != op
+                    || spec.row_capacity()? != Some(self.capacity)
+                    || spec.operands.len() != expected.len()
+                    || spec
+                        .operands
+                        .iter()
+                        .zip(expected)
+                        .any(|(a, (dtype, shape, access))| {
+                            a.dtype != dtype || a.shape != shape || a.access != access
+                        })
+                {
+                    return Err("Processed sampler operand/row contract differs".into());
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -81,10 +155,14 @@ pub(crate) struct Draw {
 }
 impl Draw {
     pub fn control(&self, offset: usize) -> Result<[i32; 3]> {
-        if !(1e-5..=2.0).contains(&self.temperature) {
+        if self.temperature != 0.0 && !(1e-5..=2.0).contains(&self.temperature) {
             return Err("Invalid device categorical temperature".into());
         }
-        let inverse = (1.0 / self.temperature) as f32;
+        let inverse = if self.temperature == 0.0 {
+            0.0
+        } else {
+            (1.0 / self.temperature) as f32
+        };
         if !inverse.is_finite() {
             return Err("Device categorical temperature exceeds FP32 range".into());
         }
@@ -115,6 +193,7 @@ pub(crate) struct Categorical {
     output: Buffer,
     program: Program,
     graph: Option<Graph>,
+    processed: Option<processed::Processed>,
 }
 impl Categorical {
     pub fn load(session: &Session, base: &Path, contract: &Contract) -> Result<Self> {
@@ -138,6 +217,13 @@ impl Categorical {
         )?;
         let second = Kernel::bind(session, &merge, &[partial, active.clone(), output.clone()])?;
         let program = Program::new(session, &[&first, &second])?;
+        let processed = contract
+            .processed_local
+            .as_ref()
+            .map(|_| {
+                processed::Processed::load(session, base, contract, &logits, &controls, &active)
+            })
+            .transpose()?;
         Ok(Self {
             contract: contract.clone(),
             logits,
@@ -146,6 +232,7 @@ impl Categorical {
             output,
             program,
             graph: None,
+            processed,
         })
     }
     pub fn sample(
@@ -154,16 +241,19 @@ impl Categorical {
         source: &Buffer,
         origin: u32,
         rows: &[[i32; 3]],
+        parameters: &[Parameters],
         capture: bool,
-    ) -> Result<Vec<(f32, u32)>> {
+    ) -> Result<Vec<Sample>> {
         if rows.is_empty()
             || rows.len() > self.contract.capacity
             || source.bytes() < rows.len() * self.contract.vocab * 4
             || origin as usize + self.contract.vocab >= 1 << 24
+            || (!parameters.is_empty() && parameters.len() != rows.len())
         {
             return Err("Device sampling rows/vocabulary exceed the contract".into());
         }
-        if capture && self.graph.is_none() {
+        let processed = parameters.iter().any(Parameters::processed);
+        if capture && !processed && self.graph.is_none() {
             session.upload_inputs(&[(self.active.clone(), 0i32.to_le_bytes().to_vec())])?;
             self.graph = Some(self.program.capture(session)?);
         }
@@ -186,6 +276,20 @@ impl Categorical {
             0,
             rows.len() * self.contract.vocab * 4,
         )?;
+        if processed {
+            return self
+                .processed
+                .as_mut()
+                .ok_or("Execution package has no processed sampler")?
+                .sample(
+                    session,
+                    &self.contract,
+                    &self.active,
+                    origin,
+                    parameters,
+                    capture,
+                );
+        }
         if capture {
             self.graph.as_ref().unwrap().enqueue(session)?.wait()?;
         } else {
@@ -207,7 +311,11 @@ impl Categorical {
                 {
                     return Err("Nonfinite/invalid device categorical output".into());
                 }
-                Ok((score, index as u32))
+                Ok(Sample {
+                    score,
+                    token: index as u32,
+                    summary: None,
+                })
             })
             .collect()
     }

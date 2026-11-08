@@ -617,7 +617,7 @@ def publish_package(model, base, destination):
         path = Path(operation["manifest"])
         assets.add(str(path))
         assets.add(str(path.parent / json.loads((base / path).read_text())["library"]["file"]))
-    for name in ("local", "merge"):
+    for name in ("local", "merge", "processed_local", "processed_merge"):
         if model.get("sampling", {}).get(name):
             path = Path(model["sampling"][name])
             assets.add(str(path))

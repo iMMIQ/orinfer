@@ -95,6 +95,7 @@ impl Runtime {
                 .max_speculative_tokens
                 .min(self.team.verification_rows)
         };
+        let budget_started = Instant::now();
         let depths = self.speculation_policy.select_requests(
             full,
             mixed,
@@ -130,6 +131,8 @@ impl Runtime {
             &feedback,
             &self.team.draft_blocks,
         )?;
+        self.statistics.mtp_budget_calls += 1;
+        self.statistics.mtp_budget_s += budget_started.elapsed().as_secs_f64();
         let selected = indices.into_iter().zip(depths).collect::<Vec<_>>();
         *self
             .statistics
@@ -208,7 +211,7 @@ impl Runtime {
             .as_ref()
             .is_some_and(|s| s.coupled_draft)
         {
-            packet::readout(requests, false)
+            packet::draft_readout(requests)
         } else {
             false.into()
         };
@@ -269,14 +272,25 @@ impl Runtime {
             uses,
             slack,
         );
-        let (verified, verify_timing) = self.team.forward_with(
-            layout,
-            inputs,
-            packet::readout(requests, full || packet_full),
-            Some(capture),
-            || {},
+        let proposal_map = selected
+            .iter()
+            .zip(&draft_tokens)
+            .map(|(&(i, _), tokens)| (i, tokens.clone()))
+            .collect();
+        let readout = packet::target_readout(
+            requests,
+            full || packet_full,
+            &proposal_map,
+            self.vocab(),
+            &packet_requests,
         )?;
+        let (verified, verify_timing) =
+            self.team
+                .forward_with(layout, inputs, readout, Some(capture), || {})?;
         let verify_s = verify_timing.seconds;
+        self.statistics.sampling_mask_rows += verify_timing.mask_rows;
+        self.statistics.sampling_report_rows += verify_timing.report_rows;
+        self.statistics.sampling_prepare_s += verify_timing.mask_prepare_s;
         let verify_prepare = verify_timing.preparation;
         let started = Instant::now();
         let mut counts = vec![];
@@ -329,6 +343,8 @@ impl Runtime {
                     request.generated,
                     129280,
                 )?
+            } else if request.processed_sampling && request.device_sample() {
+                request.verify_device(&draft, &target)?
             } else {
                 // Target draws use only their absolute position's randomness.
                 // A deterministic guess or a draft sharing that randomness can

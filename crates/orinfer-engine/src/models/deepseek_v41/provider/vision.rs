@@ -284,6 +284,7 @@ mod tests {
             token: 0,
             value: 0.,
             logits: vec![],
+            ..Default::default()
         });
         let mut request = super::super::tests::request(output, Default::default());
         request.slot = slot;

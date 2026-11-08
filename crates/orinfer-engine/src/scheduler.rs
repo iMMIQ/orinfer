@@ -426,6 +426,11 @@ impl BatchExecutionStatistics {
 
 #[derive(Default, Clone, Debug, Serialize)]
 pub struct Statistics {
+    pub sampling_mask_rows: usize,
+    pub sampling_report_rows: usize,
+    pub sampling_prepare_s: f64,
+    pub mtp_budget_calls: usize,
+    pub mtp_budget_s: f64,
     pub mtp_probe_iterations: usize,
     pub mtp_request_depth_histogram: std::collections::BTreeMap<usize, usize>,
     pub maintenance_calls: usize,

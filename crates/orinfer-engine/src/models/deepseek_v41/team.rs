@@ -91,12 +91,14 @@ pub(super) struct RoutingGroup {
     pub buffer: String,
     pub counts: Vec<i64>,
 }
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct Output {
     pub owner: usize,
     pub token: u32,
     pub value: f32,
     pub logits: Vec<f32>,
+    pub summary: Option<crate::backend::ascend::sampling::Summary>,
+    pub report: Option<crate::sampling::TokenLogprob>,
 }
 #[derive(Clone, Default)]
 pub(super) struct Readout {
@@ -104,6 +106,11 @@ pub(super) struct Readout {
     pub draws: BTreeMap<usize, crate::backend::ascend::sampling::Draw>,
     /// None retains the benchmark/legacy full-packet diagnostic contract.
     pub full_owners: Option<BTreeSet<usize>>,
+    pub parameters: Arc<
+        crate::sampling::Prepared<
+            BTreeMap<usize, Vec<crate::backend::ascend::sampling::Parameters>>,
+        >,
+    >,
 }
 impl From<bool> for Readout {
     fn from(full: bool) -> Self {
@@ -114,6 +121,35 @@ impl From<bool> for Readout {
     }
 }
 impl Readout {
+    pub fn row_parameters(
+        &self,
+        layout: &Layout,
+    ) -> Result<Vec<crate::backend::ascend::sampling::Parameters>> {
+        let parameters = self.parameters.get()?;
+        if parameters.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut positions = BTreeMap::<usize, usize>::new();
+        layout
+            .outputs
+            .iter()
+            .map(|&lane| {
+                let owner = layout.segments[lane].slot;
+                let position = positions.entry(owner).or_default();
+                let value = parameters
+                    .get(&owner)
+                    .map(|rows| {
+                        rows.get(*position)
+                            .cloned()
+                            .ok_or("Missing owner sampling parameters".to_string())
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                *position += 1;
+                Ok(value)
+            })
+            .collect()
+    }
     pub fn wants_logits(&self, owner: usize) -> bool {
         self.full
             && self
@@ -178,6 +214,7 @@ pub(super) struct Team {
 }
 
 /// Execution mode and preparation are measured separately; direct is a valid steady path.
+#[derive(Default)]
 pub(super) struct Timing {
     pub seconds: f64,
     pub preparation: f64,
@@ -185,6 +222,9 @@ pub(super) struct Timing {
     pub setup: f64,
     pub shared: bool,
     pub shared_setup: f64,
+    pub mask_rows: usize,
+    pub report_rows: usize,
+    pub mask_prepare_s: f64,
 }
 impl Team {
     pub fn load(plan: &Path, model_dir: &Path) -> Result<Self> {
@@ -550,20 +590,7 @@ impl Team {
                                 .map_or(Ok(()), |capture| worker.prepare_batch(&layout, capture))
                                 .and_then(|()| worker.select_shared(&layout, &shared))
                                 .and_then(|()| worker.forward_batch(&layout, &tokens, &readout))
-                                .map(|values| {
-                                    Reply::Outputs(
-                                        values
-                                            .into_iter()
-                                            .map(|(owner, best, logits)| Output {
-                                                owner,
-                                                token: best.token,
-                                                value: best.value,
-                                                logits,
-                                            })
-                                            .collect(),
-                                        !shared.is_empty(),
-                                    )
-                                }),
+                                .map(|values| Reply::Outputs(values, !shared.is_empty())),
                             Command::Save {
                                 owner,
                                 snapshot,
@@ -987,6 +1014,8 @@ fn forward_with(
             serde_json::json!({"rows":layout.rows.total,"pieces":shared.len(),"setup_s":shared_setup})
         );
     }
+    let sampled = !readout.draws.is_empty();
+    let parameters = Arc::clone(&readout.parameters);
     let command = Command::Forward(
         layout,
         tokens,
@@ -1025,13 +1054,48 @@ fn forward_with(
             {
                 output.token = value.token;
                 output.value = value.value;
+                output.summary.clone_from(&value.summary);
             }
             output.logits.extend_from_slice(&value.logits);
         }
+        let summaries = ranks
+            .iter()
+            .filter_map(|r| r[i].summary.as_ref())
+            .collect::<Vec<_>>();
+        if !summaries.is_empty() {
+            if summaries.len() != ranks.len() {
+                return Err("TP probability summaries differ".into());
+            }
+            output.report = Some(crate::backend::ascend::sampling::report(
+                &summaries,
+                output
+                    .summary
+                    .as_ref()
+                    .ok_or("Missing chosen sampling summary")?,
+                output.token,
+            )?);
+        }
+        if sampled && !output.value.is_finite() {
+            return Err("Grammar permits no tokens".into());
+        }
+        output.summary = None;
     }
     Ok((
         outputs,
         Timing {
+            mask_rows: parameters
+                .get()?
+                .values()
+                .flatten()
+                .filter(|p| p.mask.is_some())
+                .count(),
+            report_rows: parameters
+                .get()?
+                .values()
+                .flatten()
+                .filter(|p| p.top_logprobs.is_some())
+                .count(),
+            mask_prepare_s: parameters.seconds(),
             seconds: started.elapsed().as_secs_f64(),
             preparation: prepare_s,
             replay: capture,

@@ -134,6 +134,56 @@ def couple_draft(model, base):
     return dict(packets=packets, kernels=compiled)
 
 
+def attach_processed(model, base):
+    """Extend the existing sampler with masks and bounded probability summaries."""
+    from kernels.ascend import sampling_processed as implementation
+    from kernels.shared.rows import row_count
+    from orinfer_build.compiler.ascend.build import compile_kernel, operand
+
+    result = model.get("sampling")
+    if not result:
+        raise ValueError("Processed sampling requires the categorical sampler")
+    capacity, vocab = result["capacity"], result["vocab"]
+    parts = (vocab + 1023) // 1024
+    rows = row_count(capacity, True)
+    for field, factory, arguments, ports in [
+        (
+            "processed_local",
+            implementation.local,
+            dict(rows=rows, vocab=vocab),
+            [
+                ("logits", "f32", (capacity, vocab), "read"),
+                ("controls", "i32", (capacity, 4), "read"),
+                ("active", "i32", (1,), "read"),
+                ("masks", "u8", (capacity, ((vocab + 255) // 256) * 32), "read"),
+                ("options", "i32", (capacity, 2), "read"),
+                ("partial", "f32", (capacity, parts, implementation.WIDTH), "write"),
+            ],
+        ),
+        (
+            "processed_merge",
+            implementation.merge,
+            dict(rows=rows, parts=parts),
+            [
+                ("partial", "f32", (capacity, parts, implementation.WIDTH), "read"),
+                ("active", "i32", (1,), "read"),
+                ("options", "i32", (capacity, 2), "read"),
+                ("output", "f32", (capacity, implementation.WIDTH), "write"),
+            ],
+        ),
+    ]:
+        path = compile_kernel(
+            factory(**arguments),
+            "sampling_processed." + field.removeprefix("processed_"),
+            [operand(*p) for p in ports],
+            dict(vocab=vocab),
+            base / "cache",
+            row_capacity=capacity,
+        )
+        result[field] = str(path.relative_to(base))
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
@@ -142,6 +192,9 @@ def main():
     parser.add_argument(
         "--couple-draft", action="store_true", help="Extend existing target sampling"
     )
+    parser.add_argument(
+        "--processed", action="store_true", help="Attach masks and probability summaries"
+    )
     args = parser.parse_args()
     if (
         args.plan.parent.resolve() != args.output.parent.resolve()
@@ -149,7 +202,11 @@ def main():
     ):
         parser.error("Preserve the input and keep its asset directory")
     model = decode(json.loads(args.plan.read_text()))
-    transform = couple_draft if args.couple_draft else attach
+    if args.processed and args.couple_draft:
+        parser.error("Select one sampler extension")
+    transform = (
+        attach_processed if args.processed else couple_draft if args.couple_draft else attach
+    )
     print(json.dumps(transform(model, args.plan.parent)), flush=True)
     atomic_json(args.output, model)
 

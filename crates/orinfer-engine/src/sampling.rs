@@ -5,8 +5,11 @@
 pub const EVALUATION_SEED: u64 = 20_261_002;
 
 mod constrained;
+mod prepared;
 mod reporting;
+pub(crate) use constrained::RowParameters;
 pub use constrained::{Constraint, Decoder, TokenLogprob, verify};
+pub(crate) use prepared::Prepared;
 
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -77,14 +80,16 @@ impl Options {
     /// Full categorical law without history processors or probability reports.
     /// Grammar eligibility is checked separately against the request decoder.
     pub fn device_categorical(&self) -> bool {
-        (1e-5..=2.0).contains(&self.temperature)
+        self.temperature > 0.0 && self.device_untruncated() && self.top_logprobs.is_none()
+    }
+    pub(crate) fn device_untruncated(&self) -> bool {
+        (self.temperature == 0.0 || (1e-5..=2.0).contains(&self.temperature))
             && self.top_p == 1.0
             && self.top_k == 0
             && self.presence_penalty == 0.0
             && self.frequency_penalty == 0.0
             && self.repetition_penalty == 1.0
             && self.logit_bias.is_empty()
-            && self.top_logprobs.is_none()
     }
     pub fn validate(&self) -> Result<(), String> {
         if !self.temperature.is_finite()
