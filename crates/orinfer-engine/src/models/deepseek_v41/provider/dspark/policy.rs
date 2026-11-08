@@ -440,6 +440,7 @@ impl Policy {
         curve.calls += 1;
         curve.last_normal = Some(curve.calls);
     }
+    #[cfg(test)]
     pub fn select_requests(
         &mut self,
         full: bool,
@@ -449,6 +450,33 @@ impl Policy {
         feedback: &[&Feedback],
         blocks: &[usize],
     ) -> Result<Vec<usize>> {
+        let work = if budget.work.rows == 0 {
+            Work {
+                rows: maxima.len(),
+                ..Work::default()
+            }
+        } else {
+            budget.work
+        };
+        self.select_requests_with_forecast(
+            (full, mixed),
+            budget,
+            maxima,
+            feedback,
+            blocks,
+            |depths| work.extend(depths.iter().sum()),
+        )
+    }
+    pub fn select_requests_with_forecast(
+        &mut self,
+        mode: (bool, bool),
+        budget: Budget,
+        maxima: &[usize],
+        feedback: &[&Feedback],
+        blocks: &[usize],
+        mut forecast: impl FnMut(&[usize]) -> Work,
+    ) -> Result<Vec<usize>> {
+        let (full, mixed) = mode;
         let batch = maxima.len();
         if feedback.len() != batch || maxima.iter().any(|&m| m > crate::execution::MAX_MTP_DRAFTS) {
             return Err("Invalid DSpark request-depth contract".into());
@@ -576,7 +604,7 @@ impl Policy {
                     rows: owners,
                     ..Work::default()
                 };
-                let target_work = work.extend(rows - batch);
+                let target_work = forecast(&selected);
                 let uses = reuse_steps(&budget, &selected, maxima, feedback, block);
                 let seen = prior.and_then(|p| p.seen.get(&rows)).copied().unwrap_or(0);
                 let warmup = 2usize.saturating_sub(seen);
@@ -593,7 +621,7 @@ impl Policy {
                     .unwrap_or(normal.seconds);
                 let restore_s = restore.map_or(normal.seconds * 0.1, |p| p.seconds);
                 let opportunity = if budget.prefill_tokens_per_s > 0. {
-                    (work.prefill_rows - target_work.prefill_rows) as f64
+                    work.prefill_rows.saturating_sub(target_work.prefill_rows) as f64
                         / budget.prefill_tokens_per_s
                 } else {
                     0.

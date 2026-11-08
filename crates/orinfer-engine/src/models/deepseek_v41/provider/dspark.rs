@@ -113,9 +113,11 @@ impl Runtime {
                 .min(self.team.verification_rows)
         };
         let budget_started = Instant::now();
-        let depths = self.speculation_policy.select_requests(
-            full,
-            mixed,
+        let keep = self.final_decoder_window();
+        let capacity = self.team.rows;
+        let mut decode_rows = vec![0; requests.len()];
+        let depths = self.speculation_policy.select_requests_with_forecast(
+            (full, mixed),
             Budget {
                 rows: row_budget,
                 latency: options.policy == scheduler::Policy::Latency,
@@ -147,6 +149,19 @@ impl Runtime {
             &maxima,
             &feedback,
             &self.team.draft_blocks,
+            |depths| {
+                for (&i, &depth) in indices.iter().zip(depths) {
+                    decode_rows[i] = depth + 1;
+                }
+                packet::forecast(
+                    requests,
+                    &baseline.order,
+                    &decode_rows,
+                    baseline.budget,
+                    keep,
+                    capacity,
+                )
+            },
         )?;
         self.statistics.mtp_budget_calls += 1;
         self.statistics.mtp_budget_s += budget_started.elapsed().as_secs_f64();
@@ -276,7 +291,13 @@ impl Runtime {
             prefill_requests,
             ..
         } = self
-            .packet_for_budget(requests, Some(&inputs), baseline.budget, mixed)?
+            .packet_for_budget(
+                requests,
+                Some(&inputs),
+                baseline.budget,
+                mixed,
+                &baseline.order,
+            )?
             .ok_or("Missing DSpark verification packet")?;
         if self.team.needs_preparation(&layout)?
             && !memory::ensure_budget(self, memory::Requirement::workspace())?
