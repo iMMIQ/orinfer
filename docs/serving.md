@@ -333,6 +333,8 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 
 DeepSeek 前端在每个模型 worker 内使用 64 MiB 的有界文本编码缓存，独立于图片缓存及在途请求预算。缓存仅复用控制 token 之间完整、原文完全相同且至少 1 KiB 的文本区段，保留控制 token 身份及原始 BPE 边界；变更文本重新编码。`/health.tokenization_cache` 显示字节预算、驻留、命中、复用 token 和淘汰数。此缓存持有当前 tokenizer 的编码结果，随模型 worker 一同释放。
 
+缓存未命中时，若只有一个至少 1 KiB 的长区段，或全部为短区段，直接在已有的有界预处理任务内编码；多个长区段保留 tokenizer 的批量并行编码。两种调度方式保持相同的文本区段和 token 边界。
+
 A2 启用 DSpark 时，`scheduler_statistics.speculation` 同步发布模型级累计草稿、接受、提交计数及分段耗时。草稿、验证和恢复计时包含设备等待与结果回读，采样计时记录 CPU 验证与提交；各请求日志中的整包耗时不能跨请求直接累加。通过同一健康快照的计数差值分析稳定 decode 窗口。
 
 A2 的 `scheduler_statistics.batch_execution` 按完成的 TP packet 计数，每包计一次。`graph_hits` 记录已驻留整包 Graph 的 replay，`dynamic_graph_captures` 记录本轮新捕获，`graph_misses` 记录未命中已驻留整包 Graph 的执行。`shared_graph_hits` 记录使用公共片段 Graph 的 packet，可能同时计入 `direct_iterations`；`shared_graph_captures` 记录新捕获的片段。`capture_s` 包含整包捕获的协调准备及 warmup，或单独的片段捕获准备；`direct_s` 与 `replay_s` 是提交后的完成耗时，准备另计。普通、草稿和验证共用这些统计，不能再按 rank 或 owner 乘算。A2 提供上述执行统计及 `graph_invalidations`；其他公共字段保留默认值，例如 `graph_evictions=0` 不表示已验收无淘汰。

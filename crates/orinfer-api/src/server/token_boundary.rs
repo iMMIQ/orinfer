@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use tokenizers::{AddedVocabulary, Tokenizer};
 mod cache;
+#[cfg(test)]
+mod profile;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -127,17 +129,30 @@ impl Boundary {
             .filter_map(|(i, tokens)| tokens.is_none().then_some(i))
             .collect::<Vec<_>>();
         if !missing.is_empty() {
-            // No cache lock is held while the tokenizer's shared workers run.
-            let values = self
-                .plain
-                .encode_batch_fast(
+            // A single long regex/BPE job stays on its bounded preparation
+            // worker. The engine also uses global Rayon for host-row gathers;
+            // reserve batch parallelism for multiple substantial cold regions.
+            let multiple_long_regions = missing
+                .iter()
+                .filter(|&&i| regions[i].len() >= cache::MIN_BYTES)
+                .take(2)
+                .count()
+                > 1;
+            let values = if multiple_long_regions {
+                self.plain.encode_batch_fast(
                     missing
                         .iter()
                         .map(|&i| regions[i].as_str())
                         .collect::<Vec<_>>(),
                     false,
                 )
-                .map_err(|e| e.to_string())?;
+            } else {
+                missing
+                    .iter()
+                    .map(|&i| self.plain.encode_fast(regions[i].as_str(), false))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            }
+            .map_err(|e| e.to_string())?;
             for (index, value) in missing.into_iter().zip(values) {
                 let tokens: std::sync::Arc<[u32]> = value.get_ids().into();
                 self.cache.insert(

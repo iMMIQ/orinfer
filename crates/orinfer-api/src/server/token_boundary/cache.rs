@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const MIN_BYTES: usize = 1024;
+pub(super) const MIN_BYTES: usize = 1024;
 const OVERHEAD: usize = 64 << 10;
 const MAX_ENTRIES: usize = 256;
 
