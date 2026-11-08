@@ -17,6 +17,7 @@ pub(in crate::models::deepseek_v41::provider) struct Work {
     #[serde(default)]
     pub prefill_owners: usize,
 }
+#[cfg(test)]
 impl Work {
     pub fn extend(self, extra: usize) -> Self {
         let displaced = extra.min(self.prefill_rows);

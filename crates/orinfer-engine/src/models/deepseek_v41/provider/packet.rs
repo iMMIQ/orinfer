@@ -85,6 +85,7 @@ pub(super) fn draft_readout(requests: &[&mut Request]) -> super::super::team::Re
 
 pub(super) struct Selection {
     pub budget: usize,
+    pub order: Vec<usize>,
     pub layout: Layout,
     pub tokens: Vec<Vec<u32>>,
     pub selected: Vec<(usize, usize)>,
@@ -177,6 +178,89 @@ pub(super) fn request_order(requests: &[&mut Request], tokens_per_s: f64) -> Vec
     });
     order.into_iter().map(|(i, _, _)| i).collect()
 }
+/// The ordinary packet, verification forecast and real verification use the
+/// same admissions, atomic final windows, checkpoint and media boundaries.
+fn select_rows(
+    requests: &[&mut Request],
+    order: &[usize],
+    decode_rows: Option<&[usize]>,
+    mut budget: usize,
+    keep: usize,
+    capacity: usize,
+) -> (usize, Vec<(usize, usize)>) {
+    if let Some(rows) = decode_rows {
+        budget = budget.max(rows.iter().sum()).min(capacity);
+    }
+    let packet_budget = budget;
+    let mut selected = vec![];
+    // Existing decode rows precede bounded prefill work in a shared packet.
+    for prefill in [false, true] {
+        for &i in order {
+            let request = &requests[i];
+            if budget == 0
+                || request.is_finished()
+                || request.ready_output.is_some()
+                || request.prefilling != prefill
+                || !prefill && decode_rows.is_some_and(|v| v[i] == 0)
+            {
+                continue;
+            }
+            let count = if prefill {
+                let next = 4096 - request.offset % 4096;
+                let left = request.input.len() - request.offset;
+                // A soft latency budget may expand for the first atomic
+                // final window. Other owners defer until the next packet.
+                let limit = if keep > 0 && left <= keep && selected.is_empty() {
+                    budget.max(left)
+                } else {
+                    budget
+                };
+                let limit = if keep > 0 && left <= keep {
+                    limit
+                } else {
+                    limit.min(next)
+                };
+                // Ready text/image rows can run while a later image is
+                // still encoding. Never cross an unavailable image span.
+                let limit = request.pending_images.front().map_or(limit, |image| {
+                    limit.min(image.start.saturating_sub(request.offset))
+                });
+                let Some(count) = super::super::replay::prompt_rows(
+                    left,
+                    limit,
+                    keep,
+                    request.input.len() > capacity,
+                ) else {
+                    continue;
+                };
+                count
+            } else {
+                decode_rows.map_or(1, |v| v[i])
+            };
+            selected.push((i, count));
+            budget = budget.saturating_sub(count);
+        }
+    }
+    (packet_budget, selected)
+}
+
+pub(super) fn forecast(
+    requests: &[&mut Request],
+    order: &[usize],
+    decode_rows: &[usize],
+    budget: usize,
+    keep: usize,
+    capacity: usize,
+) -> dspark::Work {
+    let (_, selected) = select_rows(requests, order, Some(decode_rows), budget, keep, capacity);
+    let prefill_rows = selected
+        .iter()
+        .filter(|&&(i, _)| requests[i].prefilling)
+        .map(|&(_, n)| n)
+        .sum();
+    work(&selected, requests, prefill_rows, keep)
+}
+
 impl Runtime {
     pub(super) fn capture_context(
         &self,
@@ -257,92 +341,57 @@ impl Runtime {
                 .owners
                 .min(options.max_batch_tokens)
         };
-        self.packet_for_budget(requests, decode_inputs, budget, has_prefill)
+        self.packet_for_budget(
+            requests,
+            decode_inputs,
+            budget,
+            has_prefill,
+            &request_order(requests, self.prefill_tokens_per_s),
+        )
     }
 
     pub(super) fn packet_for_budget(
         &self,
         requests: &[&mut Request],
         decode_inputs: Option<&BTreeMap<usize, Vec<u32>>>,
-        mut budget: usize,
+        budget: usize,
         has_prefill: bool,
+        order: &[usize],
     ) -> Result<Option<Selection>> {
-        if let Some(inputs) = decode_inputs {
-            // Reserve verified decoder rows before admitting prefill work.
-            budget = budget
-                .max(inputs.values().map(Vec::len).sum::<usize>())
-                .min(self.team.rows);
-        }
-        let packet_budget = budget;
+        let decode_rows = decode_inputs.map(|inputs| {
+            (0..requests.len())
+                .map(|i| inputs.get(&i).map_or(0, Vec::len))
+                .collect::<Vec<_>>()
+        });
+        let (packet_budget, selected) = select_rows(
+            requests,
+            order,
+            decode_rows.as_deref(),
+            budget,
+            self.final_decoder_window(),
+            self.team.rows,
+        );
         let mut segments = vec![];
         let mut tokens = vec![];
         let mut outputs = vec![];
-        let mut selected = vec![];
-        let keep = self.final_decoder_window();
-        let order = request_order(requests, self.prefill_tokens_per_s);
-        // Existing decode rows precede bounded prefill work in a shared packet.
-        for prefill in [false, true] {
-            for &i in &order {
-                let request = &requests[i];
-                if budget == 0
-                    || request.is_finished()
-                    || request.ready_output.is_some()
-                    || request.prefilling != prefill
-                    || !prefill && decode_inputs.is_some_and(|v| !v.contains_key(&i))
-                {
-                    continue;
+        for &(i, count) in &selected {
+            let request = &requests[i];
+            let values = if request.prefilling {
+                request.input[request.offset..request.offset + count].to_vec()
+            } else {
+                match decode_inputs {
+                    Some(values) => values[&i].clone(),
+                    None => vec![*request.history.last().ok_or("Missing A2 decode input")?],
                 }
-                let count = if prefill {
-                    let next = 4096 - request.offset % 4096;
-                    let left = request.input.len() - request.offset;
-                    // A soft latency budget may expand for the first atomic
-                    // final window. Other owners defer until the next packet.
-                    let limit = if keep > 0 && left <= keep && segments.is_empty() {
-                        budget.max(left)
-                    } else {
-                        budget
-                    };
-                    let limit = if keep > 0 && left <= keep {
-                        limit
-                    } else {
-                        limit.min(next)
-                    };
-                    // Ready text/image rows can run while a later image is
-                    // still encoding. Never cross an unavailable image span.
-                    let limit = request.pending_images.front().map_or(limit, |image| {
-                        limit.min(image.start.saturating_sub(request.offset))
-                    });
-                    let Some(count) = super::super::replay::prompt_rows(
-                        left,
-                        limit,
-                        keep,
-                        request.input.len() > self.team.rows,
-                    ) else {
-                        continue;
-                    };
-                    count
-                } else {
-                    decode_inputs.map_or(1, |v| v[&i].len())
-                };
-                let values = if prefill {
-                    request.input[request.offset..request.offset + count].to_vec()
-                } else {
-                    match decode_inputs {
-                        Some(values) => values[&i].clone(),
-                        None => vec![*request.history.last().ok_or("Missing A2 decode input")?],
-                    }
-                };
-                if !prefill || request.offset + count == request.input.len() {
-                    outputs.push(segments.len());
-                }
-                segments.push(BatchSegment {
-                    slot: request.slot,
-                    tokens: count,
-                });
-                tokens.push(values);
-                selected.push((i, count));
-                budget = budget.saturating_sub(count);
+            };
+            if !request.prefilling || request.offset + count == request.input.len() {
+                outputs.push(segments.len());
             }
+            segments.push(BatchSegment {
+                slot: request.slot,
+                tokens: count,
+            });
+            tokens.push(values);
         }
         if segments.is_empty() {
             return Ok(None);
@@ -399,6 +448,7 @@ impl Runtime {
         }
         Ok(Some(Selection {
             budget: packet_budget,
+            order: order.to_vec(),
             layout,
             tokens,
             selected,
@@ -407,5 +457,95 @@ impl Runtime {
             prefill_rows,
             prefill_requests,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn request(prefill: bool, offset: usize, left: usize) -> Request {
+        let mut r = super::super::tests::request(Arc::new(Output::default()), Default::default());
+        r.ready_output = None;
+        r.prefilling = prefill;
+        r.offset = offset;
+        r.input = vec![1; offset + left];
+        r.history = vec![1; offset.max(1)];
+        r
+    }
+    #[test]
+    fn verification_uses_free_packet_capacity_without_displacing_final_prompt() {
+        let mut owners = (0..16)
+            .map(|_| request(false, 100_000, 0))
+            .collect::<Vec<_>>();
+        owners.push(request(true, 4096, 128));
+        let requests = owners.iter_mut().collect::<Vec<_>>();
+        let order = (0..17).collect::<Vec<_>>();
+        let (_, ordinary) = select_rows(&requests, &order, None, 800, 128, 2048);
+        assert_eq!(work(&ordinary, &requests, 128, 128).rows, 144);
+        let mut counts = vec![6; 17];
+        counts[16] = 0;
+        let actual = forecast(&requests, &order, &counts, 800, 128, 2048);
+        assert_eq!(
+            (actual.rows, actual.prefill_rows, actual.final_rows),
+            (224, 128, 128)
+        );
+        assert_eq!((actual.decoder_owners, actual.prefill_owners), (16, 1));
+        // A final SWA window is atomic. An overfull forecast must defer the
+        // entire window rather than invent a shorter final decoder prefix.
+        let deferred = forecast(&requests, &order, &counts, 160, 128, 2048);
+        assert_eq!(
+            (deferred.rows, deferred.prefill_rows, deferred.final_rows),
+            (96, 0, 0)
+        );
+        assert_eq!(deferred.prefill_owners, 0);
+    }
+    #[test]
+    fn forecast_preserves_checkpoint_media_and_unselected_owner_boundaries() {
+        let mut owners = [
+            request(false, 100_000, 0),
+            request(false, 200_000, 0),
+            request(true, 4000, 1000),
+        ];
+        let mut requests = owners.iter_mut().collect::<Vec<_>>();
+        let order = [1, 0, 2];
+        let counts = [6, 0, 0];
+        let first = forecast(&requests, &order, &counts, 800, 128, 2048);
+        assert_eq!(
+            (
+                first.rows,
+                first.prefill_rows,
+                first.final_rows,
+                first.context
+            ),
+            (102, 96, 0, 100_000)
+        );
+        requests[2]
+            .pending_images
+            .push_back(super::super::vision::Pending {
+                start: 4032,
+                identity: [7; 32],
+                image: None,
+            });
+        let image = forecast(&requests, &order, &counts, 800, 128, 2048);
+        assert_eq!(
+            (image.rows, image.prefill_rows, image.final_rows),
+            (38, 32, 0)
+        );
+        requests[2].pending_images.front_mut().unwrap().start = 4000;
+        let blocked = forecast(&requests, &order, &counts, 800, 128, 2048);
+        assert_eq!((blocked.rows, blocked.prefill_owners), (6, 0));
+    }
+    #[test]
+    fn forecast_keeps_long_prompt_tail_reservations_and_decoder_budget_expansion() {
+        let mut owners = [request(false, 100_000, 0), request(true, 0, 2049)];
+        let requests = owners.iter_mut().collect::<Vec<_>>();
+        let order = [0, 1];
+        let partial = forecast(&requests, &order, &[6, 0], 2048, 128, 2048);
+        assert_eq!(
+            (partial.rows, partial.prefill_rows, partial.final_rows),
+            (1927, 1921, 0)
+        );
+        let expanded = forecast(&requests, &order, &[6, 0], 4, 128, 2048);
+        assert_eq!((expanded.rows, expanded.prefill_rows), (6, 0));
     }
 }
