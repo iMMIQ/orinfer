@@ -3,22 +3,22 @@
   "minimum_age_days": 7,
   "files": {
     ".github/workflows/check.yml": "ee51369f2f0d8e41897d9cefaa1974e22a97b7fef03ed6cd6d7214c3a6e389f5",
-    "Cargo.lock": "412d4bebf016df2d9335bdfc8b3a4faa304dc062730476fcd7924ccd780e0074",
-    "Cargo.toml": "d5839605d03cea62906be2a6e33e9238288b4753901698f78492093c6cb225ef",
+    "Cargo.lock": "5b0b0ec7ad95c0848e94d922cbb563a3fe83122b69df21b6052b0726e0f88de0",
+    "Cargo.toml": "ab64a1f18d5b5a2d82557c5ea91d46a8f2a4abd5a1bf8bc4254db5edfee03f29",
     "crates/orinfer-api/Cargo.toml": "4468804dbcebd698e4fb36514837eba18c4132b05ba000a8b5d31718c85dd16f",
     "crates/orinfer-cli/Cargo.toml": "e82066f8646b3da4bfe4e52dbfa0a375e61591c1640391a326752de13c5f4c97",
     "crates/orinfer-device/Cargo.toml": "8218a7da5e10a7d5d8ce3edc624bf21836f5bd7e414bd4879b4380d59bcf00e1",
     "crates/orinfer-engine/Cargo.toml": "f51a4dbf1b2b50d2b8acd351cc45dfd0fc0a5af24e8dbf112406484a6a44b8b8",
     "crates/orinfer-model-sdk/Cargo.toml": "eb920bb9790a8373ccb936ba6a0d60e4137be4f22aff82bd4a5600bc394896fe",
     "crates/orinfer-models/Cargo.toml": "063350fde5ba0c4e9ecac33778ecdb06c453dae0702d144df25718384e6d8a61",
-    "pyproject.toml": "8353d154b59f80eca67ad14b36ed5f09d18bdcc67c179eed30dd4b3fcd6e878e",
+    "pyproject.toml": "3fe48bb0465a6847da57c08bda2a24b28401595f3681b4408360d57b9c040721",
     "rust-toolchain.toml": "b9c8d2d59f6f46474c0cfa0b8b77bea21d94fc73a30ad93d5bf6385c422197d2",
     "tools/build/jetson_wheels.json": "435e70191f25563446812566da873e69200bd0471958b0adaa021026fc5ab4b4",
     "tools/environments/ascend/Dockerfile": "bd7f5808824f17306b0bfc3752bd658610fce22126aa8ee151c44952a131b5ca",
     "tools/environments/ascend/run.sh": "6ed71b8f0e46130e12e692b3b8d6c73417c2f4d14a145f6f68e07e36168784b6",
-    "tools/environments/cuda/pyproject.toml": "72f196c9294d4a918a2027a02bebcf4d09e79a9169026e1630c6d23511910284",
-    "tools/environments/cuda/uv.lock": "37c5076c58f740429f37825bc283454c8c9c63c68b16cbd94d20186c1b560f97",
-    "uv.lock": "b65f02824c50a96dcf83464e671e216808ad89af2542fa5ff9e9bcb8fc0f6171"
+    "tools/environments/cuda/pyproject.toml": "c7dcda4355c0e17c4d7eda0d86fb4ba5c6d9f5aba799d0a6c72ba8f48c79eb65",
+    "tools/environments/cuda/uv.lock": "848ffea21024e733f7db5d97aea0b16a59687ad3c44bdf4c9ebab19ec8a91766",
+    "uv.lock": "81b199beef962c58f6527fdbe92f9e0d0870c9db9fa2500a0f57ebc4dd209660"
   },
   "releases": {
     "action/actions/checkout@v7.0.1": {
