@@ -6,18 +6,53 @@ pub(super) struct Pool {
     pub memory: Arc<tokio::sync::Semaphore>,
     bodies: Arc<tokio::sync::Semaphore>,
     pub images: Arc<super::image::cache::Cache>,
+    pub worker_count: usize,
+    statistics: std::sync::Mutex<Statistics>,
 }
 impl Pool {
     pub fn new(limits: Limits) -> Self {
+        let worker_count = limits.workers();
         Self {
             bodies: Arc::new(tokio::sync::Semaphore::new(16)),
-            workers: Arc::new(tokio::sync::Semaphore::new(limits.preprocess_workers)),
+            workers: Arc::new(tokio::sync::Semaphore::new(worker_count)),
             memory: Arc::new(tokio::sync::Semaphore::new(limits.memory_mib)),
             images: Arc::new(super::image::cache::Cache::new(
                 limits.image_cache_mib << 20,
             )),
+            worker_count,
+            statistics: Default::default(),
         }
     }
+    pub fn observe(&self, timing: &Timing, failed: bool) {
+        let mut statistics = self.statistics.lock().unwrap_or_else(|e| e.into_inner());
+        statistics.requests += 1;
+        statistics.failures += usize::from(failed);
+        statistics.timing.memory_wait_s += timing.memory_wait_s;
+        statistics.timing.worker_wait_s += timing.worker_wait_s;
+        statistics.timing.normalize_s += timing.normalize_s;
+        statistics.timing.render_s += timing.render_s;
+        statistics.timing.tokenize_s += timing.tokenize_s;
+        statistics.timing.prepare_s += timing.prepare_s;
+    }
+    pub fn statistics(&self) -> serde_json::Value {
+        let statistics = self.statistics.lock().unwrap_or_else(|e| e.into_inner());
+        json!({"workers":self.worker_count,"requests":statistics.requests,"failures":statistics.failures,"timing":statistics.timing})
+    }
+}
+#[derive(Clone, Default, serde::Serialize)]
+pub(super) struct Timing {
+    pub memory_wait_s: f64,
+    pub worker_wait_s: f64,
+    pub normalize_s: f64,
+    pub render_s: f64,
+    pub tokenize_s: f64,
+    pub prepare_s: f64,
+}
+#[derive(Default)]
+struct Statistics {
+    requests: usize,
+    failures: usize,
+    timing: Timing,
 }
 #[derive(Default)]
 pub(super) struct Cancellation(Arc<AtomicBool>);
@@ -32,6 +67,7 @@ impl Drop for Cancellation {
     }
 }
 pub(super) struct Context {
+    pub timing: Timing,
     pub images: Option<Arc<super::image::cache::Cache>>,
     cancelled: Arc<AtomicBool>,
     budget: usize,
@@ -42,6 +78,7 @@ pub(super) struct Context {
 impl Context {
     pub fn new(cancelled: Arc<AtomicBool>, budget: usize) -> Self {
         Self {
+            timing: Timing::default(),
             images: None,
             cancelled,
             budget,

@@ -307,6 +307,8 @@ async fn health(State(state): State<Service>) -> Response {
         "resident_experts":state.resident_experts,
         "default_request_params":state.default_request_params.as_ref(),
         "image_preprocess_cache":state.preparation.images.statistics(),
+        "preparation_statistics":state.preparation.statistics(),
+        "tokenization_cache":state.codec.boundary.as_ref().map(|b| b.cache_statistics()),
         "image_limits":{"history_tokens":state.vision.as_ref().map(|v|v.max_features),"tokens_per_image":state.vision.as_ref().and_then(|v|v.max_image_tokens),"request_body_mib":state.limits.request_body_mib},
         "chat_capabilities":{"streaming":true,"default_stream":state.default_request_params.get("stream").and_then(Value::as_bool).unwrap_or(false),"max_choices":1,
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
@@ -393,6 +395,8 @@ async fn prepare_chat(
             "Request exceeds preprocessing memory budget",
         );
     }
+    let mut timing = preparation::Timing::default();
+    let waiting = Instant::now();
     let mut memory = match Arc::clone(&state.preparation.memory)
         .acquire_many_owned(memory_mib)
         .await
@@ -405,10 +409,13 @@ async fn prepare_chat(
             );
         }
     };
+    timing.memory_wait_s = waiting.elapsed().as_secs_f64();
+    let waiting = Instant::now();
     let cpu = match Arc::clone(&state.preparation.workers).acquire_owned().await {
         Ok(permit) => permit,
         Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "Preprocessing unavailable"),
     };
+    timing.worker_wait_s = waiting.elapsed().as_secs_f64();
     let codec = Arc::clone(&state.codec);
     let model = Arc::clone(&state.model);
     let context = state.context;
@@ -416,20 +423,35 @@ async fn prepare_chat(
     let image_cache = Arc::clone(&state.preparation.images);
     let cancellation = preparation::Cancellation::default();
     let flag = cancellation.flag();
+    let pool = Arc::clone(&state.preparation);
     let prepared = match tokio::task::spawn_blocking(move || {
         // Admission and memory belong to actual work, including after handler cancellation.
         let _cpu = cpu;
         let _body = body;
         let mut preparation = estimate.context(flag);
         preparation.images = Some(image_cache);
-        preparation.checkpoint(0)?;
-        let prepared =
-            codec.prepare(request, &model, context, vision.as_ref(), &mut preparation)?;
-        preparation.checkpoint(0)?;
-        if !prepared.audios.is_empty() || !prepared.images.is_empty() {
-            preparation.release_media_scratch(&mut memory);
-        }
-        Ok::<_, String>((prepared, slot, preparation.lease(memory)))
+        preparation.timing = timing;
+        let started = Instant::now();
+        let result = (|| -> Result<_> {
+            preparation.checkpoint(0)?;
+            let prepared =
+                codec.prepare(request, &model, context, vision.as_ref(), &mut preparation)?;
+            preparation.checkpoint(0)?;
+            if !prepared.audios.is_empty() || !prepared.images.is_empty() {
+                preparation.release_media_scratch(&mut memory);
+            }
+            Ok(prepared)
+        })();
+        preparation.timing.prepare_s = started.elapsed().as_secs_f64();
+        pool.observe(&preparation.timing, result.is_err());
+        result.map(|prepared| {
+            (
+                prepared,
+                slot,
+                preparation.lease(memory),
+                preparation.timing,
+            )
+        })
     })
     .await
     {
@@ -437,7 +459,7 @@ async fn prepare_chat(
         Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, e),
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    let (prepared, slot, memory) = prepared;
+    let (prepared, slot, memory, timing) = prepared;
     let memory = Arc::new(memory);
     if !state.activity.lifecycle.is_ready() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker is not ready");
@@ -470,6 +492,11 @@ async fn prepare_chat(
         hint: None,
         shared_prefix: None,
     };
+    eprintln!(
+        "{}: preparation {}",
+        job.id,
+        serde_json::to_string(&timing).unwrap()
+    );
     if let Err(e) = state.jobs.try_send(job) {
         return match e {
             mpsc::error::TrySendError::Full(_) => {

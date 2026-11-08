@@ -28,7 +28,7 @@ def manifests(model):
     names.update(op["manifest"] for op in model.get("vision", {}).get("body", []))
     names.update(
         model.get("sampling", {}).get(k)
-        for k in ("local", "merge")
+        for k in ("local", "merge", "processed_local", "processed_merge")
         if model.get("sampling", {}).get(k)
     )
     return sorted(names)

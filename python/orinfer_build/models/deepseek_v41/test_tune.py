@@ -21,6 +21,25 @@ from orinfer_build.models.deepseek_v41.tune_auxiliary import (
 
 
 class AuxiliaryHeadTests(unittest.TestCase):
+    def test_row_tile_search_preserves_the_published_arithmetic_schedule(self):
+        parameters = dict(
+            integer=True,
+            output=4096,
+            reduction=1280,
+            tile_m=256,
+            tile_n=128,
+            block_k=256,
+            pipeline_stages=3,
+        )
+        configs = projection_configs(parameters, row_tile_only=True)
+        self.assertEqual(configs[0]["tile_m"], 256)
+        self.assertEqual({c["tile_m"] for c in configs}, {64, 128, 256})
+        for config in configs:
+            self.assertEqual(
+                {k: v for k, v in config.items() if k != "tile_m"},
+                {k: parameters[k] for k in config if k != "tile_m"},
+            )
+
     def test_library_search_options_are_checked_before_device_setup(self):
         for options in [
             dict(joint=True, pipeline_only=True),

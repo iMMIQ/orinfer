@@ -95,6 +95,13 @@ class ReleaseExportTests(unittest.TestCase):
                     )
                 ],
             )
+            model["sampling"] = {}
+            for role in ("processed_local", "processed_merge"):
+                directory = source / role
+                directory.mkdir()
+                (directory / "kernel.so").write_bytes(original)
+                (directory / "kernel.json").write_text(json.dumps(spec))
+                model["sampling"][role] = f"{role}/kernel.json"
             (source / "model.json").write_text(json.dumps(model, indent=2))
             (source / "package.json").write_text(
                 json.dumps(
@@ -106,6 +113,10 @@ class ReleaseExportTests(unittest.TestCase):
                 )
             )
             output = publish_execution(source, root / "cache")
+            for role in model["sampling"]:
+                self.assertEqual(
+                    runtime_sections(library), runtime_sections(output / role / "kernel.so")
+                )
             self.assertEqual(library.read_bytes(), original)
             self.assertEqual(runtime_sections(library), runtime_sections(output / "op/kernel.so"))
             self.assertLess((output / "op/kernel.so").stat().st_size, len(original))

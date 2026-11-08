@@ -282,6 +282,7 @@ impl ChatCodec {
         vision: Option<&orinfer_engine::vision::VisionSpec>,
         preparation: &mut super::preparation::Context,
     ) -> Result<Prepared> {
+        let normalize_started = std::time::Instant::now();
         preparation.checkpoint(0)?;
         request.resolve_template_options()?;
         let preserve_thinking_override = request.template_bool("preserve_thinking")?;
@@ -643,6 +644,8 @@ impl ChatCodec {
             tool_schemas => Serde(&tool_schemas), deepseek_effort => deepseek_effort,
             canonical_tools => !native_tools && constraint.is_some() && !tools.is_empty(),
         };
+        preparation.timing.normalize_s += normalize_started.elapsed().as_secs_f64();
+        let render_started = std::time::Instant::now();
         let mut rendered = self
             .template
             .get_template("chat")
@@ -659,6 +662,8 @@ impl ChatCodec {
                 super::audio::language(&language)?
             ));
         }
+        preparation.timing.render_s += render_started.elapsed().as_secs_f64();
+        let tokenize_started = std::time::Instant::now();
         let input = if let Some(boundary) = &self.boundary {
             boundary.encode(&rendered)?
         } else {
@@ -668,6 +673,7 @@ impl ChatCodec {
                 .get_ids()
                 .to_vec()
         };
+        preparation.timing.tokenize_s += tokenize_started.elapsed().as_secs_f64();
         let input = if let Some(v) = vision {
             v.expand(&input, &images, context_limit)?
         } else {

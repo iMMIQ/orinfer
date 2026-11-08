@@ -314,7 +314,7 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 | `--prefill-budget-ms` | `200` | `latency` 混合块的预测耗时上限，非严格延迟上限 |
 | `--target-tpot-ms` | `400` | `latency` 引擎提交 token 的软间隔目标 |
 | `--memory-reserve-mib` | `1024` | 系统余量以外的准入保留内存 |
-| `--preprocess-workers` | `2` | 同时执行图片/模板/tokenizer CPU 任务数 |
+| `--preprocess-workers` | `auto` | 按可用 CPU 与前处理内存预算选择 1–8 个任务；显式 1–32 覆盖自动选择 |
 | `--preprocess-memory-mib` | `2048` | 预处理和排队图片张量预算 |
 | `--image-cache-mib` | `256` | 额外的图片原始数据和前处理结果 LRU 缓存；0 关闭缓存和 UUID 引用 |
 | `--request-body-mib` | `32` | HTTP 请求体上限；最大为预处理内存预算的八分之一 |
@@ -326,6 +326,10 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 默认 `latency` 策略按完整迭代成本选择联合或独立 prefill。计时包含输入准备、target、输出头、每次请求必需的 MTP warm、状态提交及采样；分层 prefill 累加实际执行片段，暂停等待另计。首次执行用于预热，后续热态样本的均值用于收益比较，上界用于延迟预算。未校准和过期联合形状可在模型级共享探索预算内重新测量；该预算与 MTP 共用，混合包的 prefill 固定成本只计算一次，新增输出按普通 decode 热态成本比较；按完整动作的实际收益或亏损结算，换请求或形状不会重置补贴。联合形状试跑时使用普通 decode，完成热态校准后再选择 MTP 深度，避免同轮重复占用探索预算。等待校准的 prefill 暂停新的 MTP 探索，让正常执行偿还共享债务后优先获得试跑机会；该优先机会在工作负载停止出现后自动过期。多个冷请求到达时保留长请求的原生大块。混合 batch 与独立 prefill 共用 decode 时间预算，执行 prompt 工作后会留出受 `--prefill-budget-ms` 和 `--target-tpot-ms` 限制的连续 decode 时间，期间允许 MTP；等待过久的 prefill 保留推进机会。`throughput` 策略放开时间配额和冷 prefill 数限制，沿用相同成本学习和探索预算，仍保留内存准入与请求隔离，适合[离线任务](batch.md)。`/health` 的 `independent_prefill_choices`、`joint_prefill_choices` 和 `decode_burst_iterations` 可核对实际选择。请求日志分别记录排队、从进入模型队列起的首 token 时延、生成总时长和 thinking token 数；首 token 指引擎提交，可能早于客户端可见的完整文本。
 
 `/health` 显示 starting/ready/draining/failed，并提供调度、准入、缓存恢复和 Graph 统计。GPU worker 故障时返回 503；CUDA 或内部状态故障后需要重启服务。统计和真实 API 性能测量见[性能工具](../tools/bench/README.md)。
+
+前处理自动并发为可用 CPU 数除以 4，限制在 1–8，再受每个任务 256 MiB 的预算估计约束；实际请求仍按原始内存估算获取许可。`/health.preparation_statistics` 发布实际并发、请求数及内存等待、任务等待、模板前准备、模板渲染、token 编码和总准备时间。`prepare_s` 是阻塞 CPU 任务的执行总时长，包含内部阶段；内存与任务等待另计。请求的 `preparation` 日志记录同一组时间；这些累计时间包含并发重叠。
+
+DeepSeek 前端在每个模型 worker 内使用 64 MiB 的有界文本编码缓存，独立于图片缓存及在途请求预算。缓存仅复用控制 token 之间完整、原文完全相同且至少 1 KiB 的文本区段，保留控制 token 身份及原始 BPE 边界；变更文本重新编码。`/health.tokenization_cache` 显示字节预算、驻留、命中、复用 token 和淘汰数。此缓存持有当前 tokenizer 的编码结果，随模型 worker 一同释放。
 
 A2 启用 DSpark 时，`scheduler_statistics.speculation` 同步发布模型级累计草稿、接受、提交计数及分段耗时。草稿、验证和恢复计时包含设备等待与结果回读，采样计时记录 CPU 验证与提交；各请求日志中的整包耗时不能跨请求直接累加。通过同一健康快照的计数差值分析稳定 decode 窗口。
 

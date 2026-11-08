@@ -307,6 +307,8 @@ bash tools/environments/ascend/run.sh --without-devices \
 
 设备调优时去掉 `--without-devices`，增加 `--shared-attention --tune-projections local --model-dir MODEL_DIR`。调优使用真实权重，默认覆盖局部容量内的所有 1–128 行和更大行数采样，检查输出尾部、scratch 边界及改变输入后的 Graph replay。共享选择组件按逐测量点至多 5% 回退的限制选择一个通用配置；只有完整测量全部整数的短行区间才生成局部 `row_selections`。相邻区间仅在实现相同时合并，发布前再按 packet 的实际调度范围和截短边界裁掉不可达的选择与库。执行器复用 SDK 的 `KernelVariant` 和行数算术，在准备 Graph 时消费选择表；在线执行保持编译好的同源实现。替换实现必须保持源码、编译器、权重、dtype、scale、数学参数和非 scratch 操作数一致，scratch 可以使用已分配范围内的较小视图。
 
+直接使用 `orinfer_build.models.deepseek_v41.tune` 时，`--row-tile-only` 限定搜索 M64/M128/M256 及已发布的 M tile，保留 N/K tile 和流水级数。配合 `--geometry N K` 可限定实测矩阵几何。输入计划与编译源码保持同一身份；短行选择仍复用完整整数区间测量和共享选择表，大行数保留受回退约束选出的通用实现。
+
 独立投影调优入口 `orinfer_build.models.deepseek_v41.tune` 支持用 `--geometry N K --min-capacity M --rows ...` 限定矩阵和容量。只测量大行数时保留已发布的 1–128 行选择及默认回退，较大行数共同选择一个动态配置。`--joint` 为满足几何的整数投影增加 96／192 列 tile，沿用同一计算体与舍入边界。`--weight-buffers 16` 轮换同值、不同地址的真实权重副本，使 Graph 测量覆盖多层权重工作集；副本仅用于离线测量，配置和副本数计入调优缓存身份。最终执行包只发布被选择的库，完整请求与 Mini 收益另行验收。
 
 `--packet-cache-capacity N` 限制每个 rank 的 Graph 形状缓存，默认 64、范围 4–4096；普通单行 decode 常驻，其余按最近使用顺序淘汰。相同几何和 GPU 指针的 ACLNN W4 计划由仍存活的 Graph 共享；Graph 和完成事件持有原生资源。请求重置按模板中声明的状态去重，与缓存过多少种形状无关。离线构建穷举行数表达式和物理范围，在线保留实际行数、操作数和 ABI 校验。

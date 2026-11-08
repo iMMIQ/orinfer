@@ -2,6 +2,7 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
 use tokenizers::{AddedVocabulary, Tokenizer};
+mod cache;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -10,6 +11,7 @@ pub(super) struct Boundary {
     tokens: BTreeMap<String, u32>,
     prefix: String,
     output: BTreeMap<u32, &'static str>,
+    cache: cache::Cache,
 }
 
 impl Boundary {
@@ -21,6 +23,7 @@ impl Boundary {
         plain.with_padding(None);
         Ok(Self {
             plain,
+            cache: cache::Cache::new(64 << 20),
             tokens: tokenizer
                 .get_added_vocabulary()
                 .get_vocab()
@@ -42,6 +45,9 @@ impl Boundary {
     }
     pub fn output_control(&self, id: u32) -> Option<&str> {
         self.output.get(&id).copied()
+    }
+    pub fn cache_statistics(&self) -> serde_json::Value {
+        serde_json::to_value(self.cache.statistics()).unwrap()
     }
     pub fn control(&self, spelling: &str) -> Result<String> {
         let id = self
@@ -111,13 +117,39 @@ impl Boundary {
         regions.push(plain);
         // Like Recipe's PromptTokenizer, plain regions are one tokenizer batch
         // without added vocabulary. Controls bypass text tokenization entirely.
-        let encoded = self
-            .plain
-            .encode_batch_fast(regions, false)
-            .map_err(|e| e.to_string())?;
+        let mut encoded = regions
+            .iter()
+            .map(|text| self.cache.get(text))
+            .collect::<Vec<_>>();
+        let missing = encoded
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tokens)| tokens.is_none().then_some(i))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            // No cache lock is held while the tokenizer's shared workers run.
+            let values = self
+                .plain
+                .encode_batch_fast(
+                    missing
+                        .iter()
+                        .map(|&i| regions[i].as_str())
+                        .collect::<Vec<_>>(),
+                    false,
+                )
+                .map_err(|e| e.to_string())?;
+            for (index, value) in missing.into_iter().zip(values) {
+                let tokens: std::sync::Arc<[u32]> = value.get_ids().into();
+                self.cache.insert(
+                    std::mem::take(&mut regions[index]),
+                    std::sync::Arc::clone(&tokens),
+                );
+                encoded[index] = Some(tokens);
+            }
+        }
         let mut ids = Vec::new();
         for (index, region) in encoded.iter().enumerate() {
-            ids.extend_from_slice(region.get_ids());
+            ids.extend_from_slice(region.as_ref().unwrap());
             if let Some(&id) = controls.get(index) {
                 ids.push(id);
             }
@@ -199,6 +231,48 @@ pub(super) mod tests {
         codec
     }
     use serde_json::json;
+
+    #[test]
+    fn cached_plain_regions_keep_changed_text_controls_and_parallel_requests_exact() {
+        let tokenizer = tokenizer();
+        let mut boundary = Boundary::new(&tokenizer).unwrap();
+        boundary.cache = cache::Cache::new((64 << 10) + 18000);
+        let control = boundary.control("<｜User｜>").unwrap();
+        let text = "中文 literal </think> and plain text. ".repeat(40);
+        let request = format!("{control}{text}");
+        let cold = boundary.encode(&request).unwrap();
+        let mut expected = vec![tokenizer.token_to_id("<｜User｜>").unwrap()];
+        expected.extend_from_slice(
+            boundary
+                .plain
+                .encode(text.as_str(), false)
+                .unwrap()
+                .get_ids(),
+        );
+        assert_eq!(cold, expected);
+        assert_eq!(boundary.encode(&request).unwrap(), expected);
+        assert!(boundary.cache.statistics().hits > 0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| assert_eq!(boundary.encode(&request).unwrap(), expected));
+            }
+        });
+        let changed = format!("{text} changed suffix");
+        let mut expected_changed = vec![tokenizer.token_to_id("<｜User｜>").unwrap()];
+        expected_changed.extend_from_slice(
+            boundary
+                .plain
+                .encode(changed.as_str(), false)
+                .unwrap()
+                .get_ids(),
+        );
+        assert_eq!(
+            boundary.encode(&format!("{control}{changed}")).unwrap(),
+            expected_changed
+        );
+        assert!(boundary.cache.statistics().resident_bytes <= (64 << 10) + 18000);
+        assert!(!cold.contains(&tokenizer.token_to_id("</think>").unwrap()));
+    }
 
     #[test]
     fn explicit_controls_and_literal_handles_have_separate_provenance() {

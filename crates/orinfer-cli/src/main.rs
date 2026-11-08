@@ -276,7 +276,8 @@ struct InferenceArgs {
     target_tpot_ms: f64,
     #[arg(long = "memory-reserve-mib", value_name = "MIB", default_value_t = ServerConfig::default().scheduler.memory_reserve_bytes >> 20, value_parser = parse_cache_mib)]
     memory_reserve_bytes: usize,
-    #[arg(long, default_value_t = PreprocessingLimits::default().preprocess_workers)]
+    /// auto selects 1..8 preprocessing tasks from CPU and memory budgets; explicit 1..32 overrides it.
+    #[arg(long, default_value = "auto", value_parser = parse_preprocess_workers)]
     preprocess_workers: usize,
     #[arg(long, default_value_t = PreprocessingLimits::default().memory_mib)]
     preprocess_memory_mib: usize,
@@ -403,6 +404,17 @@ impl From<BatchArgs> for BatchConfig {
         }
     }
 }
+fn parse_preprocess_workers(value: &str) -> Result<usize, String> {
+    if value == "auto" || value == "0" {
+        return Ok(0);
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=32).contains(n))
+        .ok_or_else(|| "Preprocess workers must be auto or 1..32".into())
+}
+
 fn parse_request_defaults(
     value: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
@@ -1154,6 +1166,22 @@ mod tests {
     }
     #[test]
     fn model_subcommands_support_equals_and_reject_extra_positionals() {
+        assert_eq!(serve(&[]).unwrap().limits.preprocess_workers, 0);
+        assert_eq!(
+            serve(&["--preprocess-workers", "auto"])
+                .unwrap()
+                .limits
+                .preprocess_workers,
+            0
+        );
+        assert_eq!(
+            serve(&["--preprocess-workers", "8"])
+                .unwrap()
+                .limits
+                .preprocess_workers,
+            8
+        );
+        assert!(serve(&["--preprocess-workers", "33"]).is_err());
         let cli = Cli::try_parse_from([
             "orinfer",
             "run-model",

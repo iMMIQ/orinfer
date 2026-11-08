@@ -127,7 +127,7 @@ impl ServerConfig {
         if self.resident_experts == ResidentExperts::Count(0) {
             return Err("Resident expert count must be positive".into());
         }
-        if !(1..=32).contains(&self.limits.preprocess_workers)
+        if self.limits.preprocess_workers > 32
             || !(512..=16384).contains(&self.limits.memory_mib)
             || self.limits.image_cache_mib > 16384
             || !(1..=self.limits.memory_mib / 8).contains(&self.limits.request_body_mib)
@@ -142,6 +142,7 @@ impl ServerConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PreprocessingLimits {
+    /// 0 selects a CPU- and memory-bounded worker count at service startup.
     pub preprocess_workers: usize,
     pub memory_mib: usize,
     /// Retained immutable image assets; separate from in-flight preparation.
@@ -154,7 +155,7 @@ pub struct PreprocessingLimits {
 impl Default for PreprocessingLimits {
     fn default() -> Self {
         Self {
-            preprocess_workers: 2,
+            preprocess_workers: 0,
             memory_mib: 2048,
             image_cache_mib: 256,
             request_body_mib: 32,
@@ -164,10 +165,37 @@ impl Default for PreprocessingLimits {
         }
     }
 }
+impl PreprocessingLimits {
+    pub(crate) fn workers_for(&self, cpus: usize) -> usize {
+        if self.preprocess_workers > 0 {
+            self.preprocess_workers
+        } else {
+            (cpus / 4)
+                .clamp(1, 8)
+                .min((self.memory_mib / 256).clamp(1, 8))
+        }
+    }
+    pub(crate) fn workers(&self) -> usize {
+        self.workers_for(std::thread::available_parallelism().map_or(1, usize::from))
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_preparation_respects_cpu_memory_and_manual_limits() {
+        let mut limits = PreprocessingLimits::default();
+        assert_eq!(limits.workers_for(96), 8);
+        assert_eq!(limits.workers_for(192), 8);
+        assert_eq!(limits.workers_for(12), 3);
+        assert_eq!(limits.workers_for(1), 1);
+        limits.memory_mib = 512;
+        assert_eq!(limits.workers_for(96), 2);
+        limits.preprocess_workers = 5;
+        assert_eq!(limits.workers_for(1), 5);
+    }
 
     #[test]
     fn programmatic_configuration_obeys_the_same_limits() {

@@ -25,7 +25,9 @@ from orinfer_build.contracts.row_selection import bounded_choices, guarded_winne
 from orinfer_build.tuning.tuning import compile_candidates, measure, read_record, record_path
 
 
-def projection_configs(parameters, pipeline_only=False, wide_integer=False, joint=False):
+def projection_configs(
+    parameters, pipeline_only=False, wide_integer=False, joint=False, row_tile_only=False
+):
     baseline = {
         key: parameters.get(key, default)
         for key, default in (
@@ -35,7 +37,9 @@ def projection_configs(parameters, pipeline_only=False, wide_integer=False, join
             ("pipeline_stages", 0),
         )
     }
-    if joint:
+    if row_tile_only:
+        configs = [dict(baseline, tile_m=m) for m in sorted({baseline["tile_m"], 64, 128, 256})]
+    elif joint:
         configs = [
             dict(baseline, tile_m=m, tile_n=n, block_k=k, pipeline_stages=s)
             for m, n, k, s in (
@@ -161,11 +165,21 @@ class Options:
     bf16_output: bool = False
     joint: bool = False
     wide_integer: bool = False
+    row_tile_only: bool = False
 
 
 def tune(args: Options):
     if (
-        sum((args.grid_only, args.pipeline_only, args.bf16_output, args.joint, args.wide_integer))
+        sum(
+            (
+                args.grid_only,
+                args.pipeline_only,
+                args.bf16_output,
+                args.joint,
+                args.wide_integer,
+                args.row_tile_only,
+            )
+        )
         > 1
     ):
         raise ValueError("Choose one projection search mode")
@@ -257,7 +271,9 @@ def tune(args: Options):
             if parameters["integer"]
             else None
         )
-        configs = projection_configs(parameters, args.pipeline_only, args.wide_integer, args.joint)
+        configs = projection_configs(
+            parameters, args.pipeline_only, args.wide_integer, args.joint, args.row_tile_only
+        )
         if args.bf16_output:
             current = parameters.get("unit_scale", False)
             configs = [dict(configs[0], unit_scale=unit) for unit in (current, not current)]
@@ -574,6 +590,11 @@ def main():
         help="Compare shared BF16 Vector and direct Fixpipe output after verifying unit scales",
     )
     search.add_argument("--joint", action="store_true", help="Joint M/N/K/pipeline candidates")
+    search.add_argument(
+        "--row-tile-only",
+        action="store_true",
+        help="Compare M64/M128/M256 while preserving the published N/K/pipeline schedule",
+    )
     search.add_argument(
         "--wide-integer",
         action="store_true",

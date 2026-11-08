@@ -44,7 +44,7 @@ impl Default for WorkerOptions {
             load_workers: None,
             verify_weights: false,
             prompt_lookup: false,
-            preprocess_workers: 2,
+            preprocess_workers: 0,
             preprocess_memory_mib: 2048,
             image_cache_mib: 256,
             request_body_mib: 32,
@@ -142,7 +142,11 @@ impl WorkerOptions {
             "--target-tpot-ms".into(),
             self.target_tpot_ms.to_string(),
             "--preprocess-workers".into(),
-            self.preprocess_workers.to_string(),
+            if self.preprocess_workers == 0 {
+                "auto".into()
+            } else {
+                self.preprocess_workers.to_string()
+            },
             "--preprocess-memory-mib".into(),
             self.preprocess_memory_mib.to_string(),
             "--image-cache-mib".into(),

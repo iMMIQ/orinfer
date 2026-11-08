@@ -6,6 +6,8 @@
 
 回放顺序使用 seed 42；模型采样通过 `--sampling-seed` 单独固定，默认 `20261002`，实际值写入请求和 provenance。配对时两个 seed 均保持一致。早期未指定模型 seed 的回放只能用于诊断，不能把自然生成、草稿接受率和验证轮数的差异直接归因于代码。默认高性能通信仍可能使不同 batch 的数值和输出轨迹不同，性能对比同时记录接受率、执行轮数及缓存命中。
 
+DSv4.1 A2 当前性能验收使用发布版 0.3.3 的温度 0 作为基线，候选使用温度 1、top_p=1；输入、并发、输出长度、DSpark 配置和缓存命中保持可比。候选须在真实采样及接受轨迹下保持端到端性能。同温度 1 的旧版对照单独报告，不能代替温度 0 基线验收。长输入突发同时记录前处理各阶段及任务等待，区分客户端 TTFT、模型入队后首输出和真正的计算成本。
+
 十分钟持续压力回放使用 `--wall-limit 600 --benchmark-duration 600 --request-count 100000 --concurrency 16`；较大的请求预算避免默认 64 个请求提前结束。总窗口包含冷请求 warmup，另行报告正式回放窗口；到点停止的在途请求单列。`--backend vllm --deployment-spec /path/to/deployment.json` 可对已运行的 vLLM 服务使用同一客户端；配置记录需包含 `method: "dspark"` 和与 `--mtp-drafts` 一致的 `num_speculative_tokens`，实际启用情况另由服务启动日志及投机计数确认。`--enable-thinking` 使用共同的 `reasoning_effort: "high"` 和 `chat_template_kwargs.enable_thinking: true`。部署参数、模型上下文、KV 精度与 CPU offload 预算分别记录；不同后端的进程采样只代表指定 PID。闭环回放后续循环的 lane 分配可能随速度改变，共同请求比较以导出的实际 payload 一致为准。
 
 ## DSv4.1 A2 单流 decode（2026-10-28）
