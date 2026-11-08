@@ -1079,7 +1079,12 @@ impl Runtime {
             return Err("Insufficient A2 workspace after reclaiming cached state".into());
         }
         let shared = packet::mark_shared(&selected, requests);
-        let work = packet::work(&selected, requests, prefill_rows);
+        let work = packet::work(
+            &selected,
+            requests,
+            prefill_rows,
+            self.final_decoder_window(),
+        );
         self.speculation_policy.begin_round(
             selected
                 .iter()

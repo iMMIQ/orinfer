@@ -273,6 +273,7 @@ pub(super) struct Timing {
     pub replay: bool,
     pub setup: f64,
     pub shared: bool,
+    pub shared_mask: u64,
     pub shared_setup: f64,
     pub mask_rows: usize,
     pub report_rows: usize,
@@ -1067,7 +1068,8 @@ fn forward_with(
         let states = read(exchange(peers, Command::Shared(layout.clone()))?)?;
         let slack = budget.map_or(f64::INFINITY, |b| b.slack_s - b.direct_s.unwrap_or(0.))
             - started.elapsed().as_secs_f64();
-        let (ready, candidate) = super::shared::plan(&states, slack)?;
+        let (ready, candidate) =
+            super::shared::plan(&states, slack, budget.map_or(f64::INFINITY, |b| b.uses))?;
         shared = ready;
         if let Some(id) = candidate {
             if let Some(maintenance) = maintenance.take() {
@@ -1076,7 +1078,7 @@ fn forward_with(
             let capture_started = Instant::now();
             let states = read(exchange(peers, Command::CaptureShared(layout.clone(), id))?)?;
             shared_setup = capture_started.elapsed().as_secs_f64();
-            shared = super::shared::plan(&states, -1.)?.0;
+            shared = super::shared::plan(&states, -1., 0.)?.0;
         }
     }
     let prepare_s = started.elapsed().as_secs_f64();
@@ -1092,6 +1094,16 @@ fn forward_with(
             serde_json::json!({"rows":layout.rows.total,"pieces":shared.len(),"setup_s":shared_setup})
         );
     }
+    // Price each actual fragment combination independently; one ready source
+    // piece cannot lend its cost to a packet replaying a different set.
+    let shared_mask = if shared_mode {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        shared.hash(&mut hash);
+        hash.finish().max(2)
+    } else {
+        0
+    };
     let sampled = !readout.draws.is_empty();
     let readout_rejection_empty = readout.rejection.is_empty();
     let parameters = Arc::clone(&readout.parameters);
@@ -1184,6 +1196,7 @@ fn forward_with(
             preparation: prepare_s,
             replay: capture,
             shared: shared_mode,
+            shared_mask,
             shared_setup,
             setup: if cached_prepare {
                 shared_setup

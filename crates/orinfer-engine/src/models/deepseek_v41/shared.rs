@@ -1,14 +1,14 @@
-//! Stable, owner-independent pieces of a bound packet. Kernels stay unchanged.
+//! Stable address-table pieces of a bound packet. Kernels stay unchanged.
 use super::*;
 use std::{cell::RefCell, ops::Range};
 
 pub(super) fn enabled() -> bool {
-    std::env::var("ORINFER_A2_SHARED_GRAPH").is_ok_and(|v| v == "1")
+    std::env::var("ORINFER_A2_SHARED_GRAPH").map_or(true, |v| v == "1")
 }
 
 pub(super) fn eligible(layout: &batch::Layout) -> bool {
-    // Small verifier/draft cohorts use the existing whole-packet path. The
-    // shared FFN capture budget is reserved for large source-row packets.
+    // Small verifier/draft cohorts use their whole-packet path. Large source
+    // prefixes may remain identical while the decoder suffix shape changes.
     layout.role == PacketRole::Target && !layout.decode && layout.rows.total >= 512
 }
 
@@ -18,6 +18,7 @@ enum Binding {
     Gather(usize, usize, u64, Element),
     Reduce(usize, usize, u64, Element, bool),
     W4(usize),
+    Exchange(usize, usize, Vec<u64>, Vec<u64>, Element),
     Fork,
     Switch,
     Join,
@@ -68,6 +69,7 @@ pub(super) struct Entry {
     segment: Rc<Segment>,
     graph: RefCell<Option<Rc<crate::backend::ascend::graph::Graph>>>,
     uses: Cell<usize>,
+    variants: Cell<usize>,
     active: Cell<bool>,
     tick: Cell<u64>,
 }
@@ -89,9 +91,14 @@ pub(super) struct State {
     pub id: String,
     pub ready: bool,
     pub uses: usize,
+    pub variants: usize,
     pub capture_s: f64,
 }
-pub(super) fn plan(states: &[Vec<State>], slack_s: f64) -> Result<(Vec<String>, Option<String>)> {
+pub(super) fn plan(
+    states: &[Vec<State>],
+    slack_s: f64,
+    uses: f64,
+) -> Result<(Vec<String>, Option<String>)> {
     let first = states.first().ok_or("Missing shared Graph ranks")?;
     if states
         .iter()
@@ -105,9 +112,20 @@ pub(super) fn plan(states: &[Vec<State>], slack_s: f64) -> Result<(Vec<String>, 
         if states.iter().all(|s| s[i].ready) {
             ready.push(state.id.clone());
         } else if capture.is_none()
-            && states
-                .iter()
-                .all(|s| s[i].uses >= 3 && s[i].capture_s.is_finite() && s[i].capture_s <= slack_s)
+            && states.iter().all(|s| {
+                s[i].uses >= 3
+                    && s[i].variants >= 2
+                    && s[i].capture_s.is_finite()
+                    && super::team::CaptureBudget {
+                        uses,
+                        direct_s: None,
+                        replay_s: None,
+                        capture_s: Some(s[i].capture_s),
+                        slack_s,
+                        trace: false,
+                    }
+                    .profitable(0)
+            })
         {
             capture = Some(state.id.clone());
         }
@@ -150,6 +168,14 @@ impl Cache {
         true
     }
     fn touch(&mut self, entry: Rc<Entry>) {
+        self.clock = self.clock.wrapping_add(1);
+        entry.tick.set(self.clock);
+        // Uncaptured candidates already live with their bound executions and
+        // have only weak registry entries. They consume no Graph node budget
+        // and must not evict a useful resident Graph while being discovered.
+        if entry.graph.borrow().is_none() {
+            return;
+        }
         if !self.entries.contains_key(&entry.key) {
             while self.nodes + entry.segment.ops.len() > 4096 || self.entries.len() >= 128 {
                 if !self.evict() {
@@ -159,8 +185,6 @@ impl Cache {
             self.nodes += entry.segment.ops.len();
             self.entries.insert(entry.key.clone(), Rc::clone(&entry));
         }
-        self.clock = self.clock.wrapping_add(1);
-        entry.tick.set(self.clock);
     }
     pub fn pieces(&mut self, pending: &Pending, comm: &Communicator) -> Result<Vec<Piece>> {
         if !self.enabled || pending.common_end == 0 {
@@ -173,13 +197,6 @@ impl Cache {
                     SegmentOp::Fork(_) => Kind::Fork,
                     SegmentOp::Switch(_) => Kind::Switch,
                     SegmentOp::Join(_) => Kind::Join,
-                    SegmentOp::Kernel(k)
-                        if k.spec().op.starts_with("private_rows.")
-                            || k.spec().parameters.contains_key("_owner_access") =>
-                    {
-                        Kind::Private
-                    }
-                    SegmentOp::Exchange(_) => Kind::Private,
                     SegmentOp::W4(_) => Kind::Matmul,
                     _ => Kind::Shared,
                 })
@@ -244,14 +261,18 @@ impl Cache {
                         *scatter,
                     ),
                     SegmentOp::W4(p) => Binding::W4(Rc::as_ptr(p) as usize),
-                    SegmentOp::Exchange(_) => {
-                        return Err("Shared piece contains a private exchange".into());
+                    SegmentOp::Exchange(exchange) => {
+                        let (source, destination, send, receive, element) = exchange.binding_key();
+                        Binding::Exchange(source, destination, send, receive, element)
                     }
                 });
             }
             let key = Key(id.clone(), bindings);
             self.clock = self.clock.wrapping_add(1);
             let entry = if let Some(e) = self.slots.get(&key).and_then(Weak::upgrade) {
+                // A second independently bound packet establishes cross-shape
+                // reuse; repeated execution of one cold packet alone does not.
+                e.variants.set(e.variants.get().saturating_add(1));
                 e
             } else {
                 branches::validate(&normalized)?;
@@ -269,6 +290,7 @@ impl Cache {
                     }),
                     graph: RefCell::new(None),
                     uses: Cell::new(0),
+                    variants: Cell::new(1),
                     active: Cell::new(false),
                     tick: Cell::new(self.clock),
                 });
@@ -292,53 +314,31 @@ enum Kind {
     Switch,
     Join,
     Shared,
-    Private,
     Matmul,
 }
 fn ranges(kinds: &[Kind]) -> Result<Vec<Range<usize>>> {
-    let mut units = vec![];
-    let mut i = 0;
-    while i < kinds.len() {
-        let start = i;
-        let mut depth = 0usize;
-        let mut private = false;
-        let mut matmul = false;
-        loop {
-            match kinds[i] {
-                Kind::Fork => depth += 1,
-                Kind::Join => depth = depth.checked_sub(1).ok_or("Unmatched shared branch")?,
-                Kind::Private => private = true,
-                Kind::Matmul => matmul = true,
-                _ => {}
-            }
-            i += 1;
-            if depth == 0 {
-                break;
-            }
-            if i == kinds.len() {
-                return Err("Incomplete shared branch".into());
-            }
+    let mut depth = 0usize;
+    for kind in kinds {
+        match kind {
+            Kind::Fork => depth += 1,
+            Kind::Join => depth = depth.checked_sub(1).ok_or("Unmatched shared branch")?,
+            _ => {}
         }
-        units.push((start..i, private, matmul));
     }
-    let mut out = vec![];
-    let mut start = 0;
-    let mut matmul = false;
-    for (range, private, has_matmul) in units {
-        if private {
-            if matmul && range.start - start >= 8 {
-                out.push(start..range.start);
-            }
-            start = range.end;
-            matmul = false;
+    if depth != 0 {
+        return Err("Incomplete shared branch".into());
+    }
+    // common_end stops before DecoderRows. Keep the complete source prefix,
+    // including indirect private kernels and fixed-count collectives. Every
+    // native binding, launch extent and exchange count is part of its key.
+    // One prefix replaces many small FFN fragments and needs one capture.
+    Ok(
+        if kinds.len() >= 8 && kinds.iter().any(|k| matches!(k, Kind::Matmul)) {
+            std::iter::once(0..kinds.len()).collect()
         } else {
-            matmul |= has_matmul;
-        }
-    }
-    if matmul && kinds.len() - start >= 8 {
-        out.push(start..kinds.len());
-    }
-    Ok(out)
+            vec![]
+        },
+    )
 }
 
 impl Execution {
@@ -430,6 +430,7 @@ impl Worker {
                 id: e.id.clone(),
                 ready: e.graph.borrow().is_some(),
                 uses: e.uses.get(),
+                variants: e.variants.get(),
                 capture_s,
             })
             .collect())
@@ -506,6 +507,7 @@ impl Worker {
         let graph = self.capture_segment(segment)?;
         self.shared.capture_s = self.shared.capture_s.max(start.elapsed().as_secs_f64());
         *entry.graph.borrow_mut() = Some(Rc::new(graph));
+        self.shared.touch(entry);
         self.shared_state(layout)
     }
 }
@@ -538,6 +540,7 @@ mod tests {
             segment: Rc::clone(&raw),
             graph: RefCell::new(Some(graph)),
             uses: Cell::new(3),
+            variants: Cell::new(2),
             active: Cell::new(true),
             tick: Cell::new(0),
         });
@@ -552,6 +555,21 @@ mod tests {
         });
         let mut cache = Cache::new();
         cache.touch(Rc::clone(&entry));
+        for i in 0..128 {
+            cache.touch(Rc::new(Entry {
+                key: Key(format!("cold{i}"), vec![]),
+                id: format!("cold{i}"),
+                segment: Rc::clone(&raw),
+                graph: RefCell::new(None),
+                uses: Cell::new(0),
+                variants: Cell::new(1),
+                active: Cell::new(false),
+                tick: Cell::new(0),
+            }));
+        }
+        assert_eq!(cache.nodes, raw.ops.len());
+        assert_eq!(cache.entries.len(), 1);
+        assert!(entry.graph().is_some());
         upload(&session, &input, &[1, 2, 3, 4]).unwrap();
         segment.enqueue(&session).unwrap().wait().unwrap();
         upload(&session, &input, &[9, 8, 7, 6]).unwrap();
@@ -578,32 +596,38 @@ mod tests {
             id: id.into(),
             ready,
             uses,
+            variants: 2,
             capture_s: 0.02,
         };
         let mut ranks = vec![
             vec![state("a", true, 8), state("b", false, 3)],
             vec![state("a", false, 8), state("b", false, 3)],
         ];
-        assert_eq!(plan(&ranks, 0.03).unwrap(), (vec![], Some("a".into())));
-        assert_eq!(plan(&ranks, 0.01).unwrap(), (vec![], None));
+        assert_eq!(plan(&ranks, 0.03, 32.).unwrap(), (vec![], Some("a".into())));
+        assert_eq!(plan(&ranks, 0.01, 32.).unwrap(), (vec![], None));
+        assert_eq!(plan(&ranks, 0.03, 1.).unwrap(), (vec![], None));
         ranks[1][0].ready = true;
         assert_eq!(
-            plan(&ranks, 0.03).unwrap(),
+            plan(&ranks, 0.03, 32.).unwrap(),
             (vec!["a".into()], Some("b".into()))
         );
+        assert_eq!(plan(&ranks, 0.03, 1.).unwrap(), (vec!["a".into()], None));
         ranks[1][1].uses = 2;
-        assert_eq!(plan(&ranks, 0.03).unwrap(), (vec!["a".into()], None));
+        assert_eq!(plan(&ranks, 0.03, 32.).unwrap(), (vec!["a".into()], None));
         ranks[1][1].uses = 3;
+        ranks[1][1].variants = 1;
+        assert_eq!(plan(&ranks, 0.03, 32.).unwrap(), (vec!["a".into()], None));
+        ranks[1][1].variants = 2;
         ranks[1][1].capture_s = f64::INFINITY;
         assert_eq!(
-            plan(&ranks, f64::INFINITY).unwrap(),
+            plan(&ranks, f64::INFINITY, 32.).unwrap(),
             (vec!["a".into()], None)
         );
         ranks[1][1].id = "other".into();
-        assert!(plan(&ranks, 0.03).is_err());
+        assert!(plan(&ranks, 0.03, 32.).is_err());
     }
     #[test]
-    fn fragments_keep_nested_branches_and_reject_private_sides() {
+    fn source_prefix_keeps_complete_nested_branches() {
         use Kind::*;
         let public = [
             Shared, Fork, Shared, Switch, Matmul, Shared, Shared, Join, Shared,
@@ -611,9 +635,6 @@ mod tests {
         let public_ranges = ranges(&public).unwrap();
         assert_eq!(public_ranges.len(), 1);
         assert_eq!(public_ranges[0], 0..9);
-        let mut private = public;
-        private[2] = Private;
-        assert!(ranges(&private).unwrap().is_empty());
         assert!(ranges(&[Fork, Matmul]).is_err());
     }
 }

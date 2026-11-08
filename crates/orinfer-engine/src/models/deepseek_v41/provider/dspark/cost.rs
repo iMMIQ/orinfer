@@ -8,7 +8,14 @@ use std::{collections::BTreeMap, path::Path};
 pub(in crate::models::deepseek_v41::provider) struct Work {
     pub rows: usize,
     pub prefill_rows: usize,
+    /// Prompt rows replayed by the decoder in addition to continuation rows.
+    #[serde(default)]
+    pub final_rows: usize,
     pub context: usize,
+    #[serde(default)]
+    pub decoder_owners: usize,
+    #[serde(default)]
+    pub prefill_owners: usize,
 }
 impl Work {
     pub fn extend(self, extra: usize) -> Self {
@@ -16,6 +23,12 @@ impl Work {
         Self {
             rows: self.rows + extra - displaced,
             prefill_rows: self.prefill_rows - displaced,
+            final_rows: self.final_rows.min(self.prefill_rows - displaced),
+            prefill_owners: if self.prefill_rows == displaced {
+                0
+            } else {
+                self.prefill_owners
+            },
             ..self
         }
     }
@@ -48,6 +61,8 @@ pub(super) struct Point {
     #[serde(default)]
     pub shared: bool,
     #[serde(default)]
+    pub shared_mask: u64,
+    #[serde(default)]
     pub shared_setup_s: f64,
     pub work: Work,
     pub seconds: f64,
@@ -61,9 +76,36 @@ struct Profile {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Family(Stage, usize, bool, bool, usize, usize);
+struct Family(Stage, usize, bool, bool, usize, usize, usize);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Key(Family, usize, bool, bool);
+struct Key(Family, usize, Geometry, bool, u64);
+/// Live Graph modes depend on decoder rows and their owner partition. Raw
+/// execution retains a sparse row curve; it carries no cache residency claim.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Geometry(usize, usize, usize);
+fn geometry(work: Work) -> Geometry {
+    Geometry(
+        work.rows - work.prefill_rows + work.final_rows,
+        work.decoder_owners,
+        work.prefill_owners,
+    )
+}
+fn cell_key(family: Family, work: Work, replay: bool, shared: u64) -> Key {
+    Key(
+        family,
+        work.rows,
+        if (replay || shared != 0) && work.prefill_rows > 0 {
+            geometry(work)
+        } else {
+            Geometry::default()
+        },
+        replay,
+        shared,
+    )
+}
+fn mode_key(family: Family, work: Work) -> (Family, usize, Geometry) {
+    (family, work.rows, geometry(work))
+}
 struct Cell {
     time: crate::mtp::adaptive::Timing,
     prior: f64,
@@ -85,8 +127,7 @@ struct Cold {
 #[derive(Default)]
 pub(super) struct Model {
     cells: BTreeMap<Key, Cell>,
-    modes: BTreeMap<(Family, usize), bool>,
-    shared_modes: std::collections::BTreeSet<(Family, usize)>,
+    modes: BTreeMap<(Family, usize, Geometry), (bool, u64)>,
     trace: bool,
     cold: BTreeMap<(Family, usize), Cold>,
 }
@@ -110,6 +151,8 @@ fn family(stage: Stage, block: usize, full: bool, work: Work) -> Family {
         bucket(work.context),
         // Keep prompt work separate without one curve per exact mixed layout.
         work.prefill_rows.div_ceil(128),
+        // Final SWA windows execute decoder work that producer rows skip.
+        work.final_rows.div_ceil(128),
     )
 }
 impl Model {
@@ -158,19 +201,19 @@ impl Model {
     }
     fn insert(&mut self, point: Point, online: bool) {
         let group = family(point.stage, point.block, point.full, point.work);
-        let key = Key(group, point.work.rows, point.replay, point.shared);
+        let shared = if point.shared {
+            point.shared_mask.max(1)
+        } else {
+            0
+        };
+        let key = cell_key(group, point.work, point.replay, shared);
         // Offline priors describe costs, never residency in a live Graph cache.
         if online {
-            if self.modes.len() >= 2048 && !self.modes.contains_key(&(group, point.work.rows)) {
+            let mode = mode_key(group, point.work);
+            if self.modes.len() >= 2048 && !self.modes.contains_key(&mode) {
                 self.modes.clear();
-                self.shared_modes.clear();
             }
-            self.modes.insert((group, point.work.rows), point.replay);
-            if point.shared {
-                self.shared_modes.insert((group, point.work.rows));
-            } else {
-                self.shared_modes.remove(&(group, point.work.rows));
-            }
+            self.modes.insert(mode, (point.replay, shared));
         }
         if self.cells.len() >= 2048 && !self.cells.contains_key(&key) {
             // Retain the bounded sparse surface; unseen shapes can still use it.
@@ -215,8 +258,8 @@ impl Model {
         let requested = family(stage, block, full, work);
         let replay = self
             .modes
-            .get(&(requested, work.rows))
-            .copied()
+            .get(&mode_key(requested, work))
+            .map(|mode| mode.0)
             .unwrap_or(false);
         self.predict_mode(stage, block, full, work, replay)
     }
@@ -234,7 +277,7 @@ impl Model {
         [false, true]
             .into_iter()
             .filter_map(|replay| {
-                self.predict_mode(stage, block, full, work, replay)
+                self.predict_mode_scoped(stage, block, full, work, replay, false)
                     .filter(|p| p.nearby)
             })
             .fold((0, 0), |(hot, seen), p| {
@@ -249,17 +292,53 @@ impl Model {
         work: Work,
         replay: bool,
     ) -> Option<Prediction> {
+        let local = self.predict_mode_scoped(stage, block, full, work, replay, false);
+        if local.is_some_and(|p| p.samples >= crate::mtp::adaptive::HOT_SAMPLES) {
+            return local;
+        }
+        // An unseen final window may borrow a hot producer price to fund
+        // bounded calibration. It never borrows live readiness or residency.
+        self.predict_mode_scoped(stage, block, full, work, replay, true)
+            .filter(|p| p.samples >= crate::mtp::adaptive::HOT_SAMPLES)
+            .map(|mut p| {
+                p.nearby = false;
+                p
+            })
+            .or(local)
+    }
+    fn predict_mode_scoped(
+        &self,
+        stage: Stage,
+        block: usize,
+        full: bool,
+        work: Work,
+        replay: bool,
+        cross_final: bool,
+    ) -> Option<Prediction> {
         let requested = family(stage, block, full, work);
         // Select a context/prompt-work neighborhood before interpolating rows.
-        let shared = !replay && self.shared_modes.contains(&(requested, work.rows));
+        let shared = if replay {
+            0
+        } else {
+            self.modes
+                .get(&mode_key(requested, work))
+                .map_or(0, |mode| mode.1)
+        };
+        let shape = if (replay || shared != 0) && work.prefill_rows > 0 {
+            geometry(work)
+        } else {
+            Geometry::default()
+        };
         let group = self
             .cells
             .keys()
-            .filter(|Key(f, rows, mode, shared_mode)| {
+            .filter(|Key(f, rows, shape_key, mode, shared_mode)| {
                 f.0 == stage
                     && f.1 == block
                     && f.2 == full
                     && f.3 == requested.3
+                    && (f.6 == requested.6) != cross_final
+                    && *shape_key == shape
                     && *mode == replay
                     && *shared_mode == shared
                     // Small packets include a large fixed launch cost. Do not
@@ -267,24 +346,24 @@ impl Model {
                     // batch; leave that cost unknown for bounded calibration.
                     && work.rows <= rows.saturating_mul(2)
             })
-            .min_by_key(|Key(f, rows, _, _)| {
+            .min_by_key(|Key(f, rows, _, _, _)| {
                 (
                     rows.ilog2().abs_diff(work.rows.max(1).ilog2()) * 2
                         + f.4.ilog2().abs_diff(requested.4.ilog2()),
                     f.5.abs_diff(requested.5),
                 )
             })
-            .map(|Key(f, _, _, _)| *f)?;
+            .map(|Key(f, _, _, _, _)| *f)?;
         let points = self
             .cells
             .iter()
-            .filter(|(Key(f, _, mode, shared_mode), _)| {
-                *f == group && *mode == replay && *shared_mode == shared
+            .filter(|(Key(f, _, shape_key, mode, shared_mode), _)| {
+                *f == group && *shape_key == shape && *mode == replay && *shared_mode == shared
             });
         let mut lower = None;
         let mut previous = None;
         let mut upper = None;
-        for (Key(_, rows, _, _), cell) in points {
+        for (Key(_, rows, _, _, _), cell) in points {
             if *rows <= work.rows {
                 previous = lower;
                 lower = Some((*rows, cell));
@@ -365,6 +444,7 @@ impl Model {
             .filter(|((f, rows), c)| {
                 f.0 == stage
                     && f.1 == block
+                    && f.6 == requested.6
                     && (!comparable
                         || f.3 == requested.3
                             && f.4.ilog2().abs_diff(requested.4.ilog2()) <= 1
@@ -412,12 +492,7 @@ impl Model {
             // than direct execution. Only the same work key prices payback.
             replay_s: self
                 .cells
-                .get(&Key(
-                    family(stage, block, full, work),
-                    work.rows,
-                    true,
-                    false,
-                ))
+                .get(&cell_key(family(stage, block, full, work), work, true, 0))
                 .map(Cell::mean),
             capture_s: self.cold_estimate(stage, block, work, true),
             slack_s,
@@ -458,6 +533,7 @@ fn valid(point: &Point) -> bool {
     point.work.rows > 0
         && point.work.rows <= 65536
         && point.work.prefill_rows <= point.work.rows
+        && point.work.final_rows <= point.work.prefill_rows
         && point.work.context <= 1 << 24
         && point.block <= crate::execution::MAX_MTP_DRAFTS
         && point.seconds.is_finite()
@@ -473,6 +549,232 @@ fn valid(point: &Point) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn execution_modes_do_not_alias_neighboring_decoder_shapes() {
+        let mut model = Model::default();
+        let w = |decoders: usize| Work {
+            rows: 800,
+            prefill_rows: 800 - decoders,
+            decoder_owners: decoders,
+            prefill_owners: 1,
+            context: 100_000,
+            ..Work::default()
+        };
+        let mut sample = point(800, false, 0.16);
+        sample.full = true;
+        for _ in 0..4 {
+            sample.work = w(16);
+            model.observe(sample.clone());
+        }
+        sample.shared = true;
+        sample.seconds = 0.08;
+        for _ in 0..4 {
+            sample.work = w(8);
+            model.observe(sample.clone());
+        }
+        assert!(
+            (model
+                .predict(Stage::Target, 0, true, w(16))
+                .unwrap()
+                .seconds
+                - 0.16)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (model.predict(Stage::Target, 0, true, w(8)).unwrap().seconds - 0.08).abs() < 1e-12
+        );
+    }
+    #[test]
+    fn shared_combinations_and_owner_partitions_have_separate_prices() {
+        let mut model = Model::default();
+        let mut sample = point(800, false, 0.16);
+        sample.work = Work {
+            rows: 800,
+            prefill_rows: 752,
+            decoder_owners: 8,
+            prefill_owners: 1,
+            context: 100_000,
+            ..Work::default()
+        };
+        sample.shared = true;
+        sample.shared_mask = 11;
+        for _ in 0..4 {
+            model.observe(sample.clone());
+        }
+        let original = sample.clone();
+        sample.shared_mask = 22;
+        sample.seconds = 0.08;
+        for _ in 0..4 {
+            model.observe(sample.clone());
+        }
+        model.observe(original.clone());
+        assert!(
+            (model
+                .predict(Stage::Target, 0, false, original.work)
+                .unwrap()
+                .seconds
+                - 0.16)
+                .abs()
+                < 1e-12
+        );
+        let partition = Work {
+            decoder_owners: 16,
+            ..original.work
+        };
+        assert!(model.predict(Stage::Target, 0, false, partition).is_none());
+    }
+    #[test]
+    fn cold_final_windows_borrow_prices_without_borrowing_readiness() {
+        let mut model = Model::default();
+        let producer = Work {
+            rows: 800,
+            prefill_rows: 752,
+            context: 100_000,
+            ..Work::default()
+        };
+        for _ in 0..4 {
+            model.observe(Point {
+                stage: Stage::Target,
+                block: 0,
+                full: true,
+                replay: false,
+                shared: false,
+                shared_setup_s: 0.,
+                work: producer,
+                seconds: 0.15,
+                setup_s: 0.,
+                shared_mask: 0,
+            });
+        }
+        let final_window = Work {
+            rows: 144,
+            prefill_rows: 128,
+            final_rows: 128,
+            context: 100_000,
+            decoder_owners: 0,
+            prefill_owners: 0,
+        };
+        let prior = model.predict(Stage::Target, 0, true, final_window).unwrap();
+        assert!(prior.samples >= crate::mtp::adaptive::HOT_SAMPLES);
+        assert!(!prior.nearby);
+        assert_eq!(model.evidence(Stage::Target, 0, true, final_window), (0, 0));
+        let budget = model.budget(Stage::Target, 0, true, final_window, 32., 1.);
+        assert_eq!(budget.replay_s, None);
+        assert_eq!(budget.capture_s, None);
+        assert_eq!(budget.direct_s, Some(prior.seconds));
+        model.observe(Point {
+            stage: Stage::Target,
+            block: 0,
+            full: true,
+            replay: false,
+            shared: false,
+            shared_setup_s: 0.,
+            work: final_window,
+            seconds: 0.2,
+            setup_s: 0.,
+            shared_mask: 0,
+        });
+        assert_eq!(model.evidence(Stage::Target, 0, true, final_window), (0, 1));
+        for _ in 0..4 {
+            model.observe(Point {
+                stage: Stage::Target,
+                block: 0,
+                full: true,
+                replay: false,
+                shared: false,
+                shared_setup_s: 0.,
+                work: final_window,
+                seconds: 0.2,
+                setup_s: 0.,
+                shared_mask: 0,
+            });
+        }
+        assert!(
+            (model
+                .predict(Stage::Target, 0, true, final_window)
+                .unwrap()
+                .seconds
+                - 0.2)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            model
+                .predict(Stage::Target, 0, true, producer)
+                .unwrap()
+                .seconds,
+            0.15
+        );
+    }
+    #[test]
+    fn producer_and_final_decoder_windows_keep_independent_live_prices() {
+        let mut model = Model::default();
+        let producer = Work {
+            rows: 800,
+            prefill_rows: 752,
+            context: 100_000,
+            ..Work::default()
+        };
+        let final_window = Work {
+            final_rows: 128,
+            ..producer
+        };
+        let sample = |work, seconds, setup_s, replay| Point {
+            stage: Stage::Target,
+            block: 0,
+            full: true,
+            replay,
+            shared: false,
+            shared_setup_s: 0.,
+            work,
+            seconds,
+            setup_s,
+            shared_mask: 0,
+        };
+        for _ in 0..4 {
+            model.observe(sample(final_window, 0.25, 0.4, true));
+        }
+        assert!(model.predict(Stage::Target, 0, true, producer).is_none());
+        assert_eq!(
+            model
+                .budget(Stage::Target, 0, true, producer, 32., 1.)
+                .capture_s,
+            None
+        );
+        for _ in 0..4 {
+            model.observe(sample(producer, 0.12, 0.02, false));
+        }
+        assert_eq!(
+            model
+                .predict(Stage::Target, 0, true, producer)
+                .unwrap()
+                .seconds,
+            0.12
+        );
+        assert_eq!(
+            model
+                .predict(Stage::Target, 0, true, final_window)
+                .unwrap()
+                .seconds,
+            0.25
+        );
+        assert!(
+            (model
+                .budget(Stage::Target, 0, true, final_window, 32., 1.)
+                .capture_s
+                .unwrap()
+                - 0.4)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(producer.extend(40).final_rows, 0);
+        assert_eq!(final_window.extend(40).final_rows, 128);
+        assert!(valid(&sample(final_window.extend(800), 0.1, 0., false)));
+        let legacy: Work =
+            serde_json::from_str(r#"{"rows":800,"prefill_rows":752,"context":100000}"#).unwrap();
+        assert_eq!(legacy.final_rows, 0);
+    }
     #[test]
     fn imported_timings_do_not_consume_the_runtime_primer() {
         let mut model = Model::default();
@@ -564,9 +866,13 @@ mod tests {
                 rows,
                 context: 2048,
                 prefill_rows: 0,
+                final_rows: 0,
+                decoder_owners: 0,
+                prefill_owners: 0,
             },
             seconds,
             setup_s: 0.,
+            shared_mask: 0,
         }
     }
     #[test]
@@ -713,6 +1019,7 @@ mod tests {
                 work: Work { rows, ..work },
                 seconds,
                 setup_s,
+                shared_mask: 0,
             });
         }
         assert_eq!(
@@ -740,6 +1047,7 @@ mod tests {
             work,
             seconds: 0.018,
             setup_s: 0.04,
+            shared_mask: 0,
         });
         assert!(
             !model
@@ -754,6 +1062,9 @@ mod tests {
             rows: 1921,
             prefill_rows: 1921,
             context: 0,
+            final_rows: 0,
+            decoder_owners: 0,
+            prefill_owners: 0,
         };
         model.observe(Point {
             work,
@@ -765,6 +1076,9 @@ mod tests {
                     rows: 2048,
                     prefill_rows: 2048,
                     context: 0,
+                    final_rows: 0,
+                    decoder_owners: 0,
+                    prefill_owners: 0,
                 },
                 setup_s: 0.25,
                 ..point(2048, true, 0.20)
@@ -805,6 +1119,9 @@ mod tests {
                     rows: 192,
                     context: 2048,
                     prefill_rows: 0,
+                    final_rows: 0,
+                    decoder_owners: 0,
+                    prefill_owners: 0,
                 },
                 true,
             )
@@ -859,9 +1176,10 @@ mod tests {
                 .abs()
                 < 1e-12
         );
-        model
-            .modes
-            .insert((family(Stage::Target, 0, false, work), 12), true);
+        model.modes.insert(
+            mode_key(family(Stage::Target, 0, false, work), work),
+            (true, 0),
+        );
         assert_eq!(
             model
                 .predict(Stage::Target, 0, false, work)

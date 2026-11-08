@@ -574,6 +574,18 @@ pub(crate) struct Exchange {
     element: Element,
 }
 impl Exchange {
+    /// A worker's fragment cache owns one communicator. Match exchanges by
+    /// validated addresses, datatype and count values, rather than count-array
+    /// allocation identities; the captured operation retains those arrays.
+    pub(crate) fn binding_key(&self) -> (usize, usize, Vec<u64>, Vec<u64>, Element) {
+        (
+            self.source.pointer() as usize,
+            self.destination.pointer() as usize,
+            self.counts.0.counts.clone(),
+            self.counts.1.counts.clone(),
+            self.element,
+        )
+    }
     pub(crate) fn branch_accesses(&self) -> Vec<(Buffer, bool)> {
         vec![
             (self.source.clone(), false),

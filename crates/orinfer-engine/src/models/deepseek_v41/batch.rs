@@ -98,14 +98,18 @@ impl Contract {
             })
             .map(|r| layout.decoder(r.keep, r.final_prompt_only))
             .transpose()?;
+        let pad = decoder.is_none() && super::shared::enabled() && super::shared::eligible(layout);
         let layout = decoder.as_ref().unwrap_or(layout);
         let range = self.work_ranges.get(name);
-        if let Some(&stride) = self.partitioned_tables.get(name) {
+        let mut work = if let Some(&stride) = self.partitioned_tables.get(name) {
             let view = layout.rows.partition(stride, rank % stride)?;
-            work_lengths(view.lengths, grid, range)
+            work_lengths(view.lengths, grid, range)?
         } else {
-            work_items(layout, grid, range)
-        }
+            work_items(layout, grid, range)?
+        };
+        let rows = work_launch_rows(work.len(), self.owners, pad)?;
+        work.resize(rows * 2, [-1, 0]);
+        Ok(work)
     }
     pub(super) fn preferred_span(&self) -> usize {
         self.prefill_quantum.unwrap_or_else(|| {
@@ -578,10 +582,11 @@ fn shape_key(
                 sum.checked_add(work_blocks(tokens, &launch.grid, range.as_ref())?)
                     .ok_or_else(|| "Owner work extent overflow".to_string())
             })?;
-            if count > 8192 {
-                return Err("Owner work table exceeds its capacity".into());
-            }
-            work_rows.push(count.max(1).div_ceil(2));
+            work_rows.push(work_launch_rows(
+                count,
+                contract.owners,
+                !launch.decoder && super::shared::enabled() && super::shared::eligible(layout),
+            )?);
         }
     }
     Ok(Key {
@@ -590,6 +595,21 @@ fn shape_key(
         decoder_rows: decoder.as_ref().map(|d| d.rows.total),
         outputs: layout.outputs.len(),
         work_rows,
+    })
+}
+/// Bound only the indirect CTA table. Real owner lengths, row starts and
+/// tensor arithmetic remain unchanged; appended negative owners skip all work.
+fn work_launch_rows(count: usize, owners: usize, pad: bool) -> Result<usize> {
+    if count > 8192 {
+        return Err("Owner work table exceeds its capacity".into());
+    }
+    let rows = count.max(1).div_ceil(2);
+    Ok(if pad {
+        rows.next_power_of_two()
+            .min(owners.saturating_mul(32).min(4096))
+            .max(rows)
+    } else {
+        rows
     })
 }
 fn work_blocks(tokens: usize, grid: &RowExpression, range: Option<&WorkRange>) -> Result<usize> {

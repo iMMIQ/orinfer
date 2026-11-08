@@ -108,10 +108,26 @@ pub(super) fn work(
     selected: &[(usize, usize)],
     requests: &[&mut Request],
     prefill_rows: usize,
+    final_window: usize,
 ) -> dspark::Work {
     dspark::Work {
         rows: selected.iter().map(|&(_, count)| count).sum(),
         prefill_rows,
+        decoder_owners: selected
+            .iter()
+            .filter(|&&(i, _)| !requests[i].prefilling)
+            .count(),
+        prefill_owners: selected
+            .iter()
+            .filter(|&&(i, _)| requests[i].prefilling)
+            .count(),
+        final_rows: selected
+            .iter()
+            .filter(|&&(i, count)| {
+                requests[i].prefilling && requests[i].offset + count == requests[i].input.len()
+            })
+            .map(|&(_, count)| count.min(final_window))
+            .sum(),
         context: selected
             .iter()
             .map(|&(i, _)| {

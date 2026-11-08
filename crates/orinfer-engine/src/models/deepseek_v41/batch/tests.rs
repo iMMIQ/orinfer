@@ -29,6 +29,41 @@ fn key(layout: &Layout) -> Key {
     .unwrap()
 }
 #[test]
+fn source_work_padding_preserves_order_and_published_capacity() {
+    let c = contract();
+    let l = layout(
+        &[6, 6, 6, 6, 6, 6, 6, 6, 752],
+        &[0, 1, 2, 3, 4, 5, 6, 7, 17],
+    )
+    .unwrap();
+    let grid: RowExpression = serde_json::from_value(
+        serde_json::json!({"op":"multiply","lhs":{"op":"rows"},"rhs":{"op":"constant","value":4}}),
+    )
+    .unwrap();
+    let raw = work_items(&l, &grid, None).unwrap();
+    let padded = c.work_items(&l, &grid, "source", 0).unwrap();
+    assert!(padded.starts_with(&raw));
+    assert!(padded[raw.len()..].iter().all(|&x| x == [-1, 0]));
+    assert!((padded.len() / 2).is_power_of_two());
+    let launches = [WorkLaunch {
+        role: l.role,
+        grid: grid.clone(),
+        range: None,
+        partition: 1,
+        decoder: false,
+    }]
+    .into();
+    let k = shape_key(&c, &l, (l.role, false, 1), &launches).unwrap();
+    assert_eq!(k.work_rows, vec![padded.len() / 2]);
+    for owners in [1usize, 3, 20, 32, 128] {
+        for count in 0..=owners * 64 {
+            let rows = work_launch_rows(count, owners, true).unwrap();
+            assert!(rows * 2 >= count && rows <= owners * 32);
+        }
+    }
+    assert!(work_launch_rows(8193, 128, true).is_err());
+}
+#[test]
 fn explicit_verification_capacity_keeps_legacy_selection_and_checks_head_bounds() {
     let mut c = contract();
     c.output_capacity = 544;

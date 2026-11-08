@@ -139,6 +139,7 @@ pub(in crate::models::deepseek_v41::provider) struct Costs {
     pub draft_replay: bool,
     pub verify_replay: bool,
     pub shared: [bool; 2],
+    pub shared_mask: [u64; 2],
     pub shared_setup: [f64; 2],
     pub work: Work,
     pub setup: [f64; 2],
@@ -152,6 +153,7 @@ impl From<[f64; 4]> for Costs {
             draft_replay: false,
             verify_replay: false,
             shared: [false; 2],
+            shared_mask: [0; 2],
             shared_setup: [0.; 2],
             work: Work::default(),
             setup: [stages[3] * 0.5; 2],
@@ -389,6 +391,7 @@ impl Policy {
             full,
             replay: timing.replay,
             shared: timing.shared,
+            shared_mask: timing.shared_mask,
             shared_setup_s: timing.shared_setup,
             work,
             seconds: timing.seconds + timing.preparation - timing.setup,
@@ -433,6 +436,7 @@ impl Policy {
             work,
             seconds,
             setup_s: 0.,
+            shared_mask: 0,
         });
         let curve = self.curves.entry((batch, full, mixed)).or_default();
         curve.baseline = seconds;
@@ -775,6 +779,7 @@ impl Policy {
                 full: false,
                 replay: costs.draft_replay,
                 shared: costs.shared[0],
+                shared_mask: costs.shared_mask[0],
                 shared_setup_s: costs.shared_setup[0],
                 work: draft_work,
                 seconds: timing[0],
@@ -786,6 +791,7 @@ impl Policy {
                 full,
                 replay: costs.verify_replay,
                 shared: costs.shared[1],
+                shared_mask: costs.shared_mask[1],
                 shared_setup_s: costs.shared_setup[1],
                 work,
                 seconds: timing[1],
@@ -801,6 +807,7 @@ impl Policy {
                 work: draft_work,
                 seconds: timing[2],
                 setup_s: 0.,
+                shared_mask: 0,
             },
         ] {
             self.costs.observe(point);
@@ -855,6 +862,9 @@ mod tests {
                 rows: 800,
                 prefill_rows: 798,
                 context: 131072,
+                final_rows: 0,
+                decoder_owners: 0,
+                prefill_owners: 0,
             },
             ..budget(128)
         };
@@ -888,6 +898,7 @@ mod tests {
                     },
                     seconds,
                     setup_s: 0.,
+                    shared_mask: 0,
                 });
             }
         }
@@ -932,6 +943,7 @@ mod tests {
                 },
                 seconds,
                 setup_s: 0.,
+                shared_mask: 0,
             });
         }
         let states = (0..32).map(|_| Feedback::default()).collect::<Vec<_>>();
@@ -1166,6 +1178,7 @@ mod tests {
                     },
                     setup,
                     wall_s: None,
+                    shared_mask: [0; 2],
                 },
                 &[(5, 5); 16],
                 5,
@@ -1232,9 +1245,13 @@ mod tests {
                 rows: 1,
                 prefill_rows: 1,
                 context: 0,
+                final_rows: 0,
+                decoder_owners: 0,
+                prefill_owners: 0,
             },
             seconds: 0.34,
             setup_s: 1.8,
+            shared_mask: 0,
         });
         for _ in 0..4 {
             p.baseline_execution(
@@ -1388,6 +1405,7 @@ mod tests {
                     },
                     seconds: 0.022,
                     setup_s: 0.,
+                    shared_mask: 0,
                 });
             }
             let mut limits = budget(0);
@@ -1524,7 +1542,10 @@ mod tests {
                     work: Work {
                         rows: 129,
                         prefill_rows: 128,
-                        context: 2048
+                        context: 2048,
+                        final_rows: 0,
+                        decoder_owners: 0,
+                        prefill_owners: 0,
                     },
                     ..budget(0)
                 },
@@ -1589,6 +1610,9 @@ mod tests {
             rows: 128,
             prefill_rows: 112,
             context: 8192,
+            final_rows: 0,
+            decoder_owners: 0,
+            prefill_owners: 0,
         };
         let feedback = (0..16).map(|_| Feedback::default()).collect::<Vec<_>>();
         let feedback = feedback.iter().collect::<Vec<_>>();
@@ -1633,6 +1657,7 @@ mod tests {
                 work: work.extend(selected.iter().sum()),
                 setup: [0.; 2],
                 wall_s: None,
+                shared_mask: [0; 2],
             },
             &selected.iter().map(|&n| (n, n)).collect::<Vec<_>>(),
             5,

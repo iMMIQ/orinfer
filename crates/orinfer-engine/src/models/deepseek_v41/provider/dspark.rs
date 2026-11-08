@@ -131,7 +131,12 @@ impl Runtime {
                 } else {
                     f64::INFINITY
                 },
-                work: packet::work(&baseline.selected, requests, baseline.prefill_rows),
+                work: packet::work(
+                    &baseline.selected,
+                    requests,
+                    baseline.prefill_rows,
+                    self.final_decoder_window(),
+                ),
                 prefill_tokens_per_s: self.prefill_tokens_per_s,
                 uniform,
                 remaining_by_owner: indices
@@ -165,7 +170,12 @@ impl Runtime {
         self.speculation_policy.begin_round(
             selected.iter().map(|&(i, _)| requests[i].slot).collect(),
             full,
-            packet::work(&baseline.selected, requests, baseline.prefill_rows),
+            packet::work(
+                &baseline.selected,
+                requests,
+                baseline.prefill_rows,
+                self.final_decoder_window(),
+            ),
             shared_work,
             maximum + 1,
         );
@@ -283,7 +293,12 @@ impl Runtime {
         {
             return Err("Insufficient DSpark verification workspace".into());
         }
-        let verified_work = packet::work(&packet_requests, requests, prefill_rows);
+        let verified_work = packet::work(
+            &packet_requests,
+            requests,
+            prefill_rows,
+            self.final_decoder_window(),
+        );
         let started = Instant::now();
         self.team.exchange(Command::BeginVerification(journal))?;
         let save_s = started.elapsed().as_secs_f64();
@@ -478,6 +493,7 @@ impl Runtime {
                 draft_replay: draft_timing.replay,
                 verify_replay: verify_timing.replay,
                 shared: [draft_timing.shared, verify_timing.shared],
+                shared_mask: [draft_timing.shared_mask, verify_timing.shared_mask],
                 shared_setup: [draft_timing.shared_setup, verify_timing.shared_setup],
                 work: verified_work,
                 setup: [draft_timing.setup, verify_timing.setup],

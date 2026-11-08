@@ -444,3 +444,105 @@ fn verify_prompt_replay(team: &Team) {
         );
     }
 }
+
+#[test]
+#[ignore = "Requires the native TP8 A2 package and eight NPUs"]
+fn source_prefix_graph_reuses_final_roles_and_changed_owner_inputs() {
+    use super::super::replay::Role;
+    use std::os::fd::AsRawFd;
+    assert_eq!(std::env::var("HCCL_DETERMINISTIC").unwrap(), "strict");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open("artifacts/gpu-experiment.lock")
+        .unwrap();
+    assert_eq!(
+        // SAFETY: the lock descriptor outlives all native workers and resources.
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let directory = std::path::PathBuf::from(std::env::var_os("ORINFER_A2_STATE_MODEL").unwrap());
+    let plan = std::path::PathBuf::from(std::env::var_os("ORINFER_A2_STATE_PLAN").unwrap());
+    let mut team = Team::load(&plan, &directory).unwrap();
+    let mut ids = (0..8).collect::<Vec<_>>();
+    ids.push(17);
+    team.exchange(Command::Admit(ids.clone())).unwrap();
+    let layout = |final_prompt, reverse| {
+        let mut decoders = (0..8).collect::<Vec<_>>();
+        if reverse {
+            decoders.reverse();
+        }
+        let mut segments = decoders
+            .into_iter()
+            .map(|slot| BatchSegment { slot, tokens: 6 })
+            .collect::<Vec<_>>();
+        segments.push(BatchSegment {
+            slot: 17,
+            tokens: 752,
+        });
+        let mut outputs = (0..8).collect::<Vec<_>>();
+        if final_prompt {
+            outputs.push(8);
+        }
+        let mut result = Layout::new(segments, outputs, false, team.rows, 32).unwrap();
+        result.decoder_roles[..8].fill(Role::Continue);
+        result.decoder_roles[8] = if final_prompt {
+            Role::Final
+        } else {
+            Role::Producer
+        };
+        result
+    };
+    let input = |view: &Layout, salt: usize| {
+        view.segments
+            .iter()
+            .map(|s| {
+                (0..s.tokens)
+                    .map(|p| ((p * 73 + s.slot * 19 + salt) % 129280) as u32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let same = |a: &[Output], b: &[Output]| {
+        assert_eq!(a.len(), b.len());
+        for (a, b) in a.iter().zip(b) {
+            assert_eq!(a.owner, b.owner);
+            assert_eq!(a.logits, b.logits);
+        }
+    };
+    let a = layout(false, false);
+    let b = layout(true, false);
+    let c = layout(true, true);
+    // References execute the same kernels with fragment selection disabled.
+    team.graphs_enabled = false;
+    let mut references = vec![];
+    for view in [&a, &b, &a] {
+        team.exchange(Command::Reset(ids.clone())).unwrap();
+        references.push(team.forward(view.clone(), input(view, 11), true).unwrap().0);
+    }
+    team.graphs_enabled = true;
+    for (view, reference) in [(&b, &references[1]), (&a, &references[0])] {
+        team.exchange(Command::Reset(ids.clone())).unwrap();
+        let (actual, timing) = team
+            .forward_with(view.clone(), input(view, 11), true, None, || {})
+            .unwrap();
+        assert!(
+            timing.shared,
+            "The common source prefix must actually replay"
+        );
+        same(&actual, reference);
+    }
+    // The same retained prefix must follow new table contents and owner order.
+    team.graphs_enabled = false;
+    team.exchange(Command::Reset(ids.clone())).unwrap();
+    let reference = team.forward(c.clone(), input(&c, 97), true).unwrap().0;
+    team.graphs_enabled = true;
+    team.exchange(Command::Reset(ids)).unwrap();
+    let (actual, timing) = team
+        .forward_with(c.clone(), input(&c, 97), true, None, || {})
+        .unwrap();
+    assert!(timing.shared);
+    same(&actual, &reference);
+}
