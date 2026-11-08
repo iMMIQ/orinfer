@@ -11,7 +11,9 @@ use crate::{
 use serde::Deserialize;
 use std::path::Path;
 mod processed;
+mod rejection;
 pub(crate) use processed::{Parameters, Sample, Summary, report};
+pub(crate) use rejection::{Proposal as RejectionProposal, requested as rejection_requested};
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +29,8 @@ pub(crate) struct Contract {
     pub processed_local: Option<String>,
     #[serde(default)]
     pub processed_merge: Option<String>,
+    #[serde(default)]
+    pub rejection: Option<rejection::Contract>,
 }
 impl Contract {
     pub fn manifests(&self) -> impl Iterator<Item = &str> {
@@ -38,6 +42,7 @@ impl Contract {
         ]
         .into_iter()
         .flatten()
+        .chain(self.rejection.iter().flat_map(|r| r.manifests()))
     }
     pub fn bytes(&self) -> Result<usize> {
         if !(2..=4096).contains(&self.capacity)
@@ -45,6 +50,7 @@ impl Contract {
             || self.vocab >= 1 << 24
             || self.rng != "philox2x32-10-v1"
             || self.processed_local.is_some() != self.processed_merge.is_some()
+            || self.rejection.is_some() && !self.coupled_draft
         {
             return Err("Invalid A2 categorical sampling contract".into());
         }
@@ -56,10 +62,24 @@ impl Contract {
         } else {
             0
         };
-        Ok(self.capacity * (self.vocab * 4 + 16 + self.vocab.div_ceil(1024) * 8 + 8) + 4 + extra)
+        let rejection = self
+            .rejection
+            .as_ref()
+            .map(|r| r.bytes(self))
+            .transpose()?
+            .unwrap_or(0);
+        Ok(
+            self.capacity * (self.vocab * 4 + 16 + self.vocab.div_ceil(1024) * 8 + 8)
+                + 4
+                + extra
+                + rejection,
+        )
     }
     pub fn preflight(&self, base: &Path) -> Result<()> {
         self.bytes()?;
+        if let Some(r) = &self.rejection {
+            r.preflight(self, base)?;
+        }
         let parts = self.vocab.div_ceil(1024);
         let local = vec![
             (Dtype::F32, vec![self.capacity, self.vocab], Access::Read),
@@ -147,6 +167,7 @@ impl Contract {
         Ok(())
     }
 }
+
 #[derive(Clone)]
 pub(crate) struct Draw {
     pub seed: u64,
@@ -194,6 +215,7 @@ pub(crate) struct Categorical {
     program: Program,
     graph: Option<Graph>,
     processed: Option<processed::Processed>,
+    rejection: Option<rejection::Rejection>,
 }
 impl Categorical {
     pub fn load(session: &Session, base: &Path, contract: &Contract) -> Result<Self> {
@@ -215,7 +237,11 @@ impl Categorical {
                 partial.clone(),
             ],
         )?;
-        let second = Kernel::bind(session, &merge, &[partial, active.clone(), output.clone()])?;
+        let second = Kernel::bind(
+            session,
+            &merge,
+            &[partial.clone(), active.clone(), output.clone()],
+        )?;
         let program = Program::new(session, &[&first, &second])?;
         let processed = contract
             .processed_local
@@ -224,6 +250,16 @@ impl Categorical {
                 processed::Processed::load(session, base, contract, &logits, &controls, &active)
             })
             .transpose()?;
+        let rejection = if rejection_requested()? {
+            Some(rejection::Rejection::load(
+                session,
+                base,
+                contract,
+                [&logits, &controls, &active, &partial, &output],
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             contract: contract.clone(),
             logits,
@@ -233,6 +269,7 @@ impl Categorical {
             program,
             graph: None,
             processed,
+            rejection,
         })
     }
     pub fn sample(
@@ -295,7 +332,72 @@ impl Categorical {
         } else {
             self.program.enqueue(session)?;
         }
-        let bytes = session.download_compute(&self.output, 0, rows.len() * 8)?;
+        self.read_samples(session, rows.len())
+    }
+    pub fn store_proposals(
+        &mut self,
+        session: &Session,
+        source: &Buffer,
+        stride: usize,
+        owners: &[(usize, usize)],
+    ) -> Result<()> {
+        self.rejection
+            .as_mut()
+            .ok_or("Rejection sampler is disabled")?
+            .store(session, self.contract.vocab, source, stride, owners)
+    }
+    pub fn sample_rejection(
+        &mut self,
+        session: &Session,
+        comm: &super::hccl::Communicator,
+        source: &Buffer,
+        origin: u32,
+        rows: (&[[i32; 3]], &[Option<RejectionProposal>]),
+        capture: bool,
+    ) -> Result<Vec<Sample>> {
+        let (rows, proposals) = rows;
+        if rows.is_empty()
+            || rows.len() > self.contract.capacity
+            || proposals.len() != rows.len()
+            || source.bytes() < rows.len() * self.contract.vocab * 4
+            || origin as usize + self.contract.vocab >= 1 << 24
+        {
+            return Err("Invalid rejection sampling row/vocabulary extent".into());
+        }
+        let controls = rows
+            .iter()
+            .flat_map(|r| [r[0], r[1], origin as i32, r[2]])
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        session.upload_inputs(&[
+            (self.controls.slice(0, controls.len())?, controls),
+            (
+                self.active.clone(),
+                (rows.len() as i32).to_le_bytes().to_vec(),
+            ),
+        ])?;
+        session.copy(
+            source,
+            0,
+            &self.logits,
+            0,
+            rows.len() * self.contract.vocab * 4,
+        )?;
+        self.rejection
+            .as_mut()
+            .ok_or("Rejection sampler is disabled")?
+            .sample(
+                session,
+                comm,
+                &self.contract,
+                proposals,
+                &self.active,
+                capture,
+            )?;
+        self.read_samples(session, rows.len())
+    }
+    fn read_samples(&self, session: &Session, rows: usize) -> Result<Vec<Sample>> {
+        let bytes = session.download_compute(&self.output, 0, rows * 8)?;
         bytes
             .as_chunks::<8>()
             .0
@@ -318,5 +420,28 @@ impl Categorical {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejection_requires_the_actual_stochastic_proposal_law() {
+        let mut contract: Contract = serde_json::from_value(serde_json::json!({
+            "capacity":544,"vocab":16160,"rng":"philox2x32-10-v1",
+            "local":"local.json","merge":"merge.json",
+            "rejection":{"pool_rows":512,"stride":16,"ranks":8,
+                "statistics":"s.json","merge_statistics":"m.json",
+                "normalize":"n.json","select":"r.json"}
+        }))
+        .unwrap();
+        assert!(contract.bytes().is_err());
+        contract.coupled_draft = true;
+        assert!(contract.bytes().is_ok());
+        contract.rejection = None;
+        contract.coupled_draft = false;
+        assert!(contract.bytes().is_ok());
     }
 }

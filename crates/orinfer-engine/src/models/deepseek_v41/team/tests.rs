@@ -1,6 +1,53 @@
 use super::*;
 
 #[test]
+fn rejection_rows_keep_owner_bonus_and_fresh_draw_identities() {
+    use crate::backend::ascend::sampling::{Draw, RejectionProposal};
+    use orinfer_model_sdk::architecture::BatchSegment;
+    let draw = Draw {
+        seed: 20261002,
+        step: 17,
+        temperature: 1.,
+    };
+    let readout = Readout {
+        draws: [(7, draw.clone()), (2, draw.clone())].into(),
+        rejection: [(
+            7,
+            vec![RejectionProposal {
+                row: 112,
+                token: 33,
+                log_uniform: -0.3,
+            }],
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let layout = Layout::verification(
+        vec![
+            BatchSegment { slot: 7, tokens: 2 },
+            BatchSegment { slot: 2, tokens: 1 },
+        ],
+        2048,
+        32,
+    )
+    .unwrap();
+    let (controls, proposals) = readout.rejection_rows(&layout).unwrap();
+    let mut correction = draw.clone();
+    correction.seed ^= crate::mtp::CORRECTION_STREAM;
+    assert_eq!(
+        controls,
+        vec![
+            correction.control(0).unwrap(),
+            draw.control(1).unwrap(),
+            draw.control(0).unwrap()
+        ]
+    );
+    assert_eq!(proposals[0].unwrap().row, 112);
+    assert_eq!(proposals[0].unwrap().token, 33);
+    assert!(proposals[1..].iter().all(Option::is_none));
+}
+
+#[test]
 fn packet_statistics_distinguish_capture_replay_and_shared_execution() {
     let mut statistics = crate::scheduler::BatchExecutionStatistics::default();
     for timing in [

@@ -326,7 +326,7 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
         .team
         .exchange(Command::Save {
             owner: slot,
-            snapshot: u64::MAX,
+            snapshot: 1_000_128,
             complete: true,
         })
         .unwrap();
@@ -335,7 +335,7 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
             .team
             .exchange(Command::Restore {
                 owner: slot,
-                snapshot: u64::MAX,
+                snapshot: 1_000_128,
             })
             .unwrap();
         runtime
@@ -378,7 +378,7 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
             "accepted prefix {keep}"
         );
     }
-    runtime.team.exchange(Command::Evict(u64::MAX)).unwrap();
+    runtime.team.exchange(Command::Evict(1_000_128)).unwrap();
     runtime.finish_request(&mut request, false).unwrap();
     eprintln!("DSPARK_STATE accepted-prefix lengths 1..{verification_rows} passed");
     let mut short_reference = None;

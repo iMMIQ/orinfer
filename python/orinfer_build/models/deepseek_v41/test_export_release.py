@@ -14,7 +14,11 @@ from orinfer_build.models.deepseek_v41.pack_host_release import HostRecordReleas
 from orinfer_build.weights.safetensors_source import local_header
 from orinfer_build.common.files import file_hash
 from orinfer_build.common.elf import runtime_sections
-from orinfer_build.models.deepseek_v41.publication import prepare_execution, publish_execution
+from orinfer_build.models.deepseek_v41.publication import (
+    manifests,
+    prepare_execution,
+    publish_execution,
+)
 
 
 def write_tensors(path, tensors):
@@ -102,6 +106,13 @@ class ReleaseExportTests(unittest.TestCase):
                 (directory / "kernel.so").write_bytes(original)
                 (directory / "kernel.json").write_text(json.dumps(spec))
                 model["sampling"][role] = f"{role}/kernel.json"
+            model["sampling"]["rejection"] = dict(pool_rows=512, stride=16, ranks=8)
+            for role in ("statistics", "merge_statistics", "normalize", "select"):
+                directory = source / role
+                directory.mkdir()
+                (directory / "kernel.so").write_bytes(original)
+                (directory / "kernel.json").write_text(json.dumps(spec))
+                model["sampling"]["rejection"][role] = f"{role}/kernel.json"
             (source / "model.json").write_text(json.dumps(model, indent=2))
             (source / "package.json").write_text(
                 json.dumps(
@@ -113,9 +124,10 @@ class ReleaseExportTests(unittest.TestCase):
                 )
             )
             output = publish_execution(source, root / "cache")
-            for role in model["sampling"]:
+            for manifest in manifests(model):
                 self.assertEqual(
-                    runtime_sections(library), runtime_sections(output / role / "kernel.so")
+                    runtime_sections(library),
+                    runtime_sections(output / Path(manifest).parent / "kernel.so"),
                 )
             self.assertEqual(library.read_bytes(), original)
             self.assertEqual(runtime_sections(library), runtime_sections(output / "op/kernel.so"))

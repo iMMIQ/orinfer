@@ -104,6 +104,10 @@ pub(super) struct Output {
 pub(super) struct Readout {
     pub full: bool,
     pub draws: BTreeMap<usize, crate::backend::ascend::sampling::Draw>,
+    pub store_draft_distributions: bool,
+    pub rejection: BTreeMap<usize, Vec<crate::backend::ascend::sampling::RejectionProposal>>,
+    #[cfg(test)]
+    pub capture_sampled_logits: bool,
     /// None retains the benchmark/legacy full-packet diagnostic contract.
     pub full_owners: Option<BTreeSet<usize>>,
     pub parameters: Arc<
@@ -120,7 +124,57 @@ impl From<bool> for Readout {
         }
     }
 }
+type RejectionRows = (
+    Vec<[i32; 3]>,
+    Vec<Option<crate::backend::ascend::sampling::RejectionProposal>>,
+);
 impl Readout {
+    fn validate_draw_roles(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.capture_sampled_logits {
+            return Ok(());
+        }
+        if self.draws.keys().any(|owner| self.wants_logits(*owner)) {
+            return Err("An owner cannot request sampled and raw outputs together".into());
+        }
+        Ok(())
+    }
+    pub fn sampling_steps(&mut self, steps: &BTreeMap<usize, usize>) {
+        for (owner, draw) in &mut self.draws {
+            if let Some(&step) = steps.get(owner) {
+                draw.step = step;
+            }
+        }
+    }
+    pub fn rejection_rows(&self, layout: &Layout) -> Result<RejectionRows> {
+        self.validate_draw_roles()?;
+        let mut positions = BTreeMap::<usize, usize>::new();
+        let mut controls = Vec::with_capacity(layout.outputs.len());
+        let mut proposals = Vec::with_capacity(layout.outputs.len());
+        for &lane in &layout.outputs {
+            let owner = layout.segments[lane].slot;
+            let position = positions.entry(owner).or_default();
+            let proposal = self
+                .rejection
+                .get(&owner)
+                .and_then(|p| p.get(*position))
+                .copied();
+            let draw = self.draws.get(&owner).cloned().map(|mut d| {
+                if proposal.is_some() {
+                    d.seed ^= crate::mtp::CORRECTION_STREAM;
+                }
+                d
+            });
+            controls.push(
+                draw.map(|d| d.control(*position))
+                    .transpose()?
+                    .unwrap_or([0; 3]),
+            );
+            proposals.push(proposal);
+            *position += 1;
+        }
+        Ok((controls, proposals))
+    }
     pub fn row_parameters(
         &self,
         layout: &Layout,
@@ -176,9 +230,7 @@ impl Readout {
         ranges
     }
     pub fn controls(&self, layout: &Layout) -> Result<Vec<[i32; 3]>> {
-        if self.draws.keys().any(|owner| self.wants_logits(*owner)) {
-            return Err("An owner cannot request sampled and raw outputs together".into());
-        }
+        self.validate_draw_roles()?;
         let mut positions = BTreeMap::<usize, usize>::new();
         layout
             .outputs
@@ -1041,6 +1093,7 @@ fn forward_with(
         );
     }
     let sampled = !readout.draws.is_empty();
+    let readout_rejection_empty = readout.rejection.is_empty();
     let parameters = Arc::clone(&readout.parameters);
     let command = Command::Forward(
         layout,
@@ -1103,6 +1156,9 @@ fn forward_with(
         }
         if sampled && !output.value.is_finite() {
             return Err("Grammar permits no tokens".into());
+        }
+        if !readout_rejection_empty && output.value == f32::MIN {
+            return Err("Rejected proposal has no residual mass".into());
         }
         output.summary = None;
     }

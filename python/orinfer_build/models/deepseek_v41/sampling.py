@@ -184,6 +184,98 @@ def attach_processed(model, base):
     return result
 
 
+def attach_rejection(model, base):
+    """Reuse the Markov proposal bank and categorical merge for TP rejection."""
+    from kernels.ascend import sampling_rejection as implementation
+    from kernels.shared.rows import row_count
+    from orinfer_build.compiler.ascend.build import compile_kernel, operand
+
+    sampler = model.get("sampling")
+    if not sampler or not sampler.get("coupled_draft"):
+        raise ValueError("Rejection sampling requires the shared stochastic Markov head")
+    strides = {
+        p.get("draft_stride")
+        for r in model["ranks"]
+        for p in r["packets"]
+        if p.get("role") == "draft"
+    }
+    if len(strides) != 1 or None in strides:
+        raise ValueError("Rejection sampling requires one physical Markov stride")
+    stride = next(iter(strides))
+    capacity, vocab = sampler["capacity"], sampler["vocab"]
+    pool = model["batch"]["owners"] * stride
+    ranks, parts = len(model["ranks"]), (vocab + 1023) // 1024
+    result = dict(pool_rows=pool, stride=stride, ranks=ranks)
+    f32, i32 = "f32", "i32"
+    logits = ("logits", f32, (capacity, vocab), "read")
+    draft = ("draft", f32, (pool, vocab), "read")
+    controls = ("controls", i32, (capacity, 4), "read")
+    proposals = ("proposals", i32, (capacity, 4), "read")
+    active = ("active", i32, (1,), "read")
+    statistics = ("partial", f32, (capacity, parts, 4), "read")
+    for name, arguments, ports in [
+        (
+            "statistics",
+            dict(vocab=vocab, pool_rows=pool),
+            [
+                logits,
+                draft,
+                controls,
+                proposals,
+                active,
+                ("partial", f32, (capacity, parts, 4), "write"),
+            ],
+        ),
+        (
+            "merge_statistics",
+            dict(vocab=vocab, pool_rows=pool),
+            [
+                statistics,
+                logits,
+                draft,
+                controls,
+                proposals,
+                active,
+                ("out", f32, (capacity, 8), "write"),
+            ],
+        ),
+        (
+            "normalize",
+            dict(ranks=ranks),
+            [
+                ("gathered", f32, (ranks, capacity, 8), "read"),
+                proposals,
+                active,
+                ("out", f32, (capacity, 4), "write"),
+            ],
+        ),
+        (
+            "select",
+            dict(vocab=vocab, pool_rows=pool),
+            [
+                logits,
+                draft,
+                controls,
+                proposals,
+                ("normalizers", f32, (capacity, 4), "read"),
+                active,
+                ("partial", f32, (capacity, parts, 2), "write"),
+            ],
+        ),
+    ]:
+        path = compile_kernel(
+            getattr(implementation, name)(rows=row_count(capacity, True), **arguments),
+            "sampling_rejection." + name,
+            [operand(*p) for p in ports],
+            arguments,
+            base / "cache",
+            row_capacity=capacity,
+        )
+        result[name] = str(path.relative_to(base))
+    sampler["rejection"] = result
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
@@ -195,6 +287,7 @@ def main():
     parser.add_argument(
         "--processed", action="store_true", help="Attach masks and probability summaries"
     )
+    parser.add_argument("--rejection", action="store_true", help="Attach TP probability rejection")
     args = parser.parse_args()
     if (
         args.plan.parent.resolve() != args.output.parent.resolve()
@@ -202,10 +295,16 @@ def main():
     ):
         parser.error("Preserve the input and keep its asset directory")
     model = decode(json.loads(args.plan.read_text()))
-    if args.processed and args.couple_draft:
+    if sum((args.processed, args.couple_draft, args.rejection)) > 1:
         parser.error("Select one sampler extension")
     transform = (
-        attach_processed if args.processed else couple_draft if args.couple_draft else attach
+        attach_rejection
+        if args.rejection
+        else attach_processed
+        if args.processed
+        else couple_draft
+        if args.couple_draft
+        else attach
     )
     print(json.dumps(transform(model, args.plan.parent)), flush=True)
     atomic_json(args.output, model)

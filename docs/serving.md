@@ -108,6 +108,8 @@ A2 的模型、设备采样和小结果读回按计算流顺序提交，读回�
 
 声明 `coupled_draft` 的执行包在 DSpark Markov head 内复用 target 同一生成位置的 Gumbel 随机数，按顺序推进草稿条件，并复用现有匹配前缀提交与状态恢复。target 保持请求的采样概率律；草稿无需传回完整概率表。温度 0、当前需要 grammar mask 以及不满足设备采样条件的请求使用贪心草稿。离线通过 `orinfer_build.models.deepseek_v41.sampling --couple-draft` 扩展已具备 target 采样能力的计划，所有并发与草稿长度共享一个动态 Markov 算子。
 
+实验性概率拒绝采样通过 `ORINFER_A2_DSPARK_SAMPLING=rejection` 启用，默认值为 `coupled`。执行包须先通过 `orinfer_build.models.deepseek_v41.sampling --rejection` 扩展、重新打包并安装，权重保持不变。该路径复用 Markov head 的原始 logits，按 owner 保存有界草稿分布，在设备上计算接受率与正残差分布；TP rank 仅交换归一化及候选 token 的统计。草稿、接受与纠正采样使用独立的随机数域，每轮计数与普通 decode 分离，丢弃草稿的随机数在后续轮次不复用；验证、回滚和状态提交沿用公共流程。仅普通设备温度采样使用该候选；含约束、概率报告或其他采样处理的 decode packet 保留既有路径。数值错误及空残差显式报错，不添加概率下限。启用前应比较相同历史下的接受长度、整轮耗时及实际请求性能。
+
 thinking 默认值见上表；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 可显式开启，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
 DSv4.1 使用本模型的 effort 编码：开启 thinking 后默认 `high=75`，`minimal/low=50`，`max/xhigh=100`。

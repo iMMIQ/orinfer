@@ -24,8 +24,19 @@ pub fn greedy_commit(drafts: &[u32], target: &[u32]) -> Result<Vec<u32>> {
 // Separate counter streams keep proposal, acceptance and correction draws
 // independent. Counters follow committed output positions, never graph rows.
 pub const DRAFT_STREAM: u64 = 0x4d54_5001;
-const ACCEPT_STREAM: u64 = 0x4d54_5002;
-const CORRECTION_STREAM: u64 = 0x4d54_5003;
+pub(crate) const ACCEPT_STREAM: u64 = 0x4d54_5002;
+pub(crate) const CORRECTION_STREAM: u64 = 0x4d54_5003;
+
+/// Adaptive controllers observe discarded proposal confidence and whole-round
+/// cost. Fresh counters prevent those observations from selecting reused noise.
+pub(crate) fn round_step(round: usize, position: usize) -> Result<usize> {
+    if round >= u32::MAX as usize || position > u32::MAX as usize {
+        return Err("Speculative sampling counter overflow".into());
+    }
+    // High word zero belongs to ordinary decode, including fallback rounds.
+    usize::try_from((((round as u64) + 1) << 32) | position as u64)
+        .map_err(|_| "Speculative sampling requires a 64-bit counter".into())
+}
 
 pub struct Proposal {
     pub token: u32,
@@ -105,6 +116,22 @@ pub struct Statistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejected_future_noise_is_not_reused_by_adaptive_rounds() {
+        let position = 12345;
+        assert_ne!(round_step(0, position).unwrap(), position);
+        for round in 1..32 {
+            let previous = round_step(round - 1, position).unwrap();
+            let current = round_step(round, position).unwrap();
+            assert_ne!(
+                crate::sampling::categorical_key(20261002, previous as u64),
+                crate::sampling::categorical_key(20261002, current as u64)
+            );
+            assert_eq!(round_step(round, position + 1).unwrap(), current + 1);
+        }
+        assert!(round_step(u32::MAX as usize, position).is_err());
+        assert!(round_step(0, (1u64 << 32) as usize).is_err());
+    }
     #[test]
     fn rejection_preserves_target_distribution() {
         use crate::sampling::{Distribution, Options, counter_uniform};

@@ -31,6 +31,11 @@ def manifests(model):
         for k in ("local", "merge", "processed_local", "processed_merge")
         if model.get("sampling", {}).get(k)
     )
+    names.update(
+        model.get("sampling", {}).get("rejection", {}).get(k)
+        for k in ("statistics", "merge_statistics", "normalize", "select")
+        if model.get("sampling", {}).get("rejection", {}).get(k)
+    )
     return sorted(names)
 
 

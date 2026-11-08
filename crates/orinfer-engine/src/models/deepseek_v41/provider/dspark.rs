@@ -34,6 +34,23 @@ impl Runtime {
             .take(owners.min(options.max_batch_tokens))
             .map(|&(i, _)| i)
             .collect::<Vec<_>>();
+        // The initial candidate keeps grammar/report and other sampling modes
+        // on their established path. Fresh prefill rows may share this packet.
+        let rejection = self.rejection_sampling
+            && indices.iter().all(|&i| {
+                requests[i].sampling.device_categorical() && !requests[i].decoder.constrained()
+            });
+        let rejection_steps = if rejection {
+            indices
+                .iter()
+                .map(|&i| {
+                    let r = &requests[i];
+                    Ok((r.slot, crate::mtp::round_step(r.mtp.rounds, r.generated)?))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?
+        } else {
+            BTreeMap::new()
+        };
         let uniform = self.draft_limit <= self.team.draft_blocks[0];
         for &i in &indices {
             self.speculation_policy.prepare_feedback(
@@ -204,7 +221,7 @@ impl Runtime {
         let capture = self
             .speculation_policy
             .draft_budget(block, draft_owners.len(), uses, slack);
-        let readout = if self
+        let mut readout = if self
             .team
             .model
             .sampling
@@ -215,6 +232,13 @@ impl Runtime {
         } else {
             false.into()
         };
+        if rejection {
+            readout.store_draft_distributions = true;
+            readout.sampling_steps(&rejection_steps);
+            for draw in readout.draws.values_mut() {
+                draw.seed ^= crate::mtp::DRAFT_STREAM;
+            }
+        }
         let (proposals, draft_timing) =
             self.team
                 .forward_with(draft, inputs, readout, Some(capture), maintenance)?;
@@ -278,13 +302,51 @@ impl Runtime {
             .zip(&draft_tokens)
             .map(|(&(i, _), tokens)| (i, tokens.clone()))
             .collect();
-        let readout = packet::target_readout(
+        let mut readout = packet::target_readout(
             requests,
             full || packet_full,
             &proposal_map,
             self.vocab(),
             &packet_requests,
         )?;
+        if rejection {
+            readout.sampling_steps(&rejection_steps);
+            let stride = self
+                .team
+                .model
+                .sampling
+                .as_ref()
+                .unwrap()
+                .rejection
+                .as_ref()
+                .unwrap()
+                .stride;
+            for (&(i, count), tokens) in selected.iter().zip(&draft_tokens) {
+                if count == 0 {
+                    continue;
+                }
+                let request = &requests[i];
+                readout.rejection.insert(
+                    request.slot,
+                    tokens
+                        .iter()
+                        .enumerate()
+                        .map(|(position, &token)| {
+                            crate::backend::ascend::sampling::RejectionProposal {
+                                row: request.slot * stride + position,
+                                token,
+                                log_uniform: crate::sampling::counter_uniform(
+                                    request.sampling.seed,
+                                    crate::mtp::ACCEPT_STREAM,
+                                    (rejection_steps[&request.slot] + position) as u64,
+                                )
+                                .ln() as f32,
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
         let (verified, verify_timing) =
             self.team
                 .forward_with(layout, inputs, readout, Some(capture), || {})?;
@@ -480,3 +542,6 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod rejection_test;

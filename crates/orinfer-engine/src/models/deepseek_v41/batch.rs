@@ -1267,6 +1267,36 @@ impl Worker {
         if !execution.captured {
             execution.record_shared_use();
         }
+        if readout.store_draft_distributions {
+            if layout.role != super::PacketRole::Draft {
+                return Err("Only a draft packet can populate proposal distributions".into());
+            }
+            let source = get(
+                &self.buffers,
+                execution
+                    .packet
+                    .logits
+                    .as_ref()
+                    .ok_or("Missing draft logits")?,
+            )?;
+            let owners = layout
+                .segments
+                .iter()
+                .map(|s| (s.slot, s.tokens))
+                .collect::<Vec<_>>();
+            self.sampling
+                .as_mut()
+                .ok_or("Missing device sampler")?
+                .store_proposals(
+                    &self.session,
+                    &source,
+                    execution
+                        .packet
+                        .draft_stride
+                        .ok_or("Missing draft stride")?,
+                    &owners,
+                )?;
+        }
         let mut output = vec![];
         if !layout.outputs.is_empty() {
             let count = execution
@@ -1414,6 +1444,24 @@ impl Worker {
                 .as_ref()
                 .ok_or("Missing sampling logits")?,
         )?;
+        if !readout.rejection.is_empty() {
+            if readout
+                .row_parameters(layout)?
+                .iter()
+                .any(crate::backend::ascend::sampling::Parameters::processed)
+            {
+                return Err("Probability rejection does not accept processed rows".into());
+            }
+            let (controls, proposals) = readout.rejection_rows(layout)?;
+            return Ok(Some(self.sampling.as_mut().unwrap().sample_rejection(
+                &self.session,
+                &self.comm,
+                &source,
+                execution.packet.vocab_first,
+                (&controls, &proposals),
+                execution.captured,
+            )?));
+        }
         Ok(Some(self.sampling.as_mut().unwrap().sample(
             &self.session,
             &source,

@@ -26,6 +26,7 @@ pub(super) fn readout(requests: &[&mut Request], full: bool) -> super::super::te
             })
             .collect(),
         parameters: Default::default(),
+        ..Default::default()
     }
 }
 

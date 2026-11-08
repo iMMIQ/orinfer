@@ -111,6 +111,7 @@ pub(crate) struct Runtime {
     prefill_tokens_per_s: f64,
     capture_credit_s: f64,
     draft_limit: usize,
+    rejection_sampling: bool,
     speculation_policy: dspark::Policy,
     speculation: crate::mtp::Statistics,
 }
@@ -352,6 +353,20 @@ impl Runtime {
             cann: "9.2".into(),
             ranks: team.ranks(),
         })?;
+        let rejection_sampling = crate::backend::ascend::sampling::rejection_requested()?;
+        if rejection_sampling {
+            let contract = team
+                .model
+                .sampling
+                .as_ref()
+                .and_then(|s| s.rejection.as_ref())
+                .ok_or("Execution package has no probability rejection sampler")?;
+            if contract.ranks != team.ranks()
+                || contract.pool_rows != team.model.batch.as_ref().unwrap().owners * contract.stride
+            {
+                return Err("Rejection pool differs from the model owner/rank geometry".into());
+            }
+        }
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         eprintln!(
             "A2 MODEL READY after {:.3}s; owners={}, context={}, rows={}",
@@ -387,6 +402,7 @@ impl Runtime {
             prefill_tokens_per_s: 4000.,
             capture_credit_s: 0.,
             draft_limit,
+            rejection_sampling,
             speculation_policy,
             speculation: Default::default(),
         })
