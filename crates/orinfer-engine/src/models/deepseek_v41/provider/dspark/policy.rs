@@ -3,7 +3,7 @@ use crate::{artifact::Result, mtp::adaptive};
 use std::collections::BTreeMap;
 #[path = "cost.rs"]
 mod cost;
-pub(in crate::models::deepseek_v41::provider) use cost::{Identity, Work};
+pub(in crate::models::deepseek_v41::provider) use cost::{Identity, PrefillBudget, Work};
 use cost::{Model, Point, Stage};
 
 #[derive(Default)]
@@ -92,6 +92,7 @@ pub(in crate::models::deepseek_v41::provider) struct Policy {
     ledger: adaptive::Budget,
     calibration_limit: f64,
     pending: Option<Receipt>,
+    pending_prefill: Option<PrefillBudget>,
     next_calibrating: bool,
 }
 struct Receipt {
@@ -112,6 +113,7 @@ impl Default for Policy {
             ledger: adaptive::Budget::default(),
             calibration_limit: 0.4,
             pending: None,
+            pending_prefill: None,
             next_calibrating: true,
         }
     }
@@ -239,6 +241,7 @@ impl Policy {
     }
     pub fn start_iteration(&mut self, limit: f64) {
         self.pending = None;
+        self.pending_prefill = None;
         if limit.is_finite() && limit > 0. {
             self.calibration_limit = limit;
         }
@@ -302,6 +305,7 @@ impl Policy {
             // verification: CPU sampling, constraints and commit belong here.
             // Record one sample, excluding only the separately billed setup.
             point.seconds = (seconds - receipt.preparation_s).max(0.);
+            self.record_prefill(&point);
             self.costs.observe(point);
         }
         self.ledger.settle(
@@ -323,6 +327,31 @@ impl Policy {
         let mut policy = Self::default();
         policy.costs = Model::load(identity, policy.trace)?;
         Ok(policy)
+    }
+    pub fn prefill_rows(&self, full: bool, work: Work, mut budget: PrefillBudget) -> usize {
+        budget.probe_credit_s = self.ledger.available(self.calibration_limit).max(0.);
+        let rows = self.costs.prefill_rows(full, work, budget);
+        if self.trace && rows != budget.fallback {
+            eprintln!(
+                "PREFILL_BUDGET {}",
+                serde_json::json!({
+                    "fallback": budget.fallback, "rows": rows, "quantum": budget.quantum,
+                    "quota_s": budget.quota_s, "work": work
+                })
+            );
+        }
+        rows
+    }
+    pub fn prepare_prefill(&mut self, budget: Option<PrefillBudget>) {
+        self.pending_prefill = budget;
+    }
+    fn record_prefill(&mut self, point: &Point) {
+        if point.stage == Stage::Target
+            && let Some(budget) = self.pending_prefill.take()
+            && let Some(loss) = self.costs.prefill_loss(point, budget.fallback)
+        {
+            self.ledger.settle_delta(loss, self.calibration_limit, true);
+        }
     }
     pub fn target_budget(
         &self,
@@ -398,6 +427,7 @@ impl Policy {
             receipt.normal = Some(point);
         } else {
             // Standalone prefill has no decoder settlement receipt.
+            self.record_prefill(&point);
             self.costs.observe(point);
         }
         let curve = self
@@ -768,6 +798,9 @@ impl Policy {
         } else {
             costs.work
         };
+        curve.samples += 1;
+        curve.last = call;
+        curve.acceptance.observe_batch(counts);
         for point in [
             Point {
                 stage: Stage::Draft,
@@ -803,11 +836,9 @@ impl Policy {
                 setup_s: 0.,
             },
         ] {
+            self.record_prefill(&point);
             self.costs.observe(point);
         }
-        curve.samples += 1;
-        curve.last = call;
-        curve.acceptance.observe_batch(counts);
     }
 }
 

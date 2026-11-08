@@ -84,6 +84,8 @@ pub(super) fn draft_readout(requests: &[&mut Request]) -> super::super::team::Re
 }
 
 pub(super) struct Selection {
+    pub budget: usize,
+    pub prefill_budget: Option<dspark::PrefillBudget>,
     pub layout: Layout,
     pub tokens: Vec<Vec<u32>>,
     pub selected: Vec<(usize, usize)>,
@@ -245,6 +247,67 @@ impl Runtime {
             let reserved = inputs.values().map(Vec::len).sum::<usize>();
             budget = budget.max(reserved).min(self.team.rows);
         }
+        let baseline = self.packet_for_budget(requests, decode_inputs, budget, has_prefill)?;
+        if has_prefill
+            && has_decode
+            && options.policy == scheduler::Policy::Latency
+            && let Some(packet) = &baseline
+        {
+            let mut work = work(&packet.selected, requests, packet.prefill_rows);
+            // The ordinary preview and its verifier must use one chunk budget.
+            // Price the published maximum draft extent conservatively; the
+            // existing auto controller still decides the actual owner depths.
+            let extra = packet
+                .selected
+                .iter()
+                .filter(|&&(i, _)| !requests[i].prefilling)
+                .map(|&(i, _)| {
+                    self.draft_limit
+                        .min(requests[i].limit.saturating_sub(requests[i].generated + 1))
+                })
+                .sum::<usize>();
+            let decoder_rows = work.rows - work.prefill_rows;
+            work = work.extend(extra.min(self.team.verification_rows.saturating_sub(decoder_rows)));
+            let cost_budget = dspark::PrefillBudget {
+                fallback: budget,
+                capacity: self.team.rows,
+                quantum: self.team.model.batch.as_ref().unwrap().preferred_span(),
+                quota_s: options.prefill_budget_ms.min(options.target_tpot_ms) / 1000.,
+                deadline_s: options.target_tpot_ms / 1000.,
+                probe_credit_s: 0.,
+            };
+            let rows = self
+                .speculation_policy
+                .prefill_rows(packet.full, work, cost_budget);
+            if rows != budget {
+                let mut candidate =
+                    self.packet_for_budget(requests, decode_inputs, rows, has_prefill)?;
+                // Finishing a prompt can enable the full cached head. A price
+                // learned without that readout cannot fund the new boundary.
+                if let Some(next) = candidate.as_mut()
+                    && next.full == packet.full
+                {
+                    next.prefill_budget = Some(cost_budget);
+                    return Ok(candidate);
+                }
+            }
+        }
+        Ok(baseline)
+    }
+
+    pub(super) fn packet_for_budget(
+        &self,
+        requests: &[&mut Request],
+        decode_inputs: Option<&BTreeMap<usize, Vec<u32>>>,
+        mut budget: usize,
+        has_prefill: bool,
+    ) -> Result<Option<Selection>> {
+        if let Some(inputs) = decode_inputs {
+            budget = budget
+                .max(inputs.values().map(Vec::len).sum::<usize>())
+                .min(self.team.rows);
+        }
+        let packet_budget = budget;
         let mut segments = vec![];
         let mut tokens = vec![];
         let mut outputs = vec![];
@@ -369,6 +432,8 @@ impl Runtime {
             }
         }
         Ok(Some(Selection {
+            budget: packet_budget,
+            prefill_budget: None,
             layout,
             tokens,
             selected,

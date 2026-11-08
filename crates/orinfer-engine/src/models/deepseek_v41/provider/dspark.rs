@@ -1,7 +1,7 @@
 //! DSpark shares target verification and commits only confirmed state.
 use super::*;
 mod policy;
-pub(super) use policy::{Budget, Costs, Feedback, Identity, Policy, Work};
+pub(super) use policy::{Budget, Costs, Feedback, Identity, Policy, PrefillBudget, Work};
 
 impl Runtime {
     pub(super) fn advance_dspark(
@@ -157,11 +157,10 @@ impl Runtime {
             .entry(selected.iter().map(|(_, count)| *count).max().unwrap_or(0))
             .or_default() += 1;
         if selected.iter().all(|(_, k)| *k == 0) {
-            let limit = self.draft_limit;
-            self.draft_limit = 0;
-            let result = self.advance_packet(requests, options, maintenance);
-            self.draft_limit = limit;
-            return result;
+            // Calibrate the packet whose price was requested. Re-entering
+            // selection with drafts disabled can choose another prefill size,
+            // leaving the planned ordinary baseline permanently unmeasured.
+            return self.advance_selection(baseline, requests, options, maintenance);
         }
         let maximum = selected.iter().map(|(_, count)| *count).max().unwrap();
         self.speculation_policy.begin_round(
@@ -276,8 +275,9 @@ impl Runtime {
             batch: packet_batch,
             prefill_rows,
             prefill_requests,
+            ..
         } = self
-            .select_packet(requests, options, Some(&inputs))?
+            .packet_for_budget(requests, Some(&inputs), baseline.budget, mixed)?
             .ok_or("Missing DSpark verification packet")?;
         if self.team.needs_preparation(&layout)?
             && !memory::ensure_budget(self, memory::Requirement::workspace())?
@@ -347,6 +347,8 @@ impl Runtime {
                 );
             }
         }
+        self.speculation_policy
+            .prepare_prefill(baseline.prefill_budget);
         let (verified, verify_timing) =
             self.team
                 .forward_with(layout, inputs, readout, Some(capture), || {})?;

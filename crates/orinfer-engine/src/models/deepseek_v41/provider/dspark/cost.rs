@@ -1,6 +1,9 @@
 //! Sparse measured priors and bounded online corrections, independent of owners.
 use crate::{artifact::Result, scheduler::Estimate};
 use serde::{Deserialize, Serialize};
+#[path = "cost/prefill.rs"]
+mod prefill;
+pub(in crate::models::deepseek_v41::provider) use prefill::Budget as PrefillBudget;
 use std::{collections::BTreeMap, path::Path};
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
@@ -65,6 +68,9 @@ struct Family(Stage, usize, bool, bool, usize, usize);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Key(Family, usize, bool, bool);
 struct Cell {
+    work: Work,
+    tick: usize,
+    complete: crate::mtp::adaptive::Timing,
     time: crate::mtp::adaptive::Timing,
     prior: f64,
 }
@@ -84,6 +90,7 @@ struct Cold {
 }
 #[derive(Default)]
 pub(super) struct Model {
+    tick: usize,
     cells: BTreeMap<Key, Cell>,
     modes: BTreeMap<(Family, usize), bool>,
     shared_modes: std::collections::BTreeSet<(Family, usize)>,
@@ -176,12 +183,19 @@ impl Model {
             // Retain the bounded sparse surface; unseen shapes can still use it.
             return;
         }
+        self.tick = self.tick.saturating_add(1);
         let cell = self.cells.entry(key).or_insert(Cell {
+            work: point.work,
+            tick: 0,
+            complete: Default::default(),
             time: Default::default(),
             prior: 0.,
         });
         if online {
+            cell.work = point.work;
+            cell.tick = self.tick;
             cell.time.observe(point.seconds);
+            cell.complete.observe(point.seconds + point.setup_s);
         } else {
             // Imported timings price execution; only this process's real
             // calls may consume its primer and establish hot observations.
