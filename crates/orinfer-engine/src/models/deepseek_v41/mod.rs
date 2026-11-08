@@ -634,6 +634,10 @@ impl Worker {
             .is_some_and(|l| l.rows.total < actual);
         let empty_decoder = decoder_layout.as_ref().is_some_and(|l| l.rows.total == 0);
         let mut current_layout = layout;
+        // Repeated layers share owner-work tables within one row domain.
+        // Resolve each table once instead of rebuilding its CTA schedule for
+        // every private kernel merely to obtain the same launch row count.
+        let mut owner_work_rows = BTreeMap::new();
         let mut steps = vec![];
         let mut pending = shared::Pending::new(
             self.shared.enabled
@@ -677,6 +681,7 @@ impl Worker {
             };
             match instruction {
                 Instruction::DecoderRows { .. } => {
+                    owner_work_rows.clear();
                     pending.common = false;
                     current_layout = decoder_layout.as_ref();
                     active_rows = current_layout.ok_or("Missing decoder layout")?.rows.total;
@@ -686,6 +691,7 @@ impl Worker {
                     continue;
                 }
                 Instruction::LimitRows { rows } => {
+                    owner_work_rows.clear();
                     active_rows = bounded_rows(active_rows, capacity, *rows)?;
                     capacity = *rows;
                     continue;
@@ -748,18 +754,23 @@ impl Worker {
             {
                 let geometry_started = Instant::now();
                 let rows = if let Some(grid) = owner_work {
-                    self.batch
-                        .as_ref()
-                        .ok_or("Missing batch runtime")?
-                        .contract
-                        .work_items(
-                            current_layout.ok_or("Owner kernel needs batch layout")?,
-                            grid,
-                            &buffers[0],
-                            self.rank as usize,
-                        )?
-                        .len()
-                        .div_ceil(2)
+                    match owner_work_rows.entry(buffers[0].as_str()) {
+                        std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                        std::collections::btree_map::Entry::Vacant(entry) => *entry.insert(
+                            self.batch
+                                .as_ref()
+                                .ok_or("Missing batch runtime")?
+                                .contract
+                                .work_items(
+                                    current_layout.ok_or("Owner kernel needs batch layout")?,
+                                    grid,
+                                    &buffers[0],
+                                    self.rank as usize,
+                                )?
+                                .len()
+                                .div_ceil(2),
+                        ),
+                    }
                 } else if *owners {
                     current_layout
                         .ok_or("Head kernel needs batch layout")?

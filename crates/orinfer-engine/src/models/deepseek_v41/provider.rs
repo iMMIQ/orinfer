@@ -1080,6 +1080,7 @@ impl Runtime {
         let (values, timing) =
             self.team
                 .forward_with(layout, tokens, readout, Some(capture), maintenance)?;
+        timing.record(&mut self.statistics.batch_execution);
         let seconds = timing.seconds;
         self.statistics.sampling_mask_rows += timing.mask_rows;
         self.statistics.sampling_report_rows += timing.report_rows;

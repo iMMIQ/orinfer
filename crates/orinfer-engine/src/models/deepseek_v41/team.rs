@@ -225,6 +225,32 @@ pub(super) struct Timing {
     pub mask_rows: usize,
     pub report_rows: usize,
     pub mask_prepare_s: f64,
+    pub captured: bool,
+    pub invalidated: bool,
+}
+impl Timing {
+    /// One completed TP packet, independent of its number of ranks or owners.
+    pub fn record(&self, statistics: &mut crate::scheduler::BatchExecutionStatistics) {
+        statistics.direct_iterations += usize::from(!self.replay);
+        statistics.graph_hits += usize::from(self.replay && !self.captured);
+        statistics.graph_misses += usize::from(!self.replay || self.captured);
+        statistics.graph_invalidations += usize::from(self.invalidated);
+        statistics.dynamic_graph_captures += usize::from(self.captured);
+        statistics.shared_graph_hits += usize::from(self.shared);
+        statistics.shared_graph_captures += usize::from(self.shared_setup > 0.);
+        // Capture preparation includes the coordinated host work and warmup;
+        // separately priced shared capture is already inside that interval.
+        statistics.capture_s += if self.captured {
+            self.preparation
+        } else {
+            self.shared_setup
+        };
+        if self.replay {
+            statistics.replay_s += self.seconds;
+        } else {
+            statistics.direct_s += self.seconds;
+        }
+    }
 }
 impl Team {
     pub fn load(plan: &Path, model_dir: &Path) -> Result<Self> {
@@ -1096,6 +1122,8 @@ fn forward_with(
                 .filter(|p| p.top_logprobs.is_some())
                 .count(),
             mask_prepare_s: parameters.seconds(),
+            captured: plan.mode == preparation::Mode::CaptureReplay,
+            invalidated: invalidate,
             seconds: started.elapsed().as_secs_f64(),
             preparation: prepare_s,
             replay: capture,

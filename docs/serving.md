@@ -333,6 +333,8 @@ DeepSeek 前端在每个模型 worker 内使用 64 MiB 的有界文本编码缓�
 
 A2 启用 DSpark 时，`scheduler_statistics.speculation` 同步发布模型级累计草稿、接受、提交计数及分段耗时。草稿、验证和恢复计时包含设备等待与结果回读，采样计时记录 CPU 验证与提交；各请求日志中的整包耗时不能跨请求直接累加。通过同一健康快照的计数差值分析稳定 decode 窗口。
 
+A2 的 `scheduler_statistics.batch_execution` 按完成的 TP packet 计数，每包计一次。`graph_hits` 记录已驻留整包 Graph 的 replay，`dynamic_graph_captures` 记录本轮新捕获，`graph_misses` 记录未命中已驻留整包 Graph 的执行。`shared_graph_hits` 记录使用公共片段 Graph 的 packet，可能同时计入 `direct_iterations`；`shared_graph_captures` 记录新捕获的片段。`capture_s` 包含整包捕获的协调准备及 warmup，或单独的片段捕获准备；`direct_s` 与 `replay_s` 是提交后的完成耗时，准备另计。普通、草稿和验证共用这些统计，不能再按 rank 或 owner 乘算。A2 提供上述执行统计及 `graph_invalidations`；其他公共字段保留默认值，例如 `graph_evictions=0` 不表示已验收无淘汰。
+
 A2 普通 decode、草稿和验证形状在所有 rank 累计成功执行两次后统一捕获 Graph，交替出现的形状沿用累计次数；prefill 保持八次阈值。草稿成本模型从实际 Graph replay 学习普通 decode、草稿和验证的稳态成本，直接执行仍更新接受率与准备次数。Graph 准备和直接执行的实际耗时完整计入请求及调度统计。
 
 `ORINFER_A2_SHARED_GRAPH=1` 启用大 target packet 的公共 FFN 片段缓存。512 行及以上、decoder replay 边界之前的片段按真实行数和物理绑定复用，保留完整 fork/join；请求私有操作继续使用原地址表。整包 Graph 命中优先。所有 rank 统一选择已驻留片段，每轮最多捕获一个已执行三次的缺失片段；捕获同时受延迟预算、缓存容量及正常 workspace 以外的 256 MiB 显存余量约束。淘汰后重新累计复用次数。该选项默认关闭，使用完整请求实测决定是否启用；`--graph off` 统一关闭捕获与 replay。

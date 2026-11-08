@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn packet_statistics_distinguish_capture_replay_and_shared_execution() {
+    let mut statistics = crate::scheduler::BatchExecutionStatistics::default();
+    for timing in [
+        Timing {
+            seconds: 0.2,
+            invalidated: true,
+            ..Default::default()
+        },
+        Timing {
+            seconds: 0.1,
+            preparation: 0.3,
+            replay: true,
+            captured: true,
+            ..Default::default()
+        },
+        Timing {
+            seconds: 0.1,
+            replay: true,
+            ..Default::default()
+        },
+        Timing {
+            seconds: 0.15,
+            preparation: 0.04,
+            shared: true,
+            shared_setup: 0.02,
+            ..Default::default()
+        },
+        Timing {
+            seconds: 0.14,
+            shared: true,
+            ..Default::default()
+        },
+    ] {
+        timing.record(&mut statistics);
+    }
+    assert_eq!(statistics.graph_hits, 1);
+    assert_eq!(statistics.graph_misses, 4);
+    assert_eq!(statistics.graph_invalidations, 1);
+    assert_eq!(statistics.dynamic_graph_captures, 1);
+    assert_eq!(statistics.direct_iterations, 3);
+    assert_eq!(statistics.shared_graph_hits, 2);
+    assert_eq!(statistics.shared_graph_captures, 1);
+    assert!((statistics.capture_s - 0.32).abs() < 1e-12);
+    assert!((statistics.replay_s - 0.2).abs() < 1e-12);
+    assert!((statistics.direct_s - 0.49).abs() < 1e-12);
+}
+
+#[test]
 fn sampling_rows_keep_owner_positions_and_select_only_raw_outputs() {
     use orinfer_model_sdk::architecture::BatchSegment;
     let draw = crate::backend::ascend::sampling::Draw {

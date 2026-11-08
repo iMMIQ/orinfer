@@ -218,6 +218,7 @@ impl Runtime {
         let (proposals, draft_timing) =
             self.team
                 .forward_with(draft, inputs, readout, Some(capture), maintenance)?;
+        draft_timing.record(&mut self.statistics.batch_execution);
         let draft_s = draft_timing.seconds;
         let draft_prepare = draft_timing.preparation;
         let mut inputs = BTreeMap::new();
@@ -287,6 +288,7 @@ impl Runtime {
         let (verified, verify_timing) =
             self.team
                 .forward_with(layout, inputs, readout, Some(capture), || {})?;
+        verify_timing.record(&mut self.statistics.batch_execution);
         let verify_s = verify_timing.seconds;
         self.statistics.sampling_mask_rows += verify_timing.mask_rows;
         self.statistics.sampling_report_rows += verify_timing.report_rows;
