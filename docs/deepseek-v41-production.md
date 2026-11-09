@@ -38,7 +38,13 @@ DSv4.1 未显式提供采样参数时，默认 `temperature=1`、`top_p=1`、`to
 
 服务绑定本机地址，通过部门网关提供访问、用户配额及请求期限。将 `ORINFER_API_KEY` 放在仓库外的受保护环境文件中，客户端使用 `Authorization: Bearer ...`。网关应保留 SSE 流式转发并关闭响应缓冲。
 
-以下配置适用于至少 96 核 CPU、1 TB 主机内存和完整 8 卡独享的 A2 部署。DSpark 使用 `auto`，预处理线程及 batch 行数保留默认值。视觉特征缓存设为 1024 MiB；前处理缓存默认 256 MiB，按实际图片历史与内存压力调整。已有与执行包、CANN 9.2、TP8 和成本 schema 2 匹配的离线成本文件时，可显式设置 `ORINFER_A2_DSPARK_COST_MODEL`；未设置时由运行时估计成本。
+以下配置适用于至少 96 核 CPU、1 TB 主机内存和完整 8 卡独享的 A2 部署。DSpark 使用 `auto`，预处理线程及 batch 行数保留默认值。视觉特征缓存设为 1024 MiB；前处理缓存默认 256 MiB，按实际图片历史与内存压力调整。
+
+DSpark 使用权重中的接受率预测头和请求内实际接受结果，统一估计草稿排序与预期提交量。随机采样的预测按调度实际可用的上一轮置信度校准，仅在请求内误差小于历史后验时参与预算；未验证的后缀不计为失败。贪心预算使用历史接受率统计。
+
+使用经过代表性完整请求性能验收的离线成本文件。文件与执行包、CANN 9.2、TP8 和成本 schema 2 匹配时，可放在执行缓存的 `profiles/<execution_package>.json` 中自动读取，也可通过 `ORINFER_A2_DSPARK_COST_MODEL` 指定。自动发现的无效配置会被忽略；显式指定无效配置时报错。没有匹配文件时继续使用在线成本估计。离线测量只提供时间先验，实际 Graph 准备和试探成本仍由当前进程计费。
+
+离线提取成本时，在代表性短请求中启用 `ORINFER_A2_DSPARK_POLICY_TRACE=1`，再运行 `uv run --locked python -m tools.bench.dspark_costs --log service.log --output <执行缓存>/profiles/<execution_package>.json`。文件按本机配置采集；更换执行包后需重新采集。
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh

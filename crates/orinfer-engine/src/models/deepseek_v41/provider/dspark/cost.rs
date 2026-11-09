@@ -114,13 +114,24 @@ fn family(stage: Stage, block: usize, full: bool, work: Work) -> Family {
     )
 }
 impl Model {
-    pub fn load(identity: Identity, trace: bool) -> Result<Self> {
+    pub fn load(identity: Identity, package_root: &Path, trace: bool) -> Result<Self> {
         let mut model = Self {
             trace,
             ..Self::default()
         };
         if let Some(path) = std::env::var_os("ORINFER_A2_DSPARK_COST_MODEL") {
             model.read(Path::new(&path), &identity)?;
+        } else if let Some(cache) = package_root.parent() {
+            // Device timings are local tuning data, separate from immutable
+            // operators and model weights. A stale optional profile is inert.
+            let path = cache
+                .join("profiles")
+                .join(format!("{}.json", identity.execution_package));
+            if path.is_file()
+                && let Err(error) = model.read(&path, &identity)
+            {
+                eprintln!("A2 DSpark cost profile ignored: {error}");
+            }
         }
         if trace {
             eprintln!(
@@ -140,10 +151,11 @@ impl Model {
         {
             return Err("DSpark cost profile identity/point count differs".into());
         }
+        // Validate the whole profile before publishing any optional prior.
+        if profile.points.iter().any(|point| !valid(point)) {
+            return Err("Invalid DSpark cost profile point".into());
+        }
         for point in profile.points {
-            if !valid(&point) {
-                return Err("Invalid DSpark cost profile point".into());
-            }
             self.insert(point, false);
         }
         Ok(())
@@ -221,6 +233,12 @@ impl Model {
             .unwrap_or(false);
         self.predict_mode(stage, block, full, work, replay)
     }
+    pub fn profiled(&self, stage: Stage, block: usize, full: bool, work: Work) -> bool {
+        let group = family(stage, block, full, work);
+        self.cells
+            .iter()
+            .any(|(Key(f, rows, _, _), cell)| *f == group && *rows == work.rows && cell.prior > 0.)
+    }
     /// Measured neighboring rows can price another logical prefix in the same
     /// physical draft family; they do not establish Graph residency.
     pub(super) fn evidence(
@@ -263,6 +281,9 @@ impl Model {
                     && f.3 == requested.3
                     && *mode == replay
                     && *shared_mode == shared
+                    // Native verification changes its execution strategy at
+                    // 128 rows. Never interpolate across that boundary.
+                    && (*rows >= 128) == (work.rows >= 128)
                     // Small packets include a large fixed launch cost. Do not
                     // multiply a single-owner observation across a distant
                     // batch; leave that cost unknown for bounded calibration.
@@ -279,8 +300,11 @@ impl Model {
         let points = self
             .cells
             .iter()
-            .filter(|(Key(f, _, mode, shared_mode), _)| {
-                *f == group && *mode == replay && *shared_mode == shared
+            .filter(|(Key(f, rows, mode, shared_mode), _)| {
+                *f == group
+                    && *mode == replay
+                    && *shared_mode == shared
+                    && (*rows >= 128) == (work.rows >= 128)
             });
         let mut lower = None;
         let mut previous = None;
@@ -475,6 +499,84 @@ fn valid(point: &Point) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn cheap_profiled_prefix_waits_for_full_acceptance_calibration() {
+        use super::super::{Budget, Feedback, History, Policy};
+        let mut policy = Policy::default();
+        for _ in 0..4 {
+            policy.baseline(16, false, false, 0.08);
+        }
+        let state = Feedback {
+            blocks: [(
+                5,
+                History {
+                    previous: vec![0.01; 5],
+                    ..Default::default()
+                },
+            )]
+            .into(),
+        };
+        for (rows, seconds) in [(32, 0.005), (96, 0.1)] {
+            for replay in [false, true] {
+                policy.costs.insert(
+                    Point {
+                        work: Work {
+                            context: 0,
+                            ..point(rows, replay, seconds).work
+                        },
+                        ..point(rows, replay, seconds)
+                    },
+                    false,
+                );
+            }
+        }
+        for (stage, block) in [(Stage::Draft, 5), (Stage::Restore, 5)] {
+            policy.costs.insert(
+                Point {
+                    stage,
+                    block,
+                    work: Work {
+                        rows: 16,
+                        ..Default::default()
+                    },
+                    ..point(16, false, 0.001)
+                },
+                false,
+            );
+        }
+        let select = |p: &mut Policy| {
+            p.select_requests(
+                false,
+                false,
+                Budget {
+                    rows: 96,
+                    remaining: 256,
+                    uniform: true,
+                    work: Work {
+                        rows: 16,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                &[5; 16],
+                &[&state; 16],
+                &[5],
+            )
+            .unwrap()
+        };
+        assert_eq!(select(&mut policy), [5; 16]);
+        for _ in 0..crate::mtp::adaptive::CALIBRATION_ROUNDS {
+            policy.observe(
+                16,
+                (false, false, true),
+                [0.001, 0.1, 0.001, 0.],
+                &[(5, 0); 16],
+                5,
+            );
+        }
+        let selected = select(&mut policy);
+        assert!(selected.iter().any(|&depth| depth > 0 && depth < 5));
+    }
+    #[test]
     fn imported_timings_do_not_consume_the_runtime_primer() {
         let mut model = Model::default();
         let work = Work {
@@ -483,6 +585,22 @@ mod tests {
             ..Work::default()
         };
         model.insert(point(96, true, 0.29), false);
+        assert!(model.profiled(Stage::Target, 0, false, work));
+        assert!(!model.profiled(Stage::Target, 0, false, Work { rows: 80, ..work }));
+        assert!(!model.profiled(
+            Stage::Target,
+            0,
+            false,
+            Work {
+                context: 100256,
+                ..work
+            }
+        ));
+        assert!(
+            !model
+                .predict(Stage::Target, 0, false, work)
+                .is_some_and(|p| p.replay)
+        );
         assert_eq!(model.evidence(Stage::Target, 0, false, work), (0, 0));
         assert!(
             (model
@@ -666,10 +784,12 @@ mod tests {
                 },
                 false,
             );
-            let prior = model
-                .predict_mode(Stage::Target, 0, false, work, true)
-                .unwrap();
-            assert_eq!(prior.seconds, 0.51);
+            let prior = model.predict_mode(Stage::Target, 0, false, work, true);
+            if distant.rows >= 128 {
+                assert!(prior.is_none());
+            } else {
+                assert_eq!(prior.unwrap().seconds, 0.51);
+            }
             let budget = model.budget(Stage::Target, 0, false, work, 64., 1.);
             assert!(budget.replay_s.is_none());
             assert!(budget.profitable(0));
@@ -780,7 +900,7 @@ mod tests {
         );
     }
     #[test]
-    fn large_verification_uses_nearby_rows_and_marginal_extrapolation() {
+    fn verification_priors_stay_within_the_native_row_strategy() {
         let mut model = Model::default();
         model.observe(Point {
             stage: Stage::Decode,
@@ -797,6 +917,24 @@ mod tests {
                 ..point(rows, true, seconds)
             });
         }
+        assert!(
+            model
+                .predict_mode(
+                    Stage::Target,
+                    0,
+                    false,
+                    Work {
+                        rows: 192,
+                        context: 2048,
+                        prefill_rows: 0,
+                    },
+                    true
+                )
+                .is_none()
+        );
+        for (rows, seconds) in [(128, 0.10), (160, 0.11)] {
+            model.observe(point(rows, true, seconds));
+        }
         let prediction = model
             .predict_mode(
                 Stage::Target,
@@ -810,7 +948,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert!(prediction.seconds > 0.067 && prediction.seconds < 0.080);
+        assert!((prediction.seconds - 0.12).abs() < 1e-12);
     }
     #[test]
     fn priors_do_not_imply_graph_residency_and_modes_do_not_mix() {

@@ -346,13 +346,16 @@ impl Runtime {
         {
             return Err("A2 service context/state contract differs".into());
         }
-        let speculation_policy = dspark::Policy::load(dspark::Identity {
-            schema_version: 2,
-            execution_package: model.execution_package,
-            target: model.metadata.target,
-            cann: "9.2".into(),
-            ranks: team.ranks(),
-        })?;
+        let speculation_policy = dspark::Policy::load(
+            dspark::Identity {
+                schema_version: 2,
+                execution_package: model.execution_package,
+                target: model.metadata.target,
+                cann: "9.2".into(),
+                ranks: team.ranks(),
+            },
+            &package_root,
+        )?;
         let rejection_sampling = crate::backend::ascend::sampling::rejection_requested()?;
         if rejection_sampling {
             let contract = team

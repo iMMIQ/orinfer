@@ -496,14 +496,24 @@ impl Runtime {
                 rollback.push((request.slot, committed.len()));
             }
             if count > 0 {
-                let confidence = proposals
-                    .iter()
-                    .filter(|p| p.owner == request.slot)
-                    .map(|p| p.value as f64)
-                    .collect::<Vec<_>>();
-                request
-                    .draft_feedback
-                    .observe(&confidence, count, committed.len() - 1, block);
+                // Keep greedy acceptance on its historical estimator. The
+                // trained head is evaluated causally for stochastic draws.
+                let confidence = if request.sampling.temperature > 0. {
+                    proposals
+                        .iter()
+                        .filter(|p| p.owner == request.slot)
+                        .map(|p| p.value as f64)
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                self.speculation_policy.observe_feedback(
+                    request.slot,
+                    &mut request.draft_feedback,
+                    &confidence,
+                    (count, committed.len() - 1),
+                    block,
+                );
             }
             counts.push((count, committed.len() - 1));
             *self

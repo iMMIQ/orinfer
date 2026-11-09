@@ -3,6 +3,9 @@ use crate::{artifact::Result, mtp::adaptive};
 use std::collections::BTreeMap;
 #[path = "cost.rs"]
 mod cost;
+#[cfg(test)]
+#[path = "profile_test.rs"]
+mod profile_test;
 pub(in crate::models::deepseek_v41::provider) use cost::{Identity, Work};
 use cost::{Model, Point, Stage};
 
@@ -13,11 +16,29 @@ pub(in crate::models::deepseek_v41::provider) struct Feedback {
 #[derive(Default)]
 struct History {
     previous: Vec<f64>,
+    bias: [f64; crate::execution::MAX_MTP_DRAFTS],
+    errors: [ForecastError; crate::execution::MAX_MTP_DRAFTS],
     acceptance: adaptive::Acceptance,
+}
+#[derive(Clone, Copy, Default)]
+struct ForecastError {
+    head: f64,
+    history: f64,
+    observed: bool,
+}
+impl ForecastError {
+    fn observe(&mut self, head: f64, history: f64, label: f64) {
+        update(&mut self.head, (head - label).powi(2), self.observed);
+        update(&mut self.history, (history - label).powi(2), self.observed);
+        self.observed = true;
+    }
+    fn useful(self) -> bool {
+        self.observed && self.head < self.history
+    }
 }
 impl Feedback {
     pub fn progress(&self, depth: usize, block: usize) -> f64 {
-        1. + self.rates(depth, true, &[], block).iter().sum::<f64>()
+        1. + self.rates(depth, &[], block).iter().sum::<f64>()
     }
 
     pub fn observe(&mut self, confidence: &[f64], proposed: usize, accepted: usize, block: usize) {
@@ -26,33 +47,58 @@ impl Feedback {
             .or_default()
             .observe(confidence, proposed, accepted);
     }
-    fn rates(&self, maximum: usize, expected: bool, prior: &[f64], block: usize) -> Vec<f64> {
+    fn rates(&self, maximum: usize, prior: &[f64], block: usize) -> Vec<f64> {
         self.blocks
             .get(&block)
             .unwrap_or(&History::default())
-            .rates(maximum, expected, prior)
+            .rates(maximum, prior)
     }
 }
 impl History {
     fn observe(&mut self, confidence: &[f64], proposed: usize, accepted: usize) {
+        // Only the accepted prefix and first rejection were actually tested.
+        // Keep calibration private to this request and physical draft block.
+        // The planner used the preceding round's head. Assess and calibrate
+        // that forecast before seeing this round's head or updating history.
+        for (i, &prediction) in self
+            .previous
+            .iter()
+            .take(
+                proposed
+                    .min(accepted.saturating_add(1))
+                    .min(self.bias.len()),
+            )
+            .enumerate()
+        {
+            if prediction.is_finite() && (0. ..=1.).contains(&prediction) {
+                let label = f64::from(i < accepted);
+                let actual = self.acceptance.estimate(i, 0.7);
+                let predicted = (actual + (prediction + self.bias[i]).clamp(0., 1.)) * 0.5;
+                self.errors[i].observe(predicted, actual, label);
+                self.bias[i] = self.bias[i] * 0.8 + (label - prediction) * 0.2;
+            }
+        }
         self.previous = confidence.to_vec();
         self.acceptance.observe(proposed, accepted);
     }
-    fn rates(&self, maximum: usize, expected: bool, prior: &[f64]) -> Vec<f64> {
+    fn rates(&self, maximum: usize, prior: &[f64]) -> Vec<f64> {
         let mut survival = 1.;
         (0..maximum)
             .map(|i| {
                 let actual = self
                     .acceptance
                     .estimate(i, prior.get(i).copied().unwrap_or(0.7));
-                // Draft confidence ranks owner prefixes. Expected commits use
-                // the same conditional-acceptance posterior as CUDA; q's own
-                // confidence is not the probability of target acceptance.
-                let rate = if expected {
-                    actual
-                } else {
-                    (actual + self.previous.get(i).copied().unwrap_or(actual)) * 0.5
-                };
+                // This is the checkpoint's trained AcceptRatePredictor, not
+                // the draft token's softmax probability. Use one forecast for
+                // ranking and useful progress, corrected by tested outcomes.
+                let predicted = self.previous.get(i).copied().filter(|p| {
+                    p.is_finite()
+                        && (0. ..=1.).contains(p)
+                        && self.errors.get(i).is_some_and(|error| error.useful())
+                });
+                let rate = predicted.map_or(actual, |p| {
+                    (actual + (p + self.bias.get(i).copied().unwrap_or(0.)).clamp(0., 1.)) * 0.5
+                });
                 survival *= rate.clamp(0., 1.);
                 survival
             })
@@ -179,11 +225,56 @@ fn update(old: &mut f64, sample: f64, initialized: bool) {
         sample
     };
 }
+fn retain_profitable_prefixes(candidates: &mut Vec<adaptive::Candidate>) {
+    let mut incumbents = BTreeMap::<usize, f64>::new();
+    for candidate in candidates.iter().filter(|c| c.samples > 0) {
+        let rate = candidate.mean_s / candidate.expected_tokens;
+        incumbents
+            .entry(candidate.width)
+            .and_modify(|old| *old = old.min(rate))
+            .or_insert(rate);
+    }
+    // A physical block is already calibrated. A new logical prefix must pay
+    // back against its measured incumbent, not merely beat ordinary decode. Prices
+    // already amortize its own build, direct primer and Graph capture debt.
+    candidates.retain(|c| {
+        c.samples > 0
+            || incumbents
+                .get(&c.width)
+                .is_none_or(|&rate| c.mean_s / c.expected_tokens < rate * (1. - 1e-6))
+    });
+}
+#[cfg(test)]
+#[test]
+fn logical_prefix_probes_compete_with_the_hot_physical_block() {
+    let candidate = |id, width, seconds, progress, samples| adaptive::Candidate {
+        id,
+        width,
+        mean_s: seconds,
+        upper_s: seconds,
+        expected_tokens: progress,
+        maximum_tokens: progress,
+        remaining_tokens: 1024,
+        transition_s: 0.,
+        warm_ready: true,
+        review_acceptance: false,
+        samples,
+        last: None,
+    };
+    let mut choices = vec![
+        candidate(0, 6, 0.09, 60., 1),
+        candidate(1, 6, 0.08, 40., 0),
+        candidate(2, 6, 0.06, 50., 0),
+        candidate(3, 9, 1., 20., 0),
+    ];
+    retain_profitable_prefixes(&mut choices);
+    assert_eq!(choices.iter().map(|c| c.id).collect::<Vec<_>>(), [0, 2, 3]);
+    assert_eq!(choices[1].samples, 0);
+}
 fn queue(
     maxima: &[usize],
     feedback: &[&Feedback],
     prior: &[f64],
-    expected: bool,
     block: usize,
 ) -> Vec<(f64, usize, usize)> {
     let mut rows = maxima
@@ -192,7 +283,7 @@ fn queue(
         .enumerate()
         .flat_map(|(owner, (&maximum, state))| {
             state
-                .rates(maximum, expected, prior, block)
+                .rates(maximum, prior, block)
                 .into_iter()
                 .enumerate()
                 .map(move |(position, rate)| (rate, owner, position))
@@ -222,7 +313,7 @@ pub(super) fn redistribute(
     }
     let rates = feedback
         .iter()
-        .map(|f| f.rates(block, true, &[], block))
+        .map(|f| f.rates(block, &[], block))
         .collect::<Vec<_>>();
     let mut selected = depths
         .iter()
@@ -298,6 +389,30 @@ fn reuse_steps(
         .max(1.)
 }
 impl Policy {
+    pub fn observe_feedback(
+        &self,
+        owner: usize,
+        feedback: &mut Feedback,
+        confidence: &[f64],
+        counts: (usize, usize),
+        block: usize,
+    ) {
+        feedback.observe(confidence, counts.0, counts.1, block);
+        if self.trace {
+            let errors = &feedback.blocks[&block].errors[..block];
+            let compared = errors.iter().filter(|e| e.observed).count();
+            eprintln!(
+                "DSPARK_FEEDBACK {}",
+                serde_json::json!({
+                    "owner":owner,"block":block,"proposed":counts.0,"accepted":counts.1,
+                    "trusted_positions":errors.iter().filter(|e| e.useful()).count(),
+                    "compared_positions":compared,
+                    "forecast_brier":errors.iter().filter(|e| e.observed).map(|e| e.head).sum::<f64>() / compared.max(1) as f64,
+                    "history_brier":errors.iter().filter(|e| e.observed).map(|e| e.history).sum::<f64>() / compared.max(1) as f64,
+                })
+            );
+        }
+    }
     pub fn prepare_feedback(
         &self,
         batch: usize,
@@ -399,9 +514,9 @@ impl Policy {
             );
         }
     }
-    pub fn load(identity: Identity) -> Result<Self> {
+    pub fn load(identity: Identity, package_root: &std::path::Path) -> Result<Self> {
         let mut policy = Self::default();
-        policy.costs = Model::load(identity, policy.trace)?;
+        policy.costs = Model::load(identity, package_root, policy.trace)?;
         Ok(policy)
     }
     pub fn target_budget(
@@ -644,7 +759,7 @@ impl Policy {
             let priors = (0..block)
                 .map(|i| prior.map_or(0.7, |p| p.acceptance.estimate(i, 0.7)))
                 .collect::<Vec<_>>();
-            let allocation = queue(&local, feedback, &priors, false, block);
+            let allocation = queue(&local, feedback, &priors, block);
             let mut depths = vec![0; batch];
             for (index, &(_, owner, _)) in allocation.iter().take(local_limit - batch).enumerate() {
                 depths[owner] += 1;
@@ -692,9 +807,10 @@ impl Policy {
                     Some(work) => work,
                     None => forecast(&selected, None)?.ok_or("Missing DSpark packet forecast")?,
                 };
-                let yields = feedback.iter().zip(&selected).map(|(f, &depth)| {
-                    1. + f.rates(depth, true, &priors, block).iter().sum::<f64>()
-                });
+                let yields = feedback
+                    .iter()
+                    .zip(&selected)
+                    .map(|(f, &depth)| 1. + f.rates(depth, &priors, block).iter().sum::<f64>());
                 let expected = adaptive::progress(yields, batch, budget.latency);
                 let owners = selected.iter().filter(|&&d| d > 0).count();
                 let draft_work = Work {
@@ -734,7 +850,15 @@ impl Policy {
                 // One representative maximum packet calibrates a physical
                 // family. Shorter prefixes reuse its conservative measured
                 // cost; they must not each trigger a fresh Graph calibration.
-                if samples < adaptive::HOT_SAMPLES && rows != local_limit {
+                // Exact offline costs may admit shorter packets after the
+                // full-prefix acceptance primer, never replace that primer.
+                if samples < adaptive::HOT_SAMPLES
+                    && rows != local_limit
+                    && !(prior.is_some_and(|p| {
+                        p.seen.get(&local_limit).copied().unwrap_or(0)
+                            >= adaptive::CALIBRATION_ROUNDS
+                    }) && self.costs.profiled(Stage::Target, 0, full, target_work))
+                {
                     continue;
                 }
                 let mut upper = mean.max(
@@ -806,6 +930,7 @@ impl Policy {
                 });
             }
         }
+        retain_profitable_prefixes(&mut estimates);
         estimates.sort_by(|a, b| {
             (a.mean_s / a.expected_tokens).total_cmp(&(b.mean_s / b.expected_tokens))
         });
@@ -1226,18 +1351,86 @@ mod tests {
         assert_eq!(p.ledger.startup_spent, 0.);
     }
     #[test]
-    fn draft_confidence_is_priority_not_a_permanent_acceptance_ceiling() {
+    fn trained_acceptance_prediction_learns_a_request_local_bias() {
         let mut h = History::default();
         for _ in 0..32 {
             h.observe(&[0.05; 5], 5, 5);
         }
-        assert!(h.rates(5, true, &[])[4] > 0.8);
-        assert!(h.rates(5, false, &[])[4] < 0.1);
+        assert!(h.rates(5, &[])[4] > 0.8);
         let mut rejected = History::default();
         for _ in 0..32 {
             rejected.observe(&[1.; 5], 5, 0);
         }
-        assert!(rejected.rates(5, true, &[])[0] < 0.1);
+        assert!(rejected.rates(5, &[])[0] < 0.1);
+    }
+    #[test]
+    fn acceptance_head_changes_expected_progress_with_the_same_history() {
+        let high = History {
+            previous: vec![0.9; 5],
+            errors: [ForecastError {
+                head: 0.,
+                history: 1.,
+                observed: true,
+            }; crate::execution::MAX_MTP_DRAFTS],
+            ..Default::default()
+        };
+        let low = History {
+            previous: vec![0.1; 5],
+            errors: [ForecastError {
+                head: 0.,
+                history: 1.,
+                observed: true,
+            }; crate::execution::MAX_MTP_DRAFTS],
+            ..Default::default()
+        };
+        assert!(high.rates(5, &[]).iter().sum::<f64>() > low.rates(5, &[]).iter().sum::<f64>());
+        let invalid = History {
+            previous: vec![f64::NAN, f64::INFINITY, -1., 2., f64::NAN],
+            ..Default::default()
+        };
+        assert_eq!(invalid.rates(5, &[]), History::default().rates(5, &[]));
+    }
+    #[test]
+    fn rejected_prefix_does_not_calibrate_its_untested_suffix() {
+        let mut history = History {
+            previous: vec![0.9; 5],
+            ..Default::default()
+        };
+        history.observe(&[0.9; 5], 5, 1);
+        assert!(history.bias[0] > 0.);
+        assert!(history.bias[1] < 0.);
+        assert_eq!(
+            &history.bias[2..],
+            &[0.; crate::execution::MAX_MTP_DRAFTS - 2]
+        );
+        let before = history.bias;
+        history.previous.fill(f64::NAN);
+        history.observe(&[0.5; 5], 5, 0);
+        assert_eq!(history.bias, before);
+    }
+    #[test]
+    fn confidence_calibration_scores_the_lagged_forecast_without_lookahead() {
+        let mut history = History {
+            previous: vec![0.9],
+            ..Default::default()
+        };
+        history.observe(&[0.1], 1, 0);
+        assert!((history.bias[0] + 0.18).abs() < 1e-12);
+        assert!(!history.errors[0].useful());
+        assert_eq!(
+            history.rates(1, &[])[0],
+            history.acceptance.estimate(0, 0.7)
+        );
+    }
+    #[test]
+    fn a_predictive_head_can_beat_the_request_history() {
+        let mut history = History {
+            previous: vec![0.9],
+            ..Default::default()
+        };
+        history.observe(&[0.9], 1, 1);
+        assert!(history.errors[0].useful());
+        assert!(history.rates(1, &[])[0] > history.acceptance.estimate(0, 0.7));
     }
     #[test]
     fn actual_earnings_fund_a_new_cohort_without_recreating_startup_credit() {
@@ -1585,7 +1778,7 @@ mod tests {
             );
             state.observe(&[1.; 5], 5, 5, 5);
         }
-        let expected = state.rates(5, true, &[], 5);
+        let expected = state.rates(5, &[], 5);
         for _ in 0..4 {
             policy.observe(
                 1,
@@ -1596,13 +1789,13 @@ mod tests {
             );
             state.observe(&[0.01; 16], 16, 0, 16);
         }
-        assert_eq!(state.rates(5, true, &[], 5), expected);
+        assert_eq!(state.rates(5, &[], 5), expected);
         assert!(
             expected
                 .iter()
                 .enumerate()
                 .all(
-                    |(i, &p)| (p - (1. - 0.3 * 0.8_f64.powi(16)).powi(i as i32 + 1)).abs() < 1e-12
+                    |(i, &p)| (p - (1. - 0.15 * 0.8_f64.powi(16)).powi(i as i32 + 1)).abs() < 1e-12
                 )
         );
         assert_eq!(
@@ -1646,7 +1839,7 @@ mod tests {
         assert!(wider[0] > 5 && wider[0] <= 16);
         let prior = [0.9, 0.5, 0.2];
         assert_eq!(
-            Feedback::default().rates(3, true, &prior, 5),
+            Feedback::default().rates(3, &prior, 5),
             vec![0.9, 0.9 * 0.5, 0.9 * 0.5 * 0.2]
         );
     }
@@ -1881,6 +2074,11 @@ mod tests {
                 8,
                 History {
                     previous: vec![0.99; 8],
+                    errors: [ForecastError {
+                        head: 0.,
+                        history: 1.,
+                        observed: true,
+                    }; crate::execution::MAX_MTP_DRAFTS],
                     ..Default::default()
                 },
             )]
@@ -1891,6 +2089,11 @@ mod tests {
                 8,
                 History {
                     previous: vec![0.01; 8],
+                    errors: [ForecastError {
+                        head: 0.,
+                        history: 1.,
+                        observed: true,
+                    }; crate::execution::MAX_MTP_DRAFTS],
                     ..Default::default()
                 },
             )]

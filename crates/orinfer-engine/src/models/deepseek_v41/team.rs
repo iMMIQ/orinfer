@@ -762,6 +762,17 @@ impl Team {
         )
     }
 
+    #[cfg(test)]
+    pub fn profile_forward(
+        &self,
+        layout: Layout,
+        tokens: Vec<Vec<u32>>,
+        readout: Readout,
+        graph: bool,
+    ) -> Result<(Vec<Output>, Timing)> {
+        forward_with(&self.peers, layout, tokens, readout, None, || {}, graph)
+    }
+
     pub fn offload_allocations(&self, id: u64) -> Result<BTreeMap<u64, usize>> {
         self.allocations(Command::PlanOffload(id))
     }
