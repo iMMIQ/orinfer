@@ -106,6 +106,23 @@ def main():
         )
         assert bool((output[rows:] == 12345.0).all()), "Sampling wrote inactive output rows"
         checks.append(dict(rows=rows, phase=phase, exact_selected=True, changed_input_graph=True))
+    # Greedy ties across vocabulary tiles retain the smallest token ID,
+    # independent of RNG keys or the shard's global vocabulary origin.
+    active.fill_(2)
+    controls.zero_()
+    controls[:, 2] = 7 * vocab
+    controls[0, 0] = 123
+    controls[1, 0] = -9876
+    for all_equal in [False, True]:
+        logits.fill_(0.0 if all_equal else -10000.0)
+        if not all_equal:
+            for index in [2, 1025, vocab - 1]:
+                logits[:2, index] = 3.0
+        output.fill_(12345.0)
+        graph.replay()
+        torch.npu.synchronize()
+        assert bool((output[:2, 1] == (0 if all_equal else 2)).all())
+        assert bool((output[2:] == 12345.0).all())
     # A nonfinite real logit must reach the host as an invalid candidate.
     active.fill_(1)
     logits[0, 22] = float("nan")
@@ -153,6 +170,7 @@ def main():
     graph.reset()
     report = dict(
         checks=checks,
+        greedy_ties_choose_smallest_id=True,
         invalid_logit_rejected=True,
         draws=n,
         frequencies=frequencies,

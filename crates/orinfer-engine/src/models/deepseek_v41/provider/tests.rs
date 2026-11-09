@@ -71,6 +71,83 @@ fn device_sampling_keeps_cached_heads_raw_and_respects_host_fallbacks() {
     );
 }
 #[test]
+fn zero_and_positive_temperatures_share_device_selection_and_owner_controls() {
+    for temperature in [0., 0.7, 1., 2.] {
+        let mut r = request(
+            output(),
+            crate::sampling::Options {
+                temperature,
+                ..Default::default()
+            },
+        );
+        r.device_sampling = true;
+        r.prefilling = false;
+        assert!(r.device_sample());
+        assert!(!r.needs_logits());
+        let readout = packet::draft_readout(&[&mut r]);
+        let draw = &readout.draws[&r.slot];
+        assert_eq!(draw.temperature, temperature);
+        let control = draw.control(0).unwrap();
+        assert_eq!(
+            f32::from_bits(control[2] as u32),
+            if temperature == 0. {
+                0.
+            } else {
+                (1. / temperature) as f32
+            }
+        );
+    }
+    let mut r = request(
+        output(),
+        crate::sampling::Options {
+            temperature: 0.,
+            top_k: 20,
+            top_p: 0.9,
+            ..Default::default()
+        },
+    );
+    r.device_sampling = true;
+    r.prefilling = false;
+    assert!(
+        r.device_sample(),
+        "Truncation does not change greedy argmax"
+    );
+    r.sampling.frequency_penalty = 0.5;
+    assert!(!r.device_sample());
+    assert!(
+        r.needs_logits(),
+        "History processors retain their established fallback"
+    );
+}
+#[test]
+fn device_prefix_commit_is_shared_by_zero_and_positive_temperatures() {
+    for temperature in [0., 1.] {
+        let mut r = request(
+            output(),
+            crate::sampling::Options {
+                temperature,
+                ..Default::default()
+            },
+        );
+        r.device_sampling = true;
+        r.processed_sampling = true;
+        r.prefilling = false;
+        let values = [1, 3, 4].map(|token| Output {
+            owner: r.slot,
+            token,
+            value: 1.,
+            ..Default::default()
+        });
+        let actual = r
+            .verify_device(&[1, 2], &values.iter().collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(
+            actual,
+            crate::mtp::greedy_commit(&[1, 2], &[1, 3, 4]).unwrap()
+        );
+    }
+}
+#[test]
 fn shared_banks_and_cpu_heads_are_charged_once_after_parent_eviction() {
     let mut cache = Cache::new(4096);
     let head = output();

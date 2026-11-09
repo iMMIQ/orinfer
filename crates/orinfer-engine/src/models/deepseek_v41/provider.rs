@@ -176,7 +176,9 @@ impl Request {
     fn device_sample(&self) -> bool {
         self.device_sampling
             && !self.prefilling
-            && ((self.sampling.device_categorical() && !self.decoder.constrained())
+            && (((self.sampling.is_greedy() && self.sampling.top_logprobs.is_none()
+                || self.sampling.device_categorical())
+                && !self.decoder.constrained())
                 || (self.processed_sampling
                     && self.host_sampling()
                     && self.sampling.device_untruncated()))
