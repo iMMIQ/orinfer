@@ -295,4 +295,6 @@ def causal_logits(
         else main
     )
 
-    return result.with_attr("orinfer.component_sources", ["kernels/ascend/candidate.py"])
+    return result.with_attr(
+        "orinfer.component_sources", ["kernels/ascend/candidate.py", "kernels/ascend/kv_int8.py"]
+    )

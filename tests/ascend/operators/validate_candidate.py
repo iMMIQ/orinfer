@@ -89,6 +89,12 @@ def main():
     baseline = compile_call(
         indexer_cube.causal_logits, "indexer_cube.causal_logits", params, {"out", "workspace"}
     )
+    source_baseline = compile_call(
+        indexer_cube.causal_logits,
+        "indexer_cube.causal_logits",
+        dict(params, tile_rows=8),
+        {"out", "workspace"},
+    )
     print("compile fused candidate indexer", flush=True)
     fused = compile_call(
         indexer_fused.causal_topk,
@@ -112,23 +118,44 @@ def main():
     mapped_finalize = compile_call(
         candidate.finalize, "candidate.finalize", dict(rows=capacity), {"indices", "values"}
     )
+    source_fused = compile_call(
+        indexer_fused.causal_topk,
+        "indexer_fused.causal_topk",
+        dict(rows=capacity, length=length, tile_rows=8, emit_block_scores=True),
+        {"candidates", "cube_workspace", "score_workspace"},
+    )
+    packed_select = compile_call(
+        candidate.select_blocks,
+        "candidate.select_blocks",
+        dict(rows=capacity, length=length, source_chunk=4096),
+        {"out"},
+    )
+    source_local = compile_call(
+        topk.local, "topk.local", dict(rows=capacity, length=length), {"out"}
+    )
 
-    def merge_chain(sources, leaf_size):
+    def merge_chain(sources, leaf_size, source_stride=0):
         entries = []
         if sources in (16, 32, 64):
             fn = compile_call(
                 topk.merge_tree,
                 "topk.merge_tree",
-                dict(rows=capacity, sources=sources, leaf_size=leaf_size),
+                dict(
+                    rows=capacity, sources=sources, leaf_size=leaf_size, source_stride=source_stride
+                ),
                 {"out"},
             )
             entries.append((fn, torch.empty((capacity + 1, 1, 1024), device="npu"), True))
         else:
             while sources > 1:
                 fn = compile_call(
-                    topk.merge, "topk.merge", dict(rows=capacity, sources=sources), {"out"}
+                    topk.merge,
+                    "topk.merge",
+                    dict(rows=capacity, sources=sources, source_stride=source_stride),
+                    {"out"},
                 )
                 sources = (sources + 3) // 4
+                source_stride = 0
                 entries.append(
                     (fn, torch.empty((capacity + 1, sources, 1024), device="npu"), False)
                 )
@@ -143,6 +170,9 @@ def main():
 
     reference_merge = merge_chain(4, 4096)
     fused_merge = merge_chain(16384 // args.chunk_size, args.chunk_size)
+    source_chunks = (length + 4095) // 4096
+    source_merge = merge_chain(source_chunks, 4096, 1536)
+    source_reference_merge = merge_chain(source_chunks, 4096)
     scores = torch.empty((capacity, length), dtype=torch.float32, device="npu")
     # Query positions inside an owner are monotonically increasing, as required
     # by the common bounded score schedule's last-row extent.
@@ -193,6 +223,30 @@ def main():
     reference_values = torch.empty((capacity, 512), dtype=torch.float32, device="npu")
     fused_indices = torch.empty_like(reference_indices)
     fused_values = torch.empty_like(reference_values)
+    source_partials = torch.empty((capacity, source_chunks, 1536), device="npu")
+    source_reference_partials = torch.empty((capacity, source_chunks, 1024), device="npu")
+    source_cube = torch.empty((64, 8 * 32, 128), dtype=torch.int32, device="npu")
+    source_scores = torch.empty((64, 8, 4096), device="npu")
+    source_blocks = torch.empty_like(blocks)
+    source_reference_blocks = torch.empty_like(blocks)
+    source_ids, source_values = torch.empty_like(ids), torch.empty_like(reference_values)
+    source_reference_ids = torch.empty_like(ids)
+    source_reference_values = torch.empty_like(reference_values)
+
+    def source_pipeline(rows):
+        source_fused(
+            [q, qs, keys, ks, weights, counts, source_partials, source_cube, source_scores], rows
+        )
+        packed_select([source_partials, counts, source_blocks], rows)
+        final = source_merge(source_partials, counts, rows)
+        reference_finalize([final, source_ids, source_values], rows)
+
+    def source_reference(rows):
+        source_baseline([q, qs, keys, ks, weights, counts, full, scratch], rows)
+        select([full, counts, source_reference_blocks], rows)
+        source_local([full, counts, source_reference_partials], rows)
+        final = source_reference_merge(source_reference_partials, counts, rows)
+        reference_finalize([final, source_reference_ids, source_reference_values], rows)
 
     def candidate_pipeline(rows):
         fused([q, qs, keys, ks, weights, blocks, partial_fused, cube, tile_scores], rows)
@@ -218,6 +272,8 @@ def main():
         restore([blocks, reference_indices], rows)
         candidate_pipeline(rows)
         restore([blocks, ids], rows)
+        source_pipeline(rows)
+        source_reference(rows)
 
     reports = []
     for rows in (1, 3, 17):
@@ -248,6 +304,15 @@ def main():
             torch.npu.synchronize()
             torch.testing.assert_close(
                 fused_indices[:rows].cpu(), reference_indices[:rows].cpu(), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                source_blocks[:rows].cpu(), source_reference_blocks[:rows].cpu(), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                source_ids[:rows].cpu(), source_reference_ids[:rows].cpu(), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                source_values[:rows].cpu(), source_reference_values[:rows].cpu(), atol=0, rtol=0
             )
             torch.testing.assert_close(
                 fused_values[:rows].cpu(), reference_values[:rows].cpu(), atol=0, rtol=0
@@ -306,12 +371,29 @@ def main():
     scores.normal_()
     select([scores, counts, blocks], capacity)
     timings = {}
+    components = {}
     for rows in (1, 3, 17):
         timing, _ = npu_benchmark(lambda: candidate_pipeline(rows), repetitions=7, warmup=2)
         timings[str(rows)] = timing
+        components[str(rows)] = {}
+        for name, call in (
+            (
+                "full_scores",
+                lambda: baseline([q, qs, keys, ks, weights, counts, full, scratch], rows),
+            ),
+            ("source_blocks", lambda: select([scores, counts, blocks], rows)),
+            (
+                "compact_scores",
+                lambda: compact([q, qs, keys, ks, weights, blocks, actual, scratch], rows),
+            ),
+            ("source_reference", lambda: source_reference(rows)),
+            ("source_fused", lambda: source_pipeline(rows)),
+        ):
+            measured, _ = npu_benchmark(call, repetitions=7, warmup=2)
+            components[str(rows)][name] = measured
     atomic_json(
         args.output / "result.json",
-        dict(cases=reports, index_chunk=args.chunk_size, timings=timings),
+        dict(cases=reports, index_chunk=args.chunk_size, timings=timings, components=components),
     )
 
 

@@ -269,23 +269,23 @@ def merge_group(
     T.tile.fill(b, -T.infinity("float32"))
     T.tile.fill(c, -T.infinity("float32"))
     T.tile.fill(d, -T.infinity("float32"))
-    T.copy(candidates[source_row, source_group * 4, :], a)
+    T.copy(candidates[source_row, source_group * 4, : 2 * selected], a)
     if source_group * 4 + 1 < sources:
-        T.copy(candidates[source_row, source_group * 4 + 1, :], b)
+        T.copy(candidates[source_row, source_group * 4 + 1, : 2 * selected], b)
     if source_group * 4 + 2 < sources:
-        T.copy(candidates[source_row, source_group * 4 + 2, :], c)
+        T.copy(candidates[source_row, source_group * 4 + 2, : 2 * selected], c)
     if source_group * 4 + 3 < sources:
-        T.copy(candidates[source_row, source_group * 4 + 3, :], d)
+        T.copy(candidates[source_row, source_group * 4 + 3, : 2 * selected], d)
     T.tile.merge_sort(merged, a, b, c, d)
     T.copy(merged[: 2 * selected], out[output_row, output_group, :])
 
 
-def merge(rows, sources, selected=512):
+def merge(rows, sources, selected=512, source_stride=0):
     groups = (sources + 3) // 4
 
     @T.prim_func
     def main(
-        candidates: T.Tensor((rows, sources, 2 * selected), "float32"),
+        candidates: T.Tensor((rows, sources, source_stride or 2 * selected), "float32"),
         out: T.Tensor((rows, groups, 2 * selected), "float32"),
     ):
         with T.Kernel(T.ceildiv(rows * groups, 2), is_npu=True) as (cid, vid):
@@ -305,7 +305,7 @@ def merge(rows, sources, selected=512):
     return main
 
 
-def merge_tree(rows, sources, selected=512, leaf_size=4096):
+def merge_tree(rows, sources, selected=512, leaf_size=4096, source_stride=0):
     """Preserve the four-way tree, bypassing canonical empty causal subtrees."""
     if sources not in (16, 32, 64) or selected < 32 or selected > 512 or selected % 32:
         raise ValueError("Fused TopK tree requires16/32/64 sources and32-aligned selected<=512")
@@ -315,7 +315,7 @@ def merge_tree(rows, sources, selected=512, leaf_size=4096):
 
     @T.prim_func
     def main(
-        candidates: T.Tensor((rows, sources, 2 * selected), "float32"),
+        candidates: T.Tensor((rows, sources, source_stride or 2 * selected), "float32"),
         lengths: T.Tensor((rows, 1), "int32"),
         out: T.Tensor((rows, 1, 2 * selected), "float32"),
     ):
@@ -336,7 +336,7 @@ def merge_tree(rows, sources, selected=512, leaf_size=4096):
                 if live < sources:
                     # The producer canonicalizes every inactive leaf to (-inf, -1).
                     # Merging four such leaves preserves this exact bit pattern.
-                    T.copy(candidates[row, live, :], empty)
+                    T.copy(candidates[row, live, : 2 * selected], empty)
                 for parent in T.serial(second_groups):
                     if parent * 16 < live:
                         for child in T.serial(4):

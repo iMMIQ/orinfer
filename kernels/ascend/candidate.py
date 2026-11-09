@@ -8,13 +8,16 @@ from kernels.ascend.kv_int8 import _contiguous_view
 @T.macro
 def load_keys(keys, indices, row, start, output, tile, dimension, block):
     """Gather whole INT8 key blocks into the same Cube input tile."""
-    for part in T.serial(tile // block):
-        key_start = indices[row, 8 + start // block + part] * block
-        safe_key = T.max(0, key_start)
-        T.copy(
-            keys[safe_key : safe_key + block, :dimension],
-            output[part * block : (part + 1) * block, :],
-        )
+    if indices[row, 0] <= (indices.shape[1] - 8) * block:
+        T.copy(keys[start : start + tile, :dimension], output)
+    else:
+        for part in T.serial(tile // block):
+            key_start = indices[row, 8 + start // block + part] * block
+            safe_key = T.max(0, key_start)
+            T.copy(
+                keys[safe_key : safe_key + block, :dimension],
+                output[part * block : (part + 1) * block, :],
+            )
 
 
 @T.macro
@@ -26,22 +29,33 @@ def load_scales(scales, indices, row, start, length, output, lanes, block):
     candidate_scale_offsets_float = T.alloc_ub((1, lanes), "float32")
     candidate_scale_offsets_int = T.alloc_ub((lanes,), "int32")
     candidate_scale_offsets = T.alloc_ub((lanes,), "uint32")
-    T.tile.fill(candidate_scale_padded_half, 0.0)
-    for part in T.serial(lanes // block):
-        key_start = indices[row, 8 + start // block + part] * block
-        if key_start >= 0 and key_start < length:
-            T.copy(scales[key_start : key_start + block], candidate_scale_padded_half[part, :block])
-    T.tile.cast(candidate_scale_padded_float, candidate_scale_padded_half, "CAST_NONE", lanes * 2)
-    T.tile.createvecindex(candidate_scale_positions, T.float32(0.0))
-    T.tile.mul(candidate_scale_offsets_float, candidate_scale_positions, 1.0 / block)
-    T.tile.cast(candidate_scale_offsets_int, candidate_scale_offsets_float, "CAST_FLOOR", lanes)
-    T.tile.cast(candidate_scale_offsets_float, candidate_scale_offsets_int, "CAST_NONE", lanes)
-    T.tile.mul(candidate_scale_offsets_float, candidate_scale_offsets_float, float(block))
-    T.tile.add(candidate_scale_positions, candidate_scale_positions, candidate_scale_offsets_float)
-    T.tile.mul(candidate_scale_positions, candidate_scale_positions, 4.0)
-    T.tile.cast(candidate_scale_offsets_int, candidate_scale_positions, "CAST_RINT", lanes)
-    T.reinterpretcast(candidate_scale_offsets, candidate_scale_offsets_int, "uint32_t")
-    T.tile.gather(output, candidate_scale_padded_float, candidate_scale_offsets, 0)
+    if indices[row, 0] <= (indices.shape[1] - 8) * block:
+        candidate_scale_flat = _contiguous_view(candidate_scale_padded_half, (lanes * 2,))
+        T.copy(scales[start : start + lanes], candidate_scale_flat[:lanes])
+        T.tile.cast(output, candidate_scale_padded_half, "CAST_NONE", lanes)
+    else:
+        T.tile.fill(candidate_scale_padded_half, 0.0)
+        for part in T.serial(lanes // block):
+            key_start = indices[row, 8 + start // block + part] * block
+            if key_start >= 0 and key_start < length:
+                T.copy(
+                    scales[key_start : key_start + block], candidate_scale_padded_half[part, :block]
+                )
+        T.tile.cast(
+            candidate_scale_padded_float, candidate_scale_padded_half, "CAST_NONE", lanes * 2
+        )
+        T.tile.createvecindex(candidate_scale_positions, T.float32(0.0))
+        T.tile.mul(candidate_scale_offsets_float, candidate_scale_positions, 1.0 / block)
+        T.tile.cast(candidate_scale_offsets_int, candidate_scale_offsets_float, "CAST_FLOOR", lanes)
+        T.tile.cast(candidate_scale_offsets_float, candidate_scale_offsets_int, "CAST_NONE", lanes)
+        T.tile.mul(candidate_scale_offsets_float, candidate_scale_offsets_float, float(block))
+        T.tile.add(
+            candidate_scale_positions, candidate_scale_positions, candidate_scale_offsets_float
+        )
+        T.tile.mul(candidate_scale_positions, candidate_scale_positions, 4.0)
+        T.tile.cast(candidate_scale_offsets_int, candidate_scale_positions, "CAST_RINT", lanes)
+        T.reinterpretcast(candidate_scale_offsets, candidate_scale_offsets_int, "uint32_t")
+        T.tile.gather(output, candidate_scale_padded_float, candidate_scale_offsets, 0)
 
 
 @T.macro
@@ -55,7 +69,7 @@ def mask_scores(values, indices, row, start, lanes, block):
                     values[0, part * block + lane] = -T.infinity("float32")
 
 
-def select_blocks(rows, length, selected=2048, block_size=8):
+def select_blocks(rows, length, selected=2048, block_size=8, source_chunk=0):
     """Select by each block's maximum score; short histories keep every block.
 
     Only valid source scores are read, including the partial causal final block.
@@ -64,11 +78,18 @@ def select_blocks(rows, length, selected=2048, block_size=8):
     """
     if selected != 2048 or block_size != 8 or length % block_size:
         raise ValueError("Candidate selection requires K2048, block8 and aligned capacity")
+    if source_chunk not in (0, 4096):
+        raise ValueError("Packed block maxima require a 4096-token source chunk")
     span = selected * block_size
+    score_shape = (
+        (rows, (length + source_chunk - 1) // source_chunk, 1024 + source_chunk // block_size)
+        if source_chunk
+        else (rows, length)
+    )
 
     @T.prim_func
     def main(
-        scores: T.Tensor((rows, length), "float32"),
+        scores: T.Tensor(score_shape, "float32"),
         lengths: T.Tensor((rows,), "int32"),
         out: T.Tensor((rows, selected + 8), "int32"),
     ):
@@ -101,12 +122,25 @@ def select_blocks(rows, length, selected=2048, block_size=8):
                     for chunk in T.serial(T.ceildiv(live, span)):
                         start = chunk * span
                         valid = T.min(span, live - start)
-                        T.tile.fill(flat, -T.infinity("float32"))
-                        T.copy(scores[row, start : start + valid], flat[:valid])
-                        for tail in T.serial(block_size):
-                            if valid + tail < T.ceildiv(valid, block_size) * block_size:
-                                flat[valid + tail] = -T.infinity("float32")
-                        T.reduce_max(source, block_scores, dim=1)
+                        if source_chunk != 0:
+                            T.tile.fill(block_scores, -T.infinity("float32"))
+                            for part in T.serial(span // source_chunk):
+                                source_part = start // source_chunk + part
+                                if source_part < T.ceildiv(live, source_chunk):
+                                    T.copy(
+                                        scores[row, source_part, 1024:],
+                                        block_scores[
+                                            part * (source_chunk // block_size) : (part + 1)
+                                            * (source_chunk // block_size)
+                                        ],
+                                    )
+                        else:
+                            T.tile.fill(flat, -T.infinity("float32"))
+                            T.copy(scores[row, start : start + valid], flat[:valid])
+                            for tail in T.serial(block_size):
+                                if valid + tail < T.ceildiv(valid, block_size) * block_size:
+                                    flat[valid + tail] = -T.infinity("float32")
+                            T.reduce_max(source, block_scores, dim=1)
                         # Bounded DMA zero-pads the complete UB destination.
                         # Mask whole padding blocks as well as the partial one.
                         T.tile.createvecindex(ids, T.float32(0.0))

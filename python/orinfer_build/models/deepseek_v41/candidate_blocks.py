@@ -224,7 +224,11 @@ def build(plan, output, model_dir, workers=4, index_chunk=1024):
                 launch = {k: deepcopy(v) for k, v in reference[1].items() if k == "row_expression"}
                 if reference[-1]["buffers"][1] != original[-1]["buffers"][1]:
                     raise ValueError("Candidate reference changes the shared selected-index view")
-                if layer == source:
+                is_source = layer == source
+                if is_source and (
+                    length <= selected * block
+                    or describe(old)["op"] != "private_rows.indexer_fused_causal_topk"
+                ):
                     manifest, _ = register(
                         candidate.select_blocks,
                         dict(rows=count, length=length, selected=selected, block_size=block),
@@ -246,123 +250,145 @@ def build(plan, output, model_dir, workers=4, index_chunk=1024):
                             *reference[1:],
                         ]
                     )
-                else:
-                    width = min(length, selected * block)
-                    prefix = columns[5]["buffer"] + ".candidate_blocks"
+                    changed += 1
+                    continue
+                prefix = columns[5]["buffer"] + ".candidate_blocks"
+                leaf_size = 4096 if is_source else index_chunk
+                tile_rows = params.get("tile_rows", 1) if is_source else 1
+                width = length if is_source else min(length, selected * block)
+                groups = (width + leaf_size - 1) // leaf_size
+                stride = 1536 if is_source else 1024
+                kind = ".source" if is_source else ""
+                partial = define(prefix + kind + ".local", count * groups * stride * 4)
+                if not is_source:
                     columns[5].update(buffer=candidate_name, row_bytes=(selected + 8) * 4)
-                    groups = (width + index_chunk - 1) // index_chunk
-                    partial = define(prefix + ".local", count * groups * 1024 * 4)
-                    columns[6].update(buffer=partial, row_bytes=groups * 1024 * 4)
-                    cube = define(prefix + ".cube", 64 * 32 * 128 * 4)
-                    scores = define(prefix + ".tile_scores", 64 * index_chunk * 4)
-                    for name in (cube, scores):
-                        if name not in contract["private"]:
-                            contract["private"].append(name)
-                    columns = columns[:7] + [
-                        dict(buffer=name, row_bytes=None, row_alignment=1, decode=None)
-                        for name in (cube, scores)
+                lengths = contract["columns"][ids[5]]["buffer"]
+                columns[6].update(buffer=partial, row_bytes=groups * stride * 4)
+                original_columns = [contract["columns"][i] for i in ids]
+                cube_name = original_columns[7]["buffer"] if is_source else prefix + ".cube"
+                score_name = original_columns[8]["buffer"] if is_source else prefix + ".tile_scores"
+                cube = define(cube_name, 64 * tile_rows * 32 * 128 * 4)
+                scores = define(score_name, 64 * tile_rows * leaf_size * 4)
+                for name in (cube, scores):
+                    if name not in contract["private"]:
+                        contract["private"].append(name)
+                columns = columns[:7] + [
+                    dict(buffer=name, row_bytes=None, row_alignment=1, decode=None)
+                    for name in (cube, scores)
+                ]
+                params = dict(
+                    rows=count,
+                    length=length,
+                    tile_rows=tile_rows,
+                    candidate_blocks=0 if is_source else selected,
+                    candidate_block_size=block,
+                    chunk_size=leaf_size,
+                    emit_block_scores=is_source,
+                )
+                manifest, shapes = register(
+                    indexer_fused.causal_topk,
+                    params,
+                    {"candidates", "cube_workspace", "score_workspace"},
+                    columns=columns,
+                )
+                for column, shape, item_size in zip(
+                    columns, shapes, (1, 2, 1, 2, 2, 4, 4, 4, 4), strict=True
+                ):
+                    expected = (
+                        column["row_bytes"] * count
+                        if column["row_bytes"] is not None
+                        else definitions[column["buffer"]]["bytes"]
+                    )
+                    if math.prod(shape) * item_size != expected:
+                        raise ValueError(
+                            "Candidate score operand changes physical geometry: " + column["buffer"]
+                        )
+                table = pointer(ref, columns)
+                grid = registered_grids[manifest]
+                previous = ref["buffers"][0]
+                partition = contract.get("partitioned_tables", {}).get(previous)
+                replay = contract.get("decoder_replay")
+                decoder = replay is not None and previous in replay["tables"]
+                work = (
+                    "batch.candidate.work."
+                    + hashlib.sha256(json.dumps([grid, partition, decoder]).encode()).hexdigest()[
+                        :16
                     ]
-                    params = dict(
-                        rows=count,
-                        length=length,
-                        tile_rows=1,
-                        candidate_blocks=selected,
-                        candidate_block_size=block,
-                        chunk_size=index_chunk,
+                )
+                contract["work"][work] = grid
+                if partition is not None:
+                    contract["partitioned_tables"][work] = partition
+                if previous in contract.get("work_ranges", {}):
+                    contract["work_ranges"][work] = deepcopy(contract["work_ranges"][previous])
+                if decoder:
+                    replay["tables"] = sorted(set(replay["tables"]) | {work})
+                define(work, 8192 * 2 * 4)
+                body.append(
+                    dict(
+                        old,
+                        manifest=manifest,
+                        owner_work=grid,
+                        buffers=[work, table, contract["active"]],
                     )
-                    manifest, shapes = register(
-                        indexer_fused.causal_topk,
-                        params,
-                        {"candidates", "cube_workspace", "score_workspace"},
-                        columns=columns,
-                    )
-                    for column, shape, item_size in zip(
-                        columns, shapes, (1, 2, 1, 2, 2, 4, 4, 4, 4), strict=True
-                    ):
-                        expected = (
-                            column["row_bytes"] * count
-                            if column["row_bytes"] is not None
-                            else definitions[column["buffer"]]["bytes"]
-                        )
-                        if math.prod(shape) * item_size != expected:
-                            raise ValueError(
-                                "Candidate score operand changes physical geometry: "
-                                + column["buffer"]
-                            )
-                    table = pointer(ref, columns)
-                    grid = registered_grids[manifest]
-                    previous = ref["buffers"][0]
-                    partition = contract.get("partitioned_tables", {}).get(previous)
-                    replay = contract.get("decoder_replay")
-                    decoder = replay is not None and previous in replay["tables"]
-                    work = (
-                        "batch.candidate.work."
-                        + hashlib.sha256(
-                            json.dumps([grid, partition, decoder]).encode()
-                        ).hexdigest()[:16]
-                    )
-                    contract["work"][work] = grid
-                    if partition is not None:
-                        contract["partitioned_tables"][work] = partition
-                    if previous in contract.get("work_ranges", {}):
-                        contract["work_ranges"][work] = deepcopy(contract["work_ranges"][previous])
-                    if decoder:
-                        replay["tables"] = sorted(set(replay["tables"]) | {work})
-                    define(work, 8192 * 2 * 4)
-                    body.append(
-                        dict(
-                            old,
-                            manifest=manifest,
-                            owner_work=grid,
-                            buffers=[work, table, contract["active"]],
-                        )
-                    )
-
-                    if groups in (16, 32, 64):
-                        following = define(prefix + ".merged", count * 1024 * 4)
-                        manifest, _ = register(
-                            topk.merge_tree,
-                            dict(rows=count, sources=groups, leaf_size=index_chunk),
-                            {"out"},
-                        )
-                        body.append(
-                            dict(
-                                op="kernel",
-                                manifest=manifest,
-                                buffers=[partial, contract["columns"][ids[5]]["buffer"], following],
-                                **launch,
-                            )
-                        )
-                        partial, groups = following, 1
-                    level = 0
-                    while groups > 1:
-                        following = define(
-                            prefix + f".merge{level}", count * ((groups + 3) // 4) * 1024 * 4
-                        )
-                        manifest, _ = register(
-                            topk.merge, dict(rows=count, sources=groups), {"out"}
-                        )
-                        body.append(
-                            dict(
-                                op="kernel",
-                                manifest=manifest,
-                                buffers=[partial, following],
-                                **launch,
-                            )
-                        )
-                        partial, groups, level = following, (groups + 3) // 4, level + 1
-                    destination, values = original[-1]["buffers"][1:]
+                )
+                if is_source:
                     manifest, _ = register(
-                        candidate.finalize, dict(rows=count), {"indices", "values"}
+                        candidate.select_blocks,
+                        dict(
+                            rows=count,
+                            length=length,
+                            selected=selected,
+                            block_size=block,
+                            source_chunk=leaf_size,
+                        ),
+                        {"out"},
                     )
                     body.append(
                         dict(
                             op="kernel",
                             manifest=manifest,
-                            buffers=[candidate_name, partial, destination, values],
+                            buffers=[partial, lengths, candidate_name],
                             **launch,
                         )
                     )
+                if groups in (16, 32, 64):
+                    following = define(prefix + kind + ".merged", count * 1024 * 4)
+                    manifest, _ = register(
+                        topk.merge_tree,
+                        dict(rows=count, sources=groups, leaf_size=leaf_size, source_stride=stride),
+                        {"out"},
+                    )
+                    body.append(
+                        dict(
+                            op="kernel",
+                            manifest=manifest,
+                            buffers=[partial, lengths, following],
+                            **launch,
+                        )
+                    )
+                    partial, groups, stride = following, 1, 1024
+                level = 0
+                while groups > 1:
+                    following = define(
+                        prefix + kind + f".merge{level}", count * ((groups + 3) // 4) * 1024 * 4
+                    )
+                    manifest, _ = register(
+                        topk.merge, dict(rows=count, sources=groups, source_stride=stride), {"out"}
+                    )
+                    body.append(
+                        dict(op="kernel", manifest=manifest, buffers=[partial, following], **launch)
+                    )
+                    partial, groups, level, stride = following, (groups + 3) // 4, level + 1, 1024
+                destination, values = original[-1]["buffers"][1:]
+                manifest, _ = register(
+                    topk.finalize if is_source else candidate.finalize,
+                    dict(rows=count),
+                    {"indices", "values"},
+                )
+                buffers = [partial, destination, values]
+                if not is_source:
+                    buffers.insert(0, candidate_name)
+                body.append(dict(op="kernel", manifest=manifest, buffers=buffers, **launch))
                 changed += 1
             body.extend(packet["body"][cursor:])
             packet["body"] = body

@@ -11,10 +11,12 @@ def causal_topk(
     candidate_blocks=0,
     candidate_block_size=8,
     chunk_size=4096,
+    emit_block_scores=False,
 ):
     from kernels.ascend.candidate import load_keys, load_scales, mask_scores
     from kernels.ascend.indexer_cube import weighted_head_sum
     from kernels.ascend.topk import select_chunk
+    from kernels.ascend.kv_int8 import _contiguous_view
 
     if length < 1 or length > 1 << 24 or tile_rows not in (1, 2, 4, 8) or tile_s not in (64, 128):
         raise ValueError("Invalid fused causal index geometry")
@@ -23,6 +25,9 @@ def causal_topk(
     heads, dimension, block, selected, slots = 32, 128, chunk_size, 512, 64
     if candidate_blocks and (tile_rows != 1 or candidate_block_size != 8):
         raise ValueError("Candidate fusion requires one query and eight-key blocks")
+    if emit_block_scores and candidate_blocks:
+        raise ValueError("Block score emission requires the full-history source")
+    result_stride = 2 * selected + (block // candidate_block_size if emit_block_scores else 0)
     score_length = (
         min(length, candidate_blocks * candidate_block_size) if candidate_blocks else length
     )
@@ -37,7 +42,7 @@ def causal_topk(
         key_scale: T.Tensor((length,), "float16"),
         weights: T.Tensor((rows, heads), "bfloat16"),
         indices: T.Tensor((rows, candidate_blocks + 8 if candidate_blocks != 0 else 1), "int32"),
-        candidates: T.Tensor((rows, chunks, 2 * selected), "float32"),
+        candidates: T.Tensor((rows, chunks, result_stride), "float32"),
         cube_workspace: T.Tensor((slots, tile_rows * heads, tile_s), "int32"),
         score_workspace: T.Tensor((slots, tile_rows, block), "float32"),
     ):
@@ -134,6 +139,10 @@ def causal_topk(
                 selected_indices = T.alloc_ub((selected,), "float32")
                 selected_values = T.alloc_ub((selected,), "float32")
                 selected_mask = T.alloc_ub((selected // 8,), "uint8")
+                block_maxima = T.alloc_ub((block // candidate_block_size,), "float32")
+                block_view = _contiguous_view(
+                    x, (block // candidate_block_size, candidate_block_size)
+                )
                 select_chunk(
                     x,
                     pairs,
@@ -159,7 +168,7 @@ def causal_topk(
                     flat = cid * 2 + vid + item * active_slots * 2
                     row = flat // T.max(1, chunks - live_chunks)
                     chunk = live_chunks + flat % T.max(1, chunks - live_chunks)
-                    T.copy(pairs, candidates[row, chunk, :])
+                    T.copy(pairs, candidates[row, chunk, : 2 * selected])
                 for iteration in T.serial(
                     T.ceildiv(T.ceildiv(rows, tile_rows) * live_chunks - cid, active_slots)
                 ):
@@ -277,7 +286,13 @@ def causal_topk(
                                 selected,
                                 block,
                             )
-                            T.copy(pairs, candidates[row, chunk, :])
+                            T.copy(pairs, candidates[row, chunk, : 2 * selected])
+                            if emit_block_scores:
+                                if valid > 0:
+                                    T.reduce_max(block_view, block_maxima, dim=1)
+                                else:
+                                    T.tile.fill(block_maxima, -T.infinity("float32"))
+                                T.copy(block_maxima, candidates[row, chunk, 2 * selected :])
                     T.set_cross_flag("MTE3", 3)
                     T.pipe_barrier("ALL")
 
@@ -290,6 +305,7 @@ def causal_topk(
                 "kernels/ascend/indexer_cube.py",
                 "kernels/ascend/topk.py",
                 "kernels/ascend/candidate.py",
+                "kernels/ascend/kv_int8.py",
             ],
         )
     )

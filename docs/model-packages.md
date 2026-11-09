@@ -914,6 +914,8 @@ bash tools/environments/ascend/run.sh --without-devices python3 -m orinfer_build
 
 `tests.ascend.operators.validate_candidate --output OUTPUT` 验证候选集合、紧凑打分与绝对索引，覆盖 2048/2049、16384/16385、100K 和 262K 容量、负分数、尾部、动态行数及改变输入后的 Graph replay。候选约束会改变旧版全历史 TopK 的选中位置；完整模型须继续验收质量、请求隔离、prefix 恢复和实际请求性能后再发布。
 
+容量大于 16384 的源层沿用输入计划的融合边界：原本使用融合打分的 packet 同时输出 token TopK 和每八位置的最大分数，后者直接用于候选块筛选，避免完整分数写回。两种结果共用一个分块工作区，TopK 归并显式读取前缀及其物理 stride。其他 packet 保留原打分流程，候选规则保持相同。短于或等于 16384 的历史在同一候选模板内连续读取 key 和 scale，较长历史按候选块 gather；两者保持因果屏蔽和绝对索引输出。验证入口同时对照源层候选集合与 token TopK，分别记录源层和消费者的 Graph 微测耗时。
+
 完整 attention 可继续沿用查询分片，并复用现有 Cube QK、softmax、PV 和私有 KV gather 工厂：
 
 ```bash
