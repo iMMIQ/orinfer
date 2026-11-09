@@ -1,33 +1,33 @@
 # DSv4.1 A2 部署
 
-v0.3.4 支持 glibc 2.34 及以上、CANN 9.2、Ascend 910B TP8 的文本、HTTP/SSE、连续 batch、DSpark、设备及 CPU prefix cache，以及 DSML 工具与 thinking 历史。匹配视觉执行包及视觉权重后支持单图、多图和 OpenCode 读图工具交互。引擎与执行包分别安装，模型目录提供对应的前端和权重。支持范围见[模型包说明](model-packages.md#a2-文本服务与长上下文)。性能按实际工作负载与基线比较。DSH 接入方式见 [DeepSeek Harness](deepseek-harness.md)。
+v0.3.5 支持 glibc 2.34 及以上、CANN 9.2、Ascend 910B TP8 的文本、HTTP/SSE、连续 batch、DSpark、设备及 CPU prefix cache，以及 DSML 工具与 thinking 历史。匹配视觉执行包及视觉权重后支持单图、多图和 OpenCode 读图工具交互。引擎与执行包分别安装，模型目录提供对应的前端和权重。支持范围见[模型包说明](model-packages.md#a2-文本服务与长上下文)。性能按实际工作负载与基线比较。DSH 接入方式见 [DeepSeek Harness](deepseek-harness.md)。
 
 ## 安装与升级
 
-解压 `orinfer-v0.3.4-linux-aarch64.tar.xz`，使用其中的二进制安装匹配的执行包：
+解压 `orinfer-v0.3.5-linux-aarch64.tar.xz`，使用其中的二进制安装匹配的执行包：
 
 ```bash
 bin/orinfer --version
 bin/orinfer package install \
-  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.4.tar.xz \
+  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.5.tar.xz \
   --cache /srv/orinfer/execution-cache
 ```
 
-0.3.4 的配套执行包包含设备端 target 采样和共享随机数 DSpark 草稿，并沿用紧凑格式：安装时无损生成 RoPE 常量，加载时展开共享计划。部署时配套升级引擎、执行包和模型元数据；旧版模型与原执行包仍可由新引擎加载。
+0.3.5 优化跨步输出、长输入编码、设备端受约束采样和 DSpark 组包成本预测，并提供 Estuary 使用的 token 渲染接口。配套执行包保留设备端 target 采样和共享随机数 DSpark 草稿，增加受约束采样、概率报告及可选的概率拒绝采样资产；默认 DSpark 仍为 coupled。安装时无损生成 RoPE 常量，加载时展开共享计划。升级引擎及配套小文件即可复用现有权重；旧版模型与原执行包仍可由新引擎加载。
 
-本版 A2 执行包 digest 为 `b996207b6dda138d4bc4d8bc1143358e00ec430826638769e4dcbed1f07abbc5`，包含已验收的 mHC 融合、共享 FFN Graph、专家通信融合与 192 行 decoder 验证容量。自动 DSpark 默认最多 5 个草稿，32 路请求可按成本选择同一动态验证实现。正常部署使用 `--max-speculative-tokens 0`，由执行包提供验证预算。
+本版 A2 执行包 digest 为 `2d030ec319ce288154bb92ad7809f3b0bfb088b9a105fd8a979fee50da5f0929`，包含已验收的 mHC 融合、共享 FFN Graph、专家通信融合与 192 行 decoder 验证容量。自动 DSpark 默认最多 5 个草稿，32 路请求可按成本选择同一动态验证实现。正常部署使用 `--max-speculative-tokens 0`，由执行包提供验证预算。 共享片段 Graph 仍默认关闭。`ORINFER_A2_DSPARK_SAMPLING=rejection` 是显式实验选项，本轮 Mini 性能对照使用该选项，不代表默认 coupled 路径的加速承诺。
 
-已有 v0.3.1/fix1 模型的权重保持不变。通过 Hugging Face 模型仓库的 `v0.3.4` revision 下载配套元数据，确保 `cache/model.json` 声明上述 digest；旧 revision 与执行包仍可用于回滚。算子与执行计划继续单独安装。
+已有 v0.3.1/fix1 模型的权重保持不变。通过 Hugging Face 模型仓库的 `v0.3.5` revision 下载配套元数据，确保 `cache/model.json` 声明上述 digest；旧 revision 与执行包仍可用于回滚。算子与执行计划继续单独安装。
 
 工具前端需要模型 `cache/model.json` 声明 `metadata.chat_format=deepseek_v41`。已有模型可通过包内离线工具生成新目录，保留旧目录用于回滚；同一文件系统上的权重使用硬链接：
 
 ```bash
 uv run --locked python -m orinfer_build.models.deepseek_v41.service --frontend-only \
-  --model-dir /data/model/current --output /data/model/dsv41-v0.3.4
+  --model-dir /data/model/current --output /data/model/dsv41-v0.3.5
 
 hf download immiq/DeepSeek-V4.1-Flash-1017-Orinfer-A2-W4A8 \
   cache/model.json README.md publication.json SHA256SUMS \
-  --revision v0.3.4 --local-dir /data/model/dsv41-v0.3.4
+  --revision v0.3.5 --local-dir /data/model/dsv41-v0.3.5
 ```
 
 该命令只更新工具前端；启用图片还需包含 `vision.safetensors` 的模型目录和声明原生视觉程序的执行包。视觉分片使用与语言权重相同的 Ascend 预处理基，算子和执行计划保留在独立执行包中。离线工具的 Python 环境在源码目录执行 `make python-env` 准备。在线服务使用 Rust 二进制。正常加载校验结构和范围，内容完整性由独立 `validate-model` 命令校验。权重、执行包和 DSpark 成本配置的既有完整性验收在身份相同时复用。
@@ -48,7 +48,7 @@ export ORINFER_VISION_CACHE_MIB=1024
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_NPU_SOCKET_PORT_RANGE=auto
 
-bin/orinfer serve /data/model/dsv41-v0.3.4 \
+bin/orinfer serve /data/model/dsv41-v0.3.5 \
   --model deepseek-v4.1 --listen 127.0.0.1:8088 \
   --mtp-drafts auto --max-speculative-tokens 0 --graph full \
   --prefix-cache-mib 8192 --kv-offload-mib 262144 \

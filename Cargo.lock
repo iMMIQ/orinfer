@@ -1740,7 +1740,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "orinfer-api"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1769,7 +1769,7 @@ dependencies = [
 
 [[package]]
 name = "orinfer-cli"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "clap",
  "libc",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "orinfer-device"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "orinfer-engine"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "cc",
  "cudarc",
@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "orinfer-model-sdk"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "orinfer-device",
  "serde",
@@ -1823,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "orinfer-models"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "half",
  "hex",
