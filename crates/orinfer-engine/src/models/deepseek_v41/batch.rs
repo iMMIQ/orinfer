@@ -100,12 +100,21 @@ impl Contract {
             .transpose()?;
         let layout = decoder.as_ref().unwrap_or(layout);
         let range = self.work_ranges.get(name);
-        if let Some(&stride) = self.partitioned_tables.get(name) {
+        let mut items = if let Some(&stride) = self.partitioned_tables.get(name) {
             let view = layout.rows.partition(stride, rank % stride)?;
-            work_lengths(view.lengths, grid, range)
+            work_lengths(view.lengths, grid, range)?
         } else {
-            work_items(layout, grid, range)
+            work_items(layout, grid, range)?
+        };
+        if layout.work_shape.is_some() {
+            let reference = layout.work_layout()?;
+            let capacity = self.work_items(&reference, grid, name, rank)?.len();
+            if items.len() > capacity {
+                return Err("Owner work exceeds its retained Graph capacity".into());
+            }
+            items.resize(capacity, [-1, 0]);
         }
+        Ok(items)
     }
     pub(super) fn preferred_span(&self) -> usize {
         self.prefill_quantum.unwrap_or_else(|| {
@@ -164,6 +173,7 @@ struct TableKey {
     outputs: Vec<usize>,
     output_positions: Vec<usize>,
     decoder_roles: Vec<super::replay::Role>,
+    work_shape: Option<Vec<usize>>,
 }
 pub(super) struct BoundTables {
     key: TableKey,
@@ -298,6 +308,7 @@ pub(super) struct Layout {
     pub output_positions: Vec<usize>,
     pub decode: bool,
     pub decoder_roles: Vec<super::replay::Role>,
+    work_shape: Option<Vec<usize>>,
 }
 impl Layout {
     pub fn new(
@@ -333,7 +344,80 @@ impl Layout {
             outputs,
             decode,
             decoder_roles,
+            work_shape: None,
         })
+    }
+    /// Retain a proven launch envelope while row/address tables carry real lengths.
+    /// Only short decoder lengths may change. Prompt membership and lengths
+    /// remain fixed, including their final-window decoder replay roles.
+    pub(super) fn bound_work(
+        &mut self,
+        reference: &Self,
+        contract: &Contract,
+        launches: &BTreeSet<WorkLaunch>,
+    ) -> Result<bool> {
+        if self.work_shape.is_some()
+            || reference.work_shape.is_some()
+            || self.role != super::PacketRole::Target
+            || reference.role != self.role
+            || self.decode
+            || reference.decode
+            || self.rows.total != reference.rows.total
+            || self.outputs.len() != reference.outputs.len()
+            || self.segments.len() != reference.segments.len()
+            || self.decoder_roles != reference.decoder_roles
+            || self
+                .segments
+                .iter()
+                .zip(&reference.segments)
+                .zip(&self.decoder_roles)
+                .any(|((a, b), role)| {
+                    a.slot != b.slot
+                        || if *role == super::replay::Role::Continue {
+                            !(1..=8).contains(&a.tokens) || !(1..=8).contains(&b.tokens)
+                        } else {
+                            a.tokens != b.tokens
+                        }
+                })
+        {
+            return Ok(false);
+        }
+        let family = (self.role, false, 1);
+        let actual = shape_key(contract, self, family, launches)?;
+        let retained = shape_key(contract, reference, family, launches)?;
+        if actual.decoder_rows != retained.decoder_rows
+            || actual
+                .work_rows
+                .iter()
+                .zip(&retained.work_rows)
+                .any(|(a, b)| a > b)
+        {
+            return Ok(false);
+        }
+        self.work_shape = Some(reference.segments.iter().map(|s| s.tokens).collect());
+        Ok(true)
+    }
+    fn work_layout(&self) -> Result<Self> {
+        let mut reference = self.clone();
+        if let Some(lengths) = reference.work_shape.take() {
+            for (segment, tokens) in reference.segments.iter_mut().zip(lengths) {
+                segment.tokens = tokens;
+            }
+            let rows = orinfer_model_sdk::packet::RowView {
+                starts: vec![],
+                lengths: reference.segments.iter().map(|s| s.tokens).collect(),
+                total: 0,
+            }
+            .aligned(1)?;
+            if rows.total != self.rows.total {
+                return Err("Retained work changed the packet row count".into());
+            }
+            reference.rows = Rows {
+                starts: rows.starts,
+                total: rows.total,
+            };
+        }
+        Ok(reference)
     }
     /// Verification shares the target body and head; only endpoint selection changes.
     pub(super) fn verification(
@@ -362,6 +446,15 @@ impl Layout {
             return Err("Invalid final-prompt decoder layout".into());
         }
         let mut view = self.clone();
+        if let Some(lengths) = &mut view.work_shape {
+            for (length, role) in lengths.iter_mut().zip(&self.decoder_roles) {
+                *length = if *role == super::replay::Role::Producer {
+                    0
+                } else {
+                    (*length).min(keep)
+                };
+            }
+        }
         // Preserve zero-row owners and their operand-table lanes.
         let lengths = self
             .segments
@@ -399,6 +492,11 @@ impl Layout {
             return Err("Invalid decoder bounded replay layout".into());
         }
         let mut view = self.clone();
+        if let Some(lengths) = &mut view.work_shape {
+            for length in lengths {
+                *length = (*length).min(keep);
+            }
+        }
         for segment in &mut view.segments {
             segment.tokens = segment.tokens.min(keep);
         }
@@ -475,6 +573,7 @@ impl Layout {
             outputs: self.outputs.clone(),
             output_positions: self.output_positions.clone(),
             decoder_roles: self.decoder_roles.clone(),
+            work_shape: self.work_shape.clone(),
         }
     }
 }
@@ -536,6 +635,13 @@ fn shape_key(
     if layout.outputs.len() > contract.output_capacity() {
         return Err("Output rows exceed the published head capacity".into());
     }
+    let work_layout;
+    let layout = if layout.work_shape.is_some() {
+        work_layout = layout.work_layout()?;
+        &work_layout
+    } else {
+        layout
+    };
     let decoder = contract
         .decoder_replay
         .as_ref()

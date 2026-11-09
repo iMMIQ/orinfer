@@ -116,7 +116,7 @@ impl Runtime {
         let keep = self.final_decoder_window();
         let capacity = self.team.rows;
         let mut decode_rows = vec![0; requests.len()];
-        let depths = self.speculation_policy.select_requests_with_forecast(
+        let allocation = self.speculation_policy.select_requests_with_forecast(
             (full, mixed),
             Budget {
                 rows: row_budget,
@@ -149,20 +149,56 @@ impl Runtime {
             &maxima,
             &feedback,
             &self.team.draft_blocks,
-            |depths| {
+            |depths, reference| {
                 for (&i, &depth) in indices.iter().zip(depths) {
                     decode_rows[i] = depth + 1;
                 }
-                packet::forecast(
+                if let Some(reference) = reference {
+                    let mut target =
+                        baseline.forecast_layout(requests, &decode_rows, keep, capacity, owners)?;
+                    for (&i, &depth) in indices.iter().zip(reference) {
+                        decode_rows[i] = depth + 1;
+                    }
+                    let retained =
+                        baseline.forecast_layout(requests, &decode_rows, keep, capacity, owners)?;
+                    if !target.bound_work(
+                        &retained,
+                        self.team.model.batch.as_ref().unwrap(),
+                        &self.team.work_launches,
+                    )? {
+                        return Ok(None);
+                    }
+                    for (&i, &depth) in indices.iter().zip(depths) {
+                        decode_rows[i] = depth + 1;
+                    }
+                }
+                Ok(Some(packet::forecast(
                     requests,
                     &baseline.order,
                     &decode_rows,
                     baseline.budget,
                     keep,
                     capacity,
-                )
+                )))
             },
         )?;
+        let depths = allocation.depths;
+        let retained_work = if let Some(reference) = allocation.reference {
+            if std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some() {
+                eprintln!(
+                    "DSPARK_ALLOCATION {}",
+                    serde_json::json!({
+                        "before":reference,"after":depths,"mixed":mixed,
+                    })
+                );
+            }
+            for (&i, &depth) in indices.iter().zip(&reference) {
+                decode_rows[i] = depth + 1;
+            }
+            Some(baseline.forecast_layout(requests, &decode_rows, keep, capacity, owners)?)
+        } else {
+            None
+        };
         self.statistics.mtp_budget_calls += 1;
         self.statistics.mtp_budget_s += budget_started.elapsed().as_secs_f64();
         let selected = indices.into_iter().zip(depths).collect::<Vec<_>>();
@@ -282,7 +318,7 @@ impl Runtime {
             .map(|&(i, count)| (requests[i].slot, count + 1))
             .collect::<Vec<_>>();
         let packet::Selection {
-            layout,
+            mut layout,
             tokens: inputs,
             selected: packet_requests,
             full: packet_full,
@@ -299,6 +335,15 @@ impl Runtime {
                 &baseline.order,
             )?
             .ok_or("Missing DSpark verification packet")?;
+        if let Some(reference) = retained_work
+            && !layout.bound_work(
+                &reference,
+                self.team.model.batch.as_ref().unwrap(),
+                &self.team.work_launches,
+            )?
+        {
+            return Err("Verification packet changed its retained launch envelope".into());
+        }
         if self.team.needs_preparation(&layout)?
             && !memory::ensure_budget(self, memory::Requirement::workspace())?
         {
@@ -565,3 +610,6 @@ mod tests;
 
 #[cfg(test)]
 mod rejection_test;
+
+#[cfg(test)]
+mod varlen_test;

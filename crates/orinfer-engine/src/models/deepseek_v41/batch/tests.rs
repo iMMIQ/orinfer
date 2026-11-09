@@ -390,3 +390,222 @@ fn verification_uses_every_position_and_keeps_reverse_owner_endpoints() {
     contract.output_capacity = 7;
     assert!(shape_key(&contract, &view, family, &BTreeSet::new()).is_err());
 }
+
+#[test]
+fn variable_verification_reuses_work_capacity_without_reusing_owner_lengths() {
+    let mut contract = contract();
+    contract.output_capacity = 192;
+    contract.decoder_replay = Some(
+        serde_json::from_value(serde_json::json!({
+            "keep":128,"final_prompt_only":true,"tables":[],"maps":[]
+        }))
+        .unwrap(),
+    );
+    let reference = Layout::verification(
+        vec![
+            BatchSegment {
+                slot: 17,
+                tokens: 4,
+            },
+            BatchSegment { slot: 7, tokens: 4 },
+            BatchSegment {
+                slot: 21,
+                tokens: 4,
+            },
+            BatchSegment { slot: 2, tokens: 4 },
+        ],
+        192,
+        32,
+    )
+    .unwrap();
+    let mut selected = Layout::verification(
+        vec![
+            BatchSegment {
+                slot: 17,
+                tokens: 6,
+            },
+            BatchSegment { slot: 7, tokens: 2 },
+            BatchSegment {
+                slot: 21,
+                tokens: 6,
+            },
+            BatchSegment { slot: 2, tokens: 2 },
+        ],
+        192,
+        32,
+    )
+    .unwrap();
+    let mut launches = BTreeSet::new();
+    let mut names = vec![];
+    for (i, grid) in [
+        serde_json::json!({"op":"multiply","lhs":{"op":"rows"},"rhs":{"op":"constant","value":16}}),
+        serde_json::json!({"op":"divide","lhs":{"op":"add","lhs":{"op":"rows"},"rhs":{"op":"constant","value":1}},"rhs":{"op":"constant","value":2}}),
+        serde_json::json!({"op":"constant","value":64}),
+    ].into_iter().enumerate() {
+        for decoder in [false,true] {
+            for partition in [1,8] {
+                let name = format!("{i}-{decoder}-{partition}");
+                let grid: RowExpression = serde_json::from_value(grid.clone()).unwrap();
+                contract.work.insert(name.clone(),grid.clone());
+                if partition > 1 {contract.partitioned_tables.insert(name.clone(),partition);}
+                if decoder {contract.decoder_replay.as_mut().unwrap().tables.insert(name.clone());}
+                launches.insert(WorkLaunch {role:super::super::PacketRole::Target,
+                    grid,range:None,partition,decoder});
+                names.push((name,partition));
+            }
+        }
+    }
+    let unbounded = selected.clone();
+    assert!(
+        selected
+            .bound_work(&reference, &contract, &launches)
+            .unwrap()
+    );
+    let family = (super::super::PacketRole::Target, false, 1);
+    assert_eq!(
+        shape_key(&contract, &selected, family, &launches).unwrap(),
+        shape_key(&contract, &reference, family, &launches).unwrap()
+    );
+    for (name, partition) in names {
+        for rank in 0..partition {
+            let original = contract
+                .work_items(&unbounded, &contract.work[&name], &name, rank)
+                .unwrap();
+            let retained = contract
+                .work_items(&reference, &contract.work[&name], &name, rank)
+                .unwrap();
+            let padded = contract
+                .work_items(&selected, &contract.work[&name], &name, rank)
+                .unwrap();
+            assert_eq!(padded.len(), retained.len());
+            assert_eq!(&padded[..original.len()], &original);
+            assert!(padded[original.len()..].iter().all(|p| *p == [-1, 0]));
+        }
+    }
+    // The same envelope follows final-prompt replay, retaining zero-row
+    // producer owners and the fixed 128-token final window.
+    let mixed = |mut view: Layout| {
+        view.segments.extend([
+            BatchSegment {
+                slot: 9,
+                tokens: 512,
+            },
+            BatchSegment {
+                slot: 10,
+                tokens: 256,
+            },
+        ]);
+        view.decoder_roles.extend([
+            super::super::replay::Role::Producer,
+            super::super::replay::Role::Final,
+        ]);
+        view.rows = Rows::packet(&view.segments, 32, 2048).unwrap();
+        view.outputs.push(5);
+        view.output_positions.push(255);
+        view
+    };
+    let mixed_reference = mixed(reference.clone());
+    let mut mixed_selected = mixed(unbounded.clone());
+    assert!(
+        mixed_selected
+            .bound_work(&mixed_reference, &contract, &launches)
+            .unwrap()
+    );
+    assert_eq!(
+        shape_key(&contract, &mixed_selected, family, &launches).unwrap(),
+        shape_key(&contract, &mixed_reference, family, &launches).unwrap()
+    );
+    for (name, grid) in &contract.work {
+        for rank in 0..8 {
+            assert_eq!(
+                contract
+                    .work_items(&mixed_selected, grid, name, rank)
+                    .unwrap()
+                    .len(),
+                contract
+                    .work_items(&mixed_reference, grid, name, rank)
+                    .unwrap()
+                    .len()
+            );
+        }
+    }
+    assert_eq!(selected.rows.total, 16);
+    assert_eq!(
+        selected
+            .segments
+            .iter()
+            .map(|s| s.tokens)
+            .collect::<Vec<_>>(),
+        [6, 2, 6, 2]
+    );
+    assert_ne!(selected.table_key(1), unbounded.table_key(1));
+    assert!(
+        !selected
+            .bound_work(&reference, &contract, &launches)
+            .unwrap()
+    );
+    let mut wrong_owner = unbounded.clone();
+    wrong_owner.segments[0].slot = 1;
+    assert!(
+        !wrong_owner
+            .bound_work(&reference, &contract, &launches)
+            .unwrap()
+    );
+    let mut prompt = unbounded.clone();
+    prompt.decoder_roles[0] = super::super::replay::Role::Final;
+    assert!(!prompt.bound_work(&reference, &contract, &launches).unwrap());
+}
+
+#[test]
+fn retained_work_cannot_hide_a_larger_native_launch() {
+    let mut contract = contract();
+    let grid: RowExpression = serde_json::from_value(serde_json::json!({
+        "op":"divide","lhs":{"op":"add","lhs":{"op":"rows"},
+        "rhs":{"op":"constant","value":1}},"rhs":{"op":"constant","value":2}
+    }))
+    .unwrap();
+    contract.work.insert("w".into(), grid.clone());
+    let launches = [WorkLaunch {
+        role: super::super::PacketRole::Target,
+        grid,
+        range: None,
+        partition: 1,
+        decoder: false,
+    }]
+    .into();
+    let reference = Layout::verification(
+        vec![
+            BatchSegment { slot: 7, tokens: 2 },
+            BatchSegment {
+                slot: 17,
+                tokens: 2,
+            },
+        ],
+        192,
+        32,
+    )
+    .unwrap();
+    let mut selected = Layout::verification(
+        vec![
+            BatchSegment { slot: 7, tokens: 1 },
+            BatchSegment {
+                slot: 17,
+                tokens: 3,
+            },
+        ],
+        192,
+        32,
+    )
+    .unwrap();
+    assert!(
+        !selected
+            .bound_work(&reference, &contract, &launches)
+            .unwrap()
+    );
+    selected.work_shape = Some(vec![2, 2]);
+    assert!(
+        contract
+            .work_items(&selected, &contract.work["w"], "w", 0)
+            .is_err()
+    );
+}

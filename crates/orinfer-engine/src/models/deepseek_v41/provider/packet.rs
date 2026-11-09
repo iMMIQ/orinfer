@@ -95,6 +95,34 @@ pub(super) struct Selection {
     pub prefill_requests: usize,
 }
 
+impl Selection {
+    pub(super) fn forecast_layout(
+        &self,
+        requests: &[&mut Request],
+        decode_rows: &[usize],
+        keep: usize,
+        capacity: usize,
+        owners: usize,
+    ) -> Result<Layout> {
+        let (_, selected) = select_rows(
+            requests,
+            &self.order,
+            Some(decode_rows),
+            self.budget,
+            keep,
+            capacity,
+        );
+        packet_layout(
+            requests,
+            &selected,
+            true,
+            self.prefill_rows > 0,
+            capacity,
+            owners,
+        )
+    }
+}
+
 /// Shared scheduling membership survives a cohort's tail becoming single-stream.
 pub(super) fn mark_shared(selected: &[(usize, usize)], requests: &mut [&mut Request]) -> bool {
     if selected.len() > 1 {
@@ -355,9 +383,7 @@ impl Runtime {
             self.final_decoder_window(),
             self.team.rows,
         );
-        let mut segments = vec![];
         let mut tokens = vec![];
-        let mut outputs = vec![];
         for &(i, count) in &selected {
             let request = &requests[i];
             let values = if request.prefilling {
@@ -368,16 +394,9 @@ impl Runtime {
                     None => vec![*request.history.last().ok_or("Missing A2 decode input")?],
                 }
             };
-            if !request.prefilling || request.offset + count == request.input.len() {
-                outputs.push(segments.len());
-            }
-            segments.push(BatchSegment {
-                slot: request.slot,
-                tokens: count,
-            });
             tokens.push(values);
         }
-        if segments.is_empty() {
+        if selected.is_empty() {
             return Ok(None);
         }
         let complete_cache = self.complete_prompt_cache();
@@ -389,7 +408,7 @@ impl Runtime {
                     && r.cache_prompt
                     && r.offset + count == r.input.len()
         });
-        let batch = segments.len();
+        let batch = selected.len();
         let prefill_rows = selected
             .iter()
             .filter(|&&(i, _)| requests[i].prefilling)
@@ -399,37 +418,14 @@ impl Runtime {
             .iter()
             .filter(|&&(i, _)| requests[i].prefilling)
             .count();
-        let mut layout = Layout::new(
-            segments,
-            outputs,
-            !has_prefill && decode_inputs.is_none(),
-            if has_prefill || decode_inputs.is_some() {
-                self.team.rows
-            } else {
-                self.team.model.batch.as_ref().unwrap().owners
-            },
+        let layout = packet_layout(
+            requests,
+            &selected,
+            decode_inputs.is_some(),
+            has_prefill,
+            self.team.rows,
             self.team.model.batch.as_ref().unwrap().owners,
         )?;
-        for (lane, &(i, _)) in selected.iter().enumerate() {
-            if !requests[i].prefilling {
-                layout.decoder_roles[lane] = super::super::replay::Role::Continue;
-            }
-        }
-        if decode_inputs.is_some() {
-            layout.outputs.clear();
-            layout.output_positions.clear();
-            for (lane, &(i, count)) in selected.iter().enumerate() {
-                if !requests[i].prefilling {
-                    for position in 0..count {
-                        layout.outputs.push(lane);
-                        layout.output_positions.push(position);
-                    }
-                } else if requests[i].offset + count == requests[i].input.len() {
-                    layout.outputs.push(lane);
-                    layout.output_positions.push(count - 1);
-                }
-            }
-        }
         Ok(Some(Selection {
             budget: packet_budget,
             order: order.to_vec(),
@@ -442,6 +438,64 @@ impl Runtime {
             prefill_requests,
         }))
     }
+}
+
+/// Forecast native geometry using the same membership and row binding as execution.
+fn packet_layout(
+    requests: &[&mut Request],
+    selected: &[(usize, usize)],
+    verification: bool,
+    has_prefill: bool,
+    capacity: usize,
+    owners: usize,
+) -> Result<Layout> {
+    let segments = selected
+        .iter()
+        .map(|&(i, tokens)| BatchSegment {
+            slot: requests[i].slot,
+            tokens,
+        })
+        .collect();
+    let outputs = selected
+        .iter()
+        .enumerate()
+        .filter_map(|(lane, &(i, count))| {
+            let r = &requests[i];
+            (!r.prefilling || r.offset + count == r.input.len()).then_some(lane)
+        })
+        .collect();
+    let mut layout = Layout::new(
+        segments,
+        outputs,
+        !has_prefill && !verification,
+        if has_prefill || verification {
+            capacity
+        } else {
+            owners
+        },
+        owners,
+    )?;
+    for (lane, &(i, _)) in selected.iter().enumerate() {
+        if !requests[i].prefilling {
+            layout.decoder_roles[lane] = super::super::replay::Role::Continue;
+        }
+    }
+    if verification {
+        layout.outputs.clear();
+        layout.output_positions.clear();
+        for (lane, &(i, count)) in selected.iter().enumerate() {
+            if !requests[i].prefilling {
+                for position in 0..count {
+                    layout.outputs.push(lane);
+                    layout.output_positions.push(position);
+                }
+            } else if requests[i].offset + count == requests[i].input.len() {
+                layout.outputs.push(lane);
+                layout.output_positions.push(count - 1);
+            }
+        }
+    }
+    Ok(layout)
 }
 
 #[cfg(test)]

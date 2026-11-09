@@ -85,6 +85,19 @@ impl Default for Budget {
     }
 }
 
+pub(in crate::models::deepseek_v41::provider) struct Allocation {
+    pub depths: Vec<usize>,
+    pub reference: Option<Vec<usize>>,
+}
+impl From<Vec<usize>> for Allocation {
+    fn from(depths: Vec<usize>) -> Self {
+        Self {
+            depths,
+            reference: None,
+        }
+    }
+}
+
 pub(in crate::models::deepseek_v41::provider) struct Policy {
     curves: BTreeMap<(usize, bool, bool), Curve>,
     trace: bool,
@@ -188,6 +201,73 @@ fn queue(
     // Cumulative rates are nonincreasing, so this also preserves each prefix.
     rows.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     rows
+}
+/// Spend the selected verification budget on useful owner prefixes without
+/// changing the draft owner set or physical block. Launch compatibility is
+/// checked by the caller before adopting this allocation.
+pub(super) fn redistribute(
+    depths: &[usize],
+    maxima: &[usize],
+    feedback: &[&Feedback],
+    block: usize,
+    latency: bool,
+) -> Vec<usize> {
+    if depths.iter().filter(|&&d| d > 0).count() <= 1
+        || depths
+            .iter()
+            .zip(maxima)
+            .all(|(&d, &m)| d == 0 || d == m.min(block))
+    {
+        return depths.to_vec();
+    }
+    let rates = feedback
+        .iter()
+        .map(|f| f.rates(block, true, &[], block))
+        .collect::<Vec<_>>();
+    let mut selected = depths
+        .iter()
+        .map(|&d| usize::from(d > 0))
+        .collect::<Vec<_>>();
+    let mut yields = selected
+        .iter()
+        .zip(&rates)
+        .map(|(&d, r)| 1. + r.iter().take(d).sum::<f64>())
+        .collect::<Vec<_>>();
+    let extra = depths.iter().sum::<usize>() - selected.iter().sum::<usize>();
+    for _ in 0..extra {
+        let owner = (0..selected.len())
+            .filter(|&i| selected[i] > 0 && selected[i] < maxima[i].min(block))
+            .max_by(|&a, &b| {
+                let gain = |i: usize| {
+                    let p = rates[i][selected[i]];
+                    if latency {
+                        p / (yields[i] * (yields[i] + p))
+                    } else {
+                        p
+                    }
+                };
+                gain(a).total_cmp(&gain(b)).then_with(|| b.cmp(&a))
+            });
+        let Some(owner) = owner else {
+            return depths.to_vec();
+        };
+        yields[owner] += rates[owner][selected[owner]];
+        selected[owner] += 1;
+    }
+    let previous = adaptive::progress(
+        depths
+            .iter()
+            .zip(&rates)
+            .map(|(&d, r)| 1. + r.iter().take(d).sum::<f64>()),
+        depths.len(),
+        latency,
+    );
+    let expected = adaptive::progress(yields.into_iter(), depths.len(), latency);
+    if expected > previous + 1e-6 {
+        selected
+    } else {
+        depths.to_vec()
+    }
 }
 fn reuse_steps(
     budget: &Budget,
@@ -464,8 +544,9 @@ impl Policy {
             maxima,
             feedback,
             blocks,
-            |depths| work.extend(depths.iter().sum()),
+            |depths, _| Ok(Some(work.extend(depths.iter().sum()))),
         )
+        .map(|a| a.depths)
     }
     pub fn select_requests_with_forecast(
         &mut self,
@@ -474,8 +555,8 @@ impl Policy {
         maxima: &[usize],
         feedback: &[&Feedback],
         blocks: &[usize],
-        mut forecast: impl FnMut(&[usize]) -> Work,
-    ) -> Result<Vec<usize>> {
+        mut forecast: impl FnMut(&[usize], Option<&[usize]>) -> Result<Option<Work>>,
+    ) -> Result<Allocation> {
         let (full, mixed) = mode;
         let batch = maxima.len();
         if feedback.len() != batch || maxima.iter().any(|&m| m > crate::execution::MAX_MTP_DRAFTS) {
@@ -484,7 +565,7 @@ impl Policy {
         // Bounded packet selection can schedule only prefill; let the shared
         // ordinary path execute it without creating a speculation receipt.
         if batch == 0 {
-            return Ok(vec![]);
+            return Ok(vec![].into());
         }
         let ordinary = vec![0; batch];
         let limit = if budget.rows == 0 {
@@ -510,15 +591,15 @@ impl Policy {
                 .get(&(batch, full, mixed))
                 .is_none_or(|curve| curve.baseline_samples == 0)
         {
-            return Ok(ordinary);
+            return Ok(ordinary.into());
         }
         let Some(normal) = self.costs.predict(stage, 0, full, work) else {
-            return Ok(ordinary);
+            return Ok(ordinary.into());
         };
         // Establish a hot ordinary baseline before pricing savings. The first
         // direct call may be far slower than the eventual Graph replay.
         if limit <= batch || normal.samples < adaptive::HOT_SAMPLES {
-            return Ok(ordinary);
+            return Ok(ordinary.into());
         }
         if blocks.is_empty()
             || blocks.windows(2).any(|b| b[0] >= b[1])
@@ -582,7 +663,7 @@ impl Policy {
                 }
                 // A parallel block is a physical cost key, distinct from the
                 // adopted prefix length. Runtime chooses this exact smallest block.
-                let selected = if budget.uniform {
+                let mut selected = if budget.uniform {
                     let depth = (rows - batch) / positive;
                     local
                         .iter()
@@ -595,6 +676,22 @@ impl Policy {
                 if blocks.iter().copied().find(|&b| b >= maximum) != Some(block) {
                     continue;
                 }
+                let mut reference = None;
+                let mut target_work = None;
+                if budget.uniform {
+                    let candidate =
+                        redistribute(&selected, &local, feedback, block, budget.latency);
+                    if candidate != selected
+                        && let Some(work) = forecast(&candidate, Some(&selected))?
+                    {
+                        reference = Some(std::mem::replace(&mut selected, candidate));
+                        target_work = Some(work);
+                    }
+                }
+                let target_work = match target_work {
+                    Some(work) => work,
+                    None => forecast(&selected, None)?.ok_or("Missing DSpark packet forecast")?,
+                };
                 let yields = feedback.iter().zip(&selected).map(|(f, &depth)| {
                     1. + f.rates(depth, true, &priors, block).iter().sum::<f64>()
                 });
@@ -604,7 +701,6 @@ impl Policy {
                     rows: owners,
                     ..Work::default()
                 };
-                let target_work = forecast(&selected);
                 let uses = reuse_steps(&budget, &selected, maxima, feedback, block);
                 let seen = prior.and_then(|p| p.seen.get(&rows)).copied().unwrap_or(0);
                 let warmup = 2usize.saturating_sub(seen);
@@ -704,7 +800,10 @@ impl Policy {
                     samples,
                     last: observed.map(|c| c.last).or_else(|| prior.map(|p| p.last)),
                 });
-                plans.push(selected);
+                plans.push(Allocation {
+                    depths: selected,
+                    reference,
+                });
             }
         }
         estimates.sort_by(|a, b| {
@@ -735,11 +834,12 @@ impl Policy {
         } else {
             "shared_score"
         };
-        let depths = decision.map_or(ordinary, |d| plans.swap_remove(d.id));
+        let allocation = decision.map_or_else(|| ordinary.into(), |d| plans.swap_remove(d.id));
+        let depths = &allocation.depths;
         if self.trace {
-            trace_selection(curve, full, mixed, limit, maxima, &depths, reason);
+            trace_selection(curve, full, mixed, limit, maxima, depths, reason);
         }
-        Ok(depths)
+        Ok(allocation)
     }
     pub fn observe(
         &mut self,
@@ -872,6 +972,48 @@ mod tests {
             remaining: 1024,
             uniform: false,
             ..Budget::default()
+        }
+    }
+    #[test]
+    fn owner_allocation_keeps_budget_block_tails_and_sampling_evidence() {
+        let mut high = Feedback::default();
+        let mut low = Feedback::default();
+        for _ in 0..32 {
+            high.observe(&[0.1; 5], 5, 5, 5);
+            low.observe(&[0.99; 5], 5, 0, 5);
+        }
+        for latency in [false, true] {
+            let original = [3, 3, 3, 3, 0];
+            let maxima = [5, 5, 5, 5, 0];
+            let feedback = [&high, &low, &high, &low, &high];
+            let selected = redistribute(&original, &maxima, &feedback, 5, latency);
+            assert_eq!(selected, [5, 1, 5, 1, 0]);
+            assert_eq!(
+                selected.iter().sum::<usize>(),
+                original.iter().sum::<usize>()
+            );
+            let progress = |depths: &[usize]| {
+                adaptive::progress(
+                    depths.iter().zip(feedback).map(|(&d, f)| f.progress(d, 5)),
+                    depths.len(),
+                    latency,
+                )
+            };
+            assert!(progress(&selected) > progress(&original));
+            let tail = redistribute(
+                &[3, 1, 3, 0],
+                &[5, 1, 5, 0],
+                &[&high, &low, &low, &high],
+                5,
+                latency,
+            );
+            assert_eq!(tail.iter().sum::<usize>(), 7);
+            assert_eq!((tail[1], tail[3]), (1, 0));
+            let unknown = Feedback::default();
+            assert_eq!(
+                redistribute(&[3; 4], &[5; 4], &[&unknown; 4], 5, latency),
+                [3; 4]
+            );
         }
     }
     #[test]

@@ -33,7 +33,7 @@ class AuxiliaryHeadTests(unittest.TestCase):
         )
         configs = projection_configs(parameters, row_tile_only=True)
         self.assertEqual(configs[0]["tile_m"], 256)
-        self.assertEqual({c["tile_m"] for c in configs}, {64, 128, 256})
+        self.assertEqual({c["tile_m"] for c in configs}, {16, 32, 64, 128, 256})
         for config in configs:
             self.assertEqual(
                 {k: v for k, v in config.items() if k != "tile_m"},

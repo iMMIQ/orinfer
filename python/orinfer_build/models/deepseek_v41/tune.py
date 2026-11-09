@@ -38,7 +38,9 @@ def projection_configs(
         )
     }
     if row_tile_only:
-        configs = [dict(baseline, tile_m=m) for m in sorted({baseline["tile_m"], 64, 128, 256})]
+        configs = [
+            dict(baseline, tile_m=m) for m in sorted({baseline["tile_m"], 16, 32, 64, 128, 256})
+        ]
     elif joint:
         configs = [
             dict(baseline, tile_m=m, tile_n=n, block_k=k, pipeline_stages=s)

@@ -260,6 +260,7 @@ pub(super) struct Team {
     pub verification_rows: usize,
     pub draft_blocks: Vec<usize>,
     pub strided_draft: bool,
+    pub work_launches: BTreeSet<super::batch::WorkLaunch>,
     // Drop worker contexts and communication groups before the bootstrap context.
     _bootstrap: Option<Session>,
     host_tables: Option<Arc<SharedTables>>,
@@ -372,6 +373,7 @@ impl Team {
                 .ok()
                 .as_deref(),
         )?;
+        let work_launches = super::batch::graph_launches(&model);
         let ranks = std::mem::take(&mut model.ranks);
         let snapshots = std::env::var_os("ORINFER_A2_BATCH_TRACE").is_some();
         let cpus = affinity::from_env(ranks.len())?;
@@ -390,6 +392,7 @@ impl Team {
             verification_rows,
             draft_blocks,
             strided_draft,
+            work_launches,
             _bootstrap: Some(bootstrap),
             host_tables: Some(shared),
         };
