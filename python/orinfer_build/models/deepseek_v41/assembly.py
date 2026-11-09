@@ -599,37 +599,12 @@ def publish_package(model, base, destination):
                 assets.add(definition["prepared_weight"])
             if "data" in definition:
                 assets.add(definition["data"]["file"])
-        for packet in rank["packets"]:
-            for step in packet["body"] + packet["head"]:
-                if step["op"] == "kernel":
-                    for name in [step["manifest"], step.get("uncompacted_manifest")]:
-                        if name is None:
-                            continue
-                        path = Path(name)
-                        assets.add(str(path))
-                        assets.add(
-                            str(
-                                path.parent
-                                / json.loads((base / path).read_text())["library"]["file"]
-                            )
-                        )
-    for operation in model.get("vision", {}).get("body", []):
-        path = Path(operation["manifest"])
+    from orinfer_build.models.deepseek_v41.publication import manifests
+
+    for name in manifests(model):
+        path = Path(name)
         assets.add(str(path))
         assets.add(str(path.parent / json.loads((base / path).read_text())["library"]["file"]))
-    for name in ("local", "merge", "processed_local", "processed_merge"):
-        if model.get("sampling", {}).get(name):
-            path = Path(model["sampling"][name])
-            assets.add(str(path))
-            assets.add(str(path.parent / json.loads((base / path).read_text())["library"]["file"]))
-    for variants in model.get("row_selections", {}).values():
-        for variant in variants:
-            for name in variant["kernels"]:
-                path = Path(name)
-                assets.add(str(path))
-                assets.add(
-                    str(path.parent / json.loads((base / path).read_text())["library"]["file"])
-                )
     if destination.exists():
         if json.loads((destination / "model.json").read_text()) != model:
             raise ValueError("Existing package differs from the selected contract")

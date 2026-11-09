@@ -1,8 +1,15 @@
 import unittest
-from orinfer_build.contracts.row_contract import expression, contract
+from orinfer_build.contracts.row_contract import expression, contract, resolve
 
 
 class DynamicContractTests(unittest.TestCase):
+    def test_qualified_tir_minimum_bounds_real_owner_work(self):
+        grid = expression("T.min(64, m * 4)")
+        self.assertEqual(grid, expression("min(64, m * 4)"))
+        self.assertEqual([resolve(grid, n) for n in (1, 3, 17, 256)], [4, 12, 64, 64])
+        with self.assertRaises(ValueError):
+            expression("other.min(64, m * 4)")
+
     def test_ceildiv_and_unsupported_abi(self):
         result = expression("(M + 31) // 32")
         self.assertEqual(result["op"], "divide")

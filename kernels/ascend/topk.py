@@ -305,10 +305,12 @@ def merge(rows, sources, selected=512):
     return main
 
 
-def merge_tree(rows, sources, selected=512):
+def merge_tree(rows, sources, selected=512, leaf_size=4096):
     """Preserve the four-way tree, bypassing canonical empty causal subtrees."""
-    if sources not in (32, 64) or selected < 32 or selected > 512 or selected % 32:
-        raise ValueError("Fused TopK tree requires32/64 sources and32-aligned selected<=512")
+    if sources not in (16, 32, 64) or selected < 32 or selected > 512 or selected % 32:
+        raise ValueError("Fused TopK tree requires16/32/64 sources and32-aligned selected<=512")
+    if leaf_size not in (512, 1024, 2048, 4096):
+        raise ValueError("Invalid TopK leaf size")
     second_groups = (sources + 15) // 16
 
     @T.prim_func
@@ -328,7 +330,9 @@ def merge_tree(rows, sources, selected=512):
             empty = T.alloc_ub((2 * selected,), "float32")
             row = cid * 2 + vid
             if row < rows:
-                live = T.max(1, T.ceildiv(T.min(sources * 4096, T.max(0, lengths[row, 0])), 4096))
+                live = T.max(
+                    1, T.ceildiv(T.min(sources * leaf_size, T.max(0, lengths[row, 0])), leaf_size)
+                )
                 if live < sources:
                     # The producer canonicalizes every inactive leaf to (-inf, -1).
                     # Merging four such leaves preserves this exact bit pattern.
@@ -372,9 +376,12 @@ def merge_tree(rows, sources, selected=512):
                         )
                     else:
                         T.copy(empty, second_stage[0, parent, :])
-                merge_group(
-                    second_stage, out, 0, row, 0, 0, second_groups, selected, a, b, c, d, merged
-                )
+                if second_groups == 1:
+                    T.copy(second_stage[0, 0, :], out[row, 0, :])
+                else:
+                    merge_group(
+                        second_stage, out, 0, row, 0, 0, second_groups, selected, a, b, c, d, merged
+                    )
                 T.pipe_barrier("ALL")
 
     return main

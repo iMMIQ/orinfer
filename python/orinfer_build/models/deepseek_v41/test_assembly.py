@@ -1237,6 +1237,25 @@ class ConvergenceTests(unittest.TestCase):
                     dict(model, engram=dict(file="../source/live.bin")), source, root / "bad"
                 )
 
+    def test_publication_retains_optional_rejection_sampling_assets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            (source / "data.bin").write_bytes(b"data")
+            (source / "kernel.so").write_bytes(b"library")
+            rejection = {}
+            for name in ("statistics", "merge_statistics", "normalize", "select"):
+                manifest = name + ".json"
+                (source / manifest).write_text(json.dumps(dict(library=dict(file="kernel.so"))))
+                rejection[name] = manifest
+            model = dict(
+                engram=dict(file="data.bin"), rope={}, ranks=[], sampling=dict(rejection=rejection)
+            )
+            target = source.parent / "package"
+            self.assertEqual(publish_package(model, source, target), 6)
+            for name in [*rejection.values(), "kernel.so"]:
+                self.assertTrue((target / name).samefile(source / name))
+
     def test_local_replacements_preserve_math_and_fit_shared_scratch(self):
         model = self.model()
         rank = model["ranks"][0]

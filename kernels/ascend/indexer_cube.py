@@ -2,6 +2,8 @@
 
 import tilelang.language as T
 
+from kernels.ascend.candidate import load_keys, load_scales, mask_scores
+
 
 @T.macro
 def weighted_head_sum(dots, total, partial, qs, ks, w, expanded, vector_scales, direct_sum, heads):
@@ -40,6 +42,8 @@ def causal_logits(
     prefetch_inputs=False,
     workspace_tiles=0,
     length_input=False,
+    candidate_blocks=0,
+    candidate_block_size=8,
 ):
     """Score every causal key, optionally reading per-row prefix lengths.
 
@@ -51,7 +55,20 @@ def causal_logits(
         raise ValueError("Causal index Cube requires H32/D128 and aligned key tiles")
     if tile_rows not in (1, 2, 4, 8) or tile_rows * heads * tile_s * 4 > 131072:
         raise ValueError("Causal index query tile exceeds A2 L0C")
-    blocks = (length + tile_s - 1) // tile_s
+    if candidate_blocks and (
+        not length_input
+        or tile_rows != 1
+        or prefetch_inputs
+        or candidate_block_size != 8
+        or tile_s % (2 * candidate_block_size)
+    ):
+        raise ValueError(
+            "Candidate scores require length input, one query tile and eight-key blocks"
+        )
+    score_length = (
+        min(length, candidate_blocks * candidate_block_size) if candidate_blocks != 0 else length
+    )
+    blocks = (score_length + tile_s - 1) // tile_s
     padded = blocks * tile_s
     if workspace_tiles not in (0, 64):
         raise ValueError("Indexer scratch tiles must match the shared 64-CTA owner schedule")
@@ -68,8 +85,14 @@ def causal_logits(
         keys: T.Tensor((length, dimension), "int8"),
         key_scale: T.Tensor((length,), "float16"),
         weights: T.Tensor((rows, heads), "bfloat16"),
-        indices: T.Tensor((rows, 1 if length_input else length), "int32"),
-        out: T.Tensor((rows, length), "float32"),
+        indices: T.Tensor(
+            (
+                rows,
+                candidate_blocks + 8 if candidate_blocks != 0 else (1 if length_input else length),
+            ),
+            "int32",
+        ),
+        out: T.Tensor((rows, score_length), "float32"),
         workspace: T.Tensor((rows * heads, workspace_width), "int32"),
     ):
         # A bounded scratch slot belongs to one physical CTA. Reuse it only
@@ -79,7 +102,7 @@ def causal_logits(
             64 if workspace_tiles else T.ceildiv(rows, tile_rows) * blocks, is_npu=True
         ) as (cid, vid):
             live_blocks = (
-                T.max(1, T.ceildiv(T.min(length, T.max(0, indices[rows - 1, 0])), tile_s))
+                T.max(1, T.ceildiv(T.min(score_length, T.max(0, indices[rows - 1, 0])), tile_s))
                 if length_input
                 else blocks
             )
@@ -101,12 +124,24 @@ def causal_logits(
                         if length_input
                         else indices[first + valid_rows - 1, start] >= 0
                     ):
-                        valid = T.min(tile_s, length - start)
+                        valid = T.min(tile_s, score_length - start)
                         T.copy(
                             query[first * heads : (first + valid_rows) * heads, :],
                             a[: valid_rows * heads, :],
                         )
-                        T.copy(keys[start : start + valid, :], b[:valid, :])
+                        if candidate_blocks != 0:
+                            load_keys(
+                                keys,
+                                indices,
+                                first,
+                                start,
+                                b,
+                                tile_s,
+                                dimension,
+                                candidate_block_size,
+                            )
+                        else:
+                            T.copy(keys[start : start + valid, :], b[:valid, :])
                         T.gemm_v0(a, b, c, transpose_B=True, init=True)
                         T.copy(
                             c[: valid_rows * heads, :],
@@ -149,11 +184,17 @@ def causal_logits(
                                 else indices[row, start] >= 0
                             ):
                                 if column < (
-                                    T.min(length, indices[row, 0]) if length_input else length
+                                    T.min(score_length, indices[row, 0])
+                                    if length_input
+                                    else score_length
                                 ):
                                     valid = T.min(
                                         lanes,
-                                        (T.min(length, indices[row, 0]) if length_input else length)
+                                        (
+                                            T.min(score_length, indices[row, 0])
+                                            if length_input
+                                            else score_length
+                                        )
                                         - column,
                                     )
                                     T.copy(
@@ -182,9 +223,23 @@ def causal_logits(
                                     T.tile.mul(w, w, factor)
                                     T.tile.cast(w_half, w, "CAST_RINT", heads)
                                     T.tile.cast(w, w_half, "CAST_NONE", heads)
-                                    if not prefetch_inputs:
-                                        T.copy(key_scale[column : column + valid], ks_half[:valid])
-                                    T.tile.cast(ks, ks_half, "CAST_NONE", lanes)
+                                    if candidate_blocks != 0:
+                                        load_scales(
+                                            key_scale,
+                                            indices,
+                                            row,
+                                            column,
+                                            length,
+                                            ks,
+                                            lanes,
+                                            candidate_block_size,
+                                        )
+                                    else:
+                                        if not prefetch_inputs:
+                                            T.copy(
+                                                key_scale[column : column + valid], ks_half[:valid]
+                                            )
+                                        T.tile.cast(ks, ks_half, "CAST_NONE", lanes)
                                     weighted_head_sum(
                                         dots,
                                         total,
@@ -197,6 +252,10 @@ def causal_logits(
                                         direct_sum,
                                         heads,
                                     )
+                                    if candidate_blocks != 0:
+                                        mask_scores(
+                                            total, indices, row, column, lanes, candidate_block_size
+                                        )
                                     if not prefetch_inputs and not length_input:
                                         T.copy(indices[row, column : column + valid], ids[:valid])
                                     if vector_mask and not length_input:
@@ -228,10 +287,12 @@ def causal_logits(
                         ):
                             T.set_cross_flag("MTE3", 1)
 
-    return (
+    result = (
         main.with_attr("orinfer.coupled_resources", True).with_attr(
             "orinfer.explicit_cross_sync", True
         )
         if workspace_tiles
         else main
     )
+
+    return result.with_attr("orinfer.component_sources", ["kernels/ascend/candidate.py"])

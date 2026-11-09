@@ -66,8 +66,14 @@ def expression(source, row_multiplier=1, constants=None):
             return dict(op=operators[type(node.op)], lhs=visit(node.left), rhs=visit(node.right))
         if (
             isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "min"
+            and (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "min"
+                or isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "T"
+                and node.func.attr == "min"
+            )
             and len(node.args) == 2
             and not node.keywords
         ):

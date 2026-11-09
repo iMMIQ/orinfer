@@ -903,6 +903,17 @@ bash tools/environments/ascend/run.sh --without-devices python3 -m orinfer_build
 
 私有查询分片构建在输入未声明 `direct_sum` 时默认启用直接累加：沿原有 32 头 FP32 顺序读取 UB 分数行，减少逐头临时复制。输入中显式声明的配置继续保留。已有包可用 `private_schedule --operator indexer_cube.causal_logits --parameters '{"direct_sum":true}'` 复用同一计算体；默认只替换 prefill，decode 沿用原资产。索引权重使用合并后的头／维度缩放因子，在 FP16 舍入后参与逐头累加；独立参考保持这一边界，包括 FP16 次正规数的中点舍入。
 
+带有完整 owner 行与查询分片契约的计划可接入 checkpoint 声明的跨层候选块：
+
+```bash
+bash tools/environments/ascend/run.sh --without-devices python3 -m orinfer_build.models.deepseek_v41.candidate_blocks \
+  --plan PLAN --model-dir MODEL --output artifacts/a2-candidate-blocks --compile-workers 4
+```
+
+构建器读取 HF `candidate_source_layer_id`、`candidate_topk_blocks` 和 `candidate_block_size`；当前支持第 20 层生成 2048 个八位置块，第 24/28/32/36 个索引层在候选范围内计算并选择 512 个绝对位置。块得分为有效位置分数的最大值，包含未满块的因果屏蔽；短历史保留全部有效块。候选按地址顺序排列，后续 INT8 打分与局部 TopK 复用 `indexer_fused.causal_topk`，保持原来的缩放和逐头累加边界。全局 TopK 复用共享归并树，最终输出与绝对位置映射融合为一次调用。`--index-chunk` 离线选择 512/1024/2048/4096 中的一个配置，默认 1024；不同 batch 共用同一动态模板。普通 decode、验证、混合及 prefill 共用同一计算体；候选随每条查询重新生成，沿用 owner、decoder 和 TP 行映射，放在 packet 工作区中，不增加持久 KV 或 prefix 状态。后续仍使用现有索引集合通信。构建器保留未融合的同布局源层打分参考，缺少该参考时拒绝构建。
+
+`tests.ascend.operators.validate_candidate --output OUTPUT` 验证候选集合、紧凑打分与绝对索引，覆盖 2048/2049、16384/16385、100K 和 262K 容量、负分数、尾部、动态行数及改变输入后的 Graph replay。候选约束会改变旧版全历史 TopK 的选中位置；完整模型须继续验收质量、请求隔离、prefix 恢复和实际请求性能后再发布。
+
 完整 attention 可继续沿用查询分片，并复用现有 Cube QK、softmax、PV 和私有 KV gather 工厂：
 
 ```bash

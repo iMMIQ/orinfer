@@ -3,14 +3,30 @@
 import tilelang.language as T
 
 
-def causal_topk(rows, length, tile_rows=8, tile_s=128):
+def causal_topk(
+    rows,
+    length,
+    tile_rows=8,
+    tile_s=128,
+    candidate_blocks=0,
+    candidate_block_size=8,
+    chunk_size=4096,
+):
+    from kernels.ascend.candidate import load_keys, load_scales, mask_scores
     from kernels.ascend.indexer_cube import weighted_head_sum
     from kernels.ascend.topk import select_chunk
 
     if length < 1 or length > 1 << 24 or tile_rows not in (1, 2, 4, 8) or tile_s not in (64, 128):
         raise ValueError("Invalid fused causal index geometry")
-    heads, dimension, block, selected, slots = 32, 128, 4096, 512, 64
-    chunks, lanes = (length + block - 1) // block, tile_s // 2
+    if chunk_size not in (512, 1024, 2048, 4096):
+        raise ValueError("Invalid fused index chunk size")
+    heads, dimension, block, selected, slots = 32, 128, chunk_size, 512, 64
+    if candidate_blocks and (tile_rows != 1 or candidate_block_size != 8):
+        raise ValueError("Candidate fusion requires one query and eight-key blocks")
+    score_length = (
+        min(length, candidate_blocks * candidate_block_size) if candidate_blocks else length
+    )
+    chunks, lanes = (score_length + block - 1) // block, tile_s // 2
     factor = dimension**-0.5 * heads**-0.5
 
     @T.prim_func
@@ -20,12 +36,20 @@ def causal_topk(rows, length, tile_rows=8, tile_s=128):
         keys: T.Tensor((length, dimension), "int8"),
         key_scale: T.Tensor((length,), "float16"),
         weights: T.Tensor((rows, heads), "bfloat16"),
-        indices: T.Tensor((rows, 1), "int32"),
+        indices: T.Tensor((rows, candidate_blocks + 8 if candidate_blocks != 0 else 1), "int32"),
         candidates: T.Tensor((rows, chunks, 2 * selected), "float32"),
         cube_workspace: T.Tensor((slots, tile_rows * heads, tile_s), "int32"),
         score_workspace: T.Tensor((slots, tile_rows, block), "float32"),
     ):
-        with T.Kernel(slots, is_npu=True) as (cid, vid):
+        with T.Kernel(
+            T.min(slots, T.ceildiv(rows, tile_rows) * chunks) if candidate_blocks != 0 else slots,
+            is_npu=True,
+        ) as (cid, vid):
+            active_slots = (
+                T.min(slots, T.ceildiv(rows, tile_rows) * chunks)
+                if candidate_blocks != 0
+                else slots
+            )
             T.reads(
                 query[:, :],
                 query_scale[:, :],
@@ -37,20 +61,23 @@ def causal_topk(rows, length, tile_rows=8, tile_s=128):
                 score_workspace[:, :, :],
             )
             T.writes(candidates[:, :, :], cube_workspace[:, :, :], score_workspace[:, :, :])
-            live_chunks = T.max(1, T.ceildiv(T.min(length, T.max(0, indices[rows - 1, 0])), block))
+            live_chunks = T.max(
+                1, T.ceildiv(T.min(score_length, T.max(0, indices[rows - 1, 0])), block)
+            )
             with T.Scope("C"):
                 a = T.alloc_L1((tile_rows * heads, dimension), "int8")
                 b = T.alloc_L1((tile_s, dimension), "int8")
                 c = T.alloc_L0C((tile_rows * heads, tile_s), "int32")
                 for iteration in T.serial(
-                    T.ceildiv(T.ceildiv(rows, tile_rows) * live_chunks - cid, slots)
+                    T.ceildiv(T.ceildiv(rows, tile_rows) * live_chunks - cid, active_slots)
                 ):
-                    logical = cid + iteration * slots
+                    logical = cid + iteration * active_slots
                     first, chunk = logical // live_chunks * tile_rows, logical % live_chunks
                     valid_rows = T.min(tile_rows, rows - first)
                     start = chunk * block
                     valid_keys = T.min(
-                        block, T.max(0, T.min(length, indices[first + valid_rows - 1, 0]) - start)
+                        block,
+                        T.max(0, T.min(score_length, indices[first + valid_rows - 1, 0]) - start),
                     )
                     if valid_keys > 0:
                         T.copy(
@@ -59,8 +86,20 @@ def causal_topk(rows, length, tile_rows=8, tile_s=128):
                         )
                     for tile in T.serial(T.ceildiv(valid_keys, tile_s)):
                         column = start + tile * tile_s
-                        valid = T.min(tile_s, length - column)
-                        T.copy(keys[column : column + valid, :], b[:valid, :])
+                        valid = T.min(tile_s, score_length - column)
+                        if candidate_blocks != 0:
+                            load_keys(
+                                keys,
+                                indices,
+                                first,
+                                column,
+                                b,
+                                tile_s,
+                                dimension,
+                                candidate_block_size,
+                            )
+                        else:
+                            T.copy(keys[column : column + valid, :], b[:valid, :])
                         T.gemm_v0(a, b, c, transpose_B=True, init=True)
                         T.copy(
                             c[: valid_rows * heads, :], cube_workspace[cid, : valid_rows * heads, :]
@@ -115,21 +154,22 @@ def causal_topk(rows, length, tile_rows=8, tile_s=128):
                     block,
                 )
                 for item in T.serial(
-                    T.ceildiv(rows * (chunks - live_chunks) - cid * 2 - vid, slots * 2)
+                    T.ceildiv(rows * (chunks - live_chunks) - cid * 2 - vid, active_slots * 2)
                 ):
-                    flat = cid * 2 + vid + item * slots * 2
+                    flat = cid * 2 + vid + item * active_slots * 2
                     row = flat // T.max(1, chunks - live_chunks)
                     chunk = live_chunks + flat % T.max(1, chunks - live_chunks)
                     T.copy(pairs, candidates[row, chunk, :])
                 for iteration in T.serial(
-                    T.ceildiv(T.ceildiv(rows, tile_rows) * live_chunks - cid, slots)
+                    T.ceildiv(T.ceildiv(rows, tile_rows) * live_chunks - cid, active_slots)
                 ):
-                    logical = cid + iteration * slots
+                    logical = cid + iteration * active_slots
                     first, chunk = logical // live_chunks * tile_rows, logical % live_chunks
                     valid_rows = T.min(tile_rows, rows - first)
                     start = chunk * block
                     valid_keys = T.min(
-                        block, T.max(0, T.min(length, indices[first + valid_rows - 1, 0]) - start)
+                        block,
+                        T.max(0, T.min(score_length, indices[first + valid_rows - 1, 0]) - start),
                     )
                     for row_offset in T.serial(valid_rows):
                         T.copy(
@@ -150,7 +190,7 @@ def causal_topk(rows, length, tile_rows=8, tile_s=128):
                         T.wait_cross_flag(0)
                         for row_offset in T.serial(valid_rows):
                             valid = T.min(
-                                lanes, T.min(length, indices[first + row_offset, 0]) - column
+                                lanes, T.min(score_length, indices[first + row_offset, 0]) - column
                             )
                             if valid > 0:
                                 T.copy(
@@ -162,8 +202,20 @@ def causal_topk(rows, length, tile_rows=8, tile_s=128):
                                     raw,
                                 )
                                 T.tile.cast(dots, raw, "CAST_RINT", heads * lanes)
-                                T.copy(key_scale[column : column + valid], ks_half[:valid])
-                                T.tile.cast(ks, ks_half, "CAST_NONE", lanes)
+                                if candidate_blocks != 0:
+                                    load_scales(
+                                        key_scale,
+                                        indices,
+                                        first + row_offset,
+                                        column,
+                                        length,
+                                        ks,
+                                        lanes,
+                                        candidate_block_size,
+                                    )
+                                else:
+                                    T.copy(key_scale[column : column + valid], ks_half[:valid])
+                                    T.tile.cast(ks, ks_half, "CAST_NONE", lanes)
                                 weighted_head_sum(
                                     dots,
                                     total,
@@ -176,6 +228,15 @@ def causal_topk(rows, length, tile_rows=8, tile_s=128):
                                     True,
                                     heads,
                                 )
+                                if candidate_blocks != 0:
+                                    mask_scores(
+                                        total,
+                                        indices,
+                                        first + row_offset,
+                                        column,
+                                        lanes,
+                                        candidate_block_size,
+                                    )
                                 T.copy(
                                     total[0, :valid],
                                     score_workspace[
@@ -192,7 +253,9 @@ def causal_topk(rows, length, tile_rows=8, tile_s=128):
                         row_offset = group * 2 + vid
                         if row_offset < valid_rows:
                             row = first + row_offset
-                            valid = T.min(block, T.max(0, T.min(length, indices[row, 0]) - start))
+                            valid = T.min(
+                                block, T.max(0, T.min(score_length, indices[row, 0]) - start)
+                            )
                             if valid > 0:
                                 T.copy(score_workspace[cid, row_offset, :], x)
                             select_chunk(
@@ -223,6 +286,10 @@ def causal_topk(rows, length, tile_rows=8, tile_s=128):
         .with_attr("orinfer.explicit_cross_sync", True)
         .with_attr(
             "orinfer.component_sources",
-            ["kernels/ascend/indexer_cube.py", "kernels/ascend/topk.py"],
+            [
+                "kernels/ascend/indexer_cube.py",
+                "kernels/ascend/topk.py",
+                "kernels/ascend/candidate.py",
+            ],
         )
     )
