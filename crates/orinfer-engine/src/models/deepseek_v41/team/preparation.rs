@@ -38,6 +38,15 @@ impl CaptureBudget {
                 useful * (direct - replay).max(0.) > capture * 1.1
                     && capture + replay <= self.slack_s
             }
+            (Some(direct), None, Some(capture)) => {
+                // The first replay is a bounded measurement, not a predicted
+                // speedup. Limit it to a quarter of the remaining direct work:
+                // a fixed reuse count can abandon a costly fused packet before
+                // it ever measures the execution mode it was tuned for.
+                let useful = (self.uses - warmup_uses as f64).max(0.);
+                (self.uses >= 16. || useful * direct > capture * 4.)
+                    && capture + direct <= self.slack_s
+            }
             // Seed one missing family on a long, repeated packet. Observations
             // then price new row counts from the same shared sparse surface.
             _ => self.uses >= 16. && self.slack_s > self.direct_s.unwrap_or(0.),
@@ -231,6 +240,49 @@ mod tests {
                 .unwrap()
                 .mode,
             Mode::Replay
+        );
+    }
+    #[test]
+    fn first_replay_trial_uses_measured_cost_instead_of_a_fixed_reuse_count() {
+        let measured = CaptureBudget {
+            uses: 8.9409,
+            direct_s: Some(0.21065),
+            replay_s: None,
+            capture_s: Some(0.35755),
+            slack_s: 1.1494,
+            trace: false,
+        };
+        let ready = [CacheState::Direct {
+            uses: 2,
+            consecutive: 2,
+        }; 8];
+        assert!(plan(&ready, true, Some(measured)).unwrap().capture());
+        assert!(
+            !CaptureBudget {
+                uses: 4.,
+                ..measured
+            }
+            .profitable(0)
+        );
+        assert!(
+            !CaptureBudget {
+                slack_s: 0.4,
+                ..measured
+            }
+            .profitable(0)
+        );
+        assert!(
+            !CaptureBudget {
+                replay_s: Some(0.22),
+                ..measured
+            }
+            .profitable(0)
+        );
+        assert!(!measured.profitable(3));
+        assert!(
+            !plan(&[CacheState::Missing; 8], true, Some(measured))
+                .unwrap()
+                .capture()
         );
     }
     #[test]
