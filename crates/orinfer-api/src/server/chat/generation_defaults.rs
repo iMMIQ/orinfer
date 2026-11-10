@@ -7,7 +7,8 @@ pub(super) struct Defaults {
     sampling: Options,
     non_thinking: Option<Options>,
     pub thinking: bool,
-    pub max_tokens: usize,
+    max_tokens: usize,
+    deepseek: bool,
 }
 
 impl Defaults {
@@ -30,6 +31,7 @@ impl Defaults {
         let qwen35 = source == "qwen3.5-4b" || source.starts_with("qwen3.5-4b-");
         let index = source.starts_with("index-translate-");
         let qwen = qwen38 || qwen35;
+        let deepseek = descriptor["metadata"]["chat_format"] == "deepseek_v41";
         let mut sampling = Options::default();
         if qwen {
             // Qwen3.8 / Qwen3.5-4B model cards: general-task thinking defaults.
@@ -59,7 +61,7 @@ impl Defaults {
             // IndexTeam's translate.py defaults to greedy for all three sizes.
             sampling.temperature = 0.0;
         }
-        if descriptor["metadata"]["chat_format"] == "deepseek_v41" {
+        if deepseek {
             // Match DeepInfer, including checkpoints exported with legacy greedy defaults.
             sampling = Options::default();
         }
@@ -70,9 +72,7 @@ impl Defaults {
             presence_penalty: 1.5,
             ..sampling.clone()
         });
-        if generation["do_sample"] == false
-            && descriptor["metadata"]["chat_format"] != "deepseek_v41"
-        {
+        if generation["do_sample"] == false && !deepseek {
             sampling.temperature = 0.0;
             if let Some(instruct) = &mut non_thinking {
                 instruct.temperature = 0.0;
@@ -86,10 +86,18 @@ impl Defaults {
             sampling,
             non_thinking,
             thinking: qwen,
-            // Output budgets are service policy: Index follows its client;
-            // other models retain the bounded 8192-token serving budget.
+            deepseek,
+            // Index follows its client; DeepSeek thinking uses the API policy below.
             max_tokens: if index { 1024 } else { 8192 },
         })
+    }
+
+    pub fn max_tokens(&self, thinking: bool, effort: Option<&str>) -> usize {
+        if self.deepseek && thinking {
+            if effort == Some("max") { 131072 } else { 65536 }
+        } else {
+            self.max_tokens
+        }
     }
 
     pub fn sampling(&self, thinking: bool) -> &Options {

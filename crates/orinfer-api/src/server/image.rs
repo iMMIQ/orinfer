@@ -684,7 +684,7 @@ mod tests {
         let request: super::super::ChatRequest = serde_json::from_value(json!({"model":"test","messages":[
             {"role":"user","content":(0..12).map(|_|json!({"type":"image_url","image_url":{"url":url}})).collect::<Vec<_>>()}]})).unwrap();
         let estimate =
-            crate::server::preparation::request_memory(&request, 262144, Some(&spec), 2048);
+            crate::server::preparation::request_memory(&request, 262144, Some(&spec), 2048, 8192);
         let mut context = estimate.context(std::sync::Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         ));
@@ -730,7 +730,7 @@ mod tests {
             {"role":"user","content":(0..5).map(|_|json!({"type":"image_url","image_url":{"url":url}})).collect::<Vec<_>>()}]})).unwrap();
         assert!(5 * (4096 / 32) * (2048 / 32) > spec.max_features);
         let estimate =
-            crate::server::preparation::request_memory(&request, 262144, Some(&spec), 2048);
+            crate::server::preparation::request_memory(&request, 262144, Some(&spec), 2048, 8192);
         let mut context = estimate.context(std::sync::Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         ));

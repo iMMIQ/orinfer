@@ -148,6 +148,7 @@ async fn submit(
             state.context,
             state.vision.as_ref(),
             state.limits.memory_mib,
+            state.codec.max_tokens(&request),
         );
         let memory_mib = estimate.mib;
         if memory_mib as usize > state.limits.memory_mib {

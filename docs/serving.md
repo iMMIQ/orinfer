@@ -86,7 +86,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 | Qwen3.5-4B | 开启 | `1 / 0.95 / 20 / 1.5` | 8192 |
 | Index-Translate-2B/9B/35B | 关闭 | `0 / 1 / 0 / 0`（贪心） | 1024 |
 | Qwen3-ASR-1.7B | 关闭 | `0 / 1 / 0 / 0`（贪心） | 8192 |
-| DSv4.1 | 关闭 | `1 / 1 / 0 / 0` | 8192 |
+| DSv4.1 | 关闭 | `1 / 1 / 0 / 0` | 非思考 8192；思考 65536；思考且 `reasoning_effort=max` 为 131072 |
 
 Qwen3.8 和 Qwen3.5-4B 关闭 thinking 时，未显式提供的采样参数使用 `temperature=0.7、top_p=0.8、top_k=20、presence_penalty=1.5`。thinking 模式下，`generation_config.json` 中显式提供的采样和惩罚值覆盖模型推荐值；其他模型继承本模型的生成配置，缺失值使用通用默认值。`do_sample=false` 采用贪心语义；Index 使用官方翻译客户端的贪心默认值，DSv4.1 使用下面的 DeepInfer 策略。repetition_penalty 默认 1，frequency_penalty 默认 0。`top_k=0/-1` 都表示关闭截断。
 
@@ -128,7 +128,7 @@ Responses 和 Messages 由 [Estuary](https://github.com/iMMIQ/estuary) 转换为
 
 Estuary 节点选用 `openai` provider，上游填写 orinfer 的 `/v1` 地址。该模式沿用网关的通用负载和近似前缀路由；orinfer 的 `/metrics` 使用自身指标名，真实缓存事件与 vLLM 专用路由协议另行对接。多模态 token ID 不构成图片缓存身份。
 
-默认输出预算见上表，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。此处为 Chat API 的输出预算；DeepInfer 底层构造器的默认值为 16 tokens，调用方传入已编码 prompt，thinking 由外部模板决定。本服务的 thinking 开关沿用上面的请求控制。除 Index 外，8192 是服务输出预算，不继承 `generation_config.json.max_new_tokens`；ASR 转录入口同样使用此预算，以容纳长录音。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限默认 32 MiB，通过 `--request-body-mib` 调整。
+默认输出预算见上表，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。此处为 Chat API 的输出预算；DeepInfer 底层构造器的默认值为 16 tokens，调用方传入已编码 prompt，thinking 由外部模板决定。本服务的 thinking 开关沿用上面的请求控制。DSv4.1 的输出预算按最终 thinking 开关和请求的 `reasoning_effort` 选择，与 [DeepSeek 官方 Chat API](https://api-docs.deepseek.com/zh-cn/api/create-chat-completion/) 的默认值一致；`xhigh` 等其他已支持的思考强度使用 65536。预算包含思考和正文，不继承 `generation_config.json.max_new_tokens`。ASR 转录入口使用 8192 输出预算，以容纳长录音。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限默认 32 MiB，通过 `--request-body-mib` 调整。
 
 上下文溢出返回 `error.code=context_length_exceeded`，客户端可据此压缩历史并重试；其他无效参数仍为 `invalid_request`。
 

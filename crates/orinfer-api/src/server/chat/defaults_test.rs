@@ -132,6 +132,113 @@ fn deepinfer_sampling_overrides_legacy_assets_and_preserves_explicit_controls() 
 }
 
 #[test]
+fn deepseek_output_defaults_follow_thinking_effort_and_remaining_context() {
+    let generic = codec(false);
+    let codec = codec(true);
+    for (extra, expected) in [
+        (json!({}), 8192),
+        (json!({"enable_thinking":true}), 65536),
+        (json!({"reasoning_effort":"minimal"}), 65536),
+        (json!({"reasoning_effort":"low"}), 65536),
+        (json!({"reasoning_effort":"medium"}), 65536),
+        (json!({"reasoning_effort":"high"}), 65536),
+        (json!({"reasoning_effort":"xhigh"}), 65536),
+        (json!({"reasoning_effort":"max"}), 131072),
+        (json!({"reasoning_effort":"none"}), 8192),
+        (
+            json!({"enable_thinking":false,"reasoning_effort":"max"}),
+            8192,
+        ),
+        (
+            json!({"chat_template_kwargs":{"thinking":true,"reasoning_effort":"max"}}),
+            131072,
+        ),
+        (json!({"enable_thinking":true,"max_tokens":null}), 65536),
+        (
+            json!({"reasoning_effort":"max","max_completion_tokens":null}),
+            131072,
+        ),
+    ] {
+        let full = prepare(&codec, extra.clone(), 262144).unwrap();
+        assert_eq!(full.max_tokens, expected, "{extra}");
+        let short = prepare(&codec, extra.clone(), 4096).unwrap();
+        assert_eq!(short.max_tokens, 4096 - short.input.len(), "{extra}");
+        assert!(prepare(&codec, extra, 1).is_err());
+    }
+    for limit in ["max_tokens", "max_completion_tokens"] {
+        let explicit = json!({"reasoning_effort":"max",limit:64});
+        assert_eq!(
+            prepare(&codec, explicit.clone(), 100).unwrap().max_tokens,
+            64
+        );
+        assert!(prepare(&codec, explicit, 64).is_err());
+    }
+    // A request's effort does not change another model family's output policy.
+    assert_eq!(
+        prepare(&generic, json!({"reasoning_effort":"max"}), 262144)
+            .unwrap()
+            .max_tokens,
+        8192
+    );
+}
+
+#[test]
+fn deployment_budget_and_probability_admission_share_the_resolved_default() {
+    let codec = codec(true);
+    for (defaults, expected) in [
+        (json!({"enable_thinking":true}), 65536),
+        (
+            json!({"chat_template_kwargs":{"reasoning_effort":"max"}}),
+            131072,
+        ),
+        (
+            json!({"reasoning_effort":"max","max_completion_tokens":4096}),
+            4096,
+        ),
+    ] {
+        let request =
+            crate::server::defaults::validation_request(defaults.as_object().unwrap()).unwrap();
+        assert_eq!(codec.max_tokens(&request), expected);
+        let prepared = codec
+            .prepare(
+                request,
+                "defaults-validation",
+                262144,
+                None,
+                &mut Context::unbounded(),
+            )
+            .unwrap();
+        assert_eq!(prepared.max_tokens, expected);
+    }
+    let defaults = json!({"reasoning_effort":"max","max_completion_tokens":4096});
+    let request = crate::server::defaults::decode(
+        json!({"model":"test","messages":[{"role":"user","content":"one"}],"max_tokens":32}),
+        defaults.as_object().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(codec.max_tokens(&request), 32);
+
+    let mut request = crate::server::defaults::validation_request(
+        json!({"reasoning_effort":"max","logprobs":true,"top_logprobs":20})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap();
+    let output = codec.max_tokens(&request);
+    let memory = crate::server::preparation::request_memory_mib(&request, 262144, output);
+    request.max_tokens = Some(output);
+    assert_eq!(
+        memory,
+        crate::server::preparation::request_memory_mib(&request, 262144, 8192)
+    );
+    request.max_tokens = Some(8192);
+    assert!(memory > crate::server::preparation::request_memory_mib(&request, 262144, 8192));
+    request.max_tokens = None;
+    request.stream = true;
+    assert!(memory > crate::server::preparation::request_memory_mib(&request, 262144, output));
+}
+
+#[test]
 fn omitted_seed_is_fresh_and_explicit_seed_is_stable() {
     let codec = codec(false);
     let seeds = (0..16)
@@ -267,7 +374,6 @@ fn index_defaults_are_greedy_for_all_sizes_with_bounded_output() {
         assert_eq!(default.sampling.top_p, 1.0);
         assert_eq!(default.sampling.top_k, 0);
         assert_eq!(default.max_tokens, 1024);
-        assert_eq!(codec.default_max_tokens(), 1024);
         assert_eq!(prepare(&codec, json!({}), 100).unwrap().max_tokens, 99);
         let explicit = prepare(
             &codec,

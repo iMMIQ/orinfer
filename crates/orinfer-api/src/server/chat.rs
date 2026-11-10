@@ -270,8 +270,24 @@ impl ChatCodec {
             grammar,
         })
     }
-    pub fn default_max_tokens(&self) -> usize {
-        self.defaults.max_tokens
+    fn thinking(&self, request: &ChatRequest) -> bool {
+        request.enable_thinking.unwrap_or(
+            request
+                .reasoning_effort
+                .as_ref()
+                .map_or(self.defaults.thinking, |s| s != "none"),
+        )
+    }
+
+    /// Resolve after template aliases and deployment defaults, before admission.
+    pub fn max_tokens(&self, request: &ChatRequest) -> usize {
+        request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .unwrap_or_else(|| {
+                self.defaults
+                    .max_tokens(self.thinking(request), request.reasoning_effort.as_deref())
+            })
     }
 
     pub fn prepare(
@@ -354,10 +370,7 @@ impl ChatCodec {
         }
         let explicit_limit =
             request.max_completion_tokens.is_some() || request.max_tokens.is_some();
-        let mut max_tokens = request
-            .max_completion_tokens
-            .or(request.max_tokens)
-            .unwrap_or(self.default_max_tokens());
+        let mut max_tokens = self.max_tokens(&request);
         if max_tokens == 0 {
             return Err("max_completion_tokens: Output-token limit must be positive".into());
         }
@@ -377,12 +390,7 @@ impl ChatCodec {
         {
             return Err("enable_thinking: Conflicts with reasoning_effort=none".into());
         }
-        let thinking = request.enable_thinking.unwrap_or(
-            request
-                .reasoning_effort
-                .as_ref()
-                .map_or(self.defaults.thinking, |s| s != "none"),
-        );
+        let thinking = self.thinking(&request);
         let sampling_defaults = self.defaults.sampling(thinking);
         let sampling = Options {
             temperature: request.temperature.unwrap_or(sampling_defaults.temperature),

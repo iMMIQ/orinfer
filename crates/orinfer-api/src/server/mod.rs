@@ -300,6 +300,10 @@ pub(crate) fn error(status: StatusCode, message: impl Into<String>) -> Response 
     response
 }
 async fn health(State(state): State<Service>) -> Response {
+    let output_limit = match defaults::validation_request(&state.default_request_params) {
+        Ok(request) => state.codec.max_tokens(&request),
+        Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
     (if state.activity.lifecycle.is_ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(
         json!({"status":state.activity.lifecycle.name(),"failure":state.activity.lifecycle.failure(),"model":state.model.as_ref(),"max_context":state.context,
         "frontend_assets":state.codec.asset_hashes,
@@ -314,7 +318,7 @@ async fn health(State(state): State<Service>) -> Response {
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
             "tools":{"function":state.codec.tools_supported,"strict":state.codec.tools_supported,"required":state.codec.tools_supported,"incremental_arguments":state.codec.tools_supported},
             "logprobs":true,"max_top_logprobs":20,"logit_bias":true,"stored_completions":false,
-            "images":state.vision.is_some(),"video":false,"audio":state.codec.audio.is_some(),"default_max_completion_tokens":state.default_request_params.get("max_completion_tokens").and_then(Value::as_u64).or_else(|| state.default_request_params.get("max_tokens").and_then(Value::as_u64)).unwrap_or(state.codec.default_max_tokens() as u64),
+            "images":state.vision.is_some(),"video":false,"audio":state.codec.audio.is_some(),"default_max_completion_tokens":output_limit,
             "thinking_token_budget":true,"chat_template_kwargs":true,"prompt_cache":{"key":true,"retention":["in-memory","24h"],"persistent":false,"ttl_guaranteed":false}},
         "mtp":{"enabled":state.mtp_drafts>0,"max_drafts":state.mtp_drafts},
         "prompt_lookup":{"enabled":state.prompt_lookup && state.mtp_drafts>0},
@@ -387,6 +391,7 @@ async fn prepare_chat(
         state.context,
         state.vision.as_ref(),
         state.limits.memory_mib,
+        state.codec.max_tokens(&request),
     );
     let memory_mib = estimate.mib;
     if memory_mib as usize > state.limits.memory_mib {

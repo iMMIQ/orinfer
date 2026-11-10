@@ -184,8 +184,9 @@ pub(super) fn request_memory(
     context: usize,
     vision: Option<&orinfer_engine::vision::VisionSpec>,
     limit_mib: usize,
+    default_max_tokens: usize,
 ) -> Memory {
-    let minimum = request_memory_mib(request, context) as usize;
+    let minimum = request_memory_mib(request, context, default_max_tokens) as usize;
     let images = request
         .messages
         .iter()
@@ -240,7 +241,11 @@ pub(super) fn request_memory(
     }
 }
 
-pub(super) fn request_memory_mib(request: &ChatRequest, context: usize) -> u32 {
+pub(super) fn request_memory_mib(
+    request: &ChatRequest,
+    context: usize,
+    default_max_tokens: usize,
+) -> u32 {
     let bytes = serde_json::to_vec(&request.messages)
         .map(|v| v.len())
         .unwrap_or(32 << 20);
@@ -267,7 +272,7 @@ pub(super) fn request_memory_mib(request: &ChatRequest, context: usize) -> u32 {
         let output = request
             .max_completion_tokens
             .or(request.max_tokens)
-            .unwrap_or(8192)
+            .unwrap_or(default_max_tokens)
             .min(context);
         // SSE emits scores incrementally and retains only bounded mailboxes.
         (if request.stream {
@@ -318,14 +323,14 @@ mod tests {
             "messages":[{"role":"user","content":(0..12).map(|_|json!({"type":"image_url",
                 "image_url":{"url":"https://example.com/image.png"}})).collect::<Vec<_>>()}]}))
         .unwrap();
-        let estimate = request_memory(&request, 262144, Some(&vision()), 2048);
+        let estimate = request_memory(&request, 262144, Some(&vision()), 2048, 8192);
         assert_eq!(
             estimate.mib as usize,
-            request_memory_mib(&request, 262144) as usize + 192
+            request_memory_mib(&request, 262144, 8192) as usize + 192
         );
         let mut old = Context::new(
             Arc::new(AtomicBool::new(false)),
-            request_memory_mib(&request, 262144) as usize * (1 << 20),
+            request_memory_mib(&request, 262144, 8192) as usize * (1 << 20),
         );
         assert!(old.retain(576 << 20).is_err());
         let pool = Arc::new(tokio::sync::Semaphore::new(2048));
@@ -346,7 +351,7 @@ mod tests {
         assert!(context.checkpoint(1024 << 20).is_err());
         drop(permit);
         assert_eq!(pool.available_permits(), 2048);
-        let limited = request_memory(&request, 262144, Some(&vision()), 600);
+        let limited = request_memory(&request, 262144, Some(&vision()), 600, 8192);
         assert_eq!(limited.mib, 600);
         let mut context = limited.context(Arc::new(AtomicBool::new(false)));
         assert!(
@@ -378,16 +383,16 @@ mod tests {
         let mut request: ChatRequest = serde_json::from_value(json!({"model":"test","messages":[
             {"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]})).unwrap();
         assert_eq!(
-            request_memory(&request, 1024, Some(&vision()), 2048).mib,
-            request_memory_mib(&request, 1024)
+            request_memory(&request, 1024, Some(&vision()), 2048, 8192).mib,
+            request_memory_mib(&request, 1024, 8192)
         );
         request.messages = vec![json!({"role":"user","content":"hello"})];
         assert_eq!(
-            request_memory(&request, 1024, Some(&vision()), 2048).mib,
-            request_memory_mib(&request, 1024)
+            request_memory(&request, 1024, Some(&vision()), 2048, 8192).mib,
+            request_memory_mib(&request, 1024, 8192)
         );
         request.messages = vec![json!({"role":"user","content":"large text".repeat(1024*1024)})];
-        assert!(request_memory(&request, 1024, Some(&vision()), 16).mib > 16);
+        assert!(request_memory(&request, 1024, Some(&vision()), 16, 8192).mib > 16);
     }
     #[test]
     fn probability_budget_counts_completion_limit_and_streaming_retention() {
@@ -395,18 +400,18 @@ mod tests {
             "messages":[{"role":"user","content":"hello"}],"max_completion_tokens":512,
             "logprobs":true,"top_logprobs":20}))
         .unwrap();
-        let complete = request_memory_mib(&request, 1024);
+        let complete = request_memory_mib(&request, 1024, 8192);
         request.stream = true;
-        let streaming = request_memory_mib(&request, 1024);
+        let streaming = request_memory_mib(&request, 1024, 8192);
         assert!(complete > streaming);
         request.logprobs = Some(false);
-        assert!(streaming > request_memory_mib(&request, 1024));
+        assert!(streaming > request_memory_mib(&request, 1024, 8192));
         request.logprobs = Some(true);
         request.stream = false;
         request.max_completion_tokens = Some(usize::MAX);
-        let capped = request_memory_mib(&request, 1024);
+        let capped = request_memory_mib(&request, 1024, 8192);
         request.max_completion_tokens = Some(1024);
-        assert_eq!(capped, request_memory_mib(&request, 1024));
+        assert_eq!(capped, request_memory_mib(&request, 1024, 8192));
     }
     #[tokio::test]
     async fn cancelled_handler_cannot_return_permit_while_blocking_work_runs() {

@@ -103,7 +103,11 @@ pub(super) async fn prepare(
             if request.messages.iter().any(|m| !m["content"].is_string()) {
                 return Err("Media/structured content uses bounded streaming preparation".into());
             }
-            if preparation::request_memory_mib(&request, state.context) as usize
+            if preparation::request_memory_mib(
+                &request,
+                state.context,
+                state.codec.max_tokens(&request),
+            ) as usize
                 > state.limits.memory_mib
             {
                 return Err("Request exceeds preprocessing memory budget".into());
