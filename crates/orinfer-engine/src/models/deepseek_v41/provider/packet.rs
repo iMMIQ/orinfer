@@ -156,6 +156,7 @@ pub(super) fn work(
 }
 pub(super) fn request_order(
     requests: &[&mut Request],
+    decode_only: bool,
     cost: impl Fn(&Request) -> f64,
 ) -> Vec<usize> {
     // Freeze ages before sorting: the same policy ranks waiting admissions and
@@ -164,6 +165,7 @@ pub(super) fn request_order(
     let mut order = requests
         .iter()
         .enumerate()
+        .filter(|(_, r)| !decode_only || !r.prefilling)
         .filter(|(_, r)| !r.is_finished() && r.ready_output.is_none())
         .map(|(i, r)| {
             let remaining = r.remaining_prefill_tokens();
@@ -342,10 +344,17 @@ impl Runtime {
         let has_prefill = requests
             .iter()
             .any(|r| !r.is_finished() && r.ready_output.is_none() && r.prefilling);
-        let has_decode = requests
+        let decoders = requests
             .iter()
-            .any(|r| !r.is_finished() && r.ready_output.is_none() && !r.prefilling);
-        let order = request_order(requests, |r| {
+            .filter(|r| !r.is_finished() && r.ready_output.is_none() && !r.prefilling)
+            .count();
+        let has_decode = decoders > 0;
+        let decode_round = has_prefill
+            && has_decode
+            && options.policy == scheduler::Policy::Latency
+            && self.decode_burst.allows(Instant::now(), decoders);
+        let has_prefill = has_prefill && !decode_round;
+        let order = request_order(requests, decode_round, |r| {
             self.remaining_prefill_cost(r.offset, r.input.len())
         });
         let budget = if has_prefill {
@@ -552,6 +561,25 @@ fn packet_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn decode_turn_keeps_owner_indices_and_verification_cannot_reintroduce_prefill() {
+        let mut owners = [
+            request(false, 100000, 0),
+            request(true, 4096, 30000),
+            request(false, 80000, 0),
+        ];
+        let requests = owners.iter_mut().collect::<Vec<_>>();
+        let order = request_order(&requests, true, |r| {
+            assert!(!r.prefilling);
+            0.
+        });
+        assert_eq!(order.len(), 2);
+        assert!(order.contains(&0) && order.contains(&2));
+        let predicted = forecast(&requests, &order, &[6, 0, 6], 32, 128, 2048);
+        assert_eq!(predicted.prefill_rows, 0);
+        assert_eq!(predicted.rows, 12);
+        assert_eq!(requests[1].offset, 4096);
+    }
     #[test]
     fn scheduling_windows_keep_stable_tiers_and_the_native_capacity_tail() {
         assert_eq!(

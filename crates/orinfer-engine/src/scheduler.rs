@@ -359,6 +359,67 @@ pub(crate) fn decode_quantum_s(prefill_s: f64, options: &Options) -> f64 {
         .min(options.target_tpot_ms / 1000.)
 }
 
+/// A bounded wall-time turn for continuing decoders after prompt progress.
+/// Reuse hot whole-round timing so a short remainder does not buy another
+/// complete draft/verify/commit round. Idle time expires the turn as well.
+#[derive(Default)]
+pub(crate) struct DecodeBurst {
+    until: Option<std::time::Instant>,
+    credit_s: f64,
+    rounds: std::collections::BTreeMap<usize, Timing>,
+}
+impl DecodeBurst {
+    fn round(&self, decoders: usize) -> Option<&Timing> {
+        self.rounds.get(&decoders.max(1).next_power_of_two())
+    }
+    pub fn allows(&self, now: std::time::Instant, decoders: usize) -> bool {
+        self.until.is_some_and(|until| {
+            until > now
+                && self.credit_s > 0.
+                && self.round(decoders).is_none_or(|round| {
+                    round.samples() == 0
+                        || (until.duration_since(now).as_secs_f64() >= round.mean()
+                            && self.credit_s >= round.mean())
+                })
+        })
+    }
+    pub fn after_prefill(
+        &mut self,
+        now: std::time::Instant,
+        seconds: f64,
+        decoders: usize,
+        options: &Options,
+    ) {
+        if options.policy != Policy::Latency {
+            self.clear();
+            return;
+        }
+        // Mixed execution already advances decoders. Repay only the extra
+        // wall time, accumulating sub-round debt within one bounded quantum.
+        let decode_s = self
+            .round(decoders)
+            .filter(|r| r.samples() > 0)
+            .map_or(0., Timing::mean);
+        self.credit_s =
+            (self.credit_s + (seconds - decode_s).max(0.)).min(decode_quantum_s(seconds, options));
+        self.until = Some(now + std::time::Duration::from_secs_f64(self.credit_s));
+    }
+    pub fn observe_decode(&mut self, seconds: f64, preparation_s: f64, decoders: usize) {
+        let recurring = (seconds - preparation_s).max(0.);
+        if recurring > 0. {
+            self.rounds
+                .entry(decoders.max(1).next_power_of_two())
+                .or_default()
+                .observe(recurring);
+        }
+        self.credit_s = (self.credit_s - seconds).max(0.);
+    }
+    pub fn clear(&mut self) {
+        self.until = None;
+        self.credit_s = 0.;
+    }
+}
+
 /// Cached text admissions can form a cohort before the first decode. During
 /// ongoing generation, bound restoration work to protect inter-token latency.
 pub fn admission_should_yield(
@@ -480,6 +541,60 @@ pub struct Statistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn decode_turn_accumulates_only_interference_and_expires_in_wall_time() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut burst = DecodeBurst::default();
+        for _ in 0..4 {
+            burst.observe_decode(0.08, 0., 8);
+        }
+        burst.after_prefill(now, 0.14, 8, &Options::default());
+        assert!(!burst.allows(now, 8));
+        burst.after_prefill(now, 0.14, 8, &Options::default());
+        assert!(burst.allows(now, 8));
+        burst.observe_decode(0.08, 0., 8);
+        assert!(!burst.allows(now + Duration::from_millis(80), 8));
+        assert!(!burst.allows(now + Duration::from_secs(1), 8));
+        burst.after_prefill(now, 5., 8, &Options::default());
+        assert!(!burst.allows(now + Duration::from_millis(150), 8));
+        burst.clear();
+        assert!(!burst.allows(now, 8));
+        let mut cold = DecodeBurst::default();
+        cold.observe_decode(2., 0., 8);
+        cold.after_prefill(now, 0.14, 8, &Options::default());
+        assert!(cold.allows(now, 8));
+        cold.observe_decode(0.08, 0., 8);
+        assert!(!cold.allows(now + Duration::from_millis(80), 8));
+        // A slow high-concurrency round cannot permanently suppress a new
+        // smaller decoder cohort's bounded calibration.
+        for _ in 0..4 {
+            cold.observe_decode(0.8, 0., 32);
+        }
+        cold.after_prefill(now, 0.14, 8, &Options::default());
+        cold.after_prefill(now, 0.14, 8, &Options::default());
+        assert!(cold.allows(now, 8));
+        cold.observe_decode(0.38, 0.30, 8);
+        assert!(!cold.allows(now, 8));
+        cold.after_prefill(now, 0.14, 8, &Options::default());
+        cold.after_prefill(now, 0.14, 8, &Options::default());
+        assert!(cold.allows(now, 8));
+    }
+    #[test]
+    fn throughput_does_not_buy_a_decode_turn_after_prefill() {
+        let now = std::time::Instant::now();
+        let mut burst = DecodeBurst::default();
+        burst.after_prefill(
+            now,
+            0.1,
+            8,
+            &Options {
+                policy: Policy::Throughput,
+                ..Options::default()
+            },
+        );
+        assert!(!burst.allows(now, 8));
+    }
     #[test]
     fn lengths_learn_completions_and_cohorts_keep_aging() {
         let mut lengths = OutputLengths::default();

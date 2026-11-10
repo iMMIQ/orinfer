@@ -110,6 +110,7 @@ pub(crate) struct Runtime {
     next_snapshot: u64,
     hints: Vec<usize>,
     prefill_costs: scheduler::prefill::Costs,
+    decode_burst: scheduler::DecodeBurst,
     capture_credit_s: f64,
     draft_limit: usize,
     rejection_sampling: bool,
@@ -407,6 +408,7 @@ impl Runtime {
             hints: vec![],
             // Bootstrap only; actual packet and restore observations replace it.
             prefill_costs: scheduler::prefill::Costs::new(4000.),
+            decode_burst: Default::default(),
             capture_credit_s: 0.,
             draft_limit,
             rejection_sampling,
@@ -1015,7 +1017,33 @@ impl Runtime {
             options.target_tpot_ms / 1000. * crate::mtp::adaptive::CALIBRATION_ROUNDS as f64,
         );
         let started = Instant::now();
+        let before_prefill = self.statistics.prefill_tokens;
+        let before_iterations = self.statistics.iterations;
+        let burst = options.policy == scheduler::Policy::Latency
+            && self.decode_burst.allows(started, decoding.len());
         let result = self.advance_packet(requests, options, maintenance);
+        if result.is_ok() && self.statistics.iterations > before_iterations {
+            let seconds = started.elapsed().as_secs_f64();
+            if self.statistics.prefill_tokens > before_prefill {
+                self.decode_burst
+                    .after_prefill(Instant::now(), seconds, decoding.len(), options);
+            } else {
+                self.decode_burst.observe_decode(
+                    seconds,
+                    self.speculation_policy.preparation_s(),
+                    decoding.len(),
+                );
+                self.statistics.decode_burst_iterations += usize::from(burst);
+            }
+        }
+        let has_role = |prefill| {
+            requests
+                .iter()
+                .any(|r| !r.is_finished() && r.prefilling == prefill)
+        };
+        if options.policy != scheduler::Policy::Latency || !has_role(true) || !has_role(false) {
+            self.decode_burst.clear();
+        }
         let deltas = decoding
             .iter()
             .map(|&(i, before)| {
@@ -1206,6 +1234,7 @@ impl Runtime {
         self.active.remove(&request.slot);
         if self.active.is_empty() {
             self.capture_credit_s = 0.;
+            self.decode_burst.clear();
         }
         request.released = true;
         self.cache_reclamation.drain_into(&mut request.prefix);

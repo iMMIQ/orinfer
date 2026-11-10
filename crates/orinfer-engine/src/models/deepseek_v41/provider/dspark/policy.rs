@@ -520,6 +520,9 @@ impl Policy {
             );
         }
     }
+    pub fn preparation_s(&self) -> f64 {
+        self.pending.as_ref().map_or(0., |r| r.preparation_s)
+    }
     pub fn load(identity: Identity, package_root: &std::path::Path) -> Result<Self> {
         let mut policy = Self::default();
         policy.costs = Model::load(identity, package_root, policy.trace)?;
