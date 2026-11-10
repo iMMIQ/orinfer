@@ -15,6 +15,7 @@ dependencies = [
 [tool.uv]
 package = false
 exclude-newer = "7 days"
+prerelease = "disallow"
 environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
 
 [tool.uv.sources]

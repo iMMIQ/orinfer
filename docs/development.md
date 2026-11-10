@@ -68,7 +68,7 @@ uv run --locked python -m tools.dev.workspace inventory
 Rust 工具链和 workspace 最低版本统一为稳定版 1.98.1。依赖更新要求发布满 7 天，
 覆盖 Cargo 直接与传递依赖、两个 uv 环境的实际锁定文件、构建依赖、CI actions/uv、
 Jetson PyTorch wheel 和 Ascend TileLang wheel。uv 通过 `exclude-newer = "7 days"`
-在解析时过滤新文件；Rust 精确版本及完整锁文件的发布时间记录在
+在解析时过滤新文件，并通过 `prerelease = "disallow"` 排除预发布版本；Rust 精确版本及完整锁文件的发布时间记录在
 `configs/dependency-releases.json`，由官方 registry、Rust 发布元数据和 GitHub Release 生成。
 
 更新 Cargo 精确版本与锁文件后，运行以下流程：

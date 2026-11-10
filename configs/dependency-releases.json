@@ -2,23 +2,23 @@
   "schema": 1,
   "minimum_age_days": 7,
   "files": {
-    ".github/workflows/check.yml": "ee51369f2f0d8e41897d9cefaa1974e22a97b7fef03ed6cd6d7214c3a6e389f5",
-    "Cargo.lock": "863dfe0ec00667f17396795d4ff9f00b098a1ee1272ece1ebd6c7d1a9f6830c0",
+    ".github/workflows/check.yml": "708e463bb1cfe833fbc3060c610747ca1138ca20c2313a4838d963466219dbab",
+    "Cargo.lock": "354a300aa367d55c9d5d5f1df02835d5f28991d69ffd99ec5b6337b5d4489ec5",
     "Cargo.toml": "f9b7de7a481c6fb8d4bef94e74fcd4c06ee2c36c053a2665586c7bd3a91b32fd",
     "crates/orinfer-api/Cargo.toml": "4468804dbcebd698e4fb36514837eba18c4132b05ba000a8b5d31718c85dd16f",
     "crates/orinfer-cli/Cargo.toml": "e82066f8646b3da4bfe4e52dbfa0a375e61591c1640391a326752de13c5f4c97",
     "crates/orinfer-device/Cargo.toml": "8218a7da5e10a7d5d8ce3edc624bf21836f5bd7e414bd4879b4380d59bcf00e1",
-    "crates/orinfer-engine/Cargo.toml": "f51a4dbf1b2b50d2b8acd351cc45dfd0fc0a5af24e8dbf112406484a6a44b8b8",
+    "crates/orinfer-engine/Cargo.toml": "cdd625112b0952fef8efd8d1b1591bb23ae50bdc2b3f0dc6a162433a38d9c90e",
     "crates/orinfer-model-sdk/Cargo.toml": "eb920bb9790a8373ccb936ba6a0d60e4137be4f22aff82bd4a5600bc394896fe",
     "crates/orinfer-models/Cargo.toml": "063350fde5ba0c4e9ecac33778ecdb06c453dae0702d144df25718384e6d8a61",
-    "pyproject.toml": "1f564ba2da2c0050986f74ed1c9aba695a39eb52fa57196ffe541bf68c092140",
+    "pyproject.toml": "8a65d08001ebc01144c5fc70022c389f837a4073c20b1725ddfe26d8cb0697bc",
     "rust-toolchain.toml": "7553618f800829444096beea3dce84c3d07585efda504c19adb6787369bbd9e8",
     "tools/build/jetson_wheels.json": "435e70191f25563446812566da873e69200bd0471958b0adaa021026fc5ab4b4",
     "tools/environments/ascend/Dockerfile": "bd7f5808824f17306b0bfc3752bd658610fce22126aa8ee151c44952a131b5ca",
     "tools/environments/ascend/run.sh": "6ed71b8f0e46130e12e692b3b8d6c73417c2f4d14a145f6f68e07e36168784b6",
-    "tools/environments/cuda/pyproject.toml": "3bbe4d6dc6ea1a689111fc1e6c4971a9568a9baa1f72a8a20e14e5d814c6d22d",
-    "tools/environments/cuda/uv.lock": "154fba292eadb27af8968aea5385727ff3ac517216a60025c3ad6385c088dc48",
-    "uv.lock": "ffe3f09a9d73784670352b723b3e226d6f676f68f194ed503d82e7d6485d675d"
+    "tools/environments/cuda/pyproject.toml": "7b59d343a1ae7647f9c779263e2f7920b585700218bca364e856e14cdf9bfb1f",
+    "tools/environments/cuda/uv.lock": "5b8e672c6968be55bb4e0aae1d428b7627e0d4d7a20e06bc356fabdf3a5e5a8a",
+    "uv.lock": "682aec0764d8d4dbffa14045be967e4dd4ffea36b546b46b29c046abd6a0d91d"
   },
   "releases": {
     "action/actions/checkout@v7.0.1": {
@@ -177,8 +177,8 @@
       "published": "2025-07-12T16:49:05Z",
       "url": "https://index.crates.io/ca/st/castaway"
     },
-    "cargo/cc@1.10.0": {
-      "published": "2026-10-23T08:35:43Z",
+    "cargo/cc@1.11.0": {
+      "published": "2026-11-02T08:45:33Z",
       "url": "https://index.crates.io/2/cc"
     },
     "cargo/cfg-if@1.0.5": {
@@ -245,8 +245,8 @@
       "published": "2026-08-26T18:39:59Z",
       "url": "https://index.crates.io/cp/uf/cpufeatures"
     },
-    "cargo/crc32fast@1.5.3": {
-      "published": "2026-10-20T13:35:21Z",
+    "cargo/crc32fast@1.5.4": {
+      "published": "2026-11-01T20:23:57Z",
       "url": "https://index.crates.io/cr/c3/crc32fast"
     },
     "cargo/crossbeam-deque@0.8.8": {
@@ -645,8 +645,8 @@
       "published": "2026-09-13T19:19:47Z",
       "url": "https://index.crates.io/lr/u-/lru-slab"
     },
-    "cargo/lzma-rust2@0.24.0": {
-      "published": "2026-10-25T16:37:19Z",
+    "cargo/lzma-rust2@0.25.0": {
+      "published": "2026-11-01T15:47:20Z",
       "url": "https://index.crates.io/lz/ma/lzma-rust2"
     },
     "cargo/macro_rules_attribute-proc_macro@0.2.3": {
@@ -1517,9 +1517,9 @@
       "published": "2026-07-28T13:50:58.129724Z",
       "url": "https://pypi.org/pypi/annotated-doc/0.0.5/json"
     },
-    "tools/environments/cuda/uv.lock/anyio@4.15.1": {
-      "published": "2026-09-05T10:42:39.440376Z",
-      "url": "https://pypi.org/pypi/anyio/4.15.1/json"
+    "tools/environments/cuda/uv.lock/anyio@4.16.0": {
+      "published": "2026-11-01T11:20:07.282381Z",
+      "url": "https://pypi.org/pypi/anyio/4.16.0/json"
     },
     "tools/environments/cuda/uv.lock/apache-tvm-ffi@0.1.12": {
       "published": "2026-06-09T18:17:31.680145Z",
@@ -1545,9 +1545,9 @@
       "published": "2026-10-15T14:19:36.449996Z",
       "url": "https://pypi.org/pypi/cuda-python/12.9.10/json"
     },
-    "tools/environments/cuda/uv.lock/filelock@4.2.6": {
-      "published": "2026-10-31T15:10:16.889404Z",
-      "url": "https://pypi.org/pypi/filelock/4.2.6/json"
+    "tools/environments/cuda/uv.lock/filelock@4.2.7": {
+      "published": "2026-11-02T16:09:15.119537Z",
+      "url": "https://pypi.org/pypi/filelock/4.2.7/json"
     },
     "tools/environments/cuda/uv.lock/fsspec@2026.9.0": {
       "published": "2026-09-18T17:50:42.825364Z",
@@ -1701,9 +1701,9 @@
       "published": "2025-10-29T18:12:03.062278Z",
       "url": "https://pypi.org/pypi/z3-solver/4.15.4.0/json"
     },
-    "uv.lock/anyio@4.15.1": {
-      "published": "2026-09-05T10:42:39.440376Z",
-      "url": "https://pypi.org/pypi/anyio/4.15.1/json"
+    "uv.lock/anyio@4.16.0": {
+      "published": "2026-11-01T11:20:07.282381Z",
+      "url": "https://pypi.org/pypi/anyio/4.16.0/json"
     },
     "uv.lock/click@8.5.0": {
       "published": "2026-08-26T13:33:14.560531Z",
@@ -1713,9 +1713,9 @@
       "published": "2022-10-25T02:36:22.414799Z",
       "url": "https://pypi.org/pypi/colorama/0.4.6/json"
     },
-    "uv.lock/filelock@4.2.6": {
-      "published": "2026-10-31T15:10:16.889404Z",
-      "url": "https://pypi.org/pypi/filelock/4.2.6/json"
+    "uv.lock/filelock@4.2.7": {
+      "published": "2026-11-02T16:09:15.119537Z",
+      "url": "https://pypi.org/pypi/filelock/4.2.7/json"
     },
     "uv.lock/fsspec@2026.9.0": {
       "published": "2026-09-18T17:50:42.825364Z",
@@ -1789,9 +1789,9 @@
       "published": "2026-07-02T08:40:05.920538Z",
       "url": "https://pypi.org/pypi/typing-extensions/4.16.0/json"
     },
-    "uv/0.13.6": {
-      "published": "2026-10-27T00:47:49Z",
-      "url": "https://api.github.com/repos/astral-sh/uv/releases/tags/0.13.6"
+    "uv/0.13.7": {
+      "published": "2026-11-03T02:45:04Z",
+      "url": "https://api.github.com/repos/astral-sh/uv/releases/tags/0.13.7"
     }
   }
 }
