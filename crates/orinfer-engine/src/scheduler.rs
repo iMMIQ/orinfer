@@ -3,6 +3,7 @@
 use crate::artifact::Result;
 use serde::Serialize;
 use std::{fmt, str::FromStr};
+pub(crate) mod prefill;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]

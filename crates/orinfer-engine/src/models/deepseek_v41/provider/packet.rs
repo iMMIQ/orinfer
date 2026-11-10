@@ -154,7 +154,10 @@ pub(super) fn work(
             .unwrap_or(0),
     }
 }
-pub(super) fn request_order(requests: &[&mut Request], tokens_per_s: f64) -> Vec<usize> {
+pub(super) fn request_order(
+    requests: &[&mut Request],
+    cost: impl Fn(&Request) -> f64,
+) -> Vec<usize> {
     // Freeze ages before sorting: the same policy ranks waiting admissions and
     // active prompt suffixes. Progress resets age, so long prompts can resume.
     let now = Instant::now();
@@ -169,7 +172,7 @@ pub(super) fn request_order(requests: &[&mut Request], tokens_per_s: f64) -> Vec
                 r.prefilling,
                 scheduler::Waiting {
                     age_s: now.saturating_duration_since(r.last_prefill).as_secs_f64(),
-                    remaining_s: remaining as f64 / tokens_per_s,
+                    remaining_s: cost(r),
                     restore_s: 0.,
                     startup_s: 0.,
                     remaining_tokens: remaining,
@@ -256,6 +259,15 @@ fn select_rows(
     (packet_budget, selected)
 }
 
+// Stable scheduling capacities reuse Graph and DSpark calibration; actual
+// tails and owner segments still use the same arbitrary-row packet.
+fn windows(capacity: usize) -> impl Iterator<Item = usize> {
+    (7..usize::BITS)
+        .map(|bits| 1usize << bits)
+        .take_while(move |&rows| rows < capacity)
+        .chain([capacity])
+}
+
 pub(super) fn forecast(
     requests: &[&mut Request],
     order: &[usize],
@@ -333,10 +345,48 @@ impl Runtime {
         let has_decode = requests
             .iter()
             .any(|r| !r.is_finished() && r.ready_output.is_none() && !r.prefilling);
+        let order = request_order(requests, |r| {
+            self.remaining_prefill_cost(r.offset, r.input.len())
+        });
         let budget = if has_prefill {
             if has_decode {
-                ((options.prefill_budget_ms / 1000. * self.prefill_tokens_per_s) as usize)
-                    .clamp(1, self.team.rows)
+                let decoders = order.iter().filter(|&&i| !requests[i].prefilling).count();
+                // Keep one useful prompt quantum, including an atomic final
+                // window, even when this soft deadline cannot be met.
+                let prompt = order
+                    .iter()
+                    .filter(|&&i| requests[i].prefilling)
+                    .map(|&i| {
+                        (requests[i].input.len() - requests[i].offset)
+                            .min(self.final_decoder_window().max(128))
+                    })
+                    .min()
+                    .unwrap_or(1);
+                let minimum = (decoders + prompt).min(self.team.rows);
+                let mut budget = minimum;
+                // Quantize the scheduling window, not the implementation:
+                // every candidate uses the same dynamic packet and kernels.
+                for n in windows(self.team.rows) {
+                    if n < minimum {
+                        continue;
+                    }
+                    let (_, selected) = select_rows(
+                        requests,
+                        &order,
+                        None,
+                        n,
+                        self.final_decoder_window(),
+                        self.team.rows,
+                    );
+                    let full = self.packet_full(&selected, requests);
+                    let work = self.prefill_work(&selected, requests, full, false);
+                    if self.prefill_costs.estimate(work).upper_s
+                        <= options.prefill_budget_ms / 1000.
+                    {
+                        budget = n;
+                    }
+                }
+                budget
             } else {
                 // With no decoder waiting for its next token, fill the same
                 // native packet instead of buying another weight/collective
@@ -353,13 +403,7 @@ impl Runtime {
                 .owners
                 .min(options.max_batch_tokens)
         };
-        self.packet_for_budget(
-            requests,
-            decode_inputs,
-            budget,
-            has_prefill,
-            &request_order(requests, self.prefill_tokens_per_s),
-        )
+        self.packet_for_budget(requests, decode_inputs, budget, has_prefill, &order)
     }
 
     pub(super) fn packet_for_budget(
@@ -399,15 +443,7 @@ impl Runtime {
         if selected.is_empty() {
             return Ok(None);
         }
-        let complete_cache = self.complete_prompt_cache();
-        let full = selected.iter().any(|&(i, count)| {
-            let r = &requests[i];
-            r.needs_logits()
-                || complete_cache
-                    && r.prefilling
-                    && r.cache_prompt
-                    && r.offset + count == r.input.len()
-        });
+        let full = self.packet_full(&selected, requests);
         let batch = selected.len();
         let prefill_rows = selected
             .iter()
@@ -437,6 +473,21 @@ impl Runtime {
             prefill_rows,
             prefill_requests,
         }))
+    }
+    pub(super) fn packet_full(
+        &self,
+        selected: &[(usize, usize)],
+        requests: &[&mut Request],
+    ) -> bool {
+        let complete_cache = self.complete_prompt_cache();
+        selected.iter().any(|&(i, count)| {
+            let r = &requests[i];
+            r.needs_logits()
+                || complete_cache
+                    && r.prefilling
+                    && r.cache_prompt
+                    && r.offset + count == r.input.len()
+        })
     }
 }
 
@@ -501,6 +552,18 @@ fn packet_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scheduling_windows_keep_stable_tiers_and_the_native_capacity_tail() {
+        assert_eq!(
+            windows(2048).collect::<Vec<_>>(),
+            [128, 256, 512, 1024, 2048]
+        );
+        assert_eq!(
+            windows(1792).collect::<Vec<_>>(),
+            [128, 256, 512, 1024, 1792]
+        );
+        assert_eq!(windows(64).collect::<Vec<_>>(), [64]);
+    }
     fn request(prefill: bool, offset: usize, left: usize) -> Request {
         let mut r = super::super::tests::request(Arc::new(Output::default()), Default::default());
         r.ready_output = None;

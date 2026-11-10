@@ -368,7 +368,10 @@ fn packet_order_finishes_cached_suffixes_before_cold_prompts_and_keeps_decoders_
     decoder.prefilling = false;
     let mut cached = request(output(), Default::default());
     assert_eq!(
-        packet::request_order(&[&mut long, &mut suffix, &mut decoder, &mut cached], 4000.),
+        packet::request_order(&[&mut long, &mut suffix, &mut decoder, &mut cached], |r| r
+            .remaining_prefill_tokens()
+            as f64
+            / 4000.),
         vec![2, 1, 0]
     );
 }
@@ -385,13 +388,17 @@ fn packet_order_promotes_waiting_long_prompt_then_resets_on_progress() {
     suffix.input = vec![8; 128_000];
     suffix.offset = 127_740;
     assert_eq!(
-        packet::request_order(&[&mut long, &mut suffix], 4000.),
+        packet::request_order(&[&mut long, &mut suffix], |r| r.remaining_prefill_tokens()
+            as f64
+            / 4000.),
         vec![0, 1]
     );
     long.offset += 800;
     long.last_prefill = Instant::now();
     assert_eq!(
-        packet::request_order(&[&mut long, &mut suffix], 4000.),
+        packet::request_order(&[&mut long, &mut suffix], |r| r.remaining_prefill_tokens()
+            as f64
+            / 4000.),
         vec![1, 0]
     );
 }

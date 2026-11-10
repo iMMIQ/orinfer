@@ -116,6 +116,11 @@ impl Runtime {
         let keep = self.final_decoder_window();
         let capacity = self.team.rows;
         let mut decode_rows = vec![0; requests.len()];
+        let prefill_s = if mixed {
+            self.producer_price(&baseline.selected, requests).seconds
+        } else {
+            0.
+        };
         let allocation = self.speculation_policy.select_requests_with_forecast(
             (full, mixed),
             Budget {
@@ -134,7 +139,7 @@ impl Runtime {
                     f64::INFINITY
                 },
                 work: packet::work(&baseline.selected, requests, baseline.prefill_rows),
-                prefill_tokens_per_s: self.prefill_tokens_per_s,
+                prefill_s,
                 uniform,
                 remaining_by_owner: indices
                     .iter()
@@ -350,6 +355,12 @@ impl Runtime {
             return Err("Insufficient DSpark verification workspace".into());
         }
         let verified_work = packet::work(&packet_requests, requests, prefill_rows);
+        let prefill_work = self.prefill_work(
+            &packet_requests,
+            requests,
+            full || packet_full,
+            layout.decode,
+        );
         let started = Instant::now();
         self.team.exchange(Command::BeginVerification(journal))?;
         let save_s = started.elapsed().as_secs_f64();
@@ -416,6 +427,7 @@ impl Runtime {
             self.team
                 .forward_with(layout, inputs, readout, Some(capture), || {})?;
         verify_timing.record(&mut self.statistics.batch_execution);
+        self.observe_prefill(prefill_work, &verify_timing);
         let verify_s = verify_timing.seconds;
         self.statistics.sampling_mask_rows += verify_timing.mask_rows;
         self.statistics.sampling_report_rows += verify_timing.report_rows;

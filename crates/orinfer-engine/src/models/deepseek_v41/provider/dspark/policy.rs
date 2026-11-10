@@ -112,7 +112,7 @@ pub(in crate::models::deepseek_v41::provider) struct Budget {
     pub remaining_by_owner: Vec<usize>,
     pub uniform: bool,
     pub work: Work,
-    pub prefill_tokens_per_s: f64,
+    pub prefill_s: f64,
     pub latency: bool,
     pub slack_s: f64,
 }
@@ -124,10 +124,16 @@ impl Default for Budget {
             remaining_by_owner: vec![],
             uniform: false,
             work: Work::default(),
-            prefill_tokens_per_s: 0.,
+            prefill_s: 0.,
             latency: false,
             slack_s: f64::INFINITY,
         }
+    }
+}
+impl Budget {
+    fn opportunity(&self, retained: Work) -> f64 {
+        self.prefill_s * self.work.prefill_rows.saturating_sub(retained.prefill_rows) as f64
+            / self.work.prefill_rows.max(1) as f64
     }
 }
 
@@ -832,12 +838,7 @@ impl Policy {
                     .price(Stage::Draft, block, false, draft_work, uses, warmup)
                     .unwrap_or(normal.seconds);
                 let restore_s = restore.map_or(normal.seconds * 0.1, |p| p.seconds);
-                let opportunity = if budget.prefill_tokens_per_s > 0. {
-                    work.prefill_rows.saturating_sub(target_work.prefill_rows) as f64
-                        / budget.prefill_tokens_per_s
-                } else {
-                    0.
-                };
+                let opportunity = budget.opportunity(target_work);
                 let mean = target_s + draft_s + restore_s + opportunity;
                 let observed = curve.rounds.get(&(block, rows, owners, budget.uniform));
                 let evidence = [
@@ -962,7 +963,7 @@ impl Policy {
         let allocation = decision.map_or_else(|| ordinary.into(), |d| plans.swap_remove(d.id));
         let depths = &allocation.depths;
         if self.trace {
-            trace_selection(curve, full, mixed, limit, maxima, depths, reason);
+            trace_selection(curve, (full, mixed), &budget, limit, maxima, depths, reason);
         }
         Ok(allocation)
     }
@@ -1066,19 +1067,21 @@ impl Policy {
 
 fn trace_selection(
     curve: &Curve,
-    full: bool,
-    mixed: bool,
+    mode: (bool, bool),
+    budget: &Budget,
     limit: usize,
     maxima: &[usize],
     depths: &[usize],
     reason: &str,
 ) {
+    let (full, mixed) = mode;
     eprintln!(
         "DSPARK_POLICY {}",
         serde_json::json!({
             "batch": maxima.len(), "full": full, "mixed": mixed, "limit": limit,
             "maxima": maxima, "depths": depths, "reason": reason,
             "baseline_samples": curve.baseline_samples, "baseline_s": curve.baseline,
+            "prefill_rows":budget.work.prefill_rows,"producer_s":budget.prefill_s,
             "ticks": curve.calls,
             "blocks": curve.blocks.iter().map(|(&(block, uniform), c)| serde_json::json!({
                 "block":block,"uniform":uniform,"samples":c.samples,
@@ -1091,6 +1094,35 @@ fn trace_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opportunity_amortizes_only_displaced_producer_tokens() {
+        let b = Budget {
+            work: Work {
+                rows: 800,
+                prefill_rows: 780,
+                context: 100000,
+            },
+            prefill_s: 0.156,
+            ..Budget::default()
+        };
+        assert!(
+            (b.opportunity(Work {
+                prefill_rows: 700,
+                ..b.work
+            }) - 0.016)
+                .abs()
+                < 1e-9
+        );
+        assert_eq!(b.opportunity(b.work), 0.);
+        assert_eq!(
+            b.opportunity(Work {
+                prefill_rows: 790,
+                ..b.work
+            }),
+            0.
+        );
+        assert_eq!(Budget::default().opportunity(Work::default()), 0.);
+    }
     fn budget(rows: usize) -> Budget {
         Budget {
             rows,
@@ -1960,7 +1992,7 @@ mod tests {
             rows: 96,
             remaining: 1024,
             uniform: true,
-            prefill_tokens_per_s: 4000.,
+            prefill_s: 112. / 4000.,
             remaining_by_owner: vec![],
             ..Budget::default()
         };

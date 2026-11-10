@@ -257,6 +257,7 @@ pub(super) struct Team {
     pub model: Arc<Model>,
     pub load_s: f64,
     pub rows: usize,
+    pub target_domains: Vec<(bool, usize, usize)>,
     pub verification_rows: usize,
     pub draft_blocks: Vec<usize>,
     pub strided_draft: bool,
@@ -374,6 +375,14 @@ impl Team {
                 .as_deref(),
         )?;
         let work_launches = super::batch::graph_launches(&model);
+        // Rank plans move to their workers; retain only target row geometry
+        // needed by the host scheduler's measured cost domains.
+        let target_domains = model.ranks[0]
+            .packets
+            .iter()
+            .filter(|p| p.role == super::PacketRole::Target)
+            .map(|p| (p.batch_decode, p.min_rows, p.max_rows.unwrap_or(p.rows)))
+            .collect();
         let ranks = std::mem::take(&mut model.ranks);
         let snapshots = std::env::var_os("ORINFER_A2_BATCH_TRACE").is_some();
         let cpus = affinity::from_env(ranks.len())?;
@@ -389,6 +398,7 @@ impl Team {
             model: Arc::clone(&model),
             load_s: 0.,
             rows,
+            target_domains,
             verification_rows,
             draft_blocks,
             strided_draft,

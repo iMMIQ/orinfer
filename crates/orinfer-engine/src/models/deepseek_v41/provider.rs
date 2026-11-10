@@ -8,6 +8,7 @@ mod budget;
 mod dspark;
 mod offload;
 mod packet;
+mod prefill;
 mod vision;
 #[cfg(test)]
 use crate::prefix::Cache;
@@ -108,7 +109,7 @@ pub(crate) struct Runtime {
     owner: u64,
     next_snapshot: u64,
     hints: Vec<usize>,
-    prefill_tokens_per_s: f64,
+    prefill_costs: scheduler::prefill::Costs,
     capture_credit_s: f64,
     draft_limit: usize,
     rejection_sampling: bool,
@@ -404,7 +405,8 @@ impl Runtime {
             owner: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             next_snapshot: 0,
             hints: vec![],
-            prefill_tokens_per_s: 4000.,
+            // Bootstrap only; actual packet and restore observations replace it.
+            prefill_costs: scheduler::prefill::Costs::new(4000.),
             capture_credit_s: 0.,
             draft_limit,
             rejection_sampling,
@@ -536,10 +538,9 @@ impl Runtime {
         if hint.owner != self.owner {
             return Err("Foreign A2 request hint".into());
         }
-        let remaining = hint.tokens.len().saturating_sub(
-            self.matched(&hint.tokens, &hint.media)
-                .map_or(0, |hit| self.entry(hit).tokens.len()),
-        );
+        let hit = self.matched(&hint.tokens, &hint.media);
+        let cached = hit.map_or(0, |h| self.entry(h).tokens.len());
+        let remaining = hint.tokens.len().saturating_sub(cached);
         let image_s = hint.image_work as f64 * self.vision_seconds_per_patch
             / hint.media.0.len().max(1).min(self.team.ranks()) as f64;
         let startup_s = image_s
@@ -551,8 +552,11 @@ impl Runtime {
                 .map_or(1., super::vision::Program::startup_fraction);
         Ok(scheduler::Waiting {
             age_s: 0.,
-            remaining_s: remaining as f64 / self.prefill_tokens_per_s + image_s - startup_s,
-            restore_s: 0.,
+            remaining_s: self.remaining_prefill_cost(cached, hint.tokens.len()) + image_s
+                - startup_s,
+            restore_s: hit
+                .filter(|_| remaining > 0)
+                .map_or(0., |h| self.prefill_costs.restore(h.0, cached)),
             startup_s,
             remaining_tokens: remaining,
         })
@@ -708,6 +712,8 @@ impl Runtime {
                     return Err(error);
                 }
                 prefix.restore_s = at.elapsed().as_secs_f64();
+                self.prefill_costs
+                    .observe_restore(id.0, entry.tokens.len(), prefix.restore_s);
             }
             prefix.cached_tokens = entry.tokens.len();
             prefix.matched_tokens = entry.tokens.len();
@@ -1085,6 +1091,7 @@ impl Runtime {
         }
         let shared = packet::mark_shared(&selected, requests);
         let work = packet::work(&selected, requests, prefill_rows);
+        let prefill_work = self.prefill_work(&selected, requests, full, layout.decode);
         self.speculation_policy.begin_round(
             selected
                 .iter()
@@ -1112,6 +1119,7 @@ impl Runtime {
             self.team
                 .forward_with(layout, tokens, readout, Some(capture), maintenance)?;
         timing.record(&mut self.statistics.batch_execution);
+        self.observe_prefill(prefill_work, &timing);
         let seconds = timing.seconds;
         self.statistics.sampling_mask_rows += timing.mask_rows;
         self.statistics.sampling_report_rows += timing.report_rows;
