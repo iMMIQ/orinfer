@@ -1485,6 +1485,39 @@ class ExpertFusionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "still has a reader"):
             reuse_published(original, describe, minimum=16, maximum=32)
 
+    def test_reuse_subrange_shares_physical_domain_and_preserves_neighbors(self):
+        from orinfer_build.models.deepseek_v41.expert_fusion import reuse_published
+
+        source, replacement, specs = self.published_fixture()
+        packet = dict(rows=32, min_rows=16, body=source, head=[])
+        draft = dict(packet, role="draft")
+        model = dict(
+            batch={},
+            ranks=[
+                dict(
+                    buffers=[],
+                    packets=[
+                        dict(rows=32, min_rows=1, max_rows=15, body=replacement, head=[]),
+                        packet,
+                        draft,
+                    ],
+                )
+            ],
+        )
+        self.assertEqual(
+            reuse_published(model, lambda s: specs.get(s.get("manifest")), minimum=20, maximum=28),
+            1,
+        )
+        packets = model["ranks"][0]["packets"]
+        self.assertEqual(
+            [(p["min_rows"], p.get("max_rows", p["rows"])) for p in packets],
+            [(1, 15), (16, 19), (20, 28), (29, 32), (16, 32)],
+        )
+        self.assertEqual([p["rows"] for p in packets], [32] * 5)
+        self.assertEqual([p["body"] for p in packets[1:4]], [source, replacement, source])
+        self.assertIs(packets[-1], draft)
+        self.assertEqual(packet["body"], source)
+
     def fixture(self):
         from orinfer_build.models.deepseek_v41.expert_fusion import selected_chain
 

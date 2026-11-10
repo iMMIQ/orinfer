@@ -106,7 +106,9 @@ local TopK 的空块使用交错的 `(-inf, -1)` 候选对。`tests.ascend.opera
 
 DSpark Markov 的步号通过只读 INT32 表绑定，argmax、confidence 和 rank reduce 各复用一个动态算子。5／8／16 长度别名只截取公共 Markov 调用序列。专家融合使用实际专家路由倍率，`orinfer_build.models.deepseek_v41.expert_fusion --role target|draft` 共用 gather、A4 GMM 和激活边界的构建流程；所有者行数、专家数和路由倍率共同确定几何。
 
-已有双 INT4 平面专家程序的执行包可用 `orinfer_build.models.deepseek_v41.expert_fusion --reuse-published --plan PLAN --output OUT --min-rows 128 --max-rows 2048 --model-dir MODEL` 将完整选中区间复用到相同几何的融合程序。工具逐层匹配权重、路由计数、物理容量、输入输出绑定和 workspace，保留 decoder 行边界及其他角色；缺少匹配程序或仍有中间结果读者时拒绝导出。该操作复用已有动态 kernel 和单份 W4 bank，不编译新算子，也不改写权重；A8 分解、FP16 部分积重组及两处 BF16 舍入沿用原融合算术。实际启用区间由完整请求测量选择。
+已有双 INT4 平面专家程序的执行包可用 `orinfer_build.models.deepseek_v41.expert_fusion --reuse-published --plan PLAN --output OUT --min-rows 512 --max-rows 2048 --model-dir MODEL` 将选中区间复用到相同几何的融合程序。target 区间复用公共离线分段器，只划分执行计划的选择范围，各段保持同一物理容量和动态 kernel；draft 沿用完整区间选择。工具逐层匹配权重、路由计数、物理容量、输入输出绑定和 workspace，保留 decoder 行边界及其他角色；缺少匹配程序或仍有中间结果读者时拒绝导出。该操作复用已有动态 kernel 和单份 W4 bank，不编译新算子，也不改写权重；A8 分解、FP16 部分积重组及两处 BF16 舍入沿用原融合算术。实际启用区间由完整请求测量选择。
+
+大行数验收使用真实路由分布。`bench-ascend-batch` 的 case 可设置 `record_routing:true`，在非计时准备阶段记录各层、各 rank 的专家计数；验证 frame 设置 `verification:true`，初始 prefill 保留 `output:true` 以完成 decoder 末段和预热后再延续固定历史。固定历史可覆盖 96/127/128/192 等实际验证行数。离线入口 `tests.ascend.operators.validate_expert_fusion --plan PLAN --model-dir MODEL --routing ROUTING_REPORT --layers 0 20 39 --output OUTPUT` 从同一 checkpoint 读取原生权重，比较原链与已发布融合链的 INT8 输出、FP32 scale、空组、尾部及改变输入后的 Graph replay，并测量整个专家链和各边界。GMM 分组提示可用 `--hints` 测量；选用配置需同时考察多层与不同路由分布。微测按一次 replay 内多次调用摊薄提交成本，最终以完整请求和 Mini 结果选择执行计划。
 
 设置 `ORINFER_A2_DSPARK_POLICY_TRACE=1` 后，A2 模型在标准错误输出普通执行的 direct／replay 状态、耗时及 DSpark 决策的样本数、行预算、请求深度和成本曲线。该开关在模型创建时读取，默认关闭。记录可用于区分样本不足、行预算、短尾和成本评分引起的关闭；计时诊断需计入日志开销。
 

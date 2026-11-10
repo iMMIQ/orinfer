@@ -12,6 +12,7 @@ from orinfer_build.common.shared_json import decode
 from orinfer_build.models.deepseek_v41.assembly import (
     check_intermediate_liveness,
     publish_package,
+    selected_packet_ranges,
     validate_rows,
 )
 from orinfer_build.models.deepseek_v41.batch import compile_task
@@ -114,6 +115,8 @@ def reuse_published(model, describe, *, minimum=128, maximum=2048, role="target"
         raise ValueError("Invalid expert fusion row interval or role")
     changed = 0
     for rank in model["ranks"]:
+        if role == "target":
+            rank["packets"] = selected_packet_ranges(rank["packets"], minimum, maximum)
         templates = {}
         for packet in rank["packets"]:
             if packet.get("role", "target") != role:
@@ -189,7 +192,15 @@ def reuse(plan, output, minimum=128, maximum=2048, role="target", model_dir=None
     validate_rows(model, plan.parent, model_dir=model_dir)
     assets = publish_package(model, plan.parent, output / "package")
     atomic_json(
-        output / "result.json", dict(changed_chains=changed, compiled_kernels=0, assets=assets)
+        output / "result.json",
+        dict(
+            changed_chains=changed,
+            compiled_kernels=0,
+            assets=assets,
+            role=role,
+            row_interval=[minimum, maximum],
+            rewritten_weights=0,
+        ),
     )
     return output / "package" / "model.json"
 
