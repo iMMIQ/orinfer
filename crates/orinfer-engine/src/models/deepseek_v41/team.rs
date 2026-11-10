@@ -103,6 +103,9 @@ pub(super) struct Output {
 #[derive(Clone, Default)]
 pub(super) struct Readout {
     pub full: bool,
+    /// Only generated continuations may consume a retained device input.
+    /// Explicit/teacher-forced callers keep authoritative host tokens.
+    pub continuations: BTreeSet<usize>,
     pub draws: BTreeMap<usize, crate::backend::ascend::sampling::Draw>,
     pub store_draft_distributions: bool,
     pub rejection: BTreeMap<usize, Vec<crate::backend::ascend::sampling::RejectionProposal>>,

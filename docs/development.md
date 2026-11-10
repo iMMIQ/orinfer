@@ -7,6 +7,26 @@ CANN 通信适配器由引擎的 `native/ascend` 构建，保留嵌入库的 gli
 
 ## 离线源码
 
+DSv4.1 A2 的设备续步输入通过独立执行包能力 `device_inputs` 接入现有动态 packet。
+普通 decode 与 DSpark 共享 owner 输入状态、设备 embedding 查找及 Engram 地址生成；
+接受前缀在设备上更新下一个 token、位置和三 token 历史。主机保留输出解析和 prefix
+历史，Engram 大表仍在主机，地址读回与前置计算重叠。owner 重置、复用和 prefix
+恢复使设备输入身份失效，下次执行从请求历史初始化。
+生成入口显式声明可复用的无约束采样行；语法切换和显式固定历史输入从主机历史初始化，
+保持各入口的输入语义。
+
+离线附加入口为
+`python -m orinfer_build.models.deepseek_v41.device_inputs --plan PLAN --output OUTPUT`；
+输入为已有原生 A2 计划，输出目录须为新目录。它复用相同权重值，新增的常驻 embedding、
+RoPE 和输入工作区计入设备预算。通过原生执行包发布、安装流程消费该能力；旧执行包
+保持原输入路径。`tests.ascend.operators.validate_frontier` 验证动态尾部、owner 映射、
+接受前缀、媒体屏障、哈希及改变输入后的 Graph replay。
+target embedding 复用已有 TP 列分片；MTP embedding 按采样词表分片常驻。
+设备按全局采样及接受长度确定每个 owner 的下一步 token，仅其词表分片贡献
+下一步 embedding，其余 rank 贡献零，BF16 SUM 后写入 owner 行缓存。草稿复用
+该行与固定 mask 行，沿用原 HC 展开。采样结果的读回事件先于这些输入准备工作，
+CPU 输出处理与设备续步准备重叠；CPU 仍负责调度、停止条件与受约束采样的输入提交。
+
 | 目录 | 职责 |
 |---|---|
 | `kernels/cuda` | CUDA 生产 TileLang 算子 |

@@ -28,8 +28,9 @@ int orinfer_ascend_kernel_v2(void *const *buffers, uint64_t size, uint64_t rows,
     memcpy(buffers[1], buffers[0], rows);
     return 0;
 }
-static int flush(void *stream) {
+static int flush_until(void *stream, void *stop) {
     if (failure == 3) return 7;
+    if (stop && ((Event*)stop)->ready) return 0;
     for (int i=0;i<count;i++) {
         Job *j=&jobs[i];
         if (j->kind==0 || j->stream!=stream) continue;
@@ -37,12 +38,15 @@ static int flush(void *stream) {
         if (j->kind==2) memset(j->dst,j->value,j->n);
         if (j->kind==3) ((Event*)j->event)->ready=1;
         if (j->kind==4 && !((Event*)j->event)->ready) {
-            int status=flush(((Event*)j->event)->stream); if (status) return status;
+            int status=flush_until(((Event*)j->event)->stream,j->event); if (status) return status;
         }
+        int done=j->kind==3 && j->event==stop;
         j->kind=0;
+        if(done)return 0;
     }
     return 0;
 }
+static int flush(void *stream) { return flush_until(stream,NULL); }
 int test_counter(int n) { return counters[n]; }
 int test_pending_jobs(void) {
     int pending=0;
@@ -88,7 +92,7 @@ int aclrtRecordEvent(void *p,void *s) {
 /* With no waiters, wait-status can complete while the record is pending. */
 int aclrtQueryEventWaitStatus(void *p,int *state) { (void)p;*state=0;return 0; }
 int aclrtQueryEventStatus(void *p,int *state) { *state=(failure==11 || ((Event*)p)->ready)?1:0;return 0; }
-int aclrtSynchronizeEventWithTimeout(void *p,int timeout) { (void)timeout;counters[13]++;return flush(((Event*)p)->stream); }
+int aclrtSynchronizeEventWithTimeout(void *p,int timeout) { (void)timeout;counters[13]++;return flush_until(((Event*)p)->stream,p); }
 int aclrtStreamWaitEventWithTimeout(void *s,void *p,int timeout) {
     (void)timeout;jobs[count++]=(Job){.kind=4,.stream=s,.event=p};return 0;
 }

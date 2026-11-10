@@ -345,6 +345,13 @@ impl Drop for Completion {
 pub struct Ticket {
     completion: Rc<Completion>,
 }
+
+/// Ordered D2H storage retained independently of later compute submissions.
+pub(crate) struct Readback {
+    ticket: Ticket,
+    host: Rc<Pinned>,
+    spans: Vec<(usize, usize)>,
+}
 impl Ticket {
     pub fn wait(&self) -> Result<()> {
         self.completion.wait()
@@ -918,6 +925,9 @@ impl Session {
         &self,
         inputs: &[(&Buffer, usize, usize)],
     ) -> Result<Vec<Vec<u8>>> {
+        self.wait_readback(self.enqueue_readback(inputs)?)
+    }
+    pub(crate) fn enqueue_readback(&self, inputs: &[(&Buffer, usize, usize)]) -> Result<Readback> {
         let mut total = 0usize;
         let mut spans = Vec::with_capacity(inputs.len());
         for &(buffer, offset, bytes) in inputs {
@@ -964,17 +974,39 @@ impl Session {
                 Ok(())
             },
         )?;
+        Ok(Readback {
+            ticket,
+            host,
+            spans: spans
+                .into_iter()
+                .map(|(_, start, bytes)| (start, bytes))
+                .collect(),
+        })
+    }
+    pub(crate) fn wait_readback(&self, readback: Readback) -> Result<Vec<Vec<u8>>> {
+        let Readback {
+            ticket,
+            host,
+            spans,
+        } = readback;
         ticket.wait()?;
         // The hard readback fence covers every preceding compute submission.
         // Mark all covered generations before releasing nested ticket owners;
         // unrelated transfer-stream work retains its own completion lifetime.
-        for completion in self.pending.borrow().iter() {
-            if completion.stream == self.context.compute {
-                completion.complete.set(true);
+        let pending = self.pending.borrow();
+        if let Some(end) = pending
+            .iter()
+            .position(|c| Rc::ptr_eq(c, &ticket.completion))
+        {
+            for completion in pending.iter().take(end + 1) {
+                if completion.stream == self.context.compute {
+                    completion.complete.set(true);
+                }
             }
         }
+        drop(pending);
         let mut outputs = Vec::with_capacity(spans.len());
-        for &(_, start, bytes) in &spans {
+        for &(start, bytes) in &spans {
             let mut data = vec![0; bytes];
             // SAFETY: The DMA fence completed before reading its pinned destination.
             unsafe {

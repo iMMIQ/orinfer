@@ -4,6 +4,11 @@ use super::*;
 pub(super) fn readout(requests: &[&mut Request], full: bool) -> super::super::team::Readout {
     super::super::team::Readout {
         full,
+        continuations: requests
+            .iter()
+            .filter(|r| r.device_sample() && !r.decoder.constrained())
+            .map(|r| r.slot)
+            .collect(),
         full_owners: Some(
             requests
                 .iter()
@@ -600,6 +605,27 @@ mod tests {
         r.input = vec![1; offset + left];
         r.history = vec![1; offset.max(1)];
         r
+    }
+    #[test]
+    fn device_continuation_requires_generated_device_sampled_input() {
+        let mut owners = [
+            request(false, 128, 0),
+            request(true, 0, 128),
+            request(false, 128, 0),
+        ];
+        for (slot, request) in owners.iter_mut().enumerate() {
+            request.slot = slot;
+            request.device_sampling = true;
+        }
+        owners[2].device_sampling = false;
+        let requests = owners.iter_mut().collect::<Vec<_>>();
+        let result = readout(&requests, false);
+        assert_eq!(result.continuations.into_iter().collect::<Vec<_>>(), [0]);
+        assert!(
+            super::super::super::team::Readout::default()
+                .continuations
+                .is_empty()
+        );
     }
     #[test]
     fn verification_uses_free_packet_capacity_without_displacing_final_prompt() {

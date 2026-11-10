@@ -1155,6 +1155,18 @@ impl Worker {
                 .ok_or("Batch must be prepared before forward")?,
         );
         let retained = self.update_batch_tables(layout, &execution.packet)?;
+        let device_input = if std::env::var_os("ORINFER_A2_BATCH_TRACE").is_none() {
+            if let Some(mut runtime) = self.device_inputs.take() {
+                let result = runtime.prepare(self, &execution.packet, layout, tokens, readout);
+                self.device_inputs = Some(runtime);
+                Some(result?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let device_coordinates = device_input.as_ref().is_some_and(|d| d.device_coordinates);
         if !readout.draws.is_empty()
             && layout.role == super::PacketRole::Draft
             && execution.packet.sampling_controls.is_none()
@@ -1222,15 +1234,47 @@ impl Worker {
                 ))
             })
             .transpose()?;
+        if let Some(block) = execution
+            .packet
+            .coordinates
+            .draft_block
+            .filter(|_| device_coordinates)
+        {
+            let names = &execution.packet.coordinates;
+            for (ratio, indices, lengths) in [
+                (1, &names.c1_indices, &names.c1_lengths),
+                (2, &names.c2_indices, &names.c2_lengths),
+            ] {
+                let width = 128 / ratio;
+                let mut ids = vec![-1i32; layout.rows.total * width];
+                for row in ids.chunks_mut(width) {
+                    for (i, item) in row.iter_mut().take(block).enumerate() {
+                        *item = i as i32;
+                    }
+                }
+                let bytes = ids
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>();
+                inputs.push((get(&self.buffers, indices)?.slice(0, bytes.len())?, bytes));
+                let bytes = vec![block as i32; layout.rows.total]
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>();
+                inputs.push((get(&self.buffers, lengths)?.slice(0, bytes.len())?, bytes));
+            }
+        }
         for (i, (segment, input)) in layout.segments.iter().zip(tokens).enumerate() {
             let history = &self.batch.as_ref().unwrap().owners[&segment.slot].history;
-            inputs.extend(self.coordinate_inputs(
-                &execution.packet.coordinates,
-                history.len(),
-                segment.tokens,
-                layout.rows.starts[i],
-                None,
-            )?);
+            if !device_coordinates {
+                inputs.extend(self.coordinate_inputs(
+                    &execution.packet.coordinates,
+                    history.len(),
+                    segment.tokens,
+                    layout.rows.starts[i],
+                    None,
+                )?);
+            }
             if let Some((_, data)) = &mut source_images {
                 super::vision::write_mask(
                     data,
@@ -1265,30 +1309,34 @@ impl Worker {
                             count,
                         )?;
                     }
-                    inputs.extend(self.coordinate_inputs(
-                        names,
-                        history.len() + skipped,
-                        count,
-                        suffix.rows.starts[i],
-                        Some(
-                            if skipped > 0
-                                || final_prompt_only
-                                    && layout.decoder_roles[i] == super::replay::Role::Final
-                            {
-                                history.len() + skipped
-                            } else {
-                                0
-                            },
-                        ),
-                    )?);
+                    if !device_coordinates {
+                        inputs.extend(self.coordinate_inputs(
+                            names,
+                            history.len() + skipped,
+                            count,
+                            suffix.rows.starts[i],
+                            Some(
+                                if skipped > 0
+                                    || final_prompt_only
+                                        && layout.decoder_roles[i] == super::replay::Role::Final
+                                {
+                                    history.len() + skipped
+                                } else {
+                                    0
+                                },
+                            ),
+                        )?);
+                    }
                 }
             }
-            let mut owner_hashes = vec![];
-            let mut owner_valid = vec![];
-            self.hasher
-                .hash_into(history, input, &mut owner_hashes, &mut owner_valid)?;
-            hashes.extend(owner_hashes);
-            valid.extend(owner_valid);
+            if device_input.is_none() {
+                let mut owner_hashes = vec![];
+                let mut owner_valid = vec![];
+                self.hasher
+                    .hash_into(history, input, &mut owner_hashes, &mut owner_valid)?;
+                hashes.extend(owner_hashes);
+                valid.extend(owner_valid);
+            }
             if layout.role == super::PacketRole::Target {
                 for span in self.batch.as_ref().unwrap().owners[&segment.slot]
                     .vision
@@ -1314,7 +1362,9 @@ impl Worker {
             get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
             1i32.to_le_bytes().to_vec(),
         ));
-        if let Some(name) = &execution.packet.coordinates.input_ids {
+        if let Some(name) = &execution.packet.coordinates.input_ids
+            && device_input.is_none()
+        {
             let bytes = joined
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
@@ -1357,6 +1407,7 @@ impl Worker {
                     hashes: &hashes,
                     valid: &valid,
                     visual_rows: &visual_rows,
+                    device: device_input,
                 },
                 !layout.outputs.is_empty(),
                 retained,
@@ -1365,6 +1416,13 @@ impl Worker {
                 // Model, sampling and readback are ordered on the same stream.
                 self.sample_batch(&execution, layout, readout)
             });
+            if layout.role == super::PacketRole::Draft
+                && let Some(mut runtime) = self.device_inputs.take()
+            {
+                let result = runtime.save_draft(self, &execution.packet, layout);
+                self.device_inputs = Some(runtime);
+                result?;
+            }
             // Errors still drain every rank's submitted collective order. On
             // success the sampling readback has already fenced the model.
             pending.wait()?;
@@ -1540,6 +1598,13 @@ impl Worker {
             || readout.draws.is_empty()
             || layout.role == super::PacketRole::Draft
         {
+            if layout.role == super::PacketRole::Target
+                && let Some(runtime) = &mut self.device_inputs
+            {
+                for segment in &layout.segments {
+                    runtime.invalidate(segment.slot)?;
+                }
+            }
             return Ok(None);
         }
         let source = get(
@@ -1551,6 +1616,11 @@ impl Worker {
                 .ok_or("Missing sampling logits")?,
         )?;
         if !readout.rejection.is_empty() {
+            if let Some(runtime) = &mut self.device_inputs {
+                for segment in &layout.segments {
+                    runtime.invalidate(segment.slot)?;
+                }
+            }
             if readout
                 .row_parameters(layout)?
                 .iter()
@@ -1568,14 +1638,47 @@ impl Worker {
                 execution.captured,
             )?));
         }
-        Ok(Some(self.sampling.as_mut().unwrap().sample(
+        let sampled = self.sampling.as_mut().unwrap().enqueue_sample(
             &self.session,
             &source,
             execution.packet.vocab_first,
             &readout.controls(layout)?,
             &readout.row_parameters(layout)?,
             execution.captured,
-        )?))
+        )?;
+        // Return the already-produced local samples while device continuation
+        // preparation proceeds on the same stream after this readback fence.
+        let pending = sampled
+            .is_none()
+            .then(|| {
+                self.sampling
+                    .as_ref()
+                    .unwrap()
+                    .begin_read_samples(&self.session, layout.outputs.len())
+            })
+            .transpose()?;
+        if let Some(mut runtime) = self.device_inputs.take() {
+            let result =
+                if sampled.is_none() && std::env::var_os("ORINFER_A2_BATCH_TRACE").is_none() {
+                    let samples = self.sampling.as_ref().unwrap().output().clone();
+                    runtime.commit(self, layout, &samples, readout)
+                } else {
+                    layout
+                        .segments
+                        .iter()
+                        .try_for_each(|s| runtime.invalidate(s.slot))
+                };
+            self.device_inputs = Some(runtime);
+            result?;
+        }
+        Ok(Some(match sampled {
+            Some(sampled) => sampled,
+            None => self
+                .sampling
+                .as_ref()
+                .unwrap()
+                .finish_read_samples(&self.session, pending.unwrap())?,
+        }))
     }
 }
 

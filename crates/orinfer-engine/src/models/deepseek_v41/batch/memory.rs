@@ -307,6 +307,9 @@ impl Worker {
         Ok(())
     }
     pub(in crate::models::deepseek_v41) fn reset_owner(&mut self, id: usize) -> Result<()> {
+        if let Some(inputs) = &mut self.device_inputs {
+            inputs.invalidate(id)?;
+        }
         let names = self
             .packet_templates
             .iter()
@@ -330,6 +333,9 @@ impl Worker {
     }
     pub(in crate::models::deepseek_v41) fn release_owners(&mut self) -> Result<()> {
         self.session.synchronize()?;
+        if let Some(inputs) = &mut self.device_inputs {
+            inputs.invalidate_all()?;
+        }
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
         runtime.bound_tables = None;
         runtime.owners.clear();

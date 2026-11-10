@@ -156,6 +156,22 @@ impl Worker {
         let needed = needed
             .checked_add(
                 model
+                    .device_inputs
+                    .as_ref()
+                    .map(|c| {
+                        let batch = model
+                            .batch
+                            .as_ref()
+                            .ok_or("Device input batch contract missing")?;
+                        c.bytes(&rank, model.capacity, batch.owners, batch.output_capacity())
+                    })
+                    .transpose()?
+                    .unwrap_or(0),
+            )
+            .ok_or("Device input memory budget overflow")?;
+        let needed = needed
+            .checked_add(
+                model
                     .vision
                     .as_ref()
                     .map(vision::Program::device_bytes)
@@ -297,7 +313,14 @@ impl Worker {
                 vision::Encoder::from_program(&session, program, package, &mut checkpoint)
             })
             .transpose()?;
+        let device_contract = model.device_inputs.clone();
+        let input_rank = device_contract.as_ref().map(|_| Rank {
+            rank: rank.rank,
+            buffers: vec![],
+            packets: rank.packets.clone(),
+        });
         let mut worker = Self {
+            device_inputs: None,
             sampling: model
                 .sampling
                 .as_ref()
@@ -330,6 +353,15 @@ impl Worker {
             batch,
             shared: super::shared::Cache::new(),
         };
+        if let (Some(c), Some(rank), Some(batch)) = (device_contract, input_rank, &model.batch) {
+            worker.device_inputs = Some(device_inputs::Runtime::load(
+                &mut worker,
+                &c,
+                &rank,
+                batch.owners,
+                batch.output_capacity(),
+            )?);
+        }
         if model.batch.is_some() {
             return Ok(worker);
         }

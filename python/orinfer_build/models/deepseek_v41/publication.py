@@ -36,6 +36,22 @@ def manifests(model):
         for k in ("statistics", "merge_statistics", "normalize", "select")
         if model.get("sampling", {}).get("rejection", {}).get(k)
     )
+    inputs = model.get("device_inputs")
+    if inputs:
+        names.update(
+            inputs[k]
+            for k in (
+                "merge",
+                "commit",
+                "save_draft",
+                "hashes",
+                "scatter_embedding",
+                "draft_embedding",
+            )
+        )
+        names.update(inputs["embeddings"].values())
+        for preparation in inputs["preparations"].values():
+            names.update(preparation.values())
     return sorted(names)
 
 

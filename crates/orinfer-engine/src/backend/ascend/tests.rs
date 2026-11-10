@@ -371,6 +371,28 @@ fn completed_compute_fence_retires_earlier_tickets_without_repeating_waits() {
 }
 
 #[test]
+fn deferred_readback_keeps_later_compute_pending_and_retains_staging() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let input = session.allocate(4).unwrap();
+    session
+        .upload_inputs(&[(input.clone(), vec![1, 2, 3, 4])])
+        .unwrap();
+    let readback = session.enqueue_readback(&[(&input, 0, 4)]).unwrap();
+    let output = session.allocate(4).unwrap();
+    let later = session.copy(&input, 0, &output, 0, 4).unwrap();
+    assert_eq!(session.wait_readback(readback).unwrap(), [vec![1, 2, 3, 4]]);
+    assert!(
+        !later.is_ready().unwrap(),
+        "a readback fences only its own stream prefix"
+    );
+    assert!(session.pinned_bytes() >= 4);
+    later.wait().unwrap();
+    drop((later, input, output, session));
+    fixture.assert_clean();
+}
+
+#[test]
 fn compute_readback_batches_outputs_without_fencing_unrelated_transfers() {
     let mut fixture = Fixture::new();
     let session = fixture.session();

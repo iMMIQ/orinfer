@@ -4,6 +4,7 @@ mod batch;
 mod batch_benchmark;
 mod benchmark;
 mod branches;
+mod device_inputs;
 #[cfg(test)]
 mod dispatch_tests;
 mod load;
@@ -73,6 +74,8 @@ struct Model {
     vision: Option<vision::Program>,
     #[serde(default)]
     sampling: Option<crate::backend::ascend::sampling::Contract>,
+    #[serde(default)]
+    device_inputs: Option<device_inputs::Contract>,
     #[serde(skip)]
     graph_launches: std::collections::BTreeSet<batch::WorkLaunch>,
 }
@@ -494,6 +497,7 @@ struct W4Key {
 type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
 
 struct Worker {
+    device_inputs: Option<device_inputs::Runtime>,
     sampling: Option<crate::backend::ascend::sampling::Categorical>,
     growth: BTreeMap<String, crate::backend::growth::TokenLayout>,
     session: Session,

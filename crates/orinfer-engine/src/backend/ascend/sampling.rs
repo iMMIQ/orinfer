@@ -2,7 +2,7 @@
 use super::{
     graph::Graph,
     kernels::{Access, Kernel, Program, Spec, Template},
-    runtime::{Buffer, Session},
+    runtime::{Buffer, Readback, Session},
 };
 use crate::{
     artifact::{Dtype, Result, resolve_file},
@@ -272,7 +272,8 @@ impl Categorical {
             rejection,
         })
     }
-    pub fn sample(
+    /// Leave plain sampled rows on the ordered stream for device consumers.
+    pub(crate) fn enqueue_sample(
         &mut self,
         session: &Session,
         source: &Buffer,
@@ -280,7 +281,7 @@ impl Categorical {
         rows: &[[i32; 3]],
         parameters: &[Parameters],
         capture: bool,
-    ) -> Result<Vec<Sample>> {
+    ) -> Result<Option<Vec<Sample>>> {
         if rows.is_empty()
             || rows.len() > self.contract.capacity
             || source.bytes() < rows.len() * self.contract.vocab * 4
@@ -325,14 +326,15 @@ impl Categorical {
                     origin,
                     parameters,
                     capture,
-                );
+                )
+                .map(Some);
         }
         if capture {
             self.graph.as_ref().unwrap().enqueue(session)?;
         } else {
             self.program.enqueue(session)?;
         }
-        self.read_samples(session, rows.len())
+        Ok(None)
     }
     pub fn store_proposals(
         &mut self,
@@ -396,8 +398,21 @@ impl Categorical {
             )?;
         self.read_samples(session, rows.len())
     }
-    fn read_samples(&self, session: &Session, rows: usize) -> Result<Vec<Sample>> {
-        let bytes = session.download_compute(&self.output, 0, rows * 8)?;
+    pub(crate) fn output(&self) -> &Buffer {
+        &self.output
+    }
+    pub(crate) fn read_samples(&self, session: &Session, rows: usize) -> Result<Vec<Sample>> {
+        self.finish_read_samples(session, self.begin_read_samples(session, rows)?)
+    }
+    pub(crate) fn begin_read_samples(&self, session: &Session, rows: usize) -> Result<Readback> {
+        session.enqueue_readback(&[(&self.output, 0, rows * 8)])
+    }
+    pub(crate) fn finish_read_samples(
+        &self,
+        session: &Session,
+        pending: Readback,
+    ) -> Result<Vec<Sample>> {
+        let bytes = session.wait_readback(pending)?.remove(0);
         bytes
             .as_chunks::<8>()
             .0

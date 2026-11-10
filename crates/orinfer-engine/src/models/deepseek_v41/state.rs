@@ -582,6 +582,9 @@ fn grow_restored<'a>(
 impl Worker {
     pub(super) fn release_owner(&mut self, id: usize) -> Result<()> {
         self.session.synchronize()?;
+        if let Some(inputs) = &mut self.device_inputs {
+            inputs.invalidate(id)?;
+        }
         let runtime = self.batch.as_mut().ok_or("Missing A2 batch runtime")?;
         runtime.bound_tables = None;
         runtime.owners.remove(&id).ok_or("Unknown A2 owner")?;

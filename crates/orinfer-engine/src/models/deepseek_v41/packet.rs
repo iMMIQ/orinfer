@@ -12,6 +12,7 @@ pub(super) struct Inputs<'a> {
     pub hashes: &'a [i64],
     pub valid: &'a [bool],
     pub visual_rows: &'a [super::vision::Overlay],
+    pub device: Option<super::device_inputs::Prepared>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -426,6 +427,7 @@ impl Worker {
                 hashes,
                 valid,
                 visual_rows: &[],
+                device: None,
             },
             logits,
             vec![],
@@ -443,6 +445,7 @@ impl Worker {
             hashes,
             valid,
             visual_rows,
+            device,
         } = input;
         let head = if logits {
             execution.head.as_slice()
@@ -450,6 +453,7 @@ impl Worker {
             &[]
         };
         let mut embeddings = vec![];
+        let mut device_embeddings = vec![];
         for step in execution.body.iter().chain(head) {
             let input = match step {
                 Step::Embed {
@@ -458,6 +462,16 @@ impl Worker {
                     first_column,
                     columns,
                 } => {
+                    if device.as_ref().is_some_and(|d| d.device_embedding) && visual_rows.is_empty()
+                    {
+                        device_embeddings.push(
+                            self.device_inputs
+                                .as_mut()
+                                .ok_or("Missing device input runtime")?
+                                .embedding(&self.session, step, &execution.packet, tokens.len())?,
+                        );
+                        continue;
+                    }
                     let mut data = self.embedding(tensor, tokens, *first_column, *columns)?;
                     for overlay in visual_rows {
                         overlay.apply(*first_column, *columns, &mut data)?;
@@ -471,6 +485,9 @@ impl Worker {
             }
         }
         let mut embeddings = embeddings.into_iter();
+        let mut device_embeddings = device_embeddings.iter();
+        let mut hash_readback = None;
+        let mut device_hashes: Option<(Vec<i64>, Vec<bool>)> = None;
         // SAFETY: Execution owns the stable graphs and W4 plans; each graph
         // retains its kernels/collectives, and W4 retains tensors/workspace.
         // submit_compute fences partial submission on failure. Each forward
@@ -478,8 +495,34 @@ impl Worker {
         unsafe {
             self.session.submit_compute(
                 vec![],
-                Box::new((Rc::clone(&execution), retained, execution.shared_graphs())),
+                Box::new((
+                    Rc::clone(&execution),
+                    retained,
+                    execution.shared_graphs(),
+                    device.clone(),
+                    device_embeddings.clone().cloned().collect::<Vec<_>>(),
+                )),
                 |stream| {
+                    if let Some(device) = &device {
+                        for kernel in &device.kernels {
+                            kernel.launch_on_stream(stream)?;
+                        }
+                        if device.hash_width != 0 {
+                            hash_readback = Some(self.session.enqueue_readback(&[
+                                (&device.hashes, 0, tokens.len() * device.hash_width * 8),
+                                (&device.valid, 0, tokens.len() * 4),
+                            ])?);
+                        }
+                        if let Some(name) = &execution.packet.coordinates.input_ids {
+                            self.session.copy(
+                                &device.ids,
+                                0,
+                                &get(&self.buffers, name)?,
+                                0,
+                                tokens.len() * 4,
+                            )?;
+                        }
+                    }
                     let head = if logits {
                         execution.head.as_slice()
                     } else {
@@ -491,9 +534,42 @@ impl Worker {
                             Step::Segment(segment) => segment.execute_on_stream(stream)?,
                             Step::W4(plan) => plan.execute_on_stream(stream)?,
                             Step::Embed { .. } => {
-                                self.session.upload_inputs(
-                                    &embeddings.next().ok_or("Packet embedding missing")?,
-                                )?;
+                                if device.as_ref().is_some_and(|d| d.device_coordinates)
+                                    && let Some(decoder) = &execution.packet.decoder_coordinates
+                                {
+                                    // The existing causal-index prologue has
+                                    // produced full-context lengths. Continue
+                                    // packets share its row domain with replay.
+                                    let source = &execution.packet.coordinates;
+                                    let copies = [
+                                        (&source.c1_lengths, &decoder.c1_lengths),
+                                        (&source.c2_lengths, &decoder.c2_lengths),
+                                    ]
+                                    .into_iter()
+                                    .map(|(s, d)| {
+                                        Ok((
+                                            get(&self.buffers, s)?,
+                                            0,
+                                            get(&self.buffers, d)?,
+                                            0,
+                                            tokens.len() * 4,
+                                        ))
+                                    })
+                                    .collect::<Result<Vec<_>>>()?;
+                                    self.session.copy_many(&copies)?;
+                                }
+                                if device.as_ref().is_some_and(|d| d.device_embedding)
+                                    && visual_rows.is_empty()
+                                {
+                                    device_embeddings
+                                        .next()
+                                        .ok_or("Device embedding missing")?
+                                        .launch_on_stream(stream)?;
+                                } else {
+                                    self.session.upload_inputs(
+                                        &embeddings.next().ok_or("Packet embedding missing")?,
+                                    )?;
+                                }
                             }
                             Step::Lookup {
                                 layer,
@@ -501,6 +577,35 @@ impl Worker {
                                 scales,
                                 mask,
                             } => {
+                                if let Some(readback) = hash_readback.take() {
+                                    let mut bytes =
+                                        self.session.wait_readback(readback)?.into_iter();
+                                    let hashes = bytes
+                                        .next()
+                                        .ok_or("Missing device hashes")?
+                                        .as_chunks::<8>()
+                                        .0
+                                        .iter()
+                                        .map(|b| i64::from_le_bytes(*b))
+                                        .collect();
+                                    let valid = bytes
+                                        .next()
+                                        .ok_or("Missing device hash validity")?
+                                        .as_chunks::<4>()
+                                        .0
+                                        .iter()
+                                        .map(|b| match i32::from_le_bytes(*b) {
+                                            0 => Ok(false),
+                                            1 => Ok(true),
+                                            _ => Err("Invalid device hash validity".to_string()),
+                                        })
+                                        .collect::<Result<Vec<_>>>()?;
+                                    device_hashes = Some((hashes, valid));
+                                }
+                                let (hashes, valid) = device_hashes
+                                    .as_ref()
+                                    .map(|(h, v)| (h.as_slice(), v.as_slice()))
+                                    .unwrap_or((hashes, valid));
                                 // Earlier graph segments are already queued.
                                 // Prepare CPU rows while they execute, then
                                 // update reused inputs at this stream boundary.

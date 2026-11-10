@@ -45,6 +45,9 @@ pub(super) fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf
 /// Reject incomplete or mismatched packages before allocating resident weights.
 pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
     batch::validate(model)?;
+    if let Some(c) = &model.device_inputs {
+        c.preflight(model, base)?;
+    }
     if let Some(sampling) = &model.sampling {
         sampling.preflight(base)?;
         if sampling.vocab * model.ranks.len() != 129280
