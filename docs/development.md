@@ -65,7 +65,7 @@ uv run --locked python -m tools.dev.workspace inventory
 
 ## 检查与缓存
 
-Rust 工具链和 workspace 最低版本统一为稳定版 1.99.1。依赖更新要求发布满 7 天，
+Rust 工具链和 workspace 最低版本统一为稳定版 1.98.1。依赖更新要求发布满 7 天，
 覆盖 Cargo 直接与传递依赖、两个 uv 环境的实际锁定文件、构建依赖、CI actions/uv、
 Jetson PyTorch wheel 和 Ascend TileLang wheel。uv 通过 `exclude-newer = "7 days"`
 在解析时过滤新文件；Rust 精确版本及完整锁文件的发布时间记录在

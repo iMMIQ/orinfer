@@ -4,7 +4,7 @@
   "files": {
     ".github/workflows/check.yml": "ee51369f2f0d8e41897d9cefaa1974e22a97b7fef03ed6cd6d7214c3a6e389f5",
     "Cargo.lock": "863dfe0ec00667f17396795d4ff9f00b098a1ee1272ece1ebd6c7d1a9f6830c0",
-    "Cargo.toml": "f45d43105a289bb3b2de2e2a649db3e0ddead4320dd2602f7b692bdeda22b31f",
+    "Cargo.toml": "f9b7de7a481c6fb8d4bef94e74fcd4c06ee2c36c053a2665586c7bd3a91b32fd",
     "crates/orinfer-api/Cargo.toml": "4468804dbcebd698e4fb36514837eba18c4132b05ba000a8b5d31718c85dd16f",
     "crates/orinfer-cli/Cargo.toml": "e82066f8646b3da4bfe4e52dbfa0a375e61591c1640391a326752de13c5f4c97",
     "crates/orinfer-device/Cargo.toml": "8218a7da5e10a7d5d8ce3edc624bf21836f5bd7e414bd4879b4380d59bcf00e1",
@@ -12,7 +12,7 @@
     "crates/orinfer-model-sdk/Cargo.toml": "eb920bb9790a8373ccb936ba6a0d60e4137be4f22aff82bd4a5600bc394896fe",
     "crates/orinfer-models/Cargo.toml": "063350fde5ba0c4e9ecac33778ecdb06c453dae0702d144df25718384e6d8a61",
     "pyproject.toml": "1f564ba2da2c0050986f74ed1c9aba695a39eb52fa57196ffe541bf68c092140",
-    "rust-toolchain.toml": "b9c8d2d59f6f46474c0cfa0b8b77bea21d94fc73a30ad93d5bf6385c422197d2",
+    "rust-toolchain.toml": "7553618f800829444096beea3dce84c3d07585efda504c19adb6787369bbd9e8",
     "tools/build/jetson_wheels.json": "435e70191f25563446812566da873e69200bd0471958b0adaa021026fc5ab4b4",
     "tools/environments/ascend/Dockerfile": "bd7f5808824f17306b0bfc3752bd658610fce22126aa8ee151c44952a131b5ca",
     "tools/environments/ascend/run.sh": "6ed71b8f0e46130e12e692b3b8d6c73417c2f4d14a145f6f68e07e36168784b6",
@@ -1509,9 +1509,9 @@
       "published": "2026-03-26T21:57:53Z",
       "url": "https://index.crates.io/zu/ne/zune-jpeg"
     },
-    "rust/1.99.1": {
-      "published": "2026-10-15T23:59:59Z",
-      "url": "https://static.rust-lang.org/dist/channel-rust-1.99.1.toml"
+    "rust/1.98.1": {
+      "published": "2026-09-03T23:59:59Z",
+      "url": "https://static.rust-lang.org/dist/channel-rust-1.98.1.toml"
     },
     "tools/environments/cuda/uv.lock/annotated-doc@0.0.5": {
       "published": "2026-07-28T13:50:58.129724Z",
