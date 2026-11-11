@@ -236,6 +236,7 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
         [None, Some(5.), Some(64.)].map(|uses| {
             let budget = uses.map(|uses| CaptureBudget {
                 uses,
+                max_uses: None,
                 direct_s: Some(0.105),
                 replay_s: Some(0.070),
                 capture_s: Some(0.294),

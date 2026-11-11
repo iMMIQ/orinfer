@@ -239,6 +239,31 @@ impl Model {
             .iter()
             .any(|(Key(f, rows, _, _), cell)| *f == group && *rows == work.rows && cell.prior > 0.)
     }
+    /// Actual local observations, or None if the bounded surface cannot learn
+    /// this ordinary direct path. A missing prior must not defer capture forever.
+    pub(super) fn local_evidence(
+        &self,
+        stage: Stage,
+        block: usize,
+        full: bool,
+        work: Work,
+    ) -> Option<(usize, usize)> {
+        let group = family(stage, block, full, work);
+        if self.cells.len() >= 2048
+            && !self
+                .cells
+                .contains_key(&Key(group, work.rows, false, false))
+        {
+            return None;
+        }
+        Some(
+            self.cells
+                .range(Key(group, work.rows, false, false)..=Key(group, work.rows, true, true))
+                .fold((0, 0), |(hot, seen), (_, cell)| {
+                    (hot + cell.time.samples(), seen + cell.time.observations())
+                }),
+        )
+    }
     /// Measured neighboring rows can price another logical prefix in the same
     /// physical draft family; they do not establish Graph residency.
     pub(super) fn evidence(
@@ -429,6 +454,7 @@ impl Model {
     ) -> super::super::super::super::team::CaptureBudget {
         super::super::super::super::team::CaptureBudget {
             uses,
+            max_uses: None,
             direct_s: self
                 .predict_mode(stage, block, full, work, false)
                 .map(|p| p.seconds),
@@ -648,6 +674,89 @@ mod tests {
                 < 1e-12
         );
         assert_eq!(model.evidence(Stage::Target, 0, false, work), (2, 4));
+    }
+    #[test]
+    fn full_cost_surface_cannot_leave_ordinary_capture_in_calibration() {
+        use super::super::Policy;
+        let work = point(8, false, 0.06).work;
+        for direct in [false, true] {
+            let mut policy = Policy::default();
+            if direct {
+                policy.costs.observe(Point {
+                    stage: Stage::Decode,
+                    ..point(8, false, 0.06)
+                });
+            } else {
+                policy.costs.insert(
+                    Point {
+                        stage: Stage::Decode,
+                        ..point(8, true, 0.03)
+                    },
+                    false,
+                );
+            }
+            for rows in 1..=2047 {
+                policy.costs.observe(point(rows, false, 0.1));
+            }
+            assert_eq!(policy.costs.cells.len(), 2048);
+            assert_eq!(
+                policy.baseline_budget(false, true, work, 128., 2.).max_uses,
+                if direct { Some(3.) } else { None }
+            );
+            if direct {
+                for _ in 0..3 {
+                    policy.costs.observe(Point {
+                        stage: Stage::Decode,
+                        ..point(8, false, 0.06)
+                    });
+                }
+                assert_eq!(
+                    policy.baseline_budget(false, true, work, 128., 2.).max_uses,
+                    None
+                );
+            }
+        }
+    }
+    #[test]
+    fn ordinary_calibration_does_not_buy_graph_reuse_after_auto_replans() {
+        use super::super::Policy;
+        let mut policy = Policy::default();
+        let work = point(8, false, 0.06).work;
+        policy.costs.insert(
+            Point {
+                stage: Stage::Decode,
+                setup_s: 0.2,
+                ..point(8, true, 0.03)
+            },
+            false,
+        );
+        for seen in 0..4 {
+            let budget = policy.baseline_budget(false, true, work, 128., 2.);
+            assert_eq!(budget.max_uses, Some((4 - seen) as f64));
+            assert!(!budget.profitable(0));
+            assert_eq!(
+                policy.target_budget(false, true, work, 128., 2.).max_uses,
+                None
+            );
+            policy.costs.observe(Point {
+                stage: Stage::Decode,
+                ..point(8, false, 0.06)
+            });
+        }
+        let steady = policy.baseline_budget(false, true, work, 128., 2.);
+        assert_eq!(steady.max_uses, None);
+        assert!(steady.profitable(0));
+        let mixed = policy.baseline_budget(
+            false,
+            false,
+            Work {
+                prefill_rows: 4,
+                ..work
+            },
+            128.,
+            2.,
+        );
+        assert_eq!(mixed.max_uses, None);
     }
     #[test]
     fn distant_large_packets_are_priors_not_small_packet_calibration() {

@@ -19,6 +19,9 @@ pub(in crate::models::deepseek_v41) fn capture_interval(target: f64, progress: f
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub(in crate::models::deepseek_v41) struct CaptureBudget {
     pub uses: f64,
+    /// A temporary calibration path cannot spend forecast cross-cohort reuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<f64>,
     pub direct_s: Option<f64>,
     pub replay_s: Option<f64>,
     pub capture_s: Option<f64>,
@@ -27,6 +30,9 @@ pub(in crate::models::deepseek_v41) struct CaptureBudget {
 }
 impl CaptureBudget {
     pub fn profitable(self, warmup_uses: usize) -> bool {
+        let uses = self
+            .max_uses
+            .map_or(self.uses, |limit| self.uses.min(limit));
         if self.capture_s.is_some_and(|capture| {
             capture + self.replay_s.or(self.direct_s).unwrap_or(0.) > self.slack_s
         }) {
@@ -34,7 +40,7 @@ impl CaptureBudget {
         }
         match (self.direct_s, self.replay_s, self.capture_s) {
             (Some(direct), Some(replay), Some(capture)) => {
-                let useful = (self.uses - warmup_uses as f64).max(0.);
+                let useful = (uses - warmup_uses as f64).max(0.);
                 useful * (direct - replay).max(0.) > capture * 1.1
                     && capture + replay <= self.slack_s
             }
@@ -43,13 +49,12 @@ impl CaptureBudget {
                 // speedup. Limit it to a quarter of the remaining direct work:
                 // a fixed reuse count can abandon a costly fused packet before
                 // it ever measures the execution mode it was tuned for.
-                let useful = (self.uses - warmup_uses as f64).max(0.);
-                (self.uses >= 16. || useful * direct > capture * 4.)
-                    && capture + direct <= self.slack_s
+                let useful = (uses - warmup_uses as f64).max(0.);
+                (uses >= 16. || useful * direct > capture * 4.) && capture + direct <= self.slack_s
             }
             // Seed one missing family on a long, repeated packet. Observations
             // then price new row counts from the same shared sparse surface.
-            _ => self.uses >= 16. && self.slack_s > self.direct_s.unwrap_or(0.),
+            _ => uses >= 16. && self.slack_s > self.direct_s.unwrap_or(0.),
         }
     }
 }
@@ -182,6 +187,7 @@ mod tests {
     fn budget(uses: f64) -> CaptureBudget {
         CaptureBudget {
             uses,
+            max_uses: None,
             direct_s: Some(0.105),
             replay_s: Some(0.070),
             capture_s: Some(0.294),
@@ -202,6 +208,7 @@ mod tests {
     fn speculative_progress_can_pay_for_capture_without_unbounded_burst_slack() {
         let budget = CaptureBudget {
             uses: 64.,
+            max_uses: None,
             direct_s: Some(0.54),
             replay_s: None,
             capture_s: Some(0.30),
@@ -253,6 +260,7 @@ mod tests {
     fn first_replay_trial_uses_measured_cost_instead_of_a_fixed_reuse_count() {
         let measured = CaptureBudget {
             uses: 8.9409,
+            max_uses: None,
             direct_s: Some(0.21065),
             replay_s: None,
             capture_s: Some(0.35755),
@@ -267,6 +275,7 @@ mod tests {
         assert!(
             !CaptureBudget {
                 uses: 4.,
+                max_uses: None,
                 ..measured
             }
             .profitable(0)
@@ -293,9 +302,35 @@ mod tests {
         );
     }
     #[test]
+    fn temporary_calibration_limit_survives_empirical_reuse_and_keeps_graph_hits() {
+        let bounded = CaptureBudget {
+            max_uses: Some(2.),
+            ..budget(128.)
+        };
+        let hot = [CacheState::Direct {
+            uses: 32,
+            consecutive: 32,
+        }; 8];
+        assert!(!plan(&hot, true, Some(bounded)).unwrap().capture());
+        assert_eq!(
+            plan(&[CacheState::Graph; 8], true, Some(bounded))
+                .unwrap()
+                .mode,
+            Mode::Replay
+        );
+        assert!(
+            CaptureBudget {
+                capture_s: Some(0.001),
+                ..bounded
+            }
+            .profitable(0)
+        );
+    }
+    #[test]
     fn consecutive_verification_can_measure_replay_before_calibration_stops() {
         let measured = CaptureBudget {
             uses: 6.76517457959058,
+            max_uses: None,
             direct_s: Some(0.182719728),
             replay_s: None,
             capture_s: Some(0.313406262),
@@ -340,6 +375,7 @@ mod tests {
     fn retained_prompt_tail_can_learn_reuse_across_requests() {
         let unknown = CaptureBudget {
             uses: 1.,
+            max_uses: None,
             direct_s: Some(0.14),
             replay_s: None,
             capture_s: Some(0.30),
@@ -384,6 +420,7 @@ mod tests {
     fn retained_draft_shape_can_learn_reuse_across_short_cohorts() {
         let budget = CaptureBudget {
             uses: 1.,
+            max_uses: None,
             direct_s: Some(0.014),
             replay_s: None,
             capture_s: Some(0.04),

@@ -215,7 +215,15 @@ impl Runtime {
         if selected.iter().all(|(_, k)| *k == 0) {
             // Execute the packet whose ordinary price was requested. A second
             // selection can change its admissions and invalidate calibration.
-            return self.advance_selection(baseline, requests, options, maintenance);
+            let speculative_baseline =
+                maxima.iter().any(|&maximum| maximum > 0) && row_budget > selected.len();
+            return self.advance_selection(
+                baseline,
+                requests,
+                options,
+                speculative_baseline,
+                maintenance,
+            );
         }
         let maximum = selected.iter().map(|(_, count)| *count).max().unwrap();
         self.speculation_policy.begin_round(

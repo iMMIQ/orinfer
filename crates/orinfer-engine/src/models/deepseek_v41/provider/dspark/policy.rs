@@ -545,6 +545,25 @@ impl Policy {
             slack,
         )
     }
+    pub fn baseline_budget(
+        &self,
+        full: bool,
+        decode: bool,
+        work: Work,
+        uses: f64,
+        slack: f64,
+    ) -> super::super::super::team::CaptureBudget {
+        let mut budget = self.target_budget(full, decode, work, uses, slack);
+        if decode
+            && let Some((hot, seen)) = self.costs.local_evidence(Stage::Decode, 0, full, work)
+            && hot < adaptive::HOT_SAMPLES
+        {
+            // Auto reconsiders speculation after these ordinary samples.
+            // The remaining output is not a forecast of ordinary calls.
+            budget.max_uses = Some(adaptive::CALIBRATION_ROUNDS.saturating_sub(seen).max(1) as f64);
+        }
+        budget
+    }
     pub fn draft_budget(
         &self,
         block: usize,

@@ -1093,13 +1093,14 @@ impl Runtime {
             maintenance();
             return cached_outputs(requests);
         };
-        self.advance_selection(selection, requests, options, maintenance)
+        self.advance_selection(selection, requests, options, false, maintenance)
     }
     fn advance_selection(
         &mut self,
         selection: packet::Selection,
         requests: &mut [&mut Request],
         options: &scheduler::Options,
+        speculative_baseline: bool,
         maintenance: impl FnOnce(),
     ) -> Result<Vec<StepOutput>> {
         let packet::Selection {
@@ -1138,9 +1139,13 @@ impl Runtime {
             self.team.draft_blocks.first().copied().unwrap_or(0),
             options,
         );
-        let capture = self
-            .speculation_policy
-            .target_budget(full, layout.decode, work, uses, slack);
+        let capture = if speculative_baseline {
+            self.speculation_policy
+                .baseline_budget(full, layout.decode, work, uses, slack)
+        } else {
+            self.speculation_policy
+                .target_budget(full, layout.decode, work, uses, slack)
+        };
         let readout =
             packet::target_readout(requests, full, &BTreeMap::new(), self.vocab(), &selected)?;
         let (values, timing) =
