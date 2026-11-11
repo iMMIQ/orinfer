@@ -195,8 +195,10 @@ impl Costs {
         let geometry = self
             .cells
             .keys()
-            .filter(|(f, _, p)| {
+            .filter(|(f, q, p)| {
                 *p == path
+                    && (*q == 0) == (work.tokens == 0)
+                    && f.4.ilog2().abs_diff(wanted.4.ilog2()) <= 1
                     && f.0 == wanted.0
                     && f.1 == wanted.1
                     && (f.3 == 0) == (wanted.3 == 0)
@@ -367,6 +369,75 @@ mod tests {
         for _ in 0..4 {
             c.observe(w, path, seconds, 0.);
         }
+    }
+    #[test]
+    fn incompatible_decode_context_does_not_hide_a_valid_mixed_cost() {
+        let mut c = Costs::new(4000.);
+        let wanted = Work {
+            tokens: 1008,
+            context: 32768,
+            decode_rows: 16,
+            decode_context: 262144,
+            domain: 256,
+            ..Default::default()
+        };
+        observe(
+            &mut c,
+            Work {
+                tokens: 512,
+                decode_context: 32768,
+                ..wanted
+            },
+            Path::Direct,
+            0.14,
+        );
+        observe(
+            &mut c,
+            Work {
+                tokens: 1024,
+                decode_rows: 64,
+                ..wanted
+            },
+            Path::Direct,
+            0.17,
+        );
+        let p = c.estimate_path(wanted, Path::Direct);
+        assert!(p.samples > 0);
+        assert!((p.upper_s - 0.166).abs() < 1e-9);
+    }
+    #[test]
+    fn decode_only_geometry_does_not_hide_a_valid_mixed_cost() {
+        let mut c = Costs::new(4000.);
+        let wanted = Work {
+            tokens: 1008,
+            context: 32768,
+            decode_rows: 16,
+            decode_context: 262144,
+            domain: 256,
+            ..Default::default()
+        };
+        observe(
+            &mut c,
+            Work {
+                tokens: 0,
+                ..wanted
+            },
+            Path::Direct,
+            0.09,
+        );
+        observe(
+            &mut c,
+            Work {
+                tokens: 1024,
+                decode_rows: 64,
+                ..wanted
+            },
+            Path::Direct,
+            0.17,
+        );
+        let p = c.estimate_path(wanted, Path::Direct);
+        assert!(p.samples > 0);
+        assert!((p.upper_s - 0.166).abs() < 1e-9);
     }
     #[test]
     fn learns_token_context_and_execution_cost_without_mixing_modes_or_final_windows() {

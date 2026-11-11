@@ -1329,7 +1329,7 @@ impl Worker {
                     }
                 }
             }
-            if device_input.is_none() {
+            if device_input.as_ref().is_none_or(|d| !d.device_coordinates) {
                 let mut owner_hashes = vec![];
                 let mut owner_valid = vec![];
                 self.hasher

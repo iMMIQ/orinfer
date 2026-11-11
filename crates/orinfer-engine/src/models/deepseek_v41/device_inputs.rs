@@ -729,11 +729,15 @@ impl Runtime {
                 )?);
             }
         }
-        let hash_width = if packet
-            .body
-            .iter()
-            .chain(&packet.head)
-            .any(|step| matches!(step, Instruction::Lookup { .. }))
+        // Prefill already prepares host coordinates from the complete input.
+        // Keep its Engram hashes there too: a device round trip would fence
+        // the packet before its first host-resident table lookup.
+        let hash_width = if device_coordinates
+            && packet
+                .body
+                .iter()
+                .chain(&packet.head)
+                .any(|step| matches!(step, Instruction::Lookup { .. }))
         {
             self.contract.hash_width
         } else {
