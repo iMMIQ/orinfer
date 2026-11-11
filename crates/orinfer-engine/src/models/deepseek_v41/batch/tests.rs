@@ -153,6 +153,48 @@ fn launch_identity_matches_the_compilers_owner_work_extents() {
     }
 }
 #[test]
+fn graph_reuses_padded_owner_work_without_changing_real_items() {
+    let mut contract = contract();
+    let grid: RowExpression = serde_json::from_value(serde_json::json!({
+        "op":"divide", "lhs":{"op":"add","lhs":{"op":"rows"},"rhs":{"op":"constant","value":3}},
+        "rhs":{"op":"constant","value":4}
+    }))
+    .unwrap();
+    contract.work.insert("w".into(), grid.clone());
+    let launches = [WorkLaunch {
+        role: super::super::PacketRole::Target,
+        grid: grid.clone(),
+        range: None,
+        partition: 1,
+        decoder: false,
+    }]
+    .into();
+    let a = layout(&[5, 5, 5, 497], &[19, 7, 31, 2]).unwrap();
+    let b = layout(&[1, 1, 1, 509], &[2, 31, 7, 19]).unwrap();
+    let family = (super::super::PacketRole::Target, false, 1);
+    assert_eq!(
+        shape_key(&contract, &a, family, &launches).unwrap(),
+        shape_key(&contract, &b, family, &launches).unwrap()
+    );
+    let mut tables = vec![];
+    for view in [&a, &b] {
+        let real = work_items(view, &grid, None).unwrap();
+        let table = contract.work_items(view, &grid, "w", 0).unwrap();
+        assert_eq!(table.len(), 128);
+        assert_eq!(&table[..real.len()], real);
+        assert!(table[real.len()..].iter().all(|p| *p == [-1, 0]));
+        tables.push(table);
+    }
+    assert_ne!(tables[0], tables[1]);
+    assert_ne!(a.table_key(1), b.table_key(1));
+    let small_a = layout(&[3, 5, 4, 4], &[19, 7, 31, 2]).unwrap();
+    let small_b = layout(&[1, 1, 1, 13], &[2, 31, 7, 19]).unwrap();
+    assert_ne!(
+        shape_key(&contract, &small_a, family, &launches).unwrap(),
+        shape_key(&contract, &small_b, family, &launches).unwrap()
+    );
+}
+#[test]
 fn partitioned_work_keeps_original_owner_and_graph_order() {
     let mut contract: Contract = serde_json::from_value(serde_json::json!({
         "owners": 32, "columns": [], "private": [], "pointers": {},

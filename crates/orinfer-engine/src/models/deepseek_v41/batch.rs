@@ -88,6 +88,7 @@ impl Contract {
         name: &str,
         rank: usize,
     ) -> Result<Vec<[i32; 2]>> {
+        let padded = padded_work(layout);
         let decoder = self
             .decoder_replay
             .as_ref()
@@ -108,12 +109,14 @@ impl Contract {
         };
         if layout.work_shape.is_some() {
             let reference = layout.work_layout()?;
-            let capacity = self.work_items(&reference, grid, name, rank)?.len();
+            let capacity =
+                work_capacity(self.work_items(&reference, grid, name, rank)?.len(), padded);
             if items.len() > capacity {
                 return Err("Owner work exceeds its retained Graph capacity".into());
             }
             items.resize(capacity, [-1, 0]);
         }
+        items.resize(work_capacity(items.len(), padded), [-1, 0]);
         Ok(items)
     }
     pub(super) fn preferred_span(&self) -> usize {
@@ -642,6 +645,7 @@ fn shape_key(
     } else {
         layout
     };
+    let padded = padded_work(layout);
     let decoder = contract
         .decoder_replay
         .as_ref()
@@ -687,7 +691,7 @@ fn shape_key(
             if count > 8192 {
                 return Err("Owner work table exceeds its capacity".into());
             }
-            work_rows.push(count.max(1).div_ceil(2));
+            work_rows.push(work_capacity(count, padded) / 2);
         }
     }
     Ok(Key {
@@ -697,6 +701,19 @@ fn shape_key(
         outputs: layout.outputs.len(),
         work_rows,
     })
+}
+/// Owner tables carry real work; unused lanes already use the inactive sentinel.
+/// Retain a small launch envelope across nearby owner-work counts so changing
+/// prompt splits need not rebuild an otherwise identical model packet.
+fn padded_work(layout: &Layout) -> bool {
+    layout.role == super::PacketRole::Target && !layout.decode && layout.rows.total >= 512
+}
+fn work_capacity(count: usize, padded: bool) -> usize {
+    if padded {
+        count.max(2).next_power_of_two()
+    } else {
+        count.max(1).div_ceil(2) * 2
+    }
 }
 fn work_blocks(tokens: usize, grid: &RowExpression, range: Option<&WorkRange>) -> Result<usize> {
     if tokens == 0 || range.is_some_and(|r| tokens < r.min_rows || tokens > r.max_rows) {
