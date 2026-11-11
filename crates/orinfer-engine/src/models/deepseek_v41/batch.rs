@@ -1177,6 +1177,12 @@ impl Worker {
         let mut visual_rows = vec![];
         let mut hashes = vec![];
         let mut valid = vec![];
+        let needs_hashes = execution
+            .packet
+            .body
+            .iter()
+            .chain(&execution.packet.head)
+            .any(|step| matches!(step, super::Instruction::Lookup { .. }));
         let mut inputs = vec![];
         if let Some(name) = &execution.packet.sampling_controls {
             let stride = execution
@@ -1329,7 +1335,7 @@ impl Worker {
                     }
                 }
             }
-            if device_input.as_ref().is_none_or(|d| !d.device_coordinates) {
+            if needs_hashes {
                 let mut owner_hashes = vec![];
                 let mut owner_valid = vec![];
                 self.hasher

@@ -320,7 +320,7 @@ impl Model {
         }
         // An upward row extrapolation is a prior, not local calibration.
         // Downward reuse keeps the measured upper packet's whole cost.
-        let nearby = upper.is_some()
+        let nearby = upper.is_some_and(|(rows, _)| rows <= work.rows.saturating_mul(2))
             && group.4.ilog2().abs_diff(requested.4.ilog2()) <= 1
             && group.5.abs_diff(requested.5) <= 1;
         let value = |cell: &Cell| Prediction {
@@ -648,6 +648,92 @@ mod tests {
                 < 1e-12
         );
         assert_eq!(model.evidence(Stage::Target, 0, false, work), (2, 4));
+    }
+    #[test]
+    fn distant_large_packets_are_priors_not_small_packet_calibration() {
+        let mut model = Model::default();
+        for _ in 0..5 {
+            model.observe(point(96, false, 0.15));
+        }
+        let work = Work {
+            rows: 6,
+            context: 2048,
+            ..Work::default()
+        };
+        let prior = model.predict(Stage::Target, 0, false, work).unwrap();
+        assert!((prior.seconds - 0.15).abs() < 1e-12);
+        assert_eq!(model.evidence(Stage::Target, 0, false, work), (0, 0));
+        assert_eq!(
+            model.evidence(Stage::Target, 0, false, Work { rows: 48, ..work }),
+            (4, 5)
+        );
+        assert_eq!(
+            model.evidence(Stage::Target, 0, false, Work { rows: 47, ..work }),
+            (0, 0)
+        );
+        for _ in 0..5 {
+            model.observe(point(6, false, 0.02));
+        }
+        assert_eq!(model.evidence(Stage::Target, 0, false, work), (4, 5));
+    }
+    #[test]
+    fn old_round_samples_do_not_block_calibration_in_a_new_context() {
+        use super::super::{Budget, Feedback, Policy};
+        let mut policy = Policy::default();
+        for _ in 0..5 {
+            policy.baseline(1, false, false, 0.02);
+            policy.observe(
+                1,
+                (false, false, false),
+                [0.008, 0.02, 0.001, 0.],
+                &[(5, 4)],
+                5,
+            );
+            policy.costs.observe(Point {
+                stage: Stage::Decode,
+                ..point(1, false, 0.02)
+            });
+            policy.costs.observe(point(96, false, 0.15));
+        }
+        let work = Work {
+            rows: 1,
+            context: 2048,
+            ..Work::default()
+        };
+        let state = Feedback::default();
+        assert!(
+            policy.curves[&(1, false, false)].rounds[&(5, 6, 1, false)]
+                .time
+                .samples()
+                >= 3
+        );
+        assert_eq!(
+            policy
+                .costs
+                .evidence(Stage::Target, 0, false, Work { rows: 6, ..work }),
+            (0, 0)
+        );
+        let allocation = policy
+            .select_requests_with_forecast(
+                (false, false),
+                Budget {
+                    rows: 6,
+                    remaining: 256,
+                    work,
+                    ..Budget::default()
+                },
+                &[5],
+                &[&state],
+                &[5],
+                |depths, _| {
+                    Ok(Some(Work {
+                        rows: 1 + depths[0],
+                        ..work
+                    }))
+                },
+            )
+            .unwrap();
+        assert_eq!(allocation.depths, [5]);
     }
     #[test]
     fn calibration_combines_direct_and_replay_without_claiming_graph_residency() {

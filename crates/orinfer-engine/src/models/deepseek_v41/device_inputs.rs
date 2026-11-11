@@ -114,11 +114,7 @@ impl Contract {
             + self.capacity * (32 + 8 + 512)
             + owners * (32 + 16 + DRAFTS * 4)
             + outputs * 8 * 9
-            + VOCAB * 4
-            + owners * 16
-            + self.capacity * 4
-            + self.hash_width * (self.capacity * 8 + 16)
-            + 64 * 32)
+            + owners * 16)
     }
     pub(super) fn preflight(&self, model: &super::Model, base: &Path) -> Result<()> {
         let batch = model
@@ -339,9 +335,6 @@ pub(super) struct Prepared {
     pub(super) ids: Buffer,
     pub(super) device_coordinates: bool,
     pub(super) device_embedding: bool,
-    pub(super) hashes: Buffer,
-    pub(super) valid: Buffer,
-    pub(super) hash_width: usize,
 }
 type Binding = (String, usize, Vec<(usize, usize)>);
 pub(super) struct Runtime {
@@ -364,11 +357,6 @@ pub(super) struct Runtime {
     gathered: Buffer,
     output: Buffer,
     history: Buffer,
-    token_map: Buffer,
-    multipliers: Buffer,
-    buckets: Buffer,
-    hashes: Buffer,
-    valid: Buffer,
     epochs: Vec<i32>,
     ready: BTreeSet<usize>,
     drafted: BTreeSet<usize>,
@@ -388,6 +376,9 @@ impl Runtime {
         let session = &worker.session;
         let templates = c
             .manifests()
+            // Keep the legacy hash asset in package validation. Host-resident
+            // Engram tables use the shared CPU hasher without a device fence.
+            .filter(|name| *name != c.hashes)
             .map(|name| {
                 Ok((
                     name.to_owned(),
@@ -433,38 +424,6 @@ impl Runtime {
         }
         let state = session.allocate(owners * 16)?;
         session.fill(&state, 0)?.wait()?;
-        let layout = worker.hasher.layout();
-        let token_map = session.allocate(VOCAB * 4)?;
-        super::upload(
-            session,
-            &token_map,
-            &layout
-                .token_map
-                .iter()
-                .flat_map(|x| x.to_le_bytes())
-                .collect::<Vec<_>>(),
-        )?;
-        let multipliers = session.allocate(layout.layers.len() * 32)?;
-        super::upload(
-            session,
-            &multipliers,
-            &layout
-                .layers
-                .iter()
-                .flat_map(|l| l.multipliers)
-                .flat_map(i64::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )?;
-        let buckets = session.allocate(c.hash_width * 16)?;
-        let mut parameters = vec![];
-        for layer in &layout.layers {
-            let mut offset = 0i64;
-            for &prime in &layer.primes {
-                parameters.extend([prime, offset].into_iter().flat_map(i64::to_le_bytes));
-                offset += prime;
-            }
-        }
-        super::upload(session, &buckets, &parameters)?;
         let source = worker.checkpoint.read(DRAFT_EMBEDDING)?;
         if source.dtype != safetensors::Dtype::BF16 || source.shape != [VOCAB, WIDTH] {
             return Err("Draft vocabulary embedding checkpoint differs".into());
@@ -496,11 +455,6 @@ impl Runtime {
             gathered: session.allocate(8 * outputs * 8)?,
             output: session.allocate(outputs * 8)?,
             history: session.allocate(owners * 16)?,
-            token_map,
-            multipliers,
-            buckets,
-            hashes: session.allocate(c.capacity * c.hash_width * 8)?,
-            valid: session.allocate(c.capacity * 4)?,
             epochs: vec![1; owners],
             ready: BTreeSet::new(),
             drafted: BTreeSet::new(),
@@ -729,38 +683,6 @@ impl Runtime {
                 )?);
             }
         }
-        // Prefill already prepares host coordinates from the complete input.
-        // Keep its Engram hashes there too: a device round trip would fence
-        // the packet before its first host-resident table lookup.
-        let hash_width = if device_coordinates
-            && packet
-                .body
-                .iter()
-                .chain(&packet.head)
-                .any(|step| matches!(step, Instruction::Lookup { .. }))
-        {
-            self.contract.hash_width
-        } else {
-            0
-        };
-        if hash_width != 0 {
-            let name = self.contract.hashes.clone();
-            kernels.push(self.bind(
-                &worker.session,
-                &name,
-                &[
-                    self.mapping.clone(),
-                    self.ids.clone(),
-                    self.history.clone(),
-                    self.token_map.clone(),
-                    self.multipliers.clone(),
-                    self.buckets.clone(),
-                    self.hashes.clone(),
-                    self.valid.clone(),
-                ],
-                layout.rows.total,
-            )?);
-        }
         Ok(Prepared {
             kernels,
             ids: self.ids.clone(),
@@ -769,9 +691,6 @@ impl Runtime {
                 || layout.segments.iter().all(|s| {
                     self.ready.contains(&s.slot) && readout.continuations.contains(&s.slot)
                 }),
-            hashes: self.hashes.clone(),
-            valid: self.valid.clone(),
-            hash_width,
         })
     }
     pub(super) fn embedding(

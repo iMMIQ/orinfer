@@ -486,8 +486,6 @@ impl Worker {
         }
         let mut embeddings = embeddings.into_iter();
         let mut device_embeddings = device_embeddings.iter();
-        let mut hash_readback = None;
-        let mut device_hashes: Option<(Vec<i64>, Vec<bool>)> = None;
         // SAFETY: Execution owns the stable graphs and W4 plans; each graph
         // retains its kernels/collectives, and W4 retains tensors/workspace.
         // submit_compute fences partial submission on failure. Each forward
@@ -506,12 +504,6 @@ impl Worker {
                     if let Some(device) = &device {
                         for kernel in &device.kernels {
                             kernel.launch_on_stream(stream)?;
-                        }
-                        if device.hash_width != 0 {
-                            hash_readback = Some(self.session.enqueue_readback(&[
-                                (&device.hashes, 0, tokens.len() * device.hash_width * 8),
-                                (&device.valid, 0, tokens.len() * 4),
-                            ])?);
                         }
                         if let Some(name) = &execution.packet.coordinates.input_ids {
                             self.session.copy(
@@ -577,35 +569,6 @@ impl Worker {
                                 scales,
                                 mask,
                             } => {
-                                if let Some(readback) = hash_readback.take() {
-                                    let mut bytes =
-                                        self.session.wait_readback(readback)?.into_iter();
-                                    let hashes = bytes
-                                        .next()
-                                        .ok_or("Missing device hashes")?
-                                        .as_chunks::<8>()
-                                        .0
-                                        .iter()
-                                        .map(|b| i64::from_le_bytes(*b))
-                                        .collect();
-                                    let valid = bytes
-                                        .next()
-                                        .ok_or("Missing device hash validity")?
-                                        .as_chunks::<4>()
-                                        .0
-                                        .iter()
-                                        .map(|b| match i32::from_le_bytes(*b) {
-                                            0 => Ok(false),
-                                            1 => Ok(true),
-                                            _ => Err("Invalid device hash validity".to_string()),
-                                        })
-                                        .collect::<Result<Vec<_>>>()?;
-                                    device_hashes = Some((hashes, valid));
-                                }
-                                let (hashes, valid) = device_hashes
-                                    .as_ref()
-                                    .map(|(h, v)| (h.as_slice(), v.as_slice()))
-                                    .unwrap_or((hashes, valid));
                                 // Earlier graph segments are already queued.
                                 // Prepare CPU rows while they execute, then
                                 // update reused inputs at this stream boundary.

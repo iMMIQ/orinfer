@@ -8,9 +8,10 @@ CANN 通信适配器由引擎的 `native/ascend` 构建，保留嵌入库的 gli
 ## 离线源码
 
 DSv4.1 A2 的设备续步输入通过独立执行包能力 `device_inputs` 接入现有动态 packet。
-普通 decode 与 DSpark 共享 owner 输入状态、设备 embedding 查找及 Engram 地址生成；
+普通 decode 与 DSpark 共享 owner 输入状态与设备 embedding 查找；
 接受前缀在设备上更新下一个 token、位置和三 token 历史。主机保留输出解析和 prefix
-历史，Engram 大表仍在主机，地址读回与前置计算重叠。owner 重置、复用和 prefix
+历史，Engram 地址复用共享 CPU hasher，在提交 packet 前准备，与主机大表保持同侧。
+owner 重置、复用和 prefix
 恢复使设备输入身份失效，下次执行从请求历史初始化。
 生成入口显式声明可复用的无约束采样行；语法切换和显式固定历史输入从主机历史初始化，
 保持各入口的输入语义。

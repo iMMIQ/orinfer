@@ -106,7 +106,14 @@ pub(super) fn plan(
             })
             .min()
             .unwrap_or(0);
-        if observed >= 8 {
+        // Consecutive hits are stronger evidence than scattered tail reuse.
+        // A verification family can finish calibration before eight hits;
+        // use four consecutive executions to price its first replay trial.
+        let stable = repeated
+            && states.iter().all(|state| {
+                matches!(state, CacheState::Direct { consecutive, .. } if *consecutive >= 4)
+            });
+        if observed >= 8 || stable {
             budget.uses = budget.uses.max(f64::from(observed.min(16)) * 2.);
         }
         budget
@@ -284,6 +291,50 @@ mod tests {
                 .unwrap()
                 .capture()
         );
+    }
+    #[test]
+    fn consecutive_verification_can_measure_replay_before_calibration_stops() {
+        let measured = CaptureBudget {
+            uses: 6.76517457959058,
+            direct_s: Some(0.182719728),
+            replay_s: None,
+            capture_s: Some(0.313406262),
+            slack_s: 1.154249368,
+            trace: false,
+        };
+        let ready = CacheState::Direct {
+            uses: 4,
+            consecutive: 4,
+        };
+        assert!(plan(&[ready; 8], true, Some(measured)).unwrap().capture());
+        let scattered = CacheState::Direct {
+            uses: 4,
+            consecutive: 1,
+        };
+        assert!(
+            !plan(&[scattered; 8], true, Some(measured))
+                .unwrap()
+                .capture()
+        );
+        assert!(!plan(&[ready; 8], false, Some(measured)).unwrap().capture());
+        let mut lagging = [ready; 8];
+        lagging[7] = CacheState::Direct {
+            uses: 3,
+            consecutive: 3,
+        };
+        assert!(!plan(&lagging, true, Some(measured)).unwrap().capture());
+        for budget in [
+            CaptureBudget {
+                slack_s: 0.4,
+                ..measured
+            },
+            CaptureBudget {
+                replay_s: Some(0.19),
+                ..measured
+            },
+        ] {
+            assert!(!plan(&[ready; 8], true, Some(budget)).unwrap().capture());
+        }
     }
     #[test]
     fn retained_prompt_tail_can_learn_reuse_across_requests() {

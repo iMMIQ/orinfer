@@ -849,8 +849,9 @@ impl Policy {
                     self.costs.evidence(Stage::Draft, block, false, draft_work),
                     self.costs.evidence(Stage::Restore, block, full, draft_work),
                 ];
-                let inferred = evidence.iter().map(|p| p.0).min().unwrap();
-                let samples = observed.map_or(0, |c| c.time.samples()).max(inferred);
+                // Round history spans contexts. Only nearby stage samples
+                // establish calibration for this packet's actual workload.
+                let samples = evidence.iter().map(|p| p.0).min().unwrap();
                 // One representative maximum packet calibrates a physical
                 // family. Shorter prefixes reuse its conservative measured
                 // cost; they must not each trigger a fresh Graph calibration.
