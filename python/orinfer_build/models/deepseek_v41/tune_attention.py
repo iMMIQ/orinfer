@@ -17,8 +17,15 @@ from orinfer_build.contracts.row_selection import guarded_winner
 from orinfer_build.tuning.tuning import read_record, record_path
 
 
-def attention_configs(parameters):
+def attention_configs(parameters, *, gather_pipeline=False):
     """Retain the published schedule when tuning the softmax head tile."""
+    if gather_pipeline:
+        enabled = parameters.get("async_gather", False)
+        return {"baseline": {}} | (
+            {"sync-gather" if enabled else "async-gather": dict(async_gather=not enabled)}
+            if parameters.get("tile_slots", 16) > 1
+            else {}
+        )
     return {"baseline": {}} | {
         f"head-{tile}": dict(softmax_heads=tile)
         for tile in (1, 4, 8)
@@ -53,7 +60,7 @@ def attention_groups(model, base, minimum):
     return groups
 
 
-def compile_plan(plan, output, workers, minimum, model_dir=None):
+def compile_plan(plan, output, workers, minimum, model_dir=None, *, gather_pipeline=False):
     from kernels.ascend.attention_fused import selected_int8
     from orinfer_build.contracts.ascend.geometry import physical_shapes
 
@@ -80,7 +87,7 @@ def compile_plan(plan, output, workers, minimum, model_dir=None):
         aliases = list(p["_owner_aliases"])
         metadata = {k: v for k, v in p.items() if k.startswith("_owner_")}
         metadata["_owner_source_sha256"] = file_hash(Path(selected_int8.__code__.co_filename))
-        for label, updates in attention_configs(p).items():
+        for label, updates in attention_configs(p, gather_pipeline=gather_pipeline).items():
             if label == "baseline":
                 continue
             task = dict(
@@ -403,6 +410,11 @@ def main():
     parser.add_argument("--compile-workers", type=int, default=2)
     parser.add_argument("--min-rows", type=int, default=512)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument(
+        "--gather-pipeline",
+        action="store_true",
+        help="Compare the published KV read schedule with overlapping slot DMAs",
+    )
     args = parser.parse_args()
     if args.compile_only:
         report = compile_plan(
@@ -411,6 +423,7 @@ def main():
             args.compile_workers,
             args.min_rows,
             args.model_dir,
+            gather_pipeline=args.gather_pipeline,
         )
     else:
         report = select_plan(args.plan, args.output, args.device, args.min_rows, args.model_dir)

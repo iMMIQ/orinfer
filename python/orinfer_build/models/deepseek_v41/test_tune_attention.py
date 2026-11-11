@@ -7,6 +7,20 @@ from orinfer_build.models.deepseek_v41.tune_attention import attention_configs, 
 
 
 class AttentionTuningTests(unittest.TestCase):
+    def test_dma_search_keeps_the_published_math_and_supports_retuning(self):
+        original = dict(softmax_heads=4, tile_slots=16, reuse_long=True)
+        configs = attention_configs(original, gather_pipeline=True)
+        self.assertEqual(configs, {"baseline": {}, "async-gather": dict(async_gather=True)})
+        enabled = dict(original, async_gather=True)
+        self.assertEqual(
+            attention_configs(enabled, gather_pipeline=True),
+            {"baseline": {}, "sync-gather": dict(async_gather=False)},
+        )
+        self.assertEqual(
+            attention_configs(dict(original, tile_slots=1), gather_pipeline=True),
+            {"baseline": {}},
+        )
+
     def test_existing_four_head_schedule_remains_the_baseline(self):
         parameters = dict(softmax_heads=4, tile_slots=16, reuse_long=True)
         original = deepcopy(parameters)
