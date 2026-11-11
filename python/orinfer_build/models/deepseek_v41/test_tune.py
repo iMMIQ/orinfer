@@ -14,6 +14,7 @@ from orinfer_build.models.deepseek_v41.tune import (
     read_prepared_bank,
 )
 from orinfer_build.models.deepseek_v41.tune_auxiliary import (
+    baseline_configs,
     canonical_partials,
     head_configs,
     head_row_policy,
@@ -21,6 +22,18 @@ from orinfer_build.models.deepseek_v41.tune_auxiliary import (
 
 
 class AuxiliaryHeadTests(unittest.TestCase):
+    def test_auxiliary_retuning_keeps_the_published_tile_as_its_reference(self):
+        candidates = [dict(tile=256), dict(tile=1024), dict(tile=5120)]
+        self.assertEqual(
+            baseline_configs(dict(tile=5120), candidates),
+            [dict(tile=5120), dict(tile=256), dict(tile=1024)],
+        )
+        self.assertEqual(baseline_configs({}, candidates), candidates)
+        self.assertEqual(
+            baseline_configs(dict(tile=1280), candidates),
+            [dict(tile=1280), *candidates],
+        )
+
     def test_row_tile_search_preserves_the_published_arithmetic_schedule(self):
         parameters = dict(
             integer=True,

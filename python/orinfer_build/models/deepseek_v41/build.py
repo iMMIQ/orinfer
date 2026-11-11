@@ -1676,6 +1676,20 @@ def kernel_rebuild_task(spec, placeholder):
         module = import_module("kernels.ascend." + module_name)
         capacity = parameters.get("_row_capacity")
     args = {k: v for k, v in parameters.items() if not k.startswith("_")}
+    if spec["op"] == "sampling_processed.merge" and "vocab" in args:
+        # Earlier exports recorded the local sampler's vocabulary instead of
+        # this merger's physical partition count. Preserve that exact geometry.
+        parts = (args.pop("vocab") + 1023) // 1024
+        if spec["operands"][0]["shape"][1] != parts:
+            raise ValueError("Processed sampler partition geometry differs")
+        args["parts"] = parts
+    if capacity is not None and "rows" not in args:
+        from inspect import signature
+
+        # Sampling/device-input builders may record only their non-row scalars.
+        # The published capacity still fixes the original dynamic row ABI.
+        if "rows" in signature(getattr(module, name)).parameters:
+            args["rows"] = capacity
     dynamic = {
         key: args[key] // capacity
         for key in ("rows", "tokens", "expert_rows")
@@ -1764,19 +1778,9 @@ def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None):
         "floating.split",
         "model_ops.gather_attention",
     }
-    references = []
-    for rank in model["ranks"]:
-        for packet in rank["packets"]:
-            for step in packet["body"] + packet["head"]:
-                if step["op"] == "kernel":
-                    references.extend(
-                        (step, key)
-                        for key in ("manifest", "uncompacted_manifest")
-                        if step.get(key) is not None
-                    )
-    for variants in model.get("row_selections", {}).values():
-        for variant in variants:
-            references.extend((variant["kernels"], i) for i in range(len(variant["kernels"])))
+    from orinfer_build.models.deepseek_v41.publication import manifest_bindings
+
+    references = list(manifest_bindings(model))
     descriptions = {}
     for binding, key in references:
         manifest = binding[key]

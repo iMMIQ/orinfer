@@ -13,46 +13,49 @@ from orinfer_build.packaging.publication import AssetReader, source_path
 from orinfer_build.compiler.ascend.toolchain import require_cann92
 
 
-def manifests(model):
-    names = set()
+def manifest_bindings(model):
+    """Yield mutable references to every executable kernel in the published model."""
     for rank in model["ranks"]:
         for packet in rank["packets"]:
             for step in packet["body"] + packet["head"]:
                 if step["op"] == "kernel":
-                    names.add(step["manifest"])
+                    yield step, "manifest"
                     if step.get("uncompacted_manifest"):
-                        names.add(step["uncompacted_manifest"])
+                        yield step, "uncompacted_manifest"
     for choices in model.get("row_selections", {}).values():
         for choice in choices:
-            names.update(choice["kernels"])
-    names.update(op["manifest"] for op in model.get("vision", {}).get("body", []))
-    names.update(
-        model.get("sampling", {}).get(k)
-        for k in ("local", "merge", "processed_local", "processed_merge")
-        if model.get("sampling", {}).get(k)
-    )
-    names.update(
-        model.get("sampling", {}).get("rejection", {}).get(k)
-        for k in ("statistics", "merge_statistics", "normalize", "select")
-        if model.get("sampling", {}).get("rejection", {}).get(k)
-    )
+            for index in range(len(choice["kernels"])):
+                yield choice["kernels"], index
+    for op in model.get("vision", {}).get("body", []):
+        yield op, "manifest"
+    sampling = model.get("sampling", {})
+    for key in ("local", "merge", "processed_local", "processed_merge"):
+        if sampling.get(key):
+            yield sampling, key
+    rejection = sampling.get("rejection", {})
+    for key in ("statistics", "merge_statistics", "normalize", "select"):
+        if rejection.get(key):
+            yield rejection, key
     inputs = model.get("device_inputs")
     if inputs:
-        names.update(
-            inputs[k]
-            for k in (
-                "merge",
-                "commit",
-                "save_draft",
-                "hashes",
-                "scatter_embedding",
-                "draft_embedding",
-            )
-        )
-        names.update(inputs["embeddings"].values())
+        for key in (
+            "merge",
+            "commit",
+            "save_draft",
+            "hashes",
+            "scatter_embedding",
+            "draft_embedding",
+        ):
+            yield inputs, key
+        for key in inputs["embeddings"]:
+            yield inputs["embeddings"], key
         for preparation in inputs["preparations"].values():
-            names.update(preparation.values())
-    return sorted(names)
+            for key in preparation:
+                yield preparation, key
+
+
+def manifests(model):
+    return sorted({binding[key] for binding, key in manifest_bindings(model)})
 
 
 def prepare_execution(model, source, stage):

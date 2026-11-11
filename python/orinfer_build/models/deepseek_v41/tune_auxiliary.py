@@ -7,8 +7,14 @@ import json
 from pathlib import Path
 
 from orinfer_build.common.files import atomic_json, file_hash
-from orinfer_build.contracts.row_selection import aggregate_winner, guarded_winner
+from orinfer_build.contracts.row_selection import guarded_winner
 from orinfer_build.tuning.tuning import compile_candidates, measure, read_record, record_path
+
+
+def baseline_configs(parameters, configs):
+    """Compare candidates with the published schedule, including previously tuned tiles."""
+    baseline = {key: parameters.get(key, value) for key, value in configs[0].items()}
+    return [baseline] + [config for config in configs if config != baseline]
 
 
 def head_configs(parameters):
@@ -106,7 +112,12 @@ def main():
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--mask-only", action="store_true")
     parser.add_argument("--head-only", action="store_true")
-    parser.add_argument("--maximum-regression", type=float, default=0.1)
+    parser.add_argument(
+        "--maximum-regression",
+        type=float,
+        default=0.1,
+        help="Maximum per-row latency increase relative to the published schedule",
+    )
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--rows", type=int, nargs="+", default=[17, 128, 512, 2048])
     parser.add_argument(
@@ -327,6 +338,8 @@ def main():
                     )
                     configs = [baseline_config] + [c for c in configs if c != baseline_config]
 
+            configs = baseline_configs(params, configs)
+
             def build(config):
                 if args.head_only and config == configs[0]:
                     return base / step["manifest"]
@@ -374,7 +387,7 @@ def main():
                     }
                 ),
                 calls_per_replay=args.calls_per_replay,
-                maximum_regression=args.maximum_regression if args.head_only else None,
+                maximum_regression=args.maximum_regression,
                 tuner_sha256=file_hash(Path(__file__)),
                 seed=20261002,
                 reduction_source=file_hash(Path(dense.__file__)),
@@ -610,7 +623,7 @@ def main():
                         rejected.append(dict(config=legal[i], rows=rows, reason=str(error)))
                         continue
                     times[str(i)] = timing
-                if rows in identity["samples"]:
+                if rows in identity["samples"] or not args.head_only:
                     measurements.append(dict(rows=rows, times=times))
                 print(dict(op=kind, rows=rows, times=times), flush=True)
             for sample in measurements:
@@ -630,7 +643,11 @@ def main():
                 if args.head_only
                 else None
             )
-            selected = int(policy["default"] if policy else aggregate_winner(measurements))
+            selected = int(
+                policy["default"]
+                if policy
+                else guarded_winner(measurements, maximum_regression=args.maximum_regression)
+            )
             chosen = str(paths[selected].relative_to(base))
             variants = []
             if policy and policy["variant"] is not None:

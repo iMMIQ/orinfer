@@ -15,6 +15,7 @@ from orinfer_build.weights.safetensors_source import local_header
 from orinfer_build.common.files import file_hash
 from orinfer_build.common.elf import runtime_sections
 from orinfer_build.models.deepseek_v41.publication import (
+    manifest_bindings,
     manifests,
     prepare_execution,
     publish_execution,
@@ -43,6 +44,59 @@ def read_tensor(root, index, name):
 
 
 class ReleaseExportTests(unittest.TestCase):
+    def test_rebuild_bindings_cover_media_sampling_and_device_input_programs(self):
+        model = dict(
+            ranks=[
+                dict(
+                    packets=[
+                        dict(
+                            body=[
+                                dict(
+                                    op="kernel", manifest="target", uncompacted_manifest="fallback"
+                                )
+                            ],
+                            head=[],
+                        )
+                    ]
+                )
+            ],
+            row_selections=dict(target=[dict(kernels=["choice"])]),
+            vision=dict(body=[dict(manifest="vision")]),
+            sampling=dict(local="sample", rejection=dict(select="reject")),
+            device_inputs=dict(
+                merge="merge",
+                commit="commit",
+                save_draft="save",
+                hashes="hashes",
+                scatter_embedding="scatter",
+                draft_embedding="draft",
+                embeddings=dict(target="embedding"),
+                preparations=dict(target=dict(prepare="prepare")),
+            ),
+            index=dict(file="weights.index.json"),
+        )
+        expected = {
+            "target",
+            "fallback",
+            "choice",
+            "vision",
+            "sample",
+            "reject",
+            "merge",
+            "commit",
+            "save",
+            "hashes",
+            "scatter",
+            "draft",
+            "embedding",
+            "prepare",
+        }
+        self.assertEqual(set(manifests(model)), expected)
+        for binding, key in manifest_bindings(model):
+            binding[key] = "rebuilt/" + binding[key]
+        self.assertEqual(set(manifests(model)), {"rebuilt/" + name for name in expected})
+        self.assertEqual(model["index"], dict(file="weights.index.json"))
+
     def test_publication_rejects_mixed_sources_before_copying_assets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

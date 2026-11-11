@@ -29,6 +29,7 @@ from orinfer_build.compiler.ascend.rows import bounded_grid, split_resources
 from orinfer_build.compiler.ascend.scalar_cache import lower_scalar_cache
 from orinfer_build.compiler.ascend.pipeline import lower_gather_pipeline
 from orinfer_build.compiler.ascend.toolchain import cann_version
+from orinfer_build.compiler.ascend.host_launch import lower_host_arguments
 
 
 KERNEL_ROOT = ROOT / "kernels/ascend"
@@ -151,6 +152,7 @@ def compile_kernel(
         "vector_launch": "paired-aiv-v2",
         "scalar_cache": "entry-invalidate-exit-clean-v1",
         "cube_launch": "independent-aic-v1",
+        "host_launch": "packed-host-v1",
     }
     if explicit_sync:
         compiler["pipeline_sync"] = "explicit-v1"
@@ -258,10 +260,14 @@ def compile_kernel(
         # The pointer-table host ABI retains its versioned public symbols.
         operator = re.sub(r"[^a-zA-Z0-9_]", "_", name)
         source = source.replace(kernels[0], f"orinfer_{operator}_{key[:12]}_s{index}")
+        source = lower_host_arguments(source)
         if len(stages) > 1:
             source = re.sub(r"\bcall\b", f"orinfer_stage{index}_call", source)
         entry = f"orinfer_stage{index}_call" if len(stages) > 1 else "call"
-        calls.append(f"{entry}({', '.join(arguments)}, stream);")
+        calls.append(
+            f"{{ int32_t status = {entry}({', '.join(arguments)}, stream); "
+            "if (status) return status; }"
+        )
         sources.append(source)
     if used != set(range(len(operands))):
         raise ValueError("AOT pipeline contains an unused declared operand")
@@ -283,11 +289,7 @@ def compile_kernel(
         if row_capacity is not None
         else ""
     )
-    calls = "\n    ".join(
-        call
-        + "\n    { int32_t status = aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL); if (status) return status; }"
-        for call in calls
-    )
+    calls = "\n    ".join(calls)
     source += f"""
 extern "C" const char* orinfer_ascend_kernel_spec_v1() {{
     return {json.dumps(json.dumps(identity, sort_keys=True))};
@@ -297,7 +299,7 @@ extern "C" int32_t orinfer_ascend_kernel_v{version}(void* const* args, uint64_t 
     {row_check}
     for (uint64_t i = 0; i < count; ++i) if (!args[i]) return ACL_ERROR_INVALID_PARAM;
     {calls}
-    return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
+    return ACL_SUCCESS;
 }}
 """
     generator = LibraryGenerator(target="ascendc", platform="A2")

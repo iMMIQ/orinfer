@@ -176,7 +176,7 @@ def attach_processed(model, base):
             factory(**arguments),
             "sampling_processed." + field.removeprefix("processed_"),
             [operand(*p) for p in ports],
-            dict(vocab=vocab),
+            {key: value for key, value in arguments.items() if key != "rows"},
             base / "cache",
             row_capacity=capacity,
         )
