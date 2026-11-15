@@ -27,6 +27,7 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--device", type=int, default=7)
     p.add_argument("--owners", type=int, default=3)
+    p.add_argument("--indexer-query-group", type=int, choices=(1, 2, 4), default=1)
     p.add_argument("--rows", type=int, nargs="+", help="Owner row lengths for selected attention")
     p.add_argument("--attention-heads", type=int, nargs="+", default=[8])
     p.add_argument("--pv-tile-d", type=int, nargs="+", choices=(32, 64, 128, 256), default=[32])
@@ -58,6 +59,7 @@ def main():
             ["attention_cube.softmax"],
             ["attention_fused.selected_int8"],
             ["indexer_fused.causal_topk"],
+            ["indexer_fused.prepare_queries"],
         )
     ):
         p.error(
@@ -101,7 +103,12 @@ def main():
     }
     report = []
     for module, name, params in [
-        (indexer_fused, "causal_topk", dict(rows=capacity, length=8192, tile_rows=8)),
+        (
+            indexer_fused,
+            "causal_topk",
+            dict(rows=capacity, length=8192, tile_rows=8, query_group=a.indexer_query_group),
+        ),
+        (indexer_fused, "prepare_queries", dict(rows=capacity, query_group=4)),
         *[
             (attention_cube, "pv", dict(rows=capacity, heads=heads, selected=selected, tile_d=tile))
             for selected in (128, 640)
@@ -206,6 +213,7 @@ def main():
                 "output_workspace",
             },
             "causal_topk": {"candidates", "cube_workspace", "score_workspace"},
+            "prepare_queries": {"packed_query", "packed_scales", "packed_weights"},
         }[name]
         specs = [
             operand(

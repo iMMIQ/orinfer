@@ -129,6 +129,7 @@ def select_chunk(
     start,
     selected,
     block,
+    tmp=None,
 ):
     if valid > 0:
         T.tile.createvecindex(positions, T.float32(0.0))
@@ -136,15 +137,15 @@ def select_chunk(
         T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
         if selected == 512:
             if valid <= 512:
-                T.tile.topk(pairs, x, selected, 512)
+                T.tile.topk(pairs, x, selected, 512, tmp=tmp)
             elif valid <= 1024:
-                T.tile.topk(pairs, x, selected, 1024)
+                T.tile.topk(pairs, x, selected, 1024, tmp=tmp)
             elif valid <= 2048:
-                T.tile.topk(pairs, x, selected, 2048)
+                T.tile.topk(pairs, x, selected, 2048, tmp=tmp)
             else:
-                T.tile.topk(pairs, x, selected, block)
+                T.tile.topk(pairs, x, selected, block, tmp=tmp)
         else:
-            T.tile.topk(pairs, x, selected, block)
+            T.tile.topk(pairs, x, selected, block, tmp=tmp)
     else:
         T.tile.fill(pairs, -T.infinity("float32"))
     # Add the chunk origin only to index lanes, using vector math.

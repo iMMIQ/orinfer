@@ -13,6 +13,9 @@ def main():
     parser.add_argument("--length", type=int, default=131072)
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 17, 256])
     parser.add_argument("--tile-rows", type=int, choices=(1, 2, 4, 8), default=8)
+    parser.add_argument("--tile-s", type=int, choices=(64, 128), default=128)
+    parser.add_argument("--query-group", type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument("--emit-block-scores", action="store_true")
     parser.add_argument("--device", type=int, default=7)
     args = parser.parse_args()
     import torch
@@ -51,7 +54,37 @@ def main():
         (
             "indexer_fused.causal_topk",
             indexer_fused.causal_topk,
-            dict(rows=capacity, length=length, tile_rows=args.tile_rows),
+            dict(
+                rows=capacity,
+                length=length,
+                tile_rows=args.tile_rows,
+                tile_s=args.tile_s,
+                query_group=args.query_group,
+                emit_block_scores=args.emit_block_scores,
+            ),
+        ),
+        (
+            "indexer_fused.causal_topk",
+            indexer_fused.causal_topk,
+            dict(
+                rows=capacity,
+                length=length,
+                tile_rows=8,
+                tile_s=128,
+                query_group=1,
+                emit_block_scores=args.emit_block_scores,
+            ),
+        ),
+        *(
+            [
+                (
+                    "indexer_fused.prepare_queries",
+                    indexer_fused.prepare_queries,
+                    dict(rows=capacity, query_group=args.query_group),
+                )
+            ]
+            if args.query_group > 1
+            else []
         ),
     ]:
         print("compiling", name, flush=True)
@@ -71,7 +104,8 @@ def main():
                 kinds[str(t.dtype)],
                 shape,
                 "read_write"
-                if t.name in {"out", "workspace", "candidates", "cube_workspace", "score_workspace"}
+                if t.name.startswith("packed_")
+                or t.name in {"out", "workspace", "candidates", "cube_workspace", "score_workspace"}
                 else "read",
             )
             for t, shape in zip(tensors, shapes, strict=True)
@@ -102,8 +136,17 @@ def main():
     workspace = torch.empty(capacity * heads, 8192, dtype=torch.int32, device="npu")
     chunks = (length + 4095) // 4096
     before = torch.empty(capacity + 1, chunks, 1024, device="npu")
-    after = torch.empty_like(before)
-    cube = torch.empty(64, args.tile_rows * heads, 128, dtype=torch.int32, device="npu")
+    after = torch.empty(
+        capacity + 1, chunks, 1536 if args.emit_block_scores else 1024, device="npu"
+    )
+    current_output = torch.empty_like(after)
+    cube = torch.empty(
+        64,
+        args.tile_rows * heads,
+        args.tile_s,
+        dtype=torch.int32,
+        device="npu",
+    )
     local_scores = torch.empty(64, args.tile_rows, 4096, device="npu")
     shared = [q, qs, keys, ks, weights, counts]
 
@@ -119,9 +162,21 @@ def main():
         call(0, shared + [scores, workspace], rows)
         call(1, [scores, counts, before], rows)
 
-    def fused(rows):
-        call(2, shared + [after, cube, local_scores], rows)
+    packed = list(shared)
+    if args.query_group > 1:
+        for slot in (0, 1, 4):
+            packed[slot] = torch.empty_like(shared[slot])
 
+    def fused(rows):
+        if args.query_group > 1:
+            call(4, [q, qs, weights, packed[0], packed[1], packed[4]], rows)
+        call(2, (packed if args.query_group > 1 else shared) + [after, cube, local_scores], rows)
+
+    def current_fused(rows):
+        call(3, shared + [current_output, current_cube, current_scores], rows)
+
+    current_cube = torch.empty(64, 8 * heads, 128, dtype=torch.int32, device="npu")
+    current_scores = torch.empty(64, 8, 4096, device="npu")
     reports = []
     for rows in args.rows:
         counts.zero_()
@@ -132,20 +187,24 @@ def main():
         with torch.npu.graph(graph):
             baseline(rows)
             fused(rows)
-        for phase in range(3):
+        for phase in range(4):
             q.neg_()
             ks.mul_(0.5)
             if rows == 1:
-                end = [0, 4097, length][phase]
+                end = [0, 4097, min(length, 32769), length][phase]
                 counts[0, 0] = end
             else:
-                maximum = [2049, 8192, min(length, 32769)][phase]
+                maximum = [2049, 8192, min(length, 32769), length][phase]
                 counts[:rows, 0].copy_(torch.linspace(0, maximum, rows, device="npu").int())
+            if args.query_group > 1:
+                packed[0].fill_(17)
+                packed[1].fill_(float("nan"))
+                packed[4].fill_(float("nan"))
             before.fill_(12345)
             after.fill_(12345)
             graph.replay()
             torch.npu.synchronize()
-            actual, expected = after[:rows].cpu(), before[:rows].cpu()
+            actual, expected = after[:rows, :, :1024].cpu(), before[:rows].cpu()
             if not torch.equal(actual, expected):
                 bad = (actual != expected).nonzero()[:12]
                 print(
@@ -164,7 +223,22 @@ def main():
                     flush=True,
                 )
             assert torch.equal(actual, expected), (rows, phase, "candidate mismatch")
+            if args.emit_block_scores:
+                masked = scores[:rows].masked_fill(
+                    torch.arange(length, device="npu")[None, :] >= counts[:rows], -float("inf")
+                )
+                maxima = masked.view(rows, chunks, 512, 8).amax(dim=-1)
+                live_chunks = max(1, (int(counts[rows - 1, 0].item()) + 4095) // 4096)
+                assert torch.equal(after[:rows, :live_chunks, 1024:], maxima[:, :live_chunks]), (
+                    rows,
+                    phase,
+                    "block maximum mismatch",
+                )
             assert bool((after[rows:] == 12345).all()), "Fused indexer wrote row tail"
+            if args.query_group > 1:
+                assert bool((packed[0][rows * heads :] == 17).all()), "Packed query wrote tail"
+                assert bool(packed[1][rows:].isnan().all()), "Packed scale wrote tail"
+                assert bool(packed[4][rows:].isnan().all()), "Packed weight wrote tail"
             reports.append(
                 dict(
                     rows=rows,
@@ -177,10 +251,10 @@ def main():
             print(reports[-1], flush=True)
         graph.reset()
     timings = []
-    for context in [2048, 32768]:
+    for context in sorted({2048, min(length, 32768), length}):
         counts.fill_(min(length, context))
         values = []
-        for fn in [baseline, fused]:
+        for fn in [baseline, current_fused, fused]:
             values.append(
                 measure(
                     lambda: fn(capacity), budget_ms=8, max_repetitions=7, benchmark=npu_benchmark
@@ -191,8 +265,9 @@ def main():
                 rows=capacity,
                 context=context,
                 baseline_ms=values[0],
-                fused_ms=values[1],
-                change_pct=100 * (values[1] / values[0] - 1),
+                current_fused_ms=values[1],
+                fused_ms=values[2],
+                change_pct=100 * (values[2] / values[1] - 1),
             )
         )
         print(timings[-1], flush=True)

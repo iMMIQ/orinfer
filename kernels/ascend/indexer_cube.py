@@ -6,18 +6,33 @@ from kernels.ascend.candidate import load_keys, load_scales, mask_scores
 
 
 @T.macro
-def weighted_head_sum(dots, total, partial, qs, ks, w, expanded, vector_scales, direct_sum, heads):
+def weighted_head_sum(
+    dots,
+    total,
+    partial,
+    qs,
+    ks,
+    w,
+    expanded,
+    vector_scales,
+    direct_sum,
+    heads,
+    query_rows=1,
+    tmp=None,
+):
     T.tile.fill(total, 0.0)
     if vector_scales:
         T.tile.max(dots, dots, 0.0)
-        T.tile.broadcast(expanded, qs)
+        T.tile.broadcast(expanded, qs, tmp=tmp)
         T.tile.mul(dots, dots, expanded)
-        T.tile.broadcast(expanded, ks)
+        T.tile.broadcast(expanded, ks, tmp=tmp)
         T.tile.mul(dots, dots, expanded)
-        T.tile.broadcast(expanded, w)
+        T.tile.broadcast(expanded, w, tmp=tmp)
         T.tile.mul(dots, dots, expanded)
     for head in T.serial(heads):
-        if direct_sum and vector_scales:
+        if query_rows > 1:
+            T.tile.add(total, total, dots[head * query_rows : (head + 1) * query_rows, :])
+        elif direct_sum and vector_scales:
             T.tile.add(total, total, dots[head : head + 1, :])
         else:
             T.copy(dots[head : head + 1, :], partial)
