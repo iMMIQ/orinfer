@@ -273,10 +273,21 @@ def gather_tile(
     staged,
     staged_rows,
     async_gather,
+    dma_scales,
 ):
     if tile_slots == 1 or not bulk_store or staged:
         T.tile.fill(y, 0.0)
     contiguous = T.alloc_ub((8,), "int32")
+    scale_packets = T.alloc_ub((tile_slots * 16,), "float16")
+    scale_lanes = T.alloc_ub((groups,), "float32")
+    scale_blocks = T.alloc_ub((groups,), "float32")
+    scale_indices = T.alloc_ub((groups,), "int32")
+    scale_addresses = T.alloc_ub((groups,), "uint32")
+    flat_half_scales = _contiguous_view(half_scales, (groups,))
+    flat_swa_scales = _contiguous_view(swa_scales, (storage * 8,))
+    flat_long_scales = _contiguous_view(long_scales, (compressed_capacity * 8,))
+    if dma_scales:
+        T.tile.fill(scale_packets, 0.0)
     if tile_slots > 1 and bulk_store and not staged:
         contiguous[0] = 0
         if first + tile_slots <= 128:
@@ -343,6 +354,13 @@ def gather_tile(
                     T.copy(swa[source % storage, :, :], q[lane * 8 : (lane + 1) * 8, :])
                     if tile_slots == 1:
                         T.copy(swa_scales[source % storage, :], half_scales[:, 0])
+                    elif dma_scales:
+                        # Give each 16-byte scale row a separate aligned UB
+                        # slot; compact the live halves after all reads finish.
+                        T.copy(
+                            flat_swa_scales[(source % storage) * 8 : (source % storage + 1) * 8],
+                            scale_packets[lane * 16 : lane * 16 + 8],
+                        )
                     else:
                         # FP16 scale rows are 16 bytes; scalar packing
                         # avoids unaligned 32-byte UB DMA destinations.
@@ -360,6 +378,11 @@ def gather_tile(
                     T.copy(long_kv[source, :, :], q[lane * 8 : (lane + 1) * 8, :])
                     if tile_slots == 1:
                         T.copy(long_scales[source, :], half_scales[:, 0])
+                    elif dma_scales:
+                        T.copy(
+                            flat_long_scales[source * 8 : (source + 1) * 8],
+                            scale_packets[lane * 16 : lane * 16 + 8],
+                        )
                     else:
                         for group in T.unroll(8):
                             half_scales[lane * 8 + group, 0] = long_scales[source, group]
@@ -378,6 +401,18 @@ def gather_tile(
     if async_gather:
         T.wait_flag("S", "MTE2", 7)
         T.pipe_barrier("ALL")
+    if dma_scales:
+        if contiguous[0] == 0:
+            T.tile.createvecindex(scale_lanes, 0.0)
+            T.tile.mul(scale_blocks, scale_lanes, 0.125)
+            T.tile.cast(scale_indices, scale_blocks, "CAST_FLOOR", groups)
+            T.tile.cast(scale_blocks, scale_indices, "CAST_NONE", groups)
+            T.tile.mul(scale_blocks, scale_blocks, 8.0)
+            T.tile.add(scale_lanes, scale_lanes, scale_blocks)
+            T.tile.mul(scale_lanes, scale_lanes, 2.0)
+            T.tile.cast(scale_indices, scale_lanes, "CAST_RINT", groups)
+            T.reinterpretcast(scale_addresses, scale_indices, "uint32_t")
+            T.tile.gather(flat_half_scales, scale_packets, scale_addresses, 0)
     if tile_slots > 1 and (not staged or first >= 128):
         decode_values(q, half_values, values, half_scales, scale, broadcast, y, groups)
     if bulk_store:
@@ -479,6 +514,7 @@ def gather_attention(
                     False,
                     staged_rows,
                     async_gather,
+                    False,
                 )
 
     return main.with_attr("orinfer.gather_pipeline", async_gather)

@@ -363,6 +363,7 @@ def selected_int8(
     tile_d=128,
     pv_l0_k=128,
     async_gather=False,
+    dma_scales=False,
 ):
     """One paired-core selected-KV gather/QK/softmax/PV invocation per query.
 
@@ -390,6 +391,8 @@ def selected_int8(
         raise ValueError("Selected PV schedule exceeds the A2 L1 or double-buffered L0B allocation")
     if async_gather and tile_slots == 1:
         raise ValueError("Asynchronous gather requires independent multi-slot DMA tiles")
+    if dma_scales and (tile_slots == 1 or staged_swa):
+        raise ValueError("Scale DMA requires independent non-staged multi-slot tiles")
     half_heads, decode_groups = heads // 2, tile_slots * 8
     if softmax_heads not in (1, 4, 8) or half_heads % softmax_heads:
         raise ValueError("Softmax head tile must divide each Vector's head group")
@@ -521,6 +524,7 @@ def selected_int8(
                             staged_swa,
                             staged_rows,
                             async_gather,
+                            dma_scales,
                         )
                     T.set_cross_flag("MTE3", 0)
                     T.wait_cross_flag(1)

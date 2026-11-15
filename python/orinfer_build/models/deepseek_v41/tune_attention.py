@@ -17,8 +17,15 @@ from orinfer_build.contracts.row_selection import guarded_winner
 from orinfer_build.tuning.tuning import read_record, record_path
 
 
-def attention_configs(parameters, *, gather_pipeline=False):
+def attention_configs(parameters, *, gather_pipeline=False, scale_dma=False):
     """Retain the published schedule when tuning the softmax head tile."""
+    if scale_dma:
+        enabled = parameters.get("dma_scales", False)
+        return {"baseline": {}} | (
+            {"scalar-scales" if enabled else "scale-dma": dict(dma_scales=not enabled)}
+            if parameters.get("tile_slots", 16) > 1 and not parameters.get("staged_swa", False)
+            else {}
+        )
     if gather_pipeline:
         enabled = parameters.get("async_gather", False)
         return {"baseline": {}} | (
@@ -60,7 +67,9 @@ def attention_groups(model, base, minimum):
     return groups
 
 
-def compile_plan(plan, output, workers, minimum, model_dir=None, *, gather_pipeline=False):
+def compile_plan(
+    plan, output, workers, minimum, model_dir=None, *, gather_pipeline=False, scale_dma=False
+):
     from kernels.ascend.attention_fused import selected_int8
     from orinfer_build.contracts.ascend.geometry import physical_shapes
 
@@ -87,7 +96,9 @@ def compile_plan(plan, output, workers, minimum, model_dir=None, *, gather_pipel
         aliases = list(p["_owner_aliases"])
         metadata = {k: v for k, v in p.items() if k.startswith("_owner_")}
         metadata["_owner_source_sha256"] = file_hash(Path(selected_int8.__code__.co_filename))
-        for label, updates in attention_configs(p, gather_pipeline=gather_pipeline).items():
+        for label, updates in attention_configs(
+            p, gather_pipeline=gather_pipeline, scale_dma=scale_dma
+        ).items():
             if label == "baseline":
                 continue
             task = dict(
@@ -142,7 +153,7 @@ def select_plan(plan, output, device, minimum, model_dir=None):
     groups = compiled["groups"]
     configs = sorted(set.intersection(*(set(g["candidates"]) for g in groups)))
     identity = dict(
-        selection_contract=4,
+        selection_contract=5,
         kernels={
             name: json.loads((base / name).read_text())
             for g in groups
@@ -205,12 +216,14 @@ def select_plan(plan, output, device, minimum, model_dir=None):
                     bound = p["capacity"] if name == "swa_indices" else p["compressed_capacity"]
                     data = torch.randint(0, bound, shape, dtype=kind, device="npu")
                     data[:, ::19] = -1
+                    data[:, 1] = bound - 1
+                    data[:, 2] = 0
                     data[:, 3] = bound
                     data[6::7] = -1
                 elif kind == torch.int8:
                     data = torch.randint(-16, 17, shape, dtype=kind, device="npu")
                 elif name.endswith("scales"):
-                    data = torch.full(shape, 0.125, dtype=kind, device="npu")
+                    data = (torch.rand(shape, device="npu") * 0.2 + 0.001).to(kind)
                 else:
                     data = (torch.randn(shape, dtype=torch.float32, device="npu") * 0.5).to(kind)
                 inputs[name] = data
@@ -410,10 +423,16 @@ def main():
     parser.add_argument("--compile-workers", type=int, default=2)
     parser.add_argument("--min-rows", type=int, default=512)
     parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument(
+    schedules = parser.add_mutually_exclusive_group()
+    schedules.add_argument(
         "--gather-pipeline",
         action="store_true",
         help="Compare the published KV read schedule with overlapping slot DMAs",
+    )
+    schedules.add_argument(
+        "--scale-dma",
+        action="store_true",
+        help="Compare scalar scale loads with aligned slot DMAs and vector compaction",
     )
     args = parser.parse_args()
     if args.compile_only:
@@ -424,6 +443,7 @@ def main():
             args.min_rows,
             args.model_dir,
             gather_pipeline=args.gather_pipeline,
+            scale_dma=args.scale_dma,
         )
     else:
         report = select_plan(args.plan, args.output, args.device, args.min_rows, args.model_dir)

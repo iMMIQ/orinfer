@@ -21,6 +21,21 @@ class AttentionTuningTests(unittest.TestCase):
             {"baseline": {}},
         )
 
+    def test_scale_dma_search_keeps_the_kv_and_softmax_geometry(self):
+        params = dict(softmax_heads=4, tile_slots=16, async_gather=True, reuse_long=True)
+        self.assertEqual(
+            attention_configs(params, scale_dma=True),
+            {"baseline": {}, "scale-dma": dict(dma_scales=True)},
+        )
+        self.assertEqual(
+            attention_configs(dict(params, dma_scales=True), scale_dma=True),
+            {"baseline": {}, "scalar-scales": dict(dma_scales=False)},
+        )
+        for updates in [dict(tile_slots=1), dict(staged_swa=True)]:
+            self.assertEqual(
+                attention_configs(dict(params, **updates), scale_dma=True), {"baseline": {}}
+            )
+
     def test_existing_four_head_schedule_remains_the_baseline(self):
         parameters = dict(softmax_heads=4, tile_slots=16, reuse_long=True)
         original = deepcopy(parameters)

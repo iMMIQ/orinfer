@@ -2,6 +2,7 @@
 
 import argparse
 import ctypes
+from itertools import product
 from pathlib import Path
 
 from orinfer_build.common.files import atomic_json, file_hash
@@ -12,6 +13,14 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compressed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reuse-long", action="store_true")
+    parser.add_argument("--softmax-heads", type=int, choices=(1, 4, 8), default=1)
+    parser.add_argument("--gather-pipeline", action="store_true")
+    parser.add_argument(
+        "--swa-pattern",
+        nargs="+",
+        choices=("gapped", "contiguous"),
+        default=["gapped", "contiguous"],
+    )
     parser.add_argument("--cache", type=Path)
     parser.add_argument("--device", type=int, default=7)
     args = parser.parse_args()
@@ -40,6 +49,8 @@ def main():
         compressed=args.compressed,
         tile_slots=16,
         reuse_long=args.reuse_long,
+        softmax_heads=args.softmax_heads,
+        async_gather=args.gather_pipeline,
     )
     stages = [
         (
@@ -168,15 +179,16 @@ def main():
             rows,
         )
 
-    def data(prefix):
-        positions.copy_(torch.arange(sources, dtype=torch.int32, device="npu") + prefix)
+    def data(prefix, pattern="gapped"):
+        positions.copy_(torch.arange(positions.numel(), dtype=torch.int32, device="npu") + prefix)
         swa_ids.copy_(
             torch.arange(128, dtype=torch.int32, device="npu")[None, :]
             + prefix
             + torch.arange(capacity, dtype=torch.int32, device="npu")[:, None] * 8
             - 127
         )
-        swa_ids[:, ::19] = -1
+        if pattern == "gapped":
+            swa_ids[:, ::19] = -1
 
     reports = []
     if args.reuse_long:
@@ -184,8 +196,8 @@ def main():
         call(4, [query, cache, scales, long, long_scales, swa_ids, long_ids, sink] + a, capacity)
         b[1].copy_(a[1])
         b[2].copy_(a[2])
-    for rows in [1, 17, capacity]:
-        data(0)
+    for rows, pattern in product([1, 17, capacity], args.swa_pattern):
+        data(0, pattern)
         old(rows)
         new(rows)
         torch.npu.synchronize()
@@ -197,7 +209,7 @@ def main():
             borrowed.fill_(31 + prefix)
             source.neg_()
             query.neg_()
-            data(prefix)
+            data(prefix, pattern)
             a[0].fill_(17)
             b[0].fill_(17)
             graph.replay()
@@ -233,6 +245,7 @@ def main():
             reports.append(
                 dict(
                     rows=rows,
+                    pattern=pattern,
                     prefix=prefix,
                     exact=True,
                     changed_graph=True,
@@ -244,7 +257,10 @@ def main():
         graph.reset()
     data(32768)
     timings = []
-    for rows in [17, 256]:
+    source_capacity = sources
+    for rows, pattern in product([17, 64, 68, 128, 256], args.swa_pattern):
+        data(32768, pattern)
+        sources = min(source_capacity, rows * 8)
         t = []
         for run in [old, new]:
             t.append(
@@ -254,6 +270,7 @@ def main():
             dict(
                 rows=rows,
                 source_rows=sources,
+                pattern=pattern,
                 baseline_ms=t[0],
                 staged_ms=t[1],
                 change_pct=100 * (t[1] / t[0] - 1),
