@@ -1,8 +1,26 @@
 import unittest
-from orinfer_build.contracts.row_contract import expression, contract, resolve
+from orinfer_build.contracts.row_contract import (
+    expression,
+    contract,
+    resolve,
+)
+
+from orinfer_build.contracts.row_parameters import dynamic_arguments, dynamic_parameters
 
 
 class DynamicContractTests(unittest.TestCase):
+    def test_equal_capacity_shapes_retain_distinct_dynamic_axes(self):
+        geometry = dict(rows=12288, table_rows=2048)
+        fixed = dynamic_parameters(geometry, dict(rows=6), 2048)
+        growing = dynamic_parameters(geometry, dict(rows=6, table_rows=1), 2048)
+        self.assertNotEqual(fixed, growing)
+        self.assertEqual(dynamic_arguments(fixed, dict(table_rows=1), 2048), dict(rows=6))
+        self.assertEqual(dynamic_arguments(growing, {}, 2048), dict(rows=6, table_rows=1))
+        self.assertEqual(dynamic_arguments(geometry, dict(rows=6), 2048), dict(rows=6))
+        for wrong in (dict(rows=1), dict(rows=True), dict(missing=1), dict(rows=0)):
+            with self.assertRaises(ValueError):
+                dynamic_parameters(geometry, wrong, 2048)
+
     def test_qualified_tir_minimum_bounds_real_owner_work(self):
         grid = expression("T.min(64, m * 4)")
         self.assertEqual(grid, expression("min(64, m * 4)"))

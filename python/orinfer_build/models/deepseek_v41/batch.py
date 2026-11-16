@@ -24,6 +24,7 @@ from orinfer_build.models.deepseek_v41.assembly import (
     validate_rows,
 )
 from orinfer_build.contracts.row_contract import resolve
+from orinfer_build.contracts.row_parameters import dynamic_parameters
 
 SIZES = dict(i8=1, i32=4, i64=8, f16=2, bf16=2, f32=4, u64=8)
 DTYPES = dict(
@@ -42,7 +43,7 @@ def compile_task(item):
     for name, factor in task["dynamic"].items():
         arguments[name] = m * factor
     function = getattr(import_module(task["module"]), task["name"])(**arguments)
-    parameters = dict(task["arguments"])
+    parameters = dynamic_parameters(task["arguments"], task["dynamic"], task["capacity"])
     op = task["module"].split(".")[-1] + "." + task["name"]
     capacity = task["capacity"]
     if "columns" in task:

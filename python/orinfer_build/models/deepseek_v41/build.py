@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from orinfer_build.common.files import atomic_json, file_hash
+from orinfer_build.contracts.row_parameters import dynamic_arguments, dynamic_parameters
 from kernels.ascend import (
     attention,
     attention_cube,
@@ -1702,6 +1703,10 @@ def kernel_rebuild_task(spec, placeholder):
         and args.get("table_rows") == capacity
     ):
         dynamic["table_rows"] = 1
+    geometry = dict(args)
+    if "_dynamic_arguments" in parameters:
+        geometry["_dynamic_arguments"] = parameters["_dynamic_arguments"]
+    dynamic = dynamic_arguments(geometry, dynamic, capacity)
     task = dict(
         module=module.__name__,
         name=name,
@@ -1757,7 +1762,9 @@ def compile_task(task_and_output):
         function,
         f"{task['module'].split('.')[-1]}.{task['name']}",
         task["specs"],
-        task["arguments"],
+        dynamic_parameters(
+            task["arguments"], task.get("dynamic_arguments", {}), task.get("row_capacity")
+        ),
         output / "cache",
         row_capacity=task.get("row_capacity"),
         grid_limit=task.get("grid_limit", 64),
