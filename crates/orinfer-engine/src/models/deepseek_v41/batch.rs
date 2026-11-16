@@ -164,6 +164,7 @@ pub(super) struct Key {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct WorkLaunch {
     role: super::PacketRole,
+    family: (bool, usize, usize),
     grid: RowExpression,
     range: Option<(usize, usize)>,
     partition: usize,
@@ -386,8 +387,8 @@ impl Layout {
             return Ok(false);
         }
         let family = (self.role, false, 1);
-        let actual = shape_key(contract, self, family, launches)?;
-        let retained = shape_key(contract, reference, family, launches)?;
+        let actual = shape_key_with_scope(contract, self, family, launches, false)?;
+        let retained = shape_key_with_scope(contract, reference, family, launches, false)?;
         if actual.decoder_rows != retained.decoder_rows
             || actual
                 .work_rows
@@ -580,8 +581,8 @@ impl Layout {
         }
     }
 }
-/// Use a common union of every rank/family launch descriptor, so equivalent
-/// layouts form the same cache class on every TP rank, including future tunes.
+/// Keep every rank's launch descriptors within its packet family. All ranks
+/// use the same union; unrelated families cannot fragment a cache class.
 pub(super) fn graph_launches(model: &super::Model) -> BTreeSet<WorkLaunch> {
     let Some(contract) = &model.batch else {
         return BTreeSet::new();
@@ -603,6 +604,7 @@ pub(super) fn graph_launches(model: &super::Model) -> BTreeSet<WorkLaunch> {
                     {
                         launches.insert(WorkLaunch {
                             role: packet.role,
+                            family: (packet.batch_decode, packet.min_rows, packet.dispatch_max()),
                             grid: grid.clone(),
                             range: contract
                                 .work_ranges
@@ -635,6 +637,15 @@ fn shape_key(
     family: (super::PacketRole, bool, usize),
     launches: &BTreeSet<WorkLaunch>,
 ) -> Result<Key> {
+    shape_key_with_scope(contract, layout, family, launches, true)
+}
+fn shape_key_with_scope(
+    contract: &Contract,
+    layout: &Layout,
+    family: (super::PacketRole, bool, usize),
+    launches: &BTreeSet<WorkLaunch>,
+    exact_family: bool,
+) -> Result<Key> {
     if layout.outputs.len() > contract.output_capacity() {
         return Err("Output rows exceed the published head capacity".into());
     }
@@ -655,7 +666,13 @@ fn shape_key(
     let mut partitions = BTreeMap::new();
     let mut work_rows = Vec::with_capacity(launches.iter().map(|l| l.partition).sum());
     for launch in launches {
-        if launch.role != layout.role {
+        let applicable = launch.family.0 == layout.decode
+            && if layout.role == super::PacketRole::Draft {
+                launch.family.1 == family.2
+            } else {
+                (launch.family.1..=launch.family.2).contains(&layout.rows.total)
+            };
+        if launch.role != layout.role || exact_family && !applicable {
             continue;
         }
         if launch.decoder && decoder.as_ref().is_none_or(|d| d.rows.total == 0) {

@@ -124,6 +124,7 @@ fn launch_identity_matches_the_compilers_owner_work_extents() {
                     }
                     let launches = [WorkLaunch {
                         role: super::super::PacketRole::Target,
+                        family: (false, 1, 4096),
                         grid: grid.clone(),
                         range,
                         partition,
@@ -163,6 +164,7 @@ fn graph_reuses_padded_owner_work_without_changing_real_items() {
     contract.work.insert("w".into(), grid.clone());
     let launches = [WorkLaunch {
         role: super::super::PacketRole::Target,
+        family: (false, 1, 4096),
         grid: grid.clone(),
         range: None,
         partition: 1,
@@ -210,6 +212,7 @@ fn partitioned_work_keeps_original_owner_and_graph_order() {
     assert_eq!(contract.token_capacity("original", 2048).unwrap(), 2048);
     let launches = [WorkLaunch {
         role: super::super::PacketRole::Target,
+        family: (false, 1, 4096),
         grid: RowExpression::Constant { value: 64 },
         range: None,
         partition: 8,
@@ -258,6 +261,75 @@ fn partitioned_work_keeps_original_owner_and_graph_order() {
     assert_eq!(
         contract.work_items(&empty, &grid, "w", 7).unwrap(),
         [[-1, 0], [-1, 0]]
+    );
+}
+
+#[test]
+fn graph_identity_excludes_other_families_but_retained_work_checks_every_launch() {
+    let mut contract = contract();
+    contract.decoder_replay = Some(
+        serde_json::from_value(serde_json::json!({
+            "keep":128,"final_prompt_only":true,"tables":[],"maps":[]
+        }))
+        .unwrap(),
+    );
+    let complete = |lengths: &[usize]| {
+        let mut view = layout(lengths, &[7, 17]).unwrap();
+        view.outputs = vec![0, 1];
+        view.output_positions = lengths.iter().map(|n| n - 1).collect();
+        view.decoder_roles.fill(super::super::replay::Role::Final);
+        view
+    };
+    let a = complete(&[33, 95]);
+    let b = complete(&[35, 93]);
+    let mut launches = BTreeSet::new();
+    for decoder in [false, true] {
+        launches.insert(WorkLaunch {
+            role: a.role,
+            family: (false, 128, 2048),
+            grid: serde_json::from_value(serde_json::json!({
+                "op":"divide", "lhs":{"op":"add","lhs":{"op":"rows"},
+                    "rhs":{"op":"constant","value":3}},
+                "rhs":{"op":"constant","value":4}
+            }))
+            .unwrap(),
+            range: None,
+            partition: 1,
+            decoder,
+        });
+        launches.insert(WorkLaunch {
+            role: a.role,
+            family: (false, 32, 127),
+            grid: RowExpression::Rows,
+            range: None,
+            partition: 1,
+            decoder,
+        });
+    }
+    let selected = (a.role, false, 128);
+    assert_eq!(
+        shape_key(&contract, &a, selected, &launches).unwrap(),
+        shape_key(&contract, &b, selected, &launches).unwrap()
+    );
+    let short_a = complete(&[17, 95]);
+    let short_b = complete(&[19, 93]);
+    assert_ne!(
+        shape_key(&contract, &short_a, (a.role, false, 32), &launches).unwrap(),
+        shape_key(&contract, &short_b, (b.role, false, 32), &launches).unwrap()
+    );
+    // Per-rank family labels may differ; the union follows the actual row span.
+    assert_eq!(
+        shape_key(&contract, &a, selected, &launches)
+            .unwrap()
+            .work_rows,
+        shape_key(&contract, &a, (a.role, false, 64), &launches)
+            .unwrap()
+            .work_rows
+    );
+    // The speculation envelope remains conservative across execution families.
+    assert_ne!(
+        shape_key_with_scope(&contract, &a, selected, &launches, false).unwrap(),
+        shape_key_with_scope(&contract, &b, selected, &launches, false).unwrap()
     );
 }
 #[test]
@@ -491,7 +563,7 @@ fn variable_verification_reuses_work_capacity_without_reusing_owner_lengths() {
                 contract.work.insert(name.clone(),grid.clone());
                 if partition > 1 {contract.partitioned_tables.insert(name.clone(),partition);}
                 if decoder {contract.decoder_replay.as_mut().unwrap().tables.insert(name.clone());}
-                launches.insert(WorkLaunch {role:super::super::PacketRole::Target,
+                launches.insert(WorkLaunch {role:super::super::PacketRole::Target, family:(false,1,4096),
                     grid,range:None,partition,decoder});
                 names.push((name,partition));
             }
@@ -609,6 +681,7 @@ fn retained_work_cannot_hide_a_larger_native_launch() {
     contract.work.insert("w".into(), grid.clone());
     let launches = [WorkLaunch {
         role: super::super::PacketRole::Target,
+        family: (false, 1, 4096),
         grid,
         range: None,
         partition: 1,
