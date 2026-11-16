@@ -118,6 +118,8 @@ pub(super) struct Readout {
             BTreeMap<usize, Vec<crate::backend::ascend::sampling::Parameters>>,
         >,
     >,
+    pub first_input: Option<Arc<super::host_inputs::First>>,
+    pub next_input: Option<Arc<super::host_inputs::Window>>,
 }
 impl From<bool> for Readout {
     fn from(full: bool) -> Self {
@@ -267,7 +269,9 @@ pub(super) struct Team {
     pub work_launches: BTreeSet<super::batch::WorkLaunch>,
     // Drop worker contexts and communication groups before the bootstrap context.
     _bootstrap: Option<Session>,
-    host_tables: Option<Arc<SharedTables>>,
+    pub(super) host_tables: Option<Arc<SharedTables>>,
+    pub(super) host_hasher: Option<Arc<orinfer_model_sdk::conditional_memory::Hasher>>,
+    pub(super) host_prepare: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Execution mode and preparation are measured separately; direct is a valid steady path.
@@ -408,6 +412,10 @@ impl Team {
             work_launches,
             _bootstrap: Some(bootstrap),
             host_tables: Some(shared),
+            host_hasher: Some(Arc::new(
+                orinfer_model_sdk::conditional_memory::Hasher::new(layout.clone())?,
+            )),
+            host_prepare: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // One shared CPU load owns no ACL handles. Join it with rank workers
         // on every startup/teardown path, including partial rank failures.
@@ -1122,6 +1130,7 @@ fn forward_with(
     let sampled = !readout.draws.is_empty();
     let readout_rejection_empty = readout.rejection.is_empty();
     let parameters = Arc::clone(&readout.parameters);
+    let first_input = readout.first_input.clone();
     let command = Command::Forward(
         layout,
         tokens,
@@ -1134,6 +1143,20 @@ fn forward_with(
         maintenance();
     }
     let results = peers.collect()?;
+    if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some()
+        && let Some(first) = first_input
+        && first.prepared.seconds() > 0.
+        && let Ok(data) = first.prepared.get()
+    {
+        eprintln!(
+            "A2_HOST_INPUT {}",
+            serde_json::json!({
+                "rows": data.rows, "reused_rows": data.reused_rows,
+                "forecast_wait_s": data.wait_s,
+                "prepare_s": first.prepared.seconds(),
+            })
+        );
+    }
     let ranks = results
         .into_iter()
         .map(|reply| match reply {

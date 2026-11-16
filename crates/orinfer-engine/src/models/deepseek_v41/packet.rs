@@ -13,6 +13,8 @@ pub(super) struct Inputs<'a> {
     pub valid: &'a [bool],
     pub visual_rows: &'a [super::vision::Overlay],
     pub device: Option<super::device_inputs::Prepared>,
+    pub first: Option<&'a super::host_inputs::First>,
+    pub next: Option<&'a super::host_inputs::Window>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -428,6 +430,8 @@ impl Worker {
                 valid,
                 visual_rows: &[],
                 device: None,
+                first: None,
+                next: None,
             },
             logits,
             vec![],
@@ -446,6 +450,8 @@ impl Worker {
             valid,
             visual_rows,
             device,
+            first,
+            next,
         } = input;
         let head = if logits {
             execution.head.as_slice()
@@ -569,6 +575,30 @@ impl Worker {
                                 scales,
                                 mask,
                             } => {
+                                if let Some(first) = first.filter(|f| f.layer == *layer) {
+                                    let table =
+                                        self.tables.get(layer).ok_or("Engram table missing")?;
+                                    let data = first.get(
+                                        table,
+                                        || self.lookup_ids(*layer, tokens.len(), hashes, valid),
+                                        valid,
+                                    )?;
+                                    let buffers = [values, scales, mask];
+                                    let regions = data
+                                        .regions()
+                                        .map(|(plane, offset, bytes)| {
+                                            (Buffer::clone(buffers[plane]), offset, bytes)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    self.session.upload_regions(&regions)?;
+                                    // This frame now owns its immutable bytes; a
+                                    // future read can replace the store cache
+                                    // while late ranks consume the same frame.
+                                    if let Some(next) = next {
+                                        next.start();
+                                    }
+                                    continue;
+                                }
                                 // Earlier graph segments are already queued.
                                 // Prepare CPU rows while they execute, then
                                 // update reused inputs at this stream boundary.
@@ -890,17 +920,13 @@ impl Worker {
         }
         Ok(values)
     }
-    #[allow(clippy::too_many_arguments)]
-    fn lookup_inputs(
+    fn lookup_ids(
         &self,
         layer: usize,
         rows: usize,
         hashes: &[i64],
         valid: &[bool],
-        values: &Buffer,
-        scales: &Buffer,
-        mask: &Buffer,
-    ) -> Result<Vec<(Buffer, Vec<u8>)>> {
+    ) -> Result<Vec<u64>> {
         let layer_index = self
             .hasher
             .layout()
@@ -919,6 +945,20 @@ impl Worker {
                 });
             }
         }
+        Ok(ids)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_inputs(
+        &self,
+        layer: usize,
+        rows: usize,
+        hashes: &[i64],
+        valid: &[bool],
+        values: &Buffer,
+        scales: &Buffer,
+        mask: &Buffer,
+    ) -> Result<Vec<(Buffer, Vec<u8>)>> {
+        let ids = self.lookup_ids(layer, rows, hashes, valid)?;
         let table = self.tables.get(&layer).ok_or("Engram table missing")?;
         let packed = table.gather(&ids, rows * 24 * 288)?;
         let mut q = Vec::with_capacity(rows * 24 * 256);

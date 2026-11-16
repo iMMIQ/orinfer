@@ -101,10 +101,38 @@ pub(super) struct Selection {
 }
 
 impl Selection {
+    pub(super) fn verification_budget(
+        &self,
+        requests: &[&mut Request],
+        decode_rows: &[usize],
+        keep: usize,
+        estimator: &prefill::Estimator<'_>,
+        ceiling_s: f64,
+    ) -> usize {
+        if self.prefill_rows == 0 {
+            return self.budget;
+        }
+        mixed_budget(
+            requests,
+            &self.order,
+            Some(decode_rows),
+            keep,
+            estimator.capacity,
+            ceiling_s,
+            |selected| {
+                estimator
+                    .costs
+                    .estimate(estimator.work(selected, requests, self.full, false))
+                    .upper_s
+            },
+        )
+        .min(self.budget)
+    }
     pub(super) fn forecast_layout(
         &self,
         requests: &[&mut Request],
         decode_rows: &[usize],
+        budget: usize,
         keep: usize,
         capacity: usize,
         owners: usize,
@@ -113,7 +141,7 @@ impl Selection {
             requests,
             &self.order,
             Some(decode_rows),
-            self.budget,
+            budget,
             keep,
             capacity,
         );
@@ -167,25 +195,27 @@ pub(super) fn request_order(
     // Freeze ages before sorting: the same policy ranks waiting admissions and
     // active prompt suffixes. Progress resets age, so long prompts can resume.
     let now = Instant::now();
+    order_snapshot(requests, decode_only, |_, r| {
+        Some(scheduler::Waiting {
+            age_s: now.saturating_duration_since(r.last_prefill).as_secs_f64(),
+            remaining_s: cost(r),
+            restore_s: 0.,
+            startup_s: 0.,
+            remaining_tokens: r.remaining_prefill_tokens(),
+        })
+    })
+}
+fn order_snapshot(
+    requests: &[&mut Request],
+    decode_only: bool,
+    waiting: impl Fn(usize, &Request) -> Option<scheduler::Waiting>,
+) -> Vec<usize> {
     let mut order = requests
         .iter()
         .enumerate()
         .filter(|(_, r)| !decode_only || !r.prefilling)
         .filter(|(_, r)| !r.is_finished() && r.ready_output.is_none())
-        .map(|(i, r)| {
-            let remaining = r.remaining_prefill_tokens();
-            (
-                i,
-                r.prefilling,
-                scheduler::Waiting {
-                    age_s: now.saturating_duration_since(r.last_prefill).as_secs_f64(),
-                    remaining_s: cost(r),
-                    restore_s: 0.,
-                    startup_s: 0.,
-                    remaining_tokens: remaining,
-                },
-            )
-        })
+        .filter_map(|(i, r)| waiting(i, r).map(|w| (i, r.prefilling, w)))
         .collect::<Vec<_>>();
     order.sort_unstable_by(|a, b| {
         a.1.cmp(&b.1)
@@ -275,6 +305,42 @@ fn windows(capacity: usize) -> impl Iterator<Item = usize> {
         .chain([capacity])
 }
 
+/// Price the same selected rows that will execute, including speculative
+/// verification prefixes. Native compute capacity and final windows stay intact.
+fn mixed_budget(
+    requests: &[&mut Request],
+    order: &[usize],
+    decode_rows: Option<&[usize]>,
+    keep: usize,
+    capacity: usize,
+    ceiling_s: f64,
+    price: impl Fn(&[(usize, usize)]) -> f64,
+) -> usize {
+    let decoders = order
+        .iter()
+        .filter(|&&i| !requests[i].prefilling)
+        .map(|&i| decode_rows.map_or(1, |rows| rows[i]))
+        .sum::<usize>();
+    let prompt = order
+        .iter()
+        .filter(|&&i| requests[i].prefilling)
+        .map(|&i| (requests[i].input.len() - requests[i].offset).min(keep.max(128)))
+        .min()
+        .unwrap_or(1);
+    let minimum = (decoders + prompt).min(capacity);
+    let mut budget = minimum;
+    for n in windows(capacity) {
+        if n < minimum {
+            continue;
+        }
+        let (_, selected) = select_rows(requests, order, decode_rows, n, keep, capacity);
+        if price(&selected) <= ceiling_s {
+            budget = n;
+        }
+    }
+    budget
+}
+
 pub(super) fn forecast(
     requests: &[&mut Request],
     order: &[usize],
@@ -293,6 +359,70 @@ pub(super) fn forecast(
 }
 
 impl Runtime {
+    pub(super) fn prepare_host_inputs(
+        &mut self,
+        layout: &Layout,
+        selected: &[(usize, usize)],
+        requests: &[&mut Request],
+        readout: &mut super::super::team::Readout,
+    ) {
+        if layout.rows.total < 128 || !selected.iter().any(|&(i, _)| requests[i].prefilling) {
+            return;
+        }
+        let previous = self.input_window.take();
+        let hint = previous.as_ref().and_then(|window| {
+            selected.iter().enumerate().find_map(|(lane, &(i, rows))| {
+                let r = &requests[i];
+                let start = r.offset.checked_sub(window.offset)?;
+                (r.prefilling && r.slot == window.owner && start + rows <= window.rows).then(|| {
+                    super::super::host_inputs::Hint {
+                        window: Arc::clone(window),
+                        destination: layout.rows.starts[lane]..layout.rows.starts[lane] + rows,
+                        source: start..start + rows,
+                    }
+                })
+            })
+        });
+        readout.first_input = self.team.first_input(hint);
+        if layout.rows.total < 1024 {
+            return;
+        }
+        let mut offsets = requests.iter().map(|r| r.offset).collect::<Vec<_>>();
+        for &(i, n) in selected {
+            if requests[i].prefilling {
+                offsets[i] += n;
+            }
+        }
+        let now = Instant::now();
+        let order = order_snapshot(requests, false, |i, r| {
+            let offset = offsets[i];
+            if !r.prefilling
+                || offset >= r.input.len()
+                || r.pending_images
+                    .front()
+                    .is_some_and(|image| image.start <= offset)
+            {
+                return None;
+            }
+            Some(scheduler::Waiting {
+                age_s: if offset == r.offset {
+                    now.saturating_duration_since(r.last_prefill).as_secs_f64()
+                } else {
+                    0.
+                },
+                remaining_s: self.remaining_prefill_cost(offset, r.input.len()),
+                restore_s: 0.,
+                startup_s: 0.,
+                remaining_tokens: r.input.len() - offset,
+            })
+        });
+        if let Some(&i) = order.first() {
+            self.input_window =
+                self.team
+                    .forecast_input(requests[i].slot, offsets[i], &requests[i].input);
+            readout.next_input = self.input_window.clone();
+        }
+    }
     pub(super) fn capture_context(
         &self,
         selected: &[(usize, usize)],
@@ -364,43 +494,19 @@ impl Runtime {
         });
         let budget = if has_prefill {
             if has_decode {
-                let decoders = order.iter().filter(|&&i| !requests[i].prefilling).count();
-                // Keep one useful prompt quantum, including an atomic final
-                // window, even when this soft deadline cannot be met.
-                let prompt = order
-                    .iter()
-                    .filter(|&&i| requests[i].prefilling)
-                    .map(|&i| {
-                        (requests[i].input.len() - requests[i].offset)
-                            .min(self.final_decoder_window().max(128))
-                    })
-                    .min()
-                    .unwrap_or(1);
-                let minimum = (decoders + prompt).min(self.team.rows);
-                let mut budget = minimum;
-                // Quantize the scheduling window, not the implementation:
-                // every candidate uses the same dynamic packet and kernels.
-                for n in windows(self.team.rows) {
-                    if n < minimum {
-                        continue;
-                    }
-                    let (_, selected) = select_rows(
-                        requests,
-                        &order,
-                        None,
-                        n,
-                        self.final_decoder_window(),
-                        self.team.rows,
-                    );
-                    let full = self.packet_full(&selected, requests);
-                    let work = self.prefill_work(&selected, requests, full, false);
-                    if self.prefill_costs.estimate(work).upper_s
-                        <= options.prefill_budget_ms / 1000.
-                    {
-                        budget = n;
-                    }
-                }
-                budget
+                mixed_budget(
+                    requests,
+                    &order,
+                    None,
+                    self.final_decoder_window(),
+                    self.team.rows,
+                    options.prefill_budget_ms / 1000.,
+                    |selected| {
+                        let full = self.packet_full(selected, requests);
+                        let work = self.prefill_work(selected, requests, full, false);
+                        self.prefill_costs.estimate(work).upper_s
+                    },
+                )
             } else {
                 // With no decoder waiting for its next token, fill the same
                 // native packet instead of buying another weight/collective
@@ -584,6 +690,39 @@ mod tests {
         assert_eq!(predicted.prefill_rows, 0);
         assert_eq!(predicted.rows, 12);
         assert_eq!(requests[1].offset, 4096);
+    }
+    #[test]
+    fn expanded_verification_is_priced_before_admitting_prompt_rows() {
+        let mut owners = (0..16)
+            .map(|_| request(false, 100000, 0))
+            .collect::<Vec<_>>();
+        owners.push(request(true, 4096, 20000));
+        let requests = owners.iter_mut().collect::<Vec<_>>();
+        let order = (0..17).rev().collect::<Vec<_>>();
+        let price = |selected: &[(usize, usize)]| {
+            selected
+                .iter()
+                .map(|&(i, n)| {
+                    n as f64
+                        * if requests[i].prefilling {
+                            0.00006
+                        } else {
+                            0.001
+                        }
+                })
+                .sum::<f64>()
+        };
+        let ordinary = mixed_budget(&requests, &order, None, 128, 2048, 0.2, price);
+        let mut rows = vec![6; 17];
+        rows[16] = 0;
+        let verified = mixed_budget(&requests, &order, Some(&rows), 128, 2048, 0.2, price);
+        assert_eq!(ordinary, 2048);
+        assert_eq!(verified, 1024);
+        let (_, selected) = select_rows(&requests, &order, Some(&rows), verified, 128, 2048);
+        assert!(price(&selected) <= 0.2);
+        let forecast = forecast(&requests, &order, &rows, verified, 128, 2048);
+        assert_eq!((forecast.rows, forecast.prefill_rows), (1024, 928));
+        assert_eq!(requests[16].offset, 4096);
     }
     #[test]
     fn scheduling_windows_keep_stable_tiers_and_the_native_capacity_tail() {

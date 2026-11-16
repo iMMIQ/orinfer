@@ -110,6 +110,7 @@ pub(crate) struct Runtime {
     next_snapshot: u64,
     hints: Vec<usize>,
     prefill_costs: scheduler::prefill::Costs,
+    input_window: Option<Arc<super::host_inputs::Window>>,
     decode_burst: scheduler::DecodeBurst,
     capture_credit_s: f64,
     draft_limit: usize,
@@ -408,6 +409,7 @@ impl Runtime {
             hints: vec![],
             // Bootstrap only; actual packet and restore observations replace it.
             prefill_costs: scheduler::prefill::Costs::new(4000.),
+            input_window: None,
             decode_burst: Default::default(),
             capture_credit_s: 0.,
             draft_limit,
@@ -1146,8 +1148,9 @@ impl Runtime {
             self.speculation_policy
                 .target_budget(full, layout.decode, work, uses, slack)
         };
-        let readout =
+        let mut readout =
             packet::target_readout(requests, full, &BTreeMap::new(), self.vocab(), &selected)?;
+        self.prepare_host_inputs(&layout, &selected, requests, &mut readout);
         let (values, timing) =
             self.team
                 .forward_with(layout, tokens, readout, Some(capture), maintenance)?;
@@ -1237,6 +1240,13 @@ impl Runtime {
         }
         self.release_resident(request.slot)?;
         self.active.remove(&request.slot);
+        if self
+            .input_window
+            .as_ref()
+            .is_some_and(|w| w.owner == request.slot)
+        {
+            self.input_window = None;
+        }
         if self.active.is_empty() {
             self.capture_credit_s = 0.;
             self.decode_burst.clear();

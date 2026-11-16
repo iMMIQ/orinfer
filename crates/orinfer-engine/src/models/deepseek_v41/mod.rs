@@ -7,6 +7,7 @@ mod branches;
 mod device_inputs;
 #[cfg(test)]
 mod dispatch_tests;
+mod host_inputs;
 mod load;
 mod memory;
 mod packet;

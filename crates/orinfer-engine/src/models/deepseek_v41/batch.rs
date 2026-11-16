@@ -1431,6 +1431,8 @@ impl Worker {
                     valid: &valid,
                     visual_rows: &visual_rows,
                     device: device_input,
+                    first: readout.first_input.as_deref(),
+                    next: readout.next_input.as_deref(),
                 },
                 !layout.outputs.is_empty(),
                 retained,

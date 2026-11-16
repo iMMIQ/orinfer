@@ -121,6 +121,19 @@ impl Runtime {
         } else {
             0.
         };
+        let prefill_estimator = super::prefill::Estimator {
+            model: &self.team.model,
+            domains: &self.team.target_domains,
+            costs: &self.prefill_costs,
+            capacity,
+        };
+        let ceiling_s = options.prefill_budget_ms / 1000.;
+        let mut budgets = BTreeMap::<Vec<usize>, usize>::new();
+        let mut verification_budget = |rows: &[usize]| {
+            *budgets.entry(rows.to_vec()).or_insert_with(|| {
+                baseline.verification_budget(requests, rows, keep, &prefill_estimator, ceiling_s)
+            })
+        };
         let allocation = self.speculation_policy.select_requests_with_forecast(
             (full, mixed),
             Budget {
@@ -159,13 +172,25 @@ impl Runtime {
                     decode_rows[i] = depth + 1;
                 }
                 if let Some(reference) = reference {
-                    let mut target =
-                        baseline.forecast_layout(requests, &decode_rows, keep, capacity, owners)?;
+                    let mut target = baseline.forecast_layout(
+                        requests,
+                        &decode_rows,
+                        verification_budget(&decode_rows),
+                        keep,
+                        capacity,
+                        owners,
+                    )?;
                     for (&i, &depth) in indices.iter().zip(reference) {
                         decode_rows[i] = depth + 1;
                     }
-                    let retained =
-                        baseline.forecast_layout(requests, &decode_rows, keep, capacity, owners)?;
+                    let retained = baseline.forecast_layout(
+                        requests,
+                        &decode_rows,
+                        verification_budget(&decode_rows),
+                        keep,
+                        capacity,
+                        owners,
+                    )?;
                     if !target.bound_work(
                         &retained,
                         self.team.model.batch.as_ref().unwrap(),
@@ -181,13 +206,17 @@ impl Runtime {
                     requests,
                     &baseline.order,
                     &decode_rows,
-                    baseline.budget,
+                    verification_budget(&decode_rows),
                     keep,
                     capacity,
                 )))
             },
         )?;
         let depths = allocation.depths;
+        for (&i, &depth) in indices.iter().zip(&depths) {
+            decode_rows[i] = depth + 1;
+        }
+        let packet_budget = verification_budget(&decode_rows);
         let retained_work = if let Some(reference) = allocation.reference {
             if std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some() {
                 eprintln!(
@@ -200,7 +229,14 @@ impl Runtime {
             for (&i, &depth) in indices.iter().zip(&reference) {
                 decode_rows[i] = depth + 1;
             }
-            Some(baseline.forecast_layout(requests, &decode_rows, keep, capacity, owners)?)
+            Some(baseline.forecast_layout(
+                requests,
+                &decode_rows,
+                verification_budget(&decode_rows),
+                keep,
+                capacity,
+                owners,
+            )?)
         } else {
             None
         };
@@ -343,7 +379,7 @@ impl Runtime {
             .packet_for_budget(
                 requests,
                 Some(&inputs),
-                baseline.budget,
+                packet_budget,
                 mixed,
                 &baseline.order,
             )?
@@ -431,6 +467,7 @@ impl Runtime {
                 );
             }
         }
+        self.prepare_host_inputs(&layout, &packet_requests, requests, &mut readout);
         let (verified, verify_timing) =
             self.team
                 .forward_with(layout, inputs, readout, Some(capture), || {})?;
