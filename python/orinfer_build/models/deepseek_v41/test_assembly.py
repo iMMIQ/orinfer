@@ -244,8 +244,21 @@ class PacketBoundaryTests(unittest.TestCase):
         self.assertEqual(result, original)
         self.assertEqual(original, self.fixture())
 
+    def test_selected_family_can_absorb_its_complete_neighbor(self):
+        original = self.fixture()
+        result = retarget_packet_boundary(original, 512, 32)
+        for rank, before in zip(result["ranks"], original["ranks"], strict=True):
+            packets = rank["packets"]
+            self.assertEqual(len(packets), len(before["packets"]) - 1)
+            self.assertEqual(packets[:2], before["packets"][:2])
+            self.assertEqual(packets[-1], before["packets"][-1])
+            selected = deepcopy(before["packets"][3])
+            selected["min_rows"] = 32
+            self.assertEqual(packets[2], selected)
+        self.assertEqual(original, self.fixture())
+
     def test_rejects_ambiguous_domains_without_mutating_input(self):
-        for case in ("missing", "capacity", "domain", "duplicate", "empty", "boolean"):
+        for case in ("missing", "capacity", "domain", "duplicate", "outside", "boolean"):
             model = self.fixture()
             packets = model["ranks"][-1]["packets"]
             minimum = 128
@@ -257,8 +270,8 @@ class PacketBoundaryTests(unittest.TestCase):
                 packets[3]["max_rows"] = 1024
             elif case == "duplicate":
                 packets.append(deepcopy(packets[3]))
-            elif case == "empty":
-                minimum = 32
+            elif case == "outside":
+                minimum = 31
             else:
                 minimum = True
             before = deepcopy(model)

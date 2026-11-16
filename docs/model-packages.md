@@ -379,6 +379,8 @@ A2 离线 assembly 的 `--fp32-sums` 可将 BF16 AllReduce／ReduceScatter 提�
 
 `compare_serial` 使用 batch 实际生成的固定历史，按相同计算家族逐请求重放，比较完整词表概率和 greedy 输出。它验证请求隔离及批量算术，不替代官方 BF16/FP8 质量对照。报告区分 forward 时间与执行计划准备时间；完整请求吞吐包含 CPU 坐标、Engram 查找、传输、计算、HCCL、输出头和同步，预热测量排除加载、准入、重置与 Graph 捕获。
 
+固定历史的直接执行对照可在输入顶层设置 `"graph_capture":false`，使用与在线服务相同的直接路径；省略时沿用自动捕获。报告记录实际选项。对照时保持相同的显式 `frames`、后续 token 和通信模式。
+
 离线短测的 case 可设置 `record_routing:true`，在首次预热的每个 frame 完成后读取各 rank 的 W4 专家行计数。报告的 `routing` 保存 case、frame、角色、实际 token 行数及按计划 rank 顺序排列的计数；每项保留原始 groups buffer 名。读取由资源所属 worker 执行，耗时不计入 forward 测量。默认关闭，在线服务不采集该统计。
 
 可选的 decode router 分片复用现有 `dense.fp32_partials`、`dense.fp32_reduce` 和 `memory.gather_columns`。各 rank 计算连续的输出列，AllGather 后恢复完整 FP32 logits，再执行原来的 TopK。TP8 的 384 个专家按每 rank 48 个逻辑列分配，投影使用 64 列对齐视图，末端重叠列在恢复时裁剪；权重值、K 归约顺序和专家布局保持原契约。该转换作用于 `batch_decode` packet，prefill 继续使用完整投影。
@@ -843,6 +845,8 @@ DSpark 需要本次引擎及配套执行包；v0.3.0 target 包继续使用普�
 发布阶段使用 `python -m orinfer_build.models.deepseek_v41.publication --source PACKAGE_DIR --output-cache OUTPUT_CACHE` 整理已有执行包。导出与整理共用引用收集流程，只保留计划引用的算子与资产，并保留许可证；算子库移除静态符号表，逐库比较所有运行时段及设备代码字节；计划采用紧凑 JSON，重新固定库与包身份，权重 payload 保持原样。
 
 已有动态 target 家族的选择边界可通过 `--packet-boundary OLD NEW --model-dir MODEL_DIR` 离线调整。例如 `--packet-boundary 512 128` 让原有 query／序列分片模板从 128 个聚合 token 行开始执行。整理器要求各 rank 的两个家族相邻、容量及覆盖范围一致，保留两侧完整程序、算子与请求状态绑定，再校验动态行表达式及物理范围。新包的 digest 需同步写入模型描述。边界按完整请求测量选择；此操作复用已编译的动态算子。
+
+新边界可等于左侧家族的起点；此时右侧模板覆盖整个相邻区间，整理器移除被完整替代的左侧家族。例如相邻区间为 32–127 与 128–2048 时，`--packet-boundary 128 32` 保留一个覆盖 32–2048 行的现有模板，普通 decode 与 draft 保持各自的程序。
 
 A2 执行包可通过 `batch.verification_capacity` 声明 decoder 验证行预算，包含每个 owner 的 anchor 和草稿行；0.3.2 发布包声明 192 行，支持 32 路各 5 个草稿的容量。`--max-speculative-tokens 0` 采用包声明的预算，显式非零设置进一步收紧该预算。混合包的 prefill 行与 decoder 验证行分别计入原有 packet 和验证容量，复用相同动态算子。未声明该字段的旧包沿用首个交换家族之前的限制，例如 128 行边界对应 127 行。草稿深度继续由自动策略按成本选择；独立 prefill 沿用原有大行数执行计划。
 

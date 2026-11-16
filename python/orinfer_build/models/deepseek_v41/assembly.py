@@ -355,10 +355,14 @@ def retarget_packet_boundary(model, previous, minimum):
             raise ValueError("Require one adjacent pair of target families on every rank")
         left, right = left[0], right[0]
         low, high = left.get("min_rows", 1), right.get("max_rows", right["rows"])
-        if left["rows"] != right["rows"] or not low < minimum <= high:
-            raise ValueError("Boundary must retain two nonempty, equal-capacity families")
+        if left["rows"] != right["rows"] or not low <= minimum <= high:
+            raise ValueError("Boundary must preserve equal-capacity target coverage")
         domains.append((low, high, left["rows"]))
-        left["max_rows"], right["min_rows"] = minimum - 1, minimum
+        right["min_rows"] = minimum
+        if minimum == low:
+            rank["packets"] = [p for p in rank["packets"] if p is not left]
+        else:
+            left["max_rows"] = minimum - 1
     if not domains or len(set(domains)) != 1:
         raise ValueError("Target family domains must match across ranks")
     return result

@@ -13,6 +13,7 @@ use std::{collections::BTreeSet, path::Path, time::Instant};
 #[serde(deny_unknown_fields)]
 struct Inputs {
     cases: Vec<Case>,
+    graph_capture: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +89,7 @@ pub struct Report {
     tensor_parallel: usize,
     owner_capacity: usize,
     context_capacity: usize,
+    graph_capture: bool,
     load_s: f64,
     requests: Vec<Measurement>,
     preparations: Vec<Preparation>,
@@ -273,6 +275,7 @@ fn forward(
     cap: usize,
     owners: usize,
     full: bool,
+    capture: bool,
 ) -> Result<(Vec<Output>, f64, f64)> {
     let layout = frame_layout(frame, cap, owners)?;
     let positions = if frame.draft {
@@ -294,11 +297,13 @@ fn forward(
                 .collect(),
         ))?;
     }
-    let (values, seconds, preparation) = team.forward(
-        layout,
-        frame.requests.iter().map(|r| r.tokens.clone()).collect(),
-        full,
-    )?;
+    let tokens = frame.requests.iter().map(|r| r.tokens.clone()).collect();
+    let (values, seconds, preparation) = if capture {
+        team.forward(layout, tokens, full)?
+    } else {
+        let (values, timing) = team.profile_forward(layout, tokens, full.into(), false)?;
+        (values, timing.seconds, timing.preparation)
+    };
     if frame.verification {
         team.exchange(Command::EndVerification)?;
     }
@@ -646,6 +651,9 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
             return Err("Automatic decode requires each owner's final prefill output".into());
         }
     }
+    // Keep the server's session capabilities; the selected mode uses its
+    // normal direct submission or Graph capture/replay path.
+    let graph_capture = inputs.graph_capture.unwrap_or(true);
     let team = Team::load(plan, model_dir)?;
     let load_s = team.load_s;
     eprintln!("A2 shared batch model loaded in {load_s:.3}s");
@@ -683,6 +691,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                         if f.decode { owners } else { capacity },
                         owners,
                         (case.compare_serial || logits_directory.is_some()) && repeat == 0,
+                        graph_capture,
                     )?;
                     if repeat == 0
                         && let Some(directory) = logits_directory.as_deref()
@@ -789,8 +798,14 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                 for frame in
                                     plan_frames(std::slice::from_ref(request), capacity, 1)?
                                 {
-                                    let (out, _, _) =
-                                        forward(&team, &frame, capacity, owners, true)?;
+                                    let (out, _, _) = forward(
+                                        &team,
+                                        &frame,
+                                        capacity,
+                                        owners,
+                                        true,
+                                        graph_capture,
+                                    )?;
                                     serial[last].extend(out);
                                 }
                                 for (index, frame) in
@@ -811,7 +826,8 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                             .cloned()
                                             .collect(),
                                     };
-                                    let (out, _, _) = forward(&team, &one, owners, owners, true)?;
+                                    let (out, _, _) =
+                                        forward(&team, &one, owners, owners, true, graph_capture)?;
                                     serial[index].extend(out);
                                 }
                                 team.exchange(Command::Release(None))?;
@@ -840,6 +856,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
                                     if f.decode { owners } else { capacity },
                                     owners,
                                     true,
+                                    graph_capture,
                                 )?;
                                 serial[index].extend(out);
                             }
@@ -908,6 +925,7 @@ pub fn run(plan: &Path, model_dir: &Path, inputs: &Path) -> Result<Report> {
             tensor_parallel: 8,
             owner_capacity: owners,
             context_capacity: model.capacity,
+            graph_capture,
             load_s,
             requests: measurements,
             preparations,

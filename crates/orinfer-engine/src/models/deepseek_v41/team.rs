@@ -783,7 +783,6 @@ impl Team {
         )
     }
 
-    #[cfg(test)]
     pub fn profile_forward(
         &self,
         layout: Layout,
