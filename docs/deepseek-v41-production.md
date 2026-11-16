@@ -15,7 +15,7 @@ bin/orinfer package install \
 
 0.3.7 将长上下文索引的四行 query 合并执行，保留原 FP32 累加顺序，并优化 selected KV 的 DMA 读取、设备端下一步输入、Graph 复用及 DSpark 成本估计。普通 decode、验证和混合 packet 继续复用动态计算模板。升级引擎和配套元数据即可复用现有权重；旧 revision 与执行包保留用于回滚。
 
-本版 A2 执行包 digest 为 `4307320423382099921ae096f74591713f2547d3d26331feb30b1a0cd3f13c1d`，包含候选块索引/source TopK 融合、128–2048 行专家融合及既有视觉、设备采样和 decoder 验证程序。自动 DSpark 默认最多 5 个草稿，32 路请求可按成本选择同一动态验证实现。正常部署使用 `--max-speculative-tokens 0`，由执行包提供验证预算。共享片段 Graph 仍默认关闭。`ORINFER_A2_DSPARK_SAMPLING=rejection` 是显式实验选项；本版混合调度修复的 Mini 对照使用默认 coupled 路径。性能与质量验收范围见发行包中的 `ACCEPTANCE-v0.3.7.json`。
+本版 A2 执行包 digest 为 `f58978588cb8a31ef5d6fef381ed78b9c67738c8bbdfc76b76580e0576fbf80a`，包含候选块索引/source TopK 融合、128–2048 行专家融合及既有视觉、设备采样和 decoder 验证程序。自动 DSpark 默认最多 5 个草稿，32 路请求可按成本选择同一动态验证实现。正常部署使用 `--max-speculative-tokens 0`，由执行包提供验证预算。共享片段 Graph 仍默认关闭。`ORINFER_A2_DSPARK_SAMPLING=rejection` 是显式实验选项；本版混合调度修复的 Mini 对照使用默认 coupled 路径。性能与质量验收范围见发行包中的 `ACCEPTANCE-v0.3.7.json`。
 
 已有 v0.3.1/fix1 模型的权重保持不变。通过 Hugging Face 模型仓库的 `v0.3.7` revision 下载配套元数据，确保 `cache/model.json` 声明上述 digest；旧 revision 与执行包仍可用于回滚。算子与执行计划继续单独安装。
 
