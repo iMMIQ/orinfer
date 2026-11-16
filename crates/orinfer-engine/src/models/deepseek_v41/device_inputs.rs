@@ -501,7 +501,11 @@ impl Runtime {
         let ports = ports
             .iter()
             .zip(&template.spec().operands)
-            .map(|(buffer, operand)| buffer.slice(0, operand.bytes()?))
+            .map(|(buffer, operand)| {
+                buffer.slice(0, operand.bytes()?).map_err(|error| {
+                    format!("Device input {name} operand {}: {error}", operand.name)
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         let key = (
             name.to_owned(),

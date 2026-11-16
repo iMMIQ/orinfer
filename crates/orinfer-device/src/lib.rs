@@ -181,7 +181,10 @@ impl MemoryRange {
     }
     pub fn within(&self, capacity: usize) -> Result<()> {
         if self.end()? > capacity {
-            return Err("Memory extent exceeds allocation".into());
+            return Err(format!(
+                "Memory extent exceeds allocation: offset={}, bytes={}, capacity={capacity}",
+                self.offset, self.bytes
+            ));
         }
         Ok(())
     }
