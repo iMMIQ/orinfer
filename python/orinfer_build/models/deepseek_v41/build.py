@@ -1772,8 +1772,13 @@ def compile_task(task_and_output):
     return task["placeholder"], str(path.relative_to(output))
 
 
-def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None):
+def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None, grid_limit=None):
     """Recompile selected or all operators from an existing native build contract."""
+    if grid_limit is not None:
+        if type(grid_limit) is not int or not 1 <= grid_limit <= 32767:
+            raise ValueError("Invalid physical A2 grid limit")
+        if not operators:
+            raise ValueError("A grid override requires explicitly selected operators")
     base = plan.parent
     model = json.loads(plan.read_text())
     tasks = {}
@@ -1827,6 +1832,10 @@ def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None):
         ):
             continue
         task = kernel_rebuild_task(spec, manifest)
+        if grid_limit is not None:
+            if task.get("row_capacity") is None:
+                raise ValueError("A grid override requires a dynamic row operator: " + spec["op"])
+            task["grid_limit"] = grid_limit
         identity = json.dumps(
             {k: v for k, v in task.items() if k not in ("placeholder", "key")}, sort_keys=True
         )
@@ -1866,6 +1875,11 @@ def main():
     parser.add_argument("--rebuild-paired-plan", type=Path)
     parser.add_argument("--rebuild-plan", type=Path)
     parser.add_argument("--rebuild-op", action="append", help="Rebuild only these operator names")
+    parser.add_argument(
+        "--rebuild-grid-limit",
+        type=int,
+        help="Override the bounded physical grid for explicitly selected dynamic operators",
+    )
     parser.add_argument("--capacity", type=int, default=8448)
     parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--strategy", choices=("baseline", "optimized"), default="baseline")
@@ -1902,10 +1916,13 @@ def main():
             args.compile_workers,
             all_kernels=args.rebuild_plan is not None,
             operators=args.rebuild_op,
+            grid_limit=args.rebuild_grid_limit,
         )
         return
     if args.rebuild_op:
         parser.error("rebuild-op requires rebuild-plan or rebuild-paired-plan")
+    if args.rebuild_grid_limit is not None:
+        parser.error("rebuild-grid-limit requires rebuild-plan or rebuild-paired-plan")
     if args.model_dir is None or args.engram_metadata is None or args.output is None:
         parser.error("model-dir, engram-metadata and output are required for a full build")
     if not 128 <= args.capacity <= 16384 or args.capacity % 32:

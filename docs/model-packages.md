@@ -102,6 +102,8 @@ local TopK 的空块使用交错的 `(-inf, -1)` 候选对。`tests.ascend.opera
 
 已有原生计划可使用 `orinfer_build.models.deepseek_v41.build --rebuild-plan PLAN --rebuild-op topk.local` 只重建相关算子，输出同目录的 `PLAN-selected.json`。`--rebuild-op` 可重复提供，未出现在计划中的算子名会报错；未选中的库和权重保持原引用。重建复用公共编译任务及内容缓存，最终部署仍需发布新的执行包。
 
+`--rebuild-grid-limit N` 为显式选中的动态行算子设置物理网格上限，保留同一计算体、真实行数、权重和舍入边界；其余算子沿用原计划中的网格。例如 `--rebuild-op dense.projection --rebuild-grid-limit 20` 可创建 20 个 Cube 核设备上的投影候选。网格上限计入编译身份，不能根据设备核数全量替换其他算子的已验收配置；部署前比较相关算子的数值、改变输入的 Graph replay、固定历史完整词表及真实请求耗时。
+
 当前 A2 编译和运行统一支持 CANN 9.2。离线镜像面向 aarch64，包含 Python 3.12、PyTorch、torch_npu 和固定版本与 SHA256 的 TileLang-Ascend 前端；wheel 文件名中的 `cann910` 是上游发布名称。`run.sh` 挂载本机 `/usr/local/Ascend/cann-9.2.0` 并加载其环境，实际编译器与运行库均来自该目录，可通过 `ORINFER_ASCEND_CANN_ROOT` 指定另一份 CANN 9.2 安装。编译记录包含安装版本及 Bisheng 身份；发布要求全部引用算子具有同一 CANN 9.2 工具链身份。已有执行计划通过 `orinfer_build.models.deepseek_v41.build --rebuild-plan PLAN` 全量重建，保持权重和执行边界，合并同契约的编译任务，再发布引用到的库。
 
 DSpark Markov 的步号通过只读 INT32 表绑定，argmax、confidence 和 rank reduce 各复用一个动态算子。5／8／16 长度别名只截取公共 Markov 调用序列。专家融合使用实际专家路由倍率，`orinfer_build.models.deepseek_v41.expert_fusion --role target|draft` 共用 gather、A4 GMM 和激活边界的构建流程；所有者行数、专家数和路由倍率共同确定几何。

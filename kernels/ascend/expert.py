@@ -101,8 +101,11 @@ def finish(rows, width, experts, tile_n=256, slots=24):
     ):
         with T.Kernel(slots, is_npu=True) as (cid, vid):
             with T.Scope("V"):
-                start = T.alloc_var("int32", init=0)
-                cursor = T.alloc_var("int32", init=0)
+                # The Ascend frontend hoists alloc_var initializers out of the
+                # bounded logical-grid loop. Reset a UB scalar on every tile;
+                # the rotating lane cursor is exactly this prefix modulo lanes.
+                prefix = T.alloc_ub((8,), "int32")
+                prefix[0] = 0
                 ri = T.alloc_ub((2, width * 2), "float16")
                 rf = T.alloc_ub((2, width * 2), "float32")
                 high = T.alloc_ub((1, tile_n * 2), "float32")
@@ -117,9 +120,15 @@ def finish(rows, width, experts, tile_n=256, slots=24):
                 boundary = T.alloc_ub((1, tile_n), "bfloat16")
                 gated = T.alloc_ub((1, width), "bfloat16")
                 for expert in T.serial(experts):
+                    start = prefix[0]
+                    cursor = start % (slots * 2)
                     count = T.min(rows - start, T.max(0, T.cast(groups[expert], "int32")))
                     lane = cid * 2 + vid
-                    first = T.if_then_else(lane >= cursor, lane - cursor, lane + slots * 2 - cursor)
+                    if lane >= cursor:
+                        prefix[1] = lane - cursor
+                    else:
+                        prefix[1] = lane + slots * 2 - cursor
+                    first = prefix[1]
                     for item in T.serial(T.ceildiv(T.max(0, count - first), slots * 2)):
                         row = start + first + item * slots * 2
                         T.copy(raw[row * 2 : row * 2 + 2, :], ri)
@@ -165,7 +174,6 @@ def finish(rows, width, experts, tile_n=256, slots=24):
                             T.tile.cast(boundary, up, "CAST_RINT", tile_n)
                             T.copy(boundary, gated[:, column * tile_n : (column + 1) * tile_n])
                         quantize_bf16_row(gated, out, scales, row, width)
-                    start = start + count
-                    cursor = (cursor + count) % (slots * 2)
+                    prefix[0] = start + count
 
     return main.with_attr("orinfer.explicit_cross_sync", True)
