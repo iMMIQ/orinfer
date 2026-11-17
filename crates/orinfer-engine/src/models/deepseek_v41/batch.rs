@@ -112,7 +112,10 @@ impl Contract {
             let capacity =
                 work_capacity(self.work_items(&reference, grid, name, rank)?.len(), padded);
             if items.len() > capacity {
-                return Err("Owner work exceeds its retained Graph capacity".into());
+                return Err(format!(
+                    "Owner work table {name} needs {} items but its retained Graph holds {capacity}",
+                    items.len()
+                ));
             }
             items.resize(capacity, [-1, 0]);
         }
@@ -178,6 +181,7 @@ struct TableKey {
     output_positions: Vec<usize>,
     decoder_roles: Vec<super::replay::Role>,
     work_shape: Option<Vec<usize>>,
+    work_padding: bool,
 }
 pub(super) struct BoundTables {
     key: TableKey,
@@ -313,6 +317,7 @@ pub(super) struct Layout {
     pub decode: bool,
     pub decoder_roles: Vec<super::replay::Role>,
     work_shape: Option<Vec<usize>>,
+    work_padding: bool,
 }
 impl Layout {
     pub fn new(
@@ -340,6 +345,7 @@ impl Layout {
                 }
             })
             .collect();
+        let work_padding = !decode && rows.total >= 512;
         Ok(Self {
             role: super::PacketRole::Target,
             output_positions: outputs.iter().map(|&i| segments[i].tokens - 1).collect(),
@@ -349,6 +355,7 @@ impl Layout {
             decode,
             decoder_roles,
             work_shape: None,
+            work_padding,
         })
     }
     /// Retain a proven launch envelope while row/address tables carry real lengths.
@@ -370,6 +377,7 @@ impl Layout {
             || self.outputs.len() != reference.outputs.len()
             || self.segments.len() != reference.segments.len()
             || self.decoder_roles != reference.decoder_roles
+            || padded_work(self) != padded_work(reference)
             || self
                 .segments
                 .iter()
@@ -578,6 +586,7 @@ impl Layout {
             output_positions: self.output_positions.clone(),
             decoder_roles: self.decoder_roles.clone(),
             work_shape: self.work_shape.clone(),
+            work_padding: padded_work(self),
         }
     }
 }
@@ -723,7 +732,10 @@ fn shape_key_with_scope(
 /// Retain a small launch envelope across nearby owner-work counts so changing
 /// prompt splits need not rebuild an otherwise identical model packet.
 fn padded_work(layout: &Layout) -> bool {
-    layout.role == super::PacketRole::Target && !layout.decode && layout.rows.total >= 512
+    // Decoder/suffix views inherit their source packet's launch envelope.
+    // Recomputing it from their shorter row count would disagree with the
+    // retained-work check and with the uploaded owner-work table.
+    layout.role == super::PacketRole::Target && !layout.decode && layout.work_padding
 }
 fn work_capacity(count: usize, padded: bool) -> usize {
     if padded {

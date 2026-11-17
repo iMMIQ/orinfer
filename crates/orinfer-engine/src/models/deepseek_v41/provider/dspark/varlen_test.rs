@@ -5,16 +5,22 @@ use super::*;
 #[test]
 #[ignore = "Requires the A2 package, eight NPUs and HCCL_DETERMINISTIC=strict"]
 fn retained_work_replays_changed_owner_lengths_and_inputs() {
-    retained_work(false);
+    retained_work(false, false);
 }
 
 #[test]
 #[ignore = "Requires the A2 package, eight NPUs and HCCL_DETERMINISTIC=strict"]
 fn mixed_work_replays_changed_owner_lengths_and_inputs() {
-    retained_work(true);
+    retained_work(true, false);
 }
 
-fn retained_work(producer: bool) {
+#[test]
+#[ignore = "Requires the A2 package, eight NPUs and HCCL_DETERMINISTIC=strict"]
+fn mixed_final_work_replays_changed_owner_lengths_and_inputs() {
+    retained_work(false, true);
+}
+
+fn retained_work(producer: bool, final_prompt: bool) {
     use std::os::fd::AsRawFd;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -57,7 +63,7 @@ fn retained_work(producer: bool) {
                     input_tokens: input.clone(),
                     images: vec![],
                     audios: vec![],
-                    max_new_tokens: if producer { 512 } else { 64 },
+                    max_new_tokens: if producer || final_prompt { 2048 } else { 64 },
                     sampling: crate::sampling::Options {
                         temperature: 1.,
                         seed: 20261002,
@@ -100,14 +106,33 @@ fn retained_work(producer: bool) {
             owners,
         )
         .unwrap();
-        if producer {
+        if producer || final_prompt {
             view.outputs.retain(|&owner| owner < 3);
             view.output_positions.truncate(lengths[..3].iter().sum());
-            view.decoder_roles[3] = super::super::super::replay::Role::Producer;
+            view.decoder_roles[3] = if producer {
+                super::super::super::replay::Role::Producer
+            } else {
+                super::super::super::replay::Role::Final
+            };
+            if final_prompt {
+                view.outputs.push(3);
+                view.output_positions.push(lengths[3] - 1);
+            }
         }
         view
     };
-    let reference = layout(&[4, 4, 4, if producer { 500 } else { 4 }]);
+    let reference = layout(&[
+        4,
+        4,
+        4,
+        if producer {
+            500
+        } else if final_prompt {
+            1012
+        } else {
+            4
+        },
+    ]);
     // This uses the production guarded warmup and coordinated all-rank capture.
     runtime
         .team
@@ -127,6 +152,8 @@ fn retained_work(producer: bool) {
     let mut reports = vec![];
     let cases = if producer {
         [[6, 2, 4, 500], [2, 6, 4, 500], [4, 4, 4, 500]]
+    } else if final_prompt {
+        [[3, 4, 5, 1012], [5, 4, 3, 1012], [4, 4, 4, 1012]]
     } else {
         [[6, 2, 6, 2], [2, 6, 2, 6], [4, 4, 4, 4]]
     };
@@ -164,7 +191,7 @@ fn retained_work(producer: bool) {
                     requests
                         .iter()
                         .zip(lengths)
-                        .take(if producer { 3 } else { 4 })
+                        .take(if producer || final_prompt { 3 } else { 4 })
                         .map(|(r, n)| (r.slot, n))
                         .collect(),
                 ))
@@ -184,8 +211,26 @@ fn retained_work(producer: bool) {
         for right in [1, 2] {
             let mut maximum = 0f64;
             let mut variation = 0f64;
-            assert_eq!(results[0].0.len(), if producer { 12 } else { 16 });
-            assert_eq!(results[right].0.len(), if producer { 12 } else { 16 });
+            assert_eq!(
+                results[0].0.len(),
+                if producer {
+                    12
+                } else if final_prompt {
+                    13
+                } else {
+                    16
+                }
+            );
+            assert_eq!(
+                results[right].0.len(),
+                if producer {
+                    12
+                } else if final_prompt {
+                    13
+                } else {
+                    16
+                }
+            );
             for (a, b) in results[0].0.iter().zip(&results[right].0) {
                 assert_eq!(a.owner, b.owner);
                 assert_eq!(a.logits.len(), runtime.vocab());
@@ -221,7 +266,7 @@ fn retained_work(producer: bool) {
             differences.push((maximum, variation));
         }
         reports.push(
-            serde_json::json!({"trial":trial,"lengths":lengths,"producer":producer,
+            serde_json::json!({"trial":trial,"lengths":lengths,"producer":producer,"final_prompt":final_prompt,
             "maximum_probability_delta":differences[1].0,"maximum_total_variation":differences[1].1,
             "repeat_probability_delta":differences[0].0,"repeat_total_variation":differences[0].1,
             "deterministic":strict,

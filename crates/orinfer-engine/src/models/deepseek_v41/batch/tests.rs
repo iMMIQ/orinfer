@@ -724,3 +724,77 @@ fn retained_work_cannot_hide_a_larger_native_launch() {
             .is_err()
     );
 }
+
+#[test]
+fn retained_mixed_work_keeps_source_padding_in_decoder_views() {
+    let grid: RowExpression = serde_json::from_value(serde_json::json!({
+        "op":"divide", "lhs":{"op":"add", "lhs":{"op":"rows"},
+        "rhs":{"op":"constant", "value":1}}, "rhs":{"op":"constant", "value":2}
+    }))
+    .unwrap();
+    let mut c = contract();
+    c.work.insert("w".into(), grid.clone());
+    c.decoder_replay = Some(
+        serde_json::from_value(serde_json::json!({
+            "keep":128, "final_prompt_only":true, "tables":["w"], "maps":[]
+        }))
+        .unwrap(),
+    );
+    let launches = [WorkLaunch {
+        role: super::super::PacketRole::Target,
+        family: (false, 128, 4096),
+        grid: grid.clone(),
+        range: None,
+        partition: 1,
+        decoder: true,
+    }]
+    .into();
+    for prompt in [
+        super::super::replay::Role::Producer,
+        super::super::replay::Role::Final,
+    ] {
+        let make = |lengths: &[usize]| {
+            let mut view = Layout::verification(
+                lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &tokens)| BatchSegment { slot, tokens })
+                    .collect(),
+                4096,
+                32,
+            )
+            .unwrap();
+            view.outputs.retain(|&i| i < 3);
+            view.output_positions.truncate(lengths[..3].iter().sum());
+            view.decoder_roles[3] = prompt;
+            if prompt == super::super::replay::Role::Final {
+                view.outputs.push(3);
+                view.output_positions.push(lengths[3] - 1);
+            }
+            view
+        };
+        let reference = make(&[4, 4, 4, 1012]);
+        let mut selected = make(&[3, 4, 5, 1012]);
+        assert!(selected.bound_work(&reference, &c, &launches).unwrap());
+        let decoder = selected.decoder(128, true).unwrap();
+        assert!(decoder.rows.total < 512);
+        let source_items = c.work_items(&selected, &grid, "w", 0).unwrap();
+        let decoder_items = c.work_items(&decoder, &grid, "w", 0).unwrap();
+        assert_eq!(source_items, decoder_items);
+        assert!(decoder_items.iter().any(|p| p[0] == 2 && p[1] == 2));
+        let shape = shape_key(&c, &selected, (selected.role, false, 128), &launches).unwrap();
+        assert_eq!(shape.work_rows, vec![decoder_items.len() / 2]);
+        // A standalone packet with these short rows uses its own envelope.
+        if prompt == super::super::replay::Role::Final {
+            let standalone = make(
+                &decoder
+                    .segments
+                    .iter()
+                    .map(|s| s.tokens)
+                    .collect::<Vec<_>>(),
+            );
+            assert!(!padded_work(&standalone));
+            assert_ne!(decoder.table_key(128), standalone.table_key(128));
+        }
+    }
+}
