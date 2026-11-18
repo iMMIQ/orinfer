@@ -80,15 +80,20 @@ impl ModelRuntime {
                 return Err("Request cancelled during MTP warm/refresh".into());
             }
             let remaining = shifted_ids.len() - offset;
-            let (plan, tokens) = spec.warm_plan(if owner.is_some() {
-                remaining.min(capacity)
+            let native = spec.warm_plan(remaining)?;
+            // The single-owner prefill program can advance a longer causal
+            // chain than the packet used for short draft and refresh steps.
+            let packet_owner =
+                owner.filter(|_| phase != ExecutionPhase::Prefill || native.1 <= capacity);
+            let (plan, tokens) = if packet_owner.is_some() && native.1 > capacity {
+                spec.warm_plan(capacity)?
             } else {
-                remaining
-            })?;
+                native
+            };
             let ids = &shifted_ids[offset..offset + tokens];
             self.upload_ids(&spec.input, ids)?;
             self.prepare_program_inputs(&plan.program, ids, &[])?;
-            if let Some(slot) = owner {
+            if let Some(slot) = packet_owner {
                 // Preparation publishes the logical length before KV mapping.
                 // Prefill, prefix bridges and decode refresh share the same
                 // private kernels and stable-address packet implementation.
@@ -104,7 +109,7 @@ impl ModelRuntime {
             }
             offset += tokens;
             if produce_head && offset == shifted_ids.len() {
-                if let Some(slot) = owner {
+                if let Some(slot) = packet_owner {
                     self.execute_spec_packet_phase(
                         &[orinfer_model_sdk::architecture::BatchSegment { slot, tokens: 1 }],
                         orinfer_model_sdk::abi::BatchOperation::DraftHead,

@@ -193,7 +193,14 @@ def index_pending(m: int, dynamic_rows: bool = False):
 
 
 @orin_jit
-def index_scores(m: int, capacity: int, dynamic_rows: bool = False, stripes: int | None = 8):
+def index_scores(
+    m: int,
+    capacity: int,
+    dynamic_rows: bool = False,
+    stripes: int | None = 8,
+    *,
+    query_major: bool = False,
+):
     blocks = geometry(m, capacity)
     if stripes is not None and (type(stripes) is not int or stripes <= 0):
         raise ValueError("Invalid QSA stripe count")
@@ -201,13 +208,14 @@ def index_scores(m: int, capacity: int, dynamic_rows: bool = False, stripes: int
     stripes = T.dynamic("stripes") if symbolic_stripes else min((blocks + 63) // 64, stripes)
 
     m = count = row_count(m, dynamic_rows)
+    score_shape = (m * blocks,) if query_major else (blocks, m)
 
     @T.prim_func
     def main(
         Query: T.Tensor((m, 4, 128), T.float16),
         Cache: T.Tensor((blocks, 128), T.float16),
         Position: T.Tensor((1,), T.int32),
-        Scores: T.Tensor((blocks, m), T.float32),
+        Scores: T.Tensor(score_shape, T.float32),
     ):
         with T.Kernel(T.ceildiv(m, 4), stripes, threads=128) as (qr, stripe):
             q = T.alloc_shared((16, 128), T.float16)
@@ -215,6 +223,7 @@ def index_scores(m: int, capacity: int, dynamic_rows: bool = False, stripes: int
             acc = T.alloc_fragment((16, 64), T.float32)
             reduced = T.alloc_fragment((4, 64), T.float32)
             view = T.reshape(acc, (4, 4, 64))
+            live_blocks = (Position[0] + count) // 4
             # Stable graph/workspace addresses, but only live causal tiles run.
             for turn in T.serial(
                 T.ceildiv(
@@ -238,7 +247,13 @@ def index_scores(m: int, capacity: int, dynamic_rows: bool = False, stripes: int
                 T.reduce_sum(view, reduced, dim=1)
                 for i, j in T.Parallel(4, 64):
                     if qr * 4 + i < m and kb * 64 + j < (Position[0] + qr * 4 + i + 1) // 4:
-                        Scores[kb * 64 + j, qr * 4 + i] = reduced[i, j] * 128**-0.5
+                        if query_major:
+                            # Demand mapping covers only the live score prefix.
+                            Scores[(qr * 4 + i) * live_blocks + kb * 64 + j] = (
+                                reduced[i, j] * 128**-0.5
+                            )
+                        else:
+                            Scores[kb * 64 + j, qr * 4 + i] = reduced[i, j] * 128**-0.5
 
     return explicit_scalar(main, stripes) if symbolic_stripes else main
 

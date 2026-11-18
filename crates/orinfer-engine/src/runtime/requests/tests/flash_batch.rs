@@ -1497,7 +1497,7 @@ fn validate_flash_prefix_cache() {
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 2 << 30,
-            mtp_drafts: Some(0),
+            mtp_drafts: Some(fixture.mtp_drafts.unwrap_or(0)),
 
             ..Default::default()
         },
@@ -1553,7 +1553,7 @@ fn validate_flash_prefix_cache() {
         assert_eq!(
             committed(&mut model, &mut warm),
             expected_state,
-            "Full prefix restore changed committed KV/GDN/conv/PLE/index/pending state"
+            "Full prefix restore changed committed KV/GDN/conv/PLE/index/pending/MTP state"
         );
         rows.push(json!({"prompt_tokens":source.input_tokens.len(),"images":source.images.len(),
             "cached_tokens":warm.prefix.statistics.cached_tokens,"restore_s":warm.prefix.statistics.restore_s,

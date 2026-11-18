@@ -209,6 +209,92 @@ def qsa_pair(old, first, compiler, capacity, context, config, layout=None):
     return result
 
 
+def publish_qsa_prefill(package, manifest, compiler):
+    """Coalesce QSA scores and overlap packed KV reads in native Flash prefill."""
+    from kernels.cuda.model import qsa, qsa_attention, qsa_selection
+
+    if package["architecture"] != "flash_next":
+        raise ValueError("Native QSA prefill layout requires Flash Next")
+    originals = {k["name"]: k for k in package["kernels"]}
+    dynamics = {k["name"]: k for k in package["dynamic_batch_kernels"]}
+    context = manifest["max_context"]
+    replacements, launches = {}, {}
+    attention_roles = {"Query", "K", "V", "KS", "VS", "Selected", "Position", "Max", "Den", "Out"}
+    for plan in manifest["prefill_plans"]:
+        rows = plan["chunk_tokens"]
+        operations = manifest["programs"][plan["prefill_program"]]
+        for previous, current in zip(operations, operations[1:]):
+            selector = originals.get(current.get("name"))
+            if selector is not None and selector["grid"] == [rows, 2, 8]:
+                operands = compiler.pointers(selector)
+                if set(operands) == attention_roles:
+                    name = selector["name"]
+                    if dynamics[name]["capacity"] != rows or selector["block"] != [128, 1, 1]:
+                        raise ValueError("Unexpected QSA prefill attention geometry")
+                    replacements[name], launches[name] = compiler.emit(
+                        selector,
+                        name,
+                        operands,
+                        rows,
+                        build=lambda: qsa_attention.sparse_attention.__wrapped__(
+                            rows, context, packed=True, single_buffer=True, dynamic_rows=True
+                        ),
+                        key=f"qsa-single-buffer-{context}-{rows}",
+                    )
+                    continue
+            if selector is None or selector["symbol"] != "qsa_select_partial_kernel":
+                continue
+            producer = originals[previous["name"]]
+            a, b = compiler.pointers(producer), compiler.pointers(selector)
+            if (
+                set(a) != {"Cache", "Position", "Query", "Scores"}
+                or set(b) != {"Position", "Scores", "Selected"}
+                or a["Scores"] != b["Scores"]
+                or a["Position"] != b["Position"]
+                or any(dynamics[k["name"]]["capacity"] != rows for k in (producer, selector))
+            ):
+                raise ValueError("Unexpected QSA prefill score producer/consumer contract")
+            stripes, parts = producer["grid"][1], selector["grid"][1]
+            threads = selector["block"][0]
+            for old, pointers, kind, build, constants in (
+                (
+                    producer,
+                    a,
+                    f"score-{stripes}",
+                    lambda: qsa.index_scores.__wrapped__(
+                        rows, context, True, None, query_major=True
+                    ),
+                    {"stripes": stripes},
+                ),
+                (
+                    selector,
+                    b,
+                    f"select-{parts}-{threads}",
+                    lambda: qsa_selection.select.__wrapped__(
+                        rows, context, True, 512, threads, parts, query_major=True
+                    ),
+                    None,
+                ),
+            ):
+                name = old["name"]
+                replacements[name], launches[name] = compiler.emit(
+                    old,
+                    name,
+                    pointers,
+                    rows,
+                    build=build,
+                    key=f"qsa-query-major-{context}-{rows}-{kind}",
+                    constants=constants,
+                )
+    if not replacements:
+        raise ValueError("Flash Next native prefill requires a partitioned QSA selection chain")
+    package["kernels"] = [replacements.get(k["name"], k) for k in package["kernels"]]
+    package["dynamic_batch_kernels"] = [
+        launches.get(k["name"], k) for k in package["dynamic_batch_kernels"]
+    ]
+    return sorted(replacements)
+
+
 def publish(data, package, manifest, compiler, output, families=("router", "ple", "qsa")):
     from kernels.cuda.model import moe, ple
     from orinfer_build.tuning.expert_tuning import MoeTuner
@@ -419,7 +505,10 @@ def main():
     for key in ("model", "model-output", "output"):
         p.add_argument("--" + key, type=Path, required=True)
     p.add_argument(
-        "--families", nargs="+", choices=("router", "ple", "qsa"), default=["router", "ple", "qsa"]
+        "--families",
+        nargs="+",
+        choices=("router", "ple", "qsa", "qsa-prefill"),
+        default=["router", "ple", "qsa"],
     )
     args = p.parse_args()
     from orinfer_build.compiler.cuda.common import configure
@@ -433,7 +522,12 @@ def main():
         compiler = Compiler(
             origin, root, args.output, {b["name"]: b for b in data["metadata"]["buffers"]}
         )
-        publish(data, package, manifest, compiler, args.output, args.families)
+        families = tuple(family for family in args.families if family != "qsa-prefill")
+        if families:
+            publish(data, package, manifest, compiler, args.output, families)
+        if "qsa-prefill" in args.families:
+            names = publish_qsa_prefill(package, manifest, compiler)
+            write_json(args.output / "qsa-prefill.json", dict(bindings=names))
         digest = compact_package(root, package, staging / "cache/packages")
         shutil.rmtree(root)
         data["execution_package"] = digest

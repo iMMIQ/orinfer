@@ -87,3 +87,5 @@ Rust 执行器为大块共享工作区保留 CUDA 虚拟地址，在首次上传
 Qwen3_5 的 `gdn_execution` 明确声明 prefill 的 sequential/chunked 策略，以及 decode 的 dense/deferred 策略和日志容量；构建、验证、恢复与提交消费同一契约。原生适配器依据显式契约校验策略及其全部状态和工作区。Attention 的 INT8 读取与临时 FP16 KV 暂存候选按完整流水线实测选择，以小行数、非对齐尾部和大 prefill 的实测结果决定选择区间。
 
 `auxiliary_tuning.py` 可为已有原生包测量并发布 MoE top-k、QSA 选择和 FP16 PLE norm/gate 融合，参数为 `--model`、`--model-output` 和 `--output`；`--families router` 只处理共享 MoE 路由。Flash Next 正式 `build.py` 包含该步骤，Qwen3_5 构建器复用同一 MoE 调优器。几何来自 checkpoint 签名及物理 buffer 视图，支持展开或扁平 workspace；数值、尾部和 Graph 检查通过后才参与选择。QSA 与 PLE 汇总多长度测量选择一个配置，Rust 适配器验证完整生产者链后应用融合并生成执行顺序。
+
+Flash Next 执行包已有分区 QSA 选择时，可用 `python -m orinfer_build.tuning.auxiliary_tuning --families qsa-prefill --model MODEL --model-output NEW_MODEL --output BUILD_RECORD` 构建原生单请求 prefill 的 QSA 优化包。打分和选择共用按实际因果块数紧凑排列的 FP32 workspace。稀疏 attention 复用临时 INT8 tile，并将 V 读取与 QK 计算重叠，保留原 softmax 分区和精确 TopK 语义。

@@ -13,12 +13,20 @@ from orinfer_build.compiler.cuda.common import orin_jit
 
 @orin_jit
 def select(
-    m: int, capacity: int, dynamic_rows=False, tile: int = 512, threads: int = 128, parts: int = 2
+    m: int,
+    capacity: int,
+    dynamic_rows=False,
+    tile: int = 512,
+    threads: int = 128,
+    parts: int = 2,
+    *,
+    query_major: bool = False,
 ):
     blocks = geometry(m, capacity)
     if tile not in (256, 512, 1024) or threads not in (128, 256) or parts not in (2, 4, 8):
         raise ValueError("Invalid QSA selection geometry")
     m = row_count(m, dynamic_rows)
+    score_shape = (m * blocks,) if query_major else (blocks, m)
 
     def histogram(length):
 
@@ -63,7 +71,7 @@ def select(
 
     @T.prim_func
     def main(
-        Scores: T.Tensor((blocks, m), T.float32),
+        Scores: T.Tensor(score_shape, T.float32),
         Position: T.Tensor((1,), T.int32),
         Selected: T.Tensor((m, parts * 1024), T.int32),
     ):
@@ -76,6 +84,7 @@ def select(
             ranks = T.alloc_fragment((tile,), T.int32)
             equals = T.alloc_fragment((tile,), T.int32)
             equal_ranks = T.alloc_fragment((tile,), T.int32)
+            live_blocks = (Position[0] + m) // 4
             causal_full = (Position[0] + row + 1) // 4
             start = part * T.ceildiv(causal_full, parts)
             full = T.max(0, T.min(T.ceildiv(causal_full, parts), causal_full - start))
@@ -95,9 +104,15 @@ def select(
                         for i in T.Parallel(tile):
                             values[i] = 0
                             if block * tile + i < full:
-                                values[i] = T.reinterpret(
-                                    T.int32, Scores[start + block * tile + i, row]
-                                )
+                                if query_major:
+                                    values[i] = T.reinterpret(
+                                        T.int32,
+                                        Scores[row * live_blocks + start + block * tile + i],
+                                    )
+                                else:
+                                    values[i] = T.reinterpret(
+                                        T.int32, Scores[start + block * tile + i, row]
+                                    )
                         tile_histogram(
                             values, hist, control, T.min(tile, full - block * tile), digit
                         )
@@ -112,7 +127,13 @@ def select(
                     flags[i] = 0
                     equals[i] = 0
                     if block * tile + i < full:
-                        key = T.reinterpret(T.int32, Scores[start + block * tile + i, row])
+                        key = T.alloc_var(T.int32)
+                        if query_major:
+                            key = T.reinterpret(
+                                T.int32, Scores[row * live_blocks + start + block * tile + i]
+                            )
+                        else:
+                            key = T.reinterpret(T.int32, Scores[start + block * tile + i, row])
                         values[i] = key
                         flags[i] = T.cast(key > control[3], T.int32)
                         equals[i] = T.cast(key == control[3], T.int32)
