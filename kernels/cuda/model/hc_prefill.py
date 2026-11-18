@@ -294,6 +294,66 @@ def hc_up_mix_prefill(
 
 
 @orin_jit
+def hc_up_mix_packet(M: int, H: int, rank: int, dynamic_rows: bool = False):
+    """Mix streams from the packet's materialized FP16 normalization."""
+    if not 1 <= M <= 1024 or H != 2560 or rank != 320:
+        raise ValueError("Invalid Flash packet HC geometry")
+    M = row_count(M, dynamic_rows)
+    BM, BN = 64, 32
+
+    @T.prim_func
+    def hc_packet_up_mix(
+        A: T.Tensor((M, rank), T.float16),
+        W: T.Tensor((4 * H, rank), T.bfloat16),
+        Normed: T.Tensor((M, 4, H), T.float16),
+        Out: T.Tensor((M, H), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(M, BM), H // BN, threads=128) as (by, bx):
+            T.import_source(HALF_MATH)
+            a = T.alloc_shared((BM, 64), T.bfloat16)
+            w = T.alloc_shared((4 * BN, 64), T.bfloat16)
+            acc = T.alloc_fragment((BM, 4 * BN), T.float32)
+            rounded = T.alloc_shared((BM, 4 * BN), T.float16)
+            total = T.alloc_fragment((BM, BN), T.float32)
+            T.annotate_layout(
+                {
+                    total: tilelang.Fragment(
+                        (BM, BN),
+                        forward_thread_fn=lambda i, j: (i % 4) * 32 + j,
+                        forward_index_fn=lambda i, j: i // 4,
+                    )
+                }
+            )
+            T.clear(acc)
+            for kg in T.Pipelined(rank // 64, num_stages=2):
+                for i, j in T.Parallel(BM, 64):
+                    a[i, j] = T.if_then_else(
+                        by * BM + i < M, A[by * BM + i, kg * 64 + j], T.float16(0)
+                    )
+                for n, j in T.Parallel(4 * BN, 64):
+                    w[n, j] = W[(n // BN) * H + bx * BN + n % BN, kg * 64 + j]
+                T.gemm(a, w, acc, transpose_B=True)
+            T.copy(acc, rounded)
+            T.clear(total)
+            for branch in T.serial(4):
+                for i, j in T.Parallel(BM, BN, coalesced_width=T.int32(1)):
+                    if by * BM + i < M:
+                        normed = Normed[by * BM + i, branch, bx * BN + j]
+                        gate = stream_sigmoid(
+                            T.cast(rounded[i, branch * BN + j], T.float32), "float16"
+                        )
+                        product = T.cast(
+                            T.cast(gate, T.float32) * T.cast(normed, T.float32), T.float16
+                        )
+                        total[i, j] += T.cast(product, T.float32)
+            for i, j in T.Parallel(BM, BN):
+                if by * BM + i < M:
+                    Out[by * BM + i, bx * BN + j] = total[i, j] / 4
+
+    return hc_packet_up_mix
+
+
+@orin_jit
 def hc_projection_partial(M: int, N: int, K: int, dynamic_rows: bool = False):
     """Project four streams independently, preserving each K accumulation."""
     if any(type(n) is not int or n <= 0 for n in (M, N, K)) or K % 256:

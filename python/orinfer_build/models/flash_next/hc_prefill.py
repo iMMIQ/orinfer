@@ -1,7 +1,81 @@
-"""Publish the exact HC prefill path for non-aligned row counts."""
+"""Publish exact HC prefill and large packet projections."""
 
 import math
 from functools import partial
+
+
+def _publish_packet_up_mix(kernels, launches, compiler, scopes):
+    from kernels.cuda.model.hc_prefill import hc_up_mix_packet
+
+    capacity, first, hidden, rank = 1024, 97, 2560, 320
+    rows = {
+        "A": capacity * rank,
+        "Normed": capacity * 4 * hidden,
+        "Out": capacity * hidden,
+    }
+    additions, obsolete = {}, set()
+    for name, old in kernels.items():
+        if (
+            not name.startswith("flash_decode/layer")
+            or "/rows/" in name
+            or old["symbol"] != "hc_up13_vector_project_kernel"
+        ):
+            continue
+        pointers = compiler.pointers(old)
+        if not rows.keys() <= pointers.keys() or launches[name]["capacity"] != capacity:
+            raise ValueError(f"Invalid packet HC geometry: {name}")
+        bindings = {role: pointers[role] for role in rows}
+        for role, extent in rows.items():
+            operand = bindings[role]
+            buffer = compiler.buffers[operand["name"]]
+            if (
+                operand["kind"] != "buffer"
+                or scopes[operand["name"]] != "workspace"
+                or buffer["dtype"] != "f16"
+                or buffer["layout"] != "native_contiguous"
+                or math.prod(buffer["shape"]) != extent
+            ):
+                raise ValueError(f"Invalid packet HC workspace for {role}: {name}")
+
+        # The HC13 cache encodes this same immutable BF16 bank losslessly.
+        low = pointers["Lo"]["name"]
+        weight = low.removeprefix("HC13_").removesuffix("_Lo")
+        buffer = compiler.buffers[weight]
+        if (
+            low != f"HC13_{weight}_Lo"
+            or pointers["Hi"]["name"] != f"HC13_{weight}_Hi"
+            or buffer["dtype"] != "bf16"
+            or buffer["shape"] != [4 * hidden, rank]
+            or buffer["layout"] != "native_contiguous"
+            or scopes[weight] != "weights"
+            or buffer.get("data") is None
+        ):
+            raise ValueError(f"Invalid packet HC BF16 source: {name}")
+        bindings["W"] = dict(kind="buffer", name=weight)
+
+        prefix = name + "/rows/"
+        for choice in kernels.keys():
+            if choice.startswith(prefix):
+                low, high = map(int, choice[len(prefix) :].split("-"))
+                if high < first:
+                    continue
+                if low < first or compiler.pointers(kernels[choice]) != bindings:
+                    raise ValueError(f"Overlapping packet HC choice: {choice}")
+                obsolete.add(choice)
+        choice = f"{prefix}{first}-{capacity}"
+        additions[choice], launches[choice] = compiler.emit(
+            old,
+            choice,
+            bindings,
+            capacity,
+            build=partial(hc_up_mix_packet.__wrapped__, capacity, hidden, rank, dynamic_rows=True),
+            key="flash-hc-packet-up-bf16-64",
+        )
+    for name in obsolete - additions.keys():
+        del kernels[name]
+        del launches[name]
+    kernels.update(additions)
+    return additions.keys(), obsolete
 
 
 def publish(package, manifest, compiler, *, scopes):
@@ -75,7 +149,10 @@ def publish(package, manifest, compiler, *, scopes):
         raise ValueError("Missing native HC prefill up/mix bindings")
     kernels.update(replacements)
     kernels.update(small)
+    packet, obsolete = _publish_packet_up_mix(kernels, launches, compiler, scopes)
     package["kernels"] = list(kernels.values())
     package["dynamic_batch_kernels"] = list(launches.values())
-    package["plan_kernel_contracts"] = sorted(set(package["plan_kernel_contracts"]) | small.keys())
-    return sorted(replacements)
+    package["plan_kernel_contracts"] = sorted(
+        (set(package["plan_kernel_contracts"]) - obsolete) | small.keys() | packet
+    )
+    return sorted(replacements.keys() | packet)
