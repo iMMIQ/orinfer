@@ -529,6 +529,7 @@ impl Runtime {
             tokens: input.to_vec(),
             media,
             image_work,
+            checkpoint: Default::default(),
         })
     }
     pub fn estimated_request_cost(
@@ -542,7 +543,7 @@ impl Runtime {
         if hint.owner != self.owner {
             return Err("Foreign A2 request hint".into());
         }
-        let hit = self.matched(&hint.tokens, &hint.media);
+        let hit = self.matched_hint(hint);
         let cached = hit.map_or(0, |h| self.entry(h).tokens.len());
         let remaining = hint.tokens.len().saturating_sub(cached);
         let image_s = hint.image_work as f64 * self.vision_seconds_per_patch
@@ -648,7 +649,30 @@ impl Runtime {
                 .ok_or("Owner token budget overflow")?,
             options.memory_reserve_bytes,
         )?;
-        memory::ensure_budget(self, needed)
+        let capacity = self.prefill_packet_capacity();
+        if options.policy != scheduler::Policy::Latency
+            || self.active.is_empty()
+            || input.input_tokens.len() <= capacity
+        {
+            return memory::ensure_budget(self, needed);
+        }
+        if self.team.has_budget(needed)? {
+            return Ok(true);
+        }
+        let media = Media::images(&input.input_tokens, &input.images, self.vision())?;
+        let cached = self
+            .matched(&input.input_tokens, &media)
+            .map_or(0, |hit| self.entry(hit).tokens.len());
+        if input.input_tokens.len().saturating_sub(cached) > capacity {
+            // Let live owners progress while the scheduler waits for memory
+            // to admit a cold prompt. Its aged memory guard prevents starvation.
+            return Ok(false);
+        }
+        if memory::reclaim_one(self)? {
+            memory::ensure_budget(self, needed)
+        } else {
+            self.team.has_budget(needed)
+        }
     }
 
     pub fn start_request(
@@ -956,7 +980,7 @@ impl Runtime {
             return Ok(false);
         }
         let cached = self
-            .matched(&hint.tokens, &hint.media)
+            .matched_hint(hint)
             .map_or(0, |hit| self.entry(hit).tokens.len());
         if request.offset > cached
             && request.media.common_tokens(&hint.media, request.offset) == request.offset
@@ -965,7 +989,7 @@ impl Runtime {
         {
             self.store(request, None)?;
             Ok(self
-                .matched(&hint.tokens, &hint.media)
+                .matched_hint(hint)
                 .is_some_and(|hit| self.entry(hit).tokens.len() > cached))
         } else {
             let common = request

@@ -3,7 +3,7 @@ mod tiered;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-pub(crate) use tiered::{Admission, Tiered};
+pub(crate) use tiered::{Admission, CheckpointMemo, Tiered};
 
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct Statistics {
@@ -221,6 +221,14 @@ impl<T: Resident> Cache<T> {
         media: &Media,
         score: impl Fn(&Entry<T>) -> Option<f64>,
     ) -> Match {
+        self.probe::<true>(tokens, media, score)
+    }
+    fn probe<const TRACK_OVERLAP: bool>(
+        &self,
+        tokens: &[u32],
+        media: &Media,
+        score: impl Fn(&Entry<T>) -> Option<f64>,
+    ) -> Match {
         let mut result = Match::default();
         let mut best = f64::INFINITY;
         let (mut node, mut depth) = (&self.root, 0);
@@ -228,7 +236,9 @@ impl<T: Resident> Cache<T> {
             for id in &node.endpoints {
                 let e = &self.entries[id];
                 let common = e.media.common_tokens(media, depth);
-                result.matched_tokens = result.matched_tokens.max(common);
+                if TRACK_OVERLAP {
+                    result.matched_tokens = result.matched_tokens.max(common);
+                }
                 if common == depth
                     && (depth < tokens.len() || e.logits_valid)
                     && let Some(cost) = score(e)
@@ -241,38 +251,45 @@ impl<T: Resident> Cache<T> {
             let child = tokens.get(depth).and_then(|id| node.children.get(id));
             // A deeper token match can fail on an image identity. Off-path
             // siblings may still provide a longer media-compatible overlap.
-            for (key, sibling) in &node.children {
-                if Some(key) == tokens.get(depth) {
+            if TRACK_OVERLAP {
+                for (key, sibling) in &node.children {
+                    if Some(key) == tokens.get(depth) {
+                        continue;
+                    }
+                    let mut ids = vec![];
+                    sibling.descendants(&mut ids);
+                    for id in ids {
+                        result.matched_tokens = result
+                            .matched_tokens
+                            .max(self.entries[&id].media.common_tokens(media, depth));
+                    }
+                }
+            }
+            if let Some(child) = child {
+                let remaining = &tokens[depth..];
+                if remaining.starts_with(&child.label) {
+                    depth += child.label.len();
+                    node = child;
                     continue;
                 }
-                let mut ids = vec![];
-                sibling.descendants(&mut ids);
-                for id in ids {
+                if TRACK_OVERLAP {
+                    depth += child
+                        .label
+                        .iter()
+                        .zip(remaining)
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    node = child;
+                }
+            }
+            if TRACK_OVERLAP {
+                let mut descendants = vec![];
+                node.descendants(&mut descendants);
+                for id in descendants {
                     result.matched_tokens = result
                         .matched_tokens
                         .max(self.entries[&id].media.common_tokens(media, depth));
                 }
-            }
-            if let Some(child) = child {
-                let common = child
-                    .label
-                    .iter()
-                    .zip(&tokens[depth..])
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                depth += common;
-                if common == child.label.len() {
-                    node = child;
-                    continue;
-                }
-                node = child;
-            }
-            let mut descendants = vec![];
-            node.descendants(&mut descendants);
-            for id in descendants {
-                result.matched_tokens = result
-                    .matched_tokens
-                    .max(self.entries[&id].media.common_tokens(media, depth));
             }
             return result;
         }
@@ -408,10 +425,12 @@ pub(crate) fn match_tiers<D: Resident, H: Resident>(
     device_score: impl Fn(&Entry<D>) -> Option<f64>,
     host_score: impl Fn(&Entry<H>) -> Option<f64>,
 ) -> Option<(bool, u64)> {
+    // Tier selection consumes only restorable endpoints. Other branches can
+    // contribute partial-overlap statistics, while endpoints must be on path.
     let d = device
-        .match_prefix_by(tokens, media, device_score)
+        .probe::<false>(tokens, media, device_score)
         .checkpoint;
-    let h = host.match_prefix_by(tokens, media, host_score).checkpoint;
+    let h = host.probe::<false>(tokens, media, host_score).checkpoint;
     match (d, h) {
         (Some(d), Some(h)) if host.entries[&h].tokens.len() > device.entries[&d].tokens.len() => {
             Some((true, h))

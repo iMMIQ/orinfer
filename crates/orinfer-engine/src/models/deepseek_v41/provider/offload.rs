@@ -32,6 +32,10 @@ impl Runtime {
     pub(super) fn matched(&self, input: &[u32], media: &Media) -> Option<Hit> {
         matched_tier(&self.cache, input, media, self.final_decoder_window())
     }
+    pub(super) fn matched_hint(&self, hint: &scheduler::RequestHint) -> Option<Hit> {
+        hint.checkpoint
+            .lookup(&self.cache, || self.matched(&hint.tokens, &hint.media))
+    }
     pub(super) fn entry(&self, hit: Hit) -> &Entry<Snapshot> {
         if hit.0 {
             &self.cache.host.entries[&hit.1]

@@ -1,5 +1,39 @@
 //! Device-independent tier ownership and admission. Native adapters move bytes.
 use super::*;
+use std::sync::Mutex;
+
+type Revision = [(u64, usize); 2];
+type Checkpoint = (bool, u64);
+
+#[derive(Default)]
+pub(crate) struct CheckpointMemo(Mutex<Option<(Revision, Option<Checkpoint>)>>);
+
+impl CheckpointMemo {
+    pub fn lookup<D, H>(
+        &self,
+        cache: &Tiered<D, H>,
+        lookup: impl FnOnce() -> Option<Checkpoint>,
+    ) -> Option<Checkpoint> {
+        // An insertion advances the endpoint ID. A removal changes the
+        // entry count at that ID. Touches do not change restorable endpoints.
+        let revision = [
+            (cache.device.next_id, cache.device.entries.len()),
+            (cache.host.next_id, cache.host.entries.len()),
+        ];
+        let mut memo = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((seen, checkpoint)) = *memo
+            && seen == revision
+        {
+            return checkpoint;
+        }
+        let checkpoint = lookup();
+        *memo = Some((revision, checkpoint));
+        checkpoint
+    }
+}
 
 pub(crate) struct Tiered<D, H> {
     pub device: Cache<D>,
@@ -93,6 +127,32 @@ mod tests {
             0,
             true,
         )
+    }
+    #[test]
+    fn queue_checkpoint_tracks_tier_changes_without_rechecking_touches() {
+        let mut tiers = Tiered::new(4, 4);
+        let memo = CheckpointMemo::default();
+        let score = |e: &Entry<Banks>| Some(-(e.tokens.len() as f64));
+        let lookup = |tiers: &Tiered<Banks, Banks>| {
+            memo.lookup(tiers, || {
+                tiers.matched(&[1, 2, 3], &Media::default(), score, score)
+            })
+        };
+        assert_eq!(lookup(&tiers), None);
+        assert_eq!(memo.lookup(&tiers, || panic!("reused miss")), None);
+        let device = tiers.device.insert(entry(&[1, 2], &[(1, 2)]));
+        assert_eq!(lookup(&tiers), Some((false, device)));
+        tiers.device.touch(device);
+        assert_eq!(
+            memo.lookup(&tiers, || panic!("touch changes no endpoint")),
+            Some((false, device))
+        );
+        let host = tiers.host.insert(entry(&[1, 2, 3], &[(2, 2)]));
+        assert_eq!(lookup(&tiers), Some((true, host)));
+        tiers.host.remove(host);
+        assert_eq!(lookup(&tiers), Some((false, device)));
+        tiers.device.remove(device);
+        assert_eq!(lookup(&tiers), None);
     }
     #[test]
     fn tier_admission_counts_shared_banks_metadata_and_physical_granularity() {

@@ -122,6 +122,7 @@ pub struct RequestHint {
     pub(crate) tokens: Vec<u32>,
     pub(crate) media: crate::prefix::Media,
     pub(crate) image_work: usize,
+    pub(crate) checkpoint: crate::prefix::CheckpointMemo,
 }
 impl RequestHint {
     pub fn common_tokens(&self, other: &Self) -> usize {
@@ -780,6 +781,7 @@ mod tests {
             tokens: vec![1, 2, 3, 4],
             media: crate::prefix::Media(vec![(2, [image; 32])]),
             image_work: 16,
+            checkpoint: Default::default(),
         };
         assert_eq!(hint(1, 0).common_tokens(&hint(1, 0)), 4);
         assert_eq!(hint(1, 0).common_tokens(&hint(1, 1)), 2);
