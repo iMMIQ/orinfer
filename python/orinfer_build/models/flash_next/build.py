@@ -140,11 +140,21 @@ def rebuild(args):
     manifest = {}
     data, origin, package = load_model(args.model, plan=manifest)
     buffers = {b["name"]: b for b in data["metadata"]["buffers"]}
-    if args.expert_prefill_only or args.expert_decode_only or args.hc_prefill_only:
+    if (
+        args.expert_prefill_only
+        or args.expert_decode_only
+        or args.hc_prefill_only
+        or args.qsa_attention_only
+    ):
         from orinfer_build.compiler.cuda.common import configure
         from orinfer_build.packaging.compact import compact_package
 
-        if args.hc_prefill_only:
+        if args.qsa_attention_only:
+            from functools import partial
+            from orinfer_build.tuning.auxiliary_tuning import publish_qsa_prefill
+
+            publish = partial(publish_qsa_prefill, attention_only=True)
+        elif args.hc_prefill_only:
             from functools import partial
             from orinfer_build.models.flash_next.hc_prefill import publish as publish_hc_prefill
 
@@ -468,6 +478,11 @@ def main():
         action="store_true",
         help="Rebuild native HC prefill up/mix for arbitrary live row counts",
     )
+    auxiliary.add_argument(
+        "--qsa-attention-only",
+        action="store_true",
+        help="Rebuild native QSA prefill attention with vectorized KV dequantization",
+    )
     p.add_argument(
         "--prefill-only",
         action="store_true",
@@ -496,7 +511,12 @@ def main():
     args = p.parse_args()
     if args.model.resolve() == args.model_output.resolve():
         p.error("model-output must differ from the immutable input")
-    if (args.expert_prefill_only or args.expert_decode_only or args.hc_prefill_only) and (
+    if (
+        args.expert_prefill_only
+        or args.expert_decode_only
+        or args.hc_prefill_only
+        or args.qsa_attention_only
+    ) and (
         args.plan_only
         or args.prefill_only
         or args.hc_combine_norm

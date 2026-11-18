@@ -21,6 +21,13 @@ __device__ __forceinline__ unsigned int qsa_dequant_pair(unsigned int code, unsi
     result.value = __hmul2(__hsub2(values.value, bias.value), scale.value);
     return result.bits;
 }
+
+__device__ __forceinline__ void qsa_dequant_store_eight(
+    void* dst, unsigned int a, unsigned int b, unsigned short scale) {
+    *reinterpret_cast<uint4*>(dst) = make_uint4(
+        qsa_dequant_pair(a, scale), qsa_dequant_pair(a >> 16, scale),
+        qsa_dequant_pair(b, scale), qsa_dequant_pair(b >> 16, scale));
+}
 """
 
 
@@ -77,17 +84,17 @@ def sparse_attention(
     @T.macro
     def dequantize(raw, scales, output):
         if vector_dequant:
-            # Two packed words share a scale and write eight adjacent FP16 values.
-            for j, word_pair in T.Parallel(block, 32):
-                scale = T.reinterpret(T.uint16, scales[j, word_pair // 8])
-                values = T.alloc_local((4,), T.uint32)
-                for pair in T.unroll(4):
-                    bits = raw[j, word_pair * 2 + pair // 2] >> ((pair % 2) * 16)
-                    values[pair] = T.call_pure_extern("uint32", "qsa_dequant_pair", bits, scale)
-                for d in T.vectorized(8):
-                    output[j, word_pair * 8 + d] = T.reinterpret(
-                        T.float16, T.cast(values[d // 2] >> ((d % 2) * 16), T.uint16)
-                    )
+            # The MMA shared layout keeps each eight-half group contiguous
+            # and aligned. Store the four rounded half2 values in one vector.
+            for j, word_pair in T.Parallel(block, 32, coalesced_width=T.int32(1)):
+                T.call_extern(
+                    "void",
+                    "qsa_dequant_store_eight",
+                    T.access_ptr(output[j, word_pair * 8], "w", 8),
+                    raw[j, word_pair * 2],
+                    raw[j, word_pair * 2 + 1],
+                    T.reinterpret(T.uint16, scales[j, word_pair // 8]),
+                )
         else:
             for j, pair in T.Parallel(block, 128, coalesced_width=T.int32(1)):
                 values = T.call_pure_extern(

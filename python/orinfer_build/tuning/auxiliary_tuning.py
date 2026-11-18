@@ -209,7 +209,7 @@ def qsa_pair(old, first, compiler, capacity, context, config, layout=None):
     return result
 
 
-def publish_qsa_prefill(package, manifest, compiler):
+def publish_qsa_prefill(package, manifest, compiler, *, attention_only=False):
     """Coalesce QSA scores and overlap packed KV reads in native Flash prefill."""
     from kernels.cuda.model import qsa, qsa_attention, qsa_selection
 
@@ -245,10 +245,14 @@ def publish_qsa_prefill(package, manifest, compiler):
                             async_scales=True,
                             vector_dequant=True,
                         ),
-                        key=f"qsa-single-buffer-vector8-{context}-{rows}",
+                        key=f"qsa-single-buffer-vector-store-{context}-{rows}",
                     )
                     continue
-            if selector is None or selector["symbol"] != "qsa_select_partial_kernel":
+            if (
+                attention_only
+                or selector is None
+                or selector["symbol"] != "qsa_select_partial_kernel"
+            ):
                 continue
             producer = originals[previous["name"]]
             a, b = compiler.pointers(producer), compiler.pointers(selector)
@@ -293,7 +297,7 @@ def publish_qsa_prefill(package, manifest, compiler):
                     constants=constants,
                 )
     if not replacements:
-        raise ValueError("Flash Next native prefill requires a partitioned QSA selection chain")
+        raise ValueError("Missing Flash Next native prefill QSA bindings")
     package["kernels"] = [replacements.get(k["name"], k) for k in package["kernels"]]
     package["dynamic_batch_kernels"] = [
         launches.get(k["name"], k) for k in package["dynamic_batch_kernels"]
