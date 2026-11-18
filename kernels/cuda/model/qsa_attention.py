@@ -37,6 +37,7 @@ def sparse_attention(
     dynamic_rows: bool = False,
     skip_empty: bool = False,
     async_scales: bool = False,
+    vector_dequant: bool = False,
 ):
     geometry(m, capacity)
 
@@ -67,9 +68,36 @@ def sparse_attention(
         raise ValueError("Single KV buffer requires packed attention")
     if type(async_scales) is not bool or async_scales and not packed:
         raise ValueError("Async scales require packed attention")
+    if type(vector_dequant) is not bool or vector_dequant and not packed:
+        raise ValueError("Vector dequantization requires packed attention")
     block = block_size
     kv_width = 64 if packed else 256
     kv_dtype = T.uint32 if packed else T.int8
+
+    @T.macro
+    def dequantize(raw, scales, output):
+        if vector_dequant:
+            # One packed word and scale produce four adjacent FP16 values.
+            for j, word in T.Parallel(block, 64):
+                bits = raw[j, word]
+                scale = T.reinterpret(T.uint16, scales[j, word // 16])
+                low = T.call_pure_extern("uint32", "qsa_dequant_pair", bits, scale)
+                high = T.call_pure_extern("uint32", "qsa_dequant_pair", bits >> 16, scale)
+                for d in T.vectorized(4):
+                    pair = T.if_then_else(d < 2, low, high)
+                    output[j, word * 4 + d] = T.reinterpret(
+                        T.float16, T.cast(pair >> ((d % 2) * 16), T.uint16)
+                    )
+        else:
+            for j, pair in T.Parallel(block, 128, coalesced_width=T.int32(1)):
+                values = T.call_pure_extern(
+                    "uint32",
+                    "qsa_dequant_pair",
+                    raw[j, pair // 2] >> ((pair % 2) * 16),
+                    T.reinterpret(T.uint16, scales[j, pair // 32]),
+                )
+                output[j, pair * 2] = T.reinterpret(T.float16, T.cast(values & 65535, T.uint16))
+                output[j, pair * 2 + 1] = T.reinterpret(T.float16, T.cast(values >> 16, T.uint16))
 
     @T.prim_func
     def main(
@@ -210,15 +238,7 @@ def sparse_attention(
                     T.ptx_commit_group()
                     T.ptx_wait_group(0)
                     T.sync_threads()
-                    for j, pair in T.Parallel(block, 128, coalesced_width=T.int32(1)):
-                        kw = T.call_pure_extern(
-                            "uint32",
-                            "qsa_dequant_pair",
-                            raw_k[j, pair // 2] >> ((pair % 2) * 16),
-                            T.reinterpret(T.uint16, key_scales[j, pair // 32]),
-                        )
-                        k[j, pair * 2] = T.reinterpret(T.float16, T.cast(kw & 65535, T.uint16))
-                        k[j, pair * 2 + 1] = T.reinterpret(T.float16, T.cast(kw >> 16, T.uint16))
+                    dequantize(raw_k, key_scales, k)
                 else:
                     for j, d in T.Parallel(block, 256, coalesced_width=T.int32(1)):
                         slot = start + tile * block + j
@@ -282,15 +302,7 @@ def sparse_attention(
                     if single_buffer:
                         T.ptx_wait_group(0)
                     T.sync_threads()
-                    for j, pair in T.Parallel(block, 128, coalesced_width=T.int32(1)):
-                        vw = T.call_pure_extern(
-                            "uint32",
-                            "qsa_dequant_pair",
-                            raw_v[j, pair // 2] >> ((pair % 2) * 16),
-                            T.reinterpret(T.uint16, value_scales[j, pair // 32]),
-                        )
-                        k[j, pair * 2] = T.reinterpret(T.float16, T.cast(vw & 65535, T.uint16))
-                        k[j, pair * 2 + 1] = T.reinterpret(T.float16, T.cast(vw >> 16, T.uint16))
+                    dequantize(raw_v, value_scales, k)
                     T.gemm(p, k, acc)
                 else:
                     T.gemm(p, v, acc)

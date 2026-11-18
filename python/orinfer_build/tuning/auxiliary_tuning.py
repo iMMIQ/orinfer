@@ -243,8 +243,9 @@ def publish_qsa_prefill(package, manifest, compiler):
                             single_buffer=True,
                             dynamic_rows=True,
                             async_scales=True,
+                            vector_dequant=True,
                         ),
-                        key=f"qsa-single-buffer-async-scales-{context}-{rows}",
+                        key=f"qsa-single-buffer-vector-dequant-{context}-{rows}",
                     )
                     continue
             if selector is None or selector["symbol"] != "qsa_select_partial_kernel":
