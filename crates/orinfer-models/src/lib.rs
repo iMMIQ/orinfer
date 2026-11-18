@@ -31,6 +31,9 @@ impl ModelImplementation for Models {
     ) -> artifact::Result<Vec<(String, Vec<u8>)>> {
         self.adapter.prepare(program, tokens, history)
     }
+    fn prefetch_inputs(&self, tokens: &[u32], history: &[u32]) {
+        self.adapter.prefetch_inputs(tokens, history);
+    }
     fn describe() -> abi::PackageInfo {
         abi::PackageInfo {
             package: env!("CARGO_PKG_NAME").into(),
@@ -150,6 +153,10 @@ pub extern "C" fn orinfer_model_inputs_v1(version: u32) -> *const abi::inputs::A
     } else {
         std::ptr::null()
     }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn orinfer_model_input_prefetch_v1(version: u32) -> Option<abi::inputs::Prefetch> {
+    (version == 1).then_some(abi::inputs::prefetch::<Models>)
 }
 static PLAN_API: abi::plans::Api = abi::plans::Api {
     version: 1,

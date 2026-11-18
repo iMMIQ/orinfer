@@ -10,6 +10,7 @@ pub(crate) trait Adapter {
     ) -> Result<Vec<(String, Vec<u8>)>> {
         Ok(vec![])
     }
+    fn prefetch_inputs(&self, _tokens: &[u32], _history: &[u32]) {}
     fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<abi::BatchPlan>;
     fn batch_operation(
         &self,

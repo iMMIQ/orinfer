@@ -2,6 +2,39 @@
 use super::{Bytes, ModelImplementation, OwnedBytes, boundary};
 use std::{ffi::c_void, ptr, slice};
 pub const ENTRYPOINT: &[u8] = b"orinfer_model_inputs_v1\0";
+pub const PREFETCH_ENTRYPOINT: &[u8] = b"orinfer_model_input_prefetch_v1\0";
+pub type Prefetch = unsafe extern "C" fn(*mut c_void, *const u32, usize, *const u32, usize);
+
+/// # Safety
+/// The caller retains the live model and both input spans during the call.
+pub unsafe extern "C" fn prefetch<M: ModelImplementation>(
+    handle: *mut c_void,
+    tokens: *const u32,
+    count: usize,
+    history: *const u32,
+    history_count: usize,
+) {
+    if handle.is_null()
+        || tokens.is_null()
+        || count == 0
+        || count > 4096
+        || history.is_null()
+        || history_count > 2
+    {
+        return;
+    }
+    // A failed speculative preparation can be retried through the normal ABI.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: the caller supplies initialized input spans and a live model.
+        unsafe {
+            (&*handle.cast::<M>()).prefetch_inputs(
+                slice::from_raw_parts(tokens, count),
+                slice::from_raw_parts(history, history_count),
+            );
+        }
+    }));
+}
+
 #[repr(C)]
 pub struct Upload {
     pub buffer: Bytes,

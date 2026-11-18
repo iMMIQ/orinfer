@@ -394,6 +394,7 @@ def rotate_expert_a8(
     routing=None,
     top_k=1,
     experts=1,
+    group_major=False,
 ):
     """Fuse exact A8 planes and optional routing, with explicit expert geometry.
 
@@ -405,6 +406,8 @@ def rotate_expert_a8(
         raise ValueError("Invalid expert activation routing")
     if type(top_k) is not int or type(experts) is not int or not 1 <= top_k <= experts:
         raise ValueError("Invalid expert activation geometry")
+    if group_major and routing is not None:
+        raise ValueError("K64-major planes require contiguous expert rows")
     return _rotation_a8(
         M,
         K,
@@ -412,6 +415,7 @@ def rotate_expert_a8(
         reciprocal,
         dynamic_rows,
         exact=True,
+        group_major=group_major,
         routing=routing,
         top_k=top_k,
         experts=experts,
@@ -424,7 +428,17 @@ def _validate_rotation(M, K):
 
 
 def _rotation_a8(
-    M, K, swiglu, reciprocal, dynamic_rows, *, exact=False, routing=None, top_k=1, experts=1
+    M,
+    K,
+    swiglu,
+    reciprocal,
+    dynamic_rows,
+    *,
+    exact=False,
+    routing=None,
+    top_k=1,
+    experts=1,
+    group_major=False,
 ):
     scatter = routing == "scatter"
     dispatch = routing is not None
@@ -432,6 +446,7 @@ def _rotation_a8(
     M = row_count(M, dynamic_rows)
     slots = M * top_k if dispatch else M
     transform = _block_rotation(K, K, swiglu)
+    planes = (K // 64, slots, 8) if group_major else (slots, K // 8)
 
     @T.macro
     def body(X, Signs, Q, S, Low, High, Sum, IDs, RelativeSlot, RowOffsets, DS, SlotMap, row):
@@ -471,7 +486,8 @@ def _rotation_a8(
                     "float32", "__fdiv_rn", values[k], T.cast(scale[0], T.float32)
                 )
                 quant[k] = T.cast(T.max(-127.0, T.min(127.0, T.round(ratio))), T.int32)
-            Q[row, k] = quant[k]
+            if not group_major:
+                Q[row, k] = quant[k]
             if exact:
                 position = ((k & 1) << 1) | ((k & 2) >> 1) | (k & 4)
                 low[k] = (T.cast(quant[k], T.uint32) & 15) << (position * 4)
@@ -501,8 +517,12 @@ def _rotation_a8(
             else:
                 for k in T.Parallel(K):
                     if k % 8 == 0:
-                        Low[row, k // 8] = low[k]
-                        High[row, k // 8] = high[k]
+                        if group_major:
+                            Low[k // 64, row, k % 64 // 8] = low[k]
+                            High[k // 64, row, k % 64 // 8] = high[k]
+                        else:
+                            Low[row, k // 8] = low[k]
+                            High[row, k // 8] = high[k]
                 Sum[row] = total[0]
 
     if not exact:
@@ -518,6 +538,22 @@ def _rotation_a8(
                 body(X, Signs, Q, S, Q, Q, S, Q, Q, Q, S, Q, row)
 
         return main
+
+    if group_major:
+
+        @T.prim_func
+        def rotate_pack_a8(
+            X: T.Tensor((M, width), T.float16),
+            Signs: T.Tensor((K,), T.int8),
+            S: T.Tensor((M, 1), T.float16),
+            Low: T.Tensor(planes, T.uint32),
+            High: T.Tensor(planes, T.uint32),
+            Sum: T.Tensor((slots,), T.int32),
+        ):
+            with T.Kernel(M, threads=128) as row:
+                body(X, Signs, S, S, Low, High, Sum, S, S, S, S, S, row)
+
+        return rotate_pack_a8
 
     if not dispatch:
 

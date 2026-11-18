@@ -29,6 +29,9 @@ struct Flash {
     packet_kernels: Vec<crate::artifact::Kernel>,
 }
 impl Adapter for Flash {
+    fn prefetch_inputs(&self, tokens: &[u32], history: &[u32]) {
+        self.inputs.prefetch(tokens, history, 4096);
+    }
     fn batch_operation(
         &self,
         segments: &[BatchSegment],

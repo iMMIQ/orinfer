@@ -13,7 +13,8 @@ use std::{
     io::Read,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    rc::Rc,
+    sync::{Arc, Mutex},
+    thread::JoinHandle,
 };
 
 /// Execution purpose selects the arena, independently of the logical row count.
@@ -89,7 +90,7 @@ struct Source {
     scale_offset: Option<u64>,
     width: usize,
 }
-type Row = Rc<Vec<u16>>;
+type Row = Arc<Vec<u16>>;
 #[derive(Default)]
 struct Cache {
     clock: u64,
@@ -104,11 +105,11 @@ impl Cache {
         self.clock += 1;
         *stamp = self.clock;
         self.order.insert(*stamp, key);
-        Some(Rc::clone(value))
+        Some(Arc::clone(value))
     }
     fn put(&mut self, key: (usize, usize), value: Row, budget: usize) {
         let size = value.len() * 2 + 512;
-        if size > budget {
+        if size > budget || self.get(key).is_some() {
             return;
         }
         while self.bytes + size > budget {
@@ -122,14 +123,119 @@ impl Cache {
         self.order.insert(self.clock, key);
     }
 }
-pub(super) struct Inputs {
+type Uploads = Vec<(String, Vec<u8>)>;
+
+struct Lookup {
     assets: Assets,
     tables: Vec<Table>,
     embedding: Vec<Source>,
     ple: Vec<Source>,
-    embedding_cache: RefCell<Cache>,
-    ple_cache: RefCell<Cache>,
+    embedding_cache: Mutex<Cache>,
+    ple_cache: Mutex<Cache>,
 }
+// The GPU worker owns the pending job. Only immutable token spans and CPU
+// lookup assets cross into the preparation thread.
+pub(super) struct Inputs {
+    lookup: Arc<Lookup>,
+    pending: RefCell<Option<Pending>>,
+}
+
+struct Pending {
+    tokens: Vec<u32>,
+    history: Vec<u32>,
+    capacity: usize,
+    task: JoinHandle<Result<Uploads>>,
+}
+
+fn history_tail(history: &[u32]) -> &[u32] {
+    &history[history.len().saturating_sub(2)..]
+}
+
+impl Inputs {
+    pub(super) fn open(
+        root: &str,
+        identity: &crate::artifact::FileIdentity,
+        verify_weights: bool,
+    ) -> Result<Self> {
+        Ok(Self {
+            lookup: Arc::new(Lookup::open(root, identity, verify_weights)?),
+            pending: RefCell::default(),
+        })
+    }
+
+    pub(super) fn prefetch(&self, tokens: &[u32], history: &[u32], capacity: usize) {
+        let mut pending = self.pending.borrow_mut();
+        if pending.as_ref().is_some_and(|job| !job.task.is_finished()) {
+            return;
+        }
+        if let Some(job) = pending.take() {
+            let _ = job.task.join();
+        }
+        let lookup = Arc::clone(&self.lookup);
+        let tokens = tokens.to_vec();
+        let history = history_tail(history).to_vec();
+        let work_tokens = tokens.clone();
+        let work_history = history.clone();
+        if let Ok(task) = std::thread::Builder::new()
+            .name("flash-inputs".into())
+            .spawn(move || lookup.prepare_for("target", &work_tokens, &work_history, capacity))
+        {
+            *pending = Some(Pending {
+                tokens,
+                history,
+                capacity,
+                task,
+            });
+        }
+    }
+
+    pub(super) fn prepare_for(
+        &self,
+        program: &str,
+        tokens: &[u32],
+        history: &[u32],
+        capacity: usize,
+    ) -> Result<Uploads> {
+        if program == "target"
+            && history
+                .iter()
+                .all(|&token| (token as usize) < self.lookup.assets.vocab)
+        {
+            let mut pending = self.pending.borrow_mut();
+            if pending.as_ref().is_some_and(|job| {
+                job.capacity == capacity
+                    && job.tokens == tokens
+                    && job.history == history_tail(history)
+            }) {
+                return pending
+                    .take()
+                    .unwrap()
+                    .task
+                    .join()
+                    .map_err(|_| "Flash input preparation panicked")?;
+            }
+        }
+        self.lookup.prepare_for(program, tokens, history, capacity)
+    }
+    #[cfg(test)]
+    pub(super) fn prepare(
+        &self,
+        tokens: &[u32],
+        history: &[u32],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        self.prepare_for("target", tokens, history, tokens.len())
+    }
+}
+
+impl Drop for Inputs {
+    fn drop(&mut self) {
+        // The native library must keep the thread's code mapped until it exits.
+        if let Some(job) = self.pending.get_mut().take() {
+            let _ = job.task.join();
+        }
+    }
+}
+
 fn path(root: &Path, name: &str) -> Result<PathBuf> {
     let relative = Path::new(name);
     if relative.is_absolute()
@@ -195,7 +301,7 @@ fn validate_rows(file: &mut File, part: &Part, width: usize, verify_weights: boo
     }
     Ok(())
 }
-impl Inputs {
+impl Lookup {
     pub(super) fn open(
         root: &str,
         identity: &crate::artifact::FileIdentity,
@@ -336,16 +442,16 @@ impl Inputs {
     fn row(
         &self,
         sources: &[Source],
-        cache: &RefCell<Cache>,
+        cache: &Mutex<Cache>,
         row: usize,
         budget: usize,
     ) -> Result<Row> {
         let key = shard_of(sources, row)?;
-        if let Some(value) = cache.borrow_mut().get(key) {
+        if let Some(value) = cache.lock().unwrap().get(key) {
             return Ok(value);
         }
         let value = load_row(sources, &self.tables, key.0, key.1)?;
-        cache.borrow_mut().put(key, Rc::clone(&value), budget);
+        cache.lock().unwrap().put(key, Arc::clone(&value), budget);
         Ok(value)
     }
     /// Read and decode every uncached row one packet needs before assembly.
@@ -354,11 +460,11 @@ impl Inputs {
     fn prefetch_rows(&self, embedding_rows: &[usize], ple_rows: &[usize]) -> Result<()> {
         let missing = |sources: &[Source],
                        rows: &[usize],
-                       cache: &RefCell<Cache>|
+                       cache: &Mutex<Cache>|
          -> Result<Vec<(usize, usize)>> {
             let mut need: Vec<(usize, usize)> = Vec::new();
             {
-                let mut cache = cache.borrow_mut();
+                let mut cache = cache.lock().unwrap();
                 for &row in rows {
                     let key = shard_of(sources, row)?;
                     if cache.get(key).is_none() {
@@ -385,7 +491,7 @@ impl Inputs {
             .collect();
         let mut decoded: Vec<Option<Vec<u16>>> = vec![None; total];
         let threads = total.min(std::thread::available_parallelism().map_or(1, |n| n.get()));
-        let Inputs {
+        let Lookup {
             embedding,
             ple,
             tables,
@@ -422,26 +528,21 @@ impl Inputs {
             })?;
         }
         for (key, value) in keys.iter().zip(decoded) {
-            let row = Rc::new(value.expect("every missing row was decoded"));
+            let row = Arc::new(value.expect("every missing row was decoded"));
             if key.0 {
                 self.ple_cache
-                    .borrow_mut()
+                    .lock()
+                    .unwrap()
                     .put((key.1, key.2), row, PLE_CACHE_BUDGET);
             } else {
-                self.embedding_cache
-                    .borrow_mut()
-                    .put((key.1, key.2), row, EMBEDDING_CACHE_BUDGET);
+                self.embedding_cache.lock().unwrap().put(
+                    (key.1, key.2),
+                    row,
+                    EMBEDDING_CACHE_BUDGET,
+                );
             }
         }
         Ok(())
-    }
-    #[cfg(test)]
-    pub(super) fn prepare(
-        &self,
-        tokens: &[u32],
-        history: &[u32],
-    ) -> Result<Vec<(String, Vec<u8>)>> {
-        self.prepare_for("target", tokens, history, tokens.len())
     }
     pub(super) fn prepare_for(
         &self,
@@ -621,7 +722,7 @@ fn decode_row(
         .collect())
 }
 fn load_row(sources: &[Source], tables: &[Table], shard: usize, local: usize) -> Result<Row> {
-    Ok(Rc::new(decode_row(sources, tables, shard, local)?))
+    Ok(Arc::new(decode_row(sources, tables, shard, local)?))
 }
 fn decode(packet: &[u8], table: &Table) -> Result<Vec<u16>> {
     let scale = f16::from_bits(u16::from_le_bytes([packet[0], packet[1]])).to_f32();
@@ -794,12 +895,12 @@ mod tests {
     #[test]
     fn cached_rows_share_immutable_storage_and_survive_eviction() {
         let mut cache = Cache::default();
-        let row = Rc::new(vec![0x3c00; 64]);
+        let row = Arc::new(vec![0x3c00; 64]);
         let budget = row.len() * 2 + 512;
-        cache.put((0, 0), Rc::clone(&row), budget);
+        cache.put((0, 0), Arc::clone(&row), budget);
         let hit = cache.get((0, 0)).unwrap();
-        assert!(Rc::ptr_eq(&hit, &row));
-        cache.put((0, 1), Rc::new(vec![0x4000; 64]), budget);
+        assert!(Arc::ptr_eq(&hit, &row));
+        cache.put((0, 1), Arc::new(vec![0x4000; 64]), budget);
         assert!(cache.get((0, 0)).is_none());
         assert_eq!(hit.as_slice(), &[0x3c00; 64]);
         assert_eq!(cache.get((0, 1)).unwrap().as_slice(), &[0x4000; 64]);
@@ -875,7 +976,10 @@ mod tests {
             .map(|k| serde_json::from_value(golden[k].clone()).unwrap())
             .collect();
         for (index, &token) in tokens.iter().enumerate() {
+            let synchronous = inputs.prepare(&[token], &history).unwrap();
+            inputs.prefetch(&[token], &history, 1);
             let rows = inputs.prepare(&[token], &history).unwrap();
+            assert_eq!(synchronous, rows);
             for (kind, (_, raw)) in rows.iter().enumerate() {
                 let actual: Vec<u16> = raw
                     .as_chunks::<2>()
@@ -893,8 +997,8 @@ mod tests {
             }
             history.push(token);
         }
-        assert!(inputs.embedding_cache.borrow().bytes <= EMBEDDING_CACHE_BUDGET);
-        assert!(inputs.ple_cache.borrow().bytes <= PLE_CACHE_BUDGET);
+        assert!(inputs.lookup.embedding_cache.lock().unwrap().bytes <= EMBEDDING_CACHE_BUDGET);
+        assert!(inputs.lookup.ple_cache.lock().unwrap().bytes <= PLE_CACHE_BUDGET);
         assert!(inputs.prepare(&[248320], &[]).is_err());
     }
 }

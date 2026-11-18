@@ -81,6 +81,7 @@ pub(crate) struct ModelPackage {
     handle: *mut c_void,
     api: *const abi::Api,
     input_api: Option<*const abi::inputs::Api>,
+    input_prefetch: Option<abi::inputs::Prefetch>,
     pub(crate) plan_contracts: std::cell::RefCell<std::collections::BTreeSet<String>>,
     // Retain code until the opaque model and all of its buffers are destroyed.
     _library: Library,
@@ -116,6 +117,7 @@ impl ModelPackage {
             handle: ptr::null_mut(),
             api,
             input_api: None,
+            input_prefetch: None,
             plan_contracts: Default::default(),
             _library: library,
             bindings: Default::default(),
@@ -189,6 +191,18 @@ impl ModelPackage {
         };
         let input = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
         model.input_api = input_api;
+        if request.metadata.input_assets.is_some() {
+            // SAFETY: the package retains this optional versioned function.
+            model.input_prefetch = unsafe {
+                model
+                    ._library
+                    .get::<unsafe extern "C" fn(u32) -> Option<abi::inputs::Prefetch>>(
+                        abi::inputs::PREFETCH_ENTRYPOINT,
+                    )
+                    .ok()
+                    .and_then(|entry| entry(1))
+            };
+        }
         let description = model.describe()?;
         if description.package != spec.package
             || description.version != spec.version
@@ -385,6 +399,21 @@ impl ModelPackage {
             (table.free)(output);
         }
         result
+    }
+    pub(crate) fn prefetch_inputs(&self, tokens: &[u32], history: &[u32]) {
+        if let Some(prefetch) = self.input_prefetch {
+            let previous = &history[history.len().saturating_sub(2)..];
+            // SAFETY: the model and token slices stay live for the call.
+            unsafe {
+                prefetch(
+                    self.handle,
+                    tokens.as_ptr(),
+                    tokens.len(),
+                    previous.as_ptr(),
+                    previous.len(),
+                );
+            }
+        }
     }
     pub(crate) fn prepare_inputs(
         &self,

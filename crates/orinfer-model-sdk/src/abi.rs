@@ -284,6 +284,7 @@ pub trait ModelImplementation: Sized {
     ) -> Result<Vec<(String, Vec<u8>)>> {
         Ok(vec![])
     }
+    fn prefetch_inputs(&self, _tokens: &[u32], _history: &[u32]) {}
     fn describe() -> PackageInfo;
     fn visual(
         &self,

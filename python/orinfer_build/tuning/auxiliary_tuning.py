@@ -301,6 +301,216 @@ def publish_qsa_prefill(package, manifest, compiler):
     return sorted(replacements)
 
 
+def publish_qsa_sort_prefill(package, manifest, compiler):
+    """Keep within-warp exchanges in registers during the exact winner sort."""
+    from kernels.cuda.model.qsa_selection import merge
+
+    originals = {k["name"]: k for k in package["kernels"]}
+    replacements, launches = {}, {}
+    for plan in manifest["prefill_plans"]:
+        rows = plan["chunk_tokens"]
+        operations = manifest["programs"][plan["prefill_program"]]
+        for previous, op in zip(operations, operations[1:]):
+            old = originals.get(op.get("name"))
+            if old is None or old["symbol"] != "qsa_select_merge_kernel":
+                continue
+            args = compiler.pointers(old)
+            if set(args) != {"Candidates", "Position", "Selected"}:
+                raise ValueError("Unexpected native QSA candidate merge ABI")
+            partial = originals.get(previous.get("name"))
+            if (
+                partial is None
+                or partial["symbol"] != "qsa_select_partial_kernel"
+                or partial["grid"][1] != 2
+                or compiler.pointers(partial)["Selected"] != args["Candidates"]
+                or old["block"] != [128, 1, 1]
+            ):
+                raise ValueError("Unexpected native QSA merge geometry")
+            parts = partial["grid"][1]
+            name = old["name"]
+            replacements[name], launches[name] = compiler.emit(
+                old,
+                name,
+                args,
+                rows,
+                build=lambda: merge.__wrapped__(rows, parts, True, warp_sort=True),
+                key=f"qsa-prefill-warp-sort-{rows}-{parts}",
+            )
+    if not replacements:
+        raise ValueError("Missing native QSA prefill merge")
+    package["kernels"] = [replacements.get(k["name"], k) for k in package["kernels"]]
+    package["dynamic_batch_kernels"] = [
+        launches.get(k["name"], k) for k in package["dynamic_batch_kernels"]
+    ]
+    return sorted(replacements)
+
+
+def publish_expert_input_prefill(package, manifest, compiler):
+    """Write K64-major down-projection bit planes directly after SwiGLU."""
+    from kernels.cuda.model.rotation_a8 import rotate_expert_a8
+
+    originals = {k["name"]: k for k in package["kernels"]}
+    top = package["config_signature"]["text"]["num_experts_per_tok"]
+    added, launches = {}, {}
+    for plan in manifest["prefill_plans"]:
+        rows = plan["chunk_tokens"]
+        ops = manifest["programs"][plan["prefill_program"]]
+        for previous, current in zip(ops, ops[1:]):
+            old = originals.get(previous.get("name"))
+            split = originals.get(current.get("name"))
+            if old is None or split is None or split["symbol"] != "pack_exact_a8_kernel":
+                continue
+            if not any(
+                arg.get("name", "").endswith(".ffn_down_exps.weight_signs") for arg in old["args"]
+            ):
+                continue
+            rotation, planes = compiler.pointers(old), compiler.pointers(split)
+            if (
+                set(rotation) != {"Q", "S", "Signs", "X"}
+                or set(planes) != {"A", "High", "Low", "Sum"}
+                or rotation["Q"] != planes["A"]
+                or compiler.buffers[rotation["Signs"]["name"]]["shape"] != [640]
+            ):
+                raise ValueError("Incompatible expert down rotation and bit-plane layouts")
+            choice = f"/choice/2048-{rows}/1"
+            name = old["name"] + choice + "/k0"
+            bindings = {role: rotation[role] for role in ("S", "Signs", "X")}
+            bindings.update({role: planes[role] for role in ("High", "Low", "Sum")})
+            added[name], launches[name] = compiler.emit(
+                old,
+                name,
+                bindings,
+                rows,
+                multiplier=top,
+                build=lambda: rotate_expert_a8.__wrapped__(
+                    rows * top,
+                    640,
+                    swiglu=True,
+                    dynamic_rows=True,
+                    group_major=True,
+                ),
+                key=f"flash-expert-down-planes-{rows}-{top}",
+            )
+            skip = split["name"] + choice + "/skip"
+            added[skip] = dict(split, name=skip)
+    if not added:
+        raise ValueError("Missing native expert down input producers")
+    package["kernels"].extend(added.values())
+    package["dynamic_batch_kernels"].extend(launches.values())
+    package["plan_kernel_contracts"] = sorted(set(package["plan_kernel_contracts"]) | added.keys())
+    return sorted(added)
+
+
+def publish_q4_prefill(data, package, manifest, compiler):
+    """Expand one dense Q4 projection into shared temporary INT8 storage."""
+    from kernels.cuda.model.int8_projection import int8_projection
+    from kernels.cuda.model.q4_projection import unpack_q4
+
+    if package["architecture"] != "flash_next":
+        raise ValueError("Dense Q4 prefill expansion requires Flash Next")
+    originals = {k["name"]: k for k in package["kernels"]}
+    replacements, launches = {}, {}
+    width = 2560
+    workspaces = {}
+    for role, outputs in (("Attention", 12288), ("GdnGate", 6144)):
+        name = f"FlashPrefillExpanded{role}"
+        if name in compiler.buffers:
+            raise ValueError("Duplicate Q4 expansion workspace")
+        desc = dict(
+            name=name,
+            dtype="i8",
+            shape=[outputs, width],
+            alignment=256,
+            layout="native_contiguous",
+            access="read_write",
+        )
+        data["metadata"]["buffers"].append(dict(desc, data=None))
+        data["buffer_scopes"][name] = "workspace"
+        package["buffer_contracts"].append(desc)
+        compiler.buffers[name] = desc
+        workspaces[role] = dict(kind="buffer", name=name)
+    for plan in manifest["prefill_plans"]:
+        rows = plan["chunk_tokens"]
+        if rows != 4096:
+            raise ValueError("Dense Q4 prefill expansion requires the native 4096-row arena")
+        for op in manifest["programs"][plan["prefill_program"]]:
+            if op["kind"] != "kernel":
+                continue
+            old = originals[op["name"]]
+            if not any(
+                arg.get("name", "").startswith("Q4_blk.") and arg["name"].endswith("_packed")
+                for arg in old["args"]
+            ):
+                continue
+            args = compiler.pointers(old)
+            if set(args) != {"A", "W", "S", "AS", "Out"}:
+                raise ValueError("Unexpected dense Q4 projection ABI")
+            weights = compiler.buffers[args["W"]["name"]]
+            outputs, packed_width = weights["shape"]
+            if (
+                weights["dtype"] != "u16"
+                or packed_width * 4 != width
+                or outputs not in (6144, 10240, 12288)
+            ):
+                raise ValueError("Unexpected dense Q4 prefill geometry")
+            expanded = workspaces["GdnGate" if outputs == 6144 else "Attention"]
+            # Use the smaller row tile at the complete native block, where
+            # its extra CTA parallelism paid for the expansion on SM87.
+            for first, last, block in ((2048, rows - 1, 128), (rows, rows, 64)):
+                base = f"{old['name']}/choice/{first}-{last}/1"
+                for idx, (bindings, key, build, symbolic) in enumerate(
+                    (
+                        (
+                            {"W": args["W"], "Output": expanded},
+                            f"q4-expand-{outputs}",
+                            lambda: unpack_q4.__wrapped__(outputs, width),
+                            False,
+                        ),
+                        (
+                            {
+                                "A": args["A"],
+                                "Weight": expanded,
+                                "WeightScale": args["S"],
+                                "TokenScale": args["AS"],
+                                "Output": args["Out"],
+                            },
+                            f"q4-expanded-int8-{rows}-{outputs}-{block}",
+                            lambda: int8_projection.__wrapped__(
+                                rows,
+                                outputs,
+                                width,
+                                block_m=block,
+                                block_n=128,
+                                block_k=128,
+                                dynamic_rows=True,
+                            ),
+                            True,
+                        ),
+                    )
+                ):
+                    name = f"{base}/k{idx}"
+                    kernel, launch = compiler.emit(
+                        old,
+                        name,
+                        bindings,
+                        rows,
+                        build=build,
+                        key=key,
+                        symbolic=symbolic,
+                    )
+                    replacements[name] = kernel
+                    if symbolic:
+                        launches[name] = launch
+    if not replacements:
+        raise ValueError("Missing Flash Next dense Q4 prefill bindings")
+    package["kernels"].extend(replacements.values())
+    package["dynamic_batch_kernels"].extend(launches.values())
+    package["plan_kernel_contracts"] = sorted(
+        set(package["plan_kernel_contracts"]) | replacements.keys()
+    )
+    return sorted(replacements)
+
+
 def publish_conv_prefill(package, manifest, compiler):
     """Rebuild the native Flash prefill convolution with vector loads."""
     from kernels.cuda.operators.op08_gdn_conv_prep import gdn_conv_prep
@@ -579,7 +789,16 @@ def main():
     p.add_argument(
         "--families",
         nargs="+",
-        choices=("router", "ple", "qsa", "qsa-prefill", "conv-prefill"),
+        choices=(
+            "router",
+            "ple",
+            "qsa",
+            "qsa-prefill",
+            "conv-prefill",
+            "q4-prefill",
+            "expert-input-prefill",
+            "qsa-sort-prefill",
+        ),
         default=["router", "ple", "qsa"],
     )
     args = p.parse_args()
@@ -597,8 +816,17 @@ def main():
         prefill_publishers = {
             "qsa-prefill": publish_qsa_prefill,
             "conv-prefill": publish_conv_prefill,
+            "expert-input-prefill": publish_expert_input_prefill,
+            "qsa-sort-prefill": publish_qsa_sort_prefill,
         }
-        families = tuple(family for family in args.families if family not in prefill_publishers)
+        families = tuple(
+            family
+            for family in args.families
+            if family not in prefill_publishers and family != "q4-prefill"
+        )
+        if "q4-prefill" in args.families:
+            names = publish_q4_prefill(data, package, manifest, compiler)
+            write_json(args.output / "q4-prefill.json", dict(bindings=names))
         if families:
             publish(data, package, manifest, compiler, args.output, families)
         for family, build in prefill_publishers.items():

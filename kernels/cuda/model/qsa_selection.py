@@ -164,7 +164,7 @@ def select(
 
 
 @orin_jit
-def merge(m: int, parts: int, dynamic_rows=False, threads: int = 128):
+def merge(m: int, parts: int, dynamic_rows=False, threads: int = 128, *, warp_sort=False):
     """Merge bounded local winners, then sort IDs in the original emission order.
 
     No global score rescan or cluster synchronization is needed. Local top-512
@@ -174,6 +174,48 @@ def merge(m: int, parts: int, dynamic_rows=False, threads: int = 128):
         raise ValueError("Invalid QSA candidate merge geometry")
     m = row_count(m, dynamic_rows)
     width = parts * 512
+
+    source = (
+        f"#define QSA_SORT_WIDTH {width}\n#define QSA_SORT_THREADS {threads}\n"
+        + r"""
+__device__ __forceinline__ void qsa_sort_keys(int* keys) {
+    // A sub-warp XOR exchanges elements at the same register index.
+    int current[QSA_SORT_WIDTH / QSA_SORT_THREADS];
+    const int lane = threadIdx.x;
+    #pragma unroll
+    for (int i = 0; i < QSA_SORT_WIDTH / QSA_SORT_THREADS; ++i)
+        current[i] = keys[i * QSA_SORT_THREADS + lane];
+    __syncthreads();
+    #pragma unroll
+    for (int width = 2; width <= QSA_SORT_WIDTH; width *= 2) {
+        #pragma unroll
+        for (int distance = width / 2; distance >= 1; distance /= 2) {
+            if (distance >= 32) {
+                #pragma unroll
+                for (int i = 0; i < QSA_SORT_WIDTH / QSA_SORT_THREADS; ++i)
+                    keys[i * QSA_SORT_THREADS + lane] = current[i];
+                __syncthreads();
+            }
+            #pragma unroll
+            for (int i = 0; i < QSA_SORT_WIDTH / QSA_SORT_THREADS; ++i) {
+                const int index = i * QSA_SORT_THREADS + lane;
+                const int value = current[i];
+                const int peer = distance < 32
+                    ? __shfl_xor_sync(0xffffffffu, value, distance)
+                    : keys[index ^ distance];
+                const bool smaller = ((index & width) == 0) == ((index & distance) == 0);
+                current[i] = smaller ? min(value, peer) : max(value, peer);
+            }
+            if (distance >= 32)
+                __syncthreads();
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < QSA_SORT_WIDTH / QSA_SORT_THREADS; ++i)
+        keys[i * QSA_SORT_THREADS + lane] = current[i];
+}
+"""
+    )
 
     @T.prim_func
     def main(
@@ -234,17 +276,24 @@ def merge(m: int, parts: int, dynamic_rows=False, threads: int = 128):
                     identifier = Candidates[row, i // 512 * 1024 + 512 + i % 512]
                     keys[i] = identifier | T.if_then_else(values[i] == control[0], 1073741824, 0)
             T.sync_threads()
-            for level in T.unroll(width.bit_length() - 1):
-                for step in T.unroll(level + 1):
-                    for i in T.Parallel(width):
-                        other = i ^ 1 << level - step
-                        smaller = (i & 1 << level + 1 == 0) == (i & 1 << level - step == 0)
-                        next_keys[i] = T.if_then_else(
-                            smaller, T.min(keys[i], keys[other]), T.max(keys[i], keys[other])
-                        )
-                    T.sync_threads()
-                    T.copy(next_keys, keys)
-                    T.sync_threads()
+            if warp_sort:
+                T.import_source(source)
+                T.evaluate(
+                    T.call_extern("void", "qsa_sort_keys", T.access_ptr(keys[0], "rw", width))
+                )
+                T.sync_threads()
+            else:
+                for level in T.unroll(width.bit_length() - 1):
+                    for step in T.unroll(level + 1):
+                        for i in T.Parallel(width):
+                            other = i ^ 1 << level - step
+                            smaller = (i & 1 << level + 1 == 0) == (i & 1 << level - step == 0)
+                            next_keys[i] = T.if_then_else(
+                                smaller, T.min(keys[i], keys[other]), T.max(keys[i], keys[other])
+                            )
+                        T.sync_threads()
+                        T.copy(next_keys, keys)
+                        T.sync_threads()
             for i in T.Parallel(2051):
                 Selected[row, i] = -1
                 if i < T.min(full, 512) * 4:

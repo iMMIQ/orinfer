@@ -104,6 +104,17 @@ impl ModelRuntime {
                 &req.input[req.offset..req.offset + chunk],
                 &req.input[..req.offset],
             )?;
+            let end = req.offset + chunk;
+            let boundary = req
+                .checkpoints
+                .range((std::ops::Bound::Excluded(end), std::ops::Bound::Unbounded))
+                .next()
+                .copied()
+                .unwrap_or(req.input.len());
+            if let Some(next) = plan.chunk(boundary - end) {
+                self.model_package
+                    .prefetch_inputs(&req.input[end..end + next], &req.input[..end]);
+            }
             Frame {
                 plan,
                 tokens: chunk,
