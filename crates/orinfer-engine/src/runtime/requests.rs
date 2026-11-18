@@ -1034,6 +1034,9 @@ impl ModelRuntime {
             &req.input[req.offset..req.offset + chunk],
             &req.input[..req.offset],
         )?;
+        if let Some(plan) = plan.filter(|p| !p.stages.is_empty()) {
+            self.prefetch_next_prefill(req, plan, chunk);
+        }
         self.upload_segment_controls(chunk)?;
         self.launch_rows(&program, chunk, ExecutionPhase::Prefill)?;
         if let Some(spec) = &self.manifest.mtp {
