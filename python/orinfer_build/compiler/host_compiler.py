@@ -113,6 +113,7 @@ class Compiler:
         constants=None,
         kernel=None,
         artifact=None,
+        pass_configs=None,
     ):
         if build is None and kernel is None and artifact is None:
             host, assets = self.host(old), {f: old[f] for f in ("module", "source", "host_abi")}
@@ -136,6 +137,7 @@ class Compiler:
                     )
 
                     passes = EXACT_PASSES
+                passes = {**passes, **(pass_configs or {})}
                 if artifact is None and kernel is None:
                     fn = explicit_rows(build()) if symbolic else build()
                     kernel = tilelang.compile(

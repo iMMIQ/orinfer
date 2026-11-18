@@ -286,11 +286,15 @@ impl<T: Resident> Cache<T> {
         self.match_prefix(tokens, media).checkpoint
     }
     pub fn touch(&mut self, id: u64) -> &Entry<T> {
-        self.clock += 1;
-        let e = self.entries.get_mut(&id).expect("checked prefix id");
-        e.used = self.clock;
+        let e = self.mark_recent(id).expect("checked prefix id");
         e.hits += 1;
         e
+    }
+    pub fn mark_recent(&mut self, id: u64) -> Option<&mut Entry<T>> {
+        let e = self.entries.get_mut(&id)?;
+        self.clock += 1;
+        e.used = self.clock;
+        Some(e)
     }
     pub fn resident_with(&self, extra: Option<&dyn Resident>) -> usize {
         let mut allocations = BTreeMap::new();
@@ -348,16 +352,21 @@ impl<T: Resident> Cache<T> {
     /// Select without unpublishing the source. Tier transfers commit removal
     /// only after the adapter reports successful completion.
     pub fn victim_except(&self, protected: Option<u64>) -> Option<u64> {
-        self.victim_with_priority(protected, false)
+        self.victim_with_priority(protected, false, |_| false)
     }
 
-    /// GPU capture gives existing prompt checkpoints and proven continuations
-    /// priority over generated continuations that have never been restored.
-    pub fn victim_for_capture(&self, protected: Option<u64>) -> Option<u64> {
-        self.victim_with_priority(protected, true)
+    /// GPU capture preserves live prompts first, then favors prompt
+    /// checkpoints and proven continuations over unproven generated tails.
+    pub fn victim_for_capture(&self, active_prompt: impl Fn(u64) -> bool) -> Option<u64> {
+        self.victim_with_priority(None, true, active_prompt)
     }
 
-    fn victim_with_priority(&self, protected: Option<u64>, prefer_unproven: bool) -> Option<u64> {
+    fn victim_with_priority(
+        &self,
+        protected: Option<u64>,
+        prefer_unproven: bool,
+        active_prompt: impl Fn(u64) -> bool,
+    ) -> Option<u64> {
         let mut references: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
         for e in self.entries.values() {
             let mut own = BTreeMap::new();
@@ -370,7 +379,7 @@ impl<T: Resident> Cache<T> {
         self.entries
             .iter()
             .filter(|(id, _)| Some(**id) != protected)
-            .min_by(|(_, a), (_, b)| {
+            .min_by(|(id_a, a), (id_b, b)| {
                 let utility = |e: &Entry<T>| {
                     let parent = self.ancestor_depth(e);
                     let mut own = BTreeMap::new();
@@ -385,8 +394,9 @@ impl<T: Resident> Cache<T> {
                 };
                 let priority =
                     |entry: &Entry<T>| prefer_unproven && (entry.logits_valid || entry.hits != 0);
-                priority(a)
-                    .cmp(&priority(b))
+                active_prompt(**id_a)
+                    .cmp(&active_prompt(**id_b))
+                    .then_with(|| priority(a).cmp(&priority(b)))
                     .then_with(|| utility(a).total_cmp(&utility(b)))
                     .then(a.used.cmp(&b.used))
             })
@@ -506,9 +516,12 @@ mod tests {
         let prompt = cache.insert(entry(&[1], &[(1, 50)], true));
         let tail = cache.insert(entry(&[2, 3, 4, 5], &[(2, 10)], false));
         assert_eq!(cache.victim_except(None), Some(prompt));
-        assert_eq!(cache.victim_for_capture(None), Some(tail));
+        assert_eq!(cache.victim_for_capture(|_| false), Some(tail));
         cache.touch(tail);
-        assert_eq!(cache.victim_for_capture(None), Some(prompt));
+        assert_eq!(cache.victim_for_capture(|_| false), Some(prompt));
+        assert_eq!(cache.victim_for_capture(|id| id == prompt), Some(tail));
+        cache.mark_recent(prompt).unwrap();
+        assert_eq!(cache.entries[&prompt].hits, 0);
     }
 
     #[test]

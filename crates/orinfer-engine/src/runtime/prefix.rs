@@ -11,6 +11,12 @@ pub(super) struct Context {
     pub statistics: crate::prefix::Statistics,
 }
 
+impl Context {
+    pub(super) fn device_parent(&self) -> Option<u64> {
+        self.parent.and_then(|(host, id)| (!host).then_some(id))
+    }
+}
+
 impl ModelRuntime {
     pub(crate) fn prefix_media(
         &self,
@@ -319,9 +325,8 @@ impl ModelRuntime {
                         .ok_or("Prefix state size overflow")
                 })?;
             let parent = context
-                .parent
-                .filter(|(host, _)| !host)
-                .and_then(|(_, id)| self.prefix_cache.device.entries.get(&id))
+                .device_parent()
+                .and_then(|id| self.prefix_cache.device.entries.get(&id))
                 .filter(|e| {
                     input.starts_with(&e.tokens)
                         && e.media.common_tokens(media, e.tokens.len()) == e.tokens.len()
@@ -516,7 +521,11 @@ impl ModelRuntime {
     }
     pub(super) fn evict_prefix(&mut self, context: Option<&mut Context>) -> Result<bool> {
         let Some(id) = (if context.is_some() {
-            self.prefix_cache.device.victim_for_capture(None)
+            self.prefix_cache.device.victim_for_capture(|id| {
+                self.reserved_requests
+                    .values()
+                    .any(|request| request.prompt_prefix == Some(id))
+            })
         } else {
             self.prefix_cache.device.victim_except(None)
         }) else {

@@ -61,6 +61,7 @@ def sparse_attention(
     skip_empty: bool = False,
     async_scales: bool = False,
     vector_dequant: bool = False,
+    explicit_barriers: bool = False,
 ):
     geometry(m, capacity)
 
@@ -93,6 +94,12 @@ def sparse_attention(
         raise ValueError("Async scales require packed attention")
     if type(vector_dequant) is not bool or vector_dequant and not packed:
         raise ValueError("Vector dequantization requires packed attention")
+    if (
+        type(explicit_barriers) is not bool
+        or explicit_barriers
+        and not (packed and single_buffer and async_scales and vector_dequant)
+    ):
+        raise ValueError("Explicit QSA barriers require the single-buffer packed prefill path")
     block = block_size
     kv_width = 64 if packed else 256
     kv_dtype = T.uint32 if packed else T.int8
@@ -160,9 +167,12 @@ def sparse_attention(
             T.clear(denom)
             T.fill(maximum, -3.402823466e38)
             for i, d in T.Parallel(16, 256):
-                q[i, d] = 0
-                if i < 12:
-                    q[i, d] = Query[row, kh * 12 + i, d]
+                if explicit_barriers:
+                    q[i, d] = T.if_then_else(i < 12, Query[row, kh * 12 + i, d], T.float16(0))
+                else:
+                    q[i, d] = 0
+                    if i < 12:
+                        q[i, d] = Query[row, kh * 12 + i, d]
             length = T.min((Position[0] + row + 1) // 4, 512) * 4 + (Position[0] + row + 1) % 4
             count = (
                 T.ceildiv(length, splits)
@@ -326,6 +336,10 @@ def sparse_attention(
                         T.ptx_wait_group(0)
                     T.sync_threads()
                     dequantize(raw_v, value_scales, k)
+                    if explicit_barriers:
+                        # All probability and dequantized value writes must
+                        # finish before any warp starts the shared PV tile.
+                        T.sync_threads()
                     T.gemm(p, k, acc)
                 else:
                     T.gemm(p, v, acc)

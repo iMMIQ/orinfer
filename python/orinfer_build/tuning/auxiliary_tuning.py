@@ -244,8 +244,13 @@ def publish_qsa_prefill(package, manifest, compiler, *, attention_only=False):
                             dynamic_rows=True,
                             async_scales=True,
                             vector_dequant=True,
+                            explicit_barriers=True,
                         ),
-                        key=f"qsa-single-buffer-byte-permute-{context}-{rows}",
+                        key=f"qsa-single-buffer-explicit-sync-{context}-{rows}",
+                        pass_configs={
+                            "tl.disable_thread_storage_sync": True,
+                            "tl.disable_shared_memory_reuse": True,
+                        },
                     )
                     continue
             if (

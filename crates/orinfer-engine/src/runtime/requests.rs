@@ -147,6 +147,7 @@ pub(super) struct Reservation {
     sampling: bool,
     vision: bool,
     audio: bool,
+    pub(super) prompt_prefix: Option<u64>,
 }
 
 impl ModelRuntime {
@@ -706,6 +707,7 @@ impl ModelRuntime {
                         && input.sampling.top_logprobs.is_none(),
                     vision: !input.images.is_empty(),
                     audio: !input.audios.is_empty(),
+                    prompt_prefix: None,
                 },
             );
             self.scheduler_statistics.peak_active = self
@@ -970,6 +972,10 @@ impl ModelRuntime {
                 true,
                 &mut req.prefix,
             )?;
+            self.reserved_requests
+                .get_mut(&req.slot)
+                .ok_or("Missing prompt checkpoint reservation")?
+                .prompt_prefix = req.prefix.device_parent();
         }
         let pending = match self.select_request_token(req) {
             Ok(token) => token,
@@ -2478,7 +2484,12 @@ impl ModelRuntime {
         self.release_prefill_frame(req)?;
         self.execution
             .release_sequence(req.slot, &self.manifest.reset_buffers)?;
-        self.reserved_requests.remove(&req.slot);
+        let reservation = self.reserved_requests.remove(&req.slot);
+        if cache && let Some(id) = reservation.and_then(|r| r.prompt_prefix) {
+            // The prompt has just served a complete request. Keep it recent
+            // while a client prepares the next turn.
+            let _ = self.prefix_cache.device.mark_recent(id);
+        }
         req.released = true;
         self.execution.collect_snapshots()?;
         stored
