@@ -6,10 +6,9 @@ from orinfer_build.tuning.expert_tuning import tile_capacity
 def publish(package, manifest, compiler):
     from kernels.cuda.model import e8p_prefill, moe
 
-    # On SM87 the wider route and paired projections win from 1280 rows
-    # with both dispersed and concentrated routing. Smaller batches keep
-    # the narrow tile to avoid padding sparsely populated experts.
-    first, block_m = 1280, 32
+    # SM87 gate/up benefits from smaller output tiles and fixed short-tail
+    # loops. Real prefill routing favors the wider row tile from 1200 rows.
+    first, block_m = 1200, 32
     text = package["config_signature"]["text"]
     experts, top = text["num_experts"], text["num_experts_per_tok"]
     kernels = {k["name"]: k for k in package["kernels"]}
@@ -58,11 +57,11 @@ def publish(package, manifest, compiler):
 
             def emit(old, pointers, build, key, multiplier=1):
                 name = old["name"] + suffix
-                previous = old["name"] + f"/choice/2048-{rows}/1/k0"
+                previous = {old["name"] + f"/choice/{start}-{rows}/1/k0" for start in (1280, 2048)}
                 choices = {n for n in kernels if n.startswith(old["name"] + "/choice/")}
-                if choices - {name, previous}:
+                if choices - ({name} | previous):
                     raise ValueError("Overlapping Flash prefill expert choices")
-                obsolete.update(choices & {previous})
+                obsolete.update(choices & previous)
                 if old["name"] in dynamic and dynamic[old["name"]]["capacity"] != rows:
                     raise ValueError("Unexpected Flash prefill expert capacity")
                 added[name], launches[name] = compiler.emit(
@@ -92,7 +91,7 @@ def publish(package, manifest, compiler):
                 ),
                 f"flash-routing-tiles-{rows}-{experts}-{top}-{block_m}",
             )
-            for projection, sparse in zip(projections, (True, False), strict=True):
+            for projection, gate_up in zip(projections, (True, False), strict=True):
                 pointers = compiler.pointers(projection)
                 for consumer, source in (
                     ("Counts", prefix_args["Counts"]),
@@ -118,10 +117,11 @@ def publish(package, manifest, compiler):
                         n,
                         k,
                         dynamic_rows=True,
-                        sparse_rows=sparse,
                         block_m=block_m,
+                        block_n=64 if gate_up else 128,
+                        specialize_tails=gate_up,
                     ),
-                    f"expert-wide-projection-{rows}-{experts}-{top}-{n}-{k}-{int(sparse)}",
+                    f"expert-wide-tail-{rows}-{experts}-{top}-{n}-{k}-{int(gate_up)}",
                     multiplier=top,
                 )
     if not added:

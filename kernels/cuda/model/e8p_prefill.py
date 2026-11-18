@@ -148,12 +148,15 @@ def e8p_prefill_grouped(
     codec="e8p_q2",
     minimum_blocks=1,
     block_m=16,
+    block_n=128,
+    specialize_tails=False,
 ):
     """One routed-tile mainloop; optionally predicate empty MMA row stripes.
 
     Routing and computation share the selected row tile. Sparse candidates
     mask complete hardware M8 stripes inside this body. Offline tuning selects
-    both row reuse and whether masking pays off.
+    both row reuse and whether masking pays off. The wide Q2 tail variant
+    uses constant M8/M16 loops when a routed tile has at most 16 live rows.
     """
     if (
         any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
@@ -163,11 +166,17 @@ def e8p_prefill_grouped(
         or type(minimum_blocks) is not int
         or not 1 <= minimum_blocks <= 16
         or block_m not in (16, 32)
+        or block_n not in (64, 128)
+        or block_n != 128
+        and codec != "e8p_q2"
+        or type(specialize_tails) is not bool
+        or specialize_tails
+        and (block_m != 32 or codec != "e8p_q2")
         or K % 128
         or K * 128 * 128 > 2**31 - 1
     ):
         raise ValueError("Invalid exact E8P geometry")
-    BM, BN, BK = block_m, 128, 64
+    BM, BN, BK = block_m, block_n, 64
     q4 = codec == "e8p_q4"
     packed_k, packed_dtype = (128, T.uint32) if q4 else (64, T.uint16)
     # Matching swizzle for sixteen-byte activation halves and ldmatrix reads.
@@ -210,7 +219,9 @@ def e8p_prefill_grouped(
     store = store_folded_rows(tile_rows, BN, N, 5) if q4 else store_rows(tile_rows, BN, N)
 
     @T.macro
-    def project(Low, High, Sum, P, WS, AS, Out, packed, inputs, book, bx, expert, offset, count):
+    def project(
+        Low, High, Sum, P, WS, AS, Out, packed, inputs, book, bx, expert, offset, count, stripes
+    ):
         tid = T.get_thread_binding()
         lane, warp = tid % 32, tid // 32
         lo = T.alloc_local((tile_rows,), T.int32)
@@ -226,7 +237,7 @@ def e8p_prefill_grouped(
         for initial in T.unroll(min(3, K // BK)):
             if not q4 or initial % 2 == 0:
                 prefetch_weight(P, packed, initial, initial, bx, expert, tid)
-            if tid < tile_rows * 2:
+            if tid < stripes * 16:
                 T.ptx_cp_async(
                     T.access_ptr(
                         inputs[
@@ -301,7 +312,7 @@ def e8p_prefill_grouped(
                         # of the old pair have completed their reads.
                         if not q4 or (step >= 2 and step % 2 == 0):
                             prefetch_weight(P, packed, nxt, step + 3, bx, expert, tid)
-                        if tid < tile_rows * 2:
+                        if tid < stripes * 16:
                             T.ptx_cp_async(
                                 T.access_ptr(
                                     inputs[
@@ -349,7 +360,7 @@ def e8p_prefill_grouped(
                                 predicate=offset + tid // 2 < rows,
                             )
                         T.ptx_commit_group()
-                    for stripe in T.unroll(tile_rows // 8):
+                    for stripe in T.unroll(stripes):
                         if not sparse_rows or stripe * 8 < count:
                             r_index = lane % 8 + stripe * 8
                             col = (lane // 8 % 2) * 16
@@ -409,7 +420,7 @@ def e8p_prefill_grouped(
                                     v[rr] = T.call_pure_extern(
                                         "uint32", "nib_prefill", code, book[code >> 8]
                                     )
-                            for stripe in T.unroll(tile_rows // 8):
+                            for stripe in T.unroll(stripes):
                                 if not sparse_rows or stripe * 8 < count:
                                     if q4:
                                         if level == 0:
@@ -439,7 +450,7 @@ def e8p_prefill_grouped(
         TC: T.Tensor((1,), T.int32),
         Out: T.Tensor((rows, N), T.float16),
     ):
-        with T.Kernel(T.ceildiv(N, BN), launch_tiles, threads=128) as (bx, tile):
+        with T.Kernel(T.ceildiv(N, BN), launch_tiles, threads=BN) as (bx, tile):
             T.import_source(SOURCE)
             T.annotate_min_blocks_per_sm(minimum_blocks)
             tid = T.get_thread_binding()
@@ -459,24 +470,62 @@ def e8p_prefill_grouped(
                     expert, first = TE[tile], TR[tile]
                     offset = Offsets[expert] + first
                     count = T.min(BM, Counts[expert] - first)
-                    for i in T.unroll(2):
-                        book[tid + i * 128] = Book[0, tid + i * 128, 0]
-                project(
-                    Low,
-                    High,
-                    Sum,
-                    P,
-                    WS,
-                    AS,
-                    Out,
-                    packed,
-                    inputs,
-                    book,
-                    bx,
-                    expert,
-                    offset,
-                    count,
-                )
+                    for i in T.unroll(256 // BN):
+                        book[tid + i * BN] = Book[0, tid + i * BN, 0]
+                if specialize_tails and count <= 8:
+                    project(
+                        Low,
+                        High,
+                        Sum,
+                        P,
+                        WS,
+                        AS,
+                        Out,
+                        packed,
+                        inputs,
+                        book,
+                        bx,
+                        expert,
+                        offset,
+                        count,
+                        1,
+                    )
+                elif specialize_tails and count <= 16:
+                    project(
+                        Low,
+                        High,
+                        Sum,
+                        P,
+                        WS,
+                        AS,
+                        Out,
+                        packed,
+                        inputs,
+                        book,
+                        bx,
+                        expert,
+                        offset,
+                        count,
+                        2,
+                    )
+                else:
+                    project(
+                        Low,
+                        High,
+                        Sum,
+                        P,
+                        WS,
+                        AS,
+                        Out,
+                        packed,
+                        inputs,
+                        book,
+                        bx,
+                        expert,
+                        offset,
+                        count,
+                        BM // 8,
+                    )
 
     return exact_e8p_int4
 
