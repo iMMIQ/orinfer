@@ -209,9 +209,100 @@ def qsa_pair(old, first, compiler, capacity, context, config, layout=None):
     return result
 
 
+_QSA_PREFILL_PASSES = {
+    "tl.disable_thread_storage_sync": True,
+    "tl.disable_shared_memory_reuse": True,
+}
+_QSA_STATE = {"K", "V", "KS", "VS", "Position"}
+_QSA_ATTENTION = _QSA_STATE | {"Query", "Selected", "Max", "Den", "Out"}
+
+
+def _packed_qsa(rows, context):
+    from kernels.cuda.model.qsa_attention import sparse_attention
+
+    return sparse_attention.__wrapped__(
+        rows,
+        context,
+        packed=True,
+        single_buffer=True,
+        dynamic_rows=True,
+        async_scales=True,
+        vector_dequant=True,
+        explicit_barriers=True,
+    )
+
+
+def _publish_mixed_qsa(manifest, compiler, originals, dynamics, replacements, launches):
+    from kernels.cuda.model.independent_rows import indirect_parameters
+
+    rows = (manifest.get("batch_layout") or {}).get("segment_tokens", 0)
+    if not rows:
+        return
+    context = manifest["max_context"]
+    table = manifest.get("packet_table") or (manifest.get("mtp") or {}).get("packet_table")
+    columns = {name: i for i, name in enumerate(table["columns"])} if table else {}
+
+    def emit(old, operands, build, key, constants=None):
+        name = old["name"]
+        expected = dynamics[name]
+        if expected["capacity"] != rows or old["block"] != [128, 1, 1]:
+            raise ValueError(f"Unexpected mixed QSA launch geometry: {name}")
+        kernel, launch = compiler.emit(
+            old,
+            name,
+            operands,
+            rows,
+            build=build,
+            key=key,
+            constants=constants,
+            pass_configs=_QSA_PREFILL_PASSES,
+        )
+        # Packet columns are fixed in the binding; only the row scalar
+        # participates in the published dynamic launch contract.
+        if constants:
+            launch["arguments"] = [
+                arg for arg in launch["arguments"] if arg["value"]["op"] != "constant"
+            ]
+        if kernel["args"] != old["args"] or launch != expected:
+            raise ValueError(f"Changed mixed QSA parameter or launch contract: {name}")
+        replacements[name], launches[name] = kernel, launch
+
+    updated = 0
+    for name, old in originals.items():
+        if not name.startswith("causal_rows/target/") or old["grid"] != [rows, 2, 8]:
+            continue
+        operands = compiler.pointers(old)
+        if set(operands) != _QSA_ATTENTION:
+            continue
+        key = f"qsa-single-buffer-explicit-sync-{context}-{rows}"
+        emit(old, operands, lambda: _packed_qsa(rows, context), key)
+        if table:
+            private = {
+                role: arg["name"] for role, arg in operands.items() if arg["name"] in columns
+            }
+            if private.keys() != _QSA_STATE:
+                raise ValueError(f"Unexpected mixed QSA private operands: {name}")
+            offsets = {role: operands[role].get("offset", 0) for role in private}
+            alias = originals[table["kernels"][name]]
+            bindings = {role: arg for role, arg in operands.items() if role not in private}
+            bindings["Pointers"] = dict(kind="buffer", name=table["buffer"])
+            emit(
+                alias,
+                bindings,
+                lambda: indirect_parameters(_packed_qsa(rows, context), columns, private, offsets)[
+                    0
+                ],
+                key + f"-indirect-{len(columns)}-{identity(offsets)}",
+                {"column_" + role: columns[buff] for role, buff in private.items()},
+            )
+        updated += 1
+    if not updated:
+        raise ValueError("Missing Flash Next mixed prefill QSA bindings")
+
+
 def publish_qsa_prefill(package, manifest, compiler, *, attention_only=False):
     """Coalesce QSA scores and overlap packed KV reads in native Flash prefill."""
-    from kernels.cuda.model import qsa, qsa_attention, qsa_selection
+    from kernels.cuda.model import qsa, qsa_selection
 
     if package["architecture"] != "flash_next":
         raise ValueError("Native QSA prefill layout requires Flash Next")
@@ -219,7 +310,6 @@ def publish_qsa_prefill(package, manifest, compiler, *, attention_only=False):
     dynamics = {k["name"]: k for k in package["dynamic_batch_kernels"]}
     context = manifest["max_context"]
     replacements, launches = {}, {}
-    attention_roles = {"Query", "K", "V", "KS", "VS", "Selected", "Position", "Max", "Den", "Out"}
     for plan in manifest["prefill_plans"]:
         rows = plan["chunk_tokens"]
         operations = manifest["programs"][plan["prefill_program"]]
@@ -227,7 +317,7 @@ def publish_qsa_prefill(package, manifest, compiler, *, attention_only=False):
             selector = originals.get(current.get("name"))
             if selector is not None and selector["grid"] == [rows, 2, 8]:
                 operands = compiler.pointers(selector)
-                if set(operands) == attention_roles:
+                if set(operands) == _QSA_ATTENTION:
                     name = selector["name"]
                     if dynamics[name]["capacity"] != rows or selector["block"] != [128, 1, 1]:
                         raise ValueError("Unexpected QSA prefill attention geometry")
@@ -236,21 +326,9 @@ def publish_qsa_prefill(package, manifest, compiler, *, attention_only=False):
                         name,
                         operands,
                         rows,
-                        build=lambda: qsa_attention.sparse_attention.__wrapped__(
-                            rows,
-                            context,
-                            packed=True,
-                            single_buffer=True,
-                            dynamic_rows=True,
-                            async_scales=True,
-                            vector_dequant=True,
-                            explicit_barriers=True,
-                        ),
+                        build=lambda: _packed_qsa(rows, context),
                         key=f"qsa-single-buffer-explicit-sync-{context}-{rows}",
-                        pass_configs={
-                            "tl.disable_thread_storage_sync": True,
-                            "tl.disable_shared_memory_reuse": True,
-                        },
+                        pass_configs=_QSA_PREFILL_PASSES,
                     )
                     continue
             if (
@@ -303,6 +381,7 @@ def publish_qsa_prefill(package, manifest, compiler, *, attention_only=False):
                 )
     if not replacements:
         raise ValueError("Missing Flash Next native prefill QSA bindings")
+    _publish_mixed_qsa(manifest, compiler, originals, dynamics, replacements, launches)
     package["kernels"] = [replacements.get(k["name"], k) for k in package["kernels"]]
     package["dynamic_batch_kernels"] = [
         launches.get(k["name"], k) for k in package["dynamic_batch_kernels"]
