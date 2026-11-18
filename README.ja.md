@@ -68,7 +68,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 | `--default-request-params` | `{}` | JSON リクエスト既定値。明示したリクエスト値を優先 |
 | `--cuda-graph` | `decode_only` | CUDA Graph モード |
 | `--resident-experts` | `full` | 全エキスパートを常駐。Flash Next は SSD からのオンデマンド読み込みにも対応 |
-| `--prefix-cache-mib` | `12288` | GPU prefix cache の MiB 予算。0 で無効 |
+| `--prefix-cache-mib` | `4096` | GPU prefix cache の MiB 予算。0 で無効 |
 | `--max-active-requests` | `32` | アクティブなリクエスト数の上限。1–128 |
 | `--max-batch-tokens` | `128` | Decode 行数予算。混合 prefill はパッケージ容量を使用 |
 | `--max-speculative-tokens` | `0` | MTP 検証行数予算。0 はパッケージ容量を使用 |

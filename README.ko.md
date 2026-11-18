@@ -68,7 +68,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 | `--default-request-params` | `{}` | JSON 요청 기본값. 명시한 요청 필드 우선 |
 | `--cuda-graph` | `decode_only` | CUDA Graph 모드 |
 | `--resident-experts` | `full` | 전체 전문가 상주. Flash Next는 SSD 기반 용량 제한도 지원 |
-| `--prefix-cache-mib` | `12288` | GPU prefix cache 예산(MiB). 0은 비활성화 |
+| `--prefix-cache-mib` | `4096` | GPU prefix cache 예산(MiB). 0은 비활성화 |
 | `--max-active-requests` | `32` | 활성 요청 상한, 1–128 |
 | `--max-batch-tokens` | `128` | Decode 행 예산. 혼합 prefill은 패키지 용량 사용 |
 | `--max-speculative-tokens` | `0` | MTP 검증 행 예산. 0은 패키지 용량 사용 |

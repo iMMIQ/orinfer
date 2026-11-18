@@ -517,6 +517,12 @@ pub struct Statistics {
     pub speculative_iterations: usize,
     pub peak_active: usize,
     pub compute_s: f64,
+    /// Non-overlapping wall time for dispatched CUDA work, including its
+    /// input preparation and commit. Mixed packets are charged once.
+    pub native_prefill_s: f64,
+    pub mixed_packet_s: f64,
+    pub ordinary_decode_s: f64,
+    pub speculative_decode_s: f64,
     pub admission_deferrals: usize,
     pub admissions: usize,
     pub deadline_decode_iterations: usize,

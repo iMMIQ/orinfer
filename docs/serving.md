@@ -271,7 +271,7 @@ CUDA 与 A2 共用条件接受率 EMA、热态采样、收益选择和模型级�
 
 ### Prefix cache
 
-`--prefix-cache-mib` 默认 12288，单位 MiB，0 关闭复用；随实际缓存内容按需分配。缓存保存完整 KV、FP32 GDN、卷积、位置及 MTP 检查点。Rust radix tree 按 token 和图片身份匹配，并结合实际 prefill/恢复成本选择可用端点。
+`--prefix-cache-mib` 默认 4096，单位 MiB，0 关闭复用；随实际缓存内容按需分配。缓存保存完整 KV、FP32 GDN、卷积、位置及 MTP 检查点。Rust radix tree 按 token 和图片身份匹配，并结合实际 prefill/恢复成本选择可用端点。
 
 KV 区间不可变并按引用共享，持续状态单独保存。完整对齐的 KV 区间通过 CUDA VMM 共享物理内存，恢复后保留各请求的 Graph 虚拟地址；边界片段和 GDN、卷积、PLE、未完成压缩块等状态仍逐请求复制。共享区间只读，写入前复制为请求私有内存，复用 arena 前解除共享映射。创建检查点复用完整物理分配；未满尾部和持续状态紧凑复制到端点 bank，续写尾部保持私有。短前缀妨碍大块执行时可能跳过。保存最终提示、周期及按成本准入的分叉检查点；生成结束也可保存已计算的输出前缀。保存输出前缀时保留它所属的最长可复用提示；预算不足则跳过这次输出快照。正常内存回收仍可驱逐提示。模型重载后缓存清空。
 
@@ -310,7 +310,7 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 | `--cuda-graph` | `decode_only` | Graph 模式 |
 | `--resident-experts` | `full` | 主干专家每层等效常驻容量；有限模式全局缓存，MTP 全量常驻 |
 | `--verify-weights` | 关闭 | 启动时完整校验已加载权重和 CPU 表内容 |
-| `--prefix-cache-mib` | `12288` | GPU 缓存字节预算，0 关闭 |
+| `--prefix-cache-mib` | `4096` | GPU 缓存字节预算，0 关闭 |
 | `--max-active-requests` | `32` | 活跃请求上限，1–128 |
 | `--max-batch-tokens` | `128` | decode/验证行预算，1–128；混合 prefill 可使用执行包的行容量 |
 | `--prefill-budget-ms` | `200` | `latency` 混合块的预测耗时上限，非严格延迟上限 |

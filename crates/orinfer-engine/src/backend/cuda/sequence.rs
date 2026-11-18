@@ -2311,12 +2311,13 @@ impl Executor {
         &mut self,
         operations: &[Invocation],
         position: (&str, u32),
+        exact_state: bool,
     ) -> Result<Vec<Vec<f32>>> {
         self.sync()?;
         self.ensure_invocation_kernels(operations)?;
         let events = self.profile_events(operations.len() + 1)?;
         let mut trials = vec![];
-        for trial in 0..4 {
+        for trial in 0..if exact_state { 1 } else { 4 } {
             self.upload_ids(position.0, &[position.1])?;
             for (i, operation) in operations.iter().enumerate() {
                 // SAFETY: Owned events and live worker stream; ordinary launches.
@@ -2336,7 +2337,7 @@ impl Executor {
                 )?;
             }
             self.sync()?;
-            if trial == 0 {
+            if trial == 0 && !exact_state {
                 continue;
             }
             let mut times = vec![];

@@ -1409,6 +1409,12 @@ impl ModelRuntime {
             _ => false,
         };
         let executed = !matches!(prefill_work, Work::Idle);
+        let native = matches!(prefill_work, Work::Prefill(..));
+        let speculative = matches!(
+            prefill_work,
+            Work::Speculative(..) | Work::SpeculativeBatch(_)
+        );
+        let work_at = Instant::now();
         match prefill_work {
             Work::MixedSpeculative(selected) => {
                 let prefills: Vec<_> = selected
@@ -1498,6 +1504,19 @@ impl ModelRuntime {
                 self.execute_selected_with(requests, &selected, &mut output, &mut overlap)?;
             }
             Work::Idle => {}
+        }
+        if executed {
+            let statistics = &mut self.scheduler_statistics;
+            let seconds = work_at.elapsed().as_secs_f64();
+            if native {
+                statistics.native_prefill_s += seconds;
+            } else if does_prefill {
+                statistics.mixed_packet_s += seconds;
+            } else if speculative {
+                statistics.speculative_decode_s += seconds;
+            } else {
+                statistics.ordinary_decode_s += seconds;
+            }
         }
         if options.policy == scheduler::Policy::Latency
             && does_prefill

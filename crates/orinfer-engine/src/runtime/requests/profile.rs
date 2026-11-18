@@ -732,11 +732,23 @@ fn profile_prefill_stages() {
     )
     .unwrap();
     model.manifest.mtp = None;
+    let suffixes: Option<Vec<usize>> = fixture
+        .get("suffix_tokens")
+        .map(|value| serde_json::from_value(value.clone()).unwrap());
+    if let Some(suffixes) = &suffixes {
+        assert_eq!(suffixes.len(), sources.len());
+        assert_eq!(fixture["stream"].as_bool(), Some(true));
+    }
     let mut rows = vec![];
-    for source in sources {
+    for (case, source) in sources.into_iter().enumerate() {
         let length = source.input_tokens.len();
-        let (chunk, program, _) = model.manifest.select_prefill_plan(length).unwrap();
-        let program = program.to_owned();
+        let requested = suffixes.as_ref().map_or(length, |sizes| sizes[case]);
+        assert!((1..=length).contains(&requested));
+        let (chunk, program, head) = model.manifest.select_prefill_plan(requested).unwrap();
+        let (program, head) = (program.to_owned(), head.to_owned());
+        if suffixes.is_some() {
+            assert_eq!(chunk, requested);
+        }
         let base = length - chunk;
         // Materialize the exact context and its KV/workspace before profiling.
         // Replays reset only the target position; they are timing diagnostics,
@@ -754,10 +766,25 @@ fn profile_prefill_stages() {
                 &|| false,
             )
             .unwrap();
-        while request.prefilling {
-            model
-                .advance_requests(&mut [&mut request], &scheduler::Options::default())
-                .unwrap();
+        if suffixes.is_some() {
+            while request.offset < base {
+                let n = model
+                    .manifest
+                    .select_prefill_plan(base - request.offset)
+                    .unwrap()
+                    .0;
+                model
+                    .with_request(&mut request, |m, r| {
+                        m.advance_prefill_step(r, n, false, f64::INFINITY)
+                    })
+                    .unwrap();
+            }
+        } else {
+            while request.prefilling {
+                model
+                    .advance_requests(&mut [&mut request], &scheduler::Options::default())
+                    .unwrap();
+            }
         }
         model.execution.activate_sequence(request.slot).unwrap();
         model
@@ -777,7 +804,11 @@ fn profile_prefill_stages() {
             .execution
             .ensure_sequence_program(request.slot, &program)
             .unwrap();
-        let plan = row_invocations(&model, &program, chunk).unwrap();
+        let mut plan = row_invocations(&model, &program, chunk).unwrap();
+        if suffixes.is_some() {
+            model.upload_segment_controls(chunk).unwrap();
+            plan.extend(row_invocations(&model, &head, chunk).unwrap());
+        }
         if fixture["ncu"].as_bool() == Some(true) {
             profile_native_ncu(&mut model, &plan);
             rows.push(json!({"input_tokens":length,"operations":plan}));
@@ -794,6 +825,7 @@ fn profile_prefill_stages() {
             model.execution.profile_stream_operations_at_position(
                 &plan,
                 (&model.manifest.position, base as u32),
+                suffixes.is_some(),
             )
         } else {
             model.execution.profile_graph_operations_at_position(
@@ -817,8 +849,20 @@ fn profile_prefill_stages() {
             "operation_median_ms":(0..plan.len()).map(|i|median(&trials.iter().map(|t|f64::from(t[i])).collect::<Vec<_>>())).collect::<Vec<_>>(),
             "instrumented_gpu_median_ms":median(&trials.iter().map(|t|t.iter().map(|x|f64::from(*x)).sum()).collect::<Vec<f64>>()),
             "gpu_group_median_ms":groups.iter().map(|(k,v)|(k.clone(),median(v))).collect::<BTreeMap<_,_>>() }));
-        std::fs::write(&output,serde_json::to_vec_pretty(&json!({"rows":rows,"fingerprint":model.stats.manifest_sha256,
-            "scope":"Last real-model prefill chunk at fixed target position; three instrumented trials after warm-up; event boundaries include any stream launch gaps in stream mode; head excluded. Recurrent state advances between replays. Diagnostic only, not end-to-end TPS or quality acceptance."})).unwrap()).unwrap();
+        let scope = if suffixes.is_some() {
+            "Real prefix followed by one instrumented incremental target pass, including the head. Stream events include launch gaps. Request setup and MTP warm are outside this measurement."
+        } else {
+            "Last real-model prefill chunk at fixed target position; three instrumented trials after warm-up; event boundaries include any stream launch gaps in stream mode; head excluded. Recurrent state advances between replays. Diagnostic only, not end-to-end TPS or quality acceptance."
+        };
+        std::fs::write(
+            &output,
+            serde_json::to_vec_pretty(
+                &json!({"rows":rows,"fingerprint":model.stats.manifest_sha256,
+            "scope":scope}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         model.finish_request(&mut request, false).unwrap();
     }
 }

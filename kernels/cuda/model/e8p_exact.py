@@ -52,13 +52,16 @@ def split_a8(rows, K, dynamic_rows=False):
         "tl.if_stmt_binding_inline_replayable_binds": False,
     }
 )
-def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, stages=2, dynamic_rows=False):
+def e8p_exact_grouped(
+    rows, E, tiles, N, K, *, block_m=16, stages=2, dynamic_rows=False, warp_private=False
+):
     if (
         any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
         or K % 128
         or K * 128 * 128 > 2**31 - 1
         or type(block_m) is not int
         or block_m not in (8, 16)
+        or type(warp_private) is not bool
         or type(stages) is not int
         or stages not in (2, 3, 4)
         or K // 64 < stages - 1
@@ -243,7 +246,7 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, stages=2, dynamic_row
                             )
                         T.ptx_commit_group()
                     for i in T.unroll(4):
-                        n = tid // 4 + i * 32
+                        n = warp * 32 + lane // 4 + i * 8 if warp_private else tid // 4 + i * 32
                         both = T.call_pure_extern(
                             "uint32",
                             "nib_pair",
@@ -264,7 +267,11 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, stages=2, dynamic_row
                                 d1,
                             )
                         )
-                    T.sync_threads()
+                    if warp_private:
+                        # Each warp decodes and reads only its own 32 columns.
+                        T.sync_warp()
+                    else:
+                        T.sync_threads()
                     for stripe in T.unroll(BM // 8):
                         m = lane % 8 + stripe * 8
                         col = (lane // 8 % 2) * 16
@@ -301,7 +308,9 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, stages=2, dynamic_row
                         )
                         for stripe in T.unroll(BM // 8):
                             multiply(lo, hi, v, a, nt, stripe)
-                    T.sync_threads()
+                    # The next stage's CTA barrier also orders the input ring.
+                    if not warp_private:
+                        T.sync_threads()
                 store(lo, hi, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset, offset)
 
     return exact_e8p_int4

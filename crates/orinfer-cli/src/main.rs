@@ -965,7 +965,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.listen, "[::]:8088");
         assert_eq!(config.cuda_graph, CudaGraphMode::DecodeOnly);
-        assert_eq!(config.prefix_cache_bytes, 12usize << 30);
+        assert_eq!(config.prefix_cache_bytes, 4usize << 30);
         assert_eq!(config.scheduler.max_active, 32);
         assert_eq!(
             config.scheduler.policy,

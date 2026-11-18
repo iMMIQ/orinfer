@@ -33,7 +33,7 @@ impl Default for WorkerOptions {
             cuda_graph: "decode_only".into(),
             mtp_drafts: "auto".into(),
             resident_experts: "full".into(),
-            prefix_cache_mib: 12288,
+            prefix_cache_mib: ServerConfig::default().prefix_cache_bytes >> 20,
             kv_offload_mib: 0,
             max_active_requests: 32,
             max_batch_tokens: 128,

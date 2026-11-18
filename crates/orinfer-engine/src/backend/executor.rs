@@ -547,10 +547,11 @@ impl Executor {
         &mut self,
         operations: &[Invocation],
         position: (&str, u32),
+        exact_state: bool,
     ) -> Result<Vec<Vec<f32>>> {
         match &mut self.implementation {
             Implementation::Cuda(inner) => {
-                inner.profile_stream_operations_at_position(operations, position)
+                inner.profile_stream_operations_at_position(operations, position, exact_state)
             }
         }
     }

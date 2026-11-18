@@ -112,6 +112,17 @@ impl ModelRuntime {
                 .map(|p| p.chunk_tokens)
                 .collect()
         };
+        let capacity = shapes.iter().max().copied();
+        let mut prefill_costs = prefill_cost::Costs::new(shapes);
+        if let Some(capacity) = capacity
+            && prepared
+                .plan
+                .prefill_plans
+                .iter()
+                .any(|p| p.chunk_tokens == capacity && p.min_tokens == 1)
+        {
+            prefill_costs = prefill_costs.with_dynamic_capacity(capacity);
+        }
         Ok(Self {
             frontend_assets: prepared.frontend_assets,
             manifest: prepared.plan,
@@ -125,7 +136,7 @@ impl ModelRuntime {
             host_kv_pool: Default::default(),
             prefix_statistics: crate::prefix::Statistics::default(),
             prefix_hints: vec![],
-            prefill_costs: prefill_cost::Costs::new(shapes),
+            prefill_costs,
             owner_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
