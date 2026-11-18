@@ -479,7 +479,7 @@ impl ModelRuntime {
             return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
         }
         while self.admission_free_bytes()? < needed {
-            if !self.evict_prefix(None, None)? {
+            if !self.evict_prefix(None)? {
                 return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
             }
         }
@@ -614,7 +614,7 @@ impl ModelRuntime {
             .prefix_cache_limit
             .min(self.prefix_cache.device.bytes.saturating_add(available));
         while self.prefix_cache.device.bytes > self.prefix_cache.device.budget {
-            if !self.evict_prefix(None, None)? {
+            if !self.evict_prefix(None)? {
                 break;
             }
         }
@@ -2458,7 +2458,11 @@ impl ModelRuntime {
             return Ok(());
         }
         let stored = self.with_request(req, |model, req| {
-            if cache && req.cache_generated && !req.prefilling && model.prefix_enabled() {
+            if cache
+                && req.cache_generated
+                && !req.prefilling
+                && model.should_store_decoded_prefix(&req.prefix)
+            {
                 let consistent = model.refresh_request_mtp(req, false)?;
                 if consistent {
                     model.store_decoded_prefix(

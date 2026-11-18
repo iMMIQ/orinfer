@@ -1,12 +1,13 @@
 use super::*;
 use crate::backend::snapshot::Range;
-use crate::prefix::{Entry, Media, Resident, hash_floats};
+use crate::prefix::{Entry, Media, hash_floats};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub(super) struct Context {
     parent: Option<(bool, u64)>,
+    private_checkpoint_bytes: usize,
     pub statistics: crate::prefix::Statistics,
 }
 
@@ -238,6 +239,16 @@ impl ModelRuntime {
         }
         Ok(ranges)
     }
+    pub(super) fn should_store_decoded_prefix(&self, context: &Context) -> bool {
+        self.prefix_enabled()
+            && (self.prefix_cache.host.budget != 0
+                || context.private_checkpoint_bytes
+                    <= self
+                        .prefix_cache
+                        .device
+                        .budget
+                        .saturating_sub(self.prefix_cache.device.bytes))
+    }
     pub(super) fn store_prefix(
         &mut self,
         input: &[u32],
@@ -290,12 +301,23 @@ impl ModelRuntime {
                 self.update_prefix_usage(context);
                 return Ok(());
             }
-            let kv_names = self
+            let kv_names: BTreeSet<_> = self
                 .manifest
                 .kv_cache
                 .as_ref()
                 .map(|k| k.buffers.keys().cloned().collect())
                 .unwrap_or_default();
+            // Non-KV ranges always need a private bank. The lower bound
+            // lets a finished request release its arena without warming the
+            // draft just to decline a speculative snapshot.
+            context.private_checkpoint_bytes = ranges
+                .iter()
+                .filter(|(name, _)| !kv_names.contains(*name))
+                .try_fold(0usize, |bytes, (_, range)| {
+                    bytes
+                        .checked_add(range.bytes)
+                        .ok_or("Prefix state size overflow")
+                })?;
             let parent = context
                 .parent
                 .filter(|(host, _)| !host)
@@ -303,26 +325,21 @@ impl ModelRuntime {
                 .filter(|e| {
                     input.starts_with(&e.tokens)
                         && e.media.common_tokens(media, e.tokens.len()) == e.tokens.len()
-                })
-                .map(|e| &e.snapshot);
-            let plan = self.execution.plan_snapshot(ranges, &kv_names, parent)?;
-            let protected = (!logits_valid)
-                .then(|| {
-                    self.prefix_cache
-                        .device
-                        .match_prefix_by(input, media, |e| {
-                            e.logits_valid.then_some(-(e.tokens.len() as f64))
-                        })
-                        .checkpoint
-                })
-                .flatten();
-            let mut retained = BTreeMap::new();
-            plan.allocations(&mut retained);
-            if let Some(entry) = protected.and_then(|id| self.prefix_cache.device.entries.get(&id))
+                });
+            // A generated continuation has no reuse evidence at insertion.
+            // Admit it to spare GPU capacity, or offload it independently.
+            // If a prompt can already resume from the preceding token, keep
+            // that checkpoint when another dense state would force eviction.
+            let adjacent = parent.is_some_and(|e| {
+                e.logits_valid && e.tokens.len().checked_add(1) == Some(input.len())
+            });
+            let plan =
+                self.execution
+                    .plan_snapshot(ranges, &kv_names, parent.map(|e| &e.snapshot))?;
+            let admission = self.prefix_cache.device.admission(&plan, plan.new_bytes);
+            if admission == crate::prefix::Admission::TooLarge
+                || (admission != crate::prefix::Admission::Ready && (!logits_valid || adjacent))
             {
-                entry.snapshot.allocations(&mut retained);
-            }
-            if retained.values().sum::<usize>() + plan.new_bytes > self.prefix_cache.device.budget {
                 self.store_host_prefix(input, media, warm_tokens, logits_valid, &plan, context)?;
                 context.statistics.store_s += at.elapsed().as_secs_f64();
                 self.update_prefix_usage(context);
@@ -333,7 +350,7 @@ impl ModelRuntime {
             while self.prefix_cache.device.admission(&plan, plan.new_bytes)
                 != crate::prefix::Admission::Ready
             {
-                if !self.evict_prefix(protected, Some(context))? {
+                if !(logits_valid && self.evict_prefix(Some(context))?) {
                     return Err("Prefix budget planning failure".into());
                 }
             }
@@ -341,18 +358,19 @@ impl ModelRuntime {
                 if let Some(s) = self.execution.snapshot(&plan)? {
                     break Some(s);
                 }
-                if !self.evict_prefix(protected, Some(context))? {
+                if !(logits_valid && self.evict_prefix(Some(context))?) {
                     break None;
                 }
             };
             if let Some(snapshot) = snapshot {
-                let mut own = BTreeMap::new();
-                snapshot.allocations(&mut own);
-                if own.values().sum::<usize>() <= self.prefix_cache.device.budget {
+                let fitting = self.prefix_cache.device.admission(&snapshot, 0);
+                if fitting == crate::prefix::Admission::Ready
+                    || (fitting == crate::prefix::Admission::Reclaim && logits_valid)
+                {
                     while self.prefix_cache.device.admission(&snapshot, 0)
                         != crate::prefix::Admission::Ready
                     {
-                        if !self.evict_prefix(protected, Some(context))? {
+                        if !(logits_valid && self.evict_prefix(Some(context))?) {
                             return Err("Prefix budget accounting failure".into());
                         }
                     }
@@ -386,6 +404,14 @@ impl ModelRuntime {
                     context.statistics.checkpoints_stored += 1;
                 } else {
                     self.execution.release_snapshot(snapshot)?;
+                    self.store_host_prefix(
+                        input,
+                        media,
+                        warm_tokens,
+                        logits_valid,
+                        &plan,
+                        context,
+                    )?;
                 }
             } else {
                 self.store_host_prefix(input, media, warm_tokens, logits_valid, &plan, context)?;
@@ -488,12 +514,12 @@ impl ModelRuntime {
             self.prefix_cache.host.remove(id);
         }
     }
-    pub(super) fn evict_prefix(
-        &mut self,
-        protected: Option<u64>,
-        context: Option<&mut Context>,
-    ) -> Result<bool> {
-        let Some(id) = self.prefix_cache.device.victim_except(protected) else {
+    pub(super) fn evict_prefix(&mut self, context: Option<&mut Context>) -> Result<bool> {
+        let Some(id) = (if context.is_some() {
+            self.prefix_cache.device.victim_for_capture(None)
+        } else {
+            self.prefix_cache.device.victim_except(None)
+        }) else {
             return Ok(false);
         };
         let mut local = Context::default();

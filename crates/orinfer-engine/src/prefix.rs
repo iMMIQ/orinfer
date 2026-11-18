@@ -348,6 +348,16 @@ impl<T: Resident> Cache<T> {
     /// Select without unpublishing the source. Tier transfers commit removal
     /// only after the adapter reports successful completion.
     pub fn victim_except(&self, protected: Option<u64>) -> Option<u64> {
+        self.victim_with_priority(protected, false)
+    }
+
+    /// GPU capture gives existing prompt checkpoints and proven continuations
+    /// priority over generated continuations that have never been restored.
+    pub fn victim_for_capture(&self, protected: Option<u64>) -> Option<u64> {
+        self.victim_with_priority(protected, true)
+    }
+
+    fn victim_with_priority(&self, protected: Option<u64>, prefer_unproven: bool) -> Option<u64> {
         let mut references: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
         for e in self.entries.values() {
             let mut own = BTreeMap::new();
@@ -373,7 +383,12 @@ impl<T: Resident> Cache<T> {
                     (e.tokens.len() - parent).max(1) as f64 * (1.0 + e.hits as f64)
                         / (freed.max(1) as f64 * (self.clock - e.used + 1) as f64)
                 };
-                utility(a).total_cmp(&utility(b)).then(a.used.cmp(&b.used))
+                let priority =
+                    |entry: &Entry<T>| prefer_unproven && (entry.logits_valid || entry.hits != 0);
+                priority(a)
+                    .cmp(&priority(b))
+                    .then_with(|| utility(a).total_cmp(&utility(b)))
+                    .then(a.used.cmp(&b.used))
             })
             .map(|(&id, _)| id)
     }
@@ -485,6 +500,17 @@ mod tests {
             valid,
         )
     }
+    #[test]
+    fn capture_prefers_unproven_continuations_even_when_they_are_recent() {
+        let mut cache = Cache::new(100);
+        let prompt = cache.insert(entry(&[1], &[(1, 50)], true));
+        let tail = cache.insert(entry(&[2, 3, 4, 5], &[(2, 10)], false));
+        assert_eq!(cache.victim_except(None), Some(prompt));
+        assert_eq!(cache.victim_for_capture(None), Some(tail));
+        cache.touch(tail);
+        assert_eq!(cache.victim_for_capture(None), Some(prompt));
+    }
+
     #[test]
     fn selects_cheapest_compatible_endpoint_and_preserves_raw_overlap() {
         let mut c = Cache::new(100);
