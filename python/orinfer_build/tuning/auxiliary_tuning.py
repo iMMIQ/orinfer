@@ -245,7 +245,7 @@ def publish_qsa_prefill(package, manifest, compiler, *, attention_only=False):
                             async_scales=True,
                             vector_dequant=True,
                         ),
-                        key=f"qsa-single-buffer-vector-store-{context}-{rows}",
+                        key=f"qsa-single-buffer-byte-permute-{context}-{rows}",
                     )
                     continue
             if (

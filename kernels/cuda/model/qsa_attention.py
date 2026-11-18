@@ -22,11 +22,27 @@ __device__ __forceinline__ unsigned int qsa_dequant_pair(unsigned int code, unsi
     return result.bits;
 }
 
+__device__ __forceinline__ unsigned int qsa_scale_pair(
+    unsigned int packed, __half2 scale) {
+    QsaHalf2Bits values{packed}, bias{0x64806480u};
+    values.value = __hmul2(__hsub2(values.value, bias.value), scale);
+    return values.bits;
+}
+
 __device__ __forceinline__ void qsa_dequant_store_eight(
-    void* dst, unsigned int a, unsigned int b, unsigned short scale) {
+    void* dst, unsigned int a, unsigned int b, unsigned short scale_bits) {
+    // Map signed bytes to [0, 255], then place each byte in a half mantissa.
+    // The resulting lanes are 1024 + unsigned_byte. Subtracting 1152
+    // recovers the exact signed value before the original rounded half multiply.
+    constexpr unsigned int exponent = 0x64646464u;
+    a ^= 0x80808080u;
+    b ^= 0x80808080u;
+    QsaHalf2Bits scale{static_cast<unsigned int>(scale_bits) * 0x00010001u};
     *reinterpret_cast<uint4*>(dst) = make_uint4(
-        qsa_dequant_pair(a, scale), qsa_dequant_pair(a >> 16, scale),
-        qsa_dequant_pair(b, scale), qsa_dequant_pair(b >> 16, scale));
+        qsa_scale_pair(__byte_perm(a, exponent, 0x5150), scale.value),
+        qsa_scale_pair(__byte_perm(a, exponent, 0x5352), scale.value),
+        qsa_scale_pair(__byte_perm(b, exponent, 0x5150), scale.value),
+        qsa_scale_pair(__byte_perm(b, exponent, 0x5352), scale.value));
 }
 """
 
