@@ -145,11 +145,17 @@ def rebuild(args):
         or args.expert_decode_only
         or args.hc_prefill_only
         or args.qsa_attention_only
+        or args.gdn_prefill_only
     ):
         from orinfer_build.compiler.cuda.common import configure
         from orinfer_build.packaging.compact import compact_package
 
-        if args.qsa_attention_only:
+        if args.gdn_prefill_only:
+            from functools import partial
+            from orinfer_build.models.flash_next.gdn_prefill import publish as publish_gdn
+
+            publish = partial(publish_gdn, scopes=data["buffer_scopes"])
+        elif args.qsa_attention_only:
             from functools import partial
             from orinfer_build.tuning.auxiliary_tuning import publish_qsa_prefill
 
@@ -483,6 +489,11 @@ def main():
         action="store_true",
         help="Rebuild native QSA prefill attention with vectorized KV dequantization",
     )
+    auxiliary.add_argument(
+        "--gdn-prefill-only",
+        action="store_true",
+        help="Rebuild native prefill with register-resident GDN operands",
+    )
     p.add_argument(
         "--prefill-only",
         action="store_true",
@@ -516,6 +527,7 @@ def main():
         or args.expert_decode_only
         or args.hc_prefill_only
         or args.qsa_attention_only
+        or args.gdn_prefill_only
     ) and (
         args.plan_only
         or args.prefill_only
