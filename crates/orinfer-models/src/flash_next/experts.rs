@@ -72,6 +72,7 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
         let canonical = kernel
             .name
             .split_once("/rows/")
+            .or_else(|| kernel.name.split_once("/choice/"))
             .and_then(|(slot, _)| contracts.get(slot).copied())
             .filter(|k| splits.contains_key(&k.name));
         fn pointer(arg: &Argument) -> Option<(&str, usize)> {

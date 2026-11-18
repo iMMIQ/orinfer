@@ -163,7 +163,6 @@ def e8p_prefill_grouped(
         or type(minimum_blocks) is not int
         or not 1 <= minimum_blocks <= 16
         or block_m not in (16, 32)
-        or (codec == "e8p_q2" and block_m != 16)
         or K % 128
         or K * 128 * 128 > 2**31 - 1
     ):

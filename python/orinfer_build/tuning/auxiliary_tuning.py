@@ -237,9 +237,14 @@ def publish_qsa_prefill(package, manifest, compiler):
                         operands,
                         rows,
                         build=lambda: qsa_attention.sparse_attention.__wrapped__(
-                            rows, context, packed=True, single_buffer=True, dynamic_rows=True
+                            rows,
+                            context,
+                            packed=True,
+                            single_buffer=True,
+                            dynamic_rows=True,
+                            async_scales=True,
                         ),
-                        key=f"qsa-single-buffer-{context}-{rows}",
+                        key=f"qsa-single-buffer-async-scales-{context}-{rows}",
                     )
                     continue
             if selector is None or selector["symbol"] != "qsa_select_partial_kernel":

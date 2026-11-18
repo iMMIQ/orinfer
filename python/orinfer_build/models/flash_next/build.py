@@ -140,6 +140,27 @@ def rebuild(args):
     manifest = {}
     data, origin, package = load_model(args.model, plan=manifest)
     buffers = {b["name"]: b for b in data["metadata"]["buffers"]}
+    if args.expert_prefill_only:
+        from orinfer_build.compiler.cuda.common import configure
+        from orinfer_build.models.flash_next.expert_prefill import publish
+        from orinfer_build.packaging.compact import compact_package
+
+        configure()
+        with atomic_model(args.model_output) as staging:
+            root = clone_model(args.model, staging, origin)
+            compiler = Compiler(origin, root, args.output, buffers)
+            bindings = publish(package, manifest, compiler)
+            digest = compact_package(root, package, staging / "cache/packages")
+            shutil.rmtree(root)
+            data["execution_package"] = digest
+            write_json(staging / "cache/model.json", data)
+            load_model(staging, plan={})
+        write_json(
+            args.output / "results.json",
+            dict(complete=True, execution_package=digest, bindings=bindings),
+        )
+        print("COMPLETE", digest, flush=True)
+        return
     inspector = Compiler(origin, origin, args.output, buffers)
     groups, dynamic = inventory(data, package, manifest, inspector)
     bounded = bounded_measurements(manifest)
@@ -423,6 +444,11 @@ def main():
     p.add_argument("--cache", type=Path, default=work_path("cache", "build", "flash-next"))
     p.add_argument("--plan-only", action="store_true")
     p.add_argument(
+        "--expert-prefill-only",
+        action="store_true",
+        help="Publish the measured native Flash prefill expert routing and projection tiles",
+    )
+    p.add_argument(
         "--prefill-only",
         action="store_true",
         help="Rebuild only declared prefill projections; preserve other certified bindings",
@@ -450,6 +476,14 @@ def main():
     args = p.parse_args()
     if args.model.resolve() == args.model_output.resolve():
         p.error("model-output must differ from the immutable input")
+    if args.expert_prefill_only and (
+        args.plan_only
+        or args.prefill_only
+        or args.hc_combine_norm
+        or args.projection_kinds
+        or args.projection_shape
+    ):
+        p.error("expert-prefill-only cannot be combined with other rebuild modes")
     if any(r < 1 for r in args.prefill_tuning_rows):
         p.error("prefill-tuning-rows must be positive")
     if any(n < 1 or k < 1 for n, k in args.projection_shape or []):

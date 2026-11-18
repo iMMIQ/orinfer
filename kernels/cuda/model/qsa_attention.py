@@ -36,6 +36,7 @@ def sparse_attention(
     split_size: int | None = 256,
     dynamic_rows: bool = False,
     skip_empty: bool = False,
+    async_scales: bool = False,
 ):
     geometry(m, capacity)
 
@@ -64,6 +65,8 @@ def sparse_attention(
         raise ValueError("Invalid sparse attention tile/warp geometry")
     if type(single_buffer) is not bool or single_buffer and not packed:
         raise ValueError("Single KV buffer requires packed attention")
+    if type(async_scales) is not bool or async_scales and not packed:
+        raise ValueError("Async scales require packed attention")
     block = block_size
     kv_width = 64 if packed else 256
     kv_dtype = T.uint32 if packed else T.int8
@@ -135,14 +138,15 @@ def sparse_attention(
                         slot < end, Selected[row, T.min(slot, 2050)], -1
                     )
                 T.sync_threads()
-                for j, g in T.Parallel(block, 4):
-                    token = selected_tile[j]
-                    key_scales[j, g] = 0
-                    value_scales[j, g] = 0
-                    if token >= 0 and token <= Position[0] + row:
-                        key_scales[j, g] = KS[token, kh, g]
-                        value_scales[j, g] = VS[token, kh, g]
-                T.sync_threads()
+                if not async_scales:
+                    for j, g in T.Parallel(block, 4):
+                        token = selected_tile[j]
+                        key_scales[j, g] = 0
+                        value_scales[j, g] = 0
+                        if token >= 0 and token <= Position[0] + row:
+                            key_scales[j, g] = KS[token, kh, g]
+                            value_scales[j, g] = VS[token, kh, g]
+                    T.sync_threads()
                 # Gather packed INT8 KV in 16-byte asynchronous loads. Keep
                 # packed V until softmax finishes so K and V can share one
                 # FP16 tensor-core tile without increasing shared memory.
@@ -181,6 +185,25 @@ def sparse_attention(
                                     4,
                                     1,
                                 ),
+                                4,
+                                predicate=valid,
+                            )
+                    if async_scales:
+                        # Each group-64 scale row is one aligned 8-byte copy.
+                        # Retire it with the packed K tile before dequantizing.
+                        for j in T.Parallel(block):
+                            token = selected_tile[j]
+                            valid = token >= 0 and token <= Position[0] + row
+                            safe = T.max(token, 0)
+                            T.ptx_cp_async(
+                                T.access_ptr(key_scales[j, 0], "w", 4),
+                                T.access_ptr(KS[safe, kh, 0], "r", 4),
+                                4,
+                                predicate=valid,
+                            )
+                            T.ptx_cp_async(
+                                T.access_ptr(value_scales[j, 0], "w", 4),
+                                T.access_ptr(VS[safe, kh, 0], "r", 4),
                                 4,
                                 predicate=valid,
                             )
