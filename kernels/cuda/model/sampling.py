@@ -276,29 +276,34 @@ def radix_choose(vocab: int):
                                 hist[0] - 1,
                             )
                 if not skip and Output[1] == 0:
-                    remaining = T.alloc_var(T.uint64, State[4])
-                    found = T.alloc_var(T.int32, -1)
-                    for bucket in T.serial(256):
-                        before = T.if_then_else(
-                            bucket == 255, T.uint64(0), hist[T.min(bucket + 1, 255)]
-                        )
-                        if before <= remaining and remaining < hist[bucket]:
-                            found = bucket
-                            State[4] = remaining - before
-                    if found < 0:
+                    remaining = State[4]
+                    if remaining >= hist[0]:
                         Output[1] = 1
-                    elif digit < 8:
-                        State[5] = State[5] | (T.cast(found, T.uint64) << ((7 - digit) * 8))
                     else:
-                        State[6] = State[6] | (T.cast(found, T.uint64) << ((11 - digit) * 8))
-                    if digit == 11:
-                        if mode == 0:
-                            State[0] = State[5]
-                            State[1] = State[6]
-                        elif mode == 1:
-                            State[2] = State[5]
-                            State[3] = State[6]
+                        # The reverse cumulative histogram is nonincreasing.
+                        # Find the last bucket covering the rank, skipping
+                        # empty buckets without a serial scan of all 256.
+                        found = T.alloc_var(T.int32, 0)
+                        for bit in T.unroll(8):
+                            next_bucket = found + (128 >> bit)
+                            if remaining < hist[next_bucket]:
+                                found = next_bucket
+                        preceding = T.if_then_else(
+                            found == 255, T.uint64(0), hist[T.min(found + 1, 255)]
+                        )
+                        State[4] = remaining - preceding
+                        if digit < 8:
+                            State[5] = State[5] | (T.cast(found, T.uint64) << ((7 - digit) * 8))
                         else:
-                            Output[0] = T.cast(T.uint64(4294967295) - State[6], T.int32)
+                            State[6] = State[6] | (T.cast(found, T.uint64) << ((11 - digit) * 8))
+                        if digit == 11:
+                            if mode == 0:
+                                State[0] = State[5]
+                                State[1] = State[6]
+                            elif mode == 1:
+                                State[2] = State[5]
+                                State[3] = State[6]
+                            else:
+                                Output[0] = T.cast(T.uint64(4294967295) - State[6], T.int32)
 
     return explicit_scalar(explicit_scalar(main, digit), mode)
