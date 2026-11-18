@@ -245,7 +245,7 @@ def publish_qsa_prefill(package, manifest, compiler):
                             async_scales=True,
                             vector_dequant=True,
                         ),
-                        key=f"qsa-single-buffer-vector-dequant-{context}-{rows}",
+                        key=f"qsa-single-buffer-vector8-{context}-{rows}",
                     )
                     continue
             if selector is None or selector["symbol"] != "qsa_select_partial_kernel":
@@ -294,6 +294,72 @@ def publish_qsa_prefill(package, manifest, compiler):
                 )
     if not replacements:
         raise ValueError("Flash Next native prefill requires a partitioned QSA selection chain")
+    package["kernels"] = [replacements.get(k["name"], k) for k in package["kernels"]]
+    package["dynamic_batch_kernels"] = [
+        launches.get(k["name"], k) for k in package["dynamic_batch_kernels"]
+    ]
+    return sorted(replacements)
+
+
+def publish_conv_prefill(package, manifest, compiler):
+    """Rebuild the native Flash prefill convolution with vector loads."""
+    from kernels.cuda.operators.op08_gdn_conv_prep import gdn_conv_prep
+
+    if package["architecture"] != "flash_next":
+        raise ValueError("Native prefill convolution rebuild requires Flash Next")
+    text = package["config_signature"]["text"]
+    hk, hv = text["linear_num_key_heads"], text["linear_num_value_heads"]
+    if (
+        text["linear_conv_kernel_dim"] != 4
+        or text["linear_key_head_dim"] != 128
+        or text["linear_value_head_dim"] != 128
+    ):
+        raise ValueError("Unexpected Flash prefill convolution geometry")
+    heads = 2 * hk + hv
+    roles = {"X", "W", "HI", "HO", "lengths", "positions", "positions_out", "Q", "K", "V"}
+    kernels = {k["name"]: k for k in package["kernels"]}
+    dynamic = {k["name"]: k for k in package["dynamic_batch_kernels"]}
+    replacements, launches = {}, {}
+    for plan in manifest["prefill_plans"]:
+        rows = plan["chunk_tokens"]
+        for operation in manifest["programs"][plan["prefill_program"]]:
+            name = operation.get("name")
+            old = kernels.get(name)
+            if old is None or old["symbol"] != "kernel_kernel" or old["grid"][1:] != [heads, 1]:
+                continue
+            operands = compiler.pointers(old)
+            if set(operands) != roles:
+                continue
+            weight = compiler.buffers[operands["W"]["name"]]
+            if (
+                dynamic.get(name, {}).get("capacity") != rows
+                or old["block"] != [128, 1, 1]
+                or any(a["kind"] != "buffer" for a in operands.values())
+                or weight["dtype"] != "f32"
+                or weight["shape"] != [heads * 128, 4]
+                or operands["HI"] == operands["HO"]
+            ):
+                raise ValueError("Unexpected Flash prefill convolution operands")
+            replacements[name], launches[name] = compiler.emit(
+                old,
+                name,
+                operands,
+                rows,
+                build=lambda: gdn_conv_prep.__wrapped__(
+                    B=1,
+                    tokens=rows,
+                    tile_tokens=32,
+                    normalize_round_fp16=False,
+                    conv_product_round_fp16=False,
+                    weight_dtype="float32",
+                    dynamic_tokens=True,
+                    key_heads=hk,
+                    value_heads=hv,
+                ),
+                key=f"flash-conv-vector-{rows}-{hk}-{hv}-32",
+            )
+    if not replacements:
+        raise ValueError("Missing Flash prefill convolution bindings")
     package["kernels"] = [replacements.get(k["name"], k) for k in package["kernels"]]
     package["dynamic_batch_kernels"] = [
         launches.get(k["name"], k) for k in package["dynamic_batch_kernels"]
@@ -513,7 +579,7 @@ def main():
     p.add_argument(
         "--families",
         nargs="+",
-        choices=("router", "ple", "qsa", "qsa-prefill"),
+        choices=("router", "ple", "qsa", "qsa-prefill", "conv-prefill"),
         default=["router", "ple", "qsa"],
     )
     args = p.parse_args()
@@ -528,12 +594,17 @@ def main():
         compiler = Compiler(
             origin, root, args.output, {b["name"]: b for b in data["metadata"]["buffers"]}
         )
-        families = tuple(family for family in args.families if family != "qsa-prefill")
+        prefill_publishers = {
+            "qsa-prefill": publish_qsa_prefill,
+            "conv-prefill": publish_conv_prefill,
+        }
+        families = tuple(family for family in args.families if family not in prefill_publishers)
         if families:
             publish(data, package, manifest, compiler, args.output, families)
-        if "qsa-prefill" in args.families:
-            names = publish_qsa_prefill(package, manifest, compiler)
-            write_json(args.output / "qsa-prefill.json", dict(bindings=names))
+        for family, build in prefill_publishers.items():
+            if family in args.families:
+                names = build(package, manifest, compiler)
+                write_json(args.output / f"{family}.json", dict(bindings=names))
         digest = compact_package(root, package, staging / "cache/packages")
         shutil.rmtree(root)
         data["execution_package"] = digest

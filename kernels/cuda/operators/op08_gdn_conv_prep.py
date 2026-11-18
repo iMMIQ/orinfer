@@ -60,7 +60,7 @@ def gdn_conv_prep(
     CHANNELS = (2 * KEY_HEADS + VALUE_HEADS) * DIM
     if min(KEY_HEADS, VALUE_HEADS) <= 0 or VALUE_HEADS % KEY_HEADS:
         raise ValueError("Invalid GDN head geometry")
-    assert tile_tokens in (1, 2, 4, 8, 16)
+    assert tile_tokens in (1, 2, 4, 8, 16, 32)
     assert qk_output_dtype in ("float16", "float32") and q_scale > 0
     assert weight_dtype in ("float16", "float32")
     if type(compact_decode) is not bool or compact_decode and (tokens != 1 or tile_tokens != 16):

@@ -77,16 +77,16 @@ def sparse_attention(
     @T.macro
     def dequantize(raw, scales, output):
         if vector_dequant:
-            # One packed word and scale produce four adjacent FP16 values.
-            for j, word in T.Parallel(block, 64):
-                bits = raw[j, word]
-                scale = T.reinterpret(T.uint16, scales[j, word // 16])
-                low = T.call_pure_extern("uint32", "qsa_dequant_pair", bits, scale)
-                high = T.call_pure_extern("uint32", "qsa_dequant_pair", bits >> 16, scale)
-                for d in T.vectorized(4):
-                    pair = T.if_then_else(d < 2, low, high)
-                    output[j, word * 4 + d] = T.reinterpret(
-                        T.float16, T.cast(pair >> ((d % 2) * 16), T.uint16)
+            # Two packed words share a scale and write eight adjacent FP16 values.
+            for j, word_pair in T.Parallel(block, 32):
+                scale = T.reinterpret(T.uint16, scales[j, word_pair // 8])
+                values = T.alloc_local((4,), T.uint32)
+                for pair in T.unroll(4):
+                    bits = raw[j, word_pair * 2 + pair // 2] >> ((pair % 2) * 16)
+                    values[pair] = T.call_pure_extern("uint32", "qsa_dequant_pair", bits, scale)
+                for d in T.vectorized(8):
+                    output[j, word_pair * 8 + d] = T.reinterpret(
+                        T.float16, T.cast(values[d // 2] >> ((d % 2) * 16), T.uint16)
                     )
         else:
             for j, pair in T.Parallel(block, 128, coalesced_width=T.int32(1)):
