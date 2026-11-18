@@ -6,14 +6,15 @@ from orinfer_build.tuning.expert_tuning import tile_capacity
 def publish(package, manifest, compiler):
     from kernels.cuda.model import e8p_prefill, moe
 
-    # Measured together on SM87. The narrow tile still serves short extents,
-    # where expert occupancy is lower and packing extra rows increases work.
-    first, block_m = 2048, 32
+    # On SM87 the wider route and paired projections win from 1280 rows
+    # with both dispersed and concentrated routing. Smaller batches keep
+    # the narrow tile to avoid padding sparsely populated experts.
+    first, block_m = 1280, 32
     text = package["config_signature"]["text"]
     experts, top = text["num_experts"], text["num_experts_per_tok"]
     kernels = {k["name"]: k for k in package["kernels"]}
     dynamic = {k["name"]: k for k in package["dynamic_batch_kernels"]}
-    added, launches = {}, {}
+    added, launches, obsolete = {}, {}, set()
     for plan in manifest["prefill_plans"]:
         rows = plan["chunk_tokens"]
         if rows < first:
@@ -57,8 +58,11 @@ def publish(package, manifest, compiler):
 
             def emit(old, pointers, build, key, multiplier=1):
                 name = old["name"] + suffix
-                if any(n.startswith(old["name"] + "/choice/") and n != name for n in kernels):
+                previous = old["name"] + f"/choice/2048-{rows}/1/k0"
+                choices = {n for n in kernels if n.startswith(old["name"] + "/choice/")}
+                if choices - {name, previous}:
                     raise ValueError("Overlapping Flash prefill expert choices")
+                obsolete.update(choices & {previous})
                 if old["name"] in dynamic and dynamic[old["name"]]["capacity"] != rows:
                     raise ValueError("Unexpected Flash prefill expert capacity")
                 added[name], launches[name] = compiler.emit(
@@ -122,9 +126,14 @@ def publish(package, manifest, compiler):
                 )
     if not added:
         raise ValueError("Missing wide Flash prefill expert bindings")
+    for name in obsolete:
+        del kernels[name]
+        del dynamic[name]
     kernels.update(added)
     dynamic.update(launches)
     package["kernels"] = list(kernels.values())
     package["dynamic_batch_kernels"] = list(dynamic.values())
-    package["plan_kernel_contracts"] = sorted(set(package["plan_kernel_contracts"]) | added.keys())
+    package["plan_kernel_contracts"] = sorted(
+        (set(package["plan_kernel_contracts"]) - obsolete) | added.keys()
+    )
     return sorted(added)
