@@ -215,13 +215,12 @@ impl Executor {
         table: &str,
         scratch: &str,
         stride: usize,
-        source: &str,
         source_bytes: usize,
-        slots: &[usize],
+        sources: &[(&str, usize, usize)],
     ) -> Result<()> {
         match &self.implementation {
             Implementation::Cuda(inner) => {
-                inner.upload_scratch_rows(table, scratch, stride, source, source_bytes, slots)
+                inner.upload_scratch_rows(table, scratch, stride, source_bytes, sources)
             }
         }
     }

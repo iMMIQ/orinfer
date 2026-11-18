@@ -17,6 +17,19 @@ pub(super) struct PromptLookup {
 
 impl PromptLookup {
     pub fn propose(&mut self, history: &[u32], count: usize) -> Option<Vec<u32>> {
+        self.propose_after_match(history, count, KEY)
+    }
+
+    pub fn propose_confident(&mut self, history: &[u32], count: usize) -> Option<Vec<u32>> {
+        self.propose_after_match(history, count, CONTEXT)
+    }
+
+    fn propose_after_match(
+        &mut self,
+        history: &[u32],
+        count: usize,
+        minimum: usize,
+    ) -> Option<Vec<u32>> {
         if history.len() < KEY || count == 0 {
             return None;
         }
@@ -38,7 +51,7 @@ impl PromptLookup {
             }
         }
         self.indexed = history.len() - KEY + 1;
-        self.find(history, count, KEY)
+        self.find(history, count, minimum)
             .map(|end| history[end..end + count].to_vec())
     }
 

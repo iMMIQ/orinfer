@@ -262,3 +262,139 @@ fn validate_gpu_sampling_requests() {
     }
     std::fs::write(f.output, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
 }
+
+#[test]
+#[ignore = "Requires Flash Next sampled verification and the exclusive GPU lock"]
+fn validate_sampled_lookup_requests() {
+    use crate::runtime::requests::speculation::LookupChoice;
+
+    let f: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let mut model = ModelRuntime::load_with_options(
+        &f.model,
+        LoadOptions {
+            cuda_graph: f.cuda_graph.parse().unwrap(),
+            prompt_lookup: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let start = |model: &mut ModelRuntime| {
+        (0..4)
+            .map(|lane| {
+                let mut source = input(&f.cases[lane], 44);
+                source.sampling = crate::sampling::Options {
+                    temperature: 0.8,
+                    top_k: 20,
+                    top_p: 0.9,
+                    seed: crate::sampling::EVALUATION_SEED + lane as u64,
+                    ..Default::default()
+                };
+                let mut request = model.start_request(source, &|| false).unwrap();
+                prefill_reference(model, &mut request);
+                request
+            })
+            .collect::<Vec<_>>()
+    };
+    let ordinary = [(0, 1), (1, 1), (2, 1), (3, 1)];
+    let mut baseline = start(&mut model);
+    let mut baseline_times = vec![];
+    for _ in 0..34 {
+        let at = Instant::now();
+        model
+            .execute_selected(
+                &mut baseline.iter_mut().collect::<Vec<_>>(),
+                &ordinary,
+                &mut vec![],
+            )
+            .unwrap();
+        baseline_times.push(at.elapsed().as_secs_f64());
+    }
+    let expected: Vec<_> = baseline
+        .iter()
+        .map(|req| req.history[req.input.len()..].to_vec())
+        .collect();
+    for request in &mut baseline {
+        model.finish_request(request, false).unwrap();
+    }
+
+    let mut requests = start(&mut model);
+    let mut packet_times = vec![];
+    for (iteration, lookup) in [3, 1, 2, 0, 3, 1].into_iter().enumerate() {
+        let mut draft = expected[lookup][requests[lookup].generated..][..7].to_vec();
+        let accepted = if iteration.is_multiple_of(2) { 7 } else { 3 };
+        if accepted < draft.len() {
+            draft[accepted] = (draft[accepted] + 1) % model.manifest.vocab as u32;
+        }
+        let proposals = vec![(lookup, draft)];
+        let other = ordinary.into_iter().filter(|&(i, _)| i != lookup).collect();
+        let positions: Vec<_> = requests.iter().map(|r| r.warm.tokens).collect();
+        let mut steps = vec![];
+        let graph_hits = model.execution.batch_statistics().graph_hits;
+        let at = Instant::now();
+        model
+            .execute_sampled_lookup(
+                &mut requests.iter_mut().collect::<Vec<_>>(),
+                LookupChoice {
+                    ordinary: other,
+                    proposals,
+                },
+                &mut steps,
+                &mut || {},
+            )
+            .unwrap();
+        packet_times.push(at.elapsed().as_secs_f64());
+        if iteration >= 2 && f.cuda_graph == "decode_only" {
+            assert!(model.execution.batch_statistics().graph_hits >= graph_hits + 2);
+        }
+        assert_eq!(steps.len(), 4);
+        for step in steps {
+            let req = &requests[step.request];
+            assert_eq!(req.warm.tokens, positions[step.request]);
+            assert_eq!(
+                step.tokens.len(),
+                if step.request == lookup {
+                    accepted + 1
+                } else {
+                    1
+                }
+            );
+            let range = req.generated - step.tokens.len()..req.generated;
+            assert_eq!(step.tokens, expected[step.request][range]);
+        }
+    }
+    let mut steps = vec![];
+    model
+        .execute_selected(
+            &mut requests.iter_mut().collect::<Vec<_>>(),
+            &ordinary,
+            &mut steps,
+        )
+        .unwrap();
+    for step in steps {
+        let request = &requests[step.request];
+        assert_eq!(step.tokens, [expected[step.request][request.generated - 1]]);
+    }
+    for request in &mut requests {
+        model
+            .with_request(request, |m, r| {
+                assert!(m.refresh_request_mtp(r, true)?);
+                assert_eq!(r.warm.tokens, r.history.len() - 1);
+                Ok(())
+            })
+            .unwrap();
+        model.finish_request(request, false).unwrap();
+    }
+    std::fs::write(
+        &f.output,
+        json!({
+            "ordinary_seconds": baseline_times,
+            "lookup_seconds": packet_times,
+            "graph": model.execution.batch_statistics(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+}

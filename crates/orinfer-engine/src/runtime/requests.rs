@@ -134,6 +134,7 @@ pub struct StepOutput {
 enum Work {
     Speculative(usize, usize),
     SpeculativeBatch(speculation::BatchChoice),
+    SampledLookup(speculation::LookupChoice),
     MixedSpeculative(Vec<(usize, usize)>),
     Prefill(usize, usize, bool, f64),
     Batch(Vec<(usize, usize)>),
@@ -1412,8 +1413,9 @@ impl ModelRuntime {
         let native = matches!(prefill_work, Work::Prefill(..));
         let speculative = matches!(
             prefill_work,
-            Work::Speculative(..) | Work::SpeculativeBatch(_)
+            Work::Speculative(..) | Work::SpeculativeBatch(_) | Work::SampledLookup(_)
         );
+        let lookup = matches!(prefill_work, Work::SampledLookup(_));
         let work_at = Instant::now();
         match prefill_work {
             Work::MixedSpeculative(selected) => {
@@ -1437,6 +1439,17 @@ impl ModelRuntime {
                     .batch_histogram
                     .entry(selected.len())
                     .or_default() += 1;
+            }
+            Work::SampledLookup(choice) => {
+                let owners = choice.ordinary.len() + choice.proposals.len();
+                self.execute_sampled_lookup(requests, choice, &mut output, &mut overlap)?;
+                self.scheduler_statistics.speculative_iterations += 1;
+                *self
+                    .scheduler_statistics
+                    .batch_histogram
+                    .entry(owners)
+                    .or_default() += 1;
+                self.unmerged_prefill_s = 0.;
             }
             Work::SpeculativeBatch(choice) => {
                 let selected = choice.selected;
@@ -1588,7 +1601,7 @@ impl ModelRuntime {
                 alternative.measured,
                 alternative.calibrating,
             );
-        } else if executed {
+        } else if executed && !lookup {
             self.dynamic_speculation.earn_ordinary(
                 feedback_at.elapsed().as_secs_f64(),
                 self.execution
@@ -1709,6 +1722,13 @@ impl ModelRuntime {
                     return Ok(Work::Speculative(i, width));
                 }
             }
+        }
+        if decode_round
+            && throughput
+            && let Some(choice) =
+                self.select_sampled_lookup(requests, &target, options.max_speculative_tokens)
+        {
+            return Ok(Work::SampledLookup(choice));
         }
         if decode_round && !decode.is_empty() {
             let slack = if throughput {
@@ -2251,6 +2271,27 @@ impl ModelRuntime {
         }
         Ok(segments)
     }
+    fn commit_sampled_tokens(
+        &mut self,
+        req: &mut RequestState,
+        index: usize,
+        tokens: Vec<u32>,
+        output: &mut Vec<StepOutput>,
+    ) -> Result<()> {
+        let token = *tokens.last().ok_or("Missing sampled token")?;
+        self.execution
+            .upload_sequence_ids(req.slot, &self.manifest.token, &[token])?;
+        req.history.extend_from_slice(&tokens);
+        req.generated += tokens.len();
+        req.mtp.committed_tokens = req.generated;
+        self.scheduler_statistics.decode_tokens += tokens.len();
+        output.push(StepOutput {
+            request: index,
+            tokens,
+        });
+        Ok(())
+    }
+
     fn commit_batch(
         &mut self,
         requests: &mut [&mut RequestState],
@@ -2289,16 +2330,7 @@ impl ModelRuntime {
             }
             if let Some(&token) = sampled.get(&i) {
                 let req = &mut requests[i];
-                self.execution
-                    .upload_sequence_ids(req.slot, &self.manifest.token, &[token])?;
-                req.history.push(token);
-                req.generated += 1;
-                req.mtp.committed_tokens = req.generated;
-                self.scheduler_statistics.decode_tokens += 1;
-                output.push(StepOutput {
-                    request: i,
-                    tokens: vec![token],
-                });
+                self.commit_sampled_tokens(req, i, vec![token], output)?;
                 continue;
             }
             if controls.peek().is_some_and(|((index, _), _)| *index == i) {

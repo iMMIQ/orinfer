@@ -2,6 +2,14 @@
 use super::super::sampling::{inputs, padded_mask, validate_output};
 use super::*;
 
+pub(super) struct SamplingRow<'a> {
+    pub(super) source: (&'a str, usize, usize),
+    pub(super) history: &'a [u32],
+    pub(super) options: &'a crate::sampling::Options,
+    pub(super) step: usize,
+    pub(super) mask: Option<&'a [u32]>,
+}
+
 impl ModelRuntime {
     pub(super) fn gpu_sample_batch(
         &self,
@@ -65,9 +73,6 @@ impl ModelRuntime {
         if candidates.is_empty() {
             return Ok(BTreeMap::new());
         }
-        if candidates.len() > batch.capacity {
-            return Err("Sampling rows exceed capacity".into());
-        }
         let slots: Vec<_> = candidates.iter().map(|(i, _)| requests[*i].slot).collect();
         #[cfg(test)]
         profile::mark("sampling_controls_begin");
@@ -80,49 +85,20 @@ impl ModelRuntime {
                 return Err("Batched sampling position/status failure".into());
             }
         }
-        self.execution.upload_scratch_rows(
-            &batch.pointers,
-            &batch.scratch,
-            batch.stride,
-            &self.manifest.logits,
-            self.manifest.vocab * 4,
-            &slots,
-        )?;
-        #[cfg(test)]
-        profile::mark("sampling_table");
-        for (row, (index, mask)) in candidates.iter().enumerate() {
-            let req = &requests[*index];
-            for (name, bytes) in inputs(
-                &req.history,
-                &req.sampling,
-                req.generated,
-                mask.as_deref(),
-                self.manifest.vocab,
-                self.manifest.max_context,
-            )? {
-                self.execution.upload_bytes_at(
-                    &batch.scratch,
-                    row * batch.stride + batch.offsets[name],
-                    &bytes,
-                )?;
-            }
-        }
-        #[cfg(test)]
-        profile::mark("sampling_inputs");
-        self.execution.submit_program_rows(
-            &batch.program,
-            candidates.len(),
-            ExecutionPhase::Decode,
-        )?;
-        #[cfg(test)]
-        profile::mark("sampling_submit");
-        let output = self.read_controls(&batch.output, candidates.len() * 2)?;
-        #[cfg(test)]
-        profile::mark("sampling_readback");
-        let mut stats = self.execution.batch_statistics();
-        stats.sampling_packets += 1;
-        stats.sampling_rows += candidates.len();
-        self.execution.set_batch_statistics(stats);
+        let rows: Vec<_> = candidates
+            .iter()
+            .map(|(index, mask)| {
+                let req = &requests[*index];
+                SamplingRow {
+                    source: (&self.manifest.logits, req.slot, 0),
+                    history: &req.history,
+                    options: &req.sampling,
+                    step: req.generated,
+                    mask: mask.as_deref(),
+                }
+            })
+            .collect();
+        let output = self.gpu_sampling_rows(batch, &rows)?;
         let mut result = BTreeMap::new();
         for ((index, _), values) in candidates.into_iter().zip(output.as_chunks::<2>().0) {
             let token = match validate_output(values, self.manifest.vocab) {
@@ -143,5 +119,53 @@ impl ModelRuntime {
             result.insert(index, token);
         }
         Ok(result)
+    }
+    pub(super) fn gpu_sampling_rows(
+        &self,
+        batch: &orinfer_model_sdk::model::BatchedSampling,
+        rows: &[SamplingRow<'_>],
+    ) -> Result<Vec<u32>> {
+        if rows.is_empty() || rows.len() > batch.capacity {
+            return Err("Sampling rows exceed capacity".into());
+        }
+        self.execution.upload_scratch_rows(
+            &batch.pointers,
+            &batch.scratch,
+            batch.stride,
+            self.manifest.vocab * 4,
+            &rows.iter().map(|r| r.source).collect::<Vec<_>>(),
+        )?;
+        #[cfg(test)]
+        profile::mark("sampling_table");
+        for (row, input) in rows.iter().enumerate() {
+            for (name, bytes) in inputs(
+                input.history,
+                input.options,
+                input.step,
+                input.mask,
+                self.manifest.vocab,
+                self.manifest.max_context,
+            )? {
+                self.execution.upload_bytes_at(
+                    &batch.scratch,
+                    row * batch.stride + batch.offsets[name],
+                    &bytes,
+                )?;
+            }
+        }
+        #[cfg(test)]
+        profile::mark("sampling_inputs");
+        self.execution
+            .submit_program_rows(&batch.program, rows.len(), ExecutionPhase::Decode)?;
+        #[cfg(test)]
+        profile::mark("sampling_submit");
+        let output = self.read_controls(&batch.output, rows.len() * 2)?;
+        #[cfg(test)]
+        profile::mark("sampling_readback");
+        let mut stats = self.execution.batch_statistics();
+        stats.sampling_packets += 1;
+        stats.sampling_rows += rows.len();
+        self.execution.set_batch_statistics(stats);
+        Ok(output)
     }
 }

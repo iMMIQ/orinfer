@@ -224,7 +224,7 @@ struct LoadArgs {
     /// Parallel weight readers; default selects a bounded number of CPU cores.
     #[arg(long, value_name = "N", value_parser = parse_load_workers)]
     load_workers: Option<usize>,
-    /// Opt in to copied greedy drafts from this request's token history.
+    /// Opt in to target-verified proposals from this request's token history.
     #[arg(long)]
     prompt_lookup: bool,
 }

@@ -1,6 +1,8 @@
 //! Speculation advances one bounded verification round. Catch-up is lazy while
 //! batched target decode is profitable; stale ring entries are never consumed.
+use super::sampling::SamplingRow;
 use super::*;
+use orinfer_model_sdk::abi::BatchOperation;
 pub(in crate::runtime) mod control;
 
 pub(in crate::runtime) use crate::mtp::adaptive::Timing as Profile;
@@ -42,6 +44,27 @@ struct DraftRound {
 }
 pub(super) struct BatchChoice {
     pub(super) selected: Vec<(usize, usize)>,
+}
+
+pub(super) struct LookupChoice {
+    pub(super) ordinary: Vec<(usize, usize)>,
+    pub(super) proposals: Vec<(usize, Vec<u32>)>,
+}
+
+impl LookupChoice {
+    fn operation(&self) -> BatchOperation {
+        verification_operation(self.ordinary.len())
+    }
+}
+
+fn verification_operation(ordinary: usize) -> BatchOperation {
+    if ordinary == 0 {
+        BatchOperation::Verification
+    } else {
+        BatchOperation::MixedRows {
+            prefills: ordinary as u8,
+        }
+    }
 }
 
 pub(super) struct Feedback {
@@ -500,71 +523,7 @@ impl ModelRuntime {
             return Ok(());
         }
         let at = Instant::now();
-        let mut segments = if prefills.is_empty() {
-            vec![]
-        } else {
-            self.prepare_batch_inputs(requests, prefills)?
-        };
-        for (i, round) in &rounds {
-            let req = &mut requests[*i];
-            self.execution.ensure_sequence_program_at(
-                req.slot,
-                &round.plan.program,
-                round.position,
-                round.plan.tokens,
-            )?;
-            self.execution.upload_sequence_ids(
-                req.slot,
-                &self.manifest.input,
-                &round.verification,
-            )?;
-            self.prepare_sequence_program_inputs(
-                req.slot,
-                &round.plan.program,
-                &round.verification,
-                &req.history[..req.history.len() - 1],
-            )?;
-            self.upload_sequence_segment_controls(req.slot, round.plan.tokens)?;
-            segments.push(BatchSegment {
-                slot: req.slot,
-                tokens: round.plan.tokens,
-            });
-        }
-        if let Some(table) = self
-            .manifest
-            .mtp
-            .as_ref()
-            .and_then(|s| s.verification_table.as_ref())
-        {
-            let mut offset = 0;
-            for segment in &segments {
-                self.execution.upload_sequence_bytes(
-                    segment.slot,
-                    &table.row_offset,
-                    &(offset as u32).to_le_bytes(),
-                )?;
-                offset += segment.tokens;
-            }
-        }
-        let operation = if prefills.is_empty() {
-            orinfer_model_sdk::abi::BatchOperation::Verification
-        } else {
-            orinfer_model_sdk::abi::BatchOperation::MixedRows {
-                prefills: prefills.len() as u8,
-            }
-        };
-        let (plan, bindings) = self.model_package.cached_batch(&segments, operation)?;
-        self.upload_spec_bindings(&segments, operation, bindings)?;
-        self.execution.execute_cached_batch_operation_with(
-            operation,
-            segments.iter().map(|s| (s.slot, s.tokens)).collect(),
-            &plan,
-            prefills.is_empty(),
-            rounds
-                .iter()
-                .all(|(i, _)| requests[*i].limit - requests[*i].generated >= 2),
-            overlap,
-        )?;
+        let segments = self.execute_target_verification(requests, &rounds, prefills, overlap)?;
         let seconds = at.elapsed().as_secs_f64();
         if !prefills.is_empty() {
             self.scheduler_statistics.mixed_iterations += 1;
@@ -687,6 +646,351 @@ impl ModelRuntime {
         }
         Ok(())
     }
+    fn execute_target_verification(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        rounds: &[(usize, PreparedRound)],
+        prefills: &[(usize, usize)],
+        overlap: &mut dyn FnMut(),
+    ) -> Result<Vec<BatchSegment>> {
+        let mut segments = if prefills.is_empty() {
+            vec![]
+        } else {
+            self.prepare_batch_inputs(requests, prefills)?
+        };
+        for (i, round) in rounds {
+            let req = &mut requests[*i];
+            self.execution.ensure_sequence_program_at(
+                req.slot,
+                &round.plan.program,
+                round.position,
+                round.plan.tokens,
+            )?;
+            self.execution.upload_sequence_ids(
+                req.slot,
+                &self.manifest.input,
+                &round.verification,
+            )?;
+            self.prepare_sequence_program_inputs(
+                req.slot,
+                &round.plan.program,
+                &round.verification,
+                &req.history[..req.history.len() - 1],
+            )?;
+            self.upload_sequence_segment_controls(req.slot, round.plan.tokens)?;
+            segments.push(BatchSegment {
+                slot: req.slot,
+                tokens: round.plan.tokens,
+            });
+        }
+        if let Some(table) = self
+            .manifest
+            .mtp
+            .as_ref()
+            .and_then(|s| s.verification_table.as_ref())
+        {
+            let mut offset = 0;
+            for segment in &segments {
+                self.execution.upload_sequence_bytes(
+                    segment.slot,
+                    &table.row_offset,
+                    &(offset as u32).to_le_bytes(),
+                )?;
+                offset += segment.tokens;
+            }
+        }
+        let operation = verification_operation(prefills.len());
+        let (plan, bindings) = self.model_package.cached_batch(&segments, operation)?;
+        self.upload_spec_bindings(&segments, operation, bindings)?;
+        self.execution.execute_cached_batch_operation_with(
+            operation,
+            segments.iter().map(|s| (s.slot, s.tokens)).collect(),
+            &plan,
+            prefills.iter().all(|&(i, _)| !requests[i].prefilling),
+            rounds
+                .iter()
+                .all(|(i, _)| requests[*i].limit - requests[*i].generated >= 2),
+            overlap,
+        )?;
+        Ok(segments)
+    }
+
+    pub(super) fn select_sampled_lookup(
+        &self,
+        requests: &mut [&mut RequestState],
+        target: &[(usize, usize)],
+        max_rows: usize,
+    ) -> Option<LookupChoice> {
+        let spec = self.manifest.mtp.as_ref()?;
+        let batch = self.manifest.sampling.as_ref()?.batch.as_ref()?;
+        // The commit must preserve the target hidden history for lazy draft
+        // catch-up. Lookup never mutates the draft state.
+        // The hot four-owner decode path uses one fixed verification shape.
+        // Longer windows are available to a copied continuation without
+        // running extra draft forwards or growing the model-draft depth.
+        const OWNERS: usize = 4;
+        const WIDTH: usize = 8;
+        let total = OWNERS + WIDTH - 1;
+        if !self.prompt_lookup
+            || !spec.batch_commit
+            || !spec.commit_always
+            || spec.hidden_ring.is_none()
+            || self.manifest.packet_table().is_none()
+            || !spec.batch_verification_tokens.contains(&WIDTH)
+            || target.len() != OWNERS
+            || total > batch.capacity
+            || (max_rows != 0 && total > max_rows)
+            || target.iter().any(|&(i, _)| {
+                let req = &requests[i];
+                req.sampling.temperature <= 0.
+                    || req.sampling.top_logprobs.is_some()
+                    || req.decoder.has_constraint()
+            })
+        {
+            return None;
+        }
+        let (index, proposal) = target.iter().find_map(|&(i, _)| {
+            let req = &mut requests[i];
+            let remaining = (req.limit - req.generated).min(
+                self.manifest
+                    .max_context
+                    .saturating_sub(req.history.len() - 1),
+            );
+            if remaining < WIDTH {
+                return None;
+            }
+            req.prompt_lookup
+                .propose_confident(&req.history, WIDTH - 1)
+                .map(|proposal| (i, proposal))
+        })?;
+        let choice = LookupChoice {
+            ordinary: target
+                .iter()
+                .copied()
+                .filter(|&(i, _)| i != index)
+                .collect(),
+            proposals: vec![(index, proposal)],
+        };
+        let segments: Vec<_> = choice
+            .ordinary
+            .iter()
+            .copied()
+            .chain(
+                choice
+                    .proposals
+                    .iter()
+                    .map(|(i, tokens)| (*i, tokens.len() + 1)),
+            )
+            .map(|(i, tokens)| BatchSegment {
+                slot: requests[i].slot,
+                tokens,
+            })
+            .collect();
+        self.model_package
+            .supports_batch(&segments, choice.operation())
+            .then_some(choice)
+    }
+
+    pub(super) fn execute_sampled_lookup(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        choice: LookupChoice,
+        output: &mut Vec<StepOutput>,
+        overlap: &mut dyn FnMut(),
+    ) -> Result<()> {
+        let mut rounds = Vec::with_capacity(choice.proposals.len());
+        let spec = self
+            .manifest
+            .mtp
+            .as_ref()
+            .ok_or("Missing lookup verification")?;
+        for (i, drafts) in choice.proposals {
+            let req = &requests[i];
+            let position = req.history.len() - 1;
+            let plan = spec
+                .verification_plan(drafts.len() + 1)
+                .ok_or("Missing lookup verification width")?;
+            let verification = std::iter::once(req.history[position])
+                .chain(drafts.iter().copied())
+                .collect();
+            rounds.push((
+                i,
+                PreparedRound {
+                    plan,
+                    position,
+                    verification,
+                    drafts,
+                    remaining: req.limit - req.generated,
+                    vocab: self.manifest.vocab,
+                    host_sampling: false,
+                    is_lookup: true,
+                    proposals: vec![],
+                },
+            ));
+        }
+        let at = Instant::now();
+        self.execute_target_verification(requests, &rounds, &choice.ordinary, overlap)?;
+        let packet_s = at.elapsed().as_secs_f64();
+        let at = Instant::now();
+        let spec = self.manifest.mtp.as_ref().unwrap();
+        let batch = self
+            .manifest
+            .sampling
+            .as_ref()
+            .and_then(|s| s.batch.as_ref())
+            .ok_or("Missing lookup sampling packet")?;
+        let histories: Vec<_> = rounds
+            .iter()
+            .map(|(i, round)| {
+                let mut history = requests[*i].history.clone();
+                history.extend_from_slice(&round.drafts);
+                history
+            })
+            .collect();
+        let mut rows = Vec::new();
+        for &(i, _) in &choice.ordinary {
+            let req = &requests[i];
+            rows.push(SamplingRow {
+                source: (&self.manifest.logits, req.slot, 0),
+                history: &req.history,
+                options: &req.sampling,
+                step: req.generated,
+                mask: None,
+            });
+        }
+        for ((i, round), history) in rounds.iter().zip(&histories) {
+            let req = &requests[*i];
+            for offset in 0..round.plan.tokens {
+                rows.push(SamplingRow {
+                    source: (&spec.verification_logits, req.slot, offset),
+                    history: &history[..req.history.len() + offset],
+                    options: &req.sampling,
+                    step: req.generated + offset,
+                    mask: None,
+                });
+            }
+        }
+        let samples = self.gpu_sampling_rows(batch, &rows)?;
+        let sampling_s = at.elapsed().as_secs_f64();
+        let rows_total = rows.len() as f64;
+        let slots: Vec<_> = choice
+            .ordinary
+            .iter()
+            .map(|&(i, _)| requests[i].slot)
+            .chain(rounds.iter().map(|(i, _)| requests[*i].slot))
+            .collect();
+        let positions = self
+            .execution
+            .read_sequence_controls(&slots, [&self.manifest.position, &self.manifest.status])?;
+        let at = Instant::now();
+        let mut samples = samples.as_chunks::<2>().0.iter();
+        let mut positions = positions.into_iter();
+        for (i, _) in choice.ordinary {
+            let req = &mut requests[i];
+            let [position, status] = positions.next().unwrap();
+            if position as usize != req.history.len() || status != 0 {
+                return Err("Sampled packet position/status failure".into());
+            }
+            let token = match super::super::sampling::validate_output(
+                samples.next().unwrap(),
+                self.manifest.vocab,
+            ) {
+                Ok(token) => token,
+                Err(error) => {
+                    req.decoder.fail(error);
+                    continue;
+                }
+            };
+            self.commit_sampled_tokens(req, i, vec![token], output)?;
+        }
+        let mut commits = Vec::with_capacity(rounds.len());
+        let accepted_inputs = self.manifest.mtp.as_ref().unwrap().accepted_inputs.clone();
+        for (i, round) in rounds {
+            let req = &mut requests[i];
+            let width = round.plan.tokens;
+            let [position, _] = positions.next().unwrap();
+            if position as usize != round.position + width {
+                return Err("Lookup verification position mismatch".into());
+            }
+            let mut tokens = Vec::with_capacity(width);
+            let owner_samples = samples
+                .as_slice()
+                .get(..width)
+                .ok_or("Incomplete lookup samples")?;
+            for (row, sample) in owner_samples.iter().enumerate() {
+                match super::super::sampling::validate_output(sample, round.vocab) {
+                    Ok(token) => {
+                        tokens.push(token);
+                        if round.drafts.get(row) != Some(&token) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        req.decoder.fail(error);
+                        break;
+                    }
+                }
+            }
+            samples = samples.as_slice()[width..].iter();
+            let share = width as f64 / rows_total;
+            req.mtp.verification_s += packet_s * share;
+            req.mtp.sampling_s += sampling_s * share;
+            req.mtp.rounds += 1;
+            req.mtp.lookup_rounds += 1;
+            req.mtp.proposed_tokens += round.drafts.len();
+            req.mtp.lookup_proposed_tokens += round.drafts.len();
+            let accepted = tokens
+                .iter()
+                .zip(&round.drafts)
+                .take_while(|(a, b)| a == b)
+                .count();
+            req.mtp.accepted_draft_tokens += accepted;
+            req.mtp.lookup_accepted_draft_tokens += accepted;
+            req.prompt_lookup.observe(
+                accepted,
+                round.drafts.len(),
+                req.history.len() + tokens.len(),
+            );
+            // A failed request will discard its arena, including uncommitted writes.
+            if req.failure().is_some() {
+                continue;
+            }
+            self.execution.upload_sequence_ids(
+                req.slot,
+                &accepted_inputs,
+                &[tokens.len() as u32],
+            )?;
+            commits.push((
+                i,
+                BatchSegment {
+                    slot: req.slot,
+                    tokens: width,
+                },
+                round.position,
+                tokens,
+            ));
+        }
+        if !commits.is_empty() {
+            self.commit_spec_packet(&commits.iter().map(|(_, s, _, _)| *s).collect::<Vec<_>>())?;
+        }
+        for (i, _, position, tokens) in commits {
+            let req = &mut requests[i];
+            self.set_target_cursor(req.slot, position + tokens.len())?;
+            req.mtp.restore_s += at.elapsed().as_secs_f64() / slots.len() as f64;
+            self.commit_sampled_tokens(req, i, tokens, output)?;
+        }
+        Ok(())
+    }
+
+    fn set_target_cursor(&mut self, slot: usize, position: usize) -> Result<()> {
+        let position = u32::try_from(position).map_err(|_| "Target position exceeds ABI")?;
+        let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
+        self.execution
+            .upload_sequence_ids(slot, &self.manifest.position, &[position])?;
+        self.execution
+            .upload_sequence_ids(slot, &spec.target_length, &[position])
+    }
+
     fn deferred_verification(&self) -> bool {
         self.manifest
             .mtp
@@ -1451,16 +1755,7 @@ impl ModelRuntime {
             self.launch_rows(&plan.restore_program, plan.tokens, ExecutionPhase::Decode)?;
         }
         if restored || spec.commit_always || committed.len() < plan.tokens {
-            self.execution.upload_sequence_ids(
-                req.slot,
-                &self.manifest.position,
-                &[(*position + committed.len()) as u32],
-            )?;
-            self.execution.upload_sequence_ids(
-                req.slot,
-                &spec.target_length,
-                &[(*position + committed.len()) as u32],
-            )?;
+            self.set_target_cursor(req.slot, *position + committed.len())?;
         }
         req.mtp.restore_s += at.elapsed().as_secs_f64();
         req.history.extend_from_slice(committed);
