@@ -11,6 +11,8 @@ from kernels.shared.rows import explicit_scalar
 from orinfer_build.compiler.cuda.common import orin_jit
 
 TILE = 1024
+SHORTLIST = 256
+SHORTLIST_TOP_K = 64
 
 
 @orin_jit
@@ -175,46 +177,50 @@ def radix_histogram(vocab: int):
         State: T.Tensor((7,), T.uint64),
         Control: T.Tensor((4,), T.int32),
         Parameters: T.Tensor((6,), T.float64),
+        Invalid: T.Tensor((blocks,), T.int32),
         Hist: T.Tensor((blocks, 256), T.uint64),
     ):
         with T.Kernel(blocks, threads=256) as b:
             hist = T.alloc_shared((256,), T.uint64)
-            T.clear(hist)
-            if not ((mode == 0 and Control[3] == 0) or (mode == 1 and Parameters[1] == 1)):
-                for i in T.Parallel(TILE):
-                    j = b * TILE + i
-                    if j < vocab:
-                        key = Keys[j]
-                        index = T.cast(4294967295 - j, T.uint64)
-                        valid = T.alloc_var(T.bool, key != 0)
-                        if mode > 0:
-                            valid = valid and (
-                                key > State[0] or (key == State[0] and index >= State[1])
-                            )
-                        if mode == 2:
-                            valid = valid and (
-                                key > State[2] or (key == State[2] and index >= State[3])
-                            )
-                        shift = T.alloc_var(T.int32, T.max(0, (7 - digit) * 8))
-                        byte = T.alloc_var(T.int32, T.cast((key >> shift) & T.uint64(255), T.int32))
-                        if digit < 8:
-                            if digit > 0:
-                                valid = valid and ((key >> shift) >> 8) == (
-                                    (State[5] >> shift) >> 8
+            if Invalid[0] == 0:
+                T.clear(hist)
+                if not ((mode == 0 and Control[3] == 0) or (mode == 1 and Parameters[1] == 1)):
+                    for i in T.Parallel(TILE):
+                        j = b * TILE + i
+                        if j < vocab:
+                            key = Keys[j]
+                            index = T.cast(4294967295 - j, T.uint64)
+                            valid = T.alloc_var(T.bool, key != 0)
+                            if mode > 0:
+                                valid = valid and (
+                                    key > State[0] or (key == State[0] and index >= State[1])
                                 )
-                        else:
-                            shift = (11 - digit) * 8
-                            byte = T.cast((index >> shift) & T.uint64(255), T.int32)
-                            valid = valid and key == State[5]
-                            if digit > 8:
-                                valid = valid and ((index >> shift) >> 8) == (
-                                    (State[6] >> shift) >> 8
+                            if mode == 2:
+                                valid = valid and (
+                                    key > State[2] or (key == State[2] and index >= State[3])
                                 )
-                        if valid:
-                            T.atomic_add(
-                                hist[byte], T.if_then_else(mode == 0, T.uint64(1), Mass[j])
+                            shift = T.alloc_var(T.int32, T.max(0, (7 - digit) * 8))
+                            byte = T.alloc_var(
+                                T.int32, T.cast((key >> shift) & T.uint64(255), T.int32)
                             )
-            T.copy(hist, Hist[b, :])
+                            if digit < 8:
+                                if digit > 0:
+                                    valid = valid and ((key >> shift) >> 8) == (
+                                        (State[5] >> shift) >> 8
+                                    )
+                            else:
+                                shift = (11 - digit) * 8
+                                byte = T.cast((index >> shift) & T.uint64(255), T.int32)
+                                valid = valid and key == State[5]
+                                if digit > 8:
+                                    valid = valid and ((index >> shift) >> 8) == (
+                                        (State[6] >> shift) >> 8
+                                    )
+                            if valid:
+                                T.atomic_add(
+                                    hist[byte], T.if_then_else(mode == 0, T.uint64(1), Mass[j])
+                                )
+                T.copy(hist, Hist[b, :])
 
     return explicit_scalar(explicit_scalar(main, digit), mode)
 
@@ -230,80 +236,248 @@ def radix_choose(vocab: int):
         State: T.Tensor((7,), T.uint64),
         Control: T.Tensor((4,), T.int32),
         Parameters: T.Tensor((6,), T.float64),
+        Invalid: T.Tensor((blocks,), T.int32),
         Output: T.Tensor((2,), T.int32),
     ):
         with T.Kernel(1, threads=256):
             values = T.alloc_fragment((256,), T.uint64)
             hist = T.alloc_shared((256,), T.uint64)
-            T.clear(values)
-            for block in T.serial(blocks):
-                for i in T.Parallel(256):
-                    values[i] += Hist[block, i]
-            T.copy(values, hist)
-            T.cumsum(hist, dim=0, reverse=True)
-            if T.get_thread_binding() == 0:
-                skip = (mode == 0 and Control[3] == 0) or (mode == 1 and Parameters[1] == 1)
-                if digit == 0:
-                    State[5] = 0
-                    State[6] = 0
-                    if mode == 0:
-                        State[0] = 0
-                        State[1] = 0
-                    if mode == 1:
-                        State[2] = 0
-                        State[3] = 0
-                    if not skip:
-                        if hist[0] == 0:
-                            Output[1] = 1
-                            State[4] = 0
-                        elif mode == 0:
-                            State[4] = T.min(T.cast(Control[3], T.uint64), hist[0]) - 1
-                        elif mode == 1:
-                            State[4] = (
-                                T.cast(
-                                    T.call_pure_extern(
-                                        "float64",
-                                        "ceil",
-                                        Parameters[1] * T.cast(hist[0], T.float64),
-                                    ),
-                                    T.uint64,
-                                )
-                                - 1
-                            )
-                        else:
-                            State[4] = T.min(
-                                T.cast(Parameters[5] * T.cast(hist[0], T.float64), T.uint64),
-                                hist[0] - 1,
-                            )
-                if not skip and Output[1] == 0:
-                    remaining = State[4]
-                    if remaining >= hist[0]:
-                        Output[1] = 1
-                    else:
-                        # The reverse cumulative histogram is nonincreasing.
-                        # Find the last bucket covering the rank, skipping
-                        # empty buckets without a serial scan of all 256.
-                        found = T.alloc_var(T.int32, 0)
-                        for bit in T.unroll(8):
-                            next_bucket = found + (128 >> bit)
-                            if remaining < hist[next_bucket]:
-                                found = next_bucket
-                        preceding = T.if_then_else(
-                            found == 255, T.uint64(0), hist[T.min(found + 1, 255)]
-                        )
-                        State[4] = remaining - preceding
-                        if digit < 8:
-                            State[5] = State[5] | (T.cast(found, T.uint64) << ((7 - digit) * 8))
-                        else:
-                            State[6] = State[6] | (T.cast(found, T.uint64) << ((11 - digit) * 8))
-                        if digit == 11:
-                            if mode == 0:
-                                State[0] = State[5]
-                                State[1] = State[6]
+            if Invalid[0] == 0:
+                T.clear(values)
+                for block in T.serial(blocks):
+                    for i in T.Parallel(256):
+                        values[i] += Hist[block, i]
+                T.copy(values, hist)
+                T.cumsum(hist, dim=0, reverse=True)
+                if T.get_thread_binding() == 0:
+                    skip = (mode == 0 and Control[3] == 0) or (mode == 1 and Parameters[1] == 1)
+                    if digit == 0:
+                        State[5] = 0
+                        State[6] = 0
+                        if mode == 0:
+                            State[0] = 0
+                            State[1] = 0
+                        if mode == 1:
+                            State[2] = 0
+                            State[3] = 0
+                        if not skip:
+                            if hist[0] == 0:
+                                Output[1] = 1
+                                State[4] = 0
+                            elif mode == 0:
+                                State[4] = T.min(T.cast(Control[3], T.uint64), hist[0]) - 1
                             elif mode == 1:
-                                State[2] = State[5]
-                                State[3] = State[6]
+                                State[4] = (
+                                    T.cast(
+                                        T.call_pure_extern(
+                                            "float64",
+                                            "ceil",
+                                            Parameters[1] * T.cast(hist[0], T.float64),
+                                        ),
+                                        T.uint64,
+                                    )
+                                    - 1
+                                )
                             else:
-                                Output[0] = T.cast(T.uint64(4294967295) - State[6], T.int32)
+                                State[4] = T.min(
+                                    T.cast(Parameters[5] * T.cast(hist[0], T.float64), T.uint64),
+                                    hist[0] - 1,
+                                )
+                    if not skip and Output[1] == 0:
+                        remaining = State[4]
+                        if remaining >= hist[0]:
+                            Output[1] = 1
+                        else:
+                            # The reverse cumulative histogram is nonincreasing.
+                            # Find the last bucket covering the rank, skipping
+                            # empty buckets without a serial scan of all 256.
+                            found = T.alloc_var(T.int32, 0)
+                            for bit in T.unroll(8):
+                                next_bucket = found + (128 >> bit)
+                                if remaining < hist[next_bucket]:
+                                    found = next_bucket
+                            preceding = T.if_then_else(
+                                found == 255, T.uint64(0), hist[T.min(found + 1, 255)]
+                            )
+                            State[4] = remaining - preceding
+                            if digit < 8:
+                                State[5] = State[5] | (T.cast(found, T.uint64) << ((7 - digit) * 8))
+                            else:
+                                State[6] = State[6] | (
+                                    T.cast(found, T.uint64) << ((11 - digit) * 8)
+                                )
+                            if digit == 11:
+                                if mode == 0:
+                                    State[0] = State[5]
+                                    State[1] = State[6]
+                                elif mode == 1:
+                                    State[2] = State[5]
+                                    State[3] = State[6]
+                                else:
+                                    Output[0] = T.cast(T.uint64(4294967295) - State[6], T.int32)
 
     return explicit_scalar(explicit_scalar(main, digit), mode)
+
+
+@orin_jit
+def shortlist_bound(vocab: int):
+    blocks = (vocab + TILE - 1) // TILE
+    extent = min(256, max(32, 1 << (blocks - 1).bit_length()))
+    levels = (extent - 1).bit_length()
+
+    @T.prim_func
+    def main(
+        Maximum: T.Tensor((blocks,), T.float64),
+        State: T.Tensor((7,), T.uint64),
+        Control: T.Tensor((4,), T.int32),
+        Invalid: T.Tensor((blocks,), T.int32),
+        Output: T.Tensor((2,), T.int32),
+    ):
+        with T.Kernel(1, threads=extent):
+            lane = T.get_thread_binding()
+            cache = T.alloc_shared((extent,), T.uint64)
+            if lane == 0:
+                State[6] = 0
+                Invalid[0] = 0
+            if Control[3] > 0 and Control[3] <= SHORTLIST_TOP_K and Output[1] == 0:
+                key = T.alloc_var(T.uint64, T.uint64(0))
+                # Each sampled tile supplies one distinct witness. Its kth
+                # maximum bounds the true kth key from below. Padded tiles
+                # and tiles without allowed scores contribute a zero key.
+                tile = lane if blocks <= extent else lane * blocks // extent
+                if tile < blocks and Maximum[tile] != -T.infinity(T.float64):
+                    bits = T.reinterpret(T.uint64, Maximum[tile])
+                    key = T.if_then_else((bits >> 63) != 0, ~bits, bits ^ T.uint64(1 << 63))
+                cache[lane] = key
+                for group in T.unroll(1, levels + 1):
+                    for step in T.unroll(group):
+                        half = 1 << (group - step - 1)
+                        T.sync_threads()
+                        partner = cache[lane ^ half]
+                        other = T.alloc_var(T.uint64, partner)
+                        T.sync_threads()
+                        if ((lane >> group) & 1) == ((lane >> (group - step - 1)) & 1):
+                            cache[lane] = T.max(key, other)
+                        else:
+                            cache[lane] = T.min(key, other)
+                        key = cache[lane]
+                T.sync_threads()
+                if lane == 0 and Control[3] <= extent:
+                    State[6] = cache[Control[3] - 1]
+
+    return main
+
+
+@orin_jit
+def shortlist_collect(vocab: int):
+    @T.prim_func
+    def main(
+        Keys: T.Tensor((vocab,), T.uint64),
+        State: T.Tensor((7,), T.uint64),
+        Control: T.Tensor((4,), T.int32),
+        Counts: T.Tensor((vocab,), T.int32),
+        Output: T.Tensor((2,), T.int32),
+    ):
+        with T.Kernel(T.ceildiv(vocab, TILE), threads=256) as block:
+            if Control[3] > 0 and Control[3] <= SHORTLIST_TOP_K and Output[1] == 0:
+                for i in T.Parallel(TILE):
+                    token = block * TILE + i
+                    if token < vocab:
+                        key = Keys[token]
+                        if key != 0 and key >= State[6]:
+                            slot = T.atomic_add(Output[0], 1, return_prev=True)
+                            if slot < SHORTLIST:
+                                Counts[slot] = token
+
+    return main
+
+
+@orin_jit
+def shortlist_sample(vocab: int):
+    blocks = (vocab + TILE - 1) // TILE
+    rank_bits = (SHORTLIST - 1).bit_length()
+
+    @T.prim_func
+    def main(
+        Keys: T.Tensor((vocab,), T.uint64),
+        Mass: T.Tensor((vocab,), T.uint64),
+        Counts: T.Tensor((vocab,), T.int32),
+        Control: T.Tensor((4,), T.int32),
+        Parameters: T.Tensor((6,), T.float64),
+        Invalid: T.Tensor((blocks,), T.int32),
+        Output: T.Tensor((2,), T.int32),
+    ):
+        with T.Kernel(1, threads=SHORTLIST):
+            key_order = T.alloc_shared((SHORTLIST,), T.uint64)
+            id_order = T.alloc_shared((SHORTLIST,), T.int32)
+            token_order = T.alloc_shared((SHORTLIST,), T.int32)
+            prefix = T.alloc_shared((SHORTLIST,), T.uint64)
+            if Control[3] > 0 and Control[3] <= SHORTLIST_TOP_K and Output[1] == 0:
+                count = Output[0]
+                if count > 0 and count <= SHORTLIST:
+                    for i in T.Parallel(SHORTLIST):
+                        prefix[i] = 0
+                        key_order[i] = 0
+                        id_order[i] = -1
+                        if i < count:
+                            id_order[i] = Counts[i]
+                            key_order[i] = Keys[Counts[i]]
+                    for i in T.Parallel(SHORTLIST):
+                        if i < count:
+                            rank = T.alloc_var(T.int32, 0)
+                            key = key_order[i]
+                            token = id_order[i]
+                            for j in T.serial(count):
+                                if key_order[j] > key or (
+                                    key_order[j] == key and id_order[j] < token
+                                ):
+                                    rank += 1
+                            prefix[rank] = Mass[token]
+                            token_order[rank] = token
+                    T.cumsum(prefix, dim=0)
+                    if T.get_thread_binding() == 0:
+                        # Masses already copied per-tile validity to Output[1].
+                        # Invalid[0] now signals whether radix can exit early.
+                        Invalid[0] = 1
+                        active = T.min(count, Control[3])
+                        total = prefix[active - 1]
+                        Output[0] = 0
+                        if total == 0:
+                            Output[1] = 1
+                        else:
+                            cut = T.alloc_var(T.int32, active - 1)
+                            if Parameters[1] < 1:
+                                target = (
+                                    T.cast(
+                                        T.call_pure_extern(
+                                            "float64",
+                                            "ceil",
+                                            Parameters[1] * T.cast(total, T.float64),
+                                        ),
+                                        T.uint64,
+                                    )
+                                    - 1
+                                )
+                                first = T.alloc_var(T.int32, 0)
+                                for bit in T.unroll(rank_bits):
+                                    next = first + ((SHORTLIST // 2) >> bit)
+                                    if next < active and prefix[next - 1] <= target:
+                                        first = next
+                                cut = first
+                            total = prefix[cut]
+                            target = T.min(
+                                T.cast(Parameters[5] * T.cast(total, T.float64), T.uint64),
+                                total - 1,
+                            )
+                            first = T.alloc_var(T.int32, 0)
+                            for bit in T.unroll(rank_bits):
+                                next = first + ((SHORTLIST // 2) >> bit)
+                                if next <= cut and prefix[next - 1] <= target:
+                                    first = next
+                            Output[0] = token_order[first]
+
+                elif T.get_thread_binding() == 0:
+                    # The exact radix fallback owns an overflowed shortlist.
+                    Output[0] = 0
+
+    return main

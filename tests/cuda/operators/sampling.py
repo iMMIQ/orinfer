@@ -70,8 +70,9 @@ class BatchedPipeline:
             values = {None: self.pointers, "Output": self.output, "__rows__": rows, **scalars}
             kernel.adapter.func(*(values[name] for name in arguments), stream=stream)
 
-        for name in ("initialize", "history", "scores", "masses"):
-            launch(name)
+        for name in FUNCTIONS:
+            if not name.startswith("radix_"):
+                launch(name)
         for mode in range(3):
             for digit in range(12):
                 launch("radix_histogram", digit=digit, mode=mode)
@@ -155,14 +156,7 @@ class Pipeline:
         blocks = (vocab + s.TILE - 1) // s.TILE
         self.kernels = {
             name: getattr(s, name)(vocab, *([context] if name == "history" else []))
-            for name in (
-                "initialize",
-                "history",
-                "scores",
-                "masses",
-                "radix_histogram",
-                "radix_choose",
-            )
+            for name in FUNCTIONS
         }
 
         def empty(shape, dtype):
@@ -186,7 +180,7 @@ class Pipeline:
         self.output = empty((2,), torch.int32)
         self.logits = empty((vocab,), torch.float32)
 
-    def run(self):
+    def run(self, *, shortlist=True):
         k = self.kernels
         k["initialize"](self.counts, self.bias)
         k["history"](
@@ -213,6 +207,20 @@ class Pipeline:
             self.mass,
             self.output,
         )
+        if shortlist:
+            k["shortlist_bound"](self.maximum, self.state, self.control, self.invalid, self.output)
+            k["shortlist_collect"](self.keys, self.state, self.control, self.counts, self.output)
+            k["shortlist_sample"](
+                self.keys,
+                self.mass,
+                self.counts,
+                self.control,
+                self.parameters,
+                self.invalid,
+                self.output,
+            )
+        else:
+            self.invalid[0].zero_()
         for mode in range(3):
             for digit in range(12):
                 k["radix_histogram"](
@@ -221,12 +229,20 @@ class Pipeline:
                     self.state,
                     self.control,
                     self.parameters,
+                    self.invalid,
                     self.hist,
                     digit,
                     mode,
                 )
                 k["radix_choose"](
-                    self.hist, self.state, self.control, self.parameters, self.output, digit, mode
+                    self.hist,
+                    self.state,
+                    self.control,
+                    self.parameters,
+                    self.invalid,
+                    self.output,
+                    digit,
+                    mode,
                 )
 
     def inputs(
@@ -353,6 +369,16 @@ def main():
         pipe.inputs(torch.arange(vocab, dtype=torch.float32), 1)
         graph.replay()
         assert pipe.output.cpu().tolist() == [vocab - 1, 0]
+        for logits, top_k in (
+            (torch.zeros(vocab), 20),
+            (torch.randn(vocab, generator=gen), 20),
+            (torch.randn(vocab, generator=gen), 65),
+        ):
+            pipe.inputs(logits, top_k, 0.95, 0.81)
+            pipe.run(shortlist=False)
+            expected = pipe.output.cpu().tolist()
+            graph.replay()
+            assert pipe.output.cpu().tolist() == expected
         bad = torch.zeros(vocab)
         bad[-1] = float("nan")
         pipe.inputs(bad)

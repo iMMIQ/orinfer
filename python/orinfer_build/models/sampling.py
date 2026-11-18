@@ -1,7 +1,7 @@
 """Build the shared GPU sampler into a current native execution package.
 
 The CLI atomically republishes a model with unchanged weights and frontend.
-Both model builders call append() to publish the same six TileLang bodies.
+Both model builders call append() to publish the same TileLang bodies.
 """
 
 import argparse
@@ -30,8 +30,11 @@ FUNCTIONS = {
         "Invalid",
     ),
     "masses": ("Scores", "Keys", "Maximum", "Invalid", "Parameters", "Mass", "Output"),
-    "radix_histogram": ("Keys", "Mass", "State", "Control", "Parameters", "Hist"),
-    "radix_choose": ("Hist", "State", "Control", "Parameters", "Output"),
+    "shortlist_bound": ("Maximum", "State", "Control", "Invalid", "Output"),
+    "shortlist_collect": ("Keys", "State", "Control", "Counts", "Output"),
+    "shortlist_sample": ("Keys", "Mass", "Counts", "Control", "Parameters", "Invalid", "Output"),
+    "radix_histogram": ("Keys", "Mass", "State", "Control", "Parameters", "Invalid", "Hist"),
+    "radix_choose": ("Hist", "State", "Control", "Parameters", "Invalid", "Output"),
 }
 
 
@@ -222,10 +225,11 @@ def main():
         if completed.returncode:
             raise ValueError("Native sampling plan validation failed: " + completed.stderr.strip())
         report = json.loads(completed.stdout)["manifest"]
+        expected = len(FUNCTIONS) - 2 + 2 * 3 * 12
         if (
             not report.get("sampling", {}).get("batch")
-            or len(report["programs"].get("sampling", [])) != 76
-            or len(report["programs"].get("sampling_rows", [])) != 76
+            or len(report["programs"].get("sampling", [])) != expected
+            or len(report["programs"].get("sampling_rows", [])) != expected
         ):
             raise ValueError("Native library omitted the shared sampling program")
     write_json(a.output / "result.json", dict(model=str(a.model_output), execution_package=digest))

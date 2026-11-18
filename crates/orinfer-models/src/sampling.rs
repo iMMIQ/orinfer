@@ -11,6 +11,14 @@ pub(crate) fn register(m: &mut Manifest, bindings: &BTreeSet<String>) -> Result<
         .into_iter()
         .map(|s| format!("sampling/{s}"))
         .collect();
+    let shortlist = [
+        "sampling/shortlist_bound",
+        "sampling/shortlist_collect",
+        "sampling/shortlist_sample",
+    ];
+    if shortlist.iter().any(|name| bindings.contains(*name)) {
+        names.extend(shortlist.map(str::to_owned));
+    }
     for mode in 0..3 {
         for digit in 0..12 {
             names.extend([
