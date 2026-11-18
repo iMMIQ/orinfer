@@ -762,6 +762,15 @@ impl ChatCodec {
         if ends.len() >= 2 {
             prefix_hints.push(ends[ends.len() - 2]);
         }
+        // The generation prompt ends in <think> and a newline. When a later
+        // message fills this assistant turn, BPE can merge the newline with
+        // the beginning of the reasoning. The control token itself is stable.
+        if let [.., open, tail] = input.as_slice()
+            && Some(*open) == self.tokenizer.token_to_id("<think>")
+            && Some(*tail) == self.tokenizer.token_to_id("Ċ")
+        {
+            prefix_hints.push(input.len() - 1);
+        }
         prefix_hints.sort_unstable();
         prefix_hints.dedup();
         let _ = request.user; // Attribution only; it does not alter sampling identity.

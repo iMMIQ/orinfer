@@ -240,6 +240,23 @@ impl Model {
             Implementation::Ascend(inner) => inner.prefill_packet_capacity(),
         }
     }
+    pub fn latency_prefill_capacity(&self) -> usize {
+        // Layered native prefill can yield between layers of a full prompt
+        // block. Its independent block size is the relevant admission
+        // threshold even when a mixed decode packet fits fewer token rows.
+        if let Implementation::Cuda(inner) = &self.0
+            && let Some(rows) = inner
+                .manifest
+                .prefill_plans
+                .iter()
+                .filter(|plan| !plan.stages.is_empty() && plan.min_tokens > 0)
+                .map(|plan| plan.chunk_tokens)
+                .max()
+        {
+            return rows;
+        }
+        self.prefill_packet_capacity()
+    }
     pub fn scheduler_statistics(&self) -> crate::scheduler::Statistics {
         match &self.0 {
             Implementation::Cuda(inner) => inner.scheduling_statistics(),

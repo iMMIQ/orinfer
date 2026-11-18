@@ -131,3 +131,21 @@ python -m tools.bench.encoders --compare vllm-results.json native-results.json \
 重排基线启动 vLLM 时使用 `--chat-template tools/bench/templates/qwen3_reranker.jinja`，保持 Qwen 官方 prefix/body/suffix 及末尾的两个换行。`check_kernels.py` 核对模板输出与原生前端参考的 token ID。比较工具要求两边报告实际输入 token 用量，并拒绝用量不一致的结果；模板、分词和截断策略在测量前保持一致。
 
 原生构建逐项比对最终 `plan-model` 的 `row_execution.variants` 与离线选中的行数变体，确认执行计划实际引用这些绑定。构建基准身份文件时，记录所用引擎文件的 SHA256、执行包 digest 和实际选择表数量。
+
+## 合成 Mini-Weka 短测
+
+`mini_weka_synthetic.py` 生成 16 条可复现的合成 Weka 轨迹及 SHA256 manifest。默认 `compact` 的冷首轮为 2、3、4 和 6 Ki tokens，每档 4 条，后续调用新增 256–768 tokens。每条包含 5 个主会话请求和 2 个共享前缀的并行子会话请求，输出上限为 32–256 tokens。实际长度及缓存命中以服务 usage 为准。
+
+`--profile long` 复现历史合成长输入压力测的 8、24、48、80 Ki tokens 四档。性能 A/B 使用同一 profile 和 manifest。
+
+```bash
+uv run --locked python -m tools.bench.mini_weka_synthetic \
+  --profile compact --output artifacts/bench/mini-weka-synthetic-compact-v1
+
+uv run --locked python -m tools.bench.mini_weka_compact \
+  --manifest artifacts/bench/mini-weka-synthetic-compact-v1/manifest.json \
+  --tokenizer "$TOKENIZER_DIR" --url http://127.0.0.1:18828/v1 \
+  --model qwen-flash-next --concurrency 4 --wall-limit 240 --output "$MINI_OUTPUT_DIR"
+```
+
+Compact 回放连接已启动的 Flash Next 服务。父子请求复用同一段 Chat 消息，两个子会话完成后主会话再继续。历史中的助手消息和工具输入使用冻结的合成文本，模型真实生成本轮输出。回放记录每个已完成请求的实际 token 用量、首 token 时间和完成时间，以及输入身份与完成轨迹数。(长输入压力测通过 `agentx_mini.py` 回放 `--profile long` 生成的轨迹。 [AgentX Harness](https://github.com/SemiAnalysisAI/agentx-harness) · [配对口径](../../docs/performance.md)
