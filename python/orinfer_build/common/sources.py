@@ -52,8 +52,4 @@ def source_closure(modules, root=ROOT):
 
 
 def component_identity(modules, *, extra=(), root=ROOT):
-    resources = Path(root) / "python/orinfer_build/common/legacy_modules.json"
-    return source_hash(
-        root,
-        [*source_closure(modules, root), *extra, *([resources] if resources.is_file() else [])],
-    )
+    return source_hash(root, [*source_closure(modules, root), *extra])

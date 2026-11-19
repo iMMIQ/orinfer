@@ -59,7 +59,7 @@ fn recipe(tokens: usize) -> Result<Recipe> {
 
 /// Freeze layer boundaries after prerequisites are inserted. Later local
 /// fusions update both the full program and its stages to keep them identical.
-pub(super) fn stages(manifest: &mut Manifest, kernels: &[crate::artifact::Kernel]) -> Result<()> {
+pub(super) fn stages(manifest: &mut Manifest, operands: &crate::packet::Operands) -> Result<()> {
     let mut registrations = vec![];
     for plan in &mut manifest.prefill_plans {
         if plan.chunk_tokens < 512 {
@@ -109,39 +109,28 @@ pub(super) fn stages(manifest: &mut Manifest, kernels: &[crate::artifact::Kernel
             "{program}/begin/k{}",
             usize::from(manifest.vision.is_some())
         );
-        let residual = kernels
-            .iter()
-            .find(|k| k.name == initialize)
-            .and_then(|kernel| {
-                if plan.min_tokens == 0 {
-                    kernel.args.get(1)
-                } else {
-                    kernel.args.iter().find(|arg| {
-                        matches!(
-                            arg, crate::artifact::Argument::Buffer { name }
-                            if name != "Length" && name != "M4096_Embedding"
-                        )
-                    })
-                }
-            })
-            .and_then(|a| match a {
-                crate::artifact::Argument::Buffer { name } => Some(name.clone()),
-                _ => None,
-            })
-            .map(Ok)
-            .unwrap_or_else(|| crate::bindings::buffer_argument(&initialize, 1))?;
-        plan.live_buffers.push(residual);
+        let args = operands.arguments(&initialize)?;
+        let residual = if plan.min_tokens == 0 {
+            args.get(1)
+        } else {
+            args.iter()
+                .find(|arg| {
+                    matches!(arg, crate::artifact::Argument::Buffer { name }
+                    if name != "Length" && name != "M4096_Embedding")
+                })
+                .or_else(|| args.get(1))
+        };
+        let Some(crate::artifact::Argument::Buffer { name: residual }) = residual else {
+            return Err("Continuation must bind a whole mutable buffer".into());
+        };
+        plan.live_buffers.push(residual.clone());
         for (_, operations) in stages.iter().skip(1) {
             let Some(Operation::Kernel { name }) = operations.first() else {
                 return Err("Prefill continuation must begin with a layer kernel".into());
             };
-            let args = kernels
+            let args: Vec<_> = operands
+                .arguments(name)?
                 .iter()
-                .find(|k| &k.name == name)
-                .map(|k| Ok(k.args.clone()))
-                .unwrap_or_else(|| crate::bindings::kernel_arguments(name))?;
-            let args: Vec<_> = args
-                .into_iter()
                 .filter(|a| {
                     matches!(
                         a,

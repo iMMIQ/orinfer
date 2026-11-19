@@ -1,9 +1,10 @@
 //! Fuse complete auxiliary producer chains in every target/draft program alias.
+use super::contracts::{fuse, kernel_at, pointer, retire};
 use crate::{
     artifact::{Argument, Kernel, Result},
-    model::{Manifest, Operation},
+    model::Manifest,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 fn buffers(k: &Kernel) -> Vec<&Argument> {
     k.args
@@ -12,164 +13,120 @@ fn buffers(k: &Kernel) -> Vec<&Argument> {
         .collect()
 }
 
-fn connected(a: &[&Argument], ai: usize, b: &[&Argument], bi: usize) -> Result<()> {
-    if a.get(ai).zip(b.get(bi)).is_none_or(|(a, b)| !match (a, b) {
-        (Argument::Buffer { name: a }, Argument::Buffer { name: b }) => a == b,
-        (
-            Argument::BufferSlice {
-                name: a,
-                offset: ao,
-            },
-            Argument::BufferSlice {
-                name: b,
-                offset: bo,
-            },
-        ) => a == b && ao == bo,
-        _ => false,
-    }) {
+fn fixed<const N: usize>(args: Vec<&Argument>) -> Result<[&Argument; N]> {
+    args.try_into()
+        .map_err(|_| "Invalid auxiliary fusion ABI".into())
+}
+
+fn connected<const N: usize>(links: [(&Argument, &Argument); N]) -> Result<()> {
+    if links.into_iter().any(|(a, b)| !same_operand(a, b)) {
         return Err("Auxiliary fusion producer/consumer mismatch".into());
     }
     Ok(())
 }
 
+fn qsa_links(previous: &[&Kernel], args: Vec<&Argument>) -> Result<()> {
+    let [merge, scores, result] = fixed(args)?;
+    let [partial_scores, bounds, partial] = fixed(buffers(previous[0]))?;
+    let [counts, count_scores, threshold, count_bounds] = fixed(buffers(previous[8]))?;
+    let [offset_counts, _, _, offset_scores, offsets] = fixed(buffers(previous[9]))?;
+    let [first_merge, first_scores, first_threshold, _] = fixed(buffers(previous[1]))?;
+    connected([
+        (merge, partial),
+        (scores, partial_scores),
+        (merge, first_merge),
+        (scores, first_scores),
+        (threshold, first_threshold),
+        (counts, offset_counts),
+        (scores, count_scores),
+        (bounds, count_bounds),
+        (scores, offset_scores),
+        (result, offsets),
+    ])?;
+    for [hist, choose] in previous[2..8].as_chunks::<2>().0 {
+        let [bins, hist_scores, hist_threshold, hist_bounds] = fixed(buffers(hist))?;
+        let [choose_bins, choose_scores, choose_threshold, _] = fixed(buffers(choose))?;
+        connected([
+            (scores, hist_scores),
+            (bounds, hist_bounds),
+            (bins, choose_bins),
+            (scores, choose_scores),
+            (threshold, hist_threshold),
+            (threshold, choose_threshold),
+        ])?;
+    }
+    Ok(())
+}
+
+fn same_operand(a: &Argument, b: &Argument) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b) && pointer(a) == pointer(b)
+}
+
 pub(super) fn build(m: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
-    let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
-    let selected: BTreeSet<_> = kernels
-        .iter()
-        .filter(|k| {
-            matches!(
-                k.symbol.as_str(),
-                "ple_norm_gate_kernel" | "qsa_select_merge_kernel"
-            ) && !k.name.contains("/rows/")
-        })
+    let contracts = super::contracts::kernels(kernels);
+    let candidates = kernels.iter().filter(|k| !k.name.contains("/rows/"));
+    let anchors = candidates.clone().filter(|k| {
+        matches!(
+            k.symbol.as_str(),
+            "ple_norm_gate_kernel" | "qsa_select_merge_kernel"
+        )
+    });
+    let mut partials: BTreeSet<_> = candidates
+        .filter(|k| k.symbol == "qsa_select_partial_kernel")
         .map(|k| k.name.as_str())
         .collect();
-    let mut registered = BTreeSet::new();
-    let partials: BTreeSet<_> = kernels
-        .iter()
-        .filter(|k| k.symbol == "qsa_select_partial_kernel" && !k.name.contains("/rows/"))
-        .map(|k| k.name.as_str())
-        .collect();
-    let mut registered_partials = BTreeSet::new();
-    for operations in m.programs.values_mut() {
-        let mut skip = BTreeSet::new();
-        for (i, op) in operations.iter().enumerate() {
-            let Operation::Kernel { name } = op else {
-                continue;
-            };
-            if !selected.contains(name.as_str()) {
-                continue;
-            }
-            let fused = contracts[name.as_str()];
-            let selection = fused.symbol == "qsa_select_merge_kernel";
-            let count = if fused.symbol == "ple_norm_gate_kernel" {
-                2
-            } else {
-                10
-            };
-            let start = i
-                .checked_sub(count)
-                .ok_or("Incomplete auxiliary fusion chain")?;
-            let parent = name.rsplit_once('/').ok_or("Missing auxiliary section")?.0;
-            let previous: Vec<_> = operations[start..i]
-                .iter()
-                .map(|op| {
-                    let Operation::Kernel { name } = op else {
-                        return Err("Interrupted auxiliary fusion chain".to_owned());
-                    };
-                    if name.rsplit_once('/').map(|p| p.0) != Some(parent) {
-                        return Err("Auxiliary fusion crosses sections".to_owned());
-                    }
-                    contracts
-                        .get(name.as_str())
-                        .copied()
-                        .ok_or("Missing auxiliary producer contract".to_owned())
-                })
-                .collect::<Result<_>>()?;
-            let args = buffers(fused);
-            if selection && previous[0].symbol != "qsa_select_partial_kernel" {
+    fuse(&mut m.programs, anchors, |_, operations, i, fused, skip| {
+        let name = &fused.name;
+        let selection = fused.symbol == "qsa_select_merge_kernel";
+        let count = if fused.symbol == "ple_norm_gate_kernel" {
+            2
+        } else {
+            10
+        };
+        let start = i
+            .checked_sub(count)
+            .ok_or("Incomplete auxiliary fusion chain")?;
+        let parent = name.rsplit_once('/').ok_or("Missing auxiliary section")?.0;
+        let previous = (start..i)
+            .map(|at| {
+                let k = kernel_at(&contracts, operations, at)?;
+                if k.name.rsplit_once('/').map(|p| p.0) != Some(parent) {
+                    return Err("Auxiliary fusion crosses sections".into());
+                }
+                Ok(k)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let args = buffers(fused);
+        if selection {
+            if previous[0].symbol != "qsa_select_partial_kernel"
+                || previous[0].name.contains("/rows/")
+            {
                 return Err("Missing QSA local selection producer".into());
             }
-            if selection {
-                registered_partials.insert(previous[0].name.as_str());
-            }
-            if fused.symbol == "ple_norm_gate_kernel" {
-                let key = buffers(previous[0]);
-                let query = buffers(previous[1]);
-                if args.len() != 6 || key.len() != 3 || query.len() != 3 {
-                    return Err("Invalid fused PLE ABI".into());
-                }
-                // Sorted host ABI: Gated, Key, KeyWeight, Query, QueryWeight, Value.
-                connected(&args, 1, &key, 1)?;
-                connected(&args, 2, &key, 2)?;
-                connected(&args, 3, &query, 1)?;
-                connected(&args, 4, &query, 2)?;
-            } else if args.len() == 1 {
-                // Independent-row wrappers retain the same owner/column table.
+            partials.remove(previous[0].name.as_str());
+            if let [table] = args.as_slice() {
                 for old in previous {
-                    let old = buffers(old);
-                    if old.len() != 1 {
-                        return Err("Invalid private QSA fusion ABI".into());
-                    }
-                    connected(&args, 0, &old, 0)?;
+                    let [owner_table] = fixed(buffers(old))?;
+                    connected([(*table, owner_table)])?;
                 }
             } else {
-                if args.len() != 3 {
-                    return Err("Invalid fused QSA ABI".into());
-                }
-                let counts = buffers(previous[8]);
-                let offsets = buffers(previous[9]);
-                if counts.len() != 4 || offsets.len() != 5 {
-                    return Err("Invalid QSA selection producers".into());
-                }
-                let partial = buffers(previous[0]);
-                if partial.len() != 3 {
-                    return Err("Invalid local QSA selection ABI".into());
-                }
-                connected(&partial, 2, &args, 0)?;
-                connected(&partial, 0, &args, 1)?;
-                let logical = [partial[0], partial[1], args[2]];
-                for (index, pair) in previous[..8].as_chunks::<2>().0.iter().enumerate() {
-                    let hist = buffers(pair[0]);
-                    let choose = buffers(pair[1]);
-                    if index == 0 {
-                        if choose.len() != 4 {
-                            return Err("Invalid QSA threshold producer".into());
-                        }
-                        connected(&args, 0, &choose, 0)?;
-                        connected(&logical, 0, &choose, 1)?;
-                        connected(&choose, 2, &counts, 2)?;
-                        continue;
-                    }
-                    if hist.len() != 4 || choose.len() != 4 {
-                        return Err("Invalid QSA radix producer ABI".into());
-                    }
-                    for (a, b) in [(1, 0), (3, 1)] {
-                        connected(&hist, a, &logical, b)?;
-                    }
-                    connected(&hist, 0, &choose, 0)?;
-                    connected(&hist, 1, &choose, 1)?;
-                    connected(&hist, 2, &choose, 2)?;
-                    connected(&hist, 2, &counts, 2)?;
-                }
-                connected(&counts, 0, &offsets, 0)?;
-                connected(&counts, 1, &logical, 0)?;
-                connected(&counts, 3, &logical, 1)?;
-                connected(&offsets, 3, &logical, 0)?;
-                connected(&offsets, 4, &logical, 2)?;
+                qsa_links(&previous, args)?;
             }
-            if (start + usize::from(selection)..i).any(|j| !skip.insert(j)) {
-                return Err("Overlapping auxiliary fusions".into());
-            }
-            registered.insert(fused.name.as_str());
+        } else {
+            // Sorted host ABI: Gated, Key, KeyWeight, Query, QueryWeight, Value.
+            let [_, key, key_weight, query, query_weight, _] = fixed(args)?;
+            let [_, key_input, key_scale] = fixed(buffers(previous[0]))?;
+            let [_, query_input, query_scale] = fixed(buffers(previous[1]))?;
+            connected([
+                (key, key_input),
+                (key_weight, key_scale),
+                (query, query_input),
+                (query_weight, query_scale),
+            ])?;
         }
-        *operations = std::mem::take(operations)
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, op)| (!skip.contains(&i)).then_some(op))
-            .collect();
-    }
-    if registered != selected || registered_partials != partials {
+        retire(skip, start + usize::from(selection)..i)
+    })?;
+    if !partials.is_empty() {
         return Err("Unregistered auxiliary fusion".into());
     }
     Ok(())
@@ -178,6 +135,7 @@ pub(super) fn build(m: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Operation;
 
     fn kernel(name: &str, symbol: &str, args: &[&str]) -> Kernel {
         let asset = serde_json::json!({"file":"k","sha256":"0".repeat(64)});

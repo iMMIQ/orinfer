@@ -1,6 +1,6 @@
 """Stage postquant SWA values once for all selected queries in a native packet."""
 
-from orinfer_build.common.modules import import_module
+from importlib import import_module
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor

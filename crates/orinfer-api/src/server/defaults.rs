@@ -224,8 +224,21 @@ mod tests {
         assert_eq!(r.reasoning_effort.as_deref(), Some("none"));
         assert_eq!(r.max_tokens, Some(32));
         assert_eq!(r.max_completion_tokens, None);
-        assert_eq!(r.stream_options, None);
+        assert!(r.stream_options.is_none());
         assert_eq!(r.top_logprobs, None);
+        for options in [
+            json!([true]),
+            json!({"unknown":true}),
+            json!({"include_usage":null}),
+        ] {
+            assert!(
+                decode(
+                    json!({"model":"test","messages":[],"stream":true,"stream_options":options}),
+                    &Map::new(),
+                )
+                .is_err()
+            );
+        }
         let r = request(
             json!({"enable_thinking":true,"reasoning_effort":"none","max_tokens":4,"max_completion_tokens":8}),
             json!({"enable_thinking":false}),

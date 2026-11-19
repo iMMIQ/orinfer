@@ -4,6 +4,7 @@ import inspect
 import math
 
 from orinfer_build.tuning.row_tuning import launch
+from orinfer_build.tuning.tuning import lowest_total_latency
 from orinfer_build.contracts.row_selection import aggregate_winner
 
 
@@ -262,10 +263,7 @@ def chunked(tuner):
     )
     # One schedule covers all prefill lengths. These are candidates, not
     # additional runtime dispatch boundaries or per-length implementations.
-    costs = {
-        str(i): sum(row["times"][str(i)] for row in result["measurements"])
-        for i in range(len(configs))
-    }
-    selected = dict(result, default=min(costs, key=costs.get), selections=[])
+    default = lowest_total_latency(result["measurements"], map(str, range(len(configs))))
+    selected = dict(result, default=default, selections=[])
     tuner.records[key] = selected
     return selected

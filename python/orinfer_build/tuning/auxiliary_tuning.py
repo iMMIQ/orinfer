@@ -18,6 +18,7 @@ from orinfer_build.compiler.build_cache import BuildCache, identity
 from orinfer_build.compiler.host_compiler import Compiler
 from orinfer_build.packaging.publication import ROOT, atomic_model, clone_model, load_model
 from orinfer_build.common.files import write_json, source_hash
+from orinfer_build.tuning.tuning import geometric_mean
 
 
 def source_identity():
@@ -87,15 +88,9 @@ def fuse_config(family, output, source):
         config = {k: record[k] for k in ("tile", "threads", "parts") if k in record}
         key = json.dumps(config, sort_keys=True)
         grouped.setdefault(key, []).append(record["candidate_ms"] / record["reference_ms"])
-    legal = {key: values for key, values in grouped.items() if max(values) <= 1.05}
-    best = min(
-        legal, key=lambda key: sum(map(math.log, legal[key])) / len(legal[key]), default=None
-    )
-    config = (
-        None
-        if best is None or math.exp(sum(map(math.log, legal[best])) / len(legal[best])) >= 0.97
-        else json.loads(best)
-    )
+    legal = {key: geometric_mean(values) for key, values in grouped.items() if max(values) <= 1.05}
+    best = min(legal, key=legal.__getitem__, default=None)
+    config = json.loads(best) if best is not None and legal[best] < 0.97 else None
     receipt = dict(
         contract=contract, cache_hit=hit, config=config, measured=str(folder / "results.json")
     )

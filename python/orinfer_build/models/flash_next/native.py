@@ -9,14 +9,6 @@ This validation recipe is not the online Rust architecture adapter or BF16
 teacher. Its token results still require independent original-model comparison.
 """
 
-from orinfer_build.common.paths import ROOT
-
-
-import argparse
-import json
-from pathlib import Path
-import time
-
 import numpy as np
 import torch
 
@@ -62,23 +54,21 @@ from kernels.cuda.operators.op30_activation_quantization import (
     activation_quantization,
     launch as launch_quant,
 )
-from orinfer_build.models.flash_next.checkpoint import Checkpoint
 from orinfer_build.models.flash_next.kernel_policy import (
     expert_tile_config,
     expert_projection_config,
 )
 from orinfer_build.models.flash_next.chunks import chunks
-from orinfer_build.models.flash_next.speculation import DEFAULT_DRAFTS
 from orinfer_build.models.flash_next.lookup import RowCache
 from orinfer_build.models.flash_next.ple import PleLookup
 from orinfer_build.models.flash_next.roles import role
-from orinfer_build.models.flash_next.validation import validate_snapshot, probe, baseline_probes
+from orinfer_build.models.flash_next.validation import validate_snapshot
 from orinfer_build.quantization.vq import (
     e8p_selector_supports_parity_xor,
     e8p_sign_table,
     e8p_selector_table,
 )
-from orinfer_build.compiler.cuda.common import configure, environment, export_kernel, write_json
+from orinfer_build.compiler.cuda.common import export_kernel
 
 
 class Model:
@@ -1534,224 +1524,3 @@ def state_checks(model, tokens):
         "chunk_logits_error": logits_error,
         "chunk_state_errors": state_errors,
     }
-
-
-def main():
-    from orinfer_build.models.flash_next.scenes import scenes
-    from orinfer_build.validation.scoring_common import pair_probes, validate_task, SEED
-    from orinfer_build.compiler.cuda.common import identity
-
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--context", type=int, default=262144)
-    p.add_argument(
-        "--chunk",
-        type=int,
-        choices=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096),
-        default=4096,
-    )
-    p.add_argument("--max-new-tokens", type=int, default=64)
-    p.add_argument("--graph", choices=("on", "off"), default="on")
-    p.add_argument(
-        "--baseline", type=Path, help="Original BF16/FP8 probes on exactly these forced histories"
-    )
-    p.add_argument(
-        "--mtp-checkpoint",
-        type=Path,
-        help="Our separately published MTP weights; enables greedy speculation",
-    )
-    p.add_argument(
-        "--mtp-drafts",
-        type=int,
-        default=DEFAULT_DRAFTS,
-        help=f"Speculative proposals per round, 1..7 (default: {DEFAULT_DRAFTS})",
-    )
-    p.add_argument(
-        "--mtp-vocab-size",
-        type=int,
-        default=65536,
-        help="Draft-only source-code vocabulary; 0 uses the full head (default: 65536)",
-    )
-    p.add_argument(
-        "--mtp-adaptive", action="store_true", help="Opt in to measured 1/3/7 draft tiers"
-    )
-    p.add_argument("--cases", nargs="+", help="Run selected scene IDs")
-    a = p.parse_args()
-    if a.max_new_tokens < 1:
-        p.error("--max-new-tokens must be positive")
-    if not 1 <= a.mtp_drafts <= 7:
-        p.error("--mtp-drafts must be in 1..7")
-    if a.mtp_vocab_size and (not 256 <= a.mtp_vocab_size <= Model.V or a.mtp_vocab_size % 64):
-        p.error("Invalid draft vocabulary size")
-    if a.mtp_adaptive and a.mtp_drafts not in (1, 3, 7):
-        p.error("Adaptive initial depth must be 1, 3 or 7")
-    configure()
-    np.random.seed(SEED)
-    a.output.mkdir(parents=True, exist_ok=True)
-    started = time.perf_counter()
-    source = Checkpoint(a.checkpoint)
-    tokenizer, cases = scenes(a.checkpoint)
-    if a.cases:
-        if set(a.cases) - {case["id"] for case in cases}:
-            p.error("Unknown scene ID")
-        cases = [case for case in cases if case["id"] in a.cases]
-    for case in cases:
-        if len(case["prompt_ids"]) + max(a.max_new_tokens, len(case["target_ids"])) > a.context:
-            p.error("Scene exceeds context budget")
-    baseline = (
-        baseline_probes(
-            json.loads(a.baseline.read_text()), source.config["quantization_config"], cases
-        )
-        if a.baseline
-        else []
-    )
-    baseline_map = {(row["case_id"], row["position"]): row for row in baseline}
-    if len(baseline_map) != len(baseline):
-        raise ValueError("Duplicate baseline scoring positions")
-    model = Model(source, a.context, a.output, use_graph=a.graph == "on")
-    session = None
-    if a.mtp_checkpoint:
-        from orinfer_build.models.flash_next.mtp import Session
-
-        draft = Model(
-            Checkpoint(a.mtp_checkpoint),
-            a.context,
-            a.output / "mtp",
-            use_graph=a.graph == "on",
-            target=model,
-        )
-        if a.mtp_vocab_size:
-            from orinfer_build.models.flash_next.policy import code_vocabulary
-
-            draft.set_draft_vocab(code_vocabulary(tokenizer, ROOT, a.mtp_vocab_size))
-        session = Session(model, draft)
-    torch.cuda.synchronize()
-    load_s = time.perf_counter() - started
-    write_json(
-        a.output / "scenes.json",
-        {
-            "seed": SEED,
-            "cases": cases,
-            "frontend": [
-                identity(a.checkpoint / name) for name in ("tokenizer.json", "chat_template.jinja")
-            ],
-        },
-    )
-    warm_started = time.perf_counter()
-    model.plan(1)
-    model.plan(a.chunk)
-    checks = state_checks(model, cases[0]["prompt_ids"][: min(8, a.chunk)])
-    model.reset()
-    model.execute(cases[0]["prompt_ids"][:1], output="token")
-    model.reset()
-    if session:
-        max_depth = 7 if a.mtp_adaptive else a.mtp_drafts
-        session.warm(cases[0]["prompt_ids"][0], (1, 3, 7) if a.mtp_adaptive else (a.mtp_drafts,))
-        session.prefill(cases[0]["prompt_ids"], a.chunk)
-        warm_budget = max(8, 2 * (max_depth + 1) + 1)
-        session.generate(
-            min(warm_budget, model.capacity - model.position + 1), set(), drafts=a.mtp_drafts
-        )
-    torch.cuda.synchronize()
-    warm_s = time.perf_counter() - warm_started
-    generation_config = json.loads((a.checkpoint / "generation_config.json").read_text())
-    eos = generation_config["eos_token_id"]
-    eos = {eos} if isinstance(eos, int) else set(eos)
-    rows, probes = [], []
-    for case in cases:
-        model.reset()
-        begin = time.perf_counter()
-        if session:
-            session.prefill(case["prompt_ids"], a.chunk)
-            logits = model.last_plan["output"][-1].cpu().numpy().copy()
-        else:
-            logits = prefill(model, case["prompt_ids"], a.chunk)
-        prefill_s = time.perf_counter() - begin
-        prefix = model.snapshot()
-        prompt_logits = logits.copy()
-        decode_started = time.perf_counter()
-        if session:
-            from orinfer_build.models.flash_next.policy import AdaptiveDepth
-
-            tokens, reason = session.generate(
-                a.max_new_tokens,
-                eos,
-                drafts=a.mtp_drafts,
-                policy=AdaptiveDepth(initial=a.mtp_drafts) if a.mtp_adaptive else None,
-            )
-        else:
-            tokens, reason = generate(model, logits, eos, a.max_new_tokens)
-        decode_s = time.perf_counter() - decode_started
-        text = tokenizer.decode(tokens, skip_special_tokens=True)
-        model.restore(prefix)
-        # Graph workspaces are not prefix state. Keep the actual prompt logits.
-        logits = prompt_logits
-        case_probes = []
-        for position, target in enumerate(case["target_ids"]):
-            base = baseline_map.get((case["id"], position))
-            queries = [x["token_id"] for x in base["top3"]] if base else []
-            row = probe(
-                logits, case["prompt_ids"], case["target_ids"], position, case["id"], queries
-            )
-            case_probes.append(row)
-            if position + 1 < len(case["target_ids"]):
-                logits = model.execute([target])
-        probes.extend(case_probes)
-        write_json(a.output / "probes.json", {"seed": SEED, "probes": probes})
-        row = {
-            "id": case["id"],
-            "thinking": case["thinking"],
-            "prompt_tokens": len(case["prompt_ids"]),
-            "generated_token_ids": tokens,
-            "text": text,
-            "finish_reason": reason,
-            "prefill_s": prefill_s,
-            "prefill_tps": len(case["prompt_ids"]) / prefill_s,
-            "decode_s": decode_s,
-            "decode_steps": max(0, len(tokens) - 1),
-            "decode_tps": max(0, len(tokens) - 1) / max(decode_s, 1e-9),
-            "target_nll": -float(np.mean([x["reference_logprob"] for x in case_probes])),
-            "task": validate_task(case["rule"], text),
-        }
-        if session:
-            row["mtp_statistics"] = dict(session.statistics)
-        rows.append(row)
-        write_json(a.output / "requests.json", rows)
-        print(json.dumps(row, ensure_ascii=False), flush=True)
-    paired = []
-    if baseline:
-        selected = [baseline_map[(x["case_id"], x["position"])] for x in probes]
-        # Pairing labels identify the numerical path; histories remain exact.
-        normalized = [dict(row, execution_mode="flash-native") for row in selected]
-        paired = pair_probes(normalized, probes)
-    write_json(
-        a.output / "results.json",
-        {
-            "execution_complete": True,
-            "full_model_quality_verified": False,
-            "scope": __doc__,
-            "seed": SEED,
-            "environment": environment(),
-            "load_s": load_s,
-            "warm_s": warm_s,
-            "graph": a.graph,
-            "chunk": a.chunk,
-            "state_checks": checks,
-            "requests": rows,
-            "probes": probes,
-            "mtp_checkpoint": identity(a.mtp_checkpoint / "model.safetensors.index.json")
-            if a.mtp_checkpoint
-            else None,
-            "mtp_drafts": a.mtp_drafts if session else None,
-            "mtp_vocab_size": a.mtp_vocab_size if session else None,
-            "mtp_adaptive": a.mtp_adaptive,
-            "baseline": identity(a.baseline) if a.baseline else None,
-            "paired_probes": paired,
-            "checkpoint_index": identity(a.checkpoint / "model.safetensors.index.json"),
-        },
-    )
-
-
-if __name__ == "__main__":
-    main()

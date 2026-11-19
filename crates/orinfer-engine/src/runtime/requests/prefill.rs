@@ -112,7 +112,7 @@ impl ModelRuntime {
                 .copied()
                 .unwrap_or(req.input.len());
             if let Some(next) = plan.chunk(boundary - end) {
-                self.model_package
+                self.batch_plans
                     .prefetch_inputs(&req.input[end..end + next], &req.input[..end]);
             }
             Frame {

@@ -3,6 +3,7 @@ use orinfer_engine::{
     execution::LoadOptions,
     reranking::{Model, Score},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Instant};
 use tokenizers::Tokenizer;
@@ -21,35 +22,11 @@ struct Codec {
 }
 impl Codec {
     fn load(root: &Path) -> Result<Self> {
-        let descriptor: Value = serde_json::from_slice(
-            &std::fs::read(root.join("cache/model.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        let expected: BTreeMap<String, String> =
-            serde_json::from_value(descriptor["frontend_assets"].clone())
-                .map_err(|e| e.to_string())?;
-        for name in expected.keys() {
-            if Path::new(name).components().count() != 1 {
-                return Err("Invalid reranker frontend filename".into());
-            }
-        }
-        let tokenizer =
-            Tokenizer::from_file(root.join("tokenizer.json")).map_err(|e| e.to_string())?;
-        Self::new(
-            tokenizer,
-            expected,
-            descriptor["metadata"]["max_context"]
-                .as_u64()
-                .ok_or("Missing reranker context")? as usize,
-        )
+        let frontend = crate::encoder_service::load_frontend_descriptor(root)?;
+        Self::new(frontend.tokenizer, frontend.hashes, frontend.context)
     }
-    fn new(
-        mut tokenizer: Tokenizer,
-        hashes: BTreeMap<String, String>,
-        context: usize,
-    ) -> Result<Self> {
-        tokenizer.with_truncation(None).map_err(|e| e.to_string())?;
-        tokenizer.with_padding(None);
+    fn new(tokenizer: Tokenizer, hashes: BTreeMap<String, String>, context: usize) -> Result<Self> {
+        let tokenizer = crate::encoder_service::unbounded_tokenizer(tokenizer)?;
         let ids = [
             tokenizer.token_to_id("no").ok_or("Missing no token")?,
             tokenizer.token_to_id("yes").ok_or("Missing yes token")?,
@@ -88,77 +65,58 @@ impl Codec {
             .collect())
     }
 }
-struct Request<'a> {
-    query: &'a str,
-    documents: &'a [Value],
-    instruction: &'a str,
-    top: usize,
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    #[serde(default, deserialize_with = "present")]
+    model: Option<String>,
+    query: String,
+    documents: Vec<Value>,
+    #[serde(default, deserialize_with = "present")]
+    instruction: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    top_n: Option<usize>,
+    #[serde(default)]
     return_documents: bool,
 }
-fn request<'a>(request: &'a Value, model_id: &str) -> Result<Request<'a>> {
-    let object = request
-        .as_object()
-        .ok_or("Rerank request must be an object")?;
-    if object.keys().any(|k| {
-        ![
-            "model",
-            "query",
-            "documents",
-            "instruction",
-            "top_n",
-            "return_documents",
-        ]
-        .contains(&k.as_str())
-    }) {
-        return Err("Unknown rerank request field".into());
+fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+fn request(value: Value, model_id: &str) -> Result<Request> {
+    if !value.is_object() {
+        return Err("Rerank request must be an object".into());
     }
-    if object
-        .get("model")
-        .is_some_and(|m| m.as_str() != Some(model_id))
-    {
+    let request: Request = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    if request.model.as_deref().is_some_and(|m| m != model_id) {
         return Err("Unknown reranking model".into());
     }
-    let query = object
-        .get("query")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty() && s.len() <= 1024 * 1024)
-        .ok_or("Rerank query must be nonempty text within 1 MiB")?;
-    let documents = object
-        .get("documents")
-        .and_then(Value::as_array)
-        .filter(|v| !v.is_empty() && v.len() <= 128)
-        .ok_or("Rerank documents must contain 1..128 items")?;
-    let instruction = object.get("instruction").map_or(Ok(INSTRUCTION), |v| {
-        v.as_str().ok_or("Rerank instruction must be text")
-    })?;
-    if instruction.len() > 1024 * 1024 {
+    if request.query.trim().is_empty() || request.query.len() > 1024 * 1024 {
+        return Err("Rerank query must be nonempty text within 1 MiB".into());
+    }
+    if !(1..=128).contains(&request.documents.len()) {
+        return Err("Rerank documents must contain 1..128 items".into());
+    }
+    if request
+        .instruction
+        .as_ref()
+        .is_some_and(|s| s.len() > 1024 * 1024)
+    {
         return Err("Rerank instruction exceeds 1 MiB".into());
     }
-    for document in documents {
+    for document in &request.documents {
         let text = document_text(document)?;
         if text.trim().is_empty() || text.len() > 4 * 1024 * 1024 {
             return Err("Rerank document is empty or exceeds 4 MiB".into());
         }
     }
-    let top = object
-        .get("top_n")
-        .map_or(Ok(documents.len()), |n| {
-            n.as_u64()
-                .filter(|n| (1..=128).contains(n))
-                .map(|n| n as usize)
-                .ok_or("top_n must be in 1..128")
-        })?
-        .min(documents.len());
-    let return_documents = object.get("return_documents").map_or(Ok(false), |v| {
-        v.as_bool().ok_or("return_documents must be boolean")
-    })?;
-    Ok(Request {
-        query,
-        documents,
-        instruction,
-        top,
-        return_documents,
-    })
+    if request.top_n.is_some_and(|n| !(1..=128).contains(&n)) {
+        return Err("top_n must be in 1..128".into());
+    }
+    Ok(request)
 }
 fn document_text(document: &Value) -> Result<&str> {
     document
@@ -166,7 +124,7 @@ fn document_text(document: &Value) -> Result<&str> {
         .or_else(|| document.get("text").and_then(Value::as_str))
         .ok_or_else(|| "Rerank document must be text or an object with text".into())
 }
-fn ranked(request: &Request<'_>, scores: &[Score]) -> Value {
+fn ranked(request: &Request, scores: &[Score]) -> Value {
     let mut indices: Vec<_> = (0..scores.len()).collect();
     indices.sort_by(|&a, &b| {
         scores[b]
@@ -176,7 +134,7 @@ fn ranked(request: &Request<'_>, scores: &[Score]) -> Value {
     });
     let results: Vec<_> = indices
         .into_iter()
-        .take(request.top)
+        .take(request.top_n.unwrap_or(scores.len()))
         .map(|index| {
             let mut row = json!({"index":index,"relevance_score":scores[index].relevance_score});
             if request.return_documents {
@@ -197,11 +155,17 @@ fn response(
     value: Value,
     id: &str,
 ) -> Result<(Value, Vec<Score>)> {
-    let request = request(&value, id)?;
+    let request = request(value, id)?;
     let inputs: Vec<_> = request
         .documents
         .iter()
-        .map(|doc| codec.prepare(request.instruction, request.query, document_text(doc)?))
+        .map(|doc| {
+            codec.prepare(
+                request.instruction.as_deref().unwrap_or(INSTRUCTION),
+                &request.query,
+                document_text(doc)?,
+            )
+        })
         .collect::<Result<_>>()?;
     let total: usize = inputs.iter().map(Vec::len).sum();
     let scores = model.score_many(&inputs.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
@@ -271,7 +235,7 @@ mod tests {
     #[test]
     fn ranking_uses_unsaturated_logits_and_stable_input_indices() {
         let value = json!({"query":"q","documents":["a",{"text":"b","id":4},"a"],"return_documents":true,"top_n":2});
-        let r = request(&value, "m").unwrap();
+        let r = request(value, "m").unwrap();
         let scores = [1000.0, 1001.0, 1000.0].map(|logit_difference| Score {
             no_logit: 0.0,
             yes_logit: logit_difference as f32,
@@ -291,8 +255,14 @@ mod tests {
             json!({"query":"q","documents":["d"],"top_n":0}),
             json!({"query":"q","documents":[{}]}),
             json!({"query":"q","documents":["d"],"model":"other"}),
+            json!({"query":"q","documents":["d"],"model":null}),
+            json!({"query":"q","documents":["d"],"top_n":null}),
+            json!({"query":"q","documents":["d"],"instruction":null}),
+            json!({"query":"q","documents":["d"],"return_documents":null}),
+            json!({"query":"q","documents":["d"],"unexpected":true}),
+            json!(["m", "q", ["d"]]),
         ] {
-            assert!(request(&value, "m").is_err());
+            assert!(request(value, "m").is_err());
         }
     }
     #[test]

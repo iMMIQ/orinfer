@@ -1,4 +1,4 @@
-"""Validate, archive and install native schema-1 model execution packages."""
+"""Validate, archive and install schema-2 CUDA execution packages."""
 
 from orinfer_build.common.paths import ROOT
 
@@ -22,79 +22,37 @@ CONTRACT = json.loads((ROOT / "configs/architecture-contract.json").read_text())
 TEXT_KEYS = CONTRACT["families"]["qwen3_5"]["text_keys"]
 
 
-def model_library():
-    path = Path(
-        os.environ.get(
-            "ORINFER_MODEL_LIBRARY",
-            str(ROOT / "target/release/liborinfer_models.so"),
-        )
-    )
-    if not path.is_file():
-        raise ValueError(
-            "Build the model library with make build first and set ORINFER_MODEL_LIBRARY"
-        )
-    verify_library(path)
-    return path
+def read_bindings(package, directory):
+    """Read and verify the typed registry and reconstruct the compiler bindings."""
+    from orinfer_build.contracts.binding_templates import expand as expand_registry
+    from orinfer_build.contracts.catalog import expand
 
-
-def verify_library(path):
-    with path.open("rb") as stream:
-        header = stream.read(20)
     if (
-        len(header) != 20
-        or header[:4] != b"\x7fELF"
-        or header[4:6] != bytes((2, 1))
-        or int.from_bytes(header[16:18], "little") != 3
-        or int.from_bytes(header[18:20], "little") != 183
+        package.get("schema_version") != 2
+        or "catalog" not in package
+        or any(key in package for key in ("kernels", "runtime_abi", "execution"))
     ):
-        raise ValueError("Execution library must be an aarch64 ELF shared object")
+        raise ValueError("Expected a schema 2 execution package with data bindings")
+    identity = package["bindings"]
+    if identity["file"] != "bindings.json" or identity.get("tensor") is not None:
+        raise ValueError("Expected a standalone bindings.json")
+    raw = AssetReader(directory).read(identity)
+    catalog = package["catalog"]
+    kernels, dynamic, contracts = expand(catalog, expand_registry(json.loads(raw)))
+    return kernels, dynamic, contracts
 
 
-def execution_identity(library, engine=None, architecture=None, compute_policy=None):
-    """Read identity from the selected library, never from the source tree version."""
-    verify_library(library)
-    cli = engine or ROOT / "target/release/orinfer"
-    result = subprocess.run(
-        [str(cli.resolve(strict=True)), "inspect-library", str(library.resolve(strict=True))],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    info = json.loads(result.stdout)
-    if (
-        info.get("runtime_abi") != 1
-        or info.get("target") != "sm_87"
-        or not info.get("package")
-        or not info.get("version")
-    ):
-        raise ValueError("Execution library identity or target is incompatible")
-    if (architecture is not None and architecture not in info.get("architectures", [])) or (
-        compute_policy is not None and compute_policy not in info.get("compute_policies", [])
-    ):
-        raise ValueError("Execution library does not support the architecture or compute policy")
-    return dict(
-        abi_version=1,
-        library=dict(file="lib/model.so", sha256=file_hash(library)),
-        package=info["package"],
-        version=info["version"],
-    )
-
-
-def verify_execution(package, directory):
-    execution = package.get("execution", {})
-    if (
-        package.get("schema_version") != 1
-        or package.get("runtime_abi") != 1
-        or execution.get("abi_version") != 1
-        or not execution.get("package")
-        or not execution.get("version")
-    ):
-        raise ValueError("Unsupported model execution package schema or ABI")
-    asset = execution["library"]
-    library = source_path(directory.resolve(), asset["file"])
-    if file_hash(library) != asset["sha256"]:
-        raise ValueError("Execution library sha256 mismatch")
-    verify_library(library)
+def verify_package(package, directory):
+    read_bindings(package, directory)
+    reader = AssetReader(directory)
+    checked = set()
+    for asset in package["catalog"]["assets"]:
+        if asset["file"] != "assets.safetensors" or not asset.get("tensor"):
+            raise ValueError("Expected indexed execution assets in assets.safetensors")
+        key = (asset["tensor"], asset["sha256"])
+        if key not in checked:
+            reader.read(asset)
+            checked.add(key)
 
 
 def config_signature(config):
@@ -191,16 +149,7 @@ def install(archive_path, cache):
         if file_hash(package / "package.json") != digest:
             raise ValueError("Operator package digest mismatch")
         manifest = json.loads((package / "package.json").read_text())
-        verify_execution(manifest, package)
-        checked = set()
-        reader = AssetReader(package)
-        if "kernels" in manifest or "catalog" not in manifest:
-            raise ValueError("Expected schema 1 compiled kernel catalog with native bindings")
-        for asset in manifest["catalog"]["assets"]:
-            key = (asset["file"], asset.get("tensor"), asset["sha256"])
-            if key not in checked:
-                reader.read(asset)
-                checked.add(key)
+        verify_package(manifest, package)
         package.rename(cache / digest)
         return digest
     finally:

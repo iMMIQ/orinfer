@@ -1,8 +1,5 @@
 """Select one shared contiguous-copy tile per wide BF16 row-movement geometry."""
 
-from orinfer_build.common.paths import ROOT
-
-
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -13,7 +10,14 @@ from pathlib import Path
 from orinfer_build.common.files import atomic_json, file_hash
 from orinfer_build.models.deepseek_v41.assembly import publish_package, validate_rows
 from orinfer_build.contracts.row_selection import guarded_winner
-from orinfer_build.tuning.tuning import compile_candidates, measure, read_record, record_path
+from orinfer_build.tuning.ascend import kernel_entry, measurement_identity, verified_manifest
+from orinfer_build.tuning.tuning import (
+    compile_candidates,
+    measure,
+    read_record,
+    record_path,
+    write_record,
+)
 
 
 def main():
@@ -88,24 +92,17 @@ def main():
             rows=measured,
             device=torch.npu.get_device_name(args.device),
             tuner_sha256=file_hash(Path(__file__)),
-            measurement_sha256=file_hash(ROOT / "python/orinfer_build/tuning/tuning.py"),
-            benchmark_sha256=file_hash(Path(__file__).with_name("tune.py")),
-            selector_sha256=file_hash(ROOT / "python/orinfer_build/contracts/row_selection.py"),
+            measurement=measurement_identity(),
             maximum_regression=0.1,
             calls_per_replay=16,
         )
         record = record_path(args.output / "measurements", identity)
-        record.parent.mkdir(parents=True, exist_ok=True)
 
         def valid(cached):
-            path = base / cached["manifest"]
-            desc = json.loads(path.read_text())
-            return (
+            desc = verified_manifest(base, cached["manifest"], compiled_like=current)
+            return desc is not None and (
                 desc["op"] == spec["op"]
-                and desc["source_sha256"] == current["source_sha256"]
-                and desc["compiler"] == current["compiler"]
                 and desc["parameters"] == dict(parameters, tile_columns=cached["tile_columns"])
-                and desc["library"]["sha256"] == file_hash(path.parent / desc["library"]["file"])
             )
 
         cached = read_record(record, identity, valid)
@@ -118,16 +115,7 @@ def main():
             paths, legal, rejected = compile_candidates(
                 configs, lambda tile: futures[tile].result()
             )
-        libraries = [ctypes.CDLL(str((path.parent / "kernel.so").resolve())) for path in paths]
-        entries = [lib.orinfer_ascend_kernel_v2 for lib in libraries]
-        for entry in entries:
-            entry.argtypes = [
-                ctypes.POINTER(ctypes.c_void_p),
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-            ]
-            entry.restype = ctypes.c_int32
+        entries = [kernel_entry(path) for path in paths]
         width = parameters["width"]
         dtype = getattr(torch, parameters["dtype"])
         source = torch.randint(-100, 100, (capacity + 8, width), device="npu").to(dtype)
@@ -202,7 +190,7 @@ def main():
             rejected=rejected,
             timing_scope="NPU-event Graph replay, milliseconds per movement invocation",
         )
-        atomic_json(record, report)
+        write_record(record, report)
         replacements[old] = report["manifest"]
         reports.append(report)
         print(

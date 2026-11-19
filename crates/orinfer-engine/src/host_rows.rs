@@ -155,14 +155,15 @@ impl Plane {
                 if total.row_bytes != plane.row_bytes {
                     return Err("Host-row shard strides differ".into());
                 }
-                plane.parts[0].first_byte = total
-                    .rows
-                    .checked_mul(total.row_bytes)
-                    .ok_or("Host-row shard offset overflow")?;
+                plane.parts[0].first_byte = total.rows * total.row_bytes;
                 total.rows = total
                     .rows
                     .checked_add(plane.rows)
                     .ok_or("Host-row count overflow")?;
+                total
+                    .rows
+                    .checked_mul(total.row_bytes)
+                    .ok_or("Host-row extent overflow")?;
                 total.parts.append(&mut plane.parts);
             } else {
                 result = Some(plane);
@@ -194,12 +195,11 @@ impl Plane {
     }
     fn load_rows(&mut self, first: usize, rows: usize) -> Result<()> {
         use rayon::prelude::*;
-        let bytes = rows
-            .checked_mul(self.row_bytes)
-            .ok_or("Resident host table extent overflow")?;
-        let offset = first
-            .checked_mul(self.row_bytes)
-            .ok_or("Resident host table offset overflow")?;
+        if first > self.rows || rows > self.rows - first {
+            return Err("Resident host table range exceeds source".into());
+        }
+        let bytes = rows * self.row_bytes;
+        let offset = first * self.row_bytes;
         let mut data = resident::zeroed(bytes)?;
         // Bound first-touch/file-I/O concurrency while device weights load.
         // Stripes retain sequential reads and reuse the existing Rayon pool.
@@ -229,13 +229,13 @@ impl Plane {
     /// multi-hundred-GiB table, while positional reads resolve through the
     /// ARC without that contention.
     fn read_row_at(&self, row: usize, target: &mut [u8]) -> Result<()> {
-        if target.len() != self.row_bytes {
-            return Err("Host-row read target extent differs".into());
+        if row >= self.rows || target.len() != self.row_bytes {
+            return Err("Host-row read exceeds source or target extent".into());
         }
         if let Some((first, data)) = &self.resident {
             let begin = row
                 .checked_sub(*first)
-                .and_then(|v| v.checked_mul(self.row_bytes))
+                .map(|v| v * self.row_bytes)
                 .ok_or("Resident host row outside table")?;
             let source = data
                 .get(begin..begin + target.len())
@@ -243,10 +243,7 @@ impl Plane {
             target.copy_from_slice(source);
             return Ok(());
         }
-        let begin = row
-            .checked_mul(self.row_bytes)
-            .ok_or("Host-row offset overflow")?;
-        self.read_bytes(begin, target)
+        self.read_bytes(row * self.row_bytes, target)
     }
 }
 

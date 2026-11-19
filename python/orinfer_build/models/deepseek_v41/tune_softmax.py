@@ -6,9 +6,14 @@ import json
 from pathlib import Path
 
 from orinfer_build.common.files import atomic_json, file_hash
-from orinfer_build.tuning.ascend import npu_benchmark
 from orinfer_build.contracts.row_selection import aggregate_winner
-from orinfer_build.tuning.tuning import measure, read_record, record_path
+from orinfer_build.tuning.ascend import (
+    kernel_entry,
+    measurement_identity,
+    npu_benchmark,
+    verified_manifest,
+)
+from orinfer_build.tuning.tuning import measure, read_record, record_path, write_record
 
 
 def main():
@@ -94,28 +99,15 @@ def main():
             seed=20261002,
             torch=torch.__version__,
             torch_npu=torch_npu.__version__,
-            helpers={
-                str(p): file_hash(p)
-                for p in (
-                    Path(__file__),
-                    Path(__file__).with_name("tune.py"),
-                    Path("python/orinfer_build/tuning/tuning.py"),
-                    Path("python/orinfer_build/contracts/row_selection.py"),
-                )
-            },
+            tuner_sha256=file_hash(Path(__file__)),
+            measurement=measurement_identity(),
         )
 
         def valid(record):
-            for name in record["manifests"]:
-                path = base / name
-                spec = json.loads(path.read_text())
-                if (
-                    spec["source_sha256"] != current["source_sha256"]
-                    or spec["compiler"] != current["compiler"]
-                    or spec["library"]["sha256"] != file_hash(path.parent / "kernel.so")
-                ):
-                    return False
-            return True
+            return all(
+                verified_manifest(base, name, compiled_like=current) is not None
+                for name in record["manifests"]
+            )
 
         record = record_path(args.output, identity)
         cached = read_record(record, identity, valid)
@@ -138,20 +130,11 @@ def main():
             )
             for _ in paths
         ]
-        libraries, calls = [], []
+        calls = []
         for group, output in zip(paths, outputs, strict=True):
             entries = []
             for path in group:
-                library = ctypes.CDLL(str(path.parent / "kernel.so"))
-                libraries.append(library)
-                entry = library.orinfer_ascend_kernel_v2
-                entry.argtypes = [
-                    ctypes.POINTER(ctypes.c_void_p),
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_void_p,
-                ]
-                entry.restype = ctypes.c_int32
+                entry = kernel_entry(path)
                 pointers = (ctypes.c_void_p * 5)(*[t.data_ptr() for t in inputs + [output]])
                 entries.append((entry, pointers))
             calls.append(entries)
@@ -221,12 +204,12 @@ def main():
         result = dict(
             identity=identity, measurements=measurements, selected=selected, manifests=manifests
         )
-        atomic_json(record, result)
+        write_record(record, result)
         replacements[old] = manifests
         torch.npu.synchronize()
         graphs = graph = None
         calls = entries = pointers = None
-        libraries = library = entry = None
+        entry = None
         inputs = outputs = output = None
         torch.npu.empty_cache()
     if not args.compile_only:

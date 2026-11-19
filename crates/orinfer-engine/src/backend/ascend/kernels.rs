@@ -89,8 +89,7 @@ impl Spec {
             || self.operands.len() > 32
             || self.compiler.is_empty()
             || self.library.tensor.is_some()
-            || self.source_sha256.len() != 64
-            || !self.source_sha256.bytes().all(|c| c.is_ascii_hexdigit())
+            || !crate::artifact::is_sha256_hex(&self.source_sha256.to_ascii_lowercase())
         {
             return Err("Invalid Ascend AOT kernel schema or identity".into());
         }
@@ -153,10 +152,7 @@ impl Template {
         if spec.library.tensor.is_some() {
             return Err("A2 kernel library must be a standalone file".into());
         }
-        crate::model_package::validate_library(
-            &crate::model_package::library_header(&path)?,
-            &spec.target.host_arch,
-        )?;
+        validate_library(&library_header(&path)?, &spec.target.host_arch)?;
         let _current = session.context.enter()?;
         let soc = super::inventory(&session.context.driver)?
             .soc
@@ -426,6 +422,39 @@ impl Kernel {
             })
         }
     }
+}
+
+pub(crate) fn library_header(path: &Path) -> Result<[u8; 20]> {
+    use std::io::Read;
+    let mut image = [0; 20];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut image))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(image)
+}
+
+pub(crate) fn validate_library(image: &[u8], host_arch: &str) -> Result<()> {
+    let machine = match host_arch {
+        "aarch64" => 183,
+        "x86_64" => 62,
+        _ => {
+            return Err(format!(
+                "Unsupported A2 kernel-library host architecture {host_arch}"
+            ));
+        }
+    };
+    if image.len() < 20
+        || &image[..4] != b"\x7fELF"
+        || image[4] != 2
+        || image[5] != 1
+        || u16::from_le_bytes([image[16], image[17]]) != 3
+        || u16::from_le_bytes([image[18], image[19]]) != machine
+    {
+        return Err(format!(
+            "A2 kernel library must be an {host_arch} ELF shared object"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,9 +1,7 @@
 """Build one bounded dynamic ViT/aligner program from shared A2 operator factories."""
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
 import json
-import multiprocessing
 from pathlib import Path
 
 from orinfer_build.common.files import atomic_json
@@ -331,7 +329,7 @@ def build(
     weights=None,
     workspace_slots=64,
 ):
-    from orinfer_build.models.deepseek_v41.build import compile_task
+    from orinfer_build.models.deepseek_v41.build import compile_plan_tasks
 
     output.mkdir(parents=True, exist_ok=True)
     config = json.loads((source / "config.json").read_text())
@@ -364,12 +362,7 @@ def build(
         workspace_slots=workspace_slots,
     )
     # Deduplicate by operator contract, not by image size, layer or concurrent owner.
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        replacements = dict(
-            pool.map(compile_task, [(task, str(output)) for task in tasks.values()])
-        )
+    replacements = compile_plan_tasks(tasks.values(), output, workers)
     for operation in result["body"]:
         operation["manifest"] = replacements[operation["manifest"]]
     atomic_json(output / "vision-program.json", result)
@@ -386,7 +379,7 @@ def build(
 
 
 def rebuild(source, output, operators, workers):
-    from orinfer_build.models.deepseek_v41.build import compile_task, kernel_rebuild_task
+    from orinfer_build.models.deepseek_v41.build import compile_plan_tasks, kernel_rebuild_task
     from orinfer_build.models.deepseek_v41.vision_attach import hardlinks
 
     source, output = source.resolve(), output.resolve()
@@ -395,19 +388,13 @@ def rebuild(source, output, operators, workers):
     hardlinks(source.parent, output)
     program = json.loads(source.read_text())
     tasks = {}
-    for operation in program["body"]:
-        path = operation["manifest"]
+    for path in dict.fromkeys(op["manifest"] for op in program["body"]):
         spec = json.loads((source.parent / path).read_text())
         if spec["op"] in operators:
-            tasks.setdefault(path, kernel_rebuild_task(spec, path))
+            tasks[path] = kernel_rebuild_task(spec, path)
     if not tasks:
         raise ValueError("No selected operators in the vision program")
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        replacements = dict(
-            pool.map(compile_task, [(task, str(output)) for task in tasks.values()])
-        )
+    replacements = compile_plan_tasks(tasks.values(), output, workers)
     for operation in program["body"]:
         operation["manifest"] = replacements.get(operation["manifest"], operation["manifest"])
     atomic_json(output / "vision-program.json", program)

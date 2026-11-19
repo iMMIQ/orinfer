@@ -5,7 +5,7 @@ length. Compilation, ABI wrapping, validation and final asset publication reuse
 the shared native batch builder. Model arithmetic and decode assets stay fixed.
 """
 
-from orinfer_build.common.modules import import_module
+from importlib import import_module
 
 import argparse
 from copy import deepcopy

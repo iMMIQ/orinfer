@@ -1,76 +1,33 @@
-"""Attach a native execution library to an existing prepared model, atomically.
-
-Only the current schema-1 native execution-package format is supported.
-Weight shards and existing cubins are unchanged.
-"""
+"""Attach a compatible, digest-named execution package to a prepared model."""
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
-import shutil
 
-from orinfer_build.packaging.package import execution_identity, verify_execution, verify_library
-from orinfer_build.packaging.publication import (
-    AssetReader,
-    atomic_model,
-    clone_cpu_assets,
-    link_or_copy,
-    resolve_package,
-)
-from orinfer_build.common.files import write_json
+from orinfer_build.common.files import file_hash, write_json
+from orinfer_build.packaging.package import verify_package
+from orinfer_build.packaging.publication import atomic_model, clone_model, source_path
 
 
-def attach(source, output, library, engine, package_name=None, version=None):
+def attach(source, output, package, engine=None):
     source = source.resolve(strict=True)
     output = output.resolve()
     if output.is_relative_to(source):
         raise ValueError("Destination must be outside the immutable source model")
-    library = library.resolve(strict=True)
-    verify_library(library)
-    identity = execution_identity(library, engine)
-    if (package_name is not None and package_name != identity["package"]) or (
-        version is not None and version != identity["version"]
+    package = package.resolve(strict=True)
+    manifest = source_path(package, "package.json")
+    digest = file_hash(manifest)
+    if digest != package.name:
+        raise ValueError("Execution package digest mismatch")
+    execution = json.loads(manifest.read_text())
+    verify_package(execution, package)
+    descriptor = json.loads(source_path(source, "cache/model.json").read_text())
+    if descriptor.get("schema_version") != 1 or any(
+        descriptor[key] != execution[key] for key in ("architecture", "compute_policy")
     ):
-        raise ValueError("Requested execution identity differs from the native library")
-    descriptor, bundled, package = resolve_package(source, schema=1)
-    verify_execution(package, bundled)
-    reader = AssetReader(bundled)
-    checked = set()
-    if "kernels" in package or "catalog" not in package:
-        raise ValueError("Expected a compiled kernel catalog; finalize the model package first")
-    for asset in package["catalog"]["assets"]:
-        key = (asset["file"], asset.get("tensor"), asset["sha256"])
-        if key not in checked:
-            reader.read(asset)
-            checked.add(key)
+        raise ValueError("Execution package architecture or policy differs from the model")
     with atomic_model(output, engine) as staging:
-        staging.mkdir()
-        for path in source.iterdir():
-            if path.is_file():
-                shutil.copyfile(path, staging / path.name)
-        shutil.copytree(
-            source / "cache/weights",
-            staging / "cache/weights",
-            copy_function=lambda src, dst: (
-                link_or_copy(src, dst)
-                if Path(src).suffix == ".safetensors"
-                else shutil.copyfile(src, dst)
-            ),
-        )
-        clone_cpu_assets(source, staging)
-        target = staging / "cache/packages/.building"
-        shutil.copytree(bundled, target, copy_function=link_or_copy)
-        target_library = target / "lib/model.so"
-        target_library.parent.mkdir(exist_ok=True)
-        # A previous package may have been hardlinked: never overwrite its inode.
-        target_library.unlink(missing_ok=True)
-        shutil.copyfile(library, target_library)
-        package["execution"] = identity
-        raw = (json.dumps(package, indent=2, ensure_ascii=False) + "\n").encode()
-        (target / "package.json").unlink()
-        (target / "package.json").write_bytes(raw)
-        digest = hashlib.sha256(raw).hexdigest()
+        target = clone_model(source, staging, package)
         target.rename(target.with_name(digest))
         descriptor["execution_package"] = digest
         write_json(staging / "cache/model.json", descriptor)
@@ -81,12 +38,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--library", type=Path, required=True)
-    parser.add_argument("--engine", type=Path, default=Path("target/release/orinfer"))
-    parser.add_argument("--package", help="Optional identity assertion")
-    parser.add_argument("--version", help="Optional version assertion")
+    parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--engine", type=Path)
     args = parser.parse_args()
-    print(attach(args.model, args.output, args.library, args.engine, args.package, args.version))
+    print(attach(args.model, args.output, args.package, args.engine))
 
 
 if __name__ == "__main__":

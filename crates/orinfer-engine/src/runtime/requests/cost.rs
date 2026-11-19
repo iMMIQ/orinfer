@@ -1,4 +1,4 @@
-//! Complete execution prices. Layer-only estimates remain in prefill_cost.
+//! Complete execution prices. Layer-only estimates use the shared prefill profiles.
 use super::*;
 use crate::scheduler::{BatchExecutionStatistics, Timing};
 

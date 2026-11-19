@@ -6,7 +6,7 @@ TopK uses the existing recursive four-way merge. Both execution families read
 the same INT8 cache and use the existing QK/normalized-softmax/PV factories.
 """
 
-from orinfer_build.common.modules import import_module
+from importlib import import_module
 
 import argparse
 from copy import deepcopy

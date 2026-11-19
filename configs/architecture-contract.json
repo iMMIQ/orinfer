@@ -1,6 +1,5 @@
 {
   "version": 1,
-  "runtime_abi": 1,
   "families": {
     "nemotron_embed": {
       "release_variants": {

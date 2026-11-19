@@ -1,6 +1,7 @@
 //! CUDA timing identities; shared samples do not own execution resources.
 use super::{Key, Measurement};
 pub(super) use crate::mtp::adaptive::Cost;
+use crate::mtp::adaptive::evict_oldest;
 use std::collections::BTreeMap;
 
 #[derive(Default)]
@@ -19,10 +20,7 @@ impl Costs {
         self.profiles.get(&key)?.arms.get(&1)
     }
     pub fn observe(&mut self, key: Key, width: usize, measurement: Measurement) {
-        if self.profiles.len() == 256 && !self.profiles.contains_key(&key) {
-            let victim = *self.profiles.iter().min_by_key(|(_, p)| p.last).unwrap().0;
-            self.profiles.remove(&victim);
-        }
+        evict_oldest(&mut self.profiles, key, 256, |profile| profile.last);
         self.clock += 1;
         let profile = self.profiles.entry(key).or_default();
         profile.calls += 1;
@@ -43,7 +41,7 @@ impl Costs {
             })
             .filter_map(|(other, profile)| {
                 let cost = profile.arms.get(&width)?;
-                (cost.time.samples() >= 3)
+                cost.calibrated()
                     .then_some((other.context.abs_diff(key.context), cost.upper()))
             })
             .min_by_key(|(distance, _)| *distance)

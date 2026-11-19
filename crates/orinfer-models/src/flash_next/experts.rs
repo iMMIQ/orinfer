@@ -1,69 +1,64 @@
 //! Compressed expert banks and exact A8 split steps owned by the Flash recipe.
+use super::contracts::{connect, kernel_buffer_arg as buffer, pointer};
 use crate::{
     artifact::{Argument, Dtype, Kernel, Result},
     model::{Manifest, Operation},
 };
-use orinfer_model_sdk::abi::ExpertBank;
-use std::collections::BTreeMap;
+use orinfer_model_sdk::architecture::ExpertBank;
+use std::collections::{BTreeMap, BTreeSet};
+
+fn exact(kernel: &Kernel) -> bool {
+    matches!(
+        kernel.symbol.as_str(),
+        "exact_e8p_int4_kernel" | "exact_e8p_shared_input_kernel"
+    )
+}
+
+fn row_arguments(kernel: &Kernel, pointers: usize, dynamic: bool) -> bool {
+    kernel.args.len() == pointers
+        || dynamic
+            && kernel.args.len() == pointers + 1
+            && matches!(kernel.args.last(), Some(Argument::I32 { .. }))
+}
+
+fn planes(kernel: &Kernel, columns: [usize; 3]) -> Option<(&str, [&str; 3])> {
+    let (section, _) = kernel.name.rsplit_once('/')?;
+    let [a, b, c] = columns.map(|i| buffer(kernel, i).ok());
+    Some((section, [a?, b?, c?]))
+}
 
 pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
     if kernels.is_empty() && manifest.buffers.iter().any(|b| b.name.starts_with("E8P_")) {
         return Err("Missing exact expert execution contracts".into());
     }
-    let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
+    let contracts = super::contracts::kernels(kernels);
     let mut splits = BTreeMap::new();
     for kernel in kernels {
         if let Some(projection) = kernel.name.strip_suffix("/a8_split") {
             let target = contracts
                 .get(projection)
                 .ok_or("Missing exact expert projection")?;
-            if !matches!(
-                target.symbol.as_str(),
-                "exact_e8p_int4_kernel" | "exact_e8p_shared_input_kernel"
-            ) || !(target.args.len() == 13
-                || target.args.len() == 14
-                    && matches!(target.args.last(), Some(Argument::I32 { .. })))
+            if !exact(target)
+                || !row_arguments(target, 13, true)
                 || kernel.symbol != "pack_exact_a8_kernel"
-                || !(kernel.args.len() == 4
-                    || kernel.args.len() == 5
-                        && matches!(kernel.args.last(), Some(Argument::I32 { .. })))
+                || !row_arguments(kernel, 4, true)
             {
                 return Err("Unexpected exact expert ABI".into());
             }
-            for (split_index, project_index) in [(1, 3), (2, 4), (3, 8)] {
-                let (Argument::Buffer { name: a }, Argument::Buffer { name: b }) =
-                    (&kernel.args[split_index], &target.args[project_index])
-                else {
-                    return Err("Exact expert workspace must be a whole buffer".into());
-                };
-                if a != b {
-                    return Err("Exact expert split/projection workspace mismatch".into());
-                }
-            }
-            splits.insert(projection.to_owned(), kernel.name.clone());
+            connect(kernel, target, &[(1, 3), (2, 4), (3, 8)])?;
+            splits.insert(projection, kernel.name.as_str());
         }
     }
-    for kernel in kernels.iter().filter(|k| {
-        matches!(
-            k.symbol.as_str(),
-            "exact_e8p_int4_kernel" | "exact_e8p_shared_input_kernel"
-        )
-    }) {
-        if splits.contains_key(&kernel.name) {
-            continue;
-        }
-        // An everywhere-selected fused dispatch produces the exact input
-        // planes itself; no unused standalone pack needs to be published.
-        if kernel.name.starts_with("prefill_m4096/")
-            && let Some((section, _)) = kernel.name.rsplit_once('/')
-            && kernels.iter().any(|producer| {
-                producer.symbol == "dispatch_planes_kernel"
-                    && producer.name.rsplit_once('/').is_some_and(|(parent, _)| parent == section)
-                    && [(3, 2), (4, 4), (8, 9)].iter().all(|&(consumer, output)| {
-                        matches!((kernel.args.get(consumer), producer.args.get(output)),
-                            (Some(Argument::Buffer {name:a}),Some(Argument::Buffer {name:b})) if a==b)
-                    })
-            })
+    // The fused dispatch in large prefill can produce the planes itself.
+    let fused = kernels
+        .iter()
+        .filter(|k| k.symbol == "dispatch_planes_kernel")
+        .filter_map(|k| planes(k, [2, 4, 9]))
+        .collect::<BTreeSet<_>>();
+    for kernel in kernels.iter().filter(|k| exact(k)) {
+        if splits.contains_key(kernel.name.as_str())
+            || kernel.name.starts_with("prefill_m4096/")
+                && planes(kernel, [3, 4, 8]).is_some_and(|p| fused.contains(&p))
         {
             continue;
         }
@@ -74,14 +69,7 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
             .split_once("/rows/")
             .or_else(|| kernel.name.split_once("/choice/"))
             .and_then(|(slot, _)| contracts.get(slot).copied())
-            .filter(|k| splits.contains_key(&k.name));
-        fn pointer(arg: &Argument) -> Option<(&str, usize)> {
-            match arg {
-                Argument::Buffer { name } => Some((name, 0)),
-                Argument::BufferSlice { name, offset } => Some((name, *offset)),
-                _ => None,
-            }
-        }
+            .filter(|k| splits.contains_key(k.name.as_str()));
         if canonical.is_none_or(|base| {
             base.symbol != kernel.symbol
                 || base
@@ -93,23 +81,23 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
             return Err("Missing exact expert A8 split or changed row operands".into());
         }
     }
-    let mut registered = std::collections::BTreeSet::new();
+    let mut missing: BTreeSet<_> = splits.keys().copied().collect();
     for operations in manifest.programs.values_mut() {
         let mut expanded = Vec::with_capacity(operations.len());
         for operation in std::mem::take(operations) {
             if let Operation::Kernel { name } = &operation
-                && let Some(split) = splits.get(name)
+                && let Some(split) = splits.get(name.as_str())
             {
                 expanded.push(Operation::Kernel {
-                    name: split.clone(),
+                    name: (*split).into(),
                 });
-                registered.insert(name.clone());
+                missing.remove(name.as_str());
             }
             expanded.push(operation);
         }
         *operations = expanded;
     }
-    if registered.len() != splits.len() {
+    if !missing.is_empty() {
         return Err("Unregistered exact expert execution step".into());
     }
     Ok(())
@@ -121,71 +109,68 @@ pub(super) fn banks(manifest: &Manifest, kernels: &[Kernel]) -> Result<Vec<Exper
         .iter()
         .map(|b| (b.name.as_str(), b))
         .collect();
-    (0..48)
+    let mut banks = (0..48)
         .map(|layer| {
-            let prefix = format!("W_blk.{layer}.");
-            let names: Vec<_> = ["ffn_gate_up_exps", "ffn_down_exps"]
+            let buffers_for_layer = ["ffn_gate_up_exps", "ffn_down_exps"]
                 .into_iter()
                 .flat_map(|role| {
-                    ["packed", "scale"].into_iter().map({
-                        let prefix = prefix.clone();
-                        move |part| format!("{prefix}{role}.weight_{part}")
-                    })
+                    ["packed", "scale"].map(|part| format!("W_blk.{layer}.{role}.weight_{part}"))
                 })
-                .collect();
+                .collect::<Vec<_>>();
             let experts = buffers
-                .get(names[0].as_str())
+                .get(buffers_for_layer[0].as_str())
                 .and_then(|b| b.shape.first())
                 .copied()
                 .ok_or("Missing expert bank")?;
-            let mut consumers = BTreeMap::new();
-            for k in kernels {
-                if !k
-                    .args
-                    .iter()
-                    .any(|a| matches!(a, Argument::Buffer { name } if name == &names[0]))
-                {
-                    continue;
-                }
-                // Exported host argument order, not the TileLang function's
-                // declaration order. The exact path adds two nibble planes and sum.
-                let histogram = if matches!(
-                    k.symbol.as_str(),
-                    "exact_e8p_int4_kernel" | "exact_e8p_shared_input_kernel"
-                ) && (k.args.len() == 13
-                    || k.args.len() == 14 && matches!(k.args.last(), Some(Argument::I32 { .. })))
-                {
-                    2
-                } else if k.args.len() == 11
-                    || (k.args.len() == 12
-                        && matches!(k.args.last(), Some(Argument::I32 { .. }))
-                        && manifest.dynamic_batch_kernels.contains_key(&k.name))
-                {
-                    4
-                } else {
-                    return Err(format!("{}: unsupported expert consumer ABI", k.name));
-                };
-                let Some(Argument::Buffer { name }) = k.args.get(histogram) else {
-                    return Err("Unsupported grouped expert histogram ABI".into());
-                };
-                let b = buffers
-                    .get(name.as_str())
-                    .ok_or("Missing expert histogram")?;
-                if b.dtype != Dtype::I32 || b.shape != [experts] {
-                    return Err(format!("{}: unsupported expert consumer ABI", k.name));
-                }
-                consumers.insert(k.name.clone(), histogram);
-            }
-            if consumers.is_empty() && !kernels.is_empty() {
-                return Err("Missing expert gate/up consumers".into());
-            }
             Ok(ExpertBank {
                 experts,
-                buffers: names,
-                consumers,
+                buffers: buffers_for_layer,
+                consumers: BTreeMap::new(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let mut gates: BTreeMap<_, _> = banks
+        .iter_mut()
+        .map(|bank| {
+            (
+                bank.buffers[0].as_str(),
+                (bank.experts, &mut bank.consumers),
+            )
+        })
+        .collect();
+    for kernel in kernels {
+        for arg in &kernel.args {
+            let Argument::Buffer { name } = arg else {
+                continue;
+            };
+            let Some((experts, consumers)) = gates.get_mut(name.as_str()) else {
+                continue;
+            };
+            // Host ABI order: the exact path adds the two planes and sum.
+            let histogram = if exact(kernel) && row_arguments(kernel, 13, true) {
+                2
+            } else if row_arguments(
+                kernel,
+                11,
+                manifest.dynamic_batch_kernels.contains_key(&kernel.name),
+            ) {
+                4
+            } else {
+                return Err(format!("{}: unsupported expert consumer ABI", kernel.name));
+            };
+            let b = buffers
+                .get(buffer(kernel, histogram)?)
+                .ok_or("Missing expert histogram")?;
+            if b.dtype != Dtype::I32 || b.shape != [*experts] {
+                return Err(format!("{}: invalid expert histogram", kernel.name));
+            }
+            consumers.insert(kernel.name.clone(), histogram);
+        }
+    }
+    if !kernels.is_empty() && banks.iter().any(|bank| bank.consumers.is_empty()) {
+        return Err("Missing expert gate/up consumers".into());
+    }
+    Ok(banks)
 }
 
 #[cfg(test)]

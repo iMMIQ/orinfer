@@ -101,7 +101,7 @@ impl ModelRuntime {
                     .ensure_sequence_program(slot, &plan.program)?;
                 self.execute_spec_packet_phase(
                     &[orinfer_model_sdk::architecture::BatchSegment { slot, tokens }],
-                    orinfer_model_sdk::abi::BatchOperation::Warm,
+                    orinfer_model_sdk::packet::BatchOperation::Warm,
                     phase,
                 )?;
             } else {
@@ -112,7 +112,7 @@ impl ModelRuntime {
                 if let Some(slot) = packet_owner {
                     self.execute_spec_packet_phase(
                         &[orinfer_model_sdk::architecture::BatchSegment { slot, tokens: 1 }],
-                        orinfer_model_sdk::abi::BatchOperation::DraftHead,
+                        orinfer_model_sdk::packet::BatchOperation::DraftHead,
                         phase,
                     )?;
                 } else {

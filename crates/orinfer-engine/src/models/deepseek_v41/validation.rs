@@ -128,8 +128,11 @@ fn verify_assets(model: &Model, base: &Path) -> Result<()> {
         let spec: crate::backend::ascend::kernels::Spec = crate::model::read(&path)?;
         let root = path.parent().ok_or("A2 kernel has no directory")?;
         verify(root, &spec.library)?;
-        crate::model_package::validate_library(
-            &crate::model_package::library_header(&resolve_file(root, &spec.library.file)?)?,
+        crate::backend::ascend::kernels::validate_library(
+            &crate::backend::ascend::kernels::library_header(&resolve_file(
+                root,
+                &spec.library.file,
+            )?)?,
             &spec.target.host_arch,
         )?;
     }

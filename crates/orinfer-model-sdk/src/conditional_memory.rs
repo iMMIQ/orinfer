@@ -39,12 +39,7 @@ impl Hasher {
             || layout.layers.len() > 64
             || [&layout.config_sha256, &layout.tokenizer_sha256]
                 .into_iter()
-                .any(|h| {
-                    h.len() != 64
-                        || !h
-                            .bytes()
-                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                })
+                .any(|h| !crate::artifact::is_sha256_hex(h))
             || layout
                 .barriers
                 .iter()

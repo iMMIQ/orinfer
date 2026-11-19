@@ -7,85 +7,47 @@ use sys::{CUmemAccessDesc as AccessDesc, CUmemAllocationProp as AllocationProp};
 
 pub(crate) struct Reservation {
     pub address: u64,
-    pub bytes: usize,
     pub stride: usize,
-    pub granularity: usize,
-    pub mapped: usize,
-    slabs: Vec<Slab>,
-    poisoned: bool,
-    retained: Vec<Rc<crate::backend::snapshot::Allocation>>,
+    region: kv::Reservation,
+}
+impl std::ops::Deref for Reservation {
+    type Target = kv::Reservation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.region
+    }
 }
 impl Reservation {
     /// Map one sparse weight page. Payload initialization belongs to the uploader.
     pub(crate) fn map_page(&mut self, s: &Session, offset: usize) -> Result<()> {
-        if self.poisoned
-            || !offset.is_multiple_of(self.granularity)
-            || offset
-                .checked_add(self.granularity)
-                .is_none_or(|end| end > self.bytes)
-            || self.slabs.iter().any(|p| p.offset == offset)
-        {
-            return Err("Invalid sparse weight page transition".into());
-        }
-        let prop = properties(s.device);
-        let access = AccessDesc {
-            location: prop.location,
-            flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
-        };
-        let mut handle = 0;
-        // SAFETY: Aligned reserved extent; record ownership before mapping/access can fail.
-        unsafe {
-            check(
-                sys::cuMemCreate(&mut handle, self.granularity, &prop, 0),
-                "create expert page",
-            )?;
-        }
-        self.slabs.push(Slab {
-            id: kv::allocation_id()?,
+        self.region.map_sparse(
             offset,
-            bytes: self.granularity,
-            handle,
-            mapped: false,
-            shared: None,
-        });
-        let slab = self.slabs.last_mut().unwrap();
-        let result = (|| {
-            // SAFETY: Unique owned page, wholly within the reserved address range.
-            unsafe {
-                check(
-                    sys::cuMemMap(self.address + offset as u64, slab.bytes, 0, handle, 0),
-                    "map expert page",
-                )?;
-                slab.mapped = true;
-                check(
-                    sys::cuMemSetAccess(self.address + offset as u64, slab.bytes, &access, 1),
-                    "expert page access",
-                )
-            }
-        })();
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result
+            &Ops {
+                session: s,
+                address: self.address,
+            },
+        )
     }
     /// Caller must finish all consumers before releasing a sparse page.
     pub(crate) fn unmap_page(&mut self, s: &Session, offset: usize) -> Result<()> {
         let index = self
-            .slabs
+            .region
+            .mappings
             .iter()
             .position(|p| p.offset == offset)
             .ok_or("Unknown expert page")?;
-        let slab = &mut self.slabs[index];
+        let slab = &mut self.region.mappings[index];
         if slab.mapped {
             unsafe_unmap(&s.driver, self.address, slab)?;
             slab.mapped = false;
         }
         unsafe_release(&s.driver, slab.handle)?;
-        self.slabs.swap_remove(index);
+        self.region.mappings.swap_remove(index);
         Ok(())
     }
     pub(crate) fn physical_bytes(&self) -> usize {
-        self.slabs
+        self.region
+            .mappings
             .iter()
             .filter(|p| p.shared.is_none())
             .map(|p| p.bytes)
@@ -112,13 +74,8 @@ impl Reservation {
             )?;
             Ok(Self {
                 address,
-                bytes,
                 stride,
-                granularity,
-                mapped: 0,
-                slabs: vec![],
-                poisoned: false,
-                retained: vec![],
+                region: kv::Reservation::new(bytes, granularity),
             })
         }
     }
@@ -142,80 +99,19 @@ impl Reservation {
         self.grow_bytes(s, self.extent(tokens)?)
     }
     pub(crate) fn grow_bytes(&mut self, s: &Session, bytes: usize) -> Result<()> {
-        if self.poisoned {
-            return Err("KV reservation is quarantined after a failed transition".into());
-        }
-        let extent = round_up(bytes, self.granularity)?;
-        if extent > self.bytes {
-            return Err("KV growth exceeds reserved context".into());
-        }
-        if extent <= self.mapped {
-            return Ok(());
-        }
-        let offset = self.mapped;
-        let bytes = extent - offset;
-        let address = self
-            .address
-            .checked_add(offset as u64)
-            .ok_or("KV address overflow")?;
-        let prop = properties(s.device);
-        let access = AccessDesc {
-            location: prop.location,
-            flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
-        };
-        let id = kv::allocation_id()?;
-        let mut handle = 0;
-        // SAFETY: Session owns the context/stream; each successful create is
-        // immediately recorded before any fallible map/access/initialization.
-        unsafe {
-            check(
-                sys::cuMemCreate(&mut handle, bytes, &prop, 0),
-                "create KV physical slab",
-            )?;
-        }
-        let mut slab = Slab {
-            id,
-            offset,
+        self.region.grow(
             bytes,
-            handle,
-            mapped: false,
-            shared: None,
-        };
-        let result = (|| {
-            // SAFETY: Reserved VA extent and live physical allocation do not overlap prior slabs.
-            unsafe {
-                check(sys::cuMemMap(address, bytes, 0, handle, 0), "map KV slab")?;
-                slab.mapped = true;
-                check(
-                    sys::cuMemSetAccess(address, bytes, &access, 1),
-                    "enable KV slab access",
-                )?;
-                check(
-                    sys::cuMemsetD8Async(address, 0, bytes, s.stream),
-                    "initialize KV slab",
-                )?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.poisoned = true;
-            // Keep failed cleanup ownership for Session::cleanup; never expose this extent.
-            let mut pending = vec![slab];
-            let _ = release_owned(
-                &mut pending,
-                |slab| unsafe_unmap(&s.driver, self.address, slab),
-                |handle| unsafe_release(&s.driver, handle),
-            );
-            self.slabs.extend(pending);
-            return Err(error);
-        }
-        self.slabs.push(slab);
-        self.mapped = extent;
+            &Ops {
+                session: s,
+                address: self.address,
+            },
+            true,
+        )?;
         Ok(())
     }
     #[cfg(test)]
     pub(crate) fn allocation_handle(&self) -> Result<u64> {
-        match self.slabs.as_slice() {
+        match self.region.mappings.as_slice() {
             [slab] if slab.offset == 0 && slab.bytes == self.mapped && slab.shared.is_none() => {
                 Ok(slab.handle)
             }
@@ -223,7 +119,7 @@ impl Reservation {
         }
     }
     pub(crate) fn has_shared_slabs(&self) -> bool {
-        self.slabs.iter().any(|p| p.shared.is_some())
+        self.region.mappings.iter().any(|p| p.shared.is_some())
     }
     /// Append a whole immutable allocation; CUDA currently requires handle offset zero.
     pub(crate) fn map_shared(
@@ -232,56 +128,19 @@ impl Reservation {
         offset: usize,
         allocation: Rc<super::snapshot::Allocation>,
     ) -> Result<()> {
-        s.owner.require(allocation.owner)?;
-        let handle = allocation
-            .handle
-            .ok_or("Prefix allocation is not VMM backed")?;
-        let bytes = allocation.bytes;
-        if self.poisoned
-            || offset != self.mapped
-            || !offset.is_multiple_of(self.granularity)
-            || !bytes.is_multiple_of(self.granularity)
-            || offset.checked_add(bytes).is_none_or(|end| end > self.bytes)
-        {
-            return Err("Invalid shared prefix mapping".into());
-        }
-        self.slabs.push(Slab {
-            id: allocation.id,
+        self.region.map_shared(
             offset,
-            bytes,
-            handle,
-            mapped: false,
-            shared: Some(allocation),
-        });
-        let slab = self.slabs.last_mut().unwrap();
-        let access = AccessDesc {
-            location: properties(s.device).location,
-            flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READ,
-        };
-        // SAFETY: The retained immutable allocation covers this whole unmapped extent.
-        let result = unsafe {
-            check(
-                sys::cuMemMap(self.address + offset as u64, bytes, 0, handle, 0),
-                "map shared prefix",
-            )
-            .and_then(|()| {
-                slab.mapped = true;
-                check(
-                    sys::cuMemSetAccess(self.address + offset as u64, bytes, &access, 1),
-                    "shared prefix read access",
-                )
-            })
-        };
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result?;
-        self.mapped += bytes;
-        Ok(())
+            allocation,
+            s.owner,
+            &Ops {
+                session: s,
+                address: self.address,
+            },
+        )
     }
     pub(crate) fn writable_bytes(&self, start: usize, bytes: usize) -> Result<usize> {
         kv::writable_bytes(
-            &self.slabs,
+            &self.region.mappings,
             crate::backend::snapshot::Range {
                 offset: start,
                 bytes,
@@ -293,8 +152,8 @@ impl Reservation {
             return Err("KV reservation is quarantined".into());
         }
         let result = kv::make_writable(
-            &mut self.slabs,
-            &mut self.retained,
+            &mut self.region.mappings,
+            &mut self.region.retained,
             crate::backend::snapshot::Range {
                 offset: start,
                 bytes,
@@ -305,7 +164,7 @@ impl Reservation {
             },
         );
         if result.is_err() {
-            self.poisoned = true;
+            self.region.poisoned = true;
         }
         result
     }
@@ -320,7 +179,7 @@ impl Reservation {
             usize,
         )>,
     > {
-        kv::preview(&self.slabs, owner, self.address, range)
+        kv::preview(&self.region.mappings, owner, self.address, range)
     }
     pub(crate) fn publish(
         &mut self,
@@ -334,7 +193,7 @@ impl Reservation {
         )>,
     > {
         let result = kv::publish(
-            &mut self.slabs,
+            &mut self.region.mappings,
             range,
             &Ops {
                 session: s,
@@ -342,27 +201,18 @@ impl Reservation {
             },
         );
         if result.is_err() {
-            self.poisoned = true;
+            self.region.poisoned = true;
         }
         result
     }
     pub(crate) fn release_slabs(&mut self, driver: &Driver) -> Result<()> {
-        let result = kv::release_mappings(
-            &mut self.slabs,
-            &mut self.retained,
+        self.region.clear(
             |slab| unsafe_unmap(driver, self.address, slab),
-            |handle| unsafe_release(driver, handle),
-        );
-        if result.is_ok() {
-            self.mapped = 0;
-            self.poisoned = false;
-        } else {
-            self.poisoned = true;
-        }
-        result
+            |slab| unsafe_release(driver, slab.handle),
+        )
     }
     pub(crate) fn has_slabs(&self) -> bool {
-        !self.slabs.is_empty()
+        !self.region.mappings.is_empty()
     }
 }
 #[cfg(test)]
@@ -382,12 +232,13 @@ fn unsafe_release(_driver: &Driver, handle: u64) -> Result<()> {
     // SAFETY: The caller owns the live allocation handle, now unmapped.
     unsafe { check(sys::cuMemRelease(handle), "release KV slab") }
 }
+#[cfg(test)]
 fn release_owned(
     slabs: &mut Vec<Slab>,
     unmap: impl FnMut(&Slab) -> Result<()>,
-    release: impl FnMut(u64) -> Result<()>,
+    mut release: impl FnMut(u64) -> Result<()>,
 ) -> Result<()> {
-    kv::release_mappings(slabs, &mut vec![], unmap, release)
+    kv::release_mappings(slabs, &mut vec![], unmap, |page| release(page.handle))
 }
 fn properties(device: i32) -> AllocationProp {
     AllocationProp {
@@ -407,13 +258,10 @@ fn properties(device: i32) -> AllocationProp {
     }
 }
 fn round_up(bytes: usize, granularity: usize) -> Result<usize> {
-    if granularity == 0 || !granularity.is_power_of_two() {
+    if !granularity.is_power_of_two() {
         return Err("Invalid CUDA VMM granularity".into());
     }
-    bytes
-        .checked_add(granularity - 1)
-        .map(|n| n & !(granularity - 1))
-        .ok_or_else(|| "KV alignment overflow".into())
+    kv::align(bytes, granularity)
 }
 pub(crate) type Reservations = BTreeMap<String, Reservation>;
 
@@ -434,14 +282,18 @@ impl MappingOps for Ops<'_> {
         }
         Ok(handle)
     }
-    fn release(&self, handle: u64) -> Result<()> {
+    fn release(&self, handle: u64, _bytes: usize) -> Result<()> {
         unsafe_release(&self.session.driver, handle)
     }
     fn map(&self, offset: usize, bytes: usize, handle: u64, _shared: bool) -> Result<()> {
+        let address = self
+            .address
+            .checked_add(offset as u64)
+            .ok_or("KV address overflow")?;
         // SAFETY: Caller validated and owns the virtual extent and physical handle.
         unsafe {
             check(
-                sys::cuMemMap(self.address + offset as u64, bytes, 0, handle, 0),
+                sys::cuMemMap(address, bytes, 0, handle, 0),
                 "map KV allocation",
             )
         }
@@ -527,7 +379,7 @@ impl MappingOps for Ops<'_> {
             native: None,
         });
         // Until publication succeeds, this alias borrows the original handle.
-        canonical.slabs.push(Slab {
+        canonical.region.mappings.push(Slab {
             id: page.id,
             offset: 0,
             bytes: page.bytes,
@@ -540,13 +392,13 @@ impl MappingOps for Ops<'_> {
             address: canonical.address,
         };
         let result = ops.map(0, page.bytes, page.handle, true).and_then(|()| {
-            canonical.slabs[0].mapped = true;
+            canonical.region.mappings[0].mapped = true;
             ops.access(0, page.bytes, true)
         });
         let key = canonical.address.to_string();
         if result.is_ok() {
-            canonical.slabs[0].shared = None;
-            canonical.mapped = page.bytes;
+            canonical.region.mappings[0].shared = None;
+            canonical.region.mapped = page.bytes;
         }
         self.session
             .prefix_buffers
@@ -576,7 +428,7 @@ pub(crate) fn restore_host(
         address: canonical.address,
     };
     let handle = ops.allocate(descriptor.bytes)?;
-    canonical.slabs.push(Slab {
+    canonical.region.mappings.push(Slab {
         id: descriptor.id,
         offset: 0,
         bytes: descriptor.bytes,
@@ -595,7 +447,7 @@ pub(crate) fn restore_host(
     });
     let result: Result<()> = (|| {
         ops.map(0, descriptor.bytes, handle, false)?;
-        canonical.slabs[0].mapped = true;
+        canonical.region.mappings[0].mapped = true;
         ops.access(0, descriptor.bytes, false)?;
         ops.zero(0, descriptor.bytes)?;
         s.transfers
@@ -603,7 +455,7 @@ pub(crate) fn restore_host(
             .upload(s.stream, canonical.address, bytes)?;
         ops.complete()?;
         ops.access(0, descriptor.bytes, true)?;
-        canonical.mapped = descriptor.bytes;
+        canonical.region.mapped = descriptor.bytes;
         Ok(())
     })();
     s.prefix_buffers
@@ -910,13 +762,8 @@ mod tests {
         assert!(round_up(1, 3).is_err());
         let r = Reservation {
             address: 0,
-            bytes: 4 << 20,
             stride: 2048,
-            granularity: 2 << 20,
-            mapped: 0,
-            slabs: vec![],
-            poisoned: false,
-            retained: vec![],
+            region: kv::Reservation::new(4 << 20, 2 << 20),
         };
         assert_eq!(r.extent(1024).unwrap(), 2 << 20);
         assert_eq!(r.extent(1025).unwrap(), 4 << 20);
@@ -924,13 +771,8 @@ mod tests {
         assert_eq!(r.required_extent(2049).unwrap(), 6 << 20);
         let scale = Reservation {
             address: 0,
-            bytes: 8 << 20,
             stride: 32,
-            granularity: 2 << 20,
-            mapped: 0,
-            slabs: vec![],
-            poisoned: false,
-            retained: vec![],
+            region: kv::Reservation::new(8 << 20, 2 << 20),
         };
         assert_eq!(scale.extent(65536).unwrap(), 2 << 20);
         assert_eq!(scale.extent(65537).unwrap(), 4 << 20);

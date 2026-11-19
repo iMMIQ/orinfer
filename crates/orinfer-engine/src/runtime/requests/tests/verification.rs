@@ -242,9 +242,9 @@ fn validate_joint_target_verification() {
                         .execute_spec_packet(
                             &segments,
                             if mixed {
-                                orinfer_model_sdk::abi::BatchOperation::MixedRows { prefills: 1 }
+                                orinfer_model_sdk::packet::BatchOperation::MixedRows { prefills: 1 }
                             } else {
-                                orinfer_model_sdk::abi::BatchOperation::Verification
+                                orinfer_model_sdk::packet::BatchOperation::Verification
                             },
                         )
                         .unwrap();

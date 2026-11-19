@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 # Support direct script invocation before loading project modules.
 sys.path.insert(0, str(ROOT))
-from orinfer_build.packaging.package import execution_identity, install  # noqa: E402
+from orinfer_build.packaging.package import install  # noqa: E402
 from orinfer_build.packaging.publication import generated_outputs  # noqa: E402
 from orinfer_build.common.files import file_hash  # noqa: E402
 from tools.dev.dependencies import check as check_dependency_age  # noqa: E402
@@ -104,7 +104,7 @@ def execution_asset_identity(package, tag):
     )
 
 
-def execution_assets(archives, cache, binary, tag):
+def execution_assets(archives, cache, tag):
     """Validate each package independently and name assets from their actual contract."""
     assets = []
     names = set()
@@ -138,14 +138,6 @@ def execution_assets(archives, cache, binary, tag):
         digest = install(archive_path, cache)
         root = cache / digest
         package = json.loads((root / "package.json").read_text())
-        identity = execution_identity(
-            root / package["execution"]["library"]["file"],
-            binary,
-            package["architecture"],
-            package["compute_policy"],
-        )
-        if identity != package["execution"]:
-            raise ValueError("Native execution identity differs from package manifest")
         name, specification = execution_asset_identity(package, tag)
         if name in names:
             raise ValueError("Duplicate execution package asset in release")
@@ -160,7 +152,7 @@ def execution_assets(archives, cache, binary, tag):
                     architecture_id=specification,
                     compute_policy=package["compute_policy"],
                     target=package["target"],
-                    execution=identity,
+                    bindings=package["bindings"],
                 ),
             )
         )
@@ -204,7 +196,7 @@ def build(args):
     if command("git", "rev-parse", "HEAD") != revision or command("git", "status", "--porcelain"):
         raise ValueError("Source changed during build")
     with tempfile.TemporaryDirectory(prefix="orinfer-release-") as temp:
-        packages = execution_assets(args.operators, Path(temp) / "operator-cache", binary, tag)
+        packages = execution_assets(args.operators, Path(temp) / "operator-cache", tag)
         bundle = Path(temp) / f"orinfer-{tag}-linux-aarch64"
         (bundle / "bin").mkdir(parents=True)
         shutil.copy2(binary, bundle / "bin/orinfer")

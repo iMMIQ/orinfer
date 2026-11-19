@@ -6,8 +6,9 @@ mod deadline;
 pub(crate) mod defaults;
 mod grammar;
 mod image;
-mod lifecycle;
-mod listener;
+pub(crate) use image::{decode_rgb, load_source};
+pub(crate) mod lifecycle;
+pub(crate) mod listener;
 mod metrics;
 mod output;
 mod preparation;
@@ -28,12 +29,12 @@ use axum::{
     routing::{get, post},
 };
 use chat::{ChatCodec, ChatRequest, Prepared};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
+pub(crate) use lifecycle::shutdown_signal;
 use orinfer_engine::model::Model;
 use serde_json::{Value, json};
 use std::{
     convert::Infallible,
-    future::IntoFuture,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -192,16 +193,7 @@ async fn serve(settings: Settings) -> Result<()> {
             signal_shutdown.store(true, Ordering::Relaxed);
             signal_draining.notify_one();
         };
-        let server = match listener {
-            listener::Listener::Tcp(listener) => axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown)
-                .into_future()
-                .boxed(),
-            listener::Listener::Unix(listener) => axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown)
-                .into_future()
-                .boxed(),
-        };
+        let server = listener.serve(router, shutdown);
         tokio::pin!(server);
         tokio::select! {
             result = &mut server => result.map_err(|e| e.to_string()),
@@ -227,14 +219,23 @@ async fn serve(settings: Settings) -> Result<()> {
     worker.stop(remaining_ms).await?;
     result
 }
-fn authorized(state: &Service, headers: &HeaderMap) -> bool {
-    state.api_key.as_ref().is_none_or(|key| {
+pub(crate) fn api_key() -> Option<Arc<str>> {
+    std::env::var("ORINFER_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map(Into::into)
+}
+pub(crate) fn bearer_authorized(key: Option<&str>, headers: &HeaderMap) -> bool {
+    key.is_none_or(|key| {
         headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            == Some(key.as_ref())
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            == Some(key)
     })
+}
+fn authorized(state: &Service, headers: &HeaderMap) -> bool {
+    bearer_authorized(state.api_key.as_deref(), headers)
 }
 async fn request_id(
     State(state): State<Service>,
@@ -567,24 +568,6 @@ async fn wait_worker(worker: &std::thread::JoinHandle<()>, timeout_ms: u64) -> b
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
     true
-}
-
-pub(crate) async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
-            }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 #[cfg(test)]

@@ -100,7 +100,7 @@ impl ModelRuntime {
                 };
                 self.execution.upload_ids(input, chunk)?;
                 self.execution.sync()?;
-                self.model_package.prepare_inputs(
+                self.batch_plans.prepare_inputs(
                     if manifest.row_execution.is_some() {
                         program
                     } else {
@@ -147,7 +147,7 @@ impl ModelRuntime {
                     .get(step - 1)
                     .copied()
                     .unwrap_or(*tokens.last().ok_or("Missing pending token")?);
-                self.model_package
+                self.batch_plans
                     .prepare_inputs("target", &[input], &history, |name, data| {
                         self.execution.upload_bytes(name, data)
                     })?;

@@ -4,15 +4,19 @@ import io
 import json
 from pathlib import Path
 import tempfile
-import shutil
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 from safetensors import safe_open
 from safetensors.numpy import save_file
 
-from orinfer_build.packaging.compact import compact, compact_weights, header, write_shard
+from orinfer_build.packaging.compact import (
+    compact,
+    compact_package,
+    compact_weights,
+    header,
+    write_shard,
+)
 from orinfer_build.packaging.publication import AssetReader
 from orinfer_build.common.files import file_hash, write_json
 from orinfer_build.packaging.package import archive, install
@@ -24,16 +28,6 @@ class CompactTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-        def build_library(package, bindings, directory, engine=None):
-            library = Path(directory) / "lib/model.so"
-            library.parent.mkdir(parents=True, exist_ok=True)
-            if not library.exists():
-                shutil.copyfile(self.library, library)
-            return package["execution"]
-
-        builder = patch("orinfer_build.contracts.catalog.build_library", side_effect=build_library)
-        builder.start()
-        self.addCleanup(builder.stop)
         self.model = self.root / "source"
         self.weights = self.model / "cache/weights"
         self.weights.mkdir(parents=True)
@@ -94,21 +88,7 @@ class CompactTests(unittest.TestCase):
             filename = f"asset-{i}"
             (package / filename).write_bytes(raw)
             kernels.append(dict(file=filename, sha256=hashlib.sha256(raw).hexdigest()))
-        library = bytearray(20)
-        library[:6] = b"\x7fELF\x02\x01"
-        library[16:20] = bytes((3, 0, 183, 0))
-        (package / "lib").mkdir()
-        (package / "lib/model.so").write_bytes(library)
-        self.library = package / "lib/model.so"
         spec = dict(
-            schema_version=1,
-            runtime_abi=1,
-            execution=dict(
-                abi_version=1,
-                package="fixture",
-                version="1",
-                library=dict(file="lib/model.so", sha256=hashlib.sha256(library).hexdigest()),
-            ),
             kernels=[
                 dict(
                     name=f"kernel{i}",
@@ -125,16 +105,7 @@ class CompactTests(unittest.TestCase):
                 for i in range(2)
             ],
         )
-        raw = json.dumps(spec).encode()
-        digest = hashlib.sha256(raw).hexdigest()
-        directory = self.model / "cache/packages" / digest
-        directory.mkdir(parents=True)
-        for path in package.iterdir():
-            if path.is_file():
-                (directory / path.name).write_bytes(path.read_bytes())
-        (directory / "lib").mkdir()
-        (directory / "lib/model.so").write_bytes(library)
-        (directory / "package.json").write_bytes(raw)
+        digest = compact_package(package, spec, self.model / "cache/packages")
         write_json(
             self.model / "cache/model.json",
             dict(

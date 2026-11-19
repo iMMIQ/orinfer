@@ -1,7 +1,7 @@
 /// Select common profiles from architecture-owned plans, never kernel/model names.
 pub(super) fn kernels(
     manifest: &crate::model::Manifest,
-    package: &crate::model_package::ModelPackage,
+    adapter: &dyn orinfer_models::Adapter,
 ) -> crate::artifact::Result<std::collections::BTreeSet<String>> {
     use std::collections::BTreeSet;
     let mut kernels = program_kernels(manifest)?;
@@ -19,12 +19,20 @@ pub(super) fn kernels(
             let segments: Vec<_> = (0..rows)
                 .map(|slot| orinfer_model_sdk::architecture::BatchSegment { slot, tokens: 1 })
                 .collect();
-            kernels.extend(package.batch_plan(&segments)?.into_iter().filter_map(|op| {
-                match op.operation {
-                    crate::model::Operation::Kernel { name } => Some(name),
-                    _ => None,
-                }
-            }));
+            kernels.extend(
+                adapter
+                    .batch_operation(
+                        &segments,
+                        orinfer_model_sdk::packet::BatchOperation::Ordinary,
+                        true,
+                    )?
+                    .0
+                    .into_iter()
+                    .filter_map(|op| match op.operation {
+                        crate::model::Operation::Kernel { name } => Some(name),
+                        _ => None,
+                    }),
+            );
         }
     }
     Ok(kernels)

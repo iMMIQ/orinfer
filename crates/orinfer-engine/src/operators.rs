@@ -1,4 +1,4 @@
-//! Versioned, weight-independent model execution packages. Model control flow is supplied by a versioned native library.
+//! Versioned, weight-independent model execution packages. Rust adapters compose model control flow from data bindings.
 use crate::{
     architecture::{Architecture, ComputePolicy, PrefillProfile},
     artifact::{Access, Buffer, Dtype, Result},
@@ -15,8 +15,6 @@ pub mod dynamic;
 pub mod generated;
 pub mod install;
 pub(crate) mod shared_json;
-
-pub const RUNTIME_ABI: u32 = orinfer_model_sdk::abi::RUNTIME_ABI;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -45,7 +43,6 @@ impl From<&Buffer<TensorIdentity>> for BufferContract {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionPackage {
     pub schema_version: u32,
-    pub runtime_abi: u32,
     pub target: String,
     pub architecture: Architecture,
     pub compute_policy: ComputePolicy,
@@ -62,7 +59,7 @@ pub struct ExecutionPackage {
     pub buffer_contracts: Vec<BufferContract>,
     pub catalog: orinfer_model_sdk::catalog::Catalog,
     pub toolchain: BTreeMap<String, String>,
-    pub execution: crate::model_package::ExecutionLibrary,
+    pub bindings: crate::artifact::FileIdentity,
 }
 impl ExecutionPackage {
     pub(crate) fn validate(
@@ -87,14 +84,25 @@ impl ExecutionPackage {
 
     fn validate_metadata(&self) -> Result<()> {
         let target = orinfer_device::Target::from_package(&self.target)?;
-        if self.schema_version != 1
-            || self.runtime_abi != RUNTIME_ABI
+        if self.schema_version != 2
             || self.architecture.is_empty()
             || self.compute_policy.is_empty()
         {
             return Err(
-                "Incompatible model execution package architecture, policy, target or ABI".into(),
+                "Incompatible model execution package schema, architecture, policy or target"
+                    .into(),
             );
+        }
+        if self.bindings.file != "bindings.json"
+            || self.bindings.tensor.is_some()
+            || !crate::artifact::is_sha256_hex(&self.bindings.sha256)
+            || self.catalog.assets.iter().any(|asset| {
+                asset.file != "assets.safetensors"
+                    || asset.tensor.as_ref().is_none_or(String::is_empty)
+                    || !crate::artifact::is_sha256_hex(&asset.sha256)
+            })
+        {
+            return Err("Invalid binding or asset identity in execution package".into());
         }
         let mut seen = std::collections::BTreeSet::new();
         if self
@@ -116,6 +124,29 @@ impl ExecutionPackage {
         }
         Ok(())
     }
+
+    pub(crate) fn read_bindings(
+        &self,
+        root: &Path,
+        verify: bool,
+    ) -> Result<orinfer_model_sdk::catalog::Bindings> {
+        let mut reader = crate::artifact::AssetReader::default();
+        let raw = if verify {
+            let raw = reader.read(root, &self.bindings)?;
+            let mut checked = std::collections::BTreeSet::new();
+            for asset in &self.catalog.assets {
+                if checked.insert((asset.key(), &asset.sha256)) {
+                    reader.read(root, asset)?;
+                }
+            }
+            raw
+        } else {
+            reader.read_unverified(root, &self.bindings)?
+        };
+        let registry: orinfer_model_sdk::catalog::BindingRegistry =
+            shared_json::decode(&raw).map_err(|e| format!("Execution bindings: {e}"))?;
+        registry.bind(&self.catalog)
+    }
 }
 
 pub fn default_cache() -> PathBuf {
@@ -130,11 +161,7 @@ pub fn default_cache() -> PathBuf {
 }
 
 pub(crate) fn resolve(model_cache: &Path, id: &str) -> Result<PathBuf> {
-    if id.len() != 64
-        || !id
-            .bytes()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-    {
+    if !crate::artifact::is_sha256_hex(id) {
         return Err("Malformed model execution package digest".into());
     }
     // An explicit shared cache takes precedence over a bundled package.

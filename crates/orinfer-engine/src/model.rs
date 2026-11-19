@@ -4,7 +4,7 @@ use crate::execution::{CudaGraphMode, LoadOptions};
 pub use crate::weights::TensorIdentity;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::Instant,
@@ -110,11 +110,6 @@ pub struct ValidationReport {
     pub validation_s: f64,
 }
 
-/// Read the native execution library's own version and registered capabilities.
-pub fn inspect_execution_library(path: &Path) -> Result<orinfer_model_sdk::abi::PackageInfo> {
-    crate::model_package::inspect_library(path)
-}
-
 /// Verify all container layouts and payloads without CUDA or resident weight copies.
 pub fn validate_model(path: &Path) -> Result<ValidationReport> {
     let descriptor = resolve_manifest(path)?;
@@ -131,15 +126,6 @@ pub fn validate_model(path: &Path) -> Result<ValidationReport> {
         if buffer.data.is_some() {
             weights.read(buffer)?;
             tensor_count += 1;
-        }
-    }
-    let mut seen = BTreeSet::new();
-    let mut reader = crate::artifact::AssetReader::default();
-    for kernel in &manifest.kernels {
-        for identity in [&kernel.module, &kernel.source, &kernel.host_abi] {
-            if seen.insert(identity.key()) {
-                reader.read(&prepared.kernel_root, identity)?;
-            }
         }
     }
     Ok(ValidationReport {
@@ -178,7 +164,7 @@ pub fn inspect_plan(path: &Path) -> Result<PlanReport> {
         *allocation_bytes.entry(key.into()).or_insert(0) += buffer.bytes()?;
     }
     Ok(PlanReport {
-        plan_kernel_contracts: prepared.execution_model.plan_contracts.borrow().clone(),
+        plan_kernel_contracts: prepared.plan_kernel_contracts,
         manifest_sha256: prepared.fingerprint,
         execution_package: prepared.execution_package,
         architecture: prepared.architecture,
@@ -187,6 +173,71 @@ pub fn inspect_plan(path: &Path) -> Result<PlanReport> {
         manifest: prepared.plan,
     })
 }
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PacketProbe {
+    operation: orinfer_model_sdk::packet::BatchOperation,
+    segments: Vec<orinfer_model_sdk::architecture::BatchSegment>,
+}
+
+#[derive(Serialize)]
+pub struct PacketLayout {
+    private_kernels: std::collections::BTreeSet<String>,
+    private_copies: Vec<(String, String, Vec<usize>)>,
+}
+
+/// Offline inspection for the compiler that wraps request-owned operands.
+pub fn inspect_packet_layout(model: &Path, probes: &Path) -> Result<PacketLayout> {
+    let probes: Vec<PacketProbe> = read(probes)?;
+    let prepared = crate::loader::load_direct_packets(model)?;
+    let cache = crate::batch_plan::BatchPlanCache::new(prepared.execution_model, false);
+    let mut private_kernels = std::collections::BTreeSet::new();
+    let mut copies = BTreeMap::<_, Vec<_>>::new();
+    for probe in probes {
+        let Ok((commands, _)) = cache.batch_operation(&probe.segments, probe.operation, true)
+        else {
+            continue;
+        };
+        for call in commands
+            .into_iter()
+            .filter(|command| command.sequence.is_some())
+        {
+            match call.operation {
+                Operation::Kernel { name } => {
+                    private_kernels.insert(name);
+                }
+                Operation::Copy {
+                    source,
+                    destination,
+                    bytes,
+                } => {
+                    use crate::loader::BufferScope;
+                    if [&source, &destination]
+                        .iter()
+                        .any(|name| prepared.scopes.get(*name) == Some(&BufferScope::Sequence))
+                    {
+                        copies.entry((source, destination)).or_default().push(bytes);
+                    }
+                }
+                Operation::Zero { .. } => {
+                    return Err(
+                        "Private packet zero needs a declared TileLang implementation".into(),
+                    );
+                }
+            }
+        }
+    }
+    let private_copies = copies
+        .into_iter()
+        .map(|((source, destination), bytes)| (source, destination, bytes))
+        .collect();
+    Ok(PacketLayout {
+        private_kernels,
+        private_copies,
+    })
+}
+
 pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
     serde_json::from_slice(&fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?)
         .map_err(|e| format!("{}: {e}", p.display()))
@@ -198,7 +249,7 @@ enum Implementation {
     Ascend(Box<crate::models::deepseek_v41::provider::Runtime>),
 }
 pub struct Model(Implementation);
-mod request;
+pub(crate) mod request;
 pub use crate::runtime::requests::{GenerationInput, StepOutput};
 pub use crate::runtime::scoring::{Probe, ScoreCase, ScoreReport, ScoreRequests, TokenProbability};
 pub use request::RequestState;
@@ -533,9 +584,7 @@ pub fn media_layout(
     for image in images {
         vision.feature_count(image)?;
     }
-    prepared
-        .execution_model
-        .visual_layout(tokens, images, capacity)
+    crate::batch_plan::visual_layout(prepared.execution_model.as_ref(), tokens, images, capacity)
 }
 
 #[cfg(test)]
@@ -551,6 +600,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":2,"max_context":8,"vocab":4,"toolchain":{"test":"test"},
             "buffers":buffers,"kernels":[{"name":"k","module":id,"source":id,"host_abi":id,"symbol":"k","grid":[1,1,1],"block":[32,1,1],"shared_memory_bytes":0,"cooperative":false,"args":[{"kind":"buffer","name":"Input"}]}],
             "programs":{"prefill":[{"kind":"kernel","name":"k"}],"head":[{"kind":"kernel","name":"k"}],"decode":[{"kind":"kernel","name":"k"}]},
+            "prefill_plans":[{"min_tokens":0,"chunk_tokens":2,"prefill_program":"prefill","head_program":"head"}],
             "reset_buffers":["Step"],"input":"Input","token":"Token","status":"Status","logits":"Logits","position":"Step","weight_bytes":4,"weight_parameters":2,"weight_scope":"test"})).unwrap()
     }
     #[test]
@@ -592,9 +642,11 @@ mod tests {
         let mut m = fixture();
         m.kernels[0].source.sha256 = "1".repeat(64);
         assert!(m.validate().is_err());
+        assert!(m.validate_runtime().is_ok());
         m.kernels[0].source.sha256 = "0".repeat(64);
         m.reset_buffers.clear();
         assert!(m.validate().is_err());
+        assert!(m.validate_runtime().is_err());
     }
     #[test]
     fn rejects_invalid_histories_and_context_capacity() {
@@ -627,6 +679,8 @@ mod tests {
     fn selects_largest_compatible_plan_and_rejects_invalid_metadata() {
         let mut m = fixture();
         assert_eq!(m.select_prefill_plan(4).unwrap(), (2, "prefill", "head"));
+        m.prefill_plans.clear();
+        assert!(m.select_prefill_plan(4).is_err());
         m.buffers
             .iter_mut()
             .find(|b| b.name == "Input")

@@ -14,7 +14,8 @@ from orinfer_build.common.files import atomic_json, file_hash
 from orinfer_build.models.deepseek_v41.batch import compile_task, DTYPES
 from orinfer_build.models.deepseek_v41.assembly import publish_package, validate_rows
 from orinfer_build.contracts.row_selection import guarded_winner
-from orinfer_build.tuning.tuning import read_record, record_path
+from orinfer_build.tuning.ascend import kernel_entry, measurement_identity, verified_manifest
+from orinfer_build.tuning.tuning import read_record, record_path, write_record
 
 
 def attention_configs(parameters, *, gather_pipeline=False, scale_dma=False):
@@ -169,24 +170,16 @@ def select_plan(plan, output, device, minimum, model_dir=None):
         calls_per_replay=4,
         maximum_regression=0.1,
         minimum_gain=0.02,
-        helpers={
-            str(p): file_hash(p)
-            for p in [
-                Path(__file__),
-                Path("python/orinfer_build/tuning/tuning.py"),
-                Path("python/orinfer_build/contracts/row_selection.py"),
-                Path("python/orinfer_build/models/deepseek_v41/tune.py"),
-            ]
-        },
+        tuner_sha256=file_hash(Path(__file__)),
+        measurement=measurement_identity(),
     )
 
     def valid(record):
         return all(
-            file_hash((base / name).parent / spec["library"]["file"]) == spec["library"]["sha256"]
+            verified_manifest(base, name, expected=spec) is not None
             for name, spec in identity["kernels"].items()
         )
 
-    (output / "records").mkdir(parents=True, exist_ok=True)
     record = record_path(output / "records", identity)
     result = read_record(record, identity, valid)
     if result is None:
@@ -197,7 +190,7 @@ def select_plan(plan, output, device, minimum, model_dir=None):
             f16=torch.float16,
             f32=torch.float32,
         )
-        records, libraries, rejected = [], [], []
+        records, rejected = [], []
         legal_configs = set(configs)
         for group in groups:
             spec = identity["kernels"][group["baseline"]]
@@ -246,16 +239,7 @@ def select_plan(plan, output, device, minimum, model_dir=None):
                 states[config] = values
                 path = base / group["candidates"][config]
                 desc = identity["kernels"][group["candidates"][config]]
-                library = ctypes.CDLL(str((path.parent / desc["library"]["file"]).resolve()))
-                libraries.append(library)
-                entry = library.orinfer_ascend_kernel_v2
-                entry.argtypes = [
-                    ctypes.POINTER(ctypes.c_void_p),
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_void_p,
-                ]
-                entry.restype = ctypes.c_int32
+                entry = kernel_entry(path, desc["library"]["file"])
                 pointers = (ctypes.c_void_p * 4)(
                     work.data_ptr(), table.data_ptr(), active.data_ptr(), values["sink"].data_ptr()
                 )
@@ -388,7 +372,7 @@ def select_plan(plan, output, device, minimum, model_dir=None):
             torch.npu.empty_cache()
         selected = select_schedule(records)
         result = dict(identity=identity, measurements=records, selected=selected, rejected=rejected)
-        atomic_json(record, result)
+        write_record(record, result)
     selected = result["selected"]
     replacements = {g["baseline"]: g["candidates"][selected] for g in groups}
     for rank in model["ranks"]:

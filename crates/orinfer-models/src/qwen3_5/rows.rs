@@ -1,17 +1,17 @@
 //! Table-Q4A8: shared row computation with request-owned causal state.
 use super::config::Configuration;
 use crate::packet::append;
+use crate::{CreateRequest, CreatedPlan};
 use crate::{
     adapter::Adapter,
     artifact::{Access, Dtype, Result},
     execution::{BufferView, Invocation},
     model::{KvGrowth, Manifest, Operation, PrefillPlan, SegmentControls},
-    policy::Policy,
 };
 use orinfer_model_sdk::{
-    abi::{self, CreateRequest, CreatedPlan},
     architecture::{BatchLayout, BatchSegment},
     operators::rows::RowExecution,
+    packet,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -135,7 +135,7 @@ const HEAD: &[&str] = &["rotate", "project", "partials", "merge"];
 struct QwenRows {
     manifest: Manifest,
     private_roles: Vec<Option<String>>,
-    packet_kernels: Vec<crate::artifact::Kernel>,
+    operands: crate::packet::Operands,
 }
 fn private_roles(m: &Manifest) -> Vec<Option<String>> {
     let layout = m.batch_layout.as_ref().unwrap();
@@ -190,18 +190,21 @@ fn section(m: &mut Manifest, suffix: &str, names: &[&str]) -> Vec<Operation> {
     m.programs.insert(name, ops.clone());
     ops
 }
-fn validate_weights(
-    m: &Manifest,
-    config: &Configuration,
-    e8p: bool,
-    embedding_q4: bool,
-) -> Result<()> {
+fn validate_weights(m: &Manifest, config: &Configuration, embedding_q4: bool) -> Result<()> {
     let t = config.text();
     let map: BTreeMap<_, _> = m.buffers.iter().map(|b| (b.name.as_str(), b)).collect();
+    let check = |name: &str, dtype: Dtype, shape: &[usize], access: Access| -> Result<()> {
+        if map.get(name).is_none_or(|b| {
+            b.dtype != dtype
+                || b.shape != shape
+                || b.access != access
+                || b.data.is_some() != (access == Access::Read)
+        }) {
+            return Err(format!("Invalid Qwen buffer contract: {name}"));
+        }
+        Ok(())
+    };
     let gdn = m.gdn_execution.as_ref();
-    if !config.standard && gdn.is_none() {
-        return Err("Missing explicit Qwen GDN execution contract".into());
-    }
     if !chunked_gdn(m) && map.keys().any(|name| name.starts_with("GdnChunk")) {
         return Err("Chunkwise GDN buffers disagree with the execution contract".into());
     }
@@ -215,18 +218,12 @@ fn validate_weights(
     let staged = ["AttentionDecodedK", "AttentionDecodedV"];
     if staged.iter().any(|name| map.contains_key(name)) {
         for name in staged {
-            if map.get(name).is_none_or(|b| {
-                b.dtype != Dtype::F16
-                    || b.shape != [m.max_context, t.num_key_value_heads * t.head_dim]
-                    || b.data.is_some()
-                    || b.access != Access::ReadWrite
-                    || m.reset_buffers.iter().any(|reset| reset == name)
-                    || m.kv_cache
-                        .as_ref()
-                        .is_some_and(|kv| kv.buffers.contains_key(name))
-            }) {
-                return Err(format!("Invalid temporary attention workspace: {name}"));
-            }
+            check(
+                name,
+                Dtype::F16,
+                &[m.max_context, t.num_key_value_heads * t.head_dim],
+                Access::ReadWrite,
+            )?;
         }
     }
     if chunked_gdn(m) {
@@ -252,14 +249,7 @@ fn validate_weights(
                 vec![t.linear_num_value_heads, CAPACITY, 2],
             ),
         ] {
-            if map.get(name).is_none_or(|b| {
-                b.dtype != dtype
-                    || b.shape != shape
-                    || b.data.is_some()
-                    || b.access != Access::ReadWrite
-            }) {
-                return Err(format!("Invalid chunkwise GDN workspace: {name}"));
-            }
+            check(name, dtype, &shape, Access::ReadWrite)?;
         }
     }
     if deferred_gdn(m) {
@@ -294,15 +284,7 @@ fn validate_weights(
                 ),
             ] {
                 let name = format!("L{layer}_{suffix}");
-                if map.get(name.as_str()).is_none_or(|b| {
-                    b.dtype != dtype
-                        || b.shape != shape
-                        || b.data.is_some()
-                        || b.access != Access::ReadWrite
-                }) || !m.reset_buffers.contains(&name)
-                {
-                    return Err(format!("Invalid request-owned deferred GDN state: {name}"));
-                }
+                check(&name, dtype, &shape, Access::ReadWrite)?;
             }
         }
     }
@@ -326,14 +308,7 @@ fn validate_weights(
             ),
             ("MoeSum", Dtype::I32, CAPACITY * t.num_experts_per_tok),
         ] {
-            if map.get(name).is_none_or(|b| {
-                b.dtype != dtype
-                    || b.shape != [size]
-                    || b.data.is_some()
-                    || b.access != Access::ReadWrite
-            }) {
-                return Err(format!("Invalid E8P expert plane workspace: {name}"));
-            }
+            check(name, dtype, &[size], Access::ReadWrite)?;
         }
     }
     let cold_names = [
@@ -362,52 +337,31 @@ fn validate_weights(
             (cold_names[2], expert.shape.clone()),
             (cold_names[3], expert.shape.clone()),
         ] {
-            if map.get(name).is_none_or(|b| {
-                b.dtype != Dtype::I32
-                    || b.shape != shape
-                    || b.data.is_some()
-                    || b.access != Access::ReadWrite
-            }) {
-                return Err(format!("Invalid expert partition workspace: {name}"));
-            }
+            check(name, Dtype::I32, &shape, Access::ReadWrite)?;
         }
     }
-    let check = |name: String, dtype: Dtype, shape: Vec<usize>| -> Result<()> {
-        if map.get(name.as_str()).is_none_or(|b| {
-            b.dtype != dtype || b.shape != shape || b.access != Access::Read || b.data.is_none()
-        }) {
-            return Err(format!("Invalid Qwen Q4A8 operand: {name}"));
-        }
-        Ok(())
-    };
-    if e8p {
-        check("orinfer.e8p_q4.basis".into(), Dtype::I8, vec![256, 8])?;
-        check("orinfer.e8p_q4.selectors".into(), Dtype::U32, vec![256, 1])?;
-    }
+    let weight = |name: String, dtype, shape: Vec<usize>| check(&name, dtype, &shape, Access::Read);
+    weight("orinfer.e8p_q4.basis".into(), Dtype::I8, vec![256, 8])?;
+    weight("orinfer.e8p_q4.selectors".into(), Dtype::U32, vec![256, 1])?;
     let q4 = |name: String, n: usize, k: usize| -> Result<()> {
         if config
             .rotated_w8_layers
             .iter()
             .any(|layer| name.starts_with(&format!("model.language_model.layers.{layer}.")))
         {
-            check(format!("{name}.int8"), Dtype::I8, vec![n, k])?;
-            check(format!("{name}.scale"), Dtype::F16, vec![n])?;
+            weight(format!("{name}.int8"), Dtype::I8, vec![n, k])?;
+            weight(format!("{name}.scale"), Dtype::F16, vec![n])?;
             if map.contains_key(format!("{name}.packed").as_str()) {
                 return Err("Protected projection has duplicate compressed weights".into());
             }
             return Ok(());
         }
-        let (dtype, shape) = if e8p {
-            (Dtype::U32, vec![k / 128, n, 16])
-        } else {
-            (Dtype::U8, vec![n, k / 2])
-        };
         let packed = format!("{name}.packed");
-        check(packed.clone(), dtype, shape)?;
-        if e8p && map[packed.as_str()].layout != "e8p-q4-k128-u32" {
+        weight(packed.clone(), Dtype::U32, vec![k / 128, n, 16])?;
+        if map[packed.as_str()].layout != "e8p-q4-k128-u32" {
             return Err(format!("Invalid Qwen E8P physical layout: {packed}"));
         }
-        check(format!("{name}.scale"), Dtype::F16, vec![n])
+        weight(format!("{name}.scale"), Dtype::F16, vec![n])
     };
     let has_projection = |name: &str| {
         map.contains_key(format!("{name}.packed").as_str())
@@ -455,7 +409,7 @@ fn validate_weights(
             ] {
                 let name = format!("{p}.mlp.experts.{name}");
                 let packed = format!("{name}.packed");
-                check(
+                weight(
                     packed.clone(),
                     Dtype::U32,
                     vec![t.num_experts, k / 128, n, 16],
@@ -463,7 +417,7 @@ fn validate_weights(
                 if map[packed.as_str()].layout != "e8p-q4-k128-u32" {
                     return Err("Invalid Qwen MoE E8P bank layout".into());
                 }
-                check(format!("{name}.scale"), Dtype::F16, vec![t.num_experts, n])?;
+                weight(format!("{name}.scale"), Dtype::F16, vec![t.num_experts, n])?;
             }
         }
         let combined_qkv = format!("{p}.self_attn.qkv_proj.weight");
@@ -569,22 +523,14 @@ fn vision(m: &mut Manifest, depth: usize, hidden: usize) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate::registry::Built> {
-    if !matches!(request.architecture.as_str(), "qwen3_5" | "qwen3_asr")
-        || policy != Policy::Int8Quality
-    {
-        return Err("Unsupported Qwen row precision policy".into());
-    }
+pub(crate) fn create(mut request: CreateRequest) -> Result<crate::registry::Built> {
     let quant = &request.config["quantization_config"];
-    let e8p = match quant["quant_method"].as_str() {
-        Some("orinfer_q4_int8") => false,
-        Some("orinfer_e8p_q4_int8") => true,
-        _ => return Err("Unsupported Qwen Q4A8 codec".into()),
-    };
-    if e8p
-        && (quant["coefficients"] != serde_json::json!([4, 1])
-            || quant["basis_tensor"] != "orinfer.e8p_q4.basis"
-            || quant["layout"] != "u32-low-coarse-high-residual")
+    if quant["quant_method"] != "orinfer_e8p_q4_int8" {
+        return Err("Unsupported Qwen Q4A8 codec".into());
+    }
+    if quant["coefficients"] != serde_json::json!([4, 1])
+        || quant["basis_tensor"] != "orinfer.e8p_q4.basis"
+        || quant["layout"] != "u32-low-coarse-high-residual"
     {
         return Err("Unsupported Qwen E8P-Q4 encoding".into());
     }
@@ -600,7 +546,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     }
     let embedding_q4 = quant["embedding"] == "e8p_q4";
     for role in ["embedding", "vision"] {
-        if !quant[role].is_null() && (!e8p || quant[role] != "e8p_q4") {
+        if !quant[role].is_null() && quant[role] != "e8p_q4" {
             return Err(format!("Unsupported Qwen {role} precision"));
         }
     }
@@ -637,7 +583,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                 | (2048, 512, 40, 16, 2, 32, false)
         );
     let moe_geometry = if t.num_experts > 0 {
-        e8p && t.hidden_size == 2048
+        t.hidden_size == 2048
             && t.num_hidden_layers == 40
             && t.num_experts == 256
             && t.num_experts_per_tok == 8
@@ -666,7 +612,24 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         return Err("Expected dense Qwen compact 1..4096 row contract".into());
     }
     let m = &mut request.metadata;
-    validate_weights(m, &c, e8p, embedding_q4)?;
+    if !c.standard && m.gdn_execution.is_none() {
+        return Err("Missing explicit Qwen GDN execution contract".into());
+    }
+    if request.verify_weights || request.build_bindings {
+        validate_weights(m, &c, embedding_q4)?;
+    }
+    let staged_attention = m.buffers.iter().any(|b| b.name == "AttentionDecodedK");
+    if ["AttentionDecodedK", "AttentionDecodedV"]
+        .iter()
+        .any(|&name| {
+            m.reset_buffers.iter().any(|reset| reset == name)
+                || m.kv_cache
+                    .as_ref()
+                    .is_some_and(|kv| kv.buffers.contains_key(name))
+        })
+    {
+        return Err("Attention decode scratch cannot be request state".into());
+    }
     m.programs.clear();
     let begin = if m.vision.is_some() || m.audio.is_some() {
         vec!["prepare", "embedding", "overlay"]
@@ -703,10 +666,18 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             if gdn { PRE_GDN } else { PRE_ATTN },
         ));
         let mut private_names = if gdn { PRIVATE_GDN } else { PRIVATE_ATTN }.to_vec();
-        if !gdn && m.buffers.iter().any(|b| b.name == "AttentionDecodedK") {
+        if !gdn && staged_attention {
             private_names.insert(1, "attention_decode");
         }
         if gdn && deferred_gdn(m) {
+            for column in DEFERRED_COLUMNS {
+                let name = format!("L{layer}_{column}");
+                if !m.reset_buffers.contains(&name) {
+                    return Err(format!(
+                        "Missing reset for request-owned deferred GDN state: {name}"
+                    ));
+                }
+            }
             private_names.insert(3, "recurrent_materialize");
         }
         if gdn && chunked_gdn(m) {
@@ -796,7 +767,6 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         row_strides: strides,
         profiles: BTreeMap::from([(CAPACITY, "qwen_q4_rows".into())]),
         hidden: t.hidden_size,
-        small_mixed_shapes: vec![],
         segment_tokens: CAPACITY,
         state_columns,
         preparation_programs: BTreeMap::from([(1, "decode".into()), (CAPACITY, "prefill".into())]),
@@ -1057,19 +1027,18 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         .collect();
     crate::prefill::register(m, "prefill", stages, vec!["Hidden".into(), "R0".into()])?;
     let metadata = request.metadata;
+    #[cfg(test)]
+    if request.operands.is_empty() {
+        request.operands = crate::packet::Operands::from_kernels(&request.kernel_contracts);
+    }
     Ok((
         Box::new(QwenRows {
             private_roles: private_roles(&metadata),
             manifest: metadata.clone(),
-            packet_kernels: if metadata.packet_table().is_some() {
-                request.kernel_contracts
-            } else {
-                vec![]
-            },
+            operands: request.operands,
         }),
         CreatedPlan {
             metadata,
-            decode_programs: BTreeSet::from(["decode".into()]),
             expert_banks: vec![],
         },
     ))
@@ -1079,26 +1048,26 @@ impl Adapter for QwenRows {
     fn batch_operation(
         &self,
         segments: &[BatchSegment],
-        operation: abi::BatchOperation,
+        operation: packet::BatchOperation,
         include_plan: bool,
-    ) -> Result<abi::BatchPlan> {
+    ) -> Result<packet::BatchPlan> {
         let result = match operation {
-            abi::BatchOperation::Ordinary => self.packet(segments, None, include_plan),
-            abi::BatchOperation::Verification => self.packet(segments, Some(0), include_plan),
-            abi::BatchOperation::MixedRows { prefills }
+            packet::BatchOperation::Ordinary => self.packet(segments, None, include_plan),
+            packet::BatchOperation::Verification => self.packet(segments, Some(0), include_plan),
+            packet::BatchOperation::MixedRows { prefills }
                 if prefills > 0 && usize::from(prefills) < segments.len() =>
             {
                 self.packet(segments, Some(usize::from(prefills)), include_plan)
             }
-            abi::BatchOperation::Draft
-            | abi::BatchOperation::Warm
-            | abi::BatchOperation::DraftHead => {
+            packet::BatchOperation::Draft
+            | packet::BatchOperation::Warm
+            | packet::BatchOperation::DraftHead => {
                 mtp::draft(&self.manifest, segments, operation, include_plan)
             }
-            abi::BatchOperation::Commit => mtp::commit(&self.manifest, segments, include_plan),
+            packet::BatchOperation::Commit => mtp::commit(&self.manifest, segments, include_plan),
             _ => Err("Unsupported Qwen packet operation".into()),
         }?;
-        crate::packet::indirect(&self.manifest, segments, &self.packet_kernels, result)
+        crate::packet::indirect(&self.manifest, segments, &self.operands, result)
     }
     fn prepare(
         &self,
@@ -1121,7 +1090,7 @@ impl Adapter for QwenRows {
     fn visual(
         &self,
         tokens: &[u32],
-        images: &[abi::ImageGrid],
+        images: &[orinfer_model_sdk::architecture::ImageGrid],
         capacity: usize,
     ) -> Result<(Vec<i32>, Vec<u32>)> {
         crate::vision::layout(
@@ -1134,13 +1103,13 @@ impl Adapter for QwenRows {
             capacity,
         )
     }
-    fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<abi::BatchPlan> {
+    fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<packet::BatchPlan> {
         self.packet(segments, None, include_plan)
     }
 }
 
 impl QwenRows {
-    fn state_bindings(&self, segments: &[BatchSegment]) -> abi::StateBindings {
+    fn state_bindings(&self, segments: &[BatchSegment]) -> packet::StateBindings {
         let decoders: Vec<_> = segments.iter().filter(|s| s.tokens == 1).cloned().collect();
         if self
             .manifest
@@ -1170,7 +1139,7 @@ impl QwenRows {
         segments: &[BatchSegment],
         prefills: Option<usize>,
         include_plan: bool,
-    ) -> Result<abi::BatchPlan> {
+    ) -> Result<packet::BatchPlan> {
         let m = &self.manifest;
         let ordered: Vec<_> = if prefills.is_none() {
             segments
@@ -1570,7 +1539,7 @@ mod tests {
                 "source":{"file":"test","sha256":"0".repeat(64)},
                 "host_abi":{"file":"test","sha256":"0".repeat(64)}
             })).unwrap());
-            let (adapter, _) = create(request, Policy::Int8Quality).unwrap();
+            let (adapter, _) = create(request).unwrap();
             let mut count = None;
             for batch in [1, 2, 8, 128] {
                 let segments = (0..batch)
@@ -1680,7 +1649,7 @@ mod tests {
 
     #[test]
     fn pending_gdn_updates_are_private_and_materialized_before_dense_execution() {
-        let (adapter, plan) = create(deferred_request(), Policy::Int8Quality).unwrap();
+        let (adapter, plan) = create(deferred_request()).unwrap();
         let m = &plan.metadata;
         let names = |program: &str| {
             m.programs[program]
@@ -1717,7 +1686,7 @@ mod tests {
             s.as_ref()
                 .is_some_and(|(slot, name)| *slot == 3 && name == "L0_GdnLogDelta")
         }));
-        let (_, speculative) = create(with_mtp(deferred_request()), Policy::Int8Quality).unwrap();
+        let (_, speculative) = create(with_mtp(deferred_request())).unwrap();
         let verify = &speculative.metadata.programs["qwen_rows/verify/layer0/private"];
         let materialize = verify
             .iter()
@@ -1736,7 +1705,7 @@ mod tests {
         assert!(materialize < recurrent);
         let mut bad = deferred_request();
         bad.metadata.reset_buffers.retain(|n| n != "L0_GdnLogCount");
-        assert!(create(bad, Policy::Int8Quality).is_err());
+        assert!(create(bad).is_err());
         let mut bad = deferred_request();
         bad.metadata
             .buffers
@@ -1744,7 +1713,7 @@ mod tests {
             .find(|b| b.name == "L0_GdnLogDelta")
             .unwrap()
             .dtype = Dtype::F16;
-        assert!(create(bad, Policy::Int8Quality).is_err());
+        assert!(create(bad).is_err());
     }
 
     fn request_geometry(small: bool) -> CreateRequest {
@@ -1753,7 +1722,7 @@ mod tests {
         } else {
             (5120, 17408, 64, 48, 24, 4, false)
         };
-        dense_request(dimensions, small)
+        dense_request(dimensions)
     }
 
     #[test]
@@ -1771,7 +1740,7 @@ mod tests {
             }
             request
         };
-        let (_, plan) = create(staged(), Policy::Int8Quality).unwrap();
+        let (_, plan) = create(staged()).unwrap();
         let private = &plan.metadata.programs["qwen_rows/layer3/private"];
         let roles = private
             .iter()
@@ -1799,28 +1768,28 @@ mod tests {
             .metadata
             .buffers
             .retain(|b| b.name != "AttentionDecodedV");
-        assert!(create(missing, Policy::Int8Quality).is_err());
+        assert!(create(missing).is_err());
         let mut request = staged();
         request
             .metadata
             .reset_buffers
             .push("AttentionDecodedK".into());
-        assert!(create(request, Policy::Int8Quality).is_err());
+        assert!(create(request).is_err());
     }
 
     #[test]
     fn gdn_execution_is_required_and_cannot_be_inferred_from_buffers() {
         let mut missing = request();
         missing.metadata.gdn_execution = None;
-        assert!(create(missing, Policy::Int8Quality).is_err());
+        assert!(create(missing).is_err());
         let mut mismatch = deferred_request();
         mismatch.metadata.gdn_execution.as_mut().unwrap().decode =
             orinfer_model_sdk::operators::gdn::Decode::Dense;
-        assert!(create(mismatch, Policy::Int8Quality).is_err());
+        assert!(create(mismatch).is_err());
         let mut capacity = deferred_request();
         capacity.metadata.gdn_execution.as_mut().unwrap().decode =
             orinfer_model_sdk::operators::gdn::Decode::Deferred { capacity: 4 };
-        assert!(create(capacity, Policy::Int8Quality).is_err());
+        assert!(create(capacity).is_err());
     }
 
     #[test]
@@ -1839,7 +1808,7 @@ mod tests {
                     .unwrap(),
                 );
             }
-            let (adapter, _) = create(request, Policy::Int8Quality).unwrap();
+            let (adapter, _) = create(request).unwrap();
             let segments = [
                 BatchSegment { slot: 7, tokens: 1 },
                 BatchSegment { slot: 2, tokens: 1 },
@@ -1863,7 +1832,7 @@ mod tests {
 
     #[test]
     fn chunked_gdn_prefill_preserves_sequential_decode_and_verification() {
-        let mut request = with_mtp(dense_request((2048, 6144, 24, 16, 8, 2, true), true));
+        let mut request = with_mtp(dense_request((2048, 6144, 24, 16, 8, 2, true)));
         request.metadata.gdn_execution.as_mut().unwrap().prefill =
             orinfer_model_sdk::operators::gdn::Prefill::Chunked;
         for (name, dtype, width) in [
@@ -1883,8 +1852,8 @@ mod tests {
         let mut invalid: CreateRequest =
             serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
         invalid.metadata.buffers.retain(|b| b.name != "GdnChunkG");
-        assert!(create(invalid, Policy::Int8Quality).is_err());
-        let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
+        assert!(create(invalid).is_err());
+        let (adapter, plan) = create(request).unwrap();
         let names = |program: &str| {
             plan.metadata.programs[program]
                 .iter()
@@ -1924,8 +1893,8 @@ mod tests {
 
     #[test]
     fn four_billion_reuses_tied_dense_row_and_mtp_programs() {
-        let request = with_mtp(dense_request((2560, 9216, 32, 32, 16, 4, true), true));
-        let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
+        let request = with_mtp(dense_request((2560, 9216, 32, 32, 16, 4, true)));
+        let (adapter, plan) = create(request).unwrap();
         let layout = plan.metadata.batch_layout.as_ref().unwrap();
         assert_eq!(layout.hidden, 2560);
         assert_eq!(plan.metadata.prefill_plans[0].stages.len(), 32);
@@ -1944,41 +1913,26 @@ mod tests {
 
     fn dense_request(
         (h, f, layers, hv, qh, kvh, tied): (usize, usize, usize, usize, usize, usize, bool),
-        e8p: bool,
     ) -> CreateRequest {
-        let mut config = json!({"model_type":"qwen3_5","text_config":{"hidden_size":h,
+        let config = json!({"model_type":"qwen3_5","text_config":{"hidden_size":h,
             "intermediate_size":f,"num_hidden_layers":layers,"vocab_size":248320,
             "linear_num_key_heads":16,"linear_num_value_heads":hv,"linear_key_head_dim":128,
             "linear_value_head_dim":128,"linear_conv_kernel_dim":4,
             "num_attention_heads":qh,"num_key_value_heads":kvh,"head_dim":256,"tie_word_embeddings":tied,
             "layer_types":(0..layers).map(|i|if i%4==3 {"full_attention"} else {"linear_attention"}).collect::<Vec<_>>()},
-            "quantization_config":{"quant_method":"orinfer_q4_int8","version":1,"rotation":"signed-block128",
-            "scale":"fp16-output-row","compute_dtype":"int8_quality"}});
-        if e8p {
-            config["quantization_config"]["quant_method"] = json!("orinfer_e8p_q4_int8");
-            config["quantization_config"]["coefficients"] = json!([4, 1]);
-            config["quantization_config"]["basis_tensor"] = json!("orinfer.e8p_q4.basis");
-            config["quantization_config"]["layout"] = json!("u32-low-coarse-high-residual");
-            config["quantization_config"]["embedding"] = json!("e8p_q4");
-        }
+            "quantization_config":{"quant_method":"orinfer_e8p_q4_int8","version":1,"rotation":"signed-block128",
+            "scale":"fp16-output-row","compute_dtype":"int8_quality","coefficients":[4,1],
+            "basis_tensor":"orinfer.e8p_q4.basis","layout":"u32-low-coarse-high-residual","embedding":"e8p_q4"}});
         let signature = Configuration::parse(config.clone()).unwrap().signature;
         let mut buffers = vec![];
         let mut q4 = |name: String, n: usize, k: usize| {
             for (suffix, dtype, shape) in [
-                (
-                    "packed",
-                    if e8p { "u32" } else { "u8" },
-                    if e8p {
-                        vec![k / 128, n, 16]
-                    } else {
-                        vec![n, k / 2]
-                    },
-                ),
+                ("packed", "u32", vec![k / 128, n, 16]),
                 ("scale", "f16", vec![n]),
             ] {
                 buffers.push(
                     json!({"name":format!("{name}.{suffix}"),"dtype":dtype,"shape":shape,
-                    "layout":if e8p && suffix=="packed" {"e8p-q4-k128-u32"} else {"native_contiguous"},"alignment":256,"access":"read",
+                    "layout":if suffix=="packed" {"e8p-q4-k128-u32"} else {"native_contiguous"},"alignment":256,"access":"read",
                     "data":{"tensor":format!("{name}.{suffix}"),"sha256":"0".repeat(64)}}),
                 );
             }
@@ -1993,7 +1947,7 @@ mod tests {
             248320,
             h,
         );
-        if e8p && !tied {
+        if !tied {
             q4("model.language_model.embed_tokens.weight".into(), 248320, h);
         }
         for i in 0..layers {
@@ -2017,17 +1971,15 @@ mod tests {
                 q4(format!("{p}.{name}.weight"), *n, h);
             }
         }
-        if e8p {
-            for (name, dtype, shape) in [
-                ("basis", "i8", vec![256, 8]),
-                ("selectors", "u32", vec![256, 1]),
-            ] {
-                buffers.push(
-                    json!({"name":format!("orinfer.e8p_q4.{name}"),"dtype":dtype,"shape":shape,
-                    "layout":"native_contiguous","alignment":256,"access":"read",
-                    "data":{"tensor":format!("orinfer.e8p_q4.{name}"),"sha256":"0".repeat(64)}}),
-                );
-            }
+        for (name, dtype, shape) in [
+            ("basis", "i8", vec![256, 8]),
+            ("selectors", "u32", vec![256, 1]),
+        ] {
+            buffers.push(
+                json!({"name":format!("orinfer.e8p_q4.{name}"),"dtype":dtype,"shape":shape,
+                "layout":"native_contiguous","alignment":256,"access":"read",
+                "data":{"tensor":format!("orinfer.e8p_q4.{name}"),"sha256":"0".repeat(64)}}),
+            );
         }
         buffers.extend([
             json!({"name":"Hidden","dtype":"f16","shape":[4096,h],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
@@ -2036,7 +1988,7 @@ mod tests {
             json!({"name":"QwenRowScratch","dtype":"u8","shape":[256],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
         ]);
         serde_json::from_value(json!({"config":config,"expected_signature":signature,
-            "architecture":"qwen3_5","compute_policy":"int8_quality",
+            "architecture":"qwen3_5","compute_policy":"int8_quality","build_bindings":true,
             "prefill_profiles":[{"tokens":4096,"min_tokens":1,"kind":"qwen_q4_rows"}],
             "metadata":{"gdn_execution":{"prefill":"sequential","decode":{"kind":"dense"}},"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,"max_context":262144,
                 "vocab":248320,"toolchain":{},"buffers":buffers,"reset_buffers":["Step"],"input":"Input","token":"Token",
@@ -2049,7 +2001,7 @@ mod tests {
 
     #[test]
     fn moe_reuses_dense_causal_rows_with_compressed_expert_banks() {
-        let mut request = dense_request((2048, 512, 40, 32, 16, 2, false), true);
+        let mut request = dense_request((2048, 512, 40, 32, 16, 2, false));
         request.config["model_type"] = json!("qwen3_5_moe");
         for (key, value) in [
             ("num_experts", 256),
@@ -2097,7 +2049,7 @@ mod tests {
             .unwrap(),
         );
         let copied = serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
-        let (adapter, plan) = create(with_mtp(copied), Policy::Int8Quality).unwrap();
+        let (adapter, plan) = create(with_mtp(copied)).unwrap();
         assert_eq!(plan.metadata.prefill_plans[0].stages.len(), 40);
         let post = &plan.metadata.programs["qwen_rows/layer0/post"];
         assert!(
@@ -2114,7 +2066,7 @@ mod tests {
                     BatchSegment { slot: 7, tokens: 3 },
                     BatchSegment { slot: 2, tokens: 2 },
                 ],
-                abi::BatchOperation::Warm,
+                packet::BatchOperation::Warm,
                 true,
             )
             .unwrap();
@@ -2152,7 +2104,7 @@ mod tests {
             );
         }
         let copied = serde_json::from_value(serde_json::to_value(&planes).unwrap()).unwrap();
-        let (_, plan) = create(with_mtp(copied), Policy::Int8Quality).unwrap();
+        let (_, plan) = create(with_mtp(copied)).unwrap();
         let post = &plan.metadata.programs["qwen_rows/layer0/post"];
         for role in ["expert_up", "expert_down"] {
             let index = |suffix: &str| {
@@ -2184,7 +2136,7 @@ mod tests {
             );
         }
         let copied = serde_json::from_value(serde_json::to_value(&partition).unwrap()).unwrap();
-        let (_, plan) = create(with_mtp(copied), Policy::Int8Quality).unwrap();
+        let (_, plan) = create(with_mtp(copied)).unwrap();
         let post = &plan.metadata.programs["qwen_rows/layer0/post"];
         for role in ["expert_up", "expert_down"] {
             let index = |suffix: &str| {
@@ -2204,20 +2156,20 @@ mod tests {
             .metadata
             .buffers
             .retain(|b| b.name != "MoeColdTileRow");
-        assert!(create(partition, Policy::Int8Quality).is_err());
+        assert!(create(partition).is_err());
         planes.metadata.buffers.retain(|b| b.name != "MoeSum");
-        assert!(create(planes, Policy::Int8Quality).is_err());
+        assert!(create(planes).is_err());
         request
             .metadata
             .buffers
             .retain(|b| !b.name.ends_with("layers.0.mlp.experts.down_proj.scale"));
-        assert!(create(request, Policy::Int8Quality).is_err());
+        assert!(create(request).is_err());
     }
 
     #[test]
     fn medium_dense_reuses_rows_with_separate_embedding_and_head_banks() {
-        let request = dense_request((4096, 12288, 32, 32, 16, 4, false), true);
-        let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
+        let request = dense_request((4096, 12288, 32, 32, 16, 4, false));
+        let (adapter, plan) = create(request).unwrap();
         let m = &plan.metadata;
         assert_eq!(m.prefill_plans[0].stages.len(), 32);
         let layout = m.batch_layout.as_ref().unwrap();
@@ -2237,17 +2189,17 @@ mod tests {
             )
             .unwrap();
         assert!(calls.iter().any(|c| c.sequence == Some(5)));
-        let mut wrong = dense_request((4096, 12288, 32, 32, 16, 4, false), true);
+        let mut wrong = dense_request((4096, 12288, 32, 32, 16, 4, false));
         wrong
             .metadata
             .buffers
             .retain(|b| b.name != "lm_head.weight.scale");
-        assert!(create(wrong, Policy::Int8Quality).is_err());
+        assert!(create(wrong).is_err());
     }
 
     #[test]
     fn small_dense_reuses_row_state_and_tied_head_without_duplicate_weight() {
-        let (adapter, plan) = create(request_geometry(true), Policy::Int8Quality).unwrap();
+        let (adapter, plan) = create(request_geometry(true)).unwrap();
         let m = &plan.metadata;
         assert_eq!(m.prefill_plans[0].stages.len(), 24);
         let layout = m.batch_layout.as_ref().unwrap();
@@ -2269,7 +2221,7 @@ mod tests {
             .metadata
             .buffers
             .retain(|b| b.name != "model.language_model.embed_tokens.weight.scale");
-        assert!(create(wrong, Policy::Int8Quality).is_err());
+        assert!(create(wrong).is_err());
     }
 
     #[test]
@@ -2307,45 +2259,19 @@ mod tests {
 
     #[test]
     fn two_stage_codec_reuses_rows_and_rejects_scalar_storage() {
-        let candidate = || {
-            let mut r = request();
-            r.config["quantization_config"]["quant_method"] = json!("orinfer_e8p_q4_int8");
-            r.config["quantization_config"]["coefficients"] = json!([4, 1]);
-            r.config["quantization_config"]["basis_tensor"] = json!("orinfer.e8p_q4.basis");
-            r.config["quantization_config"]["layout"] = json!("u32-low-coarse-high-residual");
-            r.expected_signature = Configuration::parse(r.config.clone()).unwrap().signature;
-            for b in &mut r.metadata.buffers {
-                if b.name.ends_with(".packed") {
-                    b.dtype = Dtype::U32;
-                    b.shape = vec![b.shape[1] * 2 / 128, b.shape[0], 16];
-                    b.layout = "e8p-q4-k128-u32".into();
-                }
-            }
-            for (name, dtype, shape) in [
-                ("orinfer.e8p_q4.basis", "i8", vec![256, 8]),
-                ("orinfer.e8p_q4.selectors", "u32", vec![256, 1]),
-            ] {
-                r.metadata.buffers.push(
-                    serde_json::from_value(json!({
-                        "name": name, "dtype": dtype, "shape": shape,
-                        "layout": "native_contiguous", "alignment": 256, "access": "read",
-                        "data": {"tensor": name, "sha256": "0".repeat(64)}
-                    }))
-                    .unwrap(),
-                );
-            }
-            r
-        };
-        let (adapter, _) = create(candidate(), Policy::Int8Quality).unwrap();
+        let (adapter, _) = create(request()).unwrap();
         assert!(
             adapter
                 .batch(&[BatchSegment { slot: 0, tokens: 1 }], false)
                 .is_ok()
         );
-        let mut wrong = candidate();
+        let mut wrong = request();
+        wrong.config["quantization_config"]["quant_method"] = json!("orinfer_q4_int8");
+        assert!(create(wrong).is_err());
+        let mut wrong = request();
         wrong.metadata.buffers[0].dtype = Dtype::U8;
-        assert!(create(wrong, Policy::Int8Quality).is_err());
-        let mut wrong = candidate();
+        assert!(create(wrong).is_err());
+        let mut wrong = request();
         let packed = wrong
             .metadata
             .buffers
@@ -2353,8 +2279,8 @@ mod tests {
             .find(|b| b.name.ends_with(".packed"))
             .unwrap();
         packed.layout = "e8p-q4-row-u32".into();
-        assert!(create(wrong, Policy::Int8Quality).is_err());
-        let mut wrong = candidate();
+        assert!(create(wrong).is_err());
+        let mut wrong = request();
         let packed = wrong
             .metadata
             .buffers
@@ -2362,15 +2288,15 @@ mod tests {
             .find(|b| b.name.ends_with(".packed"))
             .unwrap();
         packed.shape.swap(0, 1);
-        assert!(create(wrong, Policy::Int8Quality).is_err());
-        let mut wrong = candidate();
+        assert!(create(wrong).is_err());
+        let mut wrong = request();
         wrong.config["quantization_config"]["coefficients"] = json!([3, 1]);
-        assert!(create(wrong, Policy::Int8Quality).is_err());
+        assert!(create(wrong).is_err());
     }
 
     #[test]
     fn mixed_rows_share_computation_without_padding_and_keep_private_owners() {
-        let (adapter, plan) = create(request(), Policy::Int8Quality).unwrap();
+        let (adapter, plan) = create(request()).unwrap();
         let segments = [
             BatchSegment { slot: 7, tokens: 1 },
             BatchSegment {
@@ -2415,15 +2341,15 @@ mod tests {
             .unwrap()
             .state_columns
             .clear();
-        assert!(create(r, Policy::Int8Quality).is_err());
+        assert!(create(r).is_err());
         let mut r = request();
         r.metadata.batch_layout.as_mut().unwrap().state_columns[0] = "DifferentHistory".into();
-        assert!(create(r, Policy::Int8Quality).is_err());
+        assert!(create(r).is_err());
     }
 
     #[test]
     fn stages_preserve_the_full_forward_and_only_shared_live_values() {
-        let (_, plan) = create(request(), Policy::Int8Quality).unwrap();
+        let (_, plan) = create(request()).unwrap();
         let m = plan.metadata;
         let p = &m.prefill_plans[0];
         assert_eq!(p.stages.len(), 64);
@@ -2495,7 +2421,7 @@ mod tests {
             }
         }
         r.metadata.buffers.push(serde_json::from_value(json!({"name":"QwenCommitPointers","dtype":"u64","shape":[128*layers*8],"layout":"native_contiguous","alignment":256,"access":"read_write"})).unwrap());
-        let (a, plan) = create(r, Policy::Int8Quality).unwrap();
+        let (a, plan) = create(r).unwrap();
         assert_eq!(
             plan.metadata
                 .mtp
@@ -2513,7 +2439,7 @@ mod tests {
             },
         ];
         let (calls, bindings) = a
-            .batch_operation(&segments, abi::BatchOperation::Commit, true)
+            .batch_operation(&segments, packet::BatchOperation::Commit, true)
             .unwrap();
         assert!(calls.iter().all(|c| c.sequence.is_none()));
         assert!(calls.iter().any(|c|matches!(&c.operation,Operation::Kernel{name} if name=="qwen_rows/commit/layer0/state")));
@@ -2529,7 +2455,7 @@ mod tests {
 
     #[test]
     fn mixed_roles_are_explicit_and_verification_heads_keep_all_positions() {
-        let (a, _) = create(mtp_request(), Policy::Int8Quality).unwrap();
+        let (a, _) = create(mtp_request()).unwrap();
         // Equal lengths have different semantics; they cannot identify roles.
         let segments = [
             BatchSegment { slot: 7, tokens: 2 },
@@ -2538,7 +2464,7 @@ mod tests {
         let (calls, _) = a
             .batch_operation(
                 &segments,
-                abi::BatchOperation::MixedRows { prefills: 1 },
+                packet::BatchOperation::MixedRows { prefills: 1 },
                 true,
             )
             .unwrap();
@@ -2553,7 +2479,7 @@ mod tests {
         assert!(
             a.batch_operation(
                 &segments,
-                abi::BatchOperation::MixedRows { prefills: 0 },
+                packet::BatchOperation::MixedRows { prefills: 0 },
                 true
             )
             .is_err()
@@ -2561,7 +2487,7 @@ mod tests {
         assert!(
             a.batch_operation(
                 &[BatchSegment { slot: 1, tokens: 1 }],
-                abi::BatchOperation::Verification,
+                packet::BatchOperation::Verification,
                 true
             )
             .is_err()
@@ -2570,7 +2496,7 @@ mod tests {
 
     #[test]
     fn indirect_packet_rebinds_owners_and_preserves_scalar_launches_and_views() {
-        let (_, built) = create(mtp_request(), Policy::Int8Quality).unwrap();
+        let (_, built) = create(mtp_request()).unwrap();
         let mut m = built.metadata;
         m.packet_table = Some(serde_json::from_value(json!({
             "buffer":"PacketPointers", "columns":["State","SequenceLogits"],
@@ -2653,7 +2579,7 @@ mod tests {
             crate::packet::indirect(
                 m,
                 &segments,
-                &contracts,
+                &crate::packet::Operands::from_kernels(&contracts),
                 (plan, vec![Some((slots[0], "ExistingState".into()))]),
             )
             .unwrap()
@@ -2689,13 +2615,13 @@ mod tests {
 
     #[test]
     fn draft_warm_joins_projections_and_keeps_conditions_private() {
-        let (a, _) = create(mtp_request(), Policy::Int8Quality).unwrap();
+        let (a, _) = create(mtp_request()).unwrap();
         let segments = [
             BatchSegment { slot: 7, tokens: 3 },
             BatchSegment { slot: 3, tokens: 2 },
         ];
         let (calls, _) = a
-            .batch_operation(&segments, abi::BatchOperation::Warm, true)
+            .batch_operation(&segments, packet::BatchOperation::Warm, true)
             .unwrap();
         let fc: Vec<_> = calls
             .iter()
@@ -2713,7 +2639,7 @@ mod tests {
             BatchSegment { slot: 3, tokens: 1 },
         ];
         let (head, _) = a
-            .batch_operation(&endpoints, abi::BatchOperation::DraftHead, true)
+            .batch_operation(&endpoints, packet::BatchOperation::DraftHead, true)
             .unwrap();
         assert!(!head.iter().any(
             |c| matches!(&c.operation,Operation::Kernel{name} if name=="qwen_rows/mtp/final_norm")
@@ -2723,7 +2649,7 @@ mod tests {
 
     #[test]
     fn invalid_packet_and_unquantized_operands_fail_before_execution() {
-        let (adapter, _) = create(request(), Policy::Int8Quality).unwrap();
+        let (adapter, _) = create(request()).unwrap();
         for segments in [
             vec![],
             vec![BatchSegment { slot: 1, tokens: 0 }],
@@ -2740,12 +2666,12 @@ mod tests {
         }
         let mut wrong = request();
         wrong.metadata.buffers[0].dtype = Dtype::F16;
-        assert!(create(wrong, Policy::Int8Quality).is_err());
+        assert!(create(wrong).is_err());
         let mut wrong = request();
         wrong.prefill_profiles[0].min_tokens = 0;
-        assert!(create(wrong, Policy::Int8Quality).is_err());
+        assert!(create(wrong).is_err());
         let mut wrong = request();
         wrong.config["quantization_config"]["rotation"] = json!("none");
-        assert!(create(wrong, Policy::Int8Quality).is_err());
+        assert!(create(wrong).is_err());
     }
 }

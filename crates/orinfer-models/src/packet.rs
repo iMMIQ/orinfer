@@ -1,11 +1,54 @@
 //! Common row invocation binding; model programs retain their arithmetic order.
 use crate::{
-    artifact::Result,
+    artifact::{Argument, Kernel, Result},
     execution::{BufferView, Invocation},
     model::{Manifest, Operation},
 };
-use orinfer_model_sdk::{abi::StateBindings, architecture::BatchSegment};
+use orinfer_model_sdk::{architecture::BatchSegment, packet::StateBindings};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Operand names used to bind and filter views before publishing a packet.
+#[derive(Default)]
+pub struct Operands(BTreeMap<String, Vec<Argument>>);
+
+impl Operands {
+    pub(crate) fn from_kernels(kernels: &[Kernel]) -> Self {
+        Self(
+            kernels
+                .iter()
+                .map(|k| (k.name.clone(), k.args.clone()))
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn arguments(&self, name: &str) -> Result<&[Argument]> {
+        self.0
+            .get(name)
+            .map(Vec::as_slice)
+            .ok_or_else(|| format!("Missing packet binding {name}"))
+    }
+
+    fn filter_views(&self, plan: &mut [Invocation]) {
+        for call in plan {
+            if call.views.is_empty() {
+                continue;
+            }
+            call.views.retain(|role, _| match &call.operation {
+                Operation::Kernel { name } => self.0.get(name).is_none_or(|args| {
+                    args.iter().any(|arg| matches!(arg,
+                        Argument::Buffer { name } | Argument::BufferSlice { name, .. } if name == role))
+                }),
+                Operation::Copy { source, destination, .. } => role == source || role == destination,
+                Operation::Zero { destination, .. } => role == destination,
+            });
+        }
+    }
+}
 
 /// Publish wrapped operands through one common program/export boundary.
 pub(crate) fn register_indirect(m: &mut Manifest) {
@@ -34,12 +77,18 @@ pub(crate) fn register_indirect(m: &mut Manifest) {
 pub(crate) fn indirect(
     m: &Manifest,
     segments: &[BatchSegment],
-    contracts: &[crate::artifact::Kernel],
-    (mut plan, mut bindings): orinfer_model_sdk::abi::BatchPlan,
-) -> Result<orinfer_model_sdk::abi::BatchPlan> {
+    operands: &Operands,
+    (mut plan, mut bindings): orinfer_model_sdk::packet::BatchPlan,
+) -> Result<orinfer_model_sdk::packet::BatchPlan> {
     let Some(table) = m.packet_table() else {
+        operands.filter_views(&mut plan);
         return Ok((plan, bindings));
     };
+    let roles: Vec<_> = table.columns.iter().cloned().map(Some).collect();
+    bindings.extend(private_bindings(segments, segments.len(), &roles));
+    if plan.is_empty() {
+        return Ok((plan, bindings));
+    }
     let stride = table
         .columns
         .len()
@@ -50,14 +99,7 @@ pub(crate) fn indirect(
         .enumerate()
         .map(|(i, s)| (s.slot, i))
         .collect();
-    let kernels: BTreeMap<_, _> = contracts.iter().map(|k| (k.name.as_str(), k)).collect();
-    let arguments = |name: &str| -> Result<Vec<crate::artifact::Argument>> {
-        if let Some(kernel) = kernels.get(name) {
-            Ok(kernel.args.clone())
-        } else {
-            crate::bindings::kernel_arguments(name)
-        }
-    };
+    let arguments = |name: &str| operands.arguments(name);
     for call in &mut plan {
         let Some(owner) = call.sequence else { continue };
         if call.views.iter().any(|(name, view)| {
@@ -84,8 +126,8 @@ pub(crate) fn indirect(
                     let mapping = if let Some(mapping) = table.scalar_arguments.get(name) {
                         mapping.clone()
                     } else {
-                        let before = scalar_indices(&arguments(name)?);
-                        let after = scalar_indices(&arguments(target)?);
+                        let before = scalar_indices(arguments(name)?);
+                        let after = scalar_indices(arguments(target)?);
                         if before.len() != after.len() {
                             return Err("Missing indirect scalar ABI mapping".into());
                         }
@@ -172,8 +214,7 @@ pub(crate) fn indirect(
         }
         call.sequence = None;
     }
-    let roles: Vec<_> = table.columns.iter().cloned().map(Some).collect();
-    bindings.extend(private_bindings(segments, segments.len(), &roles));
+    operands.filter_views(&mut plan);
     Ok((plan, bindings))
 }
 

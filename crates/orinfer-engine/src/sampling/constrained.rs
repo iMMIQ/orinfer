@@ -128,6 +128,15 @@ impl Decoder {
         result
     }
     pub fn law(&mut self, logits: &[f32], history: &[u32], options: &Options) -> Result<Law> {
+        options.validate()?;
+        self.law_validated(logits, history, options)
+    }
+    pub(crate) fn law_validated(
+        &mut self,
+        logits: &[f32],
+        history: &[u32],
+        options: &Options,
+    ) -> Result<Law> {
         let mask = match self.constraint.as_mut().map(|c| c.mask()).transpose() {
             Ok(mask) => mask,
             Err(error) => {
@@ -268,13 +277,26 @@ pub fn verify(
     step: usize,
     vocab: usize,
 ) -> Result<Vec<u32>> {
+    options.validate()?;
+    verify_validated(proposals, logits, history, options, decoder, step, vocab)
+}
+
+pub(crate) fn verify_validated(
+    proposals: &[crate::mtp::Proposal],
+    logits: &[f32],
+    history: &[u32],
+    options: &Options,
+    decoder: &mut Decoder,
+    step: usize,
+    vocab: usize,
+) -> Result<Vec<u32>> {
     if vocab == 0 || logits.len() < (proposals.len() + 1) * vocab {
         return Err("Invalid constrained verification logits".into());
     }
     let mut history = history.to_vec();
     let mut committed = vec![];
     for i in 0..=proposals.len() {
-        let law = decoder.law(&logits[i * vocab..(i + 1) * vocab], &history, options)?;
+        let law = decoder.law_validated(&logits[i * vocab..(i + 1) * vocab], &history, options)?;
         let (token, rejected) = if let Some(q) = proposals.get(i) {
             let qx = q.distribution.probability(q.token);
             if qx <= 0.0 {

@@ -1,10 +1,10 @@
 //! Checkpoint-exact shared ViT and Flash visual embedding/MRoPE roles.
 use super::plan::section;
+use crate::CreateRequest;
 use crate::{
     artifact::Result,
     model::{Manifest, Operation},
 };
-use orinfer_model_sdk::abi::CreateRequest;
 use std::collections::BTreeMap;
 
 pub(super) fn validate(request: &CreateRequest) -> Result<()> {

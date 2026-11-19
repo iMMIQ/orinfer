@@ -13,7 +13,13 @@ import math
 from pathlib import Path
 
 from orinfer_build.common.files import atomic_json, source_hash
-from orinfer_build.tuning.tuning import compile_candidates, measure, read_record, record_path
+from orinfer_build.tuning.tuning import (
+    compile_candidates,
+    measure,
+    read_record,
+    record_path,
+    write_record,
+)
 
 from orinfer_build.contracts.projection_policy import (
     q4_configs,
@@ -291,24 +297,23 @@ class ProjectionTuner:
         record = read_record(
             cached, identity, lambda r: r["config"] in configs and r["checked_rows"]
         )
-        if record is not None:
-            kernel = tilelang.compile(
-                make_prim(spec, record["config"]),
+        cache_hit = record is not None
+
+        def compile_config(config):
+            return tilelang.compile(
+                make_prim(spec, config),
                 out_idx=[],
                 execution_backend="nvrtc",
                 target=TARGET,
                 pass_configs=passes,
             )
+
+        if record is not None:
+            kernel = compile_config(record["config"])
         elif dynamic:
             candidates, legal, rejected = compile_candidates(
                 configs,
-                lambda cfg: tilelang.compile(
-                    make_prim(spec, cfg),
-                    out_idx=[],
-                    execution_backend="nvrtc",
-                    target=TARGET,
-                    pass_configs=passes,
-                ),
+                compile_config,
                 tolerate_failures=True,
             )
             invalid = set()
@@ -366,7 +371,6 @@ class ProjectionTuner:
             for live in checked:
                 self._validate(kernel, spec, record["config"], live, weights)
             record["checked_rows"] = checked
-            atomic_json(cached, record)
         else:
             supply, reference, check = self._inputs(spec, sample, weights)
             tuner = AutoTuner.from_kernel(factory(dict(spec, tuning_identity=key)), configs)
@@ -397,7 +401,8 @@ class ProjectionTuner:
                 self._validate(kernel, spec, record["config"], live, weights)
                 checked.append(live)
             record["checked_rows"] = checked
-            atomic_json(cached, record)
+        if not cache_hit:
+            write_record(cached, record)
         self.results[key] = record
         atomic_json(self.output / "tuning.json", list(self.results.values()))
         return kernel, record

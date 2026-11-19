@@ -4,6 +4,8 @@ import hashlib
 import json
 import math
 
+from orinfer_build.common.files import atomic_json
+
 
 def record_path(root, identity):
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -18,6 +20,27 @@ def read_record(path, identity, validate=lambda record: True):
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return None
+
+
+def write_record(path, record):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(path, record)
+
+
+def geometric_mean(values):
+    return math.exp(sum(map(math.log, values)) / len(values))
+
+
+def lowest_total_latency(records, candidates):
+    return min(candidates, key=lambda candidate: sum(row["times"][candidate] for row in records))
+
+
+def retain_valid_timings(records, invalid):
+    """A failed validation excludes a candidate at every measured row."""
+    for record in records:
+        record["times"] = {
+            key: ms for key, ms in record["times"].items() if int(key) not in invalid
+        }
 
 
 def compile_candidates(configs, build, *, tolerate_failures=False):
@@ -37,7 +60,13 @@ def compile_candidates(configs, build, *, tolerate_failures=False):
     return kernels, legal, rejected
 
 
-def measure(run, *, budget_ms, max_repetitions, change=None, check=None, benchmark=None):
+def measure(
+    run, *, budget_ms, max_repetitions, change=None, check=None, benchmark=None, check_initial=False
+):
+    if check_initial:
+        run()
+        check()
+
     if benchmark is None:
         from orinfer_build.compiler.cuda.common import benchmark
 

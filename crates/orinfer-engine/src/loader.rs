@@ -43,26 +43,31 @@ pub(crate) struct PreparedModel {
     pub architecture: Architecture,
     pub policy: ComputePolicy,
     pub frontend_assets: BTreeMap<String, String>,
-    pub decode_programs: std::collections::BTreeSet<String>,
-    pub expert_banks: Vec<orinfer_model_sdk::abi::ExpertBank>,
-    pub execution_model: crate::model_package::ModelPackage,
+    pub expert_banks: Vec<orinfer_model_sdk::architecture::ExpertBank>,
+    pub execution_model: Box<dyn orinfer_models::Adapter>,
+    pub plan_kernel_contracts: std::collections::BTreeSet<String>,
 }
 
 pub(crate) fn load(path: &Path, verify_weights: bool) -> Result<PreparedModel> {
-    load_impl(path, verify_weights, false, true)
+    load_impl(path, verify_weights, false, true, true)
 }
 pub(crate) fn load_with_experts(
     path: &Path,
     verify_weights: bool,
     expert_contracts: bool,
 ) -> Result<PreparedModel> {
-    load_impl(path, verify_weights, expert_contracts, false)
+    load_impl(path, verify_weights, expert_contracts, false, true)
 }
+pub(crate) fn load_direct_packets(path: &Path) -> Result<PreparedModel> {
+    load_impl(path, false, false, true, false)
+}
+
 fn load_impl(
     path: &Path,
     verify_weights: bool,
     expert_contracts: bool,
     build_bindings: bool,
+    indirect_packets: bool,
 ) -> Result<PreparedModel> {
     let descriptor = crate::model::resolve_manifest(path)?;
     let weights_root = descriptor
@@ -79,6 +84,14 @@ fn load_impl(
     if !model.metadata.kernels.is_empty() || !model.metadata.programs.is_empty() {
         return Err("Expected custom model descriptor without embedded kernels or programs".into());
     }
+    if !indirect_packets {
+        model.metadata.packet_table = None;
+        if let Some(spec) = &mut model.metadata.mtp {
+            spec.packet_table = None;
+            spec.batch_programs
+                .retain(|program| program != "mtp_packet_indirect");
+        }
+    }
     if verify_weights {
         validate_frontend_assets(root, &model.frontend_assets)?;
     }
@@ -94,12 +107,14 @@ fn load_impl(
     }
     let package: ExecutionPackage = serde_json::from_slice(&package_raw)
         .map_err(|e| format!("Model execution package: {e}"))?;
+    if package.target != model.metadata.target {
+        return Err("Model descriptor target differs from execution package".into());
+    }
     package.validate(
         &model.architecture,
         &model.compute_policy,
         &model.metadata.buffers,
     )?;
-    validate_scopes(&model.metadata, &model.buffer_scopes)?;
     model
         .metadata
         .batch_profiles
@@ -112,30 +127,42 @@ fn load_impl(
     model.metadata.batch_gdn = package.batch_gdn;
     // Fork/join order belongs to the native model implementation.
     model.metadata.graph_branches.clear();
-    let (execution_model, built) = crate::model_package::ModelPackage::create(
-        &kernel_root,
-        &package.execution,
-        orinfer_model_sdk::abi::CreateRequest {
-            catalog: Some(package.catalog),
+    let bindings = package.read_bindings(&kernel_root, verify_weights)?;
+    let plan_kernel_contracts = if build_bindings {
+        bindings.plan_contracts.clone()
+    } else {
+        Default::default()
+    };
+    let (execution_model, built) = orinfer_models::create(
+        orinfer_models::CreateRequest {
             expert_contracts,
             build_bindings,
             kernel_contracts: vec![],
-            model_root: root.display().to_string(),
+            operands: Default::default(),
+            model_root: root.to_owned(),
             verify_weights,
             config,
             architecture: model.architecture.clone(),
             compute_policy: model.compute_policy.clone(),
-            expected_signature: package.config_signature.clone(),
+            expected_signature: package.config_signature,
             metadata: model.metadata,
             prefill_profiles: package.prefill_profiles,
         },
+        bindings,
     )?;
     model.metadata = built.metadata;
+    if model.metadata.target != package.target {
+        return Err("Native execution plan target differs from execution package".into());
+    }
     validate_scopes(&model.metadata, &model.buffer_scopes)?;
-    let decode_programs = built.decode_programs;
     let expert_banks = built.expert_banks;
-    validate_dynamic_contracts(&model.metadata, build_bindings)?;
-    model.metadata.validate()?;
+    let exhaustive = verify_weights || build_bindings;
+    validate_dynamic_contracts(&model.metadata, exhaustive)?;
+    if exhaustive {
+        model.metadata.validate()?;
+    } else {
+        model.metadata.validate_runtime()?;
+    }
     // The declared package identity pins the compiled plan and config signature.
     // Loading consumes that identity; validate-model verifies its contents.
     let fingerprint = model.execution_package.clone();
@@ -149,9 +176,9 @@ fn load_impl(
         architecture: model.architecture,
         policy: model.compute_policy,
         frontend_assets: model.frontend_assets,
-        decode_programs,
         expert_banks,
         execution_model,
+        plan_kernel_contracts,
     })
 }
 
@@ -268,35 +295,19 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
 }
 
 fn validate_dynamic_contracts(model: &Manifest, exhaustive_rows: bool) -> Result<()> {
-    let kernels: BTreeMap<_, _> = model.kernels.iter().map(|k| (k.name.as_str(), k)).collect();
-    let mut row_contracts = std::collections::BTreeSet::new();
-    for (name, template) in &model.dynamic_batch_kernels {
-        if name != &template.name {
-            return Err("Dynamic launch name differs from binding".into());
-        }
-        template.validate_binding(
-            kernels
-                .get(name.as_str())
-                .ok_or("Missing dynamic batch kernel")?,
-        )?;
-        // Plans used by the offline builder and validate-model check the entire
-        // domain once per expression contract, rather than once per model layer.
-        if exhaustive_rows
-            && row_contracts.insert((template.capacity, &template.grid, &template.arguments))
-        {
-            template.validate_rows()?;
-        }
-    }
     if !model.dynamic_batch_kernels.is_empty()
-        && ((!model.batch_profiles.contains(&128) && model.row_execution.is_none())
-            || kernels
-                .keys()
-                .filter(|name| {
-                    name.starts_with("batch_m128/") || name.starts_with("batch_gdn_m128/")
-                })
-                .any(|name| !model.dynamic_batch_kernels.contains_key(*name)))
+        && !model.batch_profiles.contains(&128)
+        && model.row_execution.is_none()
     {
         return Err("Incomplete dynamic batch contracts".into());
+    }
+    if exhaustive_rows {
+        let mut row_contracts = std::collections::BTreeSet::new();
+        for template in model.dynamic_batch_kernels.values() {
+            if row_contracts.insert((template.capacity, &template.grid, &template.arguments)) {
+                template.validate_rows()?;
+            }
+        }
     }
     Ok(())
 }
@@ -367,10 +378,18 @@ mod tests {
             .insert(template.name.clone(), template);
         manifest.kernels.push(binding);
         validate_dynamic_contracts(&manifest, true).unwrap();
-        manifest.kernels[1].args[0] = crate::artifact::Argument::I32 { value: 127 };
-        for exhaustive in [false, true] {
-            assert!(validate_dynamic_contracts(&manifest, exhaustive).is_err());
+        for binding in &manifest.kernels {
+            manifest.dynamic_batch_kernels[&binding.name]
+                .validate_binding(binding)
+                .unwrap();
         }
+        manifest.kernels[1].args[0] = crate::artifact::Argument::I32 { value: 127 };
+        let binding = &manifest.kernels[1];
+        assert!(
+            manifest.dynamic_batch_kernels[&binding.name]
+                .validate_binding(binding)
+                .is_err()
+        );
     }
 
     #[test]

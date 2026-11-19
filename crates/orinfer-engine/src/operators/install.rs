@@ -1,6 +1,6 @@
-//! Install existing schema-1 archives without Python, CUDA or loading native code.
+//! Install CUDA and Ascend execution archives on CPU.
 use super::ExecutionPackage;
-use crate::artifact::{AssetReader, Result, sha256};
+use crate::artifact::{Result, sha256};
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -48,11 +48,7 @@ fn install_inner(archive: &Path, cache: &Path) -> Result<InstalledPackage> {
             return Err("Unsafe archive path".into());
         };
         let digest = name.to_str().ok_or("Malformed package digest")?;
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if !crate::artifact::is_sha256_hex(digest) {
             return Err("Malformed package digest".into());
         }
         if root.as_deref().is_some_and(|previous| previous != digest) {
@@ -69,7 +65,6 @@ fn install_inner(archive: &Path, cache: &Path) -> Result<InstalledPackage> {
         if !entry.unpack_in(staging.path()).map_err(|e| e.to_string())? {
             return Err("Unsafe archive path".into());
         }
-        // Packages contain data and dlopen libraries, not standalone executables.
         // Ignore archive permissions so even mode-000 directories remain removable.
         fs::set_permissions(
             staging.path().join(path),
@@ -108,24 +103,11 @@ fn validate(root: &Path, digest: &str) -> Result<()> {
     }
     let package: ExecutionPackage = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
     package.validate_metadata()?;
-    let execution = &package.execution;
-    if execution.abi_version != super::RUNTIME_ABI
-        || execution.package.is_empty()
-        || execution.version.is_empty()
-        || execution.library.tensor.is_some()
-    {
-        return Err("Incompatible native execution library identity or ABI".into());
-    }
-    let mut reader = AssetReader::default();
-    let target = orinfer_device::Target::from_package(&package.target)?;
-    crate::model_package::validate_library(
-        &reader.read(root, &execution.library)?,
-        &target.host_arch,
-    )?;
+    let bindings = package.read_bindings(root, true)?;
     let mut checked = BTreeSet::new();
-    for asset in &package.catalog.assets {
-        if checked.insert((asset.key(), &asset.sha256)) {
-            reader.read(root, asset)?;
+    for template in bindings.dynamic.values() {
+        if checked.insert((template.capacity, &template.grid, &template.arguments)) {
+            template.validate_rows()?;
         }
     }
     Ok(())

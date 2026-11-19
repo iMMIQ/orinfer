@@ -44,7 +44,10 @@ def config():
         model_type="qwen3_5",
         text_config=text,
         quantization_config=dict(
-            quant_method="orinfer_q4_int8",
+            quant_method="orinfer_e8p_q4_int8",
+            coefficients=[4, 1],
+            basis_tensor="orinfer.e8p_q4.basis",
+            layout="u32-low-coarse-high-residual",
             version=1,
             rotation="signed-block128",
             scale="fp16-output-row",
@@ -476,7 +479,7 @@ class BuildTests(unittest.TestCase):
         builder.weights = SimpleNamespace(
             immutable=lambda n: n, packed_k=128, index={"weight_map": {}}, buffers={}
         )
-        builder.q4_codec, builder.book = "e8p_q4", "book"
+        builder.book = "book"
         launches = []
         builder.emit = lambda name, key, build, bindings, rows, **options: launches.append(bindings)
         builder.projection(
@@ -638,7 +641,6 @@ class BuildTests(unittest.TestCase):
         builder.weights = SimpleNamespace(
             immutable=lambda name: name, packed_k=128, index={"weight_map": {}}, buffers={}
         )
-        builder.q4_codec = "e8p_q4"
         builder.book = "selectors"
         builder.lock = None
         builder.compile_projection = lambda *args, **kw: [("/rows/5-7", {"block_m": 8}, object())]
@@ -668,7 +670,7 @@ class BuildTests(unittest.TestCase):
         builder.weights = SimpleNamespace(
             immutable=lambda name: name, packed_k=128, index={"weight_map": {}}, buffers={}
         )
-        builder.q4_codec, builder.book = "e8p_q4", "selectors"
+        builder.book = "selectors"
         keys = []
         builder.emit = lambda name, key, *args, **kwargs: keys.append(key)
         for stride in (None, 64, 68):
@@ -683,7 +685,7 @@ class BuildTests(unittest.TestCase):
         builder.weights = SimpleNamespace(
             immutable=lambda name: name, packed_k=128, index={"weight_map": {}}, buffers={}
         )
-        builder.q4_codec, builder.book, builder.lock = "e8p_q4", "selectors", None
+        builder.book, builder.lock = "selectors", None
         builder.emit = lambda *args, **kwargs: None
         with patch.object(builder, "compile_projection", return_value=[]) as compile:
             for weight, stride in [("layer0", None), ("layer1", None), ("layer2", 68)]:
@@ -693,14 +695,9 @@ class BuildTests(unittest.TestCase):
     def test_two_stage_codec_has_an_explicit_contract(self):
         candidate = config()
         quant = candidate["quantization_config"]
-        quant.update(
-            quant_method="orinfer_e8p_q4_int8",
-            coefficients=[4, 1],
-            basis_tensor="orinfer.e8p_q4.basis",
-            layout="u32-low-coarse-high-residual",
-        )
         self.assertEqual(configuration(candidate, 8192)["hidden_size"], 5120)
         for key, value in [
+            ("quant_method", "orinfer_q4_int8"),
             ("coefficients", [3, 1]),
             ("coefficients", [4.0, 1.0]),
             ("basis_tensor", "other"),

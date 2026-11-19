@@ -1,6 +1,6 @@
 //! Resolve immutable model bindings once per stable decode cohort.
 use super::{Result, sequence::Sequence};
-use orinfer_model_sdk::abi::StateBindings;
+use orinfer_model_sdk::packet::StateBindings;
 use std::{
     collections::{BTreeSet, VecDeque},
     rc::Rc,

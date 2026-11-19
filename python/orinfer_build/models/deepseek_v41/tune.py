@@ -18,11 +18,23 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from orinfer_build.tuning.ascend import npu_benchmark
 from orinfer_build.common.files import atomic_json, file_hash
 from orinfer_build.models.deepseek_v41.assembly import unit_scale_manifests
 from orinfer_build.contracts.row_selection import bounded_choices, guarded_winner, samples
-from orinfer_build.tuning.tuning import compile_candidates, measure, read_record, record_path
+from orinfer_build.tuning.ascend import (
+    kernel_entry,
+    measurement_identity,
+    npu_benchmark,
+    verified_manifest,
+)
+from orinfer_build.tuning.tuning import (
+    compile_candidates,
+    measure,
+    read_record,
+    record_path,
+    retain_valid_timings,
+    write_record,
+)
 
 
 def projection_configs(
@@ -329,34 +341,24 @@ def tune(args: Options):
             published_manifest=old,
             published_descriptor_sha256=file_hash(base / old),
             tuner_sha256=file_hash(Path(__file__)),
+            measurement=measurement_identity(),
             assembly_sha256=file_hash(Path(__file__).with_name("assembly.py")),
             geometry_sha256=file_hash(ROOT / "python/orinfer_build/contracts/ascend/geometry.py"),
-            selection_sha256=file_hash(ROOT / "python/orinfer_build/contracts/row_selection.py"),
         )
         record = record_path(args.output, identity)
 
         def valid_record(record):
             names = {record["manifest"]} | {p for v in record["variants"] for p in v["kernels"]}
-            if record.get("unchanged"):
-                return (
-                    record["manifest"] == old
-                    and record["variants"] == identity["existing_small_rows"]
-                    and all(
-                        (descriptor := json.loads((base / name).read_text()))["library"]["sha256"]
-                        == file_hash((base / name).parent / "kernel.so")
-                        for name in names
-                    )
-                )
-            for name in names:
-                selected = base / name
-                descriptor = json.loads(selected.read_text())
-                if not (
-                    descriptor["source_sha256"] == current["source_sha256"]
-                    and descriptor["compiler"] == current["compiler"]
-                    and descriptor["library"]["sha256"] == file_hash(selected.parent / "kernel.so")
-                ):
-                    return False
-            return True
+            unchanged = record.get("unchanged")
+            if unchanged and (
+                record["manifest"] != old or record["variants"] != identity["existing_small_rows"]
+            ):
+                return False
+            return all(
+                verified_manifest(base, name, compiled_like=None if unchanged else current)
+                is not None
+                for name in names
+            )
 
         cached = read_record(record, identity, valid_record)
         if cached is not None:
@@ -375,16 +377,7 @@ def tune(args: Options):
             )
         if not legal or legal[0] != baseline:
             raise ValueError("The validated baseline did not compile")
-        libraries = [ctypes.CDLL(str(path.parent / "kernel.so")) for path in paths]
-        entries = [lib.orinfer_ascend_kernel_v2 for lib in libraries]
-        for entry in entries:
-            entry.argtypes = [
-                ctypes.POINTER(ctypes.c_void_p),
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-            ]
-            entry.restype = ctypes.c_int32
+        entries = [kernel_entry(path) for path in paths]
         n, k = parameters["output"], parameters["reduction"]
         integer = parameters["integer"]
         activation = (
@@ -456,10 +449,9 @@ def tune(args: Options):
                     expected.neg_()
 
                 try:
-                    run()
-                    check()
                     timing = measure(
                         run,
+                        check_initial=True,
                         budget_ms=2,
                         max_repetitions=32,
                         change=change,
@@ -482,8 +474,7 @@ def tune(args: Options):
                     continue
                 times[str(i)] = timing
             measurements.append(dict(rows=rows, times=times))
-        for sample in measurements:
-            sample["times"] = {k: v for k, v in sample["times"].items() if int(k) not in invalid}
+        retain_valid_timings(measurements, invalid)
         selected = int(guarded_winner(measurements, maximum_regression=args.maximum_regression))
         chosen = str(paths[selected].relative_to(base))
         variants = [
@@ -513,7 +504,7 @@ def tune(args: Options):
             variants=variants,
             unchanged=unchanged,
         )
-        atomic_json(record, result)
+        write_record(record, result)
         replacements[old] = chosen
         selections.pop(old, None)
         if variants:

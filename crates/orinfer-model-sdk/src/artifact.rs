@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 pub type Result<T> = std::result::Result<T, String>;
 
+/// Validate the canonical lowercase hexadecimal spelling of a SHA-256 digest.
+pub fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileIdentity {

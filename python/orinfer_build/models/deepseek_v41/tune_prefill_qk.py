@@ -1,15 +1,20 @@
 """Select live KV traversal for large prefill with exact scores and Graph checks."""
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
 import ctypes
 import json
-import multiprocessing
 from pathlib import Path
 
 from orinfer_build.common.files import atomic_json, file_hash
 from orinfer_build.contracts.row_selection import aggregate_winner
-from orinfer_build.tuning.tuning import measure, read_record, record_path
+from orinfer_build.tuning.ascend import kernel_entry, measurement_identity, verified_manifest
+from orinfer_build.tuning.tuning import (
+    measure,
+    read_record,
+    record_path,
+    retain_valid_timings,
+    write_record,
+)
 
 
 def main():
@@ -21,7 +26,7 @@ def main():
     parser.add_argument("--compile-workers", type=int, default=6)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    from orinfer_build.models.deepseek_v41.build import compile_task
+    from orinfer_build.models.deepseek_v41.build import compile_plan_tasks
 
     model = json.loads(args.plan.read_text())
     base = args.plan.parent
@@ -70,13 +75,7 @@ def main():
                 )
     if not geometries:
         raise ValueError("Missing large-prefill QK template")
-    compiled = {}
-    with ProcessPoolExecutor(
-        max_workers=args.compile_workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        for placeholder, path in pool.map(compile_task, [(task, str(base)) for task in tasks]):
-            compiled[placeholder] = path
-            print(dict(compiled=len(compiled), total=len(tasks)), flush=True)
+    compiled = compile_plan_tasks(tasks, base, args.compile_workers, progress="compiled")
     for geometry in geometries.values():
         geometry["paths"].extend(compiled[p] for p in geometry.pop("placeholders"))
     atomic_json(args.output / "candidates.json", geometries)
@@ -104,17 +103,15 @@ def main():
             samples=[512, capacity],
             device=torch.npu.get_device_name(args.device),
             tuner_sha256=file_hash(Path(__file__)),
+            measurement=measurement_identity(),
             seed=20261002,
         )
         record = record_path(args.output, identity)
 
         def valid(result):
-            chosen = base / result["manifest"]
-            return (
-                chosen.is_file()
-                and result["manifest"] in paths
-                and file_hash(chosen.parent / "kernel.so")
-                == json.loads(chosen.read_text())["library"]["sha256"]
+            chosen = result["manifest"]
+            return chosen in paths and verified_manifest(
+                base, chosen, expected=identity["descriptors"][paths.index(chosen)]
             )
 
         cached = read_record(record, identity, valid)
@@ -138,19 +135,7 @@ def main():
             positions.data_ptr(),
             expected.data_ptr(),
         )
-        libraries, entries = [], []
-        for path in paths:
-            library = ctypes.CDLL(str((base / path).parent / "kernel.so"))
-            libraries.append(library)
-            entry = library.orinfer_ascend_kernel_v2
-            entry.argtypes = [
-                ctypes.POINTER(ctypes.c_void_p),
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-            ]
-            entry.restype = ctypes.c_int32
-            entries.append(entry)
+        entries = [kernel_entry(base / path) for path in paths]
         records, rejected, invalid = [], [], set()
         for rows in sorted({1, 17, 512, 513, 2047, capacity}):
             if rows > capacity:
@@ -215,10 +200,9 @@ def main():
                         torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
                     try:
-                        run()
-                        check()
                         timing = measure(
                             run,
+                            check_initial=True,
                             budget_ms=4,
                             max_repetitions=16,
                             change=change,
@@ -251,8 +235,7 @@ def main():
                     ),
                     flush=True,
                 )
-        for row in records:
-            row["times"] = {k: v for k, v in row["times"].items() if int(k) not in invalid}
+        retain_valid_timings(records, invalid)
         winner = int(aggregate_winner(records))
         result = dict(
             identity=identity,
@@ -261,7 +244,7 @@ def main():
             config=geometry["configs"][winner],
             manifest=paths[winner],
         )
-        atomic_json(record, result)
+        write_record(record, result)
         replacements[old_path] = paths[winner]
         torch.npu.empty_cache()
         print(dict(selected=geometry["configs"][winner], manifest=paths[winner]), flush=True)

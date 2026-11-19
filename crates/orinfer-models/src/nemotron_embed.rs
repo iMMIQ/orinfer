@@ -1,15 +1,13 @@
 //! Nemotron 3.5: independent bidirectional text and Pixtral embedding programs.
-use crate::{adapter::Adapter, artifact::Result, model::Operation, policy::Policy};
-use orinfer_model_sdk::{
-    abi::{self, CreateRequest, CreatedPlan},
-    architecture::BatchSegment,
-};
+use crate::{CreateRequest, CreatedPlan};
+use crate::{adapter::Adapter, artifact::Result, model::Operation};
+use orinfer_model_sdk::{architecture::BatchSegment, packet};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 struct Embedding;
 impl Adapter for Embedding {
-    fn batch(&self, _: &[BatchSegment], _: bool) -> Result<abi::BatchPlan> {
+    fn batch(&self, _: &[BatchSegment], _: bool) -> Result<packet::BatchPlan> {
         Err("Embedding requests execute complete bidirectional sequences independently".into())
     }
 }
@@ -165,11 +163,8 @@ fn validate_config(config: &Value, signature: &Value) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::registry::Built> {
-    if request.architecture != "nemotron_embed"
-        || policy != Policy::Int8Quality
-        || !request.prefill_profiles.is_empty()
-    {
+pub(crate) fn create(request: CreateRequest) -> Result<crate::registry::Built> {
+    if request.architecture != "nemotron_embed" || !request.prefill_profiles.is_empty() {
         return Err("Unsupported Nemotron embedding execution contract".into());
     }
     validate_config(&request.config, &request.expected_signature)?;
@@ -365,7 +360,6 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
         CreatedPlan {
             expert_banks: vec![],
             metadata: m,
-            decode_programs: BTreeSet::new(),
         },
     ))
 }

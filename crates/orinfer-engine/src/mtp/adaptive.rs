@@ -1,7 +1,8 @@
 //! Shared speculation decisions and actual-loss accounting. Backends own legal plans and execution resources.
 mod budget;
-use crate::execution::MAX_MTP_DRAFTS;
+use crate::{execution::MAX_MTP_DRAFTS, scheduler::Timing};
 pub(crate) use budget::Budget;
+use std::collections::BTreeMap;
 pub(crate) const REFRESH_AFTER: usize = 512;
 pub(crate) const HOT_SAMPLES: usize = 3;
 pub(crate) const CALIBRATION_ROUNDS: usize = HOT_SAMPLES + 1;
@@ -48,28 +49,44 @@ impl Acceptance {
         }
     }
     pub(crate) fn rate(&self, position: usize, prior: f64) -> f64 {
-        if position < MAX_MTP_DRAFTS && self.samples[position] > 0 {
-            self.probability[position]
-        } else {
-            prior
-        }
+        self.samples
+            .get(position)
+            .filter(|&&samples| samples > 0)
+            .map_or(prior, |_| self.probability[position])
     }
     #[cfg(test)]
     pub(crate) fn sample_counts(&self) -> &[usize] {
         &self.samples
     }
-    pub(crate) fn estimate(&self, position: usize, prior: f64) -> f64 {
-        self.rate(position, prior)
-    }
     pub(crate) fn expected(&self, drafts: usize) -> f64 {
-        let mut prefix = 1.;
-        let mut total = 1.;
-        for j in 0..drafts.min(MAX_MTP_DRAFTS) {
-            // The neutral prior enters once, at conditional EMA initialization.
-            prefix *= self.estimate(j, 0.7);
-            total += prefix;
-        }
-        total
+        prefix_survival((0..drafts.min(MAX_MTP_DRAFTS)).map(|i| self.rate(i, 0.7)))
+            .fold(1., |total, prefix| total + prefix)
+    }
+}
+
+/// Convert conditional acceptance into the probability of keeping each prefix.
+pub(crate) fn prefix_survival(rates: impl Iterator<Item = f64>) -> impl Iterator<Item = f64> {
+    rates.scan(1., |prefix, rate| {
+        *prefix *= rate;
+        Some(*prefix)
+    })
+}
+
+pub(crate) fn ema(old: f64, sample: f64) -> f64 {
+    old * 0.8 + sample * 0.2
+}
+
+pub(crate) fn evict_oldest<K: Copy + Ord, V>(
+    entries: &mut BTreeMap<K, V>,
+    incoming: K,
+    capacity: usize,
+    last_used: impl Fn(&V) -> usize,
+) {
+    if entries.len() == capacity
+        && !entries.contains_key(&incoming)
+        && let Some((&victim, _)) = entries.iter().min_by_key(|(_, value)| last_used(value))
+    {
+        entries.remove(&victim);
     }
 }
 
@@ -98,14 +115,13 @@ impl Measurement {
         self.warm_ready && self.preparation_s == 0.
     }
     pub(crate) fn valid(self) -> bool {
-        self.seconds.is_finite()
-            && self.seconds > 0.
-            && self.preparation_s.is_finite()
-            && self.preparation_s >= 0.
+        valid_duration(self.seconds, self.preparation_s)
     }
 }
 
-pub(crate) use crate::scheduler::Timing;
+pub(crate) fn valid_duration(seconds: f64, preparation_s: f64) -> bool {
+    seconds.is_finite() && seconds > 0. && preparation_s.is_finite() && preparation_s >= 0.
+}
 
 #[derive(Default)]
 pub(crate) struct Cost {
@@ -122,6 +138,12 @@ impl Cost {
     pub fn upper(&self) -> f64 {
         self.time.upper() + self.overhead
     }
+    pub(crate) fn measured(&self) -> Option<&Self> {
+        (self.time.samples() > 0).then_some(self)
+    }
+    pub(crate) fn calibrated(&self) -> bool {
+        self.time.samples() >= HOT_SAMPLES
+    }
     pub(crate) fn observe(&mut self, measurement: Measurement, call: usize) {
         self.last = call;
         let extra = if measurement.warm_ready
@@ -134,7 +156,7 @@ impl Cost {
         };
         // Draft catch-up is already priced once by transition_s. Only resource
         // preparation of an otherwise warm invocation belongs in steady cost.
-        self.overhead = self.overhead * 0.8 + extra * 0.2;
+        self.overhead = ema(self.overhead, extra);
         if !measurement.warm_ready {
             // Before any hot sample, the observed round is a conservative
             // upper bound on its transition. It must still price the next
@@ -144,7 +166,7 @@ impl Cost {
             } else {
                 0.
             };
-            self.transition_s = self.transition_s * 0.8 + (measurement.seconds - hot).max(0.) * 0.2;
+            self.transition_s = ema(self.transition_s, (measurement.seconds - hot).max(0.));
         }
         if measurement.is_steady() && measurement.tokens > 0 {
             self.time.observe(measurement.seconds);
@@ -182,6 +204,7 @@ pub(crate) struct Selection {
 pub(crate) struct Decision {
     pub id: usize,
     pub exploring: bool,
+    pub calibrating: bool,
 }
 /// Pure scoring. A decision neither earns credit nor spends the startup pool.
 pub(crate) fn select(input: Selection, candidates: &[Candidate]) -> Option<Decision> {
@@ -286,6 +309,7 @@ pub(crate) fn select(input: Selection, candidates: &[Candidate]) -> Option<Decis
                     Decision {
                         id: c.id,
                         exploring: true,
+                        calibrating: missing > 0,
                     },
                     rank,
                 ));
@@ -296,6 +320,7 @@ pub(crate) fn select(input: Selection, candidates: &[Candidate]) -> Option<Decis
         (best.0 != usize::MAX).then_some(Decision {
             id: best.0,
             exploring: false,
+            calibrating: false,
         })
     })
 }

@@ -187,11 +187,11 @@ fn validate_visual_capacity_and_compact_inputs() {
         // Each operation has one registered plan per membership/row shape.
         // Keep target and draft captures in their actual runtime roles.
         let operation = if kernel.name.contains("/mtp/") || kernel.name.contains("/warm/") {
-            orinfer_model_sdk::abi::BatchOperation::Warm
+            orinfer_model_sdk::packet::BatchOperation::Warm
         } else if kernel.name.contains("mtp_verify/") {
-            orinfer_model_sdk::abi::BatchOperation::Verification
+            orinfer_model_sdk::packet::BatchOperation::Verification
         } else {
-            orinfer_model_sdk::abi::BatchOperation::Ordinary
+            orinfer_model_sdk::packet::BatchOperation::Ordinary
         };
         for replay in 0..3 {
             let values = [0.25 + replay as f32 * 0.125, -0.5];

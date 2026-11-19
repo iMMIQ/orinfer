@@ -153,7 +153,7 @@ fn history_tail(history: &[u32]) -> &[u32] {
 
 impl Inputs {
     pub(super) fn open(
-        root: &str,
+        root: &Path,
         identity: &crate::artifact::FileIdentity,
         verify_weights: bool,
     ) -> Result<Self> {
@@ -268,7 +268,7 @@ fn digest(file: &mut File) -> Result<String> {
 }
 
 fn validate_rows(file: &mut File, part: &Part, width: usize, verify_weights: bool) -> Result<()> {
-    if part.sha256.len() != 64 || !part.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !crate::artifact::is_sha256_hex(&part.sha256.to_ascii_lowercase()) {
         return Err("Invalid CPU row shard hash".into());
     }
     // SAFETY: Prepared assets remain immutable while open. Only the container
@@ -303,14 +303,14 @@ fn validate_rows(file: &mut File, part: &Part, width: usize, verify_weights: boo
 }
 impl Lookup {
     pub(super) fn open(
-        root: &str,
+        root: &Path,
         identity: &crate::artifact::FileIdentity,
         verify_weights: bool,
     ) -> Result<Self> {
         if identity.tensor.is_some() {
             return Err("CPU input metadata must be a standalone file".into());
         }
-        let root = Path::new(root).canonicalize().map_err(|e| e.to_string())?;
+        let root = root.canonicalize().map_err(|e| e.to_string())?;
         let raw = std::fs::read(path(&root, &identity.file)?).map_err(|e| e.to_string())?;
         if verify_weights && hex::encode(Sha256::digest(&raw)) != identity.sha256 {
             return Err("CPU input metadata hash mismatch".into());
@@ -958,7 +958,7 @@ mod tests {
         let golden = std::env::var("ORINFER_FLASH_GOLDEN").unwrap();
         let raw = std::fs::read(Path::new(&root).join("cache/cpu/inputs.json")).unwrap();
         let inputs = Inputs::open(
-            &root,
+            Path::new(&root),
             &crate::artifact::FileIdentity {
                 file: "cache/cpu/inputs.json".into(),
                 tensor: None,

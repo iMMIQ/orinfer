@@ -317,6 +317,9 @@ impl Timing {
             // The first use may capture a graph or load a lazy CUDA module.
             self.time = Default::default();
         }
+        self.observe_recurring(seconds);
+    }
+    fn observe_recurring(&mut self, seconds: f64) {
         self.time.observe(seconds);
         self.trials += 1;
     }

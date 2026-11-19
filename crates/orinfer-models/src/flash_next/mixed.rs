@@ -14,14 +14,13 @@ const HEAD_RESIDUAL: &str = "FlashMixedHeadResidual";
 pub(super) fn register(m: &mut Manifest) -> Result<()> {
     let layout = m.batch_layout.as_ref().ok_or("Missing Flash layout")?;
     if layout.profiles.is_empty() {
-        if !m.prefill_batch_profiles.is_empty() || !layout.small_mixed_shapes.is_empty() {
+        if !m.prefill_batch_profiles.is_empty() {
             return Err("Incomplete Flash mixed batch layout".into());
         }
         return Ok(());
     }
     let shapes_valid = layout.segment_tokens == 512
         && layout.profiles.keys().copied().collect::<Vec<_>>() == [512]
-        && layout.small_mixed_shapes.is_empty()
         && m.prefill_batch_profiles
             .iter()
             .map(|p| p.tokens)
@@ -73,11 +72,12 @@ pub(super) fn mixed_rows_plan(
     m: &Manifest,
     segments: &[BatchSegment],
     prefills: usize,
+    include_plan: bool,
 ) -> Result<Vec<Invocation>> {
     if prefills == 0 || prefills >= segments.len() {
         return Err("Invalid mixed role boundary".into());
     }
-    plan_kind(m, segments, Kind::MixedRows(prefills))
+    plan_kind(m, segments, Kind::MixedRows(prefills), include_plan)
 }
 
 fn append(
@@ -99,19 +99,21 @@ fn append(
 }
 
 pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
-    plan_kind(m, segments, Kind::Ordinary)
+    plan_kind(m, segments, Kind::Ordinary, true)
 }
 
 pub(super) fn verification_plan(
     m: &Manifest,
     segments: &[BatchSegment],
+    include_plan: bool,
 ) -> Result<Vec<Invocation>> {
-    plan_kind(m, segments, Kind::Verification)
+    plan_kind(m, segments, Kind::Verification, include_plan)
 }
 
 pub(super) fn mixed_verification_plan(
     m: &Manifest,
     segments: &[BatchSegment],
+    include_plan: bool,
 ) -> Result<Vec<Invocation>> {
     if !m
         .mtp
@@ -120,7 +122,7 @@ pub(super) fn mixed_verification_plan(
     {
         return Err("Package lacks mixed prefill/verification".into());
     }
-    plan_kind(m, segments, Kind::MixedVerification)
+    plan_kind(m, segments, Kind::MixedVerification, include_plan)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -131,7 +133,12 @@ enum Kind {
     MixedRows(usize),
 }
 
-fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<Invocation>> {
+fn plan_kind(
+    m: &Manifest,
+    segments: &[BatchSegment],
+    kind: Kind,
+    include_plan: bool,
+) -> Result<Vec<Invocation>> {
     let explicit_verify: BTreeSet<_> = match kind {
         Kind::MixedRows(n) => segments[n..].iter().map(|s| s.slot).collect(),
         _ => BTreeSet::new(),
@@ -192,6 +199,15 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         .as_ref()
         .filter(|l| !l.profiles.is_empty())
         .ok_or("Missing mixed row layout")?;
+    if !include_plan {
+        for segment in segments.iter().filter(|segment| verified(segment)) {
+            m.mtp
+                .as_ref()
+                .and_then(|spec| spec.verification_plan(segment.tokens))
+                .ok_or("Missing verification input template")?;
+        }
+        return Ok(vec![]);
+    }
     let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
     let parallel = kind == Kind::Ordinary && decoders >= 2 && !layout.state_columns.is_empty();
 

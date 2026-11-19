@@ -184,10 +184,7 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
         verify_weights,
         resident_experts,
         vision,
-        api_key: std::env::var("ORINFER_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(Arc::from),
+        api_key: api_key(),
         ids: Arc::new(AtomicU64::new(0)),
         scheduler,
         activity,

@@ -1,14 +1,12 @@
 //! Qwen3 causal reranking: complete sequences and a two-row final-position head.
-use crate::{adapter::Adapter, artifact::Result, model::Operation, policy::Policy};
-use orinfer_model_sdk::{
-    abi::{self, CreateRequest, CreatedPlan},
-    architecture::BatchSegment,
-};
+use crate::{CreateRequest, CreatedPlan};
+use crate::{adapter::Adapter, artifact::Result, model::Operation};
+use orinfer_model_sdk::{architecture::BatchSegment, packet};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 struct Reranker;
 impl Adapter for Reranker {
-    fn batch(&self, _: &[BatchSegment], _: bool) -> Result<abi::BatchPlan> {
+    fn batch(&self, _: &[BatchSegment], _: bool) -> Result<packet::BatchPlan> {
         Err("Reranking executes independent complete causal sequences".into())
     }
 }
@@ -17,11 +15,8 @@ fn operation(name: impl Into<String>) -> Operation {
         name: format!("qwen_reranker/{}", name.into()),
     }
 }
-pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::registry::Built> {
-    if request.architecture != "qwen3_reranker"
-        || policy != Policy::Int8Quality
-        || !request.prefill_profiles.is_empty()
-    {
+pub(crate) fn create(request: CreateRequest) -> Result<crate::registry::Built> {
+    if request.architecture != "qwen3_reranker" || !request.prefill_profiles.is_empty() {
         return Err("Unsupported Qwen3 reranker execution contract".into());
     }
     let config = &request.config;
@@ -267,7 +262,6 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
         CreatedPlan {
             expert_banks: vec![],
             metadata: m,
-            decode_programs: BTreeSet::new(),
         },
     ))
 }

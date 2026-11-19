@@ -81,7 +81,7 @@ fn validate_mtp_packet_graph_reuse() {
             rounds.push(round);
             requests.push(req);
         }
-        use orinfer_model_sdk::abi::BatchOperation;
+        use orinfer_model_sdk::packet::BatchOperation;
         for phase in [
             BatchOperation::Verification,
             BatchOperation::Commit,
@@ -146,7 +146,7 @@ fn validate_mtp_packet_graph_reuse() {
                     tokens,
                 });
             }
-            let (plan, _) = model.model_package.cached_batch(&segments, phase).unwrap();
+            let (plan, _) = model.batch_plans.cached_batch(&segments, phase).unwrap();
             if let Some(previous) = packet_plans.get(&phase) {
                 assert!(
                     std::rc::Rc::ptr_eq(previous, &plan),

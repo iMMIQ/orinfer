@@ -1,62 +1,24 @@
 //! BF16 HC prefill operands retain the original FP16 materialization boundaries.
+use super::contracts::{Storage, connect, fuse, kernel_at, kernel_buffer_arg as buffer, retire};
 use crate::{
-    artifact::{Access, Dtype, Kernel, Result},
-    model::{Manifest, Operation},
+    artifact::{Dtype, Kernel, Result},
+    model::Manifest,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-fn binding(kernel: &Kernel, index: usize) -> Result<&str> {
-    match kernel.args.get(index) {
-        Some(crate::artifact::Argument::Buffer { name }) => Ok(name),
-        _ => Err("HC prefill fusion requires whole-buffer arguments".into()),
-    }
-}
-
-pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
-    let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
-    let fused: BTreeSet<_> = kernels
-        .iter()
-        .filter(|k| {
-            k.symbol == "hc_prefill_up_mix_kernel"
-                && !k.name.ends_with("/aligned_rows")
-                && !k.name.contains("/choice/")
-        })
-        .map(|k| k.name.clone())
-        .collect();
-    if fused.is_empty() {
-        return Ok(());
-    }
-    let mut registered = BTreeSet::new();
-    let buffers: BTreeMap<_, _> = manifest
-        .buffers
-        .iter()
-        .map(|b| (b.name.as_str(), b))
-        .collect();
-    let check = |name: &str, dtype: Dtype, elements: usize, immutable: bool| -> Result<()> {
-        let b = buffers.get(name).ok_or("Missing HC prefill buffer")?;
-        if b.dtype != dtype
-            || b.bytes()? < elements * dtype.bytes()
-            || b.data.is_some() != immutable
-            || b.access
-                != if immutable {
-                    Access::Read
-                } else {
-                    Access::ReadWrite
-                }
-        {
-            return Err(format!("Invalid HC prefill buffer: {name}"));
-        }
-        Ok(())
-    };
-    for (program, operations) in &mut manifest.programs {
-        let mut skip = BTreeSet::new();
-        for (index, operation) in operations.iter().enumerate() {
-            let Operation::Kernel { name } = operation else {
-                continue;
-            };
-            if !fused.contains(name.as_str()) {
-                continue;
-            }
+pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel], exhaustive: bool) -> Result<()> {
+    let contracts = super::contracts::kernels(kernels);
+    let anchors = kernels.iter().filter(|k| {
+        k.symbol == "hc_prefill_up_mix_kernel"
+            && !k.name.ends_with("/aligned_rows")
+            && !k.name.contains("/choice/")
+    });
+    let storage = exhaustive.then(|| Storage::new(&manifest.buffers));
+    fuse(
+        &mut manifest.programs,
+        anchors.clone(),
+        |program, operations, index, up, skip| {
+            let name = &up.name;
             let rows = name
                 .split('/')
                 .next()
@@ -64,23 +26,13 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&n| matches!(n, 512 | 4096))
                 .ok_or("Unsupported HC prefill fusion program")?;
-            if (program != &format!("prefill_m{rows}") && program != "prefill") || index < 2 {
+            if (program != format!("prefill_m{rows}") && program != "prefill") || index < 2 {
                 return Err("Unsupported HC prefill fusion program".into());
             }
-            let get = |index: usize| -> Result<&Kernel> {
-                let Some(Operation::Kernel { name }) = operations.get(index) else {
-                    return Err("Missing adjacent HC prefill operation".into());
-                };
-                contracts
-                    .get(name.as_str())
-                    .copied()
-                    .ok_or("Missing HC prefill execution contract".into())
-            };
-            let norm = get(index - 2)?;
-            let down = get(index - 1)?;
-            let up = get(index)?;
-            let mix = get(index + 1)?;
-            let inject = get(index + 2)?;
+            let norm = kernel_at(&contracts, operations, index - 2)?;
+            let down = kernel_at(&contracts, operations, index - 1)?;
+            let mix = kernel_at(&contracts, operations, index + 1)?;
+            let inject = kernel_at(&contracts, operations, index + 2)?;
             let count = |k: &Kernel| {
                 k.args
                     .iter()
@@ -98,53 +50,47 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
                 || count(up) != 6
                 || count(mix) != 3
                 || count(inject) != 3
-                || binding(down, 0)? != binding(norm, normalized)?
-                || binding(up, 0)? != binding(down, 1)?
-                || binding(up, 1)? != binding(norm, inv)?
-                || binding(up, 3)? != binding(norm, residual)?
-                || binding(up, 5)? != binding(norm, weight)?
-                || binding(up, 2)? != binding(mix, 0)?
-                || binding(inject, 0)? != binding(norm, normalized)?
             {
                 return Err("HC prefill fusion producer/consumer mismatch".into());
             }
-            check(
-                binding(norm, normalized)?,
-                Dtype::Bf16,
-                rows * 4 * 2560,
-                false,
-            )?;
-            check(binding(up, 0)?, Dtype::Bf16, rows * 320, false)?;
-            check(binding(up, 1)?, Dtype::F32, rows * 4, false)?;
-            check(binding(up, 2)?, Dtype::F16, rows * 2560, false)?;
-            check(binding(up, 3)?, Dtype::F16, rows * 4 * 2560, false)?;
-            check(binding(up, 4)?, Dtype::Bf16, 4 * 2560 * 320, true)?;
-            check(binding(up, 5)?, Dtype::F32, 4 * 2560, true)?;
-            for (name, shape) in [
-                (binding(norm, normalized)?, &[rows, 4, 2560][..]),
-                (binding(up, 0)?, &[rows, 320][..]),
-                (binding(up, 1)?, &[rows, 4][..]),
-                (binding(up, 4)?, &[10240, 320][..]),
-                (binding(up, 5)?, &[4, 2560][..]),
-            ] {
-                if buffers[name].shape != shape {
-                    return Err(format!("Invalid HC prefill shape: {name}"));
+            connect(down, norm, &[(0, normalized)])?;
+            connect(up, down, &[(0, 1)])?;
+            connect(up, norm, &[(1, inv), (3, residual), (5, weight)])?;
+            connect(up, mix, &[(2, 0)])?;
+            connect(inject, norm, &[(0, normalized)])?;
+            if let Some(storage) = &storage {
+                for (k, arg, dtype, shape, exact, immutable) in [
+                    (
+                        norm,
+                        normalized,
+                        Dtype::Bf16,
+                        vec![rows, 4, 2560],
+                        true,
+                        false,
+                    ),
+                    (up, 0, Dtype::Bf16, vec![rows, 320], true, false),
+                    (up, 1, Dtype::F32, vec![rows, 4], true, false),
+                    (up, 2, Dtype::F16, vec![rows, 2560], false, false),
+                    (up, 3, Dtype::F16, vec![rows, 4, 2560], false, false),
+                    (up, 4, Dtype::Bf16, vec![10240, 320], true, true),
+                    (up, 5, Dtype::F32, vec![4, 2560], true, true),
+                ] {
+                    storage.check(buffer(k, arg)?, dtype, immutable, |b| {
+                        Ok(if exact {
+                            b.shape == shape
+                        } else {
+                            b.bytes()? >= shape.iter().product::<usize>() * dtype.bytes()
+                        })
+                    })?;
                 }
             }
-            skip.insert(index + 1);
-            registered.insert(name.clone());
-        }
-        if !skip.is_empty() {
-            *operations = std::mem::take(operations)
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, operation)| (!skip.contains(&index)).then_some(operation))
-                .collect();
-        }
+            retire(skip, [index + 1])
+        },
+    )?;
+    if anchors.clone().next().is_none() {
+        return Ok(());
     }
-    if registered != fused {
-        return Err("Unregistered HC prefill fusion operation".into());
-    }
+    let canonical_names: BTreeSet<_> = anchors.map(|k| k.name.as_str()).collect();
     for alternative in kernels
         .iter()
         .filter(|k| k.name.ends_with("/aligned_rows") && k.symbol == "hc_prefill_up_mix_kernel")
@@ -169,7 +115,7 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
                     ) => a == b,
                     _ => false,
                 });
-        if !registered.contains(base) || !matching {
+        if !canonical_names.contains(base) || !matching {
             return Err("Aligned HC changes the canonical operand contract".into());
         }
     }
@@ -179,6 +125,7 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Operation;
 
     fn fixture() -> (Manifest, Vec<Kernel>) {
         let definitions = [
@@ -239,7 +186,7 @@ mod tests {
     #[test]
     fn fusion_removes_only_the_adjacent_mix() {
         let (mut m, kernels) = fixture();
-        build(&mut m, &kernels).unwrap();
+        build(&mut m, &kernels, true).unwrap();
         let names: Vec<_> = m.programs["prefill_m512"]
             .iter()
             .map(|op| {
@@ -266,14 +213,18 @@ mod tests {
         kernels[3].args[0] = crate::artifact::Argument::Buffer {
             name: "wrong".into(),
         };
-        assert!(build(&mut m, &kernels).unwrap_err().contains("mismatch"));
+        assert!(
+            build(&mut m, &kernels, true)
+                .unwrap_err()
+                .contains("mismatch")
+        );
         let (mut m, kernels) = fixture();
         m.buffers
             .iter_mut()
             .find(|b| b.name == "Inv")
             .unwrap()
             .shape = vec![512, 8];
-        assert!(build(&mut m, &kernels).unwrap_err().contains("shape"));
+        assert!(build(&mut m, &kernels, true).unwrap_err().contains("shape"));
     }
 
     #[test]
@@ -281,7 +232,11 @@ mod tests {
         let (mut m, kernels) = fixture();
         let ops = m.programs.remove("prefill_m512").unwrap();
         m.programs.insert("decode".into(), ops);
-        assert!(build(&mut m, &kernels).unwrap_err().contains("program"));
+        assert!(
+            build(&mut m, &kernels, true)
+                .unwrap_err()
+                .contains("program")
+        );
     }
 
     #[test]
@@ -309,7 +264,7 @@ mod tests {
             k.name = k.name.replace("m512", "m4096");
             k.args.push(crate::artifact::Argument::I32 { value: 4096 });
         }
-        build(&mut m, &kernels).unwrap();
+        build(&mut m, &kernels, true).unwrap();
         assert_eq!(m.programs["prefill"], m.programs["prefill_m4096"]);
         assert_eq!(m.programs["prefill"].len(), 4);
     }

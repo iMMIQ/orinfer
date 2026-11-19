@@ -6,7 +6,7 @@ short-fragment dispatch. Both reuse the existing indexer and TopK arithmetic;
 request state and global attention consumers retain their layouts.
 """
 
-from orinfer_build.common.modules import import_module
+from importlib import import_module
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor

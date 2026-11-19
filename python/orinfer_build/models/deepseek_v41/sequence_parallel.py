@@ -6,7 +6,7 @@ inputs. The default retains AllReduce arithmetic; --reduce-scatter enables the
 native collective candidate, whose floating reduction order needs validation.
 """
 
-from orinfer_build.common.modules import import_module
+from importlib import import_module
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor

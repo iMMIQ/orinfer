@@ -8,7 +8,15 @@ from pathlib import Path
 
 from orinfer_build.common.files import atomic_json, file_hash
 from orinfer_build.contracts.row_selection import guarded_winner
-from orinfer_build.tuning.tuning import compile_candidates, measure, read_record, record_path
+from orinfer_build.tuning.ascend import kernel_entry, measurement_identity, verified_manifest
+from orinfer_build.tuning.tuning import (
+    compile_candidates,
+    measure,
+    read_record,
+    record_path,
+    retain_valid_timings,
+    write_record,
+)
 
 
 def baseline_configs(parameters, configs):
@@ -389,6 +397,7 @@ def main():
                 calls_per_replay=args.calls_per_replay,
                 maximum_regression=args.maximum_regression,
                 tuner_sha256=file_hash(Path(__file__)),
+                measurement=measurement_identity(),
                 seed=20261002,
                 reduction_source=file_hash(Path(dense.__file__)),
             )
@@ -425,11 +434,7 @@ def main():
                     for name, expected in [(name, head_contracts[name]) for name in names] + [
                         head_reducer
                     ]:
-                        path = base / name
-                        actual = json.loads(path.read_text())
-                        if actual != expected or actual["library"]["sha256"] != file_hash(
-                            path.parent / actual["library"]["file"]
-                        ):
+                        if verified_manifest(base, name, expected=expected) is None:
                             return False
                     return True
                 expected_compiler = dict(descriptor["compiler"])
@@ -441,11 +446,8 @@ def main():
                 if record.get("reducer_manifest"):
                     paths_to_check.append(record["reducer_manifest"])
                 for relative in paths_to_check:
-                    path = base / relative
-                    spec = json.loads(path.read_text())
-                    if spec["compiler"] != expected_compiler or spec["library"][
-                        "sha256"
-                    ] != file_hash(path.parent / "kernel.so"):
+                    spec = verified_manifest(base, relative)
+                    if spec is None or spec["compiler"] != expected_compiler:
                         return False
                     if (
                         relative == record["manifest"]
@@ -475,16 +477,7 @@ def main():
             if args.compile_only:
                 print(dict(op=kind, compiled=len(paths), rejected=rejected), flush=True)
                 continue
-            libraries = [ctypes.CDLL(str(path.parent / "kernel.so")) for path in paths]
-            entries = [lib.orinfer_ascend_kernel_v2 for lib in libraries]
-            for entry in entries:
-                entry.argtypes = [
-                    ctypes.POINTER(ctypes.c_void_p),
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_void_p,
-                ]
-                entry.restype = ctypes.c_int32
+            entries = [kernel_entry(path) for path in paths]
             tensors = []
             outputs = []
             for spec in manifest["operands"]:
@@ -604,10 +597,9 @@ def main():
                                 torch.testing.assert_close(actual.cpu(), converted, atol=0, rtol=0)
 
                     try:
-                        run()
-                        check()
                         timing = measure(
                             run,
+                            check_initial=True,
                             budget_ms=4 / args.calls_per_replay,
                             max_repetitions=32,
                             change=change,
@@ -626,10 +618,7 @@ def main():
                 if rows in identity["samples"] or not args.head_only:
                     measurements.append(dict(rows=rows, times=times))
                 print(dict(op=kind, rows=rows, times=times), flush=True)
-            for sample in measurements:
-                sample["times"] = {
-                    k: v for k, v in sample["times"].items() if int(k) not in invalid
-                }
+            retain_valid_timings(measurements, invalid)
             policy = (
                 head_row_policy(
                     measurements,
@@ -703,10 +692,7 @@ def main():
                     )
                 )
                 reducer_manifest = str(reduced_path.relative_to(base))
-                reduction_libraries = [
-                    ctypes.CDLL(str(p.parent / "kernel.so")) for p in (reference_path, reduced_path)
-                ]
-                reduction_entries = [lib.orinfer_ascend_kernel_v2 for lib in reduction_libraries]
+                reduction_entries = [kernel_entry(path) for path in (reference_path, reduced_path)]
                 reduced = [
                     torch.empty(capacity + 1, params["output"], device="npu") for _ in range(2)
                 ]
@@ -714,14 +700,6 @@ def main():
                     (ctypes.c_void_p * 2)(source.data_ptr(), destination.data_ptr())
                     for source, destination in zip((expected[0], tensors[2]), reduced, strict=True)
                 ]
-                for entry in reduction_entries:
-                    entry.argtypes = [
-                        ctypes.POINTER(ctypes.c_void_p),
-                        ctypes.c_uint64,
-                        ctypes.c_uint64,
-                        ctypes.c_void_p,
-                    ]
-                    entry.restype = ctypes.c_int32
 
                 def reduce_run(which):
                     status = reduction_entries[which](
@@ -804,7 +782,7 @@ def main():
             )
             if not valid(result):
                 raise ValueError("Selected auxiliary kernel identity differs")
-            atomic_json(record, result)
+            write_record(record, result)
             replacements[step["manifest"]] = chosen
             print(dict(op=kind, **result), flush=True)
     if args.head_only and not matched_heads:

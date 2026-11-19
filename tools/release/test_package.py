@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import tarfile
 import unittest
-from unittest.mock import patch
+from tests.support.model_package import data_package
 from tools.release.package import archive, execution_asset_identity, execution_assets, verify
 
 
@@ -38,7 +38,7 @@ class ExecutionAssetsTests(unittest.TestCase):
             root = cache / hashlib.sha256(raw).hexdigest()
             root.mkdir()
             (root / "package.json").write_bytes(raw)
-            assets = execution_assets([root], cache / "unused", Path("/bin/false"), "v0.3.0")
+            assets = execution_assets([root], cache / "unused", "v0.3.0")
             self.assertEqual(
                 assets[0]["metadata"]["file"],
                 "orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.0.tar.xz",
@@ -46,7 +46,7 @@ class ExecutionAssetsTests(unittest.TestCase):
             self.assertEqual(assets[0]["metadata"]["digest"], root.name)
             (root / "package.json").write_bytes(raw + b" ")
             with self.assertRaisesRegex(ValueError, "digest-named"):
-                execution_assets([root], cache / "unused", Path("/bin/false"), "v0.3.0")
+                execution_assets([root], cache / "unused", "v0.3.0")
 
     def test_encoder_assets_use_their_pinned_configuration_shapes(self):
         cases = [
@@ -92,23 +92,12 @@ class ExecutionAssetsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Register one"):
                     execution_asset_identity(package, "v0.2.2")
 
-    def test_model_variants_have_distinct_assets_and_tampered_identity_fails(self):
+    def test_model_variants_have_distinct_assets_and_duplicates_fail(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            header = bytearray(20)
-            header[:6] = b"\x7fELF\x02\x01"
-            header[16:20] = bytes((3, 0, 183, 0))
-            identity = dict(
-                abi_version=1,
-                package="orinfer-models",
-                version="0.1.2",
-                library=dict(file="lib/model.so", sha256=hashlib.sha256(header).hexdigest()),
-            )
             archives = []
             for index, architecture in enumerate(("qwen3_5", "flash_next", "qwen3_5", "qwen3_5")):
                 manifest = dict(
-                    schema_version=1,
-                    runtime_abi=1,
                     architecture=architecture,
                     config_signature=dict(
                         text=(
@@ -129,16 +118,8 @@ class ExecutionAssetsTests(unittest.TestCase):
                     ),
                     compute_policy="int8_quality",
                     target="sm_87",
-                    catalog=dict(
-                        assets=[], definitions=[], dynamic=[], binding_signature=str(index) * 64
-                    ),
-                    execution=identity,
                 )
-                raw = json.dumps(manifest).encode()
-                package = root / hashlib.sha256(raw).hexdigest()
-                (package / "lib").mkdir(parents=True)
-                (package / "package.json").write_bytes(raw)
-                (package / "lib/model.so").write_bytes(header)
+                package = data_package(root / str(index), payload=str(index).encode(), **manifest)
                 suffix = ".tar.gz" if architecture == "qwen3_5" else ".tar.xz"
                 path = root / (f"{architecture}-{index}" + suffix)
                 from orinfer_build.packaging.package import archive as archive_package
@@ -149,44 +130,25 @@ class ExecutionAssetsTests(unittest.TestCase):
                 else:
                     archive_package(package, path)
                 archives.append(path)
-            with patch("tools.release.package.execution_identity", return_value=identity):
-                assets = execution_assets(archives[:3], root / "cache", Path("/bin/true"), "v0.1.2")
-                names = [a["metadata"]["file"] for a in assets]
-                self.assertEqual(len(set(names)), 3)
-                self.assertEqual(
-                    names,
-                    [
-                        "orinfer-exec-qwen35-2b-a8-sm87-v0.1.2.tar.xz",
-                        "orinfer-exec-flash-next-a8-sm87-v0.1.2.tar.xz",
-                        "orinfer-exec-qwen35-4b-a8-sm87-v0.1.2.tar.xz",
-                    ],
-                )
-                self.assertNotIn("27b", names[1])
-                self.assertEqual(
-                    [a["metadata"]["architecture"] for a in assets],
-                    ["qwen3_5", "flash_next", "qwen3_5"],
-                )
-                from orinfer_build.packaging.package import install
+            assets = execution_assets(archives[:3], root / "cache", "v0.1.2")
+            self.assertEqual(
+                [a["metadata"]["file"] for a in assets],
+                [
+                    "orinfer-exec-qwen35-2b-a8-sm87-v0.1.2.tar.xz",
+                    "orinfer-exec-flash-next-a8-sm87-v0.1.2.tar.xz",
+                    "orinfer-exec-qwen35-4b-a8-sm87-v0.1.2.tar.xz",
+                ],
+            )
+            from orinfer_build.packaging.package import install
 
-                for asset in assets:
-                    output = root / asset["metadata"]["file"]
-                    self.assertTrue(output.name.endswith(".tar.xz"))
-                    archive(asset["directory"], output, 100)
-                    self.assertTrue(output.read_bytes().startswith(b"\xfd7zXZ\0"))
-                    self.assertEqual(
-                        install(output, root / "reinstalled"), asset["metadata"]["digest"]
-                    )
-            with patch("tools.release.package.execution_identity", return_value=identity):
-                with self.assertRaisesRegex(ValueError, "Duplicate"):
-                    execution_assets(
-                        archives, root / "collision-cache", Path("/bin/true"), "v0.1.2"
-                    )
-            with patch(
-                "tools.release.package.execution_identity",
-                return_value=dict(identity, version="wrong"),
-            ):
-                with self.assertRaisesRegex(ValueError, "differs from package"):
-                    execution_assets(archives, root / "bad-cache", Path("/bin/true"), "v0.1.2")
+            for asset in assets:
+                output = root / asset["metadata"]["file"]
+                archive(asset["directory"], output, 100)
+                self.assertTrue(output.read_bytes().startswith(b"\xfd7zXZ\0"))
+                self.assertEqual(install(output, root / "reinstalled"), asset["metadata"]["digest"])
+                self.assertEqual(asset["metadata"]["bindings"]["file"], "bindings.json")
+            with self.assertRaisesRegex(ValueError, "Duplicate"):
+                execution_assets(archives, root / "collision-cache", "v0.1.2")
 
     def test_unknown_specification_and_unsafe_tag_are_rejected(self):
         package = dict(architecture="qwen3_5", compute_policy="int8_quality", target="sm_87")

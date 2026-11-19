@@ -30,12 +30,13 @@ fn resolve(
         if request
             .image_features
             .first()
-            .is_some_and(|span| span.end() <= request.offset)
+            .is_some_and(|span| span.end() <= request.core.offset)
         {
-            Arc::make_mut(&mut request.image_features).retain(|span| span.end() > request.offset);
+            Arc::make_mut(&mut request.image_features)
+                .retain(|span| span.end() > request.core.offset);
             installed.insert(i);
         }
-        let end = request.offset.saturating_add(lookahead);
+        let end = request.core.offset.saturating_add(lookahead);
         let mut pending = VecDeque::new();
         while let Some(image) = request.pending_images.pop_front() {
             if image.start >= end && !completed.contains_key(&image.identity) {
@@ -367,7 +368,7 @@ mod tests {
         );
         assert_eq!(request.image_features[0].start, 10);
         assert_eq!(request.pending_images.front().unwrap().start, 40);
-        request.offset = 32;
+        request.core.offset = 32;
         installed.clear();
         assert_eq!(
             resolve(
@@ -382,7 +383,7 @@ mod tests {
         assert_eq!(request.image_features.len(), 1);
         assert_eq!(request.image_features[0].start, 40);
         assert!(request.pending_images.is_empty());
-        request.offset = 48;
+        request.core.offset = 48;
         installed.clear();
         resolve(
             &mut [&mut request],

@@ -112,7 +112,7 @@ fn private_role(column: &str, layer: usize) -> String {
 pub(super) fn state_bindings(
     m: &Manifest,
     segments: &[BatchSegment],
-) -> Result<orinfer_model_sdk::abi::StateBindings> {
+) -> Result<orinfer_model_sdk::packet::StateBindings> {
     let Some(layout) = &m.batch_layout else {
         return Ok(vec![]);
     };
@@ -236,7 +236,6 @@ mod tests {
             ]),
             profiles: Default::default(),
             segment_tokens: 0,
-            small_mixed_shapes: vec![],
             state_columns: vec![],
             preparation_programs: BTreeMap::new(),
         });
@@ -635,7 +634,7 @@ mod tests {
                 },
                 BatchSegment { slot: 3, tokens },
             ];
-            let plan = super::super::mixed::mixed_verification_plan(&m, &segments).unwrap();
+            let plan = super::super::mixed::mixed_verification_plan(&m, &segments, true).unwrap();
             for call in &plan {
                 let Operation::Kernel { name } = &call.operation else {
                     continue;
@@ -652,7 +651,6 @@ mod tests {
         let layout = m.batch_layout.as_mut().unwrap();
         layout.segment_tokens = 512;
         layout.profiles = BTreeMap::from([(512, "flash_recurrent".into())]);
-        layout.small_mixed_shapes.clear();
         m.prefill_batch_profiles.retain(|p| p.tokens == 1024);
         super::super::mixed::register(&mut m).unwrap();
         super::super::causal_rows::configure(&mut m).unwrap();
@@ -661,7 +659,7 @@ mod tests {
                 BatchSegment { slot: 9, tokens },
                 BatchSegment { slot: 3, tokens: 2 },
             ];
-            let plan = super::super::mixed::mixed_rows_plan(&m, &segments, 1).unwrap();
+            let plan = super::super::mixed::mixed_rows_plan(&m, &segments, 1, true).unwrap();
             assert!(plan.iter().any(|call| call.sequence==Some(9) && matches!(&call.operation,Operation::Kernel {name} if name=="causal_rows/target/layer0/private/k0")));
             assert!(plan.iter().any(|call| call.sequence==Some(3) && matches!(&call.operation,Operation::Kernel {name} if name=="causal_rows/verify/layer0/private/k0")));
         }
@@ -686,7 +684,7 @@ mod tests {
                 BatchSegment { slot: 6, tokens: 2 },
             ],
         ] {
-            let p = super::super::mixed::mixed_verification_plan(&m, &segments).unwrap();
+            let p = super::super::mixed::mixed_verification_plan(&m, &segments, true).unwrap();
             let mut start = 0;
             let mut head = 0;
             for s in &segments {
@@ -746,7 +744,7 @@ mod tests {
                 }])
                 .collect(),
         ] {
-            assert!(super::super::mixed::mixed_verification_plan(&m, &segments).is_err());
+            assert!(super::super::mixed::mixed_verification_plan(&m, &segments, true).is_err());
         }
     }
     #[test]
@@ -756,7 +754,7 @@ mod tests {
             BatchSegment { slot: 7, tokens: 4 },
             BatchSegment { slot: 3, tokens: 2 },
         ];
-        let p = super::super::mixed::verification_plan(&m, &segments).unwrap();
+        let p = super::super::mixed::verification_plan(&m, &segments, true).unwrap();
         let copies:Vec<_>=p.iter().filter(|i|matches!(&i.operation,Operation::Copy {destination,..} if destination=="FlashMixedHeadResidual")).collect();
         assert_eq!(copies.len(), 2);
         assert!(matches!(
@@ -791,7 +789,7 @@ mod tests {
                 .map(|slot| BatchSegment { slot, tokens: 8 })
                 .collect(),
         ] {
-            assert!(super::super::mixed::verification_plan(&m, &bad).is_err());
+            assert!(super::super::mixed::verification_plan(&m, &bad, true).is_err());
         }
     }
     #[test]

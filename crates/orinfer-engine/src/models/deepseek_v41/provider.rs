@@ -14,9 +14,9 @@ mod vision;
 use crate::prefix::Cache;
 use crate::{
     artifact::{FileIdentity, Result, resolve_file},
+    model::request::RequestCore,
     model::{GenerationInput, StepOutput},
     prefix::{Admission, Entry, Media, Resident, Tiered},
-    sampling::{Constraint, Decoder, TokenLogprob},
     scheduler,
 };
 use orinfer_model_sdk::architecture::BatchSegment;
@@ -134,40 +134,26 @@ impl CacheReclamation {
     }
 }
 pub(crate) struct Request {
-    owner: u64,
-    slot: usize,
-    abandoned: Arc<Mutex<Vec<usize>>>,
-    input: Vec<u32>,
+    pub(crate) core: RequestCore,
     media: Media,
     pending_images: std::collections::VecDeque<vision::Pending>,
     image_features: Arc<Vec<super::vision::Span>>,
-    history: Vec<u32>,
-    offset: usize,
-    generated: usize,
-    limit: usize,
-    prefilling: bool,
-    released: bool,
-    sampling: crate::sampling::Options,
     device_sampling: bool,
     processed_sampling: bool,
-    decoder: Decoder,
     prefix: crate::prefix::Statistics,
-    mtp: crate::mtp::Statistics,
     draft_feedback: dspark::Feedback,
-    shared_work: bool,
-    last_output: Instant,
-    last_prefill: Instant,
     ready_output: Option<Arc<Output>>,
-    cache_prompt: bool,
-    cache_generated: bool,
 }
-impl Drop for Request {
-    fn drop(&mut self) {
-        if !self.released
-            && let Ok(mut queue) = self.abandoned.lock()
-        {
-            queue.push(self.slot);
-        }
+impl std::ops::Deref for Request {
+    type Target = RequestCore;
+
+    fn deref(&self) -> &RequestCore {
+        &self.core
+    }
+}
+impl std::ops::DerefMut for Request {
+    fn deref_mut(&mut self) -> &mut RequestCore {
+        &mut self.core
     }
 }
 impl Request {
@@ -210,15 +196,16 @@ impl Request {
     }
     fn accept_output(&mut self, output: &Output) -> Result<u32> {
         let token = if self.host_sampling() && !(self.device_sample() && output.logits.is_empty()) {
-            let law = self
+            let core = &mut self.core;
+            let law = core
                 .decoder
-                .law(&output.logits, &self.history, &self.sampling)?;
+                .law_validated(&output.logits, &core.history, &core.sampling)?;
             let token = law.distribution.draw(crate::sampling::counter_uniform(
-                self.sampling.seed,
+                core.sampling.seed,
                 0,
-                self.generated as u64,
+                core.generated as u64,
             ))?;
-            self.decoder.commit(token, law)?;
+            core.decoder.commit(token, law)?;
             token
         } else {
             self.accept_device(output)?
@@ -229,57 +216,11 @@ impl Request {
         self.last_output = Instant::now();
         Ok(token)
     }
-    pub fn retain_shared_prefixes_only(&mut self, shared: bool) {
-        self.cache_prompt = shared;
-        self.cache_generated = false;
-    }
-    pub fn set_constraint(&mut self, constraint: Box<dyn Constraint>) -> Result<()> {
-        if self.generated != 0 {
-            return Err("Attach constraint before generation".into());
-        }
-        self.decoder.set_constraint(constraint);
-        Ok(())
-    }
-    pub fn take_logprobs(&mut self) -> Vec<TokenLogprob> {
-        self.decoder.take_records()
-    }
-    pub fn generated_tokens(&self) -> usize {
-        self.generated
-    }
-    pub fn computed_prompt_tokens(&self) -> usize {
-        self.offset.saturating_sub(self.prefix.cached_tokens)
-    }
-    pub fn decode_slack_s(&self, target_ms: f64) -> Option<f64> {
-        (!self.prefilling && !self.is_finished())
-            .then(|| target_ms / 1000. - self.last_output.elapsed().as_secs_f64())
-    }
-    pub fn is_prefilling(&self) -> bool {
-        self.prefilling
-    }
     pub fn has_pending_host_images(&self) -> bool {
         !self.pending_images.is_empty() || !self.image_features.is_empty()
     }
-    pub fn remaining_prefill_tokens(&self) -> usize {
-        if self.prefilling {
-            self.input.len() - self.offset
-        } else {
-            0
-        }
-    }
-    pub fn is_finished(&self) -> bool {
-        self.released || self.generated == self.limit || self.decoder.finished()
-    }
-    pub fn constraint_finished(&self) -> bool {
-        self.decoder.finished()
-    }
-    pub fn failure(&self) -> Option<&str> {
-        self.decoder.failure()
-    }
     pub fn prefix_statistics(&self) -> &crate::prefix::Statistics {
         &self.prefix
-    }
-    pub fn speculation_statistics(&self) -> &crate::mtp::Statistics {
-        &self.mtp
     }
 }
 
@@ -745,20 +686,18 @@ impl Runtime {
         let pending_images =
             self.pending_images(&input.input_tokens, input.images, offset, &media)?;
         Ok(Request {
+            core: RequestCore::new(
+                self.owner,
+                slot,
+                Arc::clone(&self.abandoned),
+                input.input_tokens,
+                input.max_new_tokens,
+                input.sampling,
+                offset,
+            ),
             media,
             pending_images,
             image_features: Default::default(),
-            owner: self.owner,
-            slot,
-            abandoned: Arc::clone(&self.abandoned),
-            history: input.input_tokens.clone(),
-            input: input.input_tokens,
-            offset,
-            generated: 0,
-            limit: input.max_new_tokens,
-            prefilling: true,
-            released: false,
-            sampling: input.sampling,
             device_sampling: self.team.model.sampling.is_some(),
             processed_sampling: self
                 .team
@@ -766,16 +705,9 @@ impl Runtime {
                 .sampling
                 .as_ref()
                 .is_some_and(|s| s.processed_local.is_some()),
-            decoder: Default::default(),
             prefix,
-            mtp: Default::default(),
             draft_feedback: Default::default(),
-            shared_work: false,
-            last_output: Instant::now(),
-            last_prefill: Instant::now(),
             ready_output,
-            cache_prompt: true,
-            cache_generated: true,
         })
     }
     fn store(&mut self, request: &mut Request, output: Option<&Output>) -> Result<()> {

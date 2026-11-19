@@ -1,18 +1,17 @@
 """Native catalog factoring must preserve real host parameter order and launches."""
 
 import copy
+import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
 
 from orinfer_build.contracts.catalog import (
-    build_library,
     construction_contracts,
     expand,
     factor,
-    rust_source,
+    seal,
 )
 from orinfer_build.contracts.binding_templates import (
     factor as templates,
@@ -81,7 +80,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(kernels, package["kernels"])
         self.assertEqual(dynamic, package["dynamic_batch_kernels"])
         self.assertEqual(contracts, package["plan_kernel_contracts"])
-        self.assertIn('"Weight1"', rust_source(factored["catalog"], bindings))
+        self.assertIn("Weight1", templates(bindings)["roles"])
 
     def test_abi_launch_or_access_changes_cannot_share_a_definition(self):
         for field, value in (
@@ -104,7 +103,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_native_mapping_identity_covers_roles_offsets_and_dynamic_launch(self):
         original = self.package()
-        before, _ = factor(original)
+        before, bindings = factor(original)
         for change in ("role", "offset", "grid", "dynamic"):
             p = self.package()
             if change == "role":
@@ -115,10 +114,8 @@ class CatalogTests(unittest.TestCase):
                 p["kernels"][0]["grid"][0] = 64
             else:
                 p["dynamic_batch_kernels"][0]["capacity"] = 64
-            after, _ = factor(p)
-            self.assertNotEqual(
-                before["catalog"]["binding_signature"], after["catalog"]["binding_signature"]
-            )
+            after, changed = factor(p)
+            self.assertNotEqual((before, templates(bindings)), (after, templates(changed)))
 
     def test_duplicate_or_missing_contract_is_rejected(self):
         p = self.package()
@@ -186,29 +183,27 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(third, before)
         self.assertEqual(third_bindings, bindings)
 
-    def test_native_rebuild_preserves_hardlinked_source_package(self):
-        package, bindings = factor(self.package())
-        package.update(architecture="test", compute_policy="int8_quality")
+    def test_binding_publication_replaces_hardlinks_and_pins_exact_bytes(self):
+        from orinfer_build.common.files import file_hash
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            before, after = root / "before/lib", root / "after/lib"
-            before.mkdir(parents=True)
-            after.mkdir(parents=True)
-            for name in ("bindings.rs", "BUILD.txt", "model.so"):
-                (before / name).write_bytes(b"immutable original")
-                os.link(before / name, after / name)
-            build_root = root / "builds/test-workspace"
-            target = build_root / "native-cargo/release/liborinfer_models.so"
-            target.parent.mkdir(parents=True)
-            target.write_bytes(b"rebuilt library")
-            with (
-                patch("orinfer_build.contracts.catalog.ROOT", root),
-                patch("orinfer_build.contracts.catalog.work_path", return_value=build_root),
-                patch("orinfer_build.contracts.catalog.subprocess.run"),
-                patch("orinfer_build.packaging.package.execution_identity", return_value={}),
-            ):
-                build_library(package, bindings, after.parent)
-            for name in ("bindings.rs", "BUILD.txt", "model.so"):
-                self.assertEqual((before / name).read_bytes(), b"immutable original")
-                self.assertFalse(os.path.samefile(before / name, after / name))
-            self.assertEqual((after / "model.so").read_bytes(), b"rebuilt library")
+            before, after = root / "before", root / "after"
+            before.mkdir()
+            after.mkdir()
+            original = before / "bindings.json"
+            replacement = after / "bindings.json"
+            original.write_bytes(b"immutable original")
+            os.link(original, replacement)
+            package = seal(self.package(), after)
+            self.assertEqual(original.read_bytes(), b"immutable original")
+            self.assertFalse(os.path.samefile(original, replacement))
+            self.assertEqual(package["schema_version"], 2)
+            self.assertEqual(
+                package["bindings"], dict(file="bindings.json", sha256=file_hash(replacement))
+            )
+            registry = json.loads(replacement.read_bytes())
+            kernels, dynamic, contracts = expand(package["catalog"], expand_templates(registry))
+            self.assertEqual(kernels, self.package()["kernels"])
+            self.assertEqual(dynamic, self.package()["dynamic_batch_kernels"])
+            self.assertEqual(contracts, self.package()["plan_kernel_contracts"])

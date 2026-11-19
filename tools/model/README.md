@@ -38,11 +38,11 @@ CUDA 编译使用物理机 CUDA 12.6 和独立 uv 环境，A2 使用固定的 CA
 - `host_compiler.py`、`build_cache.py`：公共 host ABI 生成与内容缓存；`projection_policy.py`、`projection_tuning.py`：共享整数投影候选与离线测量；`row_convergence.py`：动态 launch 表达式及相邻选择合并。
 - `catalog.py`、`binding_templates.py`：共享编译定义和原生参数模板。
 - `private_rows.py`：普通 decode 与 MTP 共用的请求私有地址表、scratch 布局和动态行包装；各入口保留自己的状态生命周期。
-- `packet_graph.py`、`native_packets.py`：从原生计划提取私有操作，将普通、混合和 MTP packet 的请求地址统一放入固定地址表；保留模型选择的计算体、标量 ABI 和 launch 几何。Qwen 与 Flash Next 构建器在发布前生成该契约，ASR 复用同一绑定。Embedding 和 reranker 按完整序列边界复用 Graph。
+- `packet_graph.py`：通过 `plan-model --packet-probes` 从 Rust 适配器提取私有操作，将普通、混合和 MTP packet 的请求地址统一放入固定地址表；保留模型选择的计算体、标量 ABI 和 launch 几何。Qwen 与 Flash Next 构建器在发布前生成该契约，ASR 复用同一绑定。Embedding 和 reranker 按完整序列边界复用 Graph。
 - `attention_reference.py`：独立 FP32 attention 参考，供离线候选和质量验证使用。
 - `publication.py`、`compact.py`：不可变资产复用、safetensors 合并及原子发布。
 - `package.py`：离线执行包校验、XZ 归档、发布工具内部安装及前端资源固定；部署使用 Rust 的 `orinfer package install`。
-- `attach_execution.py`：为匹配的数据目录安装执行包。
+- `attach_execution.py`：使用 `--package` 指定以摘要命名的 schema 2 执行包目录，为匹配的模型数据生成新的部署目录。
 
 更新执行包须核对完整程序、参数、动态 launch、状态及 buffer 契约。权重布局改变时重新准备权重；仅重新编译相同计算时可复用匹配的权重分片。
 

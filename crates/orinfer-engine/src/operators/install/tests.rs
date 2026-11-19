@@ -4,31 +4,40 @@ use std::io::Write;
 
 fn fixture(root: &Path) -> PathBuf {
     let package = root.join("source");
-    fs::create_dir_all(package.join("lib")).unwrap();
-    let mut library = vec![0; 20];
-    library[..6].copy_from_slice(b"\x7fELF\x02\x01");
-    library[16..20].copy_from_slice(&[3, 0, 183, 0]);
-    fs::write(package.join("lib/model.so"), &library).unwrap();
-    fs::write(package.join("kernel.cubin"), b"kernel").unwrap();
+    fs::create_dir(&package).unwrap();
     let bundle = safetensors::serialize(
-        [(
-            "source",
-            safetensors::tensor::TensorView::new(safetensors::Dtype::U8, vec![6], b"source")
+        [("source", b"source"), ("kernel", b"kernel")].map(|(name, data)| {
+            (
+                name,
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::U8,
+                    vec![data.len()],
+                    data,
+                )
                 .unwrap(),
-        )],
+            )
+        }),
         None,
     )
     .unwrap();
     fs::write(package.join("assets.safetensors"), bundle).unwrap();
+    let bindings = serde_json::to_vec(&json!({
+        "roles":[], "parameters":[[]],
+        "choices":[[{"suffix":"","definition":0,"grid":[1,1,1],"arguments":[],
+                     "dynamic":null,"plan_contract":true}]],
+        "templates":[{"prefix":"kernel","suffix":"","choice":0,
+                      "layers":[{"layer":null,"parameters":0}]}]
+    }))
+    .unwrap();
+    fs::write(package.join("bindings.json"), &bindings).unwrap();
     let manifest = json!({
-        "schema_version":1, "runtime_abi":1, "target":"sm_87",
-        "architecture":"test_family", "compute_policy":"test_policy",
+        "schema_version":2, "target":"sm_87",
+        "architecture":"qwen3_5", "compute_policy":"int8_quality",
         "config_signature":{}, "prefill_profiles":[], "buffer_contracts":[], "toolchain":{},
-        "execution":{"abi_version":1, "package":"test-model", "version":"1",
-            "library":{"file":"lib/model.so", "sha256":sha256(&library)}},
-        "catalog":{"binding_signature":"0".repeat(64), "dynamic":[],
+        "bindings":{"file":"bindings.json", "sha256":sha256(&bindings)},
+        "catalog":{"dynamic":[],
             "assets":[
-                {"file":"kernel.cubin", "sha256":sha256(b"kernel")},
+                {"file":"assets.safetensors", "tensor":"kernel", "sha256":sha256(b"kernel")},
                 {"file":"assets.safetensors", "tensor":"source", "sha256":sha256(b"source")}
             ],
             "definitions":[{"module":0, "source":1, "host_abi":1,
@@ -137,8 +146,8 @@ fn roundtrip_xz_and_gzip_and_duplicate_install() {
         let result = install(&archive_path, &cache).unwrap();
         assert_eq!(result.path.file_name(), package.file_name());
         assert_eq!(
-            fs::read(result.path.join("kernel.cubin")).unwrap(),
-            b"kernel"
+            fs::read(result.path.join("bindings.json")).unwrap(),
+            fs::read(package.join("bindings.json")).unwrap()
         );
         assert!(
             install(&archive_path, &cache)
@@ -147,8 +156,8 @@ fn roundtrip_xz_and_gzip_and_duplicate_install() {
         );
         assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
         assert_eq!(
-            fs::read(result.path.join("kernel.cubin")).unwrap(),
-            b"kernel"
+            fs::read(result.path.join("bindings.json")).unwrap(),
+            fs::read(package.join("bindings.json")).unwrap()
         );
     }
 }
@@ -157,13 +166,13 @@ fn roundtrip_xz_and_gzip_and_duplicate_install() {
 fn failed_validation_never_publishes() {
     for corruption in [
         "manifest",
-        "library",
-        "kernel",
+        "bindings",
         "bundle",
-        "abi",
+        "schema",
         "catalog",
         "target",
-        "elf",
+        "registry",
+        "binding_path",
         "tensor",
         "conflicting_hash",
     ] {
@@ -171,18 +180,17 @@ fn failed_validation_never_publishes() {
         let mut package = fixture(temp.path());
         match corruption {
             "manifest" => fs::write(package.join("package.json"), b"{}").unwrap(),
-            "library" => fs::write(package.join("lib/model.so"), b"corrupt").unwrap(),
-            "kernel" => fs::write(package.join("kernel.cubin"), b"corrupt").unwrap(),
+            "bindings" => fs::write(package.join("bindings.json"), b"corrupt").unwrap(),
             "bundle" => fs::write(package.join("assets.safetensors"), b"corrupt").unwrap(),
-            "elf" => {
-                fs::write(package.join("lib/model.so"), b"not an ELF").unwrap();
-                package = edit_manifest(&package, |m| {
-                    m["execution"]["library"]["sha256"] = json!(sha256(b"not an ELF"))
-                });
+            "registry" => {
+                fs::write(package.join("bindings.json"), b"{}").unwrap();
+                package =
+                    edit_manifest(&package, |m| m["bindings"]["sha256"] = json!(sha256(b"{}")));
             }
             _ => {
                 package = edit_manifest(&package, |m| match corruption {
-                    "abi" => m["execution"]["abi_version"] = json!(2),
+                    "schema" => m["schema_version"] = json!(1),
+                    "binding_path" => m["bindings"]["file"] = json!("../bindings.json"),
                     "catalog" => m["catalog"]["definitions"][0]["module"] = json!(99),
                     "target" => m["target"] = json!("sm_90"),
                     "tensor" => m["catalog"]["assets"][1]["tensor"] = json!("missing"),

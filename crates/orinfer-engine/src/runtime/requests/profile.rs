@@ -226,10 +226,11 @@ fn profile_cached_generation() {
     }
     model
         .execution
-        .parallel_gate_first
+        .graph_profile
+        .gate_first
         .set(fixture["parallel_gate_first"].as_bool().unwrap_or(false));
     if fixture.get("parallel_priority").is_some() {
-        *model.execution.parallel_priority.borrow_mut() = fixture["parallel_priority"]
+        *model.execution.graph_profile.priority.borrow_mut() = fixture["parallel_priority"]
             .as_str()
             .unwrap_or("off")
             .to_owned();
@@ -1020,7 +1021,7 @@ fn profile_joint_prefill_stages() {
     // Repeat the same causal positions. Production packets advance each owner
     // by its segment length; retaining that commit in a microbenchmark would
     // change the context and eventually exceed the prepared KV mappings.
-    let mut plan = model.model_package.batch_plan(&segments).unwrap();
+    let mut plan = model.batch_plans.batch_plan(&segments).unwrap();
     plan.retain(|call| {
         !matches!(&call.operation,
         crate::model::Operation::Kernel { name } if name == "qwen_rows/end/advance")
@@ -1179,7 +1180,7 @@ fn profile_decode_chain() {
     let segments = model
         .prepare_batch_inputs(&mut [&mut request], &[(0, 1)])
         .unwrap();
-    let plan = model.model_package.batch_plan(&segments).unwrap();
+    let plan = model.batch_plans.batch_plan(&segments).unwrap();
     model.execution.sync().unwrap();
     let mut result = json!({
         "model": fixture["model"], "fingerprint": model.stats.manifest_sha256,
@@ -1275,11 +1276,12 @@ fn profile_continuous_decode() {
         let mut walls = vec![];
         let mut phases: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         let live_events = model.execution.profile_events(2).unwrap();
-        model.execution.live_graph_ms.borrow_mut().clear();
+        model.execution.graph_profile.millis.borrow_mut().clear();
         if count == 1 {
             model
                 .execution
-                .live_graph_events
+                .graph_profile
+                .events
                 .set(Some([live_events[0], live_events[1]]));
         }
         for _ in 0..iterations {
@@ -1299,11 +1301,12 @@ fn profile_continuous_decode() {
                     .push(pair[1].1.duration_since(pair[0].1).as_secs_f64() * 1000.);
             }
         }
-        model.execution.live_graph_events.set(None);
+        model.execution.graph_profile.events.set(None);
         if fixture["live_only"].as_bool() == Some(true) {
             let gpu: Vec<_> = model
                 .execution
-                .live_graph_ms
+                .graph_profile
+                .millis
                 .borrow()
                 .iter()
                 .copied()
@@ -1338,7 +1341,7 @@ fn profile_continuous_decode() {
         model
             .advance_requests(&mut requests.iter_mut().collect::<Vec<_>>(), &options)
             .unwrap();
-        let plan = model.model_package.batch_plan(&segments).unwrap();
+        let plan = model.batch_plans.batch_plan(&segments).unwrap();
         if fixture["ncu"].as_bool() == Some(true) {
             profile_native_ncu(&mut model, &plan);
             rows.push(json!({"batch":count,"operations":plan,"wall_median_ms":median(&walls)}));

@@ -5,11 +5,31 @@ use std::{
     path::PathBuf,
 };
 
-pub(super) enum Listener {
+pub(crate) enum Listener {
     Tcp(tokio::net::TcpListener),
     Unix(tokio::net::UnixListener),
 }
-pub(super) struct SocketPath {
+impl Listener {
+    pub(crate) async fn serve(
+        self,
+        router: axum::Router,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> io::Result<()> {
+        match self {
+            Self::Tcp(listener) => {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            }
+            Self::Unix(listener) => {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            }
+        }
+    }
+}
+pub(crate) struct SocketPath {
     path: PathBuf,
     device: u64,
     inode: u64,
@@ -26,7 +46,7 @@ impl Drop for SocketPath {
         }
     }
 }
-pub(super) async fn bind(address: &str) -> io::Result<(Listener, Option<SocketPath>)> {
+pub(crate) async fn bind(address: &str) -> io::Result<(Listener, Option<SocketPath>)> {
     if let Some(path) = address.strip_prefix("unix:") {
         let listener = tokio::net::UnixListener::bind(path)?;
         let inode = std::fs::OpenOptions::new()

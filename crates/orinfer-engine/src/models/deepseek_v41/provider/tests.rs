@@ -1,4 +1,5 @@
 use super::*;
+use crate::sampling::{Constraint, TokenLogprob};
 #[test]
 fn cache_reclamation_survives_request_snapshots_and_is_counted_once() {
     let mut events = CacheReclamation {
@@ -191,32 +192,15 @@ fn shared_banks_and_cpu_heads_are_charged_once_after_parent_eviction() {
 }
 pub(super) fn request(output: Arc<Output>, sampling: crate::sampling::Options) -> Request {
     Request {
-        owner: 1,
-        slot: 91,
-        abandoned: Default::default(),
-        input: vec![0, 1],
+        core: RequestCore::new(1, 91, Default::default(), vec![0, 1], 2, sampling, 2),
         media: Default::default(),
         pending_images: Default::default(),
         image_features: Default::default(),
-        history: vec![0, 1],
-        offset: 2,
-        generated: 0,
-        limit: 2,
-        prefilling: true,
-        released: false,
-        sampling,
         device_sampling: false,
         processed_sampling: false,
-        decoder: Default::default(),
         draft_feedback: Default::default(),
-        shared_work: false,
         prefix: Default::default(),
-        mtp: Default::default(),
-        last_output: Instant::now(),
-        last_prefill: Instant::now(),
         ready_output: Some(output),
-        cache_prompt: true,
-        cache_generated: true,
     }
 }
 #[test]

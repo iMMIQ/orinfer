@@ -5,13 +5,19 @@ Every candidate receives the same data, tail guards and changed-input graph
 check. Only selected tiles are emitted; no tuning runs in the Rust runtime.
 """
 
-import math
 from itertools import chain
 from pathlib import Path
 from orinfer_build.compiler.compile import primitive
 from orinfer_build.contracts.row_selection import aggregate_winner, ranges
-from orinfer_build.common.files import atomic_json
-from orinfer_build.tuning.tuning import compile_candidates, measure, read_record, record_path
+from orinfer_build.tuning.tuning import (
+    compile_candidates,
+    geometric_mean,
+    lowest_total_latency,
+    measure,
+    read_record,
+    record_path,
+    write_record,
+)
 
 ROTATION_TILES = (256, 512, 1024)
 ATTENTION_PIPELINES = [
@@ -92,10 +98,9 @@ class RowTuner:
             for measured_case, fixture in fixtures:
                 for index, pair in enumerate(kernels):
                     run, check, change = fixture(pair, configs[index])
-                    run()
-                    check()
                     latency = measure(
                         run,
+                        check_initial=True,
                         budget_ms=0.25 if measured_case else 0,
                         max_repetitions=32,
                         change=change,
@@ -105,7 +110,7 @@ class RowTuner:
                         times[str(index)].append(latency)
             record = dict(
                 rows=rows,
-                times={k: math.exp(sum(map(math.log, v)) / len(v)) for k, v in times.items()},
+                times={k: geometric_mean(v) for k, v in times.items()},
             )
             records.append(record)
             # The cache record retains the full fixture identity, including
@@ -128,7 +133,7 @@ class RowTuner:
             ]
         chosen = ranges(decisions, capacity=4096)
         result = dict(identity=identity, configs=configs, measurements=records, **chosen)
-        atomic_json(path, result)
+        write_record(path, result)
         return result
 
     def activation_rotation(self, k, swiglu, *, multiplier=1):
@@ -185,10 +190,7 @@ class RowTuner:
         result = self.select(
             spec, configs, build, inputs, measure_rows=[1, 17, 128, 512, 2048, 4096]
         )
-        default = min(
-            result["used"],
-            key=lambda name: sum(row["times"][name] for row in result["measurements"]),
-        )
+        default = lowest_total_latency(result["measurements"], result["used"])
         result = dict(result, default=default, selections=[], used=[default])
         self.records[key] = result
         return result

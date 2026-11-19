@@ -7,7 +7,15 @@ from pathlib import Path
 
 from orinfer_build.common.files import atomic_json, file_hash
 from orinfer_build.contracts.row_selection import aggregate_winner
-from orinfer_build.tuning.tuning import compile_candidates, measure, read_record, record_path
+from orinfer_build.tuning.ascend import kernel_entry, measurement_identity, verified_manifest
+from orinfer_build.tuning.tuning import (
+    compile_candidates,
+    measure,
+    read_record,
+    record_path,
+    retain_valid_timings,
+    write_record,
+)
 
 
 def main():
@@ -107,17 +115,12 @@ def main():
                 configs=configs,
                 samples=samples,
                 tuner_sha256=file_hash(Path(__file__)),
+                measurement=measurement_identity(),
                 seed=20261002,
             )
 
             def valid(record):
-                path = base / record["manifest"]
-                spec = json.loads(path.read_text())
-                return (
-                    spec["source_sha256"] == descriptor["source_sha256"]
-                    and spec["compiler"] == descriptor["compiler"]
-                    and spec["library"]["sha256"] == file_hash(path.parent / "kernel.so")
-                )
+                return verified_manifest(base, record["manifest"], compiled_like=descriptor)
 
             record = record_path(args.output, identity)
             cached = read_record(record, identity, valid) if not args.compile_only else None
@@ -130,16 +133,7 @@ def main():
             if args.compile_only:
                 print(dict(length=length, compiled=len(paths), rejected=rejected), flush=True)
                 continue
-            libraries = [ctypes.CDLL(str(p.parent / "kernel.so")) for p in paths]
-            entries = [lib.orinfer_ascend_kernel_v2 for lib in libraries]
-            for entry in entries:
-                entry.argtypes = [
-                    ctypes.POINTER(ctypes.c_void_p),
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_void_p,
-                ]
-                entry.restype = ctypes.c_int32
+            entries = [kernel_entry(path) for path in paths]
             tensors = [
                 torch.randint(-127, 128, (capacity, 32, 128), dtype=torch.int8, device="npu"),
                 (torch.rand(capacity, 32, device="npu") * 0.01).half(),
@@ -200,10 +194,9 @@ def main():
                             assert bool((tensors[6][rows:] == 17).all()), "Indexer wrote row tail"
 
                         try:
-                            run()
-                            check()
                             timing = measure(
                                 run,
+                                check_initial=True,
                                 budget_ms=4,
                                 max_repetitions=16,
                                 change=change,
@@ -226,10 +219,7 @@ def main():
                     print(
                         dict(length=length, rows=rows, position=position, times=times), flush=True
                     )
-            for sample in measurements:
-                sample["times"] = {
-                    k: v for k, v in sample["times"].items() if int(k) not in invalid
-                }
+            retain_valid_timings(measurements, invalid)
             selected = int(aggregate_winner(measurements))
             chosen = str(paths[selected].relative_to(base))
             result = dict(
@@ -239,7 +229,7 @@ def main():
                 config=legal[selected],
                 manifest=chosen,
             )
-            atomic_json(record, result)
+            write_record(record, result)
             replacements[step["manifest"]] = chosen
             print(dict(length=length, selected=legal[selected]), flush=True)
     if args.compile_only:

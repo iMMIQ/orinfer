@@ -2,11 +2,16 @@
 //! parsing; this module owns GPU state, sampling counters and prefix endpoints.
 pub(super) mod cost;
 use super::*;
-use crate::{architecture::BatchSegment, prefix::Media, scheduler};
+use crate::{architecture::BatchSegment, model::request::RequestCore, prefix::Media, scheduler};
 use std::collections::{BTreeMap, BTreeSet};
 mod prefill;
 #[cfg(test)]
 mod profile;
+#[cfg(test)]
+use profile::mark as profile_mark;
+#[cfg(not(test))]
+#[inline]
+fn profile_mark(_: &str) {}
 mod prompt_lookup;
 mod sampling;
 pub(super) mod speculation;
@@ -26,102 +31,36 @@ pub struct GenerationInput {
     pub prefix_hints: Vec<usize>,
 }
 
-pub struct RequestState {
-    owner: u64,
-    abandoned: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
-    slot: usize,
-    input: Vec<u32>,
-    history: Vec<u32>,
-    limit: usize,
-    sampling: crate::sampling::Options,
-    offset: usize,
-    prefilling: bool,
-    released: bool,
+pub(crate) struct RequestState {
+    pub(crate) core: RequestCore,
     media: Media,
     warm: super::speculation::PrefillWarm,
     checkpoints: BTreeSet<usize>,
     prefill_frame: Option<prefill::Frame>,
     prefix: super::prefix::Context,
-    mtp: crate::mtp::Statistics,
-    generated: usize,
     served: usize,
-    last_output: Instant,
-    last_prefill: Instant,
     credit_s: f64,
     lookup_costs: BTreeMap<usize, speculation::Profile>,
     prompt_lookup: prompt_lookup::PromptLookup,
     mtp_blocked: bool,
-    shared_work: bool,
     draft_acceptance: speculation::control::Acceptance,
-    decoder: crate::sampling::Decoder,
-    cache_prompt: bool,
-    cache_generated: bool,
     pending_audio: Vec<crate::audio::AudioInput>,
 }
-impl Drop for RequestState {
-    fn drop(&mut self) {
-        if !self.released
-            && let Ok(mut abandoned) = self.abandoned.lock()
-        {
-            abandoned.push(self.slot);
-        }
+impl std::ops::Deref for RequestState {
+    type Target = RequestCore;
+
+    fn deref(&self) -> &RequestCore {
+        &self.core
+    }
+}
+impl std::ops::DerefMut for RequestState {
+    fn deref_mut(&mut self) -> &mut RequestCore {
+        &mut self.core
     }
 }
 impl RequestState {
-    /// Offline lookahead can retain shared branches without copying one-off
-    /// prompts and generated continuations into the cache.
-    pub fn retain_shared_prefixes_only(&mut self, full_prompt_shared: bool) {
-        self.cache_prompt = full_prompt_shared;
-        self.cache_generated = false;
-    }
-    pub fn set_constraint(
-        &mut self,
-        constraint: Box<dyn crate::sampling::Constraint>,
-    ) -> Result<()> {
-        if self.generated != 0 {
-            return Err("Attach constraint before generation".into());
-        }
-        self.decoder.set_constraint(constraint);
-        Ok(())
-    }
-    pub fn take_logprobs(&mut self) -> Vec<crate::sampling::TokenLogprob> {
-        self.decoder.take_records()
-    }
-    pub fn generated_tokens(&self) -> usize {
-        self.generated
-    }
-    pub fn computed_prompt_tokens(&self) -> usize {
-        self.offset
-            .saturating_sub(self.prefix.statistics.cached_tokens)
-    }
-    pub fn decode_slack_s(&self, target_tpot_ms: f64) -> Option<f64> {
-        (!self.prefilling && !self.is_finished())
-            .then(|| target_tpot_ms / 1000. - self.last_output.elapsed().as_secs_f64())
-    }
-    pub fn is_prefilling(&self) -> bool {
-        self.prefilling
-    }
-    pub fn remaining_prefill_tokens(&self) -> usize {
-        if self.prefilling {
-            self.input.len().saturating_sub(self.offset)
-        } else {
-            0
-        }
-    }
-    pub fn is_finished(&self) -> bool {
-        self.generated == self.limit || self.released || self.decoder.finished()
-    }
-    pub fn constraint_finished(&self) -> bool {
-        self.decoder.finished()
-    }
-    pub fn failure(&self) -> Option<&str> {
-        self.decoder.failure()
-    }
     pub fn prefix_statistics(&self) -> &crate::prefix::Statistics {
         &self.prefix.statistics
-    }
-    pub fn speculation_statistics(&self) -> &crate::mtp::Statistics {
-        &self.mtp
     }
 }
 #[derive(Debug)]
@@ -190,8 +129,11 @@ impl ModelRuntime {
         input.sampling.validate()?;
         Ok(context)
     }
-    fn request_limits(&self, input: &GenerationInput) -> Result<BTreeMap<String, usize>> {
-        let context = self.validate_generation(input)?;
+    fn request_limits(
+        &self,
+        input: &GenerationInput,
+        context: usize,
+    ) -> Result<BTreeMap<String, usize>> {
         let mut limits = BTreeMap::new();
         if let Some(kv) = &self.manifest.kv_cache
             && kv.demand_mapping
@@ -423,7 +365,7 @@ impl ModelRuntime {
             return Ok(false);
         }
         let context = self.validate_generation(input)?;
-        let limits = self.request_limits(input)?;
+        let limits = self.request_limits(input, context)?;
         let mut fixed = self.execution.additional_state_bytes(&limits)?;
         let mut prospective = self.execution.additional_kv_bytes(context, &limits)?;
         let sampling = input.sampling.temperature > 0. && input.sampling.top_logprobs.is_none();
@@ -440,15 +382,16 @@ impl ModelRuntime {
         let future = self
             .reserved_requests
             .values()
-            .map(|r| r.kv_bytes)
-            .sum::<usize>()
-            .saturating_sub(self.execution.active_kv_bytes());
-        let mut needed = fixed
-            .checked_add(prospective)
-            .and_then(|n| n.checked_add(future))
-            .and_then(|n| n.checked_add(workspace))
-            .and_then(|n| n.checked_add(options.memory_reserve_bytes))
-            .ok_or("Admission budget overflow")?;
+            .map(|r| r.kv_bytes as u128)
+            .sum::<u128>()
+            .saturating_sub(self.execution.active_kv_bytes() as u128);
+        let base = future + workspace as u128 + options.memory_reserve_bytes as u128;
+        let needed_bytes = |fixed: usize, prospective: usize| {
+            usize::try_from(base + fixed as u128 + prospective as u128)
+                .map_err(|_| "Admission budget overflow")
+        };
+        let mut needed = needed_bytes(fixed, prospective)?;
+        let future = future as usize;
         // Reclaim idle arenas before evicting useful prefixes. Snapshot bytes
         // are only prospective capacity; they must not hide idle allocations
         // or graphs that need releasing under current memory pressure.
@@ -457,16 +400,9 @@ impl ModelRuntime {
         }
         if self.admission_free_bytes()? < needed {
             self.execution.reclaim_idle_state()?;
-            let additional = self.execution.additional_kv_bytes(context, &limits)?;
-            let state = self.execution.additional_state_bytes(&limits)?;
-            needed = needed
-                .checked_sub(prospective)
-                .and_then(|n| n.checked_sub(fixed))
-                .and_then(|n| n.checked_add(additional))
-                .and_then(|n| n.checked_add(state))
-                .ok_or("Reclaimed KV budget overflow")?;
-            fixed = state;
-            prospective = additional;
+            prospective = self.execution.additional_kv_bytes(context, &limits)?;
+            fixed = self.execution.additional_state_bytes(&limits)?;
+            needed = needed_bytes(fixed, prospective)?;
         }
         if self
             .admission_free_bytes()?
@@ -640,7 +576,7 @@ impl ModelRuntime {
             })?)
             .ok_or("Media work overflow")?;
         let prompt_len = input.input_tokens.len();
-        let limits = self.request_limits(&input)?;
+        let limits = self.request_limits(&input, context)?;
         let slot = self.execution.lease_sequence(&limits)?;
         let result = (|| {
             self.execution
@@ -712,35 +648,26 @@ impl ModelRuntime {
                 .peak_active
                 .max(self.reserved_requests.len());
             Ok(RequestState {
-                owner: self.owner_id,
-                abandoned: std::sync::Arc::clone(&self.abandoned),
-                slot,
-                history: input.input_tokens.clone(),
-                input: input.input_tokens,
-                limit: input.max_new_tokens,
-                sampling: input.sampling,
-                offset,
-                prefilling: true,
-                released: false,
+                core: RequestCore::new(
+                    self.owner_id,
+                    slot,
+                    std::sync::Arc::clone(&self.abandoned),
+                    input.input_tokens,
+                    input.max_new_tokens,
+                    input.sampling,
+                    offset,
+                ),
                 media,
                 warm,
                 checkpoints,
                 prefill_frame: None,
                 prefix,
-                mtp: Default::default(),
-                generated: 0,
                 served: 0,
-                last_output: Instant::now(),
-                last_prefill: Instant::now(),
                 credit_s: 0.,
                 lookup_costs: Default::default(),
                 prompt_lookup: Default::default(),
                 mtp_blocked: false,
-                shared_work: false,
                 draft_acceptance: Default::default(),
-                decoder: Default::default(),
-                cache_prompt: true,
-                cache_generated: true,
                 pending_audio: if offset < prompt_len {
                     input.audios
                 } else {
@@ -921,7 +848,7 @@ impl ModelRuntime {
         }
         if checkpoint {
             self.store_prefix(
-                &req.input[..req.offset],
+                &req.core.input[..req.offset],
                 &req.media,
                 req.warm.tokens,
                 true,
@@ -963,7 +890,7 @@ impl ModelRuntime {
         }
         if req.cache_prompt {
             self.store_prefix(
-                &req.input,
+                &req.core.input,
                 &req.media,
                 req.warm.tokens,
                 true,
@@ -1184,13 +1111,9 @@ impl ModelRuntime {
     ) -> Result<()> {
         let mut shapes = vec![1];
         if let Some(layout) = &self.manifest.batch_layout {
-            shapes.extend(
-                layout
-                    .profiles
-                    .keys()
-                    .copied()
-                    .filter(|n| cap > 128 || layout.small_mixed_shapes.contains(n)),
-            );
+            if cap > 128 {
+                shapes.extend(layout.profiles.keys().copied());
+            }
         } else if cap != 1 {
             return Err("Missing batch layout".into());
         }
@@ -1334,8 +1257,7 @@ impl ModelRuntime {
                 maintenance_s += start.elapsed().as_secs_f64();
             }
         };
-        #[cfg(test)]
-        profile::mark("entry");
+        profile_mark("entry");
         self.reap_abandoned()?;
         options.validate()?;
         self.dynamic_speculation
@@ -1717,9 +1639,7 @@ impl ModelRuntime {
             }
         }
         let mixed = self.manifest.batch_layout.as_ref().is_none_or(|layout| {
-            layout.segment_tokens > 0
-                || !layout.small_mixed_shapes.is_empty()
-                || self.manifest.batch_profiles.is_empty()
+            layout.segment_tokens > 0 || self.manifest.batch_profiles.is_empty()
         });
         let mut cap = options
             .max_batch_tokens
@@ -1955,8 +1875,7 @@ impl ModelRuntime {
                         .advance_prefill(req, 1, false)
                         .map(|(_, tokens)| tokens);
                 }
-                #[cfg(test)]
-                profile::mark("single_activated");
+                profile_mark("single_activated");
                 if req.prefilling {
                     model.upload_ids(
                         &model.manifest.token,
@@ -1978,16 +1897,13 @@ impl ModelRuntime {
                     (&req.history[last..], &req.history[..last])
                 };
                 model.prepare_inputs(tokens, history)?;
-                #[cfg(test)]
-                profile::mark("single_inputs");
+                profile_mark("single_inputs");
                 model.upload_segment_controls(1)?;
-                #[cfg(test)]
-                profile::mark("single_controls");
+                profile_mark("single_controls");
                 model.execution.submit_program("decode", phase)?;
                 overlap();
                 model.execution.sync()?;
-                #[cfg(test)]
-                profile::mark("single_execute");
+                profile_mark("single_execute");
                 if let Some(spec) = &model.manifest.mtp {
                     model.mtp_capture(spec, 1, phase)?;
                 }
@@ -2020,13 +1936,11 @@ impl ModelRuntime {
         output: &mut Vec<StepOutput>,
         overlap: &mut dyn FnMut(),
     ) -> Result<()> {
-        #[cfg(test)]
-        profile::mark("policy");
+        profile_mark("policy");
         let inputs_at = Instant::now();
         let timer = cost::Timer::start(self.execution.batch_statistics());
         let segments = self.prepare_batch_inputs(requests, selected)?;
-        #[cfg(test)]
-        profile::mark("inputs");
+        profile_mark("inputs");
         self.scheduler_statistics.batch_inputs_s += inputs_at.elapsed().as_secs_f64();
         let plan_at = Instant::now();
         let decode_only = selected.iter().all(|(i, _)| !requests[*i].prefilling);
@@ -2034,16 +1948,18 @@ impl ModelRuntime {
         let plan = if self.execution.has_batch_graph(&graph_key, decode_only) {
             std::rc::Rc::new(Vec::new())
         } else {
-            self.model_package
-                .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Ordinary)?
+            self.batch_plans
+                .cached_batch(
+                    &segments,
+                    orinfer_model_sdk::packet::BatchOperation::Ordinary,
+                )?
                 .0
         };
-        #[cfg(test)]
-        profile::mark("plan");
+        profile_mark("plan");
         self.scheduler_statistics.batch_plan_s += plan_at.elapsed().as_secs_f64();
         let key = Self::iteration_key(requests, selected);
         self.execution.execute_batch_operation_with(
-            orinfer_model_sdk::abi::BatchOperation::Ordinary,
+            orinfer_model_sdk::packet::BatchOperation::Ordinary,
             graph_key,
             &plan,
             decode_only,
@@ -2052,8 +1968,7 @@ impl ModelRuntime {
                 .all(|&(i, _)| requests[i].limit - requests[i].generated >= 2),
             overlap,
         )?;
-        #[cfg(test)]
-        profile::mark("execute");
+        profile_mark("execute");
         let commit_at = Instant::now();
         *self
             .scheduler_statistics
@@ -2082,8 +1997,7 @@ impl ModelRuntime {
             requests[i].credit_s -= seconds * chunk as f64 / rows as f64;
             requests[i].last_prefill = Instant::now();
         }
-        #[cfg(test)]
-        profile::mark("commit");
+        profile_mark("commit");
         Ok(())
     }
     pub(super) fn upload_segment_controls(&self, tokens: usize) -> Result<()> {
@@ -2201,10 +2115,10 @@ impl ModelRuntime {
         if let (Some(table), None) = (table, packet) {
             self.execution.upload_sequence_addresses(
                 &table.buffer,
-                self.model_package.state_bindings(&segments)?,
+                self.batch_plans.state_bindings(&segments)?,
             )?;
         } else if packet.is_some() {
-            let bindings = self.model_package.state_bindings(&segments)?;
+            let bindings = self.batch_plans.state_bindings(&segments)?;
             let suffix = packet
                 .map_or(Some(0), |p| segments.len().checked_mul(p.columns.len()))
                 .ok_or("Packet operand table size overflow")?;
@@ -2391,15 +2305,16 @@ impl ModelRuntime {
         let raw = self
             .execution
             .download_bytes(&self.manifest.logits, spec.bytes()?)?;
-        let law = req
-            .decoder
-            .law(&floats(&raw, spec.dtype), &req.history, &req.sampling)?;
+        let core = &mut req.core;
+        let law =
+            core.decoder
+                .law_validated(&floats(&raw, spec.dtype), &core.history, &core.sampling)?;
         let token = law.distribution.draw(crate::sampling::counter_uniform(
-            req.sampling.seed,
+            core.sampling.seed,
             0,
-            req.generated as u64,
+            core.generated as u64,
         ))?;
-        req.decoder.commit(token, law)?;
+        core.decoder.commit(token, law)?;
         Ok(token)
     }
     pub(crate) fn finish_request(&mut self, req: &mut RequestState, cache: bool) -> Result<()> {
@@ -2411,7 +2326,7 @@ impl ModelRuntime {
                 let consistent = model.refresh_request_mtp(req, false)?;
                 if consistent {
                     model.store_decoded_prefix(
-                        &req.history,
+                        &req.core.history,
                         &req.media,
                         &|| false,
                         &mut req.prefix,

@@ -7,8 +7,8 @@ pub const EVALUATION_SEED: u64 = 20_261_002;
 mod constrained;
 mod prepared;
 mod reporting;
-pub(crate) use constrained::RowParameters;
 pub use constrained::{Constraint, Decoder, TokenLogprob, verify};
+pub(crate) use constrained::{RowParameters, verify_validated};
 pub(crate) use prepared::Prepared;
 
 fn splitmix64(mut x: u64) -> u64 {
@@ -92,24 +92,26 @@ impl Options {
             && self.logit_bias.is_empty()
     }
     pub fn validate(&self) -> Result<(), String> {
-        if !self.temperature.is_finite()
-            || !(0.0..=2.0).contains(&self.temperature)
-            || !self.top_p.is_finite()
-            || !(0.0..=1.0).contains(&self.top_p)
-            || self.top_p == 0.0
-            || !self.presence_penalty.is_finite()
-            || !(-2.0..=2.0).contains(&self.presence_penalty)
-            || !self.repetition_penalty.is_finite()
-            || self.repetition_penalty <= 0.0
-            || !self.frequency_penalty.is_finite()
-            || !(-2.0..=2.0).contains(&self.frequency_penalty)
-            || self
-                .logit_bias
-                .values()
-                .any(|b| !b.is_finite() || !(-100.0..=100.0).contains(b))
-            || self.top_logprobs.is_some_and(|n| n > 20)
-        {
-            return Err("Invalid sampling parameters".into());
+        for (name, value, min, max) in [
+            ("temperature", self.temperature, 0.0, 2.0),
+            ("top_p", self.top_p, 0.0, 1.0),
+            ("presence_penalty", self.presence_penalty, -2.0, 2.0),
+            ("frequency_penalty", self.frequency_penalty, -2.0, 2.0),
+        ] {
+            if !(min..=max).contains(&value) || name == "top_p" && value == 0.0 {
+                return Err(format!("{name}: Invalid sampling value"));
+            }
+        }
+        if !self.repetition_penalty.is_finite() || self.repetition_penalty <= 0.0 {
+            return Err("repetition_penalty: Expected positive finite value".into());
+        }
+        for (&id, bias) in &self.logit_bias {
+            if !(-100.0..=100.0).contains(bias) {
+                return Err(format!("logit_bias.{id}: Bias outside -100..100"));
+            }
+        }
+        if self.top_logprobs.is_some_and(|n| n > 20) {
+            return Err("top_logprobs: Expected 0–20".into());
         }
         Ok(())
     }
@@ -127,7 +129,6 @@ fn processed_scores(
     options: &Options,
     mask: Option<&[u32]>,
 ) -> Result<Vec<(u32, f64)>, String> {
-    options.validate()?;
     if logits.is_empty()
         || logits.len() > u32::MAX as usize
         || logits.iter().any(|x| !x.is_finite())
@@ -223,6 +224,15 @@ impl Distribution {
         Self::from_masked(logits, history, options, None)
     }
     pub fn from_masked(
+        logits: &[f32],
+        history: &[u32],
+        options: &Options,
+        mask: Option<&[u32]>,
+    ) -> Result<Self, String> {
+        options.validate()?;
+        Self::from_validated(logits, history, options, mask)
+    }
+    pub(crate) fn from_validated(
         logits: &[f32],
         history: &[u32],
         options: &Options,
@@ -381,10 +391,11 @@ pub fn sample(
     options: &Options,
     step: usize,
 ) -> Result<u32, String> {
+    options.validate()?;
     if options.temperature == 0.0 {
         return greedy(logits, history, options);
     }
-    Distribution::from_logits(logits, history, options)?.draw(counter_uniform(
+    Distribution::from_validated(logits, history, options, None)?.draw(counter_uniform(
         options.seed,
         0,
         step as u64,
@@ -394,7 +405,6 @@ pub fn sample(
 /// Greedy needs neither sorting nor a dense probability distribution. Retain
 /// f64 processors, full-vocabulary validation and total-order tie semantics.
 fn greedy(logits: &[f32], history: &[u32], options: &Options) -> Result<u32, String> {
-    options.validate()?;
     if logits.is_empty() || logits.len() > u32::MAX as usize {
         return Err("Invalid sampling logits".into());
     }

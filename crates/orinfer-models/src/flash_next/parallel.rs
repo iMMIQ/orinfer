@@ -1,9 +1,61 @@
-//! Fork only branches certified independent by their generated argument access.
+//! Derive fork/join endpoints from the projection operands in execution order.
+use super::contracts;
 use crate::{
     artifact::{Argument, Kernel, Result},
     model::{Manifest, Operation},
 };
-use std::collections::BTreeMap;
+
+fn hc(part: &str, select: &impl Fn(&str) -> Result<usize>) -> Result<[usize; 4]> {
+    let root = select(&format!("{part}_down.weight_value"))?;
+    let inject = select(&format!("{part}_inject.weight_value"))?;
+    Ok([root, inject, inject, inject + 1])
+}
+
+fn ffn(select: &impl Fn(&str) -> Result<usize>) -> Result<[usize; 4]> {
+    let expert = select("ffn_gate_up_exps.weight_packed")?;
+    let shared = select("ffn_gate_shexp.weight_weight")?;
+    let gate = select("ffn_gate_inp_shexp.weight_value")?;
+    Ok([
+        expert,
+        shared.checked_sub(1).ok_or("Missing shared FFN norm")?,
+        gate,
+        gate + 1,
+    ])
+}
+
+fn projection<'a>(
+    candidates: impl Iterator<Item = (usize, &'a Kernel)>,
+    weight: &str,
+    matches: impl Fn(&str) -> bool,
+) -> Result<usize> {
+    let mut positions = candidates.filter_map(|(i, k)| {
+        k.args
+            .iter()
+            .any(|a| matches!(a, Argument::Buffer { name } if matches(name)))
+            .then_some(i)
+    });
+    let first = positions
+        .next()
+        .ok_or_else(|| format!("Missing branch projection {weight}"))?;
+    if positions.next().is_some() {
+        return Err(format!("Ambiguous branch projection {weight}"));
+    }
+    Ok(first)
+}
+
+fn endpoints(
+    mut regions: Vec<[usize; 4]>,
+    name_at: impl Fn(usize) -> Option<String>,
+) -> Result<Vec<[String; 4]>> {
+    regions.sort_by_key(|region| region[0]);
+    regions
+        .into_iter()
+        .map(|region| {
+            let [a, b, c, d] = region.map(|index| name_at(index).ok_or("Missing branch endpoint"));
+            Ok([a?, b?, c?, d?])
+        })
+        .collect()
+}
 
 pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
     manifest.graph_branches.clear();
@@ -17,103 +69,44 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
         .programs
         .get("decode")
         .ok_or("Missing decode program")?;
-    let positions: BTreeMap<_, _> = ops
-        .iter()
-        .enumerate()
-        .filter_map(|(i, op)| {
-            if let Operation::Kernel { name } = op {
-                Some((name.as_str(), i))
-            } else {
-                None
-            }
-        })
-        .collect();
-    let select = |layer: usize, weight: &str| -> Result<&str> {
-        let prefix = format!("decode/layer{layer}/");
-        let mut found = kernels.iter().filter(|k| {
-            k.name.starts_with(&prefix)
-                && k.args
-                    .iter()
-                    .any(|a| matches!(a, Argument::Buffer { name } if name == weight))
-        });
-        let k = found
-            .next()
-            .ok_or_else(|| format!("Missing branch projection {weight}"))?;
-        if found.next().is_some() {
-            return Err("Ambiguous branch projection".into());
-        }
-        Ok(k.name.as_str())
-    };
-    let adjacent = |name: &str, offset: isize| -> Result<&str> {
-        let i = positions
-            .get(name)
-            .ok_or("Branch endpoint is not executed")?;
-        let Some(Operation::Kernel { name }) =
-            i.checked_add_signed(offset).and_then(|i| ops.get(i))
-        else {
-            return Err("Missing adjacent branch operation".into());
-        };
-        Ok(name.as_str())
-    };
-    let mut branches = Vec::new();
+    let catalog = contracts::kernels(kernels);
+    let mut regions = Vec::new();
     for layer in 0..48 {
-        let weight = |suffix: &str| format!("W_blk.{layer}.{suffix}");
-        for part in ["hc_attn", "hc_ffn"] {
-            let root = select(layer, &weight(&format!("{part}_down.weight_value")))?;
-            let inject = select(layer, &weight(&format!("{part}_inject.weight_value")))?;
-            branches.push([root, inject, inject, adjacent(inject, 1)?].map(str::to_owned));
-        }
+        let prefix = format!("decode/layer{layer}/");
+        let exact = |weight: &str| {
+            let candidates = ops.iter().enumerate().filter_map(|(i, op)| match op {
+                Operation::Kernel { name } if name.starts_with(&prefix) => {
+                    Some((i, *catalog.get(name.as_str())?))
+                }
+                _ => None,
+            });
+            projection(candidates, weight, |name| name == weight)
+        };
+        let select = |suffix: &str| exact(&format!("W_blk.{layer}.{suffix}"));
+        regions.extend([hc("hc_attn", &select)?, hc("hc_ffn", &select)?]);
         if layer % 4 != 3 {
-            let qkv = select(layer, &format!("Q4_blk.{layer}.attn_qkv_packed"))?;
-            let gate = select(layer, &format!("Q4_blk.{layer}.attn_gate_packed"))?;
-            let beta = select(layer, &weight("ssm_beta.weight_weight"))?;
-            let ab = adjacent(beta, 1)?;
-            branches.push([qkv, gate, ab, adjacent(ab, 1)?].map(str::to_owned));
+            let qkv = exact(&format!("Q4_blk.{layer}.attn_qkv_packed"))?;
+            let gate = exact(&format!("Q4_blk.{layer}.attn_gate_packed"))?;
+            let ab = select("ssm_beta.weight_weight")? + 1;
+            regions.push([qkv, gate, ab, ab + 1]);
         }
-        let expert = select(layer, &weight("ffn_gate_up_exps.weight_packed"))?;
-        let shared = select(layer, &weight("ffn_gate_shexp.weight_weight"))?;
-        let gate = select(layer, &weight("ffn_gate_inp_shexp.weight_value"))?;
-        branches.push([expert, adjacent(shared, -1)?, gate, adjacent(gate, 1)?].map(str::to_owned));
+        regions.push(ffn(&select)?);
     }
-    branches.sort_by_key(|r| positions[r[0].as_str()]);
+    let branches = endpoints(regions, |index| match ops.get(index)? {
+        Operation::Kernel { name } => Some(name.clone()),
+        _ => None,
+    })?;
     manifest.graph_branches.insert("decode".into(), branches);
-    orinfer_model_sdk::model::validate_graph_branches(manifest, kernels)
+    Ok(())
 }
 
 /// Canonical slots own dependency regions; AOT row substitutions retain them.
 pub(super) fn build_rows(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
-    let catalog: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
+    let catalog = contracts::kernels(kernels);
     for (program, ops) in &manifest.programs {
         if !program.starts_with("flash_decode/layer") {
             continue;
         }
-        let names = ops
-            .iter()
-            .filter_map(|op| match op {
-                Operation::Kernel { name } => Some(name),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let select = |suffix: &str| -> Result<usize> {
-            let positions = names
-                .iter()
-                .enumerate()
-                .filter_map(|(i, name)| {
-                    catalog.get(name.as_str()).and_then(|k| {
-                        k.args.iter().any(|a| {
-                    matches!(a, Argument::Buffer { name } if name.ends_with(suffix))
-                }).then_some(i)
-                    })
-                })
-                .collect::<Vec<_>>();
-            if positions.len() != 1 {
-                return Err(format!(
-                    "Ambiguous row branch projection {program}/{suffix}"
-                ));
-            }
-            Ok(positions[0])
-        };
-        let mut regions = Vec::new();
         let part = if program.ends_with("/pre") {
             "hc_attn"
         } else if program.ends_with("/post") {
@@ -121,34 +114,28 @@ pub(super) fn build_rows(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<
         } else {
             continue;
         };
-        let root = select(&format!("{part}_down.weight_value"))?;
-        let inject = select(&format!("{part}_inject.weight_value"))?;
-        regions.push([root, inject, inject, inject + 1]);
-        if part == "hc_ffn" {
-            let expert = select("ffn_gate_up_exps.weight_packed")?;
-            let shared = select("ffn_gate_shexp.weight_weight")?;
-            let gate = select("ffn_gate_inp_shexp.weight_value")?;
-            regions.push([
-                expert,
-                shared.checked_sub(1).ok_or("Missing shared FFN norm")?,
-                gate,
-                gate + 1,
-            ]);
-        }
-        let branches = regions
-            .into_iter()
-            .map(|indices| {
-                let mut region = [String::new(), String::new(), String::new(), String::new()];
-                for (i, index) in indices.into_iter().enumerate() {
-                    region[i] = names
-                        .get(index)
-                        .ok_or("Missing row branch endpoint")?
-                        .to_string();
-                }
-                Ok(region)
+        let names: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Kernel { name } => Some(name.as_str()),
+                _ => None,
             })
-            .collect::<Result<Vec<_>>>()?;
-        manifest.graph_branches.insert(program.clone(), branches);
+            .collect();
+        let select = |suffix: &str| {
+            let candidates = names
+                .iter()
+                .enumerate()
+                .filter_map(|(i, name)| Some((i, *catalog.get(name)?)));
+            projection(candidates, suffix, |name| name.ends_with(suffix))
+        };
+        let mut regions = vec![hc(part, &select)?];
+        if part == "hc_ffn" {
+            regions.push(ffn(&select)?);
+        }
+        manifest.graph_branches.insert(
+            program.clone(),
+            endpoints(regions, |i| names.get(i).map(|s| (*s).into()))?,
+        );
     }
-    orinfer_model_sdk::model::validate_graph_branches(manifest, kernels)
+    Ok(())
 }

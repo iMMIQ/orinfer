@@ -1,53 +1,27 @@
 //! Single-token routing metadata fusion belongs to the Flash execution recipe.
-use crate::{
-    artifact::{Access, Argument, Dtype, Kernel, Result},
-    model::{Manifest, Operation},
+use super::contracts::{
+    Storage, connect, distinct, fuse, kernel_at, kernel_buffer_arg as buffer, retire,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use crate::{
+    artifact::{Dtype, Kernel, Result},
+    model::Manifest,
+};
 
-fn binding(kernel: &Kernel, index: usize) -> Result<&str> {
-    match kernel.args.get(index) {
-        Some(Argument::Buffer { name }) => Ok(name),
-        _ => Err("Single-token routing requires whole buffer arguments".into()),
-    }
-}
-
-pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
-    let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
-    let buffers: BTreeMap<_, _> = manifest
-        .buffers
+pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel], exhaustive: bool) -> Result<()> {
+    let contracts = super::contracts::kernels(kernels);
+    let storage = exhaustive.then(|| Storage::new(&manifest.buffers));
+    let anchors = kernels
         .iter()
-        .map(|b| (b.name.as_str(), b))
-        .collect();
-    let mut fused: BTreeSet<_> = kernels
-        .iter()
-        .filter(|k| k.symbol == "single_route_metadata_kernel_kernel")
-        .map(|k| k.name.as_str())
-        .collect();
-    for (program, operations) in &mut manifest.programs {
-        let mut skip = BTreeSet::new();
-        for (index, operation) in operations.iter().enumerate() {
-            let Operation::Kernel { name } = operation else {
-                continue;
-            };
-            if !fused.contains(name.as_str()) {
-                continue;
-            }
+        .filter(|k| k.symbol == "single_route_metadata_kernel_kernel");
+    fuse(
+        &mut manifest.programs,
+        anchors,
+        |program, operations, index, route, skip| {
             if program != "decode" {
                 return Err("Single-token routing requires decode program".into());
             }
-            let route = contracts[name.as_str()];
-            let next = |offset: usize| -> Result<&Kernel> {
-                let Some(Operation::Kernel { name }) = operations.get(index + offset) else {
-                    return Err("Missing adjacent routing metadata operation".into());
-                };
-                contracts
-                    .get(name.as_str())
-                    .copied()
-                    .ok_or_else(|| "Missing routing metadata contract".into())
-            };
-            let prefix = next(1)?;
-            let tiles = next(2)?;
+            let prefix = kernel_at(&contracts, operations, index + 1)?;
+            let tiles = kernel_at(&contracts, operations, index + 2)?;
             if route.args.len() != 8
                 || prefix.args.len() != 4
                 || tiles.args.len() != 4
@@ -60,54 +34,25 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
                 (prefix, [(0, 0), (1, 2), (2, 4), (3, 6)]),
                 (tiles, [(0, 0), (1, 5), (2, 6), (3, 7)]),
             ] {
-                for (a, b) in connections {
-                    if binding(old, a)? != binding(route, b)? {
-                        return Err("Single-token routing producer/consumer mismatch".into());
-                    }
+                connect(old, route, &connections)?;
+            }
+            distinct((0..8).map(|i| buffer(route, i)))?;
+            if let Some(storage) = &storage {
+                for (i, elements) in [512, 10, 512, 10, 1, 11, 512, 11].into_iter().enumerate() {
+                    storage.check(buffer(route, i)?, Dtype::I32, false, |b| {
+                        Ok(b.shape == [elements])
+                    })?;
                 }
             }
-            let mut distinct = BTreeSet::new();
-            for (i, elements) in [
-                (0, 512),
-                (1, 10),
-                (2, 512),
-                (3, 10),
-                (4, 1),
-                (5, 11),
-                (6, 512),
-                (7, 11),
-            ] {
-                let name = binding(route, i)?;
-                let b = buffers.get(name).ok_or("Missing routing buffer")?;
-                if b.dtype != Dtype::I32
-                    || b.bytes()? != elements * Dtype::I32.bytes()
-                    || b.data.is_some()
-                    || b.access != Access::ReadWrite
-                    || !distinct.insert(name)
-                {
-                    return Err(format!("Invalid single-token routing buffer: {name}"));
-                }
-            }
-            skip.extend([index + 1, index + 2]);
-            fused.remove(name.as_str());
-        }
-        if !skip.is_empty() {
-            *operations = std::mem::take(operations)
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, op)| (!skip.contains(&i)).then_some(op))
-                .collect();
-        }
-    }
-    if !fused.is_empty() {
-        return Err("Unregistered single-token routing fusion".into());
-    }
-    Ok(())
+            retire(skip, [index + 1, index + 2])
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::Argument;
 
     fn fixture() -> (Manifest, Vec<Kernel>) {
         let names = [
@@ -156,7 +101,7 @@ mod tests {
     #[test]
     fn removes_only_the_two_routing_metadata_consumers() {
         let (mut m, k) = fixture();
-        build(&mut m, &k).unwrap();
+        build(&mut m, &k, true).unwrap();
         assert_eq!(m.programs["decode"].len(), 1);
     }
     #[test]
@@ -165,21 +110,33 @@ mod tests {
         k[2].args[2] = Argument::Buffer {
             name: "Relative".into(),
         };
-        assert!(build(&mut m, &k).unwrap_err().contains("producer/consumer"));
+        assert!(
+            build(&mut m, &k, true)
+                .unwrap_err()
+                .contains("producer/consumer")
+        );
         let (mut m, mut k) = fixture();
         k[0].args[1] = Argument::Buffer {
             name: "Relative".into(),
         };
-        assert!(build(&mut m, &k).unwrap_err().contains("routing buffer"));
+        assert!(
+            build(&mut m, &k, true)
+                .unwrap_err()
+                .contains("Aliased fusion buffer")
+        );
     }
     #[test]
     fn rejects_batched_program_and_missing_contract() {
         let (mut m, k) = fixture();
         let ops = m.programs.remove("decode").unwrap();
         m.programs.insert("verify_m4".into(), ops);
-        assert!(build(&mut m, &k).unwrap_err().contains("decode program"));
+        assert!(
+            build(&mut m, &k, true)
+                .unwrap_err()
+                .contains("decode program")
+        );
         let (mut m, mut k) = fixture();
         k.pop();
-        assert!(build(&mut m, &k).unwrap_err().contains("contract"));
+        assert!(build(&mut m, &k, true).unwrap_err().contains("contract"));
     }
 }

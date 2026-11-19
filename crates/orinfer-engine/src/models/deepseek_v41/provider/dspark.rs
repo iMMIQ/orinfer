@@ -520,13 +520,14 @@ impl Runtime {
                     .iter()
                     .flat_map(|v| v.logits.iter().copied())
                     .collect::<Vec<_>>();
-                crate::sampling::verify(
+                let core = &mut request.core;
+                crate::sampling::verify_validated(
                     &proposals,
                     &logits,
-                    &request.history,
-                    &request.sampling,
-                    &mut request.decoder,
-                    request.generated,
+                    &core.history,
+                    &core.sampling,
+                    &mut core.decoder,
+                    core.generated,
                     129280,
                 )?
             } else if request.processed_sampling && request.device_sample() {

@@ -2,14 +2,14 @@
 pub(crate) mod arena;
 pub mod ascend;
 pub(crate) mod cuda;
-mod executor;
 pub(crate) mod growth;
 pub(crate) mod kv;
 pub(crate) mod report;
 pub(crate) mod snapshot;
 mod values;
-pub(crate) use executor::{Executor, LoadStats};
+pub(crate) use cuda::executor::Executor;
 pub use orinfer_device::{Backend, DeviceInfo, GraphMode, Target};
+pub(crate) use report::LoadStats;
 pub(crate) use values::floats;
 
 /// Symbol presence is diagnostic information, not a hardware capability promise.

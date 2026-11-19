@@ -137,6 +137,9 @@ impl BatchedSampling {
     /// Private scratch layout shared by all six independent-row sampler bodies.
     /// Align each typed view; lane membership changes pointers, never arithmetic.
     pub fn layout(vocab: usize, context: usize) -> Result<(BTreeMap<String, usize>, usize)> {
+        if vocab > i32::MAX as usize || context > i32::MAX as usize {
+            return Err("Sampling dimensions exceed the model ABI".into());
+        }
         let blocks = vocab.div_ceil(1024);
         let shapes = BTreeMap::from([
             ("Counts", (vocab, 4)),
@@ -153,34 +156,23 @@ impl BatchedSampling {
             ("Invalid", (blocks, 4)),
             ("Mass", (vocab, 8)),
             ("State", (7, 8)),
-            (
-                "Hist",
-                (
-                    blocks
-                        .checked_mul(256)
-                        .ok_or("Sampling histogram overflow")?,
-                    8,
-                ),
-            ),
+            ("Hist", (blocks * 256, 8)),
         ]);
         let mut offsets = BTreeMap::new();
-        let mut stride = 0usize;
+        let mut stride = 0u64;
         for (name, (elements, width)) in shapes {
-            offsets.insert(name.into(), stride);
-            let bytes = elements
-                .checked_mul(width)
-                .ok_or("Sampling scratch overflow")?;
-            stride = stride
-                .checked_add(
-                    bytes
-                        .checked_add(255)
-                        .ok_or("Sampling alignment overflow")?
-                        / 256
-                        * 256,
-                )
-                .ok_or("Sampling stride overflow")?;
+            offsets.insert(
+                name.into(),
+                usize::try_from(stride).map_err(|_| "Sampling offset exceeds usize")?,
+            );
+            // Both model dimensions fit in i32. Use u64 for offset math so
+            // the alignment calculation is bounded even on a 32-bit host.
+            stride += (elements as u64 * width).next_multiple_of(256);
         }
-        Ok((offsets, stride))
+        Ok((
+            offsets,
+            usize::try_from(stride).map_err(|_| "Sampling stride exceeds usize")?,
+        ))
     }
 }
 
@@ -404,7 +396,18 @@ impl Manifest {
             .filter(|p| p.accepts(tokens))
             .min_by_key(|p| p.chunk_tokens)
     }
-    pub fn validate<'a>(&'a self) -> Result<usize> {
+    pub fn validate(&self) -> Result<usize> {
+        self.validate_plan(true)
+    }
+
+    /// Check runtime dimensions, buffer ranges and state contracts before allocation.
+    /// File identity consistency, staged program equivalence and graph analysis
+    /// are checked during offline plan validation.
+    pub fn validate_runtime(&self) -> Result<usize> {
+        self.validate_plan(false)
+    }
+
+    fn validate_plan<'a>(&'a self, exhaustive: bool) -> Result<usize> {
         if let Some(table) = self.packet_table() {
             table.validate(self)?;
         }
@@ -430,12 +433,7 @@ impl Manifest {
         }
         let mut identities = BTreeMap::<crate::artifact::AssetKey, &str>::new();
         let mut identity = |id: &'a crate::artifact::FileIdentity| -> Result<()> {
-            if id.sha256.len() != 64
-                || !id
-                    .sha256
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            {
+            if !crate::artifact::is_sha256_hex(&id.sha256) {
                 return Err("Malformed file hash".into());
             }
             if identities
@@ -446,7 +444,7 @@ impl Manifest {
             }
             Ok(())
         };
-        if let Some(asset) = &self.input_assets {
+        if exhaustive && let Some(asset) = &self.input_assets {
             identity(asset)?;
         }
         let mut buffers = BTreeMap::new();
@@ -455,17 +453,13 @@ impl Manifest {
         let mut weights = 0usize;
         for b in &self.buffers {
             if let Some(id) = &b.data {
-                if id.tensor.is_empty()
-                    || id.sha256.len() != 64
-                    || !id
-                        .sha256
-                        .bytes()
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                if id.tensor.is_empty() || exhaustive && !crate::artifact::is_sha256_hex(&id.sha256)
                 {
                     return Err("Invalid tensor identity".into());
                 }
-                if let Some(previous) =
-                    tensors.insert(&id.tensor, (&id.sha256, b.dtype, &b.shape, &b.layout))
+                if exhaustive
+                    && let Some(previous) =
+                        tensors.insert(&id.tensor, (&id.sha256, b.dtype, &b.shape, &b.layout))
                     && previous != (&id.sha256, b.dtype, &b.shape, &b.layout)
                 {
                     return Err("Conflicting tensor identities".into());
@@ -479,7 +473,7 @@ impl Manifest {
                 || b.layout.is_empty()
                 || !b.alignment.is_power_of_two()
                 || b.alignment > 256
-                || buffers.insert(&b.name, b).is_some()
+                || buffers.insert(b.name.as_str(), b).is_some()
             {
                 return Err("Invalid/duplicate model buffer".into());
             }
@@ -493,7 +487,7 @@ impl Manifest {
         }
         let lookup = |name: &str| -> Result<&Buffer<TensorIdentity>> {
             buffers
-                .get(&name.to_string())
+                .get(name)
                 .copied()
                 .ok_or_else(|| format!("Unknown buffer {name}"))
         };
@@ -634,13 +628,16 @@ impl Manifest {
         }
         let mut names = BTreeSet::new();
         for k in &self.kernels {
-            k.validate_launch(&target)?;
+            // Catalog binding has already checked launch geometry on the runtime path.
+            if exhaustive {
+                k.validate_launch(&target)?;
+                identity(&k.module)?;
+                identity(&k.source)?;
+                identity(&k.host_abi)?;
+            }
             if !k.readonly_arguments.is_empty() && k.readonly_arguments.len() != k.args.len() {
                 return Err("Mismatched kernel argument access contract".into());
             }
-            identity(&k.module)?;
-            identity(&k.source)?;
-            identity(&k.host_abi)?;
             if k.name.is_empty()
                 || !names.insert(&k.name)
                 || k.symbol.is_empty()
@@ -730,16 +727,22 @@ impl Manifest {
                 return Err("Invalid/duplicate prefill plan or missing program".into());
             }
             if !plan.stages.is_empty() {
-                let mut flattened = Vec::new();
-                for stage in &plan.stages {
-                    let ops = self
-                        .programs
-                        .get(stage)
-                        .filter(|ops| !ops.is_empty())
-                        .ok_or("Missing resumable prefill stage")?;
-                    flattened.extend_from_slice(ops);
-                }
-                if flattened != self.programs[&plan.prefill_program] {
+                let stages = plan
+                    .stages
+                    .iter()
+                    .map(|stage| {
+                        self.programs
+                            .get(stage)
+                            .filter(|ops| !ops.is_empty())
+                            .ok_or("Missing resumable prefill stage")
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                if exhaustive
+                    && !stages
+                        .into_iter()
+                        .flatten()
+                        .eq(&self.programs[&plan.prefill_program])
+                {
                     return Err("Prefill stages must exactly partition their forward pass".into());
                 }
             } else if !plan.live_buffers.is_empty() {
@@ -781,7 +784,9 @@ impl Manifest {
                 }
             }
         }
-        validate_graph_branches(self, &self.kernels)?;
+        if exhaustive {
+            validate_graph_branches(self, &self.kernels)?;
+        }
         if let Some(kv) = &self.kv_cache {
             for growth in kv.growth.values() {
                 if let Some(name) = &growth.length {
@@ -884,12 +889,6 @@ impl Manifest {
                 .prefill_plan(chunk)
                 .ok_or("Missing dynamic prefill template")?;
             return Ok((chunk, &plan.prefill_program, &plan.head_program));
-        }
-        if self.prefill_plans.is_empty() {
-            if self.chunk_tokens == 0 || !tokens.is_multiple_of(self.chunk_tokens) {
-                return Err("Input is not a multiple of the legacy chunk size".into());
-            }
-            return Ok((self.chunk_tokens, "prefill", "head"));
         }
         if let Some(plan) = self.prefill_plan(tokens).filter(|p| p.min_tokens > 0) {
             return Ok((tokens, &plan.prefill_program, &plan.head_program));

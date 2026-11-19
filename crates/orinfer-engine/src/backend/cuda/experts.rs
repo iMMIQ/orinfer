@@ -5,7 +5,7 @@ use crate::{
     execution::ResidentExperts,
     weights::TensorSource,
 };
-use orinfer_model_sdk::abi::ExpertBank;
+use orinfer_model_sdk::architecture::ExpertBank;
 use std::collections::{BTreeMap, BTreeSet};
 
 type Key = (usize, usize);

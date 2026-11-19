@@ -304,7 +304,7 @@ pub(super) fn commit(
     m: &Manifest,
     segments: &[BatchSegment],
     include: bool,
-) -> Result<abi::BatchPlan> {
+) -> Result<packet::BatchPlan> {
     let spec = m.mtp.as_ref().ok_or("Missing Qwen MTP")?;
     let mut owners = BTreeSet::new();
     if !(1..=LANES).contains(&segments.len())
@@ -367,15 +367,15 @@ pub(super) fn commit(
 pub(super) fn draft(
     m: &Manifest,
     segments: &[BatchSegment],
-    operation: abi::BatchOperation,
+    operation: packet::BatchOperation,
     include: bool,
-) -> Result<abi::BatchPlan> {
-    let body = operation != abi::BatchOperation::DraftHead;
-    let head = operation != abi::BatchOperation::Warm;
+) -> Result<packet::BatchPlan> {
+    let body = operation != packet::BatchOperation::DraftHead;
+    let head = operation != packet::BatchOperation::Warm;
     let rows = crate::packet::Rows::packet(
         segments,
         LANES,
-        if operation == abi::BatchOperation::Warm {
+        if operation == packet::BatchOperation::Warm {
             spec_warm_capacity(m)
         } else {
             LANES
@@ -384,7 +384,7 @@ pub(super) fn draft(
     let total = rows.total;
     if segments
         .iter()
-        .any(|s| operation != abi::BatchOperation::Warm && s.tokens != 1)
+        .any(|s| operation != packet::BatchOperation::Warm && s.tokens != 1)
     {
         return Err("Invalid Qwen draft packet".into());
     }
@@ -450,13 +450,13 @@ pub(super) fn draft(
     };
     if body {
         for (s, v) in segments.iter().zip(&views) {
-            if operation == abi::BatchOperation::Draft {
+            if operation == packet::BatchOperation::Draft {
                 copy(&mut out, "MtpToken", "MtpInput", 4, s.slot, &empty);
             }
             // Warm gathers the complete target-hidden chain. A draft reuses
             // its previous normalized condition, exactly like the single path.
             let begin = &m.programs["mtp_begin"];
-            let begin = if operation == abi::BatchOperation::Draft {
+            let begin = if operation == packet::BatchOperation::Draft {
                 &begin[1..]
             } else {
                 &begin[..]

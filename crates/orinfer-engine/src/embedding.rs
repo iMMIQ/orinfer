@@ -22,7 +22,6 @@ pub struct Statistics {
 pub struct Model {
     execution: Executor,
     // Keep the native library alive through executor teardown.
-    _package: crate::model_package::ModelPackage,
     spec: Spec,
     context: usize,
     vocab: usize,
@@ -57,7 +56,6 @@ impl Model {
         };
         Ok(Self {
             execution,
-            _package: prepared.execution_model,
             spec,
             context: m.max_context,
             vocab: m.vocab,

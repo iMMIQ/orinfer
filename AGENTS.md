@@ -14,7 +14,7 @@
 - 在线运行时用 Rust，生产 GPU kernel 以 TileLang 为源；Python 只用于离线转换、编译、参考和验证。A2 已有 ACLNN W4A8 grouped matmul 保留为接通模型的基线；新增 A2 算子用 TileLang-Ascend 离线编译，由 Rust 的指针表 C ABI 加载。AOT 库内描述必须与外部 dtype、shape、访问方式和编译身份一致，Graph 和完成事件持有全部原生资源。
 - DSv4.1 A2 的 W4 bank、scale 和 assist 在离线阶段准备并落盘；在线直接读取物理布局，按计划校验形状和字节范围，不执行 W4 转置、全量参考对照或权重 payload 哈希扫描。
 - DSv4.1 A2 多请求共享权重和聚合 token 行，KV、C2 环及解码 KV workspace 按 owner 隔离，私有状态复用公共对齐 arena 布局。Graph 准备关闭私有状态写入，缓存按实际显存预留回收；捕获前统一探测各 rank 缓存，任一 rank 未命中时全体失效同一形状并捕获，保持 HCCL 序列一致。普通推理使用默认高性能通信；`HCCL_DETERMINISTIC=strict` 作为显式复现选项。请求隔离和固定历史概率误差独立验收，不要求默认通信下跨 batch 逐位相同。TP8 为当前接通模型的方案，后续按实际显存、通信和完整请求性能选择并行策略。原生 batch 包默认 2048 行与每 owner 4096 上下文，准入同时校验 owner 数及显存预算。
-- 模型实现、公共执行组件、TileLang kernel 和离线构建工具在统一 workspace 维护，共享架构与计算策略组件。orinfer-models 分别注册模型适配器与计算策略，部署包内 Rust cdylib 通过版本化 C ABI 生成执行程序、动态 batch 和状态绑定，匹配的 TileLang cubin 与库同包发布。公共 CUDA 执行器从模型契约读取模型族、层数、维度和层序；新增架构通过适配器注册接入。
+- 模型实现、公共执行组件、TileLang kernel 和离线构建工具在统一 workspace 维护。CUDA 模型适配器随 `orinfer-models` 静态链接进 `orinfer-engine`，通过 Rust 类型组装执行程序、动态 batch 和状态绑定。CUDA schema 2 执行包发布 `package.json`、`bindings.json` 与包含 TileLang cubin 的 `assets.safetensors`。公共执行器从模型契约读取模型族、层数、维度和层序，新增架构通过适配器注册接入。
 - 第一阶段包含 prefix cache 与多请求 batching；缓存恢复和 batch 调度必须保持完整 KV/GDN/卷积/MTP 状态及请求隔离。
 - 项目许可证为 LGPL-3.0-or-later，保留第三方版权和许可证声明。
 
@@ -34,7 +34,7 @@
 - Flash Next 采用已确定的混合量化方案：专家保留整数 E8P Q2A8；主干 GDN QKV/Z、QSA Q/gate 和 target/MTP 共享输出头采用 signed-block128 旋转、输出行 scale 的 Q4A8。GDN/QSA 输出投影、共享 FFN 和 MTP 草稿 Q/O 保留 W8；其余精度敏感部分维持原混合精度。原生适配器统一校验和执行该策略。
 - Flash Next 使用我们自己的整数 E8P＋旋转量化表示，运行时从自有编码反量化到 INT8 计算。当前优先完成算子和真实端到端推理，允许免校准或小样本校准；原始 BF16 按矩阵或专家分块读取，分块释放。完整校准需单独验证专家覆盖和层间误差；BF16 基线必须直接来自原始浮点权重。
 - E8P 可使用无损 K64/K128 压缩权重重排及完整 A8 位平面分解，以两个 INT4 Tensor Core 乘积恢复原 INT32 点积；此过程保持完整 A8 精度，必须保留原 scale 与 FP16 边界，并验证非零码本前提。MTP、并发及大 prefill 配置通过验证后启用该路径，其余配置保留 INT8 路径，读取同一份压缩 bank。
-- 在线模型采用 HF 配置/tokenizer 目录和 `cache/model.json` 数据描述；标准分片 safetensors 保留当前 W4 表示，默认在线校验 dtype、shape、物理 layout 和容器边界；权重 payload hash 由 `--verify-weights` 显式开启，`validate-model` 始终完整校验。配置签名和原生 ABI 仍校验；正常加载不计算资产内容 SHA256，前端资源、CPU 资产元数据、原生执行库、kernel 与权重的内容完整性通过独立 `validate-model` 校验。模型数据通过 execution_package digest 固定独立模型执行包，第一阶段采用 INT8 为主、质量优先的混合精度，关键部分可 FP16/FP32；本阶段实现 int8_quality 计算策略和原生格式加载。离线 AOT manifest 只作构建中间产物，在线模型数据描述与执行包均保留 schema 1，统一使用当前原生模型包结构。算子夹具格式独立。
+- 在线模型采用 HF 配置/tokenizer 目录和 schema 1 的 `cache/model.json` 数据描述。模型数据通过 `execution_package` digest 固定独立包，CUDA 使用 schema 2，DSv4.1 A2 使用 schema 1 原生计划封装。标准分片 safetensors 保留当前 W4 表示。CUDA 在线校验配置签名、kernel ABI、tensor dtype、shape、物理 layout 与容器边界，默认跳过内容哈希。CUDA 的 `--verify-weights` 启用显式加载校验，`validate-model` 完整校验前端、CPU 资产、执行包及权重。离线 AOT manifest 与算子夹具使用各自契约。
 - 服务协议位于 orinfer-api；CLI 只处理命令。CUDA 执行器、加载器、模型适配器、计算策略与生成/视觉/MTP 控制分离；权重、序列状态和 workspace 分作用域管理。
 - HTTP 与离线入口并行准备前端和模型；CUDA 模型在所属 worker 创建、使用及销毁，前端失败或 panic 也需等待并正确回收，模型销毁完成后再释放 GPU 锁。只读权重 arena 保持每张量对齐且仅释放单一 owner，padding 计入权重与显存预算；请求状态、KV 和按需专家单独管理。权重读取和 DMA 有界流水化，缓冲区复用及失败清理等待对应传输完成；启动验收同时测进程到 API 就绪、首输出及首请求完成。
 - JSONL 离线入口与 HTTP 复用 Chat 前端、模型加载和连续 worker 及状态提交流程；输入有界预处理、完成即写结果，续跑固定输入和模型/参数身份，截断与错误分别统计。
@@ -42,7 +42,7 @@
 - JSONL 全局规划复用 Chat 前端提取实际 token 前缀，索引与工作区受预处理预算的四分之一约束，每条最多保留 4096 个前缀 token，预算紧张或规划范围外的内容保留流式处理。重排保持物理行号、custom_id、输入身份和续跑语义；缓存提示限定用于快照选择，输入和输出均保持完整。长度估计依据自然完成请求的实际长度，输出预算作为生成上限。异步结果队列保留内存计费，返回成功或中断结果前须排空并确认写入/同步；错误必须传播。
 - 主机输入通过有界、只追加的 pinned slab 按 stream 顺序上传，大输入同样分块，超过单 slab 容量时继续沿用 stream 级异步传输。调用者的内存可在上传方法返回后释放；slab 复用和退出清理必须等待对应 DMA 完成，读回结果仍须确认 GPU 完成。
 - 离线构建将 HF tokenizer_config 的 added_tokens_decoder 合并到部署 tokenizer.json，逐项验证 ID 一致。验收比较 Transformers 实际生成的 token ID；thinking/工具标记必须按原始特殊 token 映射切分。
-- 执行包 catalog 仅保存共享编译定义/资产及动态 launch 模板；逐层 tensor 角色与参数映射以共享调用模板、逐层参数表和去重特化表离线编译进 Rust 模型库；生成模块共享特化绑定，经 orinfer_model_plans_v1 的有 owner C 数组导出，在线直接消费原生计划。目录身份与原生绑定注册表必须匹配，重建后校验完整程序/参数及全部请求状态。plan-model 保留构建契约以支持离线重建；在线导出范围限定为最终程序、局部特化和专家常驻契约引用的绑定，融合前的输入留在离线构建契约中。
+- CUDA 执行包 `catalog` 保存共享编译定义、资产及动态 launch 模板。`bindings.json` 保存因子化的 tensor 角色、逐层参数、特化选择和调用模板，离线构建验证精确往返。静态链接的 Rust 适配器消费绑定并组装模型计划。正常加载保留最终程序、局部特化和专家常驻契约引用的 kernel；`plan-model` 和 `validate-model` 保留构建契约以供重建及诊断。重建后校验完整程序、实参与全部请求状态。
 - Rust 按实际导出 host ABI 绑定参数、grid/block/shared；检查 CUDA 返回值、unsafe 边界、资源生存期和 stream 顺序。
 - 动态 launch 全行数验证放在离线构建使用的 plan-model 和 validate-model，同容量及表达式去重；在线加载保留逐绑定 ABI 校验，实际 launch 保留真实行数与算术检查，行数穷举限定在离线验证。
 - Flash Next 普通 decode（1–128 请求）、混合 batch 和 MTP 验证共享 1–1024 token 行的 target 执行模板；单／多流草稿和 warm 共享 1–512 行 draft 模板，输出头复用相同实现。因果段、接受前缀因子、捕获、提交和请求隔离独立处理，投影／HC／FFN／专家复用同一计算流程。整数投影和专家按 1/2/3/4/8/16/32 离线特化，其余行数使用动态参数 cubin；TileLang 自动调优只选择保持 scale、dtype 与归约边界的合法 tile，路由与专家 tile 必须一致。运行时消费编译生成的行数选择表，单流也使用相同模板；辅助算子统一使用动态模板，真实请求直接组成混合 packet；离线中间绑定只用于构建最终模板，MTP 短尾也走一行 packet，单请求 target 程序仅保留状态准备／参考用途。Graph 分支按模板槽位注册，全部特化验证读写依赖后复用；batch 档位与配置由离线调优结果生成；缓存按源码、编译器和设备身份失效。

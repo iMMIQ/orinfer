@@ -1,7 +1,9 @@
 //! Flash Next execution order and immutable CPU lookup owned by the model package.
+use crate::{CreateRequest, CreatedPlan};
 mod auxiliary;
 mod batching;
 mod causal_rows;
+mod contracts;
 mod decode_fusions;
 mod draft_batch;
 mod draft_rows;
@@ -18,15 +20,12 @@ mod row_variants;
 mod rows;
 mod unified_decode;
 mod vision;
-use crate::{adapter::Adapter, artifact::Result, model::Manifest, policy::Policy};
-use orinfer_model_sdk::{
-    abi::{self, CreateRequest, CreatedPlan},
-    architecture::BatchSegment,
-};
+use crate::{adapter::Adapter, artifact::Result, model::Manifest};
+use orinfer_model_sdk::{architecture::BatchSegment, packet};
 struct Flash {
     manifest: Manifest,
     inputs: inputs::Inputs,
-    packet_kernels: Vec<crate::artifact::Kernel>,
+    operands: crate::packet::Operands,
 }
 impl Adapter for Flash {
     fn prefetch_inputs(&self, tokens: &[u32], history: &[u32]) {
@@ -35,30 +34,35 @@ impl Adapter for Flash {
     fn batch_operation(
         &self,
         segments: &[BatchSegment],
-        operation: abi::BatchOperation,
+        operation: packet::BatchOperation,
         include_plan: bool,
-    ) -> Result<abi::BatchPlan> {
+    ) -> Result<packet::BatchPlan> {
         let result = match operation {
-            abi::BatchOperation::Ordinary => self.batch(segments, include_plan),
-            abi::BatchOperation::Verification => {
-                let plan = mixed::verification_plan(&self.manifest, segments)?;
-                Ok((if include_plan { plan } else { vec![] }, vec![]))
+            packet::BatchOperation::Ordinary => self.batch(segments, include_plan),
+            packet::BatchOperation::Verification => {
+                let plan = mixed::verification_plan(&self.manifest, segments, include_plan)?;
+                Ok((plan, vec![]))
             }
-            abi::BatchOperation::MixedVerification => {
-                let plan = mixed::mixed_verification_plan(&self.manifest, segments)?;
-                Ok((if include_plan { plan } else { vec![] }, vec![]))
+            packet::BatchOperation::MixedVerification => {
+                let plan = mixed::mixed_verification_plan(&self.manifest, segments, include_plan)?;
+                Ok((plan, vec![]))
             }
-            abi::BatchOperation::MixedRows { prefills } => {
-                let plan = mixed::mixed_rows_plan(&self.manifest, segments, usize::from(prefills))?;
-                Ok((if include_plan { plan } else { vec![] }, vec![]))
+            packet::BatchOperation::MixedRows { prefills } => {
+                let plan = mixed::mixed_rows_plan(
+                    &self.manifest,
+                    segments,
+                    usize::from(prefills),
+                    include_plan,
+                )?;
+                Ok((plan, vec![]))
             }
-            abi::BatchOperation::Draft
-            | abi::BatchOperation::Warm
-            | abi::BatchOperation::DraftHead => {
-                let plan = draft_batch::plan(&self.manifest, segments, operation)?;
-                Ok((if include_plan { plan } else { vec![] }, vec![]))
+            packet::BatchOperation::Draft
+            | packet::BatchOperation::Warm
+            | packet::BatchOperation::DraftHead => {
+                let plan = draft_batch::plan(&self.manifest, segments, operation, include_plan)?;
+                Ok((plan, vec![]))
             }
-            abi::BatchOperation::Commit => {
+            packet::BatchOperation::Commit => {
                 let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
                 let mut owners = std::collections::BTreeSet::new();
                 if segments.is_empty() || segments.len() > 128 {
@@ -88,12 +92,12 @@ impl Adapter for Flash {
                 Ok((plan, vec![]))
             }
         }?;
-        crate::packet::indirect(&self.manifest, segments, &self.packet_kernels, result)
+        crate::packet::indirect(&self.manifest, segments, &self.operands, result)
     }
     fn visual(
         &self,
         tokens: &[u32],
-        images: &[abi::ImageGrid],
+        images: &[orinfer_model_sdk::architecture::ImageGrid],
         capacity: usize,
     ) -> Result<(Vec<i32>, Vec<u32>)> {
         crate::vision::layout(
@@ -147,7 +151,7 @@ impl Adapter for Flash {
         )?;
         self.inputs.prepare_for(program, tokens, history, capacity)
     }
-    fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<abi::BatchPlan> {
+    fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<packet::BatchPlan> {
         Ok((
             if include_plan {
                 batching::plan(&self.manifest, segments)?
@@ -158,11 +162,8 @@ impl Adapter for Flash {
         ))
     }
 }
-pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate::registry::Built> {
-    if policy != Policy::Int8Quality
-        || request.config["model_type"] != "qwen4_exp"
-        || request.architecture != "flash_next"
-    {
+pub(crate) fn create(mut request: CreateRequest) -> Result<crate::registry::Built> {
+    if request.config["model_type"] != "qwen4_exp" || request.architecture != "flash_next" {
         return Err("Unsupported Flash architecture or precision policy".into());
     }
     let contract: serde_json::Value = serde_json::from_str(include_str!(
@@ -234,14 +235,17 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         return Err("Flash requires shared target/draft rows and dynamic causal state".into());
     }
     plan::build(&mut request.metadata, &request.prefill_profiles)?;
-    q4::validate(&request.metadata)?;
+    let exhaustive = request.verify_weights || request.build_bindings;
+    if exhaustive {
+        q4::validate(&request.metadata)?;
+    }
     q4::prerequisites(&mut request.metadata, &request.kernel_contracts)?;
     experts::build(&mut request.metadata, &request.kernel_contracts)?;
-    hc::build(&mut request.metadata, &request.kernel_contracts)?;
-    routing::build(&mut request.metadata, &request.kernel_contracts)?;
-    decode_fusions::build(&mut request.metadata, &request.kernel_contracts)?;
+    hc::build(&mut request.metadata, &request.kernel_contracts, exhaustive)?;
+    routing::build(&mut request.metadata, &request.kernel_contracts, exhaustive)?;
+    decode_fusions::build(&mut request.metadata, &request.kernel_contracts, exhaustive)?;
     parallel::build(&mut request.metadata, &request.kernel_contracts)?;
-    plan::stages(&mut request.metadata, &request.kernel_contracts)?;
+    plan::stages(&mut request.metadata, &request.operands)?;
     crate::packet::register_indirect(&mut request.metadata);
 
     let manifest = &mut request.metadata;
@@ -277,7 +281,10 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     if manifest.mtp.is_some() {
         programs.insert("mtp_capture_m4096".into());
     }
-    let variants = row_variants::build(&request.kernel_contracts, &manifest.buffers)?;
+    let variants = row_variants::build(
+        &request.kernel_contracts,
+        exhaustive.then_some(manifest.buffers.as_slice()),
+    )?;
     manifest.row_execution = Some(orinfer_model_sdk::operators::rows::RowExecution {
         capacity: 4096,
         program_capacities: std::collections::BTreeMap::new(),
@@ -351,37 +358,15 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         request.verify_weights,
     )?;
     let metadata = request.metadata;
-    let mut decode_programs = std::collections::BTreeSet::from(["decode".into()]);
-    if let Some(spec) = &metadata.mtp {
-        decode_programs.extend([
-            spec.draft_program.clone(),
-            "mtp_snapshot".into(),
-            "mtp_restore_draft".into(),
-        ]);
-        for p in &spec.warm_plans {
-            if p.tokens <= 8 || p.min_tokens > 0 {
-                decode_programs.extend([p.program.clone(), p.head_program.clone()]);
-            }
-        }
-        decode_programs.insert("mtp_capture_m1".into());
-        for p in &spec.verification_plans {
-            decode_programs.extend([
-                p.program.clone(),
-                p.capture_program.clone(),
-                p.restore_program.clone(),
-            ]);
-        }
-    }
     let created = CreatedPlan {
         expert_banks,
         metadata: metadata.clone(),
-        decode_programs,
     };
     Ok((
         Box::new(Flash {
             manifest: metadata,
             inputs,
-            packet_kernels: request.kernel_contracts,
+            operands: request.operands,
         }),
         created,
     ))

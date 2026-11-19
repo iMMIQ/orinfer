@@ -1,6 +1,7 @@
 //! Row-Q4 input transforms are part of the registered Flash execution recipe.
+use super::contracts::{Storage, connect, kernel_buffer_arg as buffer};
 use crate::{
-    artifact::{Access, Argument, Dtype, Kernel, Result},
+    artifact::{Dtype, Kernel, Result},
     model::{Manifest, Operation},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,11 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Creation receives storage contracts before kernels are attached. Derive
 /// precision variants from roles, never from package kernel enumeration.
 pub(super) fn validate(manifest: &Manifest) -> Result<()> {
-    let buffers: BTreeMap<_, _> = manifest
-        .buffers
-        .iter()
-        .map(|b| (b.name.as_str(), b))
-        .collect();
+    let storage = Storage::new(&manifest.buffers);
     let mut matrices = vec![("Q4_output".to_owned(), 248320, true)];
     for layer in 0..48 {
         if layer % 4 == 3 {
@@ -35,17 +32,14 @@ pub(super) fn validate(manifest: &Manifest) -> Result<()> {
         .into_iter()
         .chain(signs.then_some(("signs", Dtype::I8, vec![2560])))
         {
-            let name = format!("{prefix}_{suffix}");
-            if buffers.get(name.as_str()).is_none_or(|b| {
-                b.dtype != dtype || b.shape != shape || b.access != Access::Read || b.data.is_none()
-            }) {
-                return Err(format!("Invalid Flash Q4A8 policy operand: {name}"));
-            }
+            storage.check(&format!("{prefix}_{suffix}"), dtype, true, |b| {
+                Ok(b.shape == shape)
+            })?;
         }
     }
-    if buffers
-        .keys()
-        .any(|n| n.starts_with("Q4_") && n.ends_with("_packed") && !selected.contains(*n))
+    if storage
+        .names()
+        .any(|n| n.starts_with("Q4_") && n.ends_with("_packed") && !selected.contains(n))
     {
         return Err("Unexpected Q4 matrix outside the Flash mixed-precision policy".into());
     }
@@ -56,19 +50,7 @@ pub(super) fn validate(manifest: &Manifest) -> Result<()> {
 /// counts describe logical operators; implementations can add prerequisites
 /// without duplicating the model's single/batch/mixed execution recipes.
 pub(super) fn prerequisites(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
-    let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
-    let executed: BTreeSet<_> = manifest
-        .programs
-        .values()
-        .flatten()
-        .filter_map(|op| {
-            if let Operation::Kernel { name } = op {
-                Some(name.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let contracts = super::contracts::kernels(kernels);
     let mut rotations = BTreeMap::new();
     let mut declared = BTreeMap::new();
     for rotation in kernels {
@@ -81,19 +63,9 @@ pub(super) fn prerequisites(manifest: &mut Manifest, kernels: &[Kernel]) -> Resu
         if !(4..=5).contains(&rotation.args.len()) || !(5..=6).contains(&target.args.len()) {
             return Err("Unexpected Q4 prerequisite ABI".into());
         }
-        for index in 0..2 {
-            if !matches!((&rotation.args[index], &target.args[index]),
-                (Argument::Buffer {name: a}, Argument::Buffer {name: b}) if a == b)
-            {
-                return Err("Q4 transform/projection workspace mismatch".into());
-            }
-        }
-        let Argument::Buffer { name: signs } = &rotation.args[2] else {
-            return Err("Missing Q4 rotation signs".into());
-        };
-        let Argument::Buffer { name: packed } = &target.args[4] else {
-            return Err("Missing Q4 projection weights".into());
-        };
+        connect(rotation, target, &[(0, 0), (1, 1)])?;
+        let signs = buffer(rotation, 2)?;
+        let packed = buffer(target, 4)?;
         if !signs.starts_with("Q4_")
             || !signs.ends_with("_signs")
             || !packed.starts_with("Q4_")
@@ -105,43 +77,28 @@ pub(super) fn prerequisites(manifest: &mut Manifest, kernels: &[Kernel]) -> Resu
             .rsplit_once('/')
             .ok_or("Missing Q4 projection section")?
             .0;
-        let workspace = |i| match &rotation.args[i] {
-            Argument::Buffer { name } => name.clone(),
-            _ => unreachable!(),
-        };
         if rotations
             .insert(
-                (
-                    section.to_owned(),
-                    workspace(0),
-                    workspace(1),
-                    signs.clone(),
-                ),
-                rotation.name.clone(),
+                (section, buffer(rotation, 0)?, buffer(rotation, 1)?, signs),
+                rotation.name.as_str(),
             )
             .is_some()
         {
             return Err("Ambiguous Q4 input transform".into());
         }
-        declared.insert(projection.to_owned(), rotation.name.clone());
+        declared.insert(projection, rotation.name.as_str());
     }
     // Associate every consumer of a transformed operand, including QKV/Z's
     // shared rotation. Section and sign identities prevent reuse across layers
     // or between target and draft heads that share scratch storage.
     let mut pending = BTreeMap::new();
     for kernel in kernels {
-        let (
-            Some((section, _)),
-            Some(Argument::Buffer { name: a }),
-            Some(Argument::Buffer { name: scale }),
-            Some(Argument::Buffer { name: packed }),
-        ) = (
+        let (Some((section, _)), Ok(a), Ok(scale), Ok(packed)) = (
             kernel.name.rsplit_once('/'),
-            kernel.args.first(),
-            kernel.args.get(1),
-            kernel.args.get(4),
-        )
-        else {
+            buffer(kernel, 0),
+            buffer(kernel, 1),
+            buffer(kernel, 4),
+        ) else {
             continue;
         };
         let Some(base) = packed
@@ -155,33 +112,34 @@ pub(super) fn prerequisites(manifest: &mut Manifest, kernels: &[Kernel]) -> Resu
         } else {
             format!("{base}_signs")
         };
-        if let Some(rotation) =
-            rotations.get(&(section.to_owned(), a.clone(), scale.clone(), signs))
-        {
-            pending.insert(kernel.name.clone(), rotation.clone());
+        if let Some(rotation) = rotations.get(&(section, a, scale, signs.as_str())) {
+            pending.insert(kernel.name.as_str(), *rotation);
         }
     }
     if declared
         .keys()
-        .any(|projection| !pending.contains_key(projection))
+        .any(|projection| pending.get(projection) != declared.get(projection))
     {
         return Err("Q4 transform does not match the projection rotation policy".into());
     }
-    let transforms: BTreeSet<_> = rotations.values().cloned().collect();
+    let mut unregistered: BTreeSet<_> = declared.values().copied().collect();
+    let transforms = unregistered.clone();
     for operations in manifest.programs.values_mut() {
         // Each alias executes its own transform, once before its first consumer.
         let mut installed = BTreeSet::new();
         let mut expanded = Vec::with_capacity(operations.len());
         for operation in std::mem::take(operations) {
             if let Operation::Kernel { name } = &operation {
-                if transforms.contains(name) {
+                if transforms.contains(name.as_str()) {
+                    unregistered.remove(name.as_str());
                     continue;
                 }
-                if let Some(rotation) = pending.get(name)
-                    && installed.insert(rotation.clone())
+                if let Some(rotation) = pending.get(name.as_str())
+                    && installed.insert(*rotation)
                 {
+                    unregistered.remove(rotation);
                     expanded.push(Operation::Kernel {
-                        name: rotation.clone(),
+                        name: (*rotation).into(),
                     });
                 }
             }
@@ -189,9 +147,7 @@ pub(super) fn prerequisites(manifest: &mut Manifest, kernels: &[Kernel]) -> Resu
         }
         *operations = expanded;
     }
-    if declared.iter().any(|(projection, rotation)| {
-        !executed.contains(projection.as_str()) && !executed.contains(rotation.as_str())
-    }) {
+    if !unregistered.is_empty() {
         return Err("Unregistered Q4 prerequisite".into());
     }
     Ok(())
@@ -200,6 +156,7 @@ pub(super) fn prerequisites(manifest: &mut Manifest, kernels: &[Kernel]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::Argument;
     fn contract(name: &str, args: &[&str]) -> Kernel {
         let asset = serde_json::json!({"file":"test.cubin","sha256":"0".repeat(64)});
         serde_json::from_value(serde_json::json!({
@@ -285,7 +242,7 @@ mod tests {
                 let mut ops = vec![];
                 if preinstalled && program == "prefill" {
                     ops.push(Operation::Kernel {
-                        name: rotation.clone(),
+                        name: (*rotation).into(),
                     });
                 }
                 ops.push(Operation::Kernel {

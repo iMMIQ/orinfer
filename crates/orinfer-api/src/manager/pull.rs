@@ -285,11 +285,7 @@ pub(super) fn pull(data_dir: &Path, input: Pull) -> Result<ModelRecord> {
     let expected = descriptor["execution_package"]
         .as_str()
         .ok_or("Missing execution package digest")?;
-    if expected.len() != 64
-        || !expected
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
+    if !orinfer_engine::artifact::is_sha256_hex(expected) {
         return Err("Invalid execution package digest".into());
     }
     if let Some(package) = input.package {

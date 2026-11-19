@@ -21,10 +21,9 @@ from orinfer_build.common.gpu import gpu_lock
 import numpy as np
 from orinfer_build.packaging.publication import atomic_model
 from orinfer_build.common.files import file_hash, write_json
-from orinfer_build.packaging.package import config_signature, execution_identity, model_library
+from orinfer_build.packaging.package import config_signature
 from orinfer_build.packaging.compact import compact_package
 from orinfer_build.models.qwen35.storage import Weights
-from orinfer_build.quantization.row_q4 import MAGNITUDES
 from orinfer_build.compiler.compile import primitive
 
 
@@ -153,29 +152,21 @@ def configuration(config, context):
 
         if q.get("rotated_w8_layers") != rotated_w8_layers(config):
             raise ValueError("ASR requires its quality-first W8 layer policy")
-    if q.get("quant_method") not in ("orinfer_q4_int8", "orinfer_e8p_q4_int8"):
+    if q.get("quant_method") != "orinfer_e8p_q4_int8":
         raise ValueError("Unsupported Qwen Q4 codec")
-    if q["quant_method"] == "orinfer_e8p_q4_int8":
-        if any(
-            q.get(k) != v
-            for k, v in dict(
-                coefficients=[4, 1],
-                basis_tensor="orinfer.e8p_q4.basis",
-                layout="u32-low-coarse-high-residual",
-            ).items()
-        ) or any(type(v) is not int for v in q["coefficients"]):
-            raise ValueError("Unsupported two-stage E8P-Q4 contract")
-    if t["tie_word_embeddings"] and (
-        q["quant_method"] != "orinfer_e8p_q4_int8" or q.get("embedding") != "e8p_q4"
-    ):
+    if any(
+        q.get(k) != v
+        for k, v in dict(
+            coefficients=[4, 1],
+            basis_tensor="orinfer.e8p_q4.basis",
+            layout="u32-low-coarse-high-residual",
+        ).items()
+    ) or any(type(v) is not int for v in q["coefficients"]):
+        raise ValueError("Unsupported two-stage E8P-Q4 contract")
+    if t["tie_word_embeddings"] and q.get("embedding") != "e8p_q4":
         raise ValueError("Tied embedding/head requires the shared E8P Q4 bank")
     if any(q.get(role) not in (None, "e8p_q4") for role in ("embedding", "vision")):
         raise ValueError("Unsupported embedding or vision codec")
-    if (
-        any(q.get(role) for role in ("embedding", "vision"))
-        and q["quant_method"] != "orinfer_e8p_q4_int8"
-    ):
-        raise ValueError("Embedding/vision Q4 requires the two-stage E8P codec")
     if type(context) is not int or not 1 <= context <= min(t["max_position_embeddings"], 262144):
         raise ValueError("Invalid context capacity")
     return t
@@ -209,11 +200,6 @@ class Builder:
             "model.language_model.embed_tokens.weight" if self.tied else "lm_head.weight"
         )
         self.embedding_q4 = self.config["quantization_config"].get("embedding") == "e8p_q4"
-        self.q4_codec = (
-            "e8p_q4"
-            if self.config["quantization_config"]["quant_method"] == "orinfer_e8p_q4_int8"
-            else "q4"
-        )
         state = json.loads((source / "progress.json").read_text())
         if not state.get("complete"):
             raise ValueError("Quantization is still running; no partial model may be published")
@@ -223,7 +209,7 @@ class Builder:
         self.gdn_execution = (
             None if self.standard else dict(prefill="sequential", decode=dict(kind="dense"))
         )
-        self.weights = Weights(source, root, packed_k=128 if self.q4_codec == "e8p_q4" else 0)
+        self.weights = Weights(source, root, packed_k=128)
         prepare_chat_template(source, root / "chat_template.jinja")
         self.aot = Aot(
             root / "cache", output, cache, self.weights.buffers, compile_lock=lambda: gpu_lock(lock)
@@ -393,22 +379,14 @@ class Builder:
             if signs.dtype != np.int8 or signs.shape != (k,) or not np.isin(signs, [-1, 1]).all():
                 raise ValueError("Invalid rotation signs")
             self.signs[k] = w.constant(name, signs)
-        if self.q4_codec == "e8p_q4":
-            from orinfer_build.quantization.e8p import basis
-            from orinfer_build.quantization.vq import e8p_selector_table
+        from orinfer_build.quantization.e8p import basis
+        from orinfer_build.quantization.vq import e8p_selector_table
 
-            table = w.array("orinfer.e8p_q4.basis")
-            if table.dtype != np.int8 or not np.array_equal(table, basis()):
-                raise ValueError("E8P-Q4 basis differs from compiled decoder")
-            w.constant("orinfer.e8p_q4.basis", table)
-            self.book = w.constant("orinfer.e8p_q4.selectors", e8p_selector_table(table))
-        else:
-            table = w.array("orinfer.q4.table")
-            if not np.array_equal(
-                table, np.array((*MAGNITUDES, *(-x for x in MAGNITUDES)), np.int8)
-            ):
-                raise ValueError("Q4 integer table differs from compiled decoder")
-            w.constant("orinfer.q4.table", table)
+        table = w.array("orinfer.e8p_q4.basis")
+        if table.dtype != np.int8 or not np.array_equal(table, basis()):
+            raise ValueError("E8P-Q4 basis differs from compiled decoder")
+        w.constant("orinfer.e8p_q4.basis", table)
+        self.book = w.constant("orinfer.e8p_q4.selectors", e8p_selector_table(table))
 
     def emit(
         self,
@@ -706,9 +684,9 @@ class Builder:
             kind = (
                 "w8"
                 if weight + ".int8" in w.index["weight_map"] or weight + ".int8" in w.buffers
-                else self.q4_codec
+                else "e8p_q4"
             )
-        compressed = kind in ("q4", "e8p_q4")
+        compressed = kind == "e8p_q4"
         suffix = ".packed" if compressed else ".int8"
         data = w.immutable(weight + suffix)
         scale = w.immutable(weight + ".scale")
@@ -790,13 +768,11 @@ class Builder:
         from orinfer_build.contracts.row_selection import samples
 
         w = self.weights
-        suffix = ".packed" if kind in ("q4", "e8p_q4") else ".int8"
+        suffix = ".packed" if kind == "e8p_q4" else ".int8"
         actual = dict(
             W=torch.from_numpy(w.array(weight + suffix).copy()).cuda(),
             WS=torch.from_numpy(w.array(weight + ".scale").copy()).cuda(),
         )
-        if kind == "q4":
-            actual["W"] = actual["W"].view(torch.uint16)
         if kind == "e8p_q4":
             actual["Book"] = torch.from_numpy(w.extra[self.book].copy()).cuda()
         identity = w.buffers[weight + suffix]["data"]["sha256"]
@@ -1160,7 +1136,7 @@ class Builder:
         metadata = dict(
             schema_version=2,
             target="sm_87",
-            model=f"{self.config.get('quantization_config', {}).get('source', 'Qwen3.5')}-{self.q4_codec}-A8",
+            model=f"{self.config.get('quantization_config', {}).get('source', 'Qwen3.5')}-e8p_q4-A8",
             chunk_tokens=CAPACITY,
             max_context=self.context,
             vocab=self.v,
@@ -1174,7 +1150,7 @@ class Builder:
             position="Step",
             weight_bytes=total,
             weight_parameters=self.state["parameters"],
-            weight_scope=f"Original BF16 -> signed-block128 {self.q4_codec} Q4A8; embedding/vision precision from quantization policy, sensitive output/MTP projections W8; one packed resident copy; no permanent W8 expansion",
+            weight_scope="Original BF16 -> signed-block128 e8p_q4 Q4A8; embedding/vision precision from quantization policy, sensitive output/MTP projections W8; one packed resident copy; no permanent W8 expansion",
             kv_cache=dict(
                 direct_prefill=True, demand_mapping=True, buffers=self.kv, prefill_workspace={}
             ),
@@ -1192,8 +1168,6 @@ class Builder:
             ),
         )
         package = dict(
-            schema_version=1,
-            runtime_abi=1,
             target="sm_87",
             architecture=self.architecture,
             compute_policy="int8_quality",
@@ -1205,9 +1179,6 @@ class Builder:
                 {k: v for k, v in b.items() if k != "data"} for b in w.buffers.values()
             ],
             toolchain=self.aot.identity,
-            execution=execution_identity(
-                model_library(), engine, self.architecture, "int8_quality"
-            ),
             plan_kernel_contracts=[
                 k["name"]
                 for k in self.aot.kernels

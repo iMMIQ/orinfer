@@ -3,7 +3,7 @@
 use super::*;
 pub(in crate::runtime) mod control;
 
-pub(in crate::runtime) use crate::mtp::adaptive::Timing as Profile;
+pub(in crate::runtime) use crate::scheduler::Timing as Profile;
 
 pub(super) enum Preparation {
     Finished(Vec<u32>),
@@ -286,13 +286,13 @@ impl ModelRuntime {
             }
             let packet = mixed || key.batch > 1 || spec.batch_verification_tokens.contains(&width);
             let operation = if mixed {
-                orinfer_model_sdk::abi::BatchOperation::MixedRows {
+                orinfer_model_sdk::packet::BatchOperation::MixedRows {
                     prefills: (joint.len() - key.batch) as u8,
                 }
             } else {
-                orinfer_model_sdk::abi::BatchOperation::Verification
+                orinfer_model_sdk::packet::BatchOperation::Verification
             };
-            if packet && !self.model_package.supports_batch(&segments, operation) {
+            if packet && !self.batch_plans.supports_batch(&segments, operation) {
                 continue;
             }
             let expected_tokens = control::progress(
@@ -547,13 +547,13 @@ impl ModelRuntime {
             }
         }
         let operation = if prefills.is_empty() {
-            orinfer_model_sdk::abi::BatchOperation::Verification
+            orinfer_model_sdk::packet::BatchOperation::Verification
         } else {
-            orinfer_model_sdk::abi::BatchOperation::MixedRows {
+            orinfer_model_sdk::packet::BatchOperation::MixedRows {
                 prefills: prefills.len() as u8,
             }
         };
-        let (plan, bindings) = self.model_package.cached_batch(&segments, operation)?;
+        let (plan, bindings) = self.batch_plans.cached_batch(&segments, operation)?;
         self.upload_spec_bindings(&segments, operation, bindings)?;
         self.execution.execute_cached_batch_operation_with(
             operation,
@@ -695,9 +695,9 @@ impl ModelRuntime {
             .is_some_and(|t| t.deferred)
     }
     fn commit_spec_packet(&mut self, segments: &[BatchSegment]) -> Result<()> {
-        use orinfer_model_sdk::abi::BatchOperation;
+        use orinfer_model_sdk::packet::BatchOperation;
         let (plan, bindings) = self
-            .model_package
+            .batch_plans
             .cached_batch(segments, BatchOperation::Commit)?;
         self.upload_spec_bindings(segments, BatchOperation::Commit, bindings)?;
         self.execution.execute_cached_batch_operation(
@@ -711,10 +711,10 @@ impl ModelRuntime {
     fn upload_spec_bindings(
         &mut self,
         segments: &[BatchSegment],
-        phase: orinfer_model_sdk::abi::BatchOperation,
-        bindings: std::rc::Rc<orinfer_model_sdk::abi::StateBindings>,
+        phase: orinfer_model_sdk::packet::BatchOperation,
+        bindings: std::rc::Rc<orinfer_model_sdk::packet::StateBindings>,
     ) -> Result<()> {
-        use orinfer_model_sdk::abi::BatchOperation;
+        use orinfer_model_sdk::packet::BatchOperation;
         let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP contract")?;
         let suffix = self
             .manifest
@@ -773,17 +773,17 @@ impl ModelRuntime {
     fn execute_spec_packet(
         &mut self,
         segments: &[BatchSegment],
-        phase: orinfer_model_sdk::abi::BatchOperation,
+        phase: orinfer_model_sdk::packet::BatchOperation,
     ) -> Result<()> {
         self.execute_spec_packet_phase(segments, phase, ExecutionPhase::Decode)
     }
     pub(in crate::runtime) fn execute_spec_packet_phase(
         &mut self,
         segments: &[BatchSegment],
-        phase: orinfer_model_sdk::abi::BatchOperation,
+        phase: orinfer_model_sdk::packet::BatchOperation,
         execution_phase: ExecutionPhase,
     ) -> Result<()> {
-        let (plan, bindings) = self.model_package.cached_batch(segments, phase)?;
+        let (plan, bindings) = self.batch_plans.cached_batch(segments, phase)?;
         self.upload_spec_bindings(segments, phase, bindings)?;
         self.execution.execute_cached_batch_operation(
             phase,
@@ -798,7 +798,7 @@ impl ModelRuntime {
         requests: &mut [&mut RequestState],
         committed: &[(usize, CommittedRound)],
     ) -> Result<()> {
-        use orinfer_model_sdk::abi::BatchOperation;
+        use orinfer_model_sdk::packet::BatchOperation;
         let spec = self.manifest.mtp.clone().ok_or("Missing MTP adapter")?;
         let capacity = spec.batch_warm_capacity.max(
             *spec
@@ -909,15 +909,15 @@ impl ModelRuntime {
                     .unwrap_or(segments.len());
                 for chunk in segments.chunks(lanes.max(1)) {
                     let (plan, bindings) = self
-                        .model_package
-                        .cached_batch(chunk, orinfer_model_sdk::abi::BatchOperation::Draft)?;
+                        .batch_plans
+                        .cached_batch(chunk, orinfer_model_sdk::packet::BatchOperation::Draft)?;
                     self.upload_spec_bindings(
                         chunk,
-                        orinfer_model_sdk::abi::BatchOperation::Draft,
+                        orinfer_model_sdk::packet::BatchOperation::Draft,
                         bindings,
                     )?;
                     self.execution.execute_cached_batch_operation(
-                        orinfer_model_sdk::abi::BatchOperation::Draft,
+                        orinfer_model_sdk::packet::BatchOperation::Draft,
                         chunk.iter().map(|s| (s.slot, s.tokens)).collect(),
                         &plan,
                         true,
@@ -1059,7 +1059,10 @@ impl ModelRuntime {
         };
         let host_sampling = !req.sampling.is_greedy() || req.sampling.top_logprobs.is_some();
         let lookup = (self.prompt_lookup && !host_sampling)
-            .then(|| req.prompt_lookup.propose(&req.history, plan.tokens - 1))
+            .then(|| {
+                req.prompt_lookup
+                    .propose(&req.core.history, plan.tokens - 1)
+            })
             .flatten();
         let is_lookup = lookup.is_some();
         if !is_lookup && let Some(save) = &spec.draft_snapshot_program {
@@ -1096,9 +1099,10 @@ impl ModelRuntime {
         if self.manifest.batch_profiles.contains(&1) {
             let allow_replay = req.limit - req.generated >= 2;
             let segments = self.prepare_batch_inputs(&mut [req], &[(0, 1)])?;
-            let (plan, _) = self
-                .model_package
-                .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Ordinary)?;
+            let (plan, _) = self.batch_plans.cached_batch(
+                &segments,
+                orinfer_model_sdk::packet::BatchOperation::Ordinary,
+            )?;
             self.execution.execute_batch(
                 segments.iter().map(|s| (s.slot, s.tokens)).collect(),
                 &plan,
@@ -1160,7 +1164,7 @@ impl ModelRuntime {
                         .execution
                         .download_bytes(&spec.draft_logits, vocab * 4)?;
                     draft_decoder
-                        .law(
+                        .law_validated(
                             &floats(&raw, crate::artifact::Dtype::F32),
                             draft_history,
                             &draft_options,
@@ -1188,7 +1192,7 @@ impl ModelRuntime {
                 .execution
                 .download_bytes(&spec.draft_logits, vocab * 4)?;
             let law = draft_decoder
-                .law(
+                .law_validated(
                     &floats(&raw, crate::artifact::Dtype::F32),
                     draft_history,
                     &draft_options,
@@ -1262,7 +1266,7 @@ impl ModelRuntime {
                             slot: req.slot,
                             tokens: 1,
                         }],
-                        orinfer_model_sdk::abi::BatchOperation::Draft,
+                        orinfer_model_sdk::packet::BatchOperation::Draft,
                     )?;
                 } else {
                     self.launch_rows(&program, 1, ExecutionPhase::Decode)?;
@@ -1302,7 +1306,7 @@ impl ModelRuntime {
                     slot: req.slot,
                     tokens: plan.tokens,
                 }],
-                orinfer_model_sdk::abi::BatchOperation::Verification,
+                orinfer_model_sdk::packet::BatchOperation::Verification,
             )?;
         } else {
             self.launch_rows(&plan.program, plan.tokens, ExecutionPhase::Decode)?;
@@ -1363,11 +1367,12 @@ impl ModelRuntime {
                             )?;
                             logits = Some(floats(&raw, crate::artifact::Dtype::F32));
                         }
-                        req.decoder
-                            .law(
+                        req.core
+                            .decoder
+                            .law_validated(
                                 &logits.as_ref().unwrap()[row * vocab..(row + 1) * vocab],
                                 &history,
-                                &req.sampling,
+                                &req.core.sampling,
                             )?
                             .distribution
                             .draw(0.0)?
@@ -1386,13 +1391,14 @@ impl ModelRuntime {
             let raw = self
                 .execution
                 .download_bytes(&spec.verification_logits, plan.tokens * vocab * 4)?;
-            crate::sampling::verify(
+            let core = &mut req.core;
+            crate::sampling::verify_validated(
                 &proposals,
                 &floats(&raw, crate::artifact::Dtype::F32),
-                &req.history,
-                &req.sampling,
-                &mut req.decoder,
-                req.generated,
+                &core.history,
+                &core.sampling,
+                &mut core.decoder,
+                core.generated,
                 vocab,
             )?
         };
@@ -1776,24 +1782,24 @@ mod policy_tests {
                     })
                     .collect();
                 let (plan, bindings) = model
-                    .model_package
+                    .batch_plans
                     .batch_operation(
                         &segments,
-                        orinfer_model_sdk::abi::BatchOperation::Draft,
+                        orinfer_model_sdk::packet::BatchOperation::Draft,
                         true,
                     )
                     .unwrap();
                 model
                     .upload_spec_bindings(
                         &segments,
-                        orinfer_model_sdk::abi::BatchOperation::Draft,
+                        orinfer_model_sdk::packet::BatchOperation::Draft,
                         std::rc::Rc::new(bindings),
                     )
                     .unwrap();
                 model
                     .execution
                     .execute_batch_operation(
-                        orinfer_model_sdk::abi::BatchOperation::Draft,
+                        orinfer_model_sdk::packet::BatchOperation::Draft,
                         segments.iter().map(|s| (s.slot, s.tokens)).collect(),
                         &plan,
                         true,

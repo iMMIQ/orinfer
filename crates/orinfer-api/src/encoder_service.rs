@@ -1,7 +1,51 @@
 //! Shared bounded HTTP ingress and an owner-thread GPU lifecycle for encoders.
+use crate::server::{api_key, bearer_authorized, lifecycle::Lifecycle, listener, shutdown_signal};
 use serde_json::{Value, json};
-use std::time::Instant;
+use std::{
+    collections::BTreeMap,
+    path::{Component, Path},
+    time::Instant,
+};
+use tokenizers::Tokenizer;
 type Result<T> = std::result::Result<T, String>;
+pub(crate) struct Frontend {
+    pub tokenizer: Tokenizer,
+    pub hashes: BTreeMap<String, String>,
+    pub context: usize,
+    pub metadata: Value,
+}
+pub(crate) fn load_frontend_descriptor(root: &Path) -> Result<Frontend> {
+    let bytes = std::fs::read(root.join("cache/model.json")).map_err(|e| e.to_string())?;
+    let mut descriptor: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let hashes: BTreeMap<String, String> =
+        serde_json::from_value(descriptor["frontend_assets"].take()).map_err(|e| e.to_string())?;
+    for name in hashes.keys() {
+        let mut components = Path::new(name).components();
+        if components.next() != Some(Component::Normal(name.as_ref()))
+            || components.next().is_some()
+        {
+            return Err("Invalid encoder frontend filename".into());
+        }
+    }
+    let metadata = descriptor["metadata"].take();
+    let context = metadata["max_context"]
+        .as_u64()
+        .ok_or("Missing encoder context")? as usize;
+    let tokenizer = Tokenizer::from_file(root.join("tokenizer.json")).map_err(|e| e.to_string())?;
+    Ok(Frontend {
+        tokenizer,
+        hashes,
+        context,
+        metadata,
+    })
+}
+
+pub(crate) fn unbounded_tokenizer(mut tokenizer: Tokenizer) -> Result<Tokenizer> {
+    tokenizer.with_truncation(None).map_err(|e| e.to_string())?;
+    tokenizer.with_padding(None);
+    Ok(tokenizer)
+}
+
 pub(crate) trait Backend {
     fn respond(&mut self, request: Value) -> Result<Value>;
 }
@@ -12,6 +56,7 @@ struct Service {
     model: std::sync::Arc<str>,
     key: Option<std::sync::Arc<str>>,
     timeout_ms: u64,
+    lifecycle: std::sync::Arc<Lifecycle>,
 }
 struct Job {
     _slot: tokio::sync::OwnedSemaphorePermit,
@@ -55,55 +100,60 @@ where
         extract::DefaultBodyLimit,
         routing::{get, post},
     };
+    let (listener, _socket_path) = listener::bind(&settings.listen)
+        .await
+        .map_err(|error| format!("Listener bind failed: {error}"))?;
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Job>(4);
     let (ready, initialized) = tokio::sync::oneshot::channel();
     let state = Service {
         sender,
         slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         model: settings.model.clone().into(),
-        key: std::env::var("ORINFER_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(Into::into),
+        key: api_key(),
         timeout_ms: settings.limits.output_ms,
+        lifecycle: Default::default(),
     };
     let listen = settings.listen.clone();
+    let lifecycle = state.lifecycle.clone();
     let worker = std::thread::Builder::new()
         .name("orinfer-encoder-gpu".into())
         .spawn(move || {
-            let initialize = || -> Result<_> {
-                let lock = crate::manager::locked_file(&settings.gpu_lock)?;
-                let backend = load(&settings)?;
-                struct Loaded<B> {
-                    backend: B,
-                    _lock: std::fs::File,
-                }
-                Ok(Loaded {
-                    backend,
-                    _lock: lock,
-                })
-            };
-            match initialize() {
-                Err(error) => {
-                    let _ = ready.send(Err(error));
-                }
-                Ok(mut loaded) => {
-                    if ready.send(Ok(())).is_err() {
-                        return;
+            lifecycle.supervise(|| {
+                let initialize = || -> Result<_> {
+                    let lock = crate::manager::locked_file(&settings.gpu_lock)?;
+                    let backend = load(&settings)?;
+                    struct Loaded<B> {
+                        backend: B,
+                        _lock: std::fs::File,
                     }
-                    while let Some(job) = receiver.blocking_recv() {
-                        if job.result.is_closed() {
-                            continue;
+                    Ok(Loaded {
+                        backend,
+                        _lock: lock,
+                    })
+                };
+                match initialize() {
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                    }
+                    Ok(mut loaded) => {
+                        lifecycle.ready();
+                        if ready.send(Ok(())).is_err() {
+                            return;
                         }
-                        let result = if Instant::now() >= job.deadline {
-                            Err("Encoder request expired in queue".into())
-                        } else {
-                            loaded.backend.respond(job.request)
-                        };
-                        let _ = job.result.send(result);
+                        while let Some(job) = receiver.blocking_recv() {
+                            if job.result.is_closed() {
+                                continue;
+                            }
+                            let result = if Instant::now() >= job.deadline {
+                                Err("Encoder request expired in queue".into())
+                            } else {
+                                loaded.backend.respond(job.request)
+                            };
+                            let _ = job.result.send(result);
+                        }
                     }
                 }
-            }
+            })
         })
         .map_err(|e| e.to_string())?;
     let initialized = initialized
@@ -115,71 +165,46 @@ where
         let _ = worker.join();
         return Err(error);
     }
-    let result = async {
-        let mut router = Router::new()
-            .route("/health", get(health))
-            .route("/v1/models", get(models));
-        for route in routes {
-            router = router.route(route, post(inference_request));
-        }
-        let router = router
-            .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
-            .with_state(state.clone());
-        async fn shutdown() {
-            #[cfg(unix)]
-            {
-                let mut terminate =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("SIGTERM listener");
-                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
-        if let Some(path) = listen.strip_prefix("unix:") {
-            let listener = tokio::net::UnixListener::bind(path).map_err(|e| e.to_string())?;
-            eprintln!(
-                "API READY encoders at {listen}; one complete independent sequence at a time"
-            );
-            axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown())
-                .await
-                .map_err(|e| e.to_string())
-        } else {
-            let listener = tokio::net::TcpListener::bind(&listen)
-                .await
-                .map_err(|e| e.to_string())?;
-            eprintln!(
-                "API READY encoders at {listen}; one complete independent sequence at a time"
-            );
-            axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown())
-                .await
-                .map_err(|e| e.to_string())
-        }
+    let mut router = Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(models));
+    for route in routes {
+        router = router.route(route, post(inference_request));
     }
-    .await;
-    drop(state);
+    let lifecycle = state.lifecycle.clone();
+    let router = router
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .with_state(state);
+    eprintln!("API READY encoders at {listen}; one complete independent sequence at a time");
+    let result = listener
+        .serve(router, async move {
+            shutdown_signal().await;
+            lifecycle.drain();
+        })
+        .await
+        .map_err(|e| e.to_string());
     tokio::task::spawn_blocking(move || worker.join())
         .await
         .map_err(|e| e.to_string())?
+        .and_then(|outcome| outcome)
         .map_err(|_| "Encoder GPU worker panicked".to_owned())?;
     result
 }
 
-fn authorized(state: &Service, headers: &axum::http::HeaderMap) -> bool {
-    state.key.as_ref().is_none_or(|key| {
-        headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            == Some(key.as_ref())
-    })
-}
-async fn health(axum::extract::State(state): axum::extract::State<Service>) -> axum::Json<Value> {
-    axum::Json(json!({"status":"ready","model":state.model.as_ref()}))
+async fn health(
+    axum::extract::State(state): axum::extract::State<Service>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let status = if state.lifecycle.is_ready() {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        axum::Json(json!({"status":state.lifecycle.name(),"model":state.model.as_ref()})),
+    )
+        .into_response()
 }
 fn failure(status: axum::http::StatusCode, message: impl Into<String>) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -194,7 +219,7 @@ async fn models(
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if !authorized(&state, &headers) {
+    if !bearer_authorized(state.key.as_deref(), &headers) {
         return failure(axum::http::StatusCode::UNAUTHORIZED, "Invalid API key");
     }
     axum::Json(json!({"object":"list","data":[{"id":state.model.as_ref(),"object":"model","owned_by":"orinfer"}]})).into_response()
@@ -205,7 +230,7 @@ async fn inference_request(
     body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::{http::StatusCode, response::IntoResponse};
-    if !authorized(&state, &headers) {
+    if !bearer_authorized(state.key.as_deref(), &headers) {
         return failure(StatusCode::UNAUTHORIZED, "Invalid API key");
     }
     let Ok(slot) = std::sync::Arc::clone(&state.slots).try_acquire_owned() else {
@@ -260,8 +285,15 @@ mod tests {
             model: "test-rerank".into(),
             key: Some("test-key".into()),
             timeout_ms: 10000,
+            lifecycle: Default::default(),
         };
-        let axum::Json(value) = health(axum::extract::State(state)).await;
+        state.lifecycle.ready();
+        let response = health(axum::extract::State(state)).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value, json!({"status":"ready","model":"test-rerank"}));
     }
     #[tokio::test]
@@ -274,6 +306,7 @@ mod tests {
             model: "embed".into(),
             key: None,
             timeout_ms: 10000,
+            lifecycle: Default::default(),
         };
         let handler = tokio::spawn(inference_request(
             axum::extract::State(state),

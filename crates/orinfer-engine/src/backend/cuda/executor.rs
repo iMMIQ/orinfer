@@ -1,9 +1,11 @@
+#[cfg(test)]
+mod graph_profile;
 use super::*;
 use crate::execution::{CudaGraphMode, ExecutionPhase, LoadOptions};
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::BTreeSet};
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct BatchGraphKey {
-    pub operation: orinfer_model_sdk::abi::BatchOperation,
+    pub operation: orinfer_model_sdk::packet::BatchOperation,
     pub segments: Vec<(usize, usize)>,
     pub rows: usize,
     pub shared: Option<SharedGraphKey>,
@@ -11,7 +13,7 @@ pub(super) struct BatchGraphKey {
 impl From<Vec<(usize, usize)>> for BatchGraphKey {
     fn from(segments: Vec<(usize, usize)>) -> Self {
         Self {
-            operation: orinfer_model_sdk::abi::BatchOperation::Ordinary,
+            operation: orinfer_model_sdk::packet::BatchOperation::Ordinary,
             rows: segments.iter().map(|(_, tokens)| tokens).sum(),
             segments,
             shared: None,
@@ -82,43 +84,6 @@ impl std::ops::Deref for BufferAddresses {
     }
 }
 
-#[cfg(test)]
-mod address_tests {
-    use super::BufferAddresses;
-
-    #[test]
-    fn only_request_addresses_can_be_rebound() {
-        let mut addresses = BufferAddresses::new(
-            [("weights", 10), ("workspace", 20), ("request", 30)]
-                .map(|(name, address)| (name.into(), address))
-                .into(),
-            ["request".into()].into(),
-        );
-        for name in ["weights", "workspace", "unknown"] {
-            assert!(!addresses.is_private(name));
-            assert!(addresses.bind_private(name, 99).is_err());
-        }
-        assert_eq!(addresses.len(), 3);
-        assert_eq!(addresses["weights"], 10);
-        assert_eq!(addresses["workspace"], 20);
-        assert_eq!(addresses["request"], 30);
-        assert!(addresses.is_private("request"));
-        addresses.bind_private("request", 40).unwrap();
-        assert_eq!(addresses["request"], 40);
-        addresses.bind_private("request", 0).unwrap();
-        assert_eq!(addresses["request"], 0);
-    }
-
-    #[test]
-    fn binding_never_creates_an_unknown_private_address() {
-        let mut addresses =
-            BufferAddresses::new([("weights".into(), 10)].into(), ["missing".into()].into());
-        assert!(addresses.bind_private("missing", 99).is_err());
-        assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses["weights"], 10);
-    }
-}
-
 pub(super) struct DirectKernel {
     pub(super) spec: Kernel,
     pub(super) function: Option<sys::CUfunction>,
@@ -153,25 +118,19 @@ pub(crate) struct Executor {
     pub(super) cuda_graph: CudaGraphMode,
     pub(super) expert_cache: RefCell<Option<super::experts::Pager>>,
     pub(super) growth: BTreeMap<String, crate::model::KvGrowth>,
-    pub(crate) peak_kv_bytes: std::cell::Cell<usize>,
-    pub(crate) peak_prefill_workspace_bytes: std::cell::Cell<usize>,
+    pub(super) peak_kv_bytes: std::cell::Cell<usize>,
+    pub(super) peak_prefill_workspace_bytes: std::cell::Cell<usize>,
     pub(super) prefill_workspace: std::collections::BTreeSet<String>,
-    pub(crate) allocations: Allocations,
+    pub(super) weight_buffers: BTreeSet<String>,
     workspace_dependencies: BTreeMap<String, Vec<String>>,
     text_workspaces: Vec<String>,
     pub(crate) parallel_regions: RefCell<Vec<[String; 4]>>,
     pub(super) row_kernel_slots: BTreeMap<String, String>,
     #[cfg(test)]
-    pub(crate) parallel_gate_first: std::cell::Cell<bool>,
-    #[cfg(test)]
-    pub(crate) parallel_priority: RefCell<String>,
-    #[cfg(test)]
-    pub(crate) live_graph_events: std::cell::Cell<Option<[sys::CUevent; 2]>>,
-    #[cfg(test)]
-    pub(crate) live_graph_ms: RefCell<Vec<f32>>,
+    pub(crate) graph_profile: graph_profile::Profile,
     pub(super) live_workspace: Option<(usize, std::rc::Weak<RefCell<super::snapshot::Workspace>>)>,
-    pub(crate) workspace_save_s: f64,
-    pub(crate) workspace_restore_s: f64,
+    pub(super) workspace_save_s: f64,
+    pub(super) workspace_restore_s: f64,
     pub(super) sequences: Vec<super::sequence::Sequence>,
     pub(super) state_table: RefCell<super::state_table::StateTable>,
     pub(super) idle_selection: RefCell<Option<super::sequence::IdleSelection>>,
@@ -183,22 +142,9 @@ pub(crate) struct Executor {
     pub(super) shared_graphs: RefCell<SharedGraphCache>,
     pub(super) shared_graph_trials: RefCell<BTreeMap<SharedGraphKey, usize>>,
     pub(super) batch_graph_clock: std::cell::Cell<u64>,
-    pub(crate) batch_statistics: std::cell::Cell<crate::scheduler::BatchExecutionStatistics>,
+    pub(super) batch_statistics: std::cell::Cell<crate::scheduler::BatchExecutionStatistics>,
 }
 
-/// Logical arenas share one CUDA owner today. Their addresses are separate so
-/// future sequence scheduling can retain weights and replace request state.
-#[derive(Default)]
-pub(crate) struct BufferArena {
-    pub addresses: BTreeMap<String, u64>,
-    pub bytes: usize,
-}
-#[derive(Default)]
-pub(crate) struct Allocations {
-    pub weights: BufferArena,
-    pub sequence: BufferArena,
-    pub workspace: BufferArena,
-}
 pub(crate) use crate::backend::report::LoadStats;
 
 fn deferred_workspace(
@@ -235,10 +181,14 @@ impl Executor {
         preload: &std::collections::BTreeSet<String>,
     ) -> Result<(Self, LoadStats)> {
         let manifest = &prepared.plan;
+        let target = orinfer_device::Target::from_package(&manifest.target)?;
+        target.require_host(std::env::consts::ARCH)?;
+        if target.backend == orinfer_device::Backend::Ascend {
+            return Err("This package requires Ascend model execution; no Ascend model provider is registered yet".into());
+        }
         let base = &prepared.weights_root;
         let kernel_base = &prepared.kernel_root;
         let scopes = &prepared.scopes;
-        let decode_programs = &prepared.decode_programs;
         let fingerprint = prepared.fingerprint.clone();
         let expert_plan = super::experts::Plan::new(prepared, options.resident_experts)?;
         let cuda_graph = if expert_plan.is_some() {
@@ -253,14 +203,12 @@ impl Executor {
             options.cuda_graph
         };
         let load_workers = options.weight_workers()?;
-        if decode_programs
-            .iter()
-            .any(|name| !manifest.programs.contains_key(name))
-        {
-            return Err("Architecture declares a missing decode program".into());
-        }
         let started = Instant::now();
-        let capacity_bytes = manifest.validate()?;
+        let capacity_bytes = manifest
+            .buffers
+            .iter()
+            .map(crate::artifact::Buffer::bytes)
+            .sum::<Result<usize>>()?;
         let lazy = manifest.kv_cache.as_ref().filter(|kv| kv.demand_mapping);
         let lazy_bytes = manifest
             .buffers
@@ -359,8 +307,8 @@ impl Executor {
         let mut s = Session::new(Driver::load()?);
         let mut pointers = BTreeMap::new();
         let mut sizes = BTreeMap::new();
-        let mut allocations = Allocations::default();
-        let (mut major, mut minor, mut version) = (0, 0, 0);
+        let mut weight_buffers = BTreeSet::new();
+        let (mut major, mut minor) = (0, 0);
         let mut name = [0u8; 256];
         let mut total = 0usize;
         // SAFETY: This owner initializes and retains the context on this thread.
@@ -388,7 +336,6 @@ impl Executor {
             if [major, minor] != [8, 7] {
                 return Err("Model requires SM87".into());
             }
-            check(sys::cuDriverGetVersion(&mut version), "driver version")?;
             check(
                 sys::cuDeviceGetName(name.as_mut_ptr().cast(), 256, s.device),
                 "device name",
@@ -453,7 +400,6 @@ impl Executor {
             load_stages.cuda_allocations += 1;
         }
         load_stages.buffer_alloc_s += allocation_started.elapsed().as_secs_f64();
-        allocations.weights.bytes = weight_layout.padding_bytes;
         // Buffers below that no weights/paged/lazy/deferred path claims would
         // each take an individual cuMemAlloc; carve them from one fixed arena
         // so load cost scales with bytes instead of the buffer count.
@@ -568,14 +514,8 @@ impl Executor {
             }
             pointers.insert(b.name.clone(), address);
             sizes.insert(b.name.clone(), bytes);
-            let arena = match scopes[&b.name] {
-                crate::loader::BufferScope::Weights => &mut allocations.weights,
-                crate::loader::BufferScope::Sequence => &mut allocations.sequence,
-                crate::loader::BufferScope::Workspace => &mut allocations.workspace,
-            };
-            arena.addresses.insert(b.name.clone(), address);
-            if !paged {
-                arena.bytes += bytes;
+            if scopes[&b.name] == crate::loader::BufferScope::Weights {
+                weight_buffers.insert(b.name.clone());
             }
             if b.data.is_some() {
                 let t = Instant::now();
@@ -786,7 +726,7 @@ impl Executor {
                 .trim_end_matches('\0')
                 .to_string(),
             sm: [major, minor],
-            driver_version: version,
+            driver_version: s.driver.version,
             total_bytes: total,
         };
         let executor = Self {
@@ -804,13 +744,7 @@ impl Executor {
                     .collect(),
             ),
             #[cfg(test)]
-            parallel_gate_first: Default::default(),
-            #[cfg(test)]
-            parallel_priority: RefCell::new("small_side".into()),
-            #[cfg(test)]
-            live_graph_events: Default::default(),
-            #[cfg(test)]
-            live_graph_ms: Default::default(),
+            graph_profile: Default::default(),
             session: s,
             pointers: BufferAddresses::new(
                 pointers,
@@ -834,7 +768,7 @@ impl Executor {
                 .as_ref()
                 .map(|kv| kv.growth.clone())
                 .unwrap_or_default(),
-            allocations,
+            weight_buffers,
             workspace_dependencies,
             text_workspaces: text_workspaces.into_iter().collect(),
             peak_kv_bytes: std::cell::Cell::new(0),
@@ -885,22 +819,54 @@ impl Executor {
             buffer_capacity_bytes: capacity_bytes,
         };
         let mut executor = executor;
-        executor.sequences[0].addresses = executor.allocations.sequence.addresses.clone();
-        executor.sequences[0].sizes = executor
-            .allocations
-            .sequence
-            .addresses
-            .keys()
-            .map(|n| (n.clone(), executor.sizes[n]))
-            .collect();
+        let sequence = &mut executor.sequences[0];
+        for (name, &address) in executor.pointers.iter() {
+            if scopes[name] == crate::loader::BufferScope::Sequence {
+                sequence.addresses.insert(name.clone(), address);
+                sequence.sizes.insert(name.clone(), executor.sizes[name]);
+            }
+        }
         // Sequence buffers carved from the fixed arena are interior slices of
         // one allocation: lease growth and idle reclaim must skip their free.
         for name in direct_offsets.keys() {
-            if executor.allocations.sequence.addresses.contains_key(*name) {
-                executor.sequences[0].mark_fixed_slice(name);
+            if sequence.addresses.contains_key(*name) {
+                sequence.mark_fixed_slice(name);
             }
         }
         Ok((executor, stats))
+    }
+    pub(crate) fn batch_statistics(&self) -> crate::scheduler::BatchExecutionStatistics {
+        self.batch_statistics.get()
+    }
+    pub(crate) fn set_batch_statistics(
+        &self,
+        statistics: crate::scheduler::BatchExecutionStatistics,
+    ) {
+        self.batch_statistics.set(statistics)
+    }
+    pub(crate) fn peak_kv_bytes(&self) -> usize {
+        self.peak_kv_bytes.get()
+    }
+    pub(crate) fn peak_prefill_workspace_bytes(&self) -> usize {
+        self.peak_prefill_workspace_bytes.get()
+    }
+    pub(crate) fn workspace_save_s(&self) -> f64 {
+        self.workspace_save_s
+    }
+    pub(crate) fn workspace_restore_s(&self) -> f64 {
+        self.workspace_restore_s
+    }
+    pub(crate) fn buffer_size(&self, name: &str) -> usize {
+        self.sizes[name]
+    }
+    pub(crate) fn cleanup(&mut self) -> Result<()> {
+        self.session.cleanup()
+    }
+    pub(crate) fn read_ready_control(&self, name: &str) -> Result<i32> {
+        let raw = self.read_ready_bytes(name, 4)?;
+        Ok(i32::from_le_bytes(
+            raw.try_into().map_err(|_| "Invalid control width")?,
+        ))
     }
     pub(crate) fn sync(&self) -> Result<()> {
         // SAFETY: This thread owns the live stream and all graph allocations.
@@ -1066,21 +1032,7 @@ impl Executor {
         self.submit_program(name, phase)?;
         self.sync()?;
         #[cfg(test)]
-        if name == "decode"
-            && phase == ExecutionPhase::Decode
-            && self.cuda_graph.uses_graph(phase)
-            && let Some(events) = self.live_graph_events.get()
-        {
-            let mut ms = 0.;
-            // SAFETY: Both events were recorded on the synchronized stream and are retained by Session.
-            unsafe {
-                check(
-                    sys::cuEventElapsedTime(&mut ms, events[0], events[1]),
-                    "live graph elapsed",
-                )?;
-            }
-            self.live_graph_ms.borrow_mut().push(ms);
-        }
+        self.graph_profile.finish(name, phase, self.cuda_graph)?;
         Ok(())
     }
 
@@ -1118,31 +1070,19 @@ impl Executor {
             // and addresses. KV growth above invalidates captures before reuse.
             let graph = self.program_graph(name)?;
             #[cfg(test)]
-            let events = (name == "decode" && phase == ExecutionPhase::Decode)
-                .then(|| self.live_graph_events.get())
-                .flatten();
+            if let Some(result) = self
+                .graph_profile
+                .replay(name, phase, self.session.stream, graph)
+            {
+                return result;
+            }
             // SAFETY: Graphs and their stable addresses live in this thread's session.
-            unsafe {
-                #[cfg(test)]
-                if let Some(events) = events {
-                    check(
-                        sys::cuEventRecord(events[0], self.session.stream),
-                        "live graph begin",
-                    )?;
-                }
+            return unsafe {
                 check(
                     sys::cuGraphLaunch(graph, self.session.stream),
                     "model graph",
-                )?;
-                #[cfg(test)]
-                if let Some(events) = events {
-                    check(
-                        sys::cuEventRecord(events[1], self.session.stream),
-                        "live graph end",
-                    )?;
-                }
-            }
-            return Ok(());
+                )
+            };
         }
         self.ensure_program_kernels(name)?;
         if let Some(direct) = &self.direct {
@@ -1549,5 +1489,42 @@ impl Executor {
             )?;
         }
         Ok(values)
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::BufferAddresses;
+
+    #[test]
+    fn only_request_addresses_can_be_rebound() {
+        let mut addresses = BufferAddresses::new(
+            [("weights", 10), ("workspace", 20), ("request", 30)]
+                .map(|(name, address)| (name.into(), address))
+                .into(),
+            ["request".into()].into(),
+        );
+        for name in ["weights", "workspace", "unknown"] {
+            assert!(!addresses.is_private(name));
+            assert!(addresses.bind_private(name, 99).is_err());
+        }
+        assert_eq!(addresses.len(), 3);
+        assert_eq!(addresses["weights"], 10);
+        assert_eq!(addresses["workspace"], 20);
+        assert_eq!(addresses["request"], 30);
+        assert!(addresses.is_private("request"));
+        addresses.bind_private("request", 40).unwrap();
+        assert_eq!(addresses["request"], 40);
+        addresses.bind_private("request", 0).unwrap();
+        assert_eq!(addresses["request"], 0);
+    }
+
+    #[test]
+    fn binding_never_creates_an_unknown_private_address() {
+        let mut addresses =
+            BufferAddresses::new([("weights".into(), 10)].into(), ["missing".into()].into());
+        assert!(addresses.bind_private("missing", 99).is_err());
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses["weights"], 10);
     }
 }

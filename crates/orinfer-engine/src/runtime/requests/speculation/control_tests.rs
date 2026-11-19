@@ -104,15 +104,15 @@ fn profitable_calibration_does_not_require_a_full_round_of_credit() {
     // Priming paid its actual loss from startup. Exhaust the startup pool to
     // exercise continuation using only this workload's marginal savings.
     hot(&mut c, k, 2, 0.04, 4);
-    c.budget.startup_spent = c.calibration_limit;
+    c.budget.startup_spent = c.budget.limit();
     let plans = [candidate(2, 7., 0.04)];
-    assert_eq!(c.budget.available(c.calibration_limit), 0.);
+    assert_eq!(c.budget.available(), 0.);
     for _ in 0..3 {
         assert_eq!(c.choose(k, &plans, 0.4), Some((2, true)));
         hot(&mut c, k, 2, 0.04, 8);
     }
     assert_eq!(c.choose(k, &plans, 0.4), Some((2, false)));
-    assert_eq!(c.budget.startup_spent, c.calibration_limit);
+    assert_eq!(c.budget.startup_spent, c.budget.limit());
     // Predicted profit is no grant: one unexpected loss blocks further probes.
     hot(&mut c, k, 3, 0.1, 0);
     assert!(c.budget.balance < 0.);
@@ -145,7 +145,7 @@ fn draft_lag_needs_full_deadline_and_credit_but_can_pay_back_over_hot_rounds() {
     assert_eq!(c.choose(k, &[plan], 0.05), Some((2, false)));
     assert_eq!(c.choose(k, &[cold], 0.05), None);
     assert_eq!(c.choose(k, &[cold], 0.4), Some((2, false)));
-    c.budget.startup_spent = c.calibration_limit;
+    c.budget.startup_spent = c.budget.limit();
     hot(&mut c, k, 3, 0.1, 0);
     assert!(c.budget.balance < 0.);
     assert_eq!(c.choose(k, &[cold], 0.4), None);
@@ -171,7 +171,7 @@ fn first_cold_sample_prices_retry_but_allows_consecutive_hot_calibration() {
             warm_ready: false,
         },
     );
-    c.budget.startup_spent = c.calibration_limit;
+    c.budget.startup_spent = c.budget.limit();
     let plan = candidate(2, 7., 0.04);
     assert_eq!(c.choose(k, &[plan], 0.4), Some((2, true)));
     assert_eq!(
@@ -285,7 +285,7 @@ fn stale_acceptance_gets_a_funded_shallow_review_without_invented_profit() {
     }
     assert_eq!(c.choose(k, &[deep, shallow], 0.4), Some((2, true)));
     hot(&mut c, k, 4, 0.1, 0);
-    c.budget.startup_spent = c.calibration_limit;
+    c.budget.startup_spent = c.budget.limit();
     // Even an optimistic yield cannot fund a review without enough cash for
     // the excess cost of a single guaranteed ordinary step.
     shallow.expected_tokens = 8.;
@@ -332,7 +332,7 @@ fn calibrated_losses_preserve_debt_without_spending_unused_startup_subsidy() {
     );
     assert!(c.budget.balance < -0.06);
     assert_eq!(c.budget.startup_spent, spent);
-    assert!(c.budget.available(c.calibration_limit) > 0.);
+    assert!(c.budget.available() > 0.);
     let cold = Candidate {
         warm_ready: false,
         ..candidate(2, 8., 0.04)
@@ -435,7 +435,7 @@ fn earned_model_credit_funds_new_shapes_without_copying_timings() {
     for _ in 0..100 {
         hot(&mut c, one, 2, 0.01, 2);
     }
-    c.budget.startup_spent = c.calibration_limit;
+    c.budget.startup_spent = c.budget.limit();
     let many = key(4);
     normal(&mut c, many);
     assert!(!c.costs.profiles[&many].arms.contains_key(&2));
@@ -465,7 +465,7 @@ fn startup_is_one_bounded_model_lifetime_pool() {
         let _ = c.choose(k, &[candidate(2, batch as f64 * 1.8, 0.04)], 0.4);
         assert_eq!(c.budget.startup_spent, before);
         hot(&mut c, k, 2, 0.05, 0);
-        assert!(c.budget.startup_spent <= c.calibration_limit);
+        assert!(c.budget.startup_spent <= c.budget.limit());
     }
     assert_eq!(c.budget.startup_spent, 0.4);
 }
@@ -646,7 +646,7 @@ fn many_new_shapes_cannot_reset_global_credit_or_debt() {
     let one = key(1);
     normal(&mut c, one);
     hot(&mut c, one, 2, 2., 0);
-    assert_eq!(c.budget.startup_spent, c.calibration_limit);
+    assert_eq!(c.budget.startup_spent, c.budget.limit());
     for batch in 1..=300 {
         let k = key(batch);
         normal(&mut c, k);
@@ -656,7 +656,7 @@ fn many_new_shapes_cannot_reset_global_credit_or_debt() {
         );
     }
     assert!(c.budget.balance < 0.);
-    assert_eq!(c.budget.startup_spent, c.calibration_limit);
+    assert_eq!(c.budget.startup_spent, c.budget.limit());
     assert_eq!(c.costs.profiles.len(), 256);
 }
 #[test]

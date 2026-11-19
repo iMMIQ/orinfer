@@ -6,6 +6,7 @@ order, scalar bits, offsets, grids and dynamic contracts are never inferred.
 
 import copy
 import re
+import struct
 
 
 def key(value):
@@ -48,31 +49,103 @@ def factor(bindings):
         template["layers"].append(
             dict(layer=layer, parameters=intern(values, parameters, parameter_ids))
         )
-    result = dict(parameters=parameters, choices=choices, templates=list(templates.values()))
+    roles, role_ids = [], {}
+    tagged = [
+        [encode_argument(a, lambda name: intern(name, roles, role_ids)) for a in group]
+        for group in parameters
+    ]
+    result = dict(
+        roles=roles, parameters=tagged, choices=choices, templates=list(templates.values())
+    )
     # Prove the generated representation itself, not just the earlier cubin catalog.
     before = {b["name"]: b for b in bindings}
     after = expand(result)
     if len(before) != len(bindings) or len(after) != len(before):
         raise ValueError("Duplicate binding in native templates")
-    if {b["name"]: b for b in after} != before:
+
+    def encoded(bindings):
+        return {
+            name: dict(
+                binding, args=[encode_argument(a, lambda name: name) for a in binding["args"]]
+            )
+            for name, binding in bindings.items()
+        }
+
+    if encoded({b["name"]: b for b in after}) != encoded(before):
         raise ValueError("Layer template failed exact binding roundtrip")
     return result
 
 
+def encode_argument(arg, role):
+    kind = arg["kind"]
+    if kind == "buffer":
+        value = role(arg["name"])
+    elif kind == "buffer_slice":
+        value = [role(arg["name"]), arg["offset"]]
+    elif kind == "f32":
+        value = struct.unpack("<I", struct.pack("<f", arg["value"]))[0]
+    elif kind in ("i32", "u32", "i64", "u64"):
+        value = arg["value"]
+    else:
+        raise ValueError("Unknown binding argument type")
+    return {kind: value}
+
+
+def lookup(items, index):
+    if type(index) is not int or not 0 <= index < len(items):
+        raise ValueError("Invalid binding table index")
+    return items[index]
+
+
+def decode_argument(arg, roles):
+    ((kind, value),) = arg.items()
+    if kind == "buffer":
+        return dict(kind=kind, name=lookup(roles, value))
+    if kind == "buffer_slice":
+        role, offset = value
+        if type(offset) is not int or not 0 <= offset < 2**64:
+            raise ValueError("Invalid binding slice offset")
+        return dict(kind=kind, name=lookup(roles, role), offset=offset)
+    if kind == "f32":
+        value = struct.unpack("<f", struct.pack("<I", value))[0]
+    elif kind in ("i32", "u32", "i64", "u64"):
+        signed = kind.startswith("i")
+        bits = int(kind[1:]) - signed
+        if type(value) is not int or not (-(2**bits) if signed else 0) <= value < 2**bits:
+            raise ValueError("Invalid binding scalar")
+    else:
+        raise ValueError("Unknown binding argument type")
+    return dict(kind=kind, value=value)
+
+
 def expand(registry):
     bindings = []
+    if set(registry) != {"roles", "parameters", "choices", "templates"}:
+        raise ValueError("Invalid binding registry fields")
+    parameters = [
+        [decode_argument(a, registry["roles"]) for a in group] for group in registry["parameters"]
+    ]
+    seen = set()
     for template in registry["templates"]:
+        choices = lookup(registry["choices"], template["choice"])
+        if not choices or not template["layers"]:
+            raise ValueError("Empty binding template")
         for instance in template["layers"]:
             layer = "" if instance["layer"] is None else str(instance["layer"])
             base = template["prefix"] + layer + template["suffix"]
-            parameters = registry["parameters"][instance["parameters"]]
-            for choice in registry["choices"][template["choice"]]:
+            arguments = lookup(parameters, instance["parameters"])
+            for choice in choices:
                 binding = {
                     k: copy.deepcopy(v)
                     for k, v in choice.items()
                     if k not in ("suffix", "arguments")
                 }
                 binding["name"] = base + choice["suffix"]
-                binding["args"] = [copy.deepcopy(parameters[i]) for i in choice["arguments"]]
+                if not binding["name"] or binding["name"] in seen:
+                    raise ValueError("Empty or duplicate binding name")
+                seen.add(binding["name"])
+                binding["args"] = [copy.deepcopy(lookup(arguments, i)) for i in choice["arguments"]]
                 bindings.append(binding)
+    if not bindings:
+        raise ValueError("Empty binding registry")
     return bindings

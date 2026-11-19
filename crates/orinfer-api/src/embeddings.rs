@@ -1,13 +1,10 @@
 //! Embeddings protocol, retrieval prefixes, and Pixtral image preparation.
+use crate::server::{decode_rgb, load_source as load_image};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use orinfer_engine::{embedding::Model, execution::LoadOptions, vision::ImageInput};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    io::{Cursor, Read},
-    path::Path,
-    time::Instant,
-};
+use std::{collections::BTreeMap, path::Path, time::Instant};
 use tokenizers::Tokenizer;
 type Result<T> = std::result::Result<T, String>;
 
@@ -17,6 +14,14 @@ struct Codec {
     context: usize,
     patches: usize,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MultimodalInput<'a> {
+    #[serde(default)]
+    text: &'a str,
+    #[serde(default, borrow)]
+    images: Vec<&'a str>,
+}
 struct Prepared {
     tokens: Vec<u32>,
     images: Vec<ImageInput>,
@@ -24,22 +29,8 @@ struct Prepared {
 }
 impl Codec {
     fn load(root: &Path) -> Result<Self> {
-        let descriptor: Value = serde_json::from_slice(
-            &std::fs::read(root.join("cache/model.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        let expected: BTreeMap<String, String> =
-            serde_json::from_value(descriptor["frontend_assets"].clone())
-                .map_err(|e| e.to_string())?;
-        for name in expected.keys() {
-            if Path::new(name).components().count() != 1 {
-                return Err("Invalid embedding frontend filename".into());
-            }
-        }
-        let mut tokenizer =
-            Tokenizer::from_file(root.join("tokenizer.json")).map_err(|e| e.to_string())?;
-        tokenizer.with_truncation(None).map_err(|e| e.to_string())?;
-        tokenizer.with_padding(None);
+        let frontend = crate::encoder_service::load_frontend_descriptor(root)?;
+        let tokenizer = crate::encoder_service::unbounded_tokenizer(frontend.tokenizer)?;
         for (token, id) in [("[IMG]", 10), ("[IMG_BREAK]", 12), ("[IMG_END]", 13)] {
             if tokenizer.token_to_id(token) != Some(id) {
                 return Err(format!("Unexpected image token {token}"));
@@ -47,40 +38,26 @@ impl Codec {
         }
         Ok(Self {
             tokenizer,
-            hashes: expected,
-            context: descriptor["metadata"]["max_context"]
-                .as_u64()
-                .ok_or("Missing embedding context")? as usize,
-            patches: descriptor["metadata"]["embedding"]["max_patches"]
+            hashes: frontend.hashes,
+            context: frontend.context,
+            patches: frontend.metadata["embedding"]["max_patches"]
                 .as_u64()
                 .ok_or("Missing vision capacity")? as usize,
         })
     }
     fn prepare(&self, input: &Value, role: &str, local: bool) -> Result<Prepared> {
-        let (text, sources): (&str, Vec<&str>) = if let Some(text) = input.as_str() {
+        let (text, sources) = if let Some(text) = input.as_str() {
             (text, vec![])
         } else {
-            let object = input
-                .as_object()
-                .ok_or("Embedding input must be text or a text/images object")?;
-            if object
-                .keys()
-                .any(|k| !["text", "images"].contains(&k.as_str()))
-            {
-                return Err("Unknown multimodal embedding input field".into());
+            if !input.is_object() {
+                return Err("Embedding input must be text or a text/images object".into());
             }
-            let text = object.get("text").map_or(Ok(""), |v| {
-                v.as_str().ok_or("Embedding text must be a string")
-            })?;
-            let sources = match object.get("images") {
-                None => vec![],
-                Some(Value::Array(v)) if v.len() <= 8 => v
-                    .iter()
-                    .map(|v| v.as_str().ok_or("Embedding image must be a URL/path"))
-                    .collect::<std::result::Result<Vec<_>, _>>()?,
-                _ => return Err("Embedding images must be a list of at most eight URLs".into()),
-            };
-            (text, sources)
+            let input = MultimodalInput::deserialize(input)
+                .map_err(|e| format!("Invalid multimodal embedding input: {e}"))?;
+            if input.images.len() > 8 {
+                return Err("Embedding images must be a list of at most eight URLs".into());
+            }
+            (input.text, input.images)
         };
         if text.len() > 4 * 1024 * 1024 || (text.is_empty() && sources.is_empty()) {
             return Err("Embedding input is empty or exceeds the text limit".into());
@@ -146,55 +123,8 @@ impl Codec {
     }
 }
 
-fn load_image(source: &str, local: bool) -> Result<Vec<u8>> {
-    const MAX: usize = 24 * 1024 * 1024;
-    if let Some(data) = source.strip_prefix("data:") {
-        let (kind, raw) = data.split_once(',').ok_or("Invalid image data URI")?;
-        if !["image/png;base64", "image/jpeg;base64", "image/webp;base64"].contains(&kind)
-            || raw.len() > MAX.div_ceil(3) * 4
-        {
-            return Err("Unsupported or oversized embedding image".into());
-        }
-        return STANDARD.decode(raw).map_err(|e| e.to_string());
-    }
-    let reader: Box<dyn Read> = if source.starts_with("https://") || source.starts_with("http://") {
-        Box::new(
-            reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(20))
-                .build()
-                .map_err(|e| e.to_string())?
-                .get(source)
-                .send()
-                .map_err(|e| e.to_string())?
-                .error_for_status()
-                .map_err(|e| e.to_string())?,
-        )
-    } else if local {
-        Box::new(std::fs::File::open(source).map_err(|e| e.to_string())?)
-    } else {
-        return Err("Embedding images require HTTP(S) or a base64 data URI".into());
-    };
-    let mut bytes = Vec::new();
-    reader
-        .take((MAX + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > MAX {
-        return Err("Embedding image exceeds 24 MiB".into());
-    }
-    Ok(bytes)
-}
-
 fn preprocess(bytes: &[u8], max_patches: usize) -> Result<ImageInput> {
-    let mut reader = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| e.to_string())?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16384);
-    limits.max_image_height = Some(16384);
-    limits.max_alloc = Some(256 * 1024 * 1024);
-    reader.limits(limits);
-    let rgb = reader.decode().map_err(|e| e.to_string())?.to_rgb8();
+    let rgb = decode_rgb(bytes, 16384)?;
     let (height, width) = (rgb.height() as usize, rgb.width() as usize);
     if height == 0 || width == 0 {
         return Err("Empty embedding image".into());
@@ -396,6 +326,7 @@ pub(crate) fn serve(settings: crate::ServerConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     fn png(width: u32, height: u32) -> Vec<u8> {
         let image = image::RgbImage::from_pixel(width, height, image::Rgb([255, 255, 255]));
         let mut output = Cursor::new(Vec::new());

@@ -1,5 +1,6 @@
 //! Common packet operand-table contract for ordinary and speculative rows.
 use crate::architecture::BatchSegment;
+use crate::execution::Invocation;
 use crate::{
     artifact::{Dtype, Result},
     model::Manifest,
@@ -7,6 +8,25 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub type StateBindings = Vec<Option<(usize, String)>>;
+pub type BatchPlan = (Vec<Invocation>, StateBindings);
+
+/// Selects the model-owned execution for a packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum BatchOperation {
+    Ordinary,
+    Verification,
+    Draft,
+    Commit,
+    Warm,
+    DraftHead,
+    MixedVerification,
+    /// Prefill segments precede verification segments; lengths do not encode roles.
+    MixedRows {
+        prefills: u8,
+    },
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PacketTable {

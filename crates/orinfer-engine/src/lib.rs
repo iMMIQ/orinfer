@@ -6,13 +6,13 @@
 pub mod architecture;
 pub mod artifact;
 pub mod backend;
+mod batch_plan;
 pub mod embedding;
 pub mod error;
 pub mod execution;
 pub mod host_rows;
 mod loader;
 pub mod model;
-mod model_package;
 pub mod models;
 pub mod mtp;
 pub mod operators;

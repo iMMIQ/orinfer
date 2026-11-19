@@ -4,13 +4,14 @@ use crate::{
     execution::{BufferView, Invocation},
     model::{Manifest, Operation},
 };
-use orinfer_model_sdk::{abi::BatchOperation, architecture::BatchSegment};
+use orinfer_model_sdk::{architecture::BatchSegment, packet::BatchOperation};
 use std::collections::BTreeMap;
 
 pub(super) fn plan(
     m: &Manifest,
     segments: &[BatchSegment],
     operation: BatchOperation,
+    include_plan: bool,
 ) -> Result<Vec<Invocation>> {
     let body = operation != BatchOperation::DraftHead;
     let head = operation != BatchOperation::Warm;
@@ -23,6 +24,9 @@ pub(super) fn plan(
         .any(|s| operation != BatchOperation::Warm && s.tokens != 1)
     {
         return Err("Draft packet requires unique independent one-token rows".into());
+    }
+    if !include_plan {
+        return Ok(vec![]);
     }
     let offsets = rows.starts;
     let frame_capacity = 512;

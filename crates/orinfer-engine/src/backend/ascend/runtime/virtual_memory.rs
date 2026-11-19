@@ -70,98 +70,40 @@ fn properties(context: &Context) -> Properties {
         reserved: 0,
     }
 }
-fn aligned(bytes: usize, grain: usize) -> Result<usize> {
-    if grain == 0 {
-        return Err("Empty ACL physical allocation granularity".into());
-    }
-    Ok(bytes
-        .checked_add(grain - 1)
-        .ok_or("ACL virtual extent overflow")?
-        / grain
-        * grain)
-}
 pub(super) struct Reservation {
     context: Rc<Context>,
     api: Api,
     address: Handle,
-    bytes: usize,
-    grain: usize,
-    mapped: usize,
-    pages: Vec<Page>,
-    retained: Vec<Rc<SharedAllocation>>,
+    region: kv::Reservation,
 }
 impl Reservation {
-    fn extent(&self, bytes: usize) -> Result<usize> {
-        let extent = aligned(bytes, self.grain)?;
-        if extent > self.bytes {
-            return Err("ACL demand growth exceeds reservation".into());
+    fn ops<'a>(&self, session: &'a Session) -> Ops<'a> {
+        Ops {
+            session,
+            api: self.api,
+            address: self.address,
         }
-        Ok(extent)
     }
-    fn map_growth(&mut self, bytes: usize) -> Result<Option<(Handle, usize)>> {
-        let extent = self.extent(bytes)?;
-        if extent <= self.mapped {
-            return Ok(None);
-        }
-        self.context.ready()?;
-        let additional = extent - self.mapped;
-        if additional
-            > self
-                .context
-                .limits
-                .device_bytes
-                .saturating_sub(self.context.device_bytes.get())
-        {
-            return Err("ACL demand growth exceeds remaining session budget".into());
-        }
+
+    fn map_growth(&mut self, session: &Session, bytes: usize) -> Result<Option<(Handle, usize)>> {
         let _current = self.context.enter()?;
-        let id = kv::allocation_id()?;
-        let mut handle = ptr::null_mut();
-        check(
-            // SAFETY: Current owned device, aligned extent and live handle output.
-            unsafe { (self.api.allocate)(&mut handle, additional, &properties(&self.context), 0) },
-            "allocate ACL physical pages",
-        )?;
-        self.context
-            .device_bytes
-            .set(self.context.device_bytes.get() + additional);
-        self.pages.push(Page {
-            id,
-            offset: self.mapped,
-            bytes: additional,
-            handle: handle as usize as u64,
-            mapped: false,
-            shared: None,
-        });
-        let page = self.pages.last_mut().unwrap();
-        // SAFETY: Offset is inside this retained virtual reservation; allocation has the same extent.
-        let pointer = unsafe { self.address.cast::<u8>().add(page.offset).cast() };
-        let result: Result<()> = (|| {
-            check(
-                // SAFETY: Retained aligned reservation and physical handle have identical extents.
-                unsafe { (self.api.map)(pointer, additional, 0, handle, 0) },
-                "map ACL physical pages",
-            )?;
-            page.mapped = true;
-            Ok(())
-        })();
-        if result.is_err() {
+        let ops = self.ops(session);
+        let result = self.region.grow(bytes, &ops, false);
+        if self.region.poisoned {
             self.context.retire();
         }
-        result?;
-        self.mapped = extent;
-        Ok(Some((pointer, additional)))
+        Ok(result?.map(|range| {
+            // SAFETY: The common core returns a mapped span inside this retained reservation.
+            (
+                unsafe { self.address.cast::<u8>().add(range.offset).cast() },
+                range.bytes,
+            )
+        }))
     }
+
     fn clear(&mut self) -> Result<()> {
         let _current = self.context.enter()?;
-        let sizes = self
-            .pages
-            .iter()
-            .map(|p| (p.handle, p.bytes))
-            .collect::<BTreeMap<_, _>>();
-        let result = kv::release_mappings(
-            &mut self.pages,
-            &mut self.retained,
+        self.region.clear(
             |page| {
                 check(
                     // SAFETY: Prior accesses completed and this is an owned mapped extent.
@@ -169,24 +111,21 @@ impl Reservation {
                     "unmap ACL KV alias",
                 )
             },
-            |handle| {
-                check(
-                    // SAFETY: The last owned mapping has been detached; shared handles are skipped by the common core.
-                    unsafe { (self.api.free)(handle as usize as Handle) },
-                    "free ACL KV physical allocation",
-                )?;
-                self.context
-                    .device_bytes
-                    .set(self.context.device_bytes.get() - sizes[&handle]);
-                Ok(())
-            },
-        );
-        if result.is_ok() {
-            self.mapped = 0;
-        }
-        result
+            |page| release_physical(&self.context, self.api, page.handle, page.bytes),
+        )
     }
 }
+
+fn release_physical(context: &Context, api: Api, handle: u64, bytes: usize) -> Result<()> {
+    check(
+        // SAFETY: The physical handle is owned and its final owned mapping detached.
+        unsafe { (api.free)(handle as usize as Handle) },
+        "free ACL KV physical allocation",
+    )?;
+    context.device_bytes.set(context.device_bytes.get() - bytes);
+    Ok(())
+}
+
 impl Drop for Reservation {
     fn drop(&mut self) {
         if self.context.poisoned.get() {
@@ -225,7 +164,7 @@ impl Session {
             unsafe { (api.granularity)(&properties(&self.context), 0, &mut grain) },
             "ACL physical allocation granularity",
         )?;
-        let physical_capacity = aligned(bytes, grain)?;
+        let physical_capacity = kv::align(bytes, grain)?;
         let mut address = ptr::null_mut();
         check(
             // SAFETY: Nonzero aligned capacity, huge-page flag and writable address output.
@@ -236,11 +175,7 @@ impl Session {
             context: Rc::clone(&self.context),
             api,
             address,
-            bytes: physical_capacity,
-            grain,
-            mapped: 0,
-            pages: vec![],
-            retained: vec![],
+            region: kv::Reservation::new(physical_capacity, grain),
         };
         Ok(Buffer {
             offset: 0,
@@ -287,7 +222,7 @@ impl Session {
         }
         let additional = growth.iter().try_fold(0usize, |sum, (buffer, end)| {
             let memory = buffer.allocation.virtual_memory.as_ref().unwrap().borrow();
-            sum.checked_add(memory.extent(*end)? - memory.mapped)
+            sum.checked_add(memory.region.extent(*end)? - memory.region.mapped)
                 .ok_or_else(|| "ACL demand growth extent overflow".to_string())
         })?;
         if additional == 0 {
@@ -307,7 +242,7 @@ impl Session {
                 .as_ref()
                 .unwrap()
                 .borrow_mut()
-                .map_growth(*end);
+                .map_growth(self, *end);
             match mapped {
                 Ok(Some(span)) => spans.push(span),
                 Ok(None) => (),
@@ -361,7 +296,7 @@ impl Buffer {
             .virtual_memory
             .as_ref()
             .map_or(Ok(bytes), |memory| {
-                memory.borrow().extent(self.offset + bytes)
+                memory.borrow().region.extent(self.offset + bytes)
             })
     }
     pub(crate) fn growth_bytes(&self, bytes: usize) -> Result<usize> {
@@ -372,8 +307,9 @@ impl Buffer {
             .map_or(Ok(0), |memory| {
                 let memory = memory.borrow();
                 Ok(memory
+                    .region
                     .extent(self.offset + bytes)?
-                    .saturating_sub(memory.mapped))
+                    .saturating_sub(memory.region.mapped))
             })
     }
 }
@@ -548,7 +484,6 @@ struct Ops<'a> {
     session: &'a Session,
     api: Api,
     address: Handle,
-    pending: RefCell<BTreeMap<u64, usize>>,
 }
 impl MappingOps for Ops<'_> {
     fn allocate(&self, bytes: usize) -> Result<u64> {
@@ -569,25 +504,10 @@ impl MappingOps for Ops<'_> {
             .device_bytes
             .set(self.session.allocated_bytes() + bytes);
         let handle = handle as usize as u64;
-        self.pending.borrow_mut().insert(handle, bytes);
         Ok(handle)
     }
-    fn release(&self, handle: u64) -> Result<()> {
-        check(
-            // SAFETY: This unpublished physical handle has no remaining mapping.
-            unsafe { (self.api.free)(handle as usize as Handle) },
-            "rollback ACL KV COW",
-        )?;
-        let bytes = self
-            .pending
-            .borrow_mut()
-            .remove(&handle)
-            .ok_or("Unknown A2 COW allocation")?;
-        self.session
-            .context
-            .device_bytes
-            .set(self.session.allocated_bytes() - bytes);
-        Ok(())
+    fn release(&self, handle: u64, bytes: usize) -> Result<()> {
+        release_physical(&self.session.context, self.api, handle, bytes)
     }
     fn map(&self, offset: usize, bytes: usize, handle: u64, _shared: bool) -> Result<()> {
         check(
@@ -668,7 +588,7 @@ impl MappingOps for Ops<'_> {
                 },
                 "publish ACL KV alias",
             )?;
-            memory.pages.push(Page {
+            memory.region.mappings.push(Page {
                 id: page.id,
                 offset: 0,
                 bytes: page.bytes,
@@ -676,7 +596,7 @@ impl MappingOps for Ops<'_> {
                 mapped: true,
                 shared: None,
             });
-            memory.mapped = page.bytes;
+            memory.region.mapped = page.bytes;
         }
         Ok(Rc::new(SharedAllocation {
             owner: self.session.context.owner,
@@ -705,7 +625,7 @@ impl Buffer {
             .ok_or("KV buffer is not demand mapped")?
             .borrow();
         kv::preview(
-            &memory.pages,
+            &memory.region.mappings,
             self.allocation.context.owner,
             self.pointer() as usize as u64,
             MemoryRange { offset: 0, bytes },
@@ -715,7 +635,7 @@ impl Buffer {
         range.within(self.bytes)?;
         if let Some(memory) = &self.allocation.virtual_memory {
             kv::writable_bytes(
-                &memory.borrow().pages,
+                &memory.borrow().region.mappings,
                 MemoryRange {
                     offset: self.offset + range.offset,
                     bytes: range.bytes,
@@ -737,13 +657,12 @@ impl Session {
             .as_ref()
             .unwrap()
             .borrow_mut();
-        let ops = Ops {
-            session: self,
-            api: memory.api,
-            address: memory.address,
-            pending: Default::default(),
-        };
-        let result = kv::publish(&mut memory.pages, MemoryRange { offset: 0, bytes }, &ops);
+        let ops = memory.ops(self);
+        let result = kv::publish(
+            &mut memory.region.mappings,
+            MemoryRange { offset: 0, bytes },
+            &ops,
+        );
         if result.is_err() {
             self.context.retire();
         }
@@ -767,17 +686,12 @@ impl Session {
                     continue;
                 };
                 let mut memory = memory.borrow_mut();
-                let ops = Ops {
-                    session: self,
-                    api: memory.api,
-                    address: memory.address,
-                    pending: Default::default(),
-                };
-                let Reservation {
-                    pages, retained, ..
-                } = &mut *memory;
+                let ops = memory.ops(self);
+                let kv::Reservation {
+                    mappings, retained, ..
+                } = &mut memory.region;
                 kv::make_writable(
-                    pages,
+                    mappings,
                     retained,
                     MemoryRange {
                         offset: buffer.offset + range.offset,
@@ -789,7 +703,7 @@ impl Session {
             self.context.sync(self.context.compute)?;
             for (buffer, _) in writes {
                 if let Some(memory) = &buffer.allocation.virtual_memory {
-                    memory.borrow_mut().retained.clear();
+                    memory.borrow_mut().region.retained.clear();
                 }
             }
             Ok(())
@@ -815,59 +729,36 @@ impl Session {
             .as_ref()
             .ok_or("Missing KV reservation")?
             .borrow_mut();
+        let mut end = 0;
         for piece in pieces {
             piece.allocation.owner.require(self.context.owner)?;
-            kv::alias_offset(
-                &piece.allocation,
-                piece.range,
-                piece.source,
-                memory.grain,
-                memory.bytes,
-            )
-            .ok_or("Invalid A2 KV alias")?;
-        }
-        memory.clear()?;
-        for piece in pieces {
             let offset = kv::alias_offset(
                 &piece.allocation,
                 piece.range,
                 piece.source,
-                memory.grain,
-                memory.bytes,
+                memory.region.granularity,
+                memory.region.bytes,
             )
-            .unwrap();
-            if offset != memory.mapped {
+            .ok_or("Invalid A2 KV alias")?;
+            if offset != end {
                 return Err("Noncontiguous shared A2 KV mappings".into());
             }
-            memory.pages.push(Page {
-                id: piece.allocation.id,
+            end += piece.allocation.bytes;
+        }
+        memory.clear()?;
+        let ops = memory.ops(self);
+        for piece in pieces {
+            let offset = memory.region.mapped;
+            let result = memory.region.map_shared(
                 offset,
-                bytes: piece.allocation.bytes,
-                handle: piece.allocation.handle.unwrap(),
-                mapped: false,
-                shared: Some(piece.allocation.clone()),
-            });
-            let index = memory.pages.len() - 1;
-            // SAFETY: Validated full physical extent, retained immutable allocation and owned target VA.
-            let result = check(
-                // SAFETY: This owned context retains the checked native handle and allocation.
-                unsafe {
-                    (memory.api.map)(
-                        memory.address.cast::<u8>().add(offset).cast(),
-                        piece.allocation.bytes,
-                        0,
-                        piece.allocation.handle.unwrap() as usize as Handle,
-                        0,
-                    )
-                },
-                "restore shared ACL KV mapping",
+                piece.allocation.clone(),
+                self.context.owner,
+                &ops,
             );
-            if result.is_err() {
+            if memory.region.poisoned {
                 self.context.retire();
             }
             result?;
-            memory.pages[index].mapped = true;
-            memory.mapped += piece.allocation.bytes;
         }
         Ok(())
     }
@@ -884,7 +775,7 @@ impl Session {
             owner: self.context.owner,
             id,
             address: buffer.pointer() as usize as u64,
-            bytes: aligned(buffer.bytes(), 2 << 20)?,
+            bytes: kv::align(buffer.bytes(), 2 << 20)?,
             used: buffer.bytes(),
             handle: None,
             native: Some(Rc::new(buffer.clone())),
@@ -940,7 +831,7 @@ impl Session {
             self.context
                 .device_bytes
                 .set(self.allocated_bytes() + descriptor.bytes);
-            memory.pages.push(Page {
+            memory.region.mappings.push(Page {
                 id: descriptor.id,
                 offset: 0,
                 bytes: descriptor.bytes,
@@ -958,8 +849,8 @@ impl Session {
                 self.context.retire();
             }
             result?;
-            memory.pages[0].mapped = true;
-            memory.mapped = descriptor.bytes;
+            memory.region.mappings[0].mapped = true;
+            memory.region.mapped = descriptor.bytes;
         }
         self.fill(&canonical, 0)?;
         self.upload_regions(&[(canonical.clone(), 0, bytes)])?
@@ -977,7 +868,8 @@ impl Session {
                     .as_ref()
                     .unwrap()
                     .borrow()
-                    .pages[0]
+                    .region
+                    .mappings[0]
                     .handle,
             ),
             native: Some(Rc::new(canonical.clone())),

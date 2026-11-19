@@ -23,7 +23,7 @@ pub struct Manifest {
 }
 
 pub use orinfer_model_sdk::artifact::{
-    Access, Argument, AssetKey, Buffer, Dtype, FileIdentity, Kernel,
+    Access, Argument, AssetKey, Buffer, Dtype, FileIdentity, Kernel, is_sha256_hex,
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -57,8 +57,9 @@ impl Manifest {
                 .checked_add(b.bytes()?)
                 .ok_or("Total buffer size overflow")?;
         }
+        let target = orinfer_device::Target::from_package(&self.target)?;
         for k in &self.kernels {
-            k.validate_launch(&orinfer_device::Target::from_package(&self.target)?)?;
+            k.validate_launch(&target)?;
             if k.name.is_empty()
                 || k.symbol.is_empty()
                 || k.symbol.contains('\0')
@@ -68,15 +69,6 @@ impl Manifest {
             }
             if k.cooperative {
                 return Err("Cooperative launch is not supported by fixture runner".into());
-            }
-            if k.grid.contains(&0)
-                || k.block.contains(&0)
-                || k.block
-                    .iter()
-                    .try_fold(1u32, |n, d| n.checked_mul(*d))
-                    .is_none_or(|n| n > 1024)
-            {
-                return Err(format!("{}: invalid launch dimensions", k.name));
             }
             for a in &k.args {
                 match a {
@@ -156,14 +148,6 @@ impl AssetReader {
 
     /// Runtime loading checks containers and ranges; validate-model checks content.
     pub(crate) fn read_unverified(&mut self, base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
-        if id.sha256.len() != 64
-            || !id
-                .sha256
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
-            return Err(format!("{}: malformed sha256", id.file));
-        }
         let canonical = resolve_file(base, &id.file)?;
         let data = if let Some(name) = &id.tensor {
             if name.is_empty() {

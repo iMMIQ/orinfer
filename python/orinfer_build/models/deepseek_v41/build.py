@@ -5,14 +5,13 @@ checkpoint nor expands permanent W4 banks to W8. Candidate filtering is exact
 full coverage within the initial <=16384-position single-stream scope.
 """
 
+from importlib import import_module
 from orinfer_build.common.paths import ROOT
 
 
-from orinfer_build.common.modules import import_module
-
 import argparse
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 import math
 import multiprocessing
@@ -27,7 +26,6 @@ import torch
 from orinfer_build.common.files import atomic_json, file_hash
 from orinfer_build.contracts.row_parameters import dynamic_arguments, dynamic_parameters
 from kernels.ascend import (
-    attention,
     attention_cube,
     attention_prefill,
     compressor,
@@ -67,13 +65,7 @@ DECODE_COLUMN_TILES = {
 
 
 @dataclass(frozen=True)
-class Strategy:
-    shared_tp: bool = False
-    cube_attention: bool = False
-    parallel: bool = False
-    fusion: bool = False
-    engram_tp: bool = False
-    prefill: bool = False
+class PrefillOptions:
     fp32_cube: bool = False
     parallel_regroup: bool = False
     packed_attention: bool = False
@@ -85,17 +77,14 @@ class Strategy:
     vector_prefix: bool = False
 
 
-OPTIMIZED = Strategy(True, True, True, True, True, True)
-
-
 class Builder:
-    def __init__(self, output, rank, capacity, kernels, strategy=None, model_dir=None):
+    def __init__(self, output, rank, capacity, kernels, prefill=PrefillOptions(), model_dir=None):
         self.output, self.rank, self.capacity = output, rank, capacity
         self.kernels = kernels
         self.buffers, self.by_name, self.types = [], {}, {}
         self.prefix = ""
         self.steps = []
-        self.strategy = strategy or Strategy()
+        self.prefill = prefill
         self.ready_collapsed = None
         self.dynamic = False
         self.model_dir = model_dir
@@ -353,23 +342,6 @@ class Builder:
         )
         return out, scales
 
-    def swiglu_quant(self, gate, up, width, output="swiglu.quant", rows=None):
-        rows = self.rows if rows is None else rows
-        out = self.temp(output, (rows, width), "i8")
-        scales = self.temp(output + ".scale", (rows,), "f32")
-        self.kernel(
-            vector,
-            "swiglu_quant",
-            {"rows": rows, "width": width},
-            [
-                ("gate", gate, "bf16", (rows, width), "read"),
-                ("up", up, "bf16", (rows, width), "read"),
-                ("out", out, "i8", (rows, width), "write"),
-                ("scales", scales, "f32", (rows,), "write"),
-            ],
-        )
-        return out, scales
-
     def swiglu_packed_quant(
         self, packed, width, output="expert.act.quant", rows=None, active_counts=None
     ):
@@ -455,7 +427,7 @@ class Builder:
         rows = self.rows if rows is None else rows
         partials = self.temp(f"fp32.partial.{output}", (rows, n // 32, 8, 32), "f32")
         out = self.temp(output, (rows, n), "f32")
-        if self.strategy.fp32_cube and self.dynamic and rows == self.rows:
+        if self.prefill.fp32_cube and self.dynamic and rows == self.rows:
             self.floating_partials(x, weight, n, k, partials, input_dtype=input_dtype)
         else:
             self.kernel(
@@ -494,7 +466,7 @@ class Builder:
                 "heads": heads,
                 "dimension": dimension,
                 "inverse": inverse,
-                **({"batch_heads": True} if self.dynamic and self.strategy.batched_rope else {}),
+                **({"batch_heads": True} if self.dynamic and self.prefill.batched_rope else {}),
             },
             [
                 ("x", x, "bf16", (self.rows, heads, dimension), "read"),
@@ -597,9 +569,8 @@ class Builder:
         next_mix = self.temp("pre.b" if incoming.endswith("pre.a") else "pre.a", (rows, 8), "f32")
         post = self.temp("hc.post", (rows, 8), "f32")
         combination = self.temp("hc.combination", (rows, 16), "f32")
-        if self.strategy.parallel:
-            self.steps.append({"op": "fork"})
-        if self.strategy.fp32_cube and self.dynamic:
+        self.steps.append({"op": "fork"})
+        if self.prefill.fp32_cube and self.dynamic:
             self.floating_partials(current, fn, 32, 20480, partials, variance=True)
         else:
             self.kernel(
@@ -613,8 +584,8 @@ class Builder:
                 ],
             )
         self.kernel(
-            hc_prefill if self.dynamic and self.strategy.batched_hc else vector,
-            "reduce" if self.dynamic and self.strategy.batched_hc else "mhc_prenorm_reduce",
+            hc_prefill if self.dynamic and self.prefill.batched_hc else vector,
+            "reduce" if self.dynamic and self.prefill.batched_hc else "mhc_prenorm_reduce",
             {"rows": rows, "width": 5120},
             [
                 ("partials", partials, "f32", (rows, 8, 32), "read"),
@@ -634,8 +605,7 @@ class Builder:
                 ("combination", combination, "f32", (rows, 16), "write"),
             ],
         )
-        if self.strategy.parallel:
-            self.steps.append({"op": "switch"})
+        self.steps.append({"op": "switch"})
         x = self.temp("collapsed", (rows, 5120))
         if self.ready_collapsed != (current, incoming):
             self.kernel(
@@ -699,42 +669,33 @@ class Builder:
                 ("out", lookup, "bf16", (rows * 24, 256), "write"),
             ],
         )
-        if self.strategy.engram_tp:
-            local = self.projection(
-                lookup,
-                self.matrix(prefix + ".wkv.weight", "bf16", 3200, 6144, first_row=self.rank * 3200),
-                3200,
-                6144,
-                "engram.local",
-            )
-            projected = self.temp("engram.projected", (rows, 25600))
-            gathered = projected if rows == 1 else self.temp("engram.gathered", (8, rows, 3200))
-            self.steps.append(
-                {
-                    "op": "gather",
-                    "source": local,
-                    "destination": gathered,
-                    "elements": rows * 3200,
-                    "fp32": False,
-                }
-            )
-            if rows != 1:
-                self.kernel(
-                    memory,
-                    "gather_columns",
-                    {"rows": rows, "width": 25600},
-                    [
-                        ("gathered", gathered, "bf16", (8, rows, 3200), "read"),
-                        ("out", projected, "bf16", (rows, 25600), "write"),
-                    ],
-                )
-        else:
-            projected = self.projection(
-                lookup,
-                self.matrix(prefix + ".wkv.weight", "bf16", 25600, 6144),
-                25600,
-                6144,
-                "engram.projected",
+        local = self.projection(
+            lookup,
+            self.matrix(prefix + ".wkv.weight", "bf16", 3200, 6144, first_row=self.rank * 3200),
+            3200,
+            6144,
+            "engram.local",
+        )
+        projected = self.temp("engram.projected", (rows, 25600))
+        gathered = projected if rows == 1 else self.temp("engram.gathered", (8, rows, 3200))
+        self.steps.append(
+            {
+                "op": "gather",
+                "source": local,
+                "destination": gathered,
+                "elements": rows * 3200,
+                "fp32": False,
+            }
+        )
+        if rows != 1:
+            self.kernel(
+                memory,
+                "gather_columns",
+                {"rows": rows, "width": 25600},
+                [
+                    ("gathered", gathered, "bf16", (8, rows, 3200), "read"),
+                    ("out", projected, "bf16", (rows, 25600), "write"),
+                ],
             )
         key = self.temp("engram.key", (rows, 20480))
         value = self.temp("engram.value", (rows, 5120))
@@ -751,13 +712,13 @@ class Builder:
         original = self.temp("engram.original", (rows, 4, 5120), "f32")
         self.kernel(
             engram,
-            "hadamard32" if self.dynamic and self.strategy.fast_engram else "rotate_blocks",
+            "hadamard32" if self.dynamic and self.prefill.fast_engram else "rotate_blocks",
             dict(
                 rows=rows,
                 width=5120,
                 **(
                     {"tile_groups": 64}
-                    if self.dynamic and self.strategy.fast_engram
+                    if self.dynamic and self.prefill.fast_engram
                     else {"block": 32}
                 ),
             ),
@@ -813,7 +774,7 @@ class Builder:
         rows, capacity = self.rows, self.capacity
         long_length = capacity // ratio
         length = capacity + (long_length if compressed else 0)
-        span = min(384, capacity) if self.strategy.compact_attention else capacity
+        span = min(384, capacity) if self.prefill.compact_attention else capacity
         probability_length = span + (long_length if compressed else 0)
         mask = self.temp(f"attention.packed.mask.{long_length}", (rows, long_length), "i32")
         if compressed and layer in (2, 8, 14, 20, 24, 28, 32, 36):
@@ -862,7 +823,7 @@ class Builder:
             attention_prefill,
             "softmax",
             dict(parameters, compact=True, live_buckets=True)
-            if self.strategy.compact_attention
+            if self.prefill.compact_attention
             else parameters,
             [
                 ("scores", score, "f32", (rows * 8, length), "read"),
@@ -875,7 +836,7 @@ class Builder:
         self.kernel(
             attention_prefill,
             "pv",
-            dict(parameters, compact=True) if self.strategy.compact_attention else parameters,
+            dict(parameters, compact=True) if self.prefill.compact_attention else parameters,
             [
                 ("probabilities", prob, "bf16", (rows * 8, probability_length), "read"),
                 ("swa", swa, "bf16", (capacity, 512), "read"),
@@ -894,20 +855,16 @@ class Builder:
         cosine = coordinates["long_cos" if compressed else "base_cos"]
         sine = coordinates["long_sin" if compressed else "base_sin"]
         quant, scales = self.quant(x, 5120)
-        if self.strategy.parallel:
-            self.steps.append({"op": "fork"})
-            swa = self.attention_kv(quant, scales, layer, cosine, sine, coordinates["slots"])
-            self.steps.append({"op": "switch"})
+        self.steps.append({"op": "fork"})
+        swa = self.attention_kv(quant, scales, layer, cosine, sine, coordinates["slots"])
+        self.steps.append({"op": "switch"})
         qa = self.w8(quant, scales, prefix + ".wq_a", 1280, 5120, "q.a")
         q8, qs = self.norm_quant(
             qa, self.matrix(prefix + ".q_norm.weight", "f32", 1280, 1), 1280, "q.norm.quant"
         )
         query = self.w8(q8, qs, prefix + ".wq_b", 4096, 1280, "q.b", first=self.rank * 4096)
         query = self.rope(query, 8, 512, cosine, sine, "q.rope")
-        if self.strategy.parallel:
-            self.steps.append({"op": "join"})
-        else:
-            swa = self.attention_kv(quant, scales, layer, cosine, sine, coordinates["slots"])
+        self.steps.append({"op": "join"})
         source = max((s for s in (2, 8, 14, 20) if s <= layer), default=2)
         ratio = 2 if source < 20 else 1
         compressed_capacity = capacity // ratio
@@ -1018,7 +975,7 @@ class Builder:
                 ),
                 ("out", scores, "f32", (rows, compressed_capacity), "write"),
             ]
-            if self.strategy.prefill and self.dynamic:
+            if self.dynamic:
                 padded = (compressed_capacity + 63) // 64 * 64
                 workspace = self.temp(
                     "index.cube.workspace", (rows, 32, (capacity + 63) // 64 * 64), "i32"
@@ -1048,7 +1005,7 @@ class Builder:
                     operands,
                 )
             selected, _ = self.select(scores, compressed_capacity, coordinates[f"c{ratio}_lengths"])
-        if self.dynamic and self.strategy.packed_attention:
+        if self.dynamic and self.prefill.packed_attention:
             attended = self.prefill_attention(
                 query,
                 swa,
@@ -1084,56 +1041,42 @@ class Builder:
             )
             attended = self.temp("attention.output", (rows, 8, 512))
             sink = self.matrix(prefix + ".attn_sink", "f32", 8, 1, first_row=self.rank * 8)
-            if self.strategy.cube_attention and (rows == 1 or self.strategy.prefill):
-                score = self.temp(f"attention.cube.score.{count}", (rows, 16, count), "f32")
-                prob = self.temp(f"attention.cube.prob.{count}", (rows, 16, count))
-                scratch = self.temp("attention.cube.workspace", (rows, 16, 512), "f32")
-                parameters = {"rows": rows, "heads": 8, "selected": count}
-                self.kernel(
-                    attention_cube,
-                    "qk",
-                    parameters,
-                    [
-                        ("query", query, "bf16", (rows, 8, 512), "read"),
-                        ("kv", gathered, "bf16", (rows, count, 512), "read"),
-                        ("scores", score, "f32", (rows, 16, count), "write"),
-                    ],
-                )
-                self.kernel(
-                    attention_cube,
-                    "softmax",
-                    parameters,
-                    [
-                        ("scores", score, "f32", (rows, 16, count), "read"),
-                        ("indices", mask, "i32", (rows, count), "read"),
-                        ("sink", sink, "f32", (8,), "read"),
-                        ("probabilities", prob, "bf16", (rows, 16, count), "write"),
-                    ],
-                )
-                self.kernel(
-                    attention_cube,
-                    "pv",
-                    parameters,
-                    [
-                        ("probabilities", prob, "bf16", (rows, 16, count), "read"),
-                        ("kv", gathered, "bf16", (rows, count, 512), "read"),
-                        ("output", attended, "bf16", (rows, 8, 512), "write"),
-                        ("workspace", scratch, "f32", (rows, 16, 512), "scratch"),
-                    ],
-                )
-            else:
-                self.kernel(
-                    attention,
-                    "sparse_attention",
-                    {"rows": rows, "heads": 8, "selected": count},
-                    [
-                        ("query", query, "bf16", (rows, 8, 512), "read"),
-                        ("gathered_kv", gathered, "bf16", (rows, count, 512), "read"),
-                        ("indices", mask, "i32", (rows, count), "read"),
-                        ("sink", sink, "f32", (8,), "read"),
-                        ("out", attended, "bf16", (rows, 8, 512), "write"),
-                    ],
-                )
+            score = self.temp(f"attention.cube.score.{count}", (rows, 16, count), "f32")
+            prob = self.temp(f"attention.cube.prob.{count}", (rows, 16, count))
+            scratch = self.temp("attention.cube.workspace", (rows, 16, 512), "f32")
+            parameters = {"rows": rows, "heads": 8, "selected": count}
+            self.kernel(
+                attention_cube,
+                "qk",
+                parameters,
+                [
+                    ("query", query, "bf16", (rows, 8, 512), "read"),
+                    ("kv", gathered, "bf16", (rows, count, 512), "read"),
+                    ("scores", score, "f32", (rows, 16, count), "write"),
+                ],
+            )
+            self.kernel(
+                attention_cube,
+                "softmax",
+                parameters,
+                [
+                    ("scores", score, "f32", (rows, 16, count), "read"),
+                    ("indices", mask, "i32", (rows, count), "read"),
+                    ("sink", sink, "f32", (8,), "read"),
+                    ("probabilities", prob, "bf16", (rows, 16, count), "write"),
+                ],
+            )
+            self.kernel(
+                attention_cube,
+                "pv",
+                parameters,
+                [
+                    ("probabilities", prob, "bf16", (rows, 16, count), "read"),
+                    ("kv", gathered, "bf16", (rows, count, 512), "read"),
+                    ("output", attended, "bf16", (rows, 8, 512), "write"),
+                    ("workspace", scratch, "f32", (rows, 16, 512), "scratch"),
+                ],
+            )
         return self.attention_output(attended, layer, cosine, sine)
 
     def attention_output(self, attended, layer, cosine, sine):
@@ -1168,11 +1111,6 @@ class Builder:
 
     def shared_expert(self, quant, scale, layer):
         prefix = f"{self.layer_name(layer)}.ffn.shared_experts"
-        if not self.strategy.shared_tp:
-            gate = self.w8(quant, scale, prefix + ".w1", 2304, 5120, "shared.gate")
-            up = self.w8(quant, scale, prefix + ".w3", 2304, 5120, "shared.up")
-            act8, act_scale = self.swiglu_quant(gate, up, 2304, "shared.act.quant")
-            return self.w8(act8, act_scale, prefix + ".w2", 5120, 2304, "shared.output")
 
         def bank(plane, shape, dtype):
             return self.buffer(
@@ -1226,18 +1164,16 @@ class Builder:
             ],
         )
         quant, scale = self.quant(x, 5120)
-        if self.strategy.parallel:
-            self.steps.append({"op": "fork"})
+        self.steps.append({"op": "fork"})
         shared = self.shared_expert(quant, scale, layer)
-        if self.strategy.parallel:
-            self.steps.append({"op": "switch"})
+        self.steps.append({"op": "switch"})
         expert_rows = rows * selected
         gather = self.temp("expert.gather", (expert_rows,), "i32")
         restore = self.temp("expert.restore", (rows, 8), "i32")
         counts = self.temp(f"L{layer}.counts", (local,), "i64")
         route_errors = self.temp("route.errors", (rows + 1,), "i32")
         up_name, down_name = f"{self.prefix}L{layer}.up", f"{self.prefix}L{layer}.down"
-        if self.dynamic and self.strategy.parallel_regroup:
+        if self.dynamic and self.prefill.parallel_regroup:
             chunks = (rows + 31) // 32
             positions = self.temp("route.positions", (local, chunks, 256), "i32")
             chunk_counts = self.temp("route.chunk_counts", (local, chunks), "i32")
@@ -1265,7 +1201,7 @@ class Builder:
                 ),
                 (
                     "prefix",
-                    {"scan_rows": rows} if self.strategy.vector_prefix and rows > 1 else {},
+                    {"scan_rows": rows} if self.prefill.vector_prefix and rows > 1 else {},
                     {"counts": "read", "offsets": "write", "groups": "write", "errors": "scratch"},
                 ),
                 (
@@ -1313,45 +1249,19 @@ class Builder:
         gathered = self.temp("expert.input", (expert_rows, 5120), "i8")
         gathered_scale = self.temp("expert.input.scale", (expert_rows,), "f32")
         error = self.temp("expert.gather.errors", (expert_rows,), "i32")
-        if self.strategy.fusion:
-            self.kernel(
-                memory,
-                "gather_quantized_rows",
-                {"rows": expert_rows, "table_rows": rows, "width": 5120},
-                [
-                    ("table", quant, "i8", (rows, 5120), "read"),
-                    ("scales", scale, "f32", (rows,), "read"),
-                    ("indices", gather, "i32", (expert_rows,), "read"),
-                    ("out", gathered, "i8", (expert_rows, 5120), "write"),
-                    ("out_scales", gathered_scale, "f32", (expert_rows,), "write"),
-                    ("errors", error, "i32", (expert_rows,), "write"),
-                ],
-            )
-        for source, destination, width, dtype in (
-            []
-            if self.strategy.fusion
-            else [
-                (quant, gathered, 5120, "i8"),
-                (scale, gathered_scale, 1, "f32"),
-            ]
-        ):
-            self.kernel(
-                memory,
-                "gather_rows",
-                {
-                    "rows": expert_rows,
-                    "table_rows": rows,
-                    "width": width,
-                    "dtype": DTYPE[dtype][0],
-                    "index_dtype": "int32",
-                },
-                [
-                    ("table", source, dtype, (rows, width), "read"),
-                    ("indices", gather, "i32", (expert_rows,), "read"),
-                    ("out", destination, dtype, (expert_rows, width), "write"),
-                    ("errors", error, "i32", (expert_rows,), "write"),
-                ],
-            )
+        self.kernel(
+            memory,
+            "gather_quantized_rows",
+            {"rows": expert_rows, "table_rows": rows, "width": 5120},
+            [
+                ("table", quant, "i8", (rows, 5120), "read"),
+                ("scales", scale, "f32", (rows,), "read"),
+                ("indices", gather, "i32", (expert_rows,), "read"),
+                ("out", gathered, "i8", (expert_rows, 5120), "write"),
+                ("out_scales", gathered_scale, "f32", (expert_rows,), "write"),
+                ("errors", error, "i32", (expert_rows,), "write"),
+            ],
+        )
         experts = [
             f"{prefix}.experts.{expert}"
             for expert in range(self.rank * local, (self.rank + 1) * local)
@@ -1405,7 +1315,7 @@ class Builder:
             "expert.act.quant",
             rows=expert_rows,
             active_counts=route_errors
-            if self.dynamic and self.strategy.active_expert_rows
+            if self.dynamic and self.prefill.active_expert_rows
             else None,
         )
         self.steps.append(
@@ -1421,10 +1331,8 @@ class Builder:
                 "groups": counts,
             }
         )
-        if self.strategy.parallel:
-            self.steps.append({"op": "join"})
+        self.steps.append({"op": "join"})
         routed = self.temp("expert.local", (rows, 5120), "f32")
-        zeros = shared if self.strategy.shared_tp else self.temp("zero.shared", (rows, 5120))
         errors = self.temp("expert.errors", (rows,), "i32")
         self.kernel(
             moe,
@@ -1438,7 +1346,7 @@ class Builder:
             },
             [
                 ("experts", expert_output, "bf16", (expert_rows, 5120), "read"),
-                ("shared", zeros, "bf16", (rows, 5120), "read"),
+                ("shared", shared, "bf16", (rows, 5120), "read"),
                 ("row_map", restore, "i32", (rows, 8), "read"),
                 ("weights", weights, "f32", (rows, 8), "read"),
                 ("out", routed, "f32", (rows, 5120), "write"),
@@ -1456,32 +1364,20 @@ class Builder:
             }
         )
         output = self.temp("ffn.output", (rows, 5120))
-        if self.strategy.shared_tp:
-            self.kernel(
-                model_ops,
-                "convert",
-                {
-                    "rows": rows,
-                    "width": 5120,
-                    "source_dtype": "float32",
-                    "destination_dtype": "bfloat16",
-                },
-                [
-                    ("x", reduced, "f32", (rows, 5120), "read"),
-                    ("out", output, "bf16", (rows, 5120), "write"),
-                ],
-            )
-        else:
-            self.kernel(
-                model_ops,
-                "add_shared",
-                {"rows": rows, "width": 5120},
-                [
-                    ("routed", reduced, "f32", (rows, 5120), "read"),
-                    ("shared", shared, "bf16", (rows, 5120), "read"),
-                    ("out", output, "bf16", (rows, 5120), "write"),
-                ],
-            )
+        self.kernel(
+            model_ops,
+            "convert",
+            {
+                "rows": rows,
+                "width": 5120,
+                "source_dtype": "float32",
+                "destination_dtype": "bfloat16",
+            },
+            [
+                ("x", reduced, "f32", (rows, 5120), "read"),
+                ("out", output, "bf16", (rows, 5120), "write"),
+            ],
+        )
         return output
 
     def packet(self, rows, *, dynamic=False):
@@ -1552,11 +1448,8 @@ class Builder:
                     if sublayer == "attn"
                     else self.ffn(x, precise, layer)
                 )
-                if self.strategy.parallel:
-                    self.steps.append({"op": "join"})
-                collapse_next = self.strategy.fusion and not (
-                    sublayer == "ffn" and layer + 1 in (1, 14)
-                )
+                self.steps.append({"op": "join"})
+                collapse_next = not (sublayer == "ffn" and layer + 1 in (1, 14))
                 current = self.hc_post(
                     output, current, post, combination, next_mix if collapse_next else None
                 )
@@ -1703,9 +1596,7 @@ def kernel_rebuild_task(spec, placeholder):
         and args.get("table_rows") == capacity
     ):
         dynamic["table_rows"] = 1
-    geometry = dict(args)
-    if "_dynamic_arguments" in parameters:
-        geometry["_dynamic_arguments"] = parameters["_dynamic_arguments"]
+    geometry = dict(parameters, **args)
     dynamic = dynamic_arguments(geometry, dynamic, capacity)
     task = dict(
         module=module.__name__,
@@ -1719,10 +1610,6 @@ def kernel_rebuild_task(spec, placeholder):
         operator=spec["op"],
     )
     if private:
-        aliases = list(parameters["_owner_aliases"])
-        accesses = parameters["_owner_access"]
-        if len(aliases) != len(accesses):
-            raise ValueError("Private alias and access contracts differ")
         metadata = {k: v for k, v in parameters.items() if k.startswith("_owner_")}
         metadata["_owner_source_sha256"] = file_hash(Path(module.__file__))
         task.update(
@@ -1732,7 +1619,9 @@ def kernel_rebuild_task(spec, placeholder):
             dynamic=dynamic,
             columns={
                 a.removesuffix("_owner"): v["column"]
-                for a, v in zip(aliases, accesses, strict=True)
+                for a, v in zip(
+                    parameters["_owner_aliases"], parameters["_owner_access"], strict=True
+                )
             },
             owners=spec["operands"][1]["shape"][0],
             table_columns=spec["operands"][1]["shape"][1] - 1,
@@ -1751,25 +1640,36 @@ def compile_task(task_and_output):
     output = Path(output)
     module = import_module(task["module"])
     arguments = dict(task["arguments"])
-    if task.get("dynamic_arguments"):
+    dynamic = task.get("dynamic_arguments", {})
+    capacity = task.get("row_capacity")
+    if dynamic:
         from kernels.shared.rows import row_count
 
-        rows = row_count(task["row_capacity"], True)
-        for name, multiplier in task["dynamic_arguments"].items():
-            arguments[name] = rows * multiplier
+        rows = row_count(capacity, True)
+        arguments.update((name, rows * multiplier) for name, multiplier in dynamic.items())
     function = getattr(module, task["name"])(**arguments)
     path = compile_kernel(
         function,
         f"{task['module'].split('.')[-1]}.{task['name']}",
         task["specs"],
-        dynamic_parameters(
-            task["arguments"], task.get("dynamic_arguments", {}), task.get("row_capacity")
-        ),
+        dynamic_parameters(task["arguments"], dynamic, capacity),
         output / "cache",
-        row_capacity=task.get("row_capacity"),
+        row_capacity=capacity,
         grid_limit=task.get("grid_limit", 64),
     )
     return task["placeholder"], str(path.relative_to(output))
+
+
+def compile_plan_tasks(tasks, output, workers, *, progress=None):
+    manifests = {}
+    with ProcessPoolExecutor(
+        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        for slot, path in pool.map(compile_task, ((task, str(output)) for task in tasks)):
+            manifests[slot] = path
+            if progress:
+                print(json.dumps({progress: len(manifests), "total": len(tasks)}), flush=True)
+    return manifests
 
 
 def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None, grid_limit=None):
@@ -1800,11 +1700,10 @@ def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None, grid_li
             descriptions[manifest] = json.loads((base / manifest).read_text())
     from orinfer_build.models.deepseek_v41.dspark import MARKOV_STEP_OPS, converge_markov_steps
 
-    if all_kernels or operators and set(operators) & MARKOV_STEP_OPS:
+    operators = set(operators or ())
+    if all_kernels or operators & MARKOV_STEP_OPS:
         selected = {
-            path: spec
-            for path, spec in descriptions.items()
-            if all_kernels and not operators or operators and spec["op"] in operators
+            path for path, spec in descriptions.items() if not operators or spec["op"] in operators
         }
         # The binding upgrade must see every instruction's description, while
         # only selected operators may change ABI in a partial rebuild.
@@ -1844,15 +1743,9 @@ def rebuild_kernels(plan, workers, *, all_kernels=False, operators=None, grid_li
         else:
             identities[identity] = manifest
             tasks[manifest] = task
-    if operators and set(operators) - {t["operator"] for t in tasks.values()}:
+    if operators - {t["operator"] for t in tasks.values()}:
         raise ValueError("Selected operator is absent from the plan")
-    replacements = {}
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        for old, new in pool.map(compile_task, [(t, str(base)) for t in tasks.values()]):
-            replacements[old] = new
-            print(json.dumps(dict(rebuilt=len(replacements), total=len(tasks))), flush=True)
+    replacements = compile_plan_tasks(tasks.values(), base, workers, progress="rebuilt")
     for binding, key in references:
         old = binding[key]
         binding[key] = replacements.get(aliases.get(old, old), old)
@@ -1882,7 +1775,7 @@ def main():
     )
     parser.add_argument("--capacity", type=int, default=8448)
     parser.add_argument("--compile-workers", type=int, default=4)
-    parser.add_argument("--strategy", choices=("baseline", "optimized"), default="baseline")
+    parser.add_argument("--strategy", choices=("optimized",), help=argparse.SUPPRESS)
     parser.add_argument("--prefill-capacity", type=int, default=16)
     parser.add_argument("--packed-attention", action="store_true")
     parser.add_argument("--batched-hc", action="store_true")
@@ -1929,16 +1822,8 @@ def main():
         parser.error("capacity must be divisible by 32, within 128..16384")
     if not 2 <= args.prefill_capacity <= min(4096, args.capacity):
         parser.error("prefill capacity must be in 2..min(4096, context capacity)")
-    if args.fp32_cube and args.strategy != "optimized":
-        parser.error("fp32-cube requires the optimized strategy")
-    if args.parallel_regroup and args.strategy != "optimized":
-        parser.error("parallel-regroup requires the optimized strategy")
     if args.packed_attention and (args.capacity % 256 or args.capacity > 8448):
         parser.error("packed-attention requires 256-aligned capacity <=8448")
-    if (args.packed_attention or args.batched_hc) and args.strategy != "optimized":
-        parser.error("packed-attention and batched-hc require the optimized strategy")
-    if args.fast_engram and args.strategy != "optimized":
-        parser.error("fast-engram requires the optimized strategy")
     if args.active_expert_rows and not args.parallel_regroup:
         parser.error("active-expert-rows requires parallel-regroup")
     if args.vector_prefix and not args.parallel_regroup:
@@ -1983,8 +1868,7 @@ def main():
             rank,
             args.capacity,
             kernels,
-            replace(
-                OPTIMIZED,
+            PrefillOptions(
                 fp32_cube=args.fp32_cube,
                 parallel_regroup=args.parallel_regroup,
                 vector_prefix=args.vector_prefix,
@@ -1994,9 +1878,7 @@ def main():
                 compact_attention=args.compact_attention,
                 batched_rope=args.batched_rope,
                 active_expert_rows=args.active_expert_rows,
-            )
-            if args.strategy == "optimized"
-            else Strategy(),
+            ),
             args.model_dir,
         )
         builder.asset("rotation", block.numpy().astype("<f4"), "f32")
@@ -2031,23 +1913,11 @@ def main():
     }
     tasks = list(kernels.values())
     atomic_json(args.output / "construction.json", {"model": model, "kernels": tasks})
-    manifests = {}
-    with ProcessPoolExecutor(
-        max_workers=args.compile_workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        for placeholder, path in pool.map(
-            compile_task, [(task, str(args.output)) for task in tasks]
-        ):
-            manifests[placeholder] = path
-            print(
-                json.dumps({"compiled": len(manifests), "total": len(tasks), "manifest": path}),
-                flush=True,
-            )
-    for rank in ranks:
-        for packet in rank["packets"]:
-            for step in packet["body"] + packet["head"]:
-                if step["op"] == "kernel":
-                    step["manifest"] = manifests[step["manifest"]]
+    manifests = compile_plan_tasks(tasks, args.output, args.compile_workers, progress="compiled")
+    from orinfer_build.models.deepseek_v41.publication import manifest_bindings
+
+    for binding, key in manifest_bindings(model):
+        binding[key] = manifests[binding[key]]
     atomic_json(args.output / "model.json", model)
     print(
         json.dumps({"model": str(args.output / "model.json"), "unique_kernels": len(kernels)}),

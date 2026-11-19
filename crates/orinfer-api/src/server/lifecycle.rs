@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 #[derive(Default)]
-pub(super) struct Lifecycle {
+pub(crate) struct Lifecycle {
     phase: AtomicU8,
     failure: Mutex<Option<orinfer_engine::error::EngineError>>,
 }
@@ -55,6 +55,24 @@ impl Lifecycle {
     }
     pub fn failure(&self) -> Option<orinfer_engine::error::EngineError> {
         self.failure.lock().ok().and_then(|v| v.clone())
+    }
+}
+
+pub(crate) async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

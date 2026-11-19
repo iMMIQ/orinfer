@@ -69,7 +69,7 @@ impl ModelRuntime {
         for image in images {
             v.feature_count(image)?;
         }
-        let (index, positions) = self.model_package.visual_layout(input, images, capacity)?;
+        let (index, positions) = self.batch_plans.visual_layout(input, images, capacity)?;
         if let Some(name) = self
             .manifest
             .mtp

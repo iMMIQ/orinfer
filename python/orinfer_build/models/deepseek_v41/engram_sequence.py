@@ -1,6 +1,6 @@
 """Exchange Engram column shards directly into the existing sequence partitions."""
 
-from orinfer_build.common.modules import import_module
+from importlib import import_module
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor

@@ -1,4 +1,5 @@
 use super::*;
+use crate::sampling::TokenLogprob;
 
 // Compare probability bounds while history is identical. Free-running branches
 // and the ordinary repeated control are recorded independently of state checks.

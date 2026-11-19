@@ -24,72 +24,25 @@ pub(crate) type Handle = sys::CUgraphExec;
 
 pub(crate) struct Driver {
     _library: Library,
+    version: i32,
 }
 impl Driver {
     pub(crate) fn load() -> Result<Self> {
         // SAFETY: Loading the installed CUDA driver; retaining it for the session.
         let library = unsafe { Library::new("libcuda.so.1") }.map_err(|e| e.to_string())?;
-        // Preflight prevents cudarc's lazy symbol loader from panicking during execution.
-        // Signatures and CUDA types come entirely from its generated CUDA 12.6 bindings.
-        for name in [
-            b"cuInit\0".as_slice(),
-            b"cuDriverGetVersion\0".as_slice(),
-            b"cuDeviceGet\0".as_slice(),
-            b"cuDeviceGetName\0".as_slice(),
-            b"cuDeviceGetAttribute\0".as_slice(),
-            b"cuDeviceTotalMem_v2\0".as_slice(),
-            b"cuCtxGetCurrent\0".as_slice(),
-            b"cuDevicePrimaryCtxRetain\0".as_slice(),
-            b"cuDevicePrimaryCtxRelease_v2\0".as_slice(),
-            b"cuCtxSetCurrent\0".as_slice(),
-            b"cuCtxSynchronize\0".as_slice(),
-            b"cuStreamCreate\0".as_slice(),
-            b"cuStreamSynchronize\0".as_slice(),
-            b"cuEventQuery\0".as_slice(),
-            b"cuStreamDestroy_v2\0".as_slice(),
-            b"cuMemGetInfo_v2\0".as_slice(),
-            b"cuMemAlloc_v2\0".as_slice(),
-            b"cuMemAddressReserve\0".as_slice(),
-            b"cuMemAddressFree\0".as_slice(),
-            b"cuMemGetAllocationGranularity\0".as_slice(),
-            b"cuMemCreate\0".as_slice(),
-            b"cuMemMap\0".as_slice(),
-            b"cuMemSetAccess\0".as_slice(),
-            b"cuMemUnmap\0".as_slice(),
-            b"cuMemRelease\0".as_slice(),
-            b"cuMemFree_v2\0".as_slice(),
-            b"cuMemcpyHtoD_v2\0".as_slice(),
-            b"cuMemcpyHtoDAsync_v2\0".as_slice(),
-            b"cuMemHostAlloc\0".as_slice(),
-            b"cuMemFreeHost\0".as_slice(),
-            b"cuMemcpyDtoDAsync_v2\0".as_slice(),
-            b"cuMemcpyDtoH_v2\0".as_slice(),
-            b"cuMemcpyDtoHAsync_v2\0".as_slice(),
-            b"cuMemsetD8Async\0".as_slice(),
-            b"cuModuleLoadData\0".as_slice(),
-            b"cuModuleUnload\0".as_slice(),
-            b"cuModuleGetFunction\0".as_slice(),
-            b"cuFuncGetAttribute\0".as_slice(),
-            b"cuFuncSetAttribute\0".as_slice(),
-            b"cuLaunchKernel\0".as_slice(),
-            b"cuStreamBeginCapture_v2\0".as_slice(),
-            b"cuStreamEndCapture\0".as_slice(),
-            b"cuGraphInstantiateWithFlags\0".as_slice(),
-            b"cuGraphUpload\0".as_slice(),
-            b"cuGraphLaunch\0".as_slice(),
-            b"cuGraphDestroy\0".as_slice(),
-            b"cuGraphExecDestroy\0".as_slice(),
-            b"cuEventCreate\0".as_slice(),
-            b"cuEventRecord\0".as_slice(),
-            b"cuEventSynchronize\0".as_slice(),
-            b"cuEventElapsedTime\0".as_slice(),
-            b"cuEventDestroy_v2\0".as_slice(),
-            b"cuEventRecordWithFlags\0".as_slice(),
-        ] {
-            // SAFETY: Inspect the symbol address without calling it or dereferencing it.
-            unsafe { library.get::<*const c_void>(name) }.map_err(|e| e.to_string())?;
+        // SAFETY: The dynamic symbol has the CUDA Driver ABI and the library is live.
+        let version = unsafe {
+            library.get::<unsafe extern "C" fn(*mut i32) -> sys::CUresult>(b"cuDriverGetVersion\0")
         }
-        Ok(Self { _library: library })
+        .map_err(|e| e.to_string())?;
+        let mut driver_version = 0;
+        // SAFETY: The driver writes to a live CUDA version output.
+        let status = unsafe { version(&mut driver_version) };
+        check(status, "cuDriverGetVersion")?;
+        Ok(Self {
+            _library: library,
+            version: driver_version,
+        })
     }
 }
 pub(crate) fn check(code: sys::CUresult, operation: &str) -> Result<()> {
@@ -104,7 +57,7 @@ pub(crate) fn check(code: sys::CUresult, operation: &str) -> Result<()> {
 pub(super) fn inspect() -> Result<super::Inventory> {
     let _driver = Driver::load()?;
     let mut count = 0;
-    // SAFETY: Driver symbols are validated and retained. These calls query
+    // SAFETY: The driver library remains loaded. These calls query
     // inventory without retaining contexts, allocating memory, or launching work.
     unsafe {
         check(sys::cuInit(0), "CUDA discovery")?;
@@ -403,7 +356,7 @@ fn errors(output: &[f32], reference: &[f32]) -> Result<(f64, f64)> {
 pub(crate) fn run(x: Loaded) -> Result<RunReport> {
     let started = Instant::now();
     let mut s = Session::new(Driver::load()?);
-    let (mut major, mut minor, mut version, mut total) = (0, 0, 0, 0usize);
+    let (mut major, mut minor, mut total) = (0, 0, 0usize);
     let mut name = [0u8; 256];
     let mut device_buffers = BTreeMap::new();
     let mut launches = vec![];
@@ -433,7 +386,6 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
         if [major, minor] != [8, 7] {
             return Err(format!("Expected SM87, got {major}.{minor}"));
         }
-        check(sys::cuDriverGetVersion(&mut version), "driver version")?;
         check(
             sys::cuDeviceGetName(name.as_mut_ptr().cast(), 256, s.device),
             "device name",
@@ -773,7 +725,7 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
                     .map(|c| char::from(*c))
                     .collect(),
                 sm: [major, minor],
-                driver_version: version,
+                driver_version: s.driver.version,
                 total_bytes: total,
             },
             buffer_bytes: x.buffer_bytes,

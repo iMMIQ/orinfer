@@ -20,8 +20,6 @@ pub struct BatchLayout {
     pub row_strides: BTreeMap<String, usize>,
     pub profiles: BTreeMap<usize, PrefillKind>,
     pub hidden: usize,
-    #[serde(default)]
-    pub small_mixed_shapes: Vec<usize>,
     /// Nonzero means every real segment length through this capacity is supported.
     #[serde(default, skip_serializing_if = "crate::model::is_zero")]
     pub segment_tokens: usize,
@@ -32,9 +30,25 @@ pub struct BatchLayout {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub preparation_programs: BTreeMap<usize, String>,
 }
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchSegment {
     pub slot: usize,
     pub tokens: usize,
+}
+
+/// Whole-expert storage and the kernels whose histogram selects its consumers.
+/// Each consumer argument is an I32[experts] count array produced on the stream.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpertBank {
+    pub experts: usize,
+    pub buffers: Vec<String>,
+    pub consumers: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ImageGrid {
+    pub grid_height: usize,
+    pub grid_width: usize,
 }

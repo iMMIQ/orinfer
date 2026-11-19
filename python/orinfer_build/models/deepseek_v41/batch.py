@@ -5,7 +5,7 @@ expert operations consume aggregate rows; only causal/state operations use the
 same-source indirect wrapper. No checkpoint payload is transformed online.
 """
 
-from orinfer_build.common.modules import import_module
+from importlib import import_module
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor

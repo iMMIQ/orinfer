@@ -562,24 +562,20 @@ fn validate_flash_decode_batches() {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             };
             if !admitted {
+                let context = model.validate_generation(&item).unwrap();
+                let limits = model.request_limits(&item, context).unwrap();
                 eprintln!(
                     "MTP admission deferred after {} requests: free {}, fixed {}, KV {}, workspace {} bytes",
                     requests.len(),
                     model.admission_free_bytes().unwrap(),
+                    model.execution.additional_state_bytes(&limits).unwrap(),
                     model
                         .execution
-                        .additional_state_bytes(&model.request_limits(&item).unwrap())
-                        .unwrap(),
-                    model
-                        .execution
-                        .additional_kv_bytes(
-                            model.validate_generation(&item).unwrap(),
-                            &model.request_limits(&item).unwrap()
-                        )
+                        .additional_kv_bytes(context, &limits)
                         .unwrap(),
                     model
                         .pending_workspace(
-                            model.validate_generation(&item).unwrap(),
+                            context,
                             item.sampling.temperature > 0.,
                             &["decode", "prefill", "head"]
                         )
@@ -842,7 +838,9 @@ fn validate_flash_decode_batches() {
     model.finish_request(&mut other, false).unwrap();
     model.execution.reclaim_idle_state().unwrap();
     assert_eq!(before, state(&mut model, &mut survivor));
-    let limits = model.request_limits(&input(&fixture.cases[1], 8)).unwrap();
+    let replacement_input = input(&fixture.cases[1], 8);
+    let context = model.validate_generation(&replacement_input).unwrap();
+    let limits = model.request_limits(&replacement_input, context).unwrap();
     assert_eq!(
         model.execution.additional_state_bytes(&limits).unwrap(),
         0,
@@ -995,10 +993,10 @@ fn validate_flash_batched_verification() {
             })
             .collect();
         let (plan, bindings) = model
-            .model_package
+            .batch_plans
             .batch_operation(
                 &segments,
-                orinfer_model_sdk::abi::BatchOperation::Verification,
+                orinfer_model_sdk::packet::BatchOperation::Verification,
                 true,
             )
             .unwrap();
@@ -1007,7 +1005,7 @@ fn validate_flash_batched_verification() {
         model
             .execution
             .execute_batch_operation(
-                orinfer_model_sdk::abi::BatchOperation::Verification,
+                orinfer_model_sdk::packet::BatchOperation::Verification,
                 segments.iter().map(|s| (s.slot, s.tokens)).collect(),
                 &plan,
                 true,

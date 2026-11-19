@@ -1,6 +1,6 @@
 """Bind owner-local bounded decoder rows to existing native A2 arithmetic."""
 
-from orinfer_build.common.modules import import_module
+from importlib import import_module
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor

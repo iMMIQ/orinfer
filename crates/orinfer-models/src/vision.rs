@@ -1,6 +1,6 @@
 //! Qwen image spans and interleaved MRoPE positions.
 use orinfer_model_sdk::{
-    abi::ImageGrid,
+    architecture::ImageGrid,
     artifact::Result,
     vision::{ImageLayout, VisionSpec},
 };

@@ -76,6 +76,26 @@ mod mtp_fixture_export {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+    #[serde(default)]
+    include_obfuscation: bool,
+}
+
+impl StreamOptions {
+    fn optional<'de, D>(deserializer: D) -> std::result::Result<Option<Self>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<serde_json::Map<String, Value>>::deserialize(deserializer)?
+            .map(|map| serde_json::from_value(Value::Object(map)).map_err(serde::de::Error::custom))
+            .transpose()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Value>,
@@ -96,7 +116,8 @@ pub struct ChatRequest {
     pub ignore_eos: bool,
     #[serde(default, deserialize_with = "nullable_default")]
     pub stream: bool,
-    pub stream_options: Option<Value>,
+    #[serde(default, deserialize_with = "StreamOptions::optional")]
+    pub(super) stream_options: Option<StreamOptions>,
     pub stop: Option<Value>,
     pub n: Option<usize>,
     pub logprobs: Option<bool>,
@@ -311,9 +332,6 @@ impl ChatCodec {
         if request.n.is_some_and(|n| n != 1) {
             return Err("n: Only n=1 is supported".into());
         }
-        if request.top_logprobs.is_some_and(|n| n > 20) {
-            return Err("top_logprobs: Expected 0–20".into());
-        }
         if request.top_logprobs.is_some() && request.logprobs != Some(true) {
             return Err("top_logprobs: Requires logprobs=true".into());
         }
@@ -344,24 +362,11 @@ impl ChatCodec {
             return Err("safety_identifier: At most 128 characters".into());
         }
         if let Some(options) = &request.stream_options {
-            let options = options
-                .as_object()
-                .ok_or("stream_options: Expected object")?;
             if !request.stream {
                 return Err("stream_options: Requires stream=true".into());
             }
-            for (name, value) in options {
-                if !["include_usage", "include_obfuscation"].contains(&name.as_str()) {
-                    return Err(format!("stream_options.{name}: Unsupported option"));
-                }
-                if !value.is_boolean() {
-                    return Err(format!("stream_options.{name}: Expected boolean"));
-                }
-                if name == "include_obfuscation" && value == true {
-                    return Err(
-                        "stream_options.include_obfuscation: Only false is supported".into(),
-                    );
-                }
+            if options.include_obfuscation {
+                return Err("stream_options.include_obfuscation: Only false is supported".into());
             }
         }
         let schema = super::grammar::output_schema(request.response_format.as_ref())?;
@@ -426,30 +431,12 @@ impl ChatCodec {
                 .unwrap_or(false)
                 .then_some(request.top_logprobs.unwrap_or(0)),
         };
-        for (&id, bias) in &sampling.logit_bias {
-            if self.tokenizer.id_to_token(id).is_none()
-                || !bias.is_finite()
-                || !(-100.0..=100.0).contains(bias)
-            {
-                return Err(format!(
-                    "logit_bias.{id}: Invalid token or bias outside -100..100"
-                ));
-            }
-        }
-        for (name, value, min, max) in [
-            ("temperature", sampling.temperature, 0.0, 2.0),
-            ("top_p", sampling.top_p, 0.0, 1.0),
-            ("presence_penalty", sampling.presence_penalty, -2.0, 2.0),
-            ("frequency_penalty", sampling.frequency_penalty, -2.0, 2.0),
-        ] {
-            if !value.is_finite() || value < min || value > max || name == "top_p" && value == 0.0 {
-                return Err(format!("{name}: Invalid sampling value"));
-            }
-        }
-        if !sampling.repetition_penalty.is_finite() || sampling.repetition_penalty <= 0.0 {
-            return Err("repetition_penalty: Expected positive finite value".into());
-        }
         sampling.validate()?;
+        for &id in sampling.logit_bias.keys() {
+            if self.tokenizer.id_to_token(id).is_none() {
+                return Err(format!("logit_bias.{id}: Invalid token"));
+            }
+        }
         if sampling.top_logprobs.is_some() {
             self.grammar
                 .token_bytes(0)
@@ -745,7 +732,7 @@ impl ChatCodec {
         let include_usage = request
             .stream_options
             .as_ref()
-            .is_some_and(|v| v["include_usage"] == true);
+            .is_some_and(|v| v.include_usage);
         // Hint at actual template token boundaries; never alter or pad the prompt.
         let ends: Vec<_> = input
             .iter()

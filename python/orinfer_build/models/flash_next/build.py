@@ -37,8 +37,8 @@ from orinfer_build.common.files import file_hash, write_json
 
 def inventory(data, package, manifest, compiler):
     if data["architecture"] != "flash_next" or data["schema_version"] != 1:
-        raise ValueError("Expected the current native Flash Next schema-1 model")
-    if not manifest.get("row_execution"):
+        raise ValueError("Expected a Flash Next schema-1 model descriptor")
+    if package.get("schema_version") != 2 or not manifest.get("row_execution"):
         raise ValueError("The native model must provide its shared row construction contract")
     fixed = fixed_extents(manifest)
     dynamic = {k["name"]: k for k in package["dynamic_batch_kernels"]}

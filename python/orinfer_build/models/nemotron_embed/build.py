@@ -18,7 +18,6 @@ from orinfer_build.compiler.compile import primitive
 from orinfer_build.models.encoder import Projections
 from orinfer_build.packaging.compact import compact_package
 from orinfer_build.models.nemotron_embed.config import configuration, signature
-from orinfer_build.packaging.package import execution_identity, model_library
 from orinfer_build.packaging.publication import atomic_model
 from orinfer_build.models.qwen35.compiler import Aot
 from orinfer_build.models.qwen35.storage import Weights
@@ -392,8 +391,6 @@ class Builder(Projections):
             embedding=spec,
         )
         package = dict(
-            schema_version=1,
-            runtime_abi=1,
             target="sm_87",
             architecture="nemotron_embed",
             compute_policy="int8_quality",
@@ -405,9 +402,6 @@ class Builder(Projections):
                 {k: v for k, v in b.items() if k != "data"} for b in self.w.buffers.values()
             ],
             toolchain=self.aot.identity,
-            execution=execution_identity(
-                model_library(), self.args.engine, "nemotron_embed", "int8_quality"
-            ),
         )
         digest = compact_package(self.root / "cache", package, self.root / "cache/packages")
         write_json(

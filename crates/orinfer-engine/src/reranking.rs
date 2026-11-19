@@ -18,7 +18,6 @@ pub struct Score {
 }
 pub struct Model {
     execution: Executor,
-    _package: crate::model_package::ModelPackage,
     spec: Spec,
     context: usize,
     vocab: usize,
@@ -52,7 +51,6 @@ impl Model {
         };
         Ok(Self {
             execution,
-            _package: prepared.execution_model,
             spec,
             context: m.max_context,
             vocab: m.vocab,

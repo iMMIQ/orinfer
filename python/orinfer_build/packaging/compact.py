@@ -280,13 +280,11 @@ def compact_package(origin, package, cache):
                     file="assets.safetensors", tensor=verified[key], sha256=verified[key]
                 )
         write_shard(staging / "assets.safetensors", tensors)
-        for name in ("lib", "LICENSE", "COPYING.LESSER", "COPYING", "THIRD_PARTY_NOTICES.md"):
+        for name in ("LICENSE", "COPYING.LESSER", "COPYING", "THIRD_PARTY_NOTICES.md"):
             path = origin / name
-            if name != "lib" and not path.exists():
+            if not path.exists():
                 path = ROOT / name
-            if path.is_dir():
-                shutil.copytree(path, staging / name)
-            elif path.is_file():
+            if path.is_file():
                 shutil.copyfile(path, staging / name)
         from orinfer_build.contracts.catalog import seal
 

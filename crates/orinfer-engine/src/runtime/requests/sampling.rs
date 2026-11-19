@@ -69,8 +69,7 @@ impl ModelRuntime {
             return Err("Sampling rows exceed capacity".into());
         }
         let slots: Vec<_> = candidates.iter().map(|(i, _)| requests[*i].slot).collect();
-        #[cfg(test)]
-        profile::mark("sampling_controls_begin");
+        profile_mark("sampling_controls_begin");
         let controls = self
             .execution
             .read_sequence_controls(&slots, [&self.manifest.position, &self.manifest.status])?;
@@ -88,8 +87,7 @@ impl ModelRuntime {
             self.manifest.vocab * 4,
             &slots,
         )?;
-        #[cfg(test)]
-        profile::mark("sampling_table");
+        profile_mark("sampling_table");
         for (row, (index, mask)) in candidates.iter().enumerate() {
             let req = &requests[*index];
             for (name, bytes) in inputs(
@@ -107,18 +105,15 @@ impl ModelRuntime {
                 )?;
             }
         }
-        #[cfg(test)]
-        profile::mark("sampling_inputs");
+        profile_mark("sampling_inputs");
         self.execution.submit_program_rows(
             &batch.program,
             candidates.len(),
             ExecutionPhase::Decode,
         )?;
-        #[cfg(test)]
-        profile::mark("sampling_submit");
+        profile_mark("sampling_submit");
         let output = self.read_controls(&batch.output, candidates.len() * 2)?;
-        #[cfg(test)]
-        profile::mark("sampling_readback");
+        profile_mark("sampling_readback");
         let mut stats = self.execution.batch_statistics();
         stats.sampling_packets += 1;
         stats.sampling_rows += candidates.len();

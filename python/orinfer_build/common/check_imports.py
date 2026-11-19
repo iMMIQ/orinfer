@@ -1,12 +1,9 @@
 """Check offline module references in the CUDA uv environment without using a GPU."""
 
-from orinfer_build.common.paths import ROOT
-
-
-from orinfer_build.common.modules import canonical_module, import_module
-
-
 import argparse
+from importlib import import_module
+
+from orinfer_build.common.paths import ROOT
 
 
 def source_modules(root):
@@ -51,10 +48,6 @@ def main():
         if relative.parts[0] == "python":
             relative = relative.relative_to("python")
         name = ".".join(relative.with_suffix("").parts)
-        # Compatibility commands delegate to canonical modules, which are
-        # inspected at their real path in the selected backend environment.
-        if canonical_module(name) != name:
-            continue
         try:
             import_module(name)
             imported += 1

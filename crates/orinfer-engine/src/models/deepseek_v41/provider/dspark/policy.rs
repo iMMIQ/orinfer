@@ -70,39 +70,34 @@ impl History {
             )
             .enumerate()
         {
-            if prediction.is_finite() && (0. ..=1.).contains(&prediction) {
+            if (0. ..=1.).contains(&prediction) {
                 let label = f64::from(i < accepted);
-                let actual = self.acceptance.estimate(i, 0.7);
+                let actual = self.acceptance.rate(i, 0.7);
                 let predicted = (actual + (prediction + self.bias[i]).clamp(0., 1.)) * 0.5;
                 self.errors[i].observe(predicted, actual, label);
-                self.bias[i] = self.bias[i] * 0.8 + (label - prediction) * 0.2;
+                self.bias[i] = adaptive::ema(self.bias[i], label - prediction);
             }
         }
         self.previous = confidence.to_vec();
         self.acceptance.observe(proposed, accepted);
     }
     fn rates(&self, maximum: usize, prior: &[f64]) -> Vec<f64> {
-        let mut survival = 1.;
-        (0..maximum)
-            .map(|i| {
-                let actual = self
-                    .acceptance
-                    .estimate(i, prior.get(i).copied().unwrap_or(0.7));
-                // This is the checkpoint's trained AcceptRatePredictor, not
-                // the draft token's softmax probability. Use one forecast for
-                // ranking and useful progress, corrected by tested outcomes.
-                let predicted = self.previous.get(i).copied().filter(|p| {
-                    p.is_finite()
-                        && (0. ..=1.).contains(p)
-                        && self.errors.get(i).is_some_and(|error| error.useful())
-                });
-                let rate = predicted.map_or(actual, |p| {
-                    (actual + (p + self.bias.get(i).copied().unwrap_or(0.)).clamp(0., 1.)) * 0.5
-                });
-                survival *= rate.clamp(0., 1.);
-                survival
-            })
-            .collect()
+        adaptive::prefix_survival((0..maximum).map(|i| {
+            let actual = self
+                .acceptance
+                .rate(i, prior.get(i).copied().unwrap_or(0.7));
+            // This is the checkpoint's trained AcceptRatePredictor, not
+            // the draft token's softmax probability. Use one forecast for
+            // ranking and useful progress, corrected by tested outcomes.
+            let predicted = self.previous.get(i).copied().filter(|p| {
+                (0. ..=1.).contains(p) && self.errors.get(i).is_some_and(|error| error.useful())
+            });
+            let rate = predicted.map_or(actual, |p| {
+                (actual + (p + self.bias.get(i).copied().unwrap_or(0.)).clamp(0., 1.)) * 0.5
+            });
+            rate.clamp(0., 1.)
+        }))
+        .collect()
     }
 }
 
@@ -155,7 +150,6 @@ pub(in crate::models::deepseek_v41::provider) struct Policy {
     trace: bool,
     costs: Model,
     ledger: adaptive::Budget,
-    calibration_limit: f64,
     pending: Option<Receipt>,
     next_calibrating: bool,
 }
@@ -175,7 +169,6 @@ impl Default for Policy {
             trace: std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some(),
             costs: Model::default(),
             ledger: adaptive::Budget::default(),
-            calibration_limit: 0.4,
             pending: None,
             next_calibrating: true,
         }
@@ -226,7 +219,7 @@ impl From<[f64; 4]> for Costs {
 }
 fn update(old: &mut f64, sample: f64, initialized: bool) {
     *old = if initialized {
-        *old * 0.8 + sample * 0.2
+        adaptive::ema(*old, sample)
     } else {
         sample
     };
@@ -440,9 +433,7 @@ impl Policy {
     }
     pub fn start_iteration(&mut self, limit: f64) {
         self.pending = None;
-        if limit.is_finite() && limit > 0. {
-            self.calibration_limit = limit;
-        }
+        self.ledger.set_limit(limit);
     }
     pub fn begin_round(
         &mut self,
@@ -510,7 +501,6 @@ impl Policy {
             sample,
             receipt.normal_s,
             receipt.slots.len(),
-            self.calibration_limit,
             receipt.calibrating,
         );
         if self.trace {
@@ -753,7 +743,7 @@ impl Policy {
             return Err("Invalid DSpark physical blocks".into());
         }
         let curve = self.curves.entry((batch, full, mixed)).or_default();
-        let available = self.ledger.available(self.calibration_limit);
+        let available = self.ledger.available();
         let horizon = reuse_steps(&budget, &ordinary, maxima, feedback, blocks[0]);
         let normal_s = self
             .costs
@@ -785,7 +775,7 @@ impl Policy {
             };
             let prior = curve.blocks.get(&(block, budget.uniform));
             let priors = (0..block)
-                .map(|i| prior.map_or(0.7, |p| p.acceptance.estimate(i, 0.7)))
+                .map(|i| prior.map_or(0.7, |p| p.acceptance.rate(i, 0.7)))
                 .collect::<Vec<_>>();
             let allocation = queue(&local, feedback, &priors, block);
             let mut depths = vec![0; batch];
@@ -972,12 +962,7 @@ impl Policy {
             },
             &estimates,
         );
-        self.next_calibrating = decision.as_ref().is_some_and(|d| {
-            estimates
-                .iter()
-                .find(|c| c.id == d.id)
-                .is_some_and(|c| c.samples < adaptive::HOT_SAMPLES)
-        });
+        self.next_calibrating = decision.as_ref().is_some_and(|d| d.calibrating);
         let reason = if decision.as_ref().is_some_and(|d| d.exploring) {
             "shared_probe"
         } else {
@@ -1013,10 +998,7 @@ impl Policy {
         }
         let rows = batch + counts.iter().map(|p| p.0).sum::<usize>();
         let key = (block, rows, positive, uniform);
-        if curve.rounds.len() == 256 && !curve.rounds.contains_key(&key) {
-            let victim = *curve.rounds.iter().min_by_key(|(_, c)| c.last).unwrap().0;
-            curve.rounds.remove(&victim);
-        }
+        adaptive::evict_oldest(&mut curve.rounds, key, 256, |cost| cost.last);
         curve.rounds.entry(key).or_default().observe(
             adaptive::Measurement {
                 seconds: costs.wall_s.unwrap_or_else(|| {
@@ -1029,17 +1011,14 @@ impl Policy {
             call,
         );
         let curve = curve.blocks.entry((block, uniform)).or_default();
-        *curve
-            .seen
-            .entry(batch + counts.iter().map(|p| p.0).sum::<usize>())
-            .or_default() += 1;
+        *curve.seen.entry(rows).or_default() += 1;
         let draft_work = Work {
             rows: positive,
             ..Work::default()
         };
         let work = if costs.work.rows == 0 {
             Work {
-                rows: batch + counts.iter().map(|p| p.0).sum::<usize>(),
+                rows,
                 ..Work::default()
             }
         } else {
@@ -1472,10 +1451,7 @@ mod tests {
         history.observe(&[0.1], 1, 0);
         assert!((history.bias[0] + 0.18).abs() < 1e-12);
         assert!(!history.errors[0].useful());
-        assert_eq!(
-            history.rates(1, &[])[0],
-            history.acceptance.estimate(0, 0.7)
-        );
+        assert_eq!(history.rates(1, &[])[0], history.acceptance.rate(0, 0.7));
     }
     #[test]
     fn a_predictive_head_can_beat_the_request_history() {
@@ -1485,7 +1461,7 @@ mod tests {
         };
         history.observe(&[0.9], 1, 1);
         assert!(history.errors[0].useful());
-        assert!(history.rates(1, &[])[0] > history.acceptance.estimate(0, 0.7));
+        assert!(history.rates(1, &[])[0] > history.acceptance.rate(0, 0.7));
     }
     #[test]
     fn actual_earnings_fund_a_new_cohort_without_recreating_startup_credit() {

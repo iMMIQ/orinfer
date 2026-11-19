@@ -66,7 +66,7 @@ struct Family(Stage, usize, bool, bool, usize, usize);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Key(Family, usize, bool, bool);
 struct Cell {
-    time: crate::mtp::adaptive::Timing,
+    time: crate::scheduler::Timing,
     prior: f64,
 }
 impl Cell {
@@ -199,12 +199,12 @@ impl Model {
             // Imported timings price execution; only this process's real
             // calls may consume its primer and establish hot observations.
             cell.prior = if cell.prior > 0. {
-                cell.prior * 0.8 + point.seconds * 0.2
+                crate::mtp::adaptive::ema(cell.prior, point.seconds)
             } else {
                 point.seconds
             };
         }
-        let local_setup = (point.setup_s - point.shared_setup_s).max(0.);
+        let local_setup = point.setup_s - point.shared_setup_s;
         if local_setup > 0. {
             // Host readback mode does not change the captured launch geometry.
             let cold_group = family(point.stage, point.block, false, point.work);
@@ -511,14 +511,9 @@ fn valid(point: &Point) -> bool {
         && point.work.prefill_rows <= point.work.rows
         && point.work.context <= 1 << 24
         && point.block <= crate::execution::MAX_MTP_DRAFTS
-        && point.seconds.is_finite()
-        && point.seconds > 0.
-        && point.setup_s.is_finite()
-        && point.setup_s >= 0.
+        && crate::mtp::adaptive::valid_duration(point.seconds, point.setup_s)
         && !(point.replay && point.shared)
-        && point.shared_setup_s.is_finite()
-        && point.shared_setup_s >= 0.
-        && point.shared_setup_s <= point.setup_s
+        && (0. ..=point.setup_s).contains(&point.shared_setup_s)
 }
 
 #[cfg(test)]

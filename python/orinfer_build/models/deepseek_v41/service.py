@@ -1,7 +1,6 @@
 """Publish an HF-style native A2 text-service directory from a compiled rows plan."""
 
 import argparse
-from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -70,7 +69,7 @@ def enable_prefix_sharing(model):
 
 
 def publish(plan, checkpoint, output, share_prefix_banks=False):
-    model = deepcopy(json.loads(plan.read_text()))
+    model = json.loads(plan.read_text())
     if not model.get("batch"):
         raise ValueError("Native A2 service requires shared rows and owner-private state")
     if not model["batch"].get("state"):

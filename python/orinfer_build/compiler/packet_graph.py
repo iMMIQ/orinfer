@@ -5,6 +5,10 @@ from orinfer_build.common.paths import ROOT, work_path
 
 import hashlib
 import math
+import json
+import os
+import subprocess
+import tempfile
 from pathlib import Path
 
 from orinfer_build.common.files import source_hash, write_json
@@ -29,7 +33,6 @@ def build(b):
             root / "kernels/cuda/model/packet_io.py",
             root / "python/orinfer_build/compiler/compile.py",
             root / "kernels/cuda/model/retained.py",
-            root / "python/orinfer_build/compiler/native_packets.py",
         ],
     )
     columns = sorted(name for name, scope in b.weights.scopes.items() if scope == "sequence")
@@ -192,34 +195,49 @@ def build(b):
         b.mtp["packet_table"] = table
 
 
-def inspect(model):
-    """Find owner-bound operands in the registered native construction."""
-    from orinfer_build.compiler.native_packets import Packets, profiles
+def probes(has_mtp):
+    """Representative role boundaries, lengths and reversed request ownership."""
+    yield "ordinary", [(2, 1), (7, 1)]
+    for tokens in (3, 17, 32, 128, 512):
+        yield "ordinary", [(2, tokens), (7, 1)]
+        yield "ordinary", [(2, tokens), (7, tokens)]
+    if has_mtp:
+        for tokens in (1, 2, 3, 8):
+            for operation in ("verification", "draft", "commit", "warm", "draft_head"):
+                yield operation, [(2, tokens), (7, tokens)]
+        for tokens in (2, 3, 8):
+            yield "mixed_verification", [(2, tokens), (7, 1)]
+            yield {"mixed_rows": {"prefills": 1}}, [(2, tokens), (7, 2)]
 
-    copy_sizes = {}
-    private_names = set()
-    with Packets(model, indirect=False) as packets:
-        for operation, segments in profiles(packets.manifest):
-            try:
-                commands, _ = packets.plan(segments, operation)
-            except ValueError:
-                continue
-            for command in commands:
-                if command["sequence"] is None:
-                    continue
-                if command["kind"] == 0:
-                    private_names.add(command["name"])
-                elif command["kind"] == 1:
-                    pair = (command["name"], command["destination"])
-                    if any(
-                        name in packets.data["buffer_scopes"]
-                        and packets.data["buffer_scopes"][name] == "sequence"
-                        for name in pair
-                    ):
-                        copy_sizes.setdefault(pair, []).append(command["bytes"])
-                else:
-                    raise ValueError("Private packet zero needs a declared TileLang implementation")
-    return private_names, copy_sizes
+
+def inspect(model):
+    """Find owner-bound operands in the registered Rust adapter."""
+    from orinfer_build.packaging.publication import resolve_package
+
+    data, _, _ = resolve_package(model)
+    engine = os.environ.get("ORINFER_ENGINE", str(ROOT / "target/release/orinfer"))
+    with tempfile.TemporaryDirectory() as temp:
+        request = Path(temp) / "probes.json"
+        write_json(
+            request,
+            [
+                dict(
+                    operation=operation,
+                    segments=[dict(slot=slot, tokens=tokens) for slot, tokens in segments],
+                )
+                for operation, segments in probes(bool(data["metadata"].get("mtp")))
+            ],
+        )
+        result = subprocess.run(
+            [engine, "plan-model", str(model), "--packet-probes", str(request)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    layout = json.loads(result.stdout)
+    return set(layout["private_kernels"]), {
+        (source, destination): sizes for source, destination, sizes in layout["private_copies"]
+    }
 
 
 def compile_package(data, package, manifest, origin, operator, output, cache, layout):

@@ -1,20 +1,15 @@
 //! Local tiling choices share the canonical operand and row contracts.
-use crate::artifact::{Access, Argument, Buffer, Dtype, Kernel, Result};
+use super::contracts::{Storage, connect, kernel_buffer_arg as buffer};
+use crate::artifact::{Argument, Buffer, Dtype, Kernel, Result};
 use orinfer_model_sdk::operators::rows::KernelVariant;
 use std::collections::BTreeMap;
 
-fn argument(k: &Kernel, index: usize) -> Result<&str> {
-    match k.args.get(index) {
-        Some(Argument::Buffer { name }) => Ok(name.as_str()),
-        _ => Err("HC stream projection requires whole-buffer operands".into()),
-    }
-}
-
 pub(super) fn build<Data>(
     kernels: &[Kernel],
-    buffers: &[Buffer<Data>],
+    buffers: Option<&[Buffer<Data>]>,
 ) -> Result<BTreeMap<String, Vec<KernelVariant>>> {
-    let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
+    let contracts = super::contracts::kernels(kernels);
+    let storage = buffers.map(Storage::new);
     let mut variants: BTreeMap<String, Vec<KernelVariant>> = BTreeMap::new();
     for kernel in kernels {
         let Some((slot, suffix)) = kernel.name.rsplit_once('/') else {
@@ -42,41 +37,24 @@ pub(super) fn build<Data>(
                 || !extent(canonical, 3)
                 || !extent(kernel, 3)
                 || !extent(finish, 2)
-                || argument(canonical, 0)? != argument(kernel, 0)?
-                || argument(canonical, 2)? != argument(kernel, 2)?
-                || argument(canonical, 1)? != argument(finish, 0)?
-                || argument(kernel, 1)? != argument(finish, 1)?
             {
                 return Err("HC stream projection producer/consumer mismatch".into());
             }
-            let partial_name = argument(kernel, 1)?;
-            let partial = buffers
-                .iter()
-                .find(|b| b.name == partial_name)
-                .ok_or("Missing HC partial workspace")?;
-            if partial.dtype != Dtype::F32
-                || partial.shape != [4, 4096, 320]
-                || partial.data.is_some()
-                || partial.access != Access::ReadWrite
-            {
-                return Err("Invalid HC partial workspace".into());
-            }
-            for (index, dtype, elements, immutable) in [
-                (0, Dtype::Bf16, 4096 * 10240, false),
-                (1, Dtype::Bf16, 4096 * 320, false),
-                (2, Dtype::Bf16, 320 * 10240, true),
-            ] {
-                let name = argument(canonical, index)?;
-                let b = buffers
-                    .iter()
-                    .find(|b| b.name == name)
-                    .ok_or("Missing HC canonical operand")?;
-                if b.dtype != dtype
-                    || b.bytes()? != elements * dtype.bytes()
-                    || b.data.is_some() != immutable
-                    || b.layout != "native_contiguous"
+            connect(canonical, kernel, &[(0, 0), (2, 2)])?;
+            connect(canonical, finish, &[(1, 0)])?;
+            connect(kernel, finish, &[(1, 1)])?;
+            if let Some(storage) = &storage {
+                storage.check(buffer(kernel, 1)?, Dtype::F32, false, |b| {
+                    Ok(b.shape == [4, 4096, 320])
+                })?;
+                for (index, elements) in [4096 * 10240, 4096 * 320, 320 * 10240]
+                    .into_iter()
+                    .enumerate()
                 {
-                    return Err("Invalid HC canonical stream operand".into());
+                    storage.check(buffer(canonical, index)?, Dtype::Bf16, index == 2, |b| {
+                        Ok(b.bytes()? == elements * Dtype::Bf16.bytes()
+                            && b.layout == "native_contiguous")
+                    })?;
                 }
             }
             variants
@@ -100,11 +78,13 @@ pub(super) fn build<Data>(
         if !slot.starts_with("prefill_m4096/") || !contracts.contains_key(slot) {
             return Err("Measured prefill choice lacks a canonical slot".into());
         }
-        let parts: Vec<_> = choice.split('/').collect();
-        if parts.len() != 3 {
+        let mut parts = choice.split('/');
+        let (Some(interval), Some(multiple), Some(step), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
             return Err("Invalid measured prefill choice".into());
-        }
-        let (low, high) = parts[0]
+        };
+        let (low, high) = interval
             .split_once('-')
             .ok_or("Invalid measured prefill interval")?;
         let first = low
@@ -113,7 +93,7 @@ pub(super) fn build<Data>(
         let last = high
             .parse::<usize>()
             .map_err(|_| "Invalid measured row maximum")?;
-        let multiple = parts[1]
+        let multiple = multiple
             .parse::<usize>()
             .map_err(|_| "Invalid measured row multiple")?;
         if first == 0 || first > last || last > 4096 || multiple == 0 {
@@ -122,12 +102,12 @@ pub(super) fn build<Data>(
         let steps = measured
             .entry((slot.into(), first, last, multiple))
             .or_default();
-        if parts[2] == "skip" {
+        if step == "skip" {
             if !steps.is_empty() {
                 return Err("Mixed skip/kernel prefill choice".into());
             }
         } else {
-            let at = parts[2]
+            let at = step
                 .strip_prefix('k')
                 .ok_or("Invalid measured prefill step")?
                 .parse::<usize>()
@@ -157,6 +137,7 @@ pub(super) fn build<Data>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::Access;
     fn kernel(name: &str, buffer: &str) -> Kernel {
         serde_json::from_value(serde_json::json!({
             "name":name,"module":{"file":"k.cubin","sha256":"0".repeat(64)},
@@ -175,10 +156,10 @@ mod tests {
             kernel(&format!("{slot}/choice/19-93/1/k0"), "A"),
             kernel(&format!("{slot}/choice/94-281/1/k0"), "A"),
         ];
-        let v = build::<()>(&selections, &[]).unwrap();
+        let v = build::<()>(&selections, None).unwrap();
         assert_eq!((v[slot][0].min_rows, v[slot][0].max_rows), (19, 93));
         assert_eq!((v[slot][1].min_rows, v[slot][1].max_rows), (94, 281));
-        assert!(build::<()>(&selections[1..], &[]).is_err());
+        assert!(build::<()>(&selections[1..], None).is_err());
     }
     #[test]
     fn hc_stream_pair_checks_workspace_and_endpoints() {
@@ -221,20 +202,20 @@ mod tests {
             buffer("W", Dtype::Bf16, vec![320, 10240], true),
         ];
         let kernels = vec![canonical, partial, finish];
-        let v = build(&kernels, &buffers).unwrap();
+        let v = build(&kernels, Some(&buffers)).unwrap();
         assert_eq!(
             v[slot][0].kernels,
             [format!("{slot}/hc_partials"), format!("{slot}/hc_finish")]
         );
-        assert!(build(&kernels[..2], &buffers).is_err());
-        assert!(build(&[kernels[0].clone(), kernels[2].clone()], &buffers).is_err());
+        assert!(build(&kernels[..2], Some(&buffers)).is_err());
+        assert!(build(&[kernels[0].clone(), kernels[2].clone()], Some(&buffers)).is_err());
         buffers[0].shape[0] = 3;
-        assert!(build(&kernels, &buffers).is_err());
+        assert!(build(&kernels, Some(&buffers)).is_err());
         buffers[0].shape[0] = 4;
         let mut invalid = kernels.clone();
         invalid[2].args[1] = Argument::Buffer {
             name: "Other".into(),
         };
-        assert!(build(&invalid, &buffers).is_err());
+        assert!(build(&invalid, Some(&buffers)).is_err());
     }
 }

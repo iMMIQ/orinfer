@@ -6,6 +6,7 @@ cannot diverge between measurement and the emitted execution package.
 """
 
 from orinfer_build.tuning.row_tuning import RowTuner, launch
+from orinfer_build.tuning.tuning import lowest_total_latency
 from orinfer_build.compiler.compile import primitive
 
 
@@ -251,11 +252,8 @@ class MoeTuner(RowTuner):
         result = self.select(
             spec, configs, build, inputs, measure_rows=[1, 17, 128, 512, 2048, 4096]
         )
-        costs = {
-            str(i): sum(row["times"][str(i)] for row in result["measurements"])
-            for i in range(len(configs))
-        }
-        result = prefill_fallback(result, min(costs, key=costs.get))
+        default = lowest_total_latency(result["measurements"], map(str, range(len(configs))))
+        result = prefill_fallback(result, default)
         self.records[key] = result
         return result
 
@@ -588,8 +586,6 @@ class MoeTuner(RowTuner):
         )
         from orinfer_build.contracts.row_selection import prefill_fallback
 
-        costs = {
-            str(i): sum(row["times"][str(i)] for row in result["measurements"] if row["rows"] > 128)
-            for i in range(len(configs))
-        }
-        return prefill_fallback(result, min(costs, key=costs.get))
+        measured = [row for row in result["measurements"] if row["rows"] > 128]
+        default = lowest_total_latency(measured, map(str, range(len(configs))))
+        return prefill_fallback(result, default)

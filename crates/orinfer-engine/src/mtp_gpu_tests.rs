@@ -748,7 +748,7 @@ fn validate_mtp_generation() {
                     if !case.images.is_empty() {
                         let vision = model.manifest.vision.as_ref().unwrap();
                         let (index, _) = model
-                            .model_package
+                            .batch_plans
                             .visual_layout(
                                 &case.input_tokens,
                                 &case.images,

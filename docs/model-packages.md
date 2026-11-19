@@ -1,8 +1,8 @@
 # 模型执行包
 
-在线引擎通过版本化 C ABI 加载模型执行逻辑。模型适配器、计算策略、共享执行组件、kernel 和构建工具在同一源码 workspace 维护。部署包包含原生 `.so`、匹配的 cubin 和配置/布局契约；权重仍在模型目录中。部署包从统一 workspace 构建。A8/A4 表示主要计算策略，包同时声明各关键路径的实际混合精度。
+CUDA 执行包使用 schema 2，包含编译后的设备资产和执行数据。模型适配器随 `orinfer-models` 静态链接进 `orinfer-engine`。引擎读取配置和绑定，通过 Rust 接口组装程序、动态 batch、状态绑定和视觉位置。权重保存在模型目录，计算策略声明各路径使用的混合精度。
 
-核心负责 API、调度、CUDA context/stream、内存、graph 和 prefix 索引；包负责配置校验、模型执行顺序、融合、动态 batch、状态绑定和视觉位置。新增模型族通过包内适配器注册。当前原生库为 `orinfer-models`，注册 Qwen3.5 和 Flash Next 的 `int8_quality` 路径。
+核心负责 API、调度、CUDA context/stream、内存、Graph 和 prefix 索引。新增模型族通过 Rust 适配器注册，当前 `int8_quality` 策略支持 Qwen3.5、Qwen3-ASR、Flash Next、Nemotron Embed 和 Qwen Reranker。DSv4.1 A2 使用下文的 schema 1 原生计划封装和独立的设备 AOT 算子库。
 
 ```text
 MODEL_DIR/
@@ -12,33 +12,30 @@ MODEL_DIR/
   cache/cpu/                         # 可选 CPU 查表数据
   cache/packages/<sha256>/
     package.json
-    lib/model.so
-    lib/bindings.rs, lib/BUILD.txt    # 生成模块的对应源码与重建方法
-    assets.safetensors               # 或独立 cubin/source/host ABI 文件
+    bindings.json                    # 因子化的调用绑定
+    assets.safetensors               # cubin、生成源码和 host ABI
     LICENSE
 ```
 
-`model.json` schema 1 的 `execution_package` 固定整个包。共享缓存位于 `~/.cache/orinfer/packages`，可通过 `ORINFER_EXECUTION_CACHE` 覆盖。包 schema 1 / runtime ABI 1 描述目标 SM87、架构与计算策略、支持的配置、buffer 契约、kernel ABI 和 `.so` 身份。包自身通过 `describe` 返回身份及能力，运行时与 manifest 交叉检查。部署包以内容摘要固定；公共 ABI 的兼容性与源码组织分别管理。破坏协议兼容性的变化必须更新 ABI。
+`cache/model.json` 使用 schema 1，`execution_package` 记录对应 `package.json` 的 SHA256。`package.json` 使用 schema 2，记录目标、架构、计算策略、配置签名、buffer 契约、batch/prefill profiles、catalog 和 `bindings.json` 的文件身份。默认共享缓存为 `~/.cache/orinfer/packages`，可通过 `ORINFER_EXECUTION_CACHE` 覆盖。
 
-`.so` 的运行依赖限定为 `orinfer-model-sdk`。入口 `orinfer_model_v1` 返回 C 函数表，包含 describe/create/batch/visual 和对应资源释放函数。完整 C 声明位于 [`orinfer_model.h`](../crates/orinfer-model-sdk/include/orinfer_model.h)。跨动态库边界统一传递 C 兼容数据。
+`catalog` 保存共享资产、编译实现定义和动态行数 launch 模板。定义包含 cubin、生成源码、host ABI、symbol、block、shared memory、cooperative、参数类型顺序及只读契约。同一 cubin 可对应多个 ABI/launch 契约，定义去重须比较完整契约。
 
-包内 `catalog` 保存共享资产、编译实现定义和动态行数 launch 模板。定义包含 cubin/source/host ABI 索引、symbol、block、shared memory、cooperative、实际参数类型顺序及只读契约。层号、权重名、逐层参数、grid 及完整执行程序由原生模型库提供。同一 cubin 可对应多个 ABI/launch 契约，定义去重须比较完整契约。
+`bindings.json` 保存因子化的张量角色、共享调用模板、逐层参数和特化选择。离线构建检查绑定展开后的实参、字节偏移、标量位模式和动态 launch。在线引擎读取绑定及 catalog 并检查配置签名、buffer dtype/shape/layout 和边界，由静态链接的适配器组装执行计划。
 
-离线编译得到的参数映射编译为 `.so` 内的 Rust 张量角色表、共享调用模板、逐层参数表和去重特化选择表；该映射只记录实现与存储角色，执行顺序和融合仍由注册的 Rust 模型适配器生成。目录与映射分别固定身份，交换实现、参数类型、偏移或动态 launch 后必须重新构建匹配的库。运行时在 Rust 中校验目录身份、buffer dtype/shape/layout 和边界，并直接执行已编译的包。
-
-同类层共享调用模板和特化表，每层仅提供层号、权重、状态、workspace 角色及必要标量。模板实例化严格保留实参顺序、slice 偏移、标量位模式、grid 和动态 launch 契约；计算与精度由显式契约确定。独立 continuation 参数查找直接查询模板。此因子分解在发布时逐条做精确往返校验，适用于两种模型适配器。
+同类层共享调用模板和特化表，每层提供权重、状态、workspace 角色及必要标量。独立 continuation 参数直接查询模板。
 
 Flash Next 的 HC 无损缓存指数和 QSA radix shift 通过已有 ABI 的整数标量绑定，共享相同计算实现；独立请求的 QSA 复用同一私有状态包装器。QSA 条带数离线测量选择。相邻行数区间仅在全部实参、资产及动态 launch 契约相同时合并。整数投影的固定行数和动态行数使用相同模板与候选空间，动态回退在多个实际行数上测量，选择结果随编译器、设备和源码身份失效；发布包仅包含离线选中的实现。
 
-在线创建只导出最终程序、全部局部特化候选和专家常驻契约引用的绑定；融合前的输入保留在离线构建契约中。`plan-model` 和 `validate-model` 通过内部创建参数 `build_bindings` 保留完整构建契约，供离线重建、完整资产校验和诊断。该参数保持 schema 1 与 C ABI 1；运行时的实际逐层执行节点仍需实例化，CUDA Graph replay 直接执行已捕获的程序。
+正常加载保留最终程序、局部特化和专家常驻契约引用的 kernel。`plan-model` 和 `validate-model` 保留完整构建契约，供重建和诊断。CUDA Graph replay 直接执行已捕获的程序。
 
-动态 launch 的全行数验证只在离线构建使用的 `plan-model` 和 `validate-model` 执行，相同容量和表达式只验证一次。正常加载检查每个绑定的参数类型和容量 ABI；实际 launch 继续检查真实行数、算术溢出、除零和非零 grid，行数穷举检查限定在离线验证。该行为由引擎实现，现有执行包可直接复用。
+动态 launch 的全行数验证只在离线构建使用的 `plan-model` 和 `validate-model` 执行，相同容量和表达式只验证一次。正常加载检查每个绑定的参数类型和容量 ABI；实际 launch 继续检查真实行数、算术溢出、除零和非零 grid，行数穷举检查限定在离线验证。
 
 Qwen MTP 执行包可声明 `mtp.packet_table`，将验证、提交、草稿、接受后补算和草稿输出中的请求私有操作数放入固定地址表。包装保持原 kernel 的计算体、grid、标量与共享 workspace 字节视图；Rust 每轮更新当前请求地址，完整 packet Graph 按执行阶段和实际执行形状跨请求复用。提交的缓存行数按请求数计，命中仍要求实际 kernel、grid 和标量一致；验证与补算保留各段实际长度、动态参数和混合角色边界。单请求沿用相同 packet；未声明该契约的包继续使用原有执行方式。启用该能力需重新构建匹配的模型数据与执行包，并验证改变输入、替换请求和 Graph replay 后的全部私有状态。
 
 原生 Qwen 构建入口自动生成该地址表。已有 dense Qwen 执行包采用 sequential prefill、dense decode GDN 且尚无地址表时，可通过 `python/orinfer_build/models/qwen35/rebuild_mtp.py --model 原模型目录 --target 新模型目录` 增量构建，保留原权重与矩阵实现。该入口由 `bash tools/environments/cuda/run.sh python/orinfer_build/models/qwen35/rebuild_mtp.py 输出目录` 调用，并在末尾传入上述模型参数；发布前验证模型计划与实际 host ABI。
 
-地址表的列序、kernel 映射及标量映射作为共享的不可变描述保存，逐轮复制 MTP 策略时只复制其引用。实际请求地址每轮独立刷新，JSON 格式和 C ABI 保持不变。
+地址表的列序、kernel 映射及标量映射作为共享的不可变描述保存，逐轮复制 MTP 策略时只复制其引用。实际请求地址每轮独立刷新。
 
 启动预加载选择实际 packet 使用的私有 kernel 和拷贝实现，并在权重读取的等待间隙由同一 CUDA worker 完成；已完成的读取优先上传，输入槽复用仍等待对应 DMA。
 
@@ -46,11 +43,11 @@ Qwen MTP 执行包可声明 `mtp.packet_table`，将验证、提交、草稿、�
 
 完整 packet Graph 缓存最多保留 16 个条目，并与共享片段一起遵守 12288 个节点预算；满额时淘汰最久未使用的完整图。阶段切换后，连续执行的新形状逐步替换旧形状，历史累计命中次数不参与淘汰。
 
-创建时用 JSON 传递配置、数据契约与小型编译目录。独立入口 `orinfer_model_plans_v1` 用 C 数组导出生成的 kernel 参数绑定和 kernel/copy/zero 程序；主 `orinfer_model_v1` 表保持 ABI 1。导出接口显式声明表及记录大小，数组、字符串和嵌套参数由同一个 owner 管理并释放。逐层绑定和完整程序通过原生 C 数组直接导出。动态 batch 热路径继续使用 C 数组，一次返回指令、buffer views、动态 launch 参数和请求状态绑定。原生内存由分配方释放，库保持加载直到模型及 CUDA 资源释放完成。模型实例与 GPU 执行线程绑定。
+模型适配器以 Rust 类型向引擎提供指令、buffer views、动态 launch 参数和请求状态绑定。动态 batch 复用已缓存的计划，并按本轮 owner 绑定请求状态。模型实例与设备执行线程绑定。
 
-有限专家常驻模式通过创建请求的 `expert_contracts` 选择更完整的原生绑定契约。模型库返回 `expert_banks`：专家数、按专家连续存储的张量，以及消费 kernel 的 I32 路由计数参数位置。核心按实际绑定读取计数，按模型契约声明的几何管理全局 SLRU 和 CUDA VMM 页。默认全量常驻从原生模型库获取计划所需的验证契约。
+有限专家常驻模式使用适配器返回的 `expert_banks`，其中包含专家数、按专家连续存储的张量，以及消费 kernel 的 I32 路由计数位置。引擎按实际绑定读取计数，并按模型契约管理全局 SLRU 和 CUDA VMM 页。默认全量常驻使用执行计划所需的绑定。
 
-模型可声明 hash 固定的 `input_assets`，通过独立可选入口 `orinfer_model_inputs_v1` 接收执行程序名、当前 token 和请求历史，返回命名 buffer 的上传数据；原有 ABI v1 函数表保持兼容。核心校验访问权限与上传范围，并在库释放数据前完成上传。Flash Next 在包内完成 CPU W8 embedding／E8P PLE 查表，有预算的行缓存共享，n-gram 历史从请求提供。CPU 资产随模型克隆和执行包更新一起保留。主模型、验证和 shifted draft 输入由模型包区分，架构专属输入分派由模型包注册。
+模型可声明以 SHA256 固定的 `input_assets`。适配器根据程序、当前 token 和请求历史准备命名 buffer 的上传数据，引擎校验访问权限与上传范围。Flash Next 在 CPU 执行 W8 embedding／E8P PLE 查表，多个请求共享有预算的行缓存，各请求提供自己的 n-gram 历史。
 
 MTP 的验证计划可声明始终提交紧凑 recurrent 更新，也可提供 draft 分支的保存/恢复程序；调度器在提出草稿前保存、刷新已提交前缀前恢复。Flash Next 使用这些通用接口保留 GDN、卷积、PLE、HC 和 QSA pending/index 的完整状态。
 
@@ -60,9 +57,9 @@ CUDA context、stream 和显存统一由引擎管理。包声明执行程序，�
 
 ### 设备后端边界
 
-`orinfer-device` 定义后端、主机 ABI、设备架构、Graph 策略、逻辑内存区间及会话归属，不加载设备驱动。`orinfer-engine/src/backend/executor.rs` 是共享运行时的执行入口；CUDA 的 context、stream、VMM、Graph、kernel 和传输实现位于 `backend/cuda/`。生成、embedding 和 rerank 使用同一个入口，设备句柄留在后端内部。
+`orinfer-device` 定义后端、主机 ABI、设备架构、Graph 策略、逻辑内存区间及会话归属。CUDA 的 context、stream、VMM、Graph、kernel 和传输实现位于 `orinfer-engine/src/backend/cuda/`。生成、embedding 和 rerank 复用 CUDA 执行器，设备句柄由后端管理。
 
-包的 `target` 决定后端和主机 ABI：原有 `sm_87` 对应 aarch64/CUDA，`ascend910b` 对应 aarch64/Ascend，`ascend910b-x86_64` 对应 x86_64/Ascend。安装时静态检查 ELF 与声明的主机匹配；加载原生模型库前检查当前主机。模型架构及 `compute_policy` 保持独立，Ascend 目标本身不表示已有 DeepSeek 或 W4A8 模型实现。
+`target` 声明设备和主机 ABI。`sm_87` 对应 aarch64/CUDA，`ascend910b` 和 `ascend910b-x86_64` 分别对应 aarch64 和 x86_64 Ascend。DSv4.1 原生计划使用独立的 Ascend AOT 接口，安装时检查算子库的 ELF 与主机契约。
 
 现有 CUDA catalog 保留原字段和 JSON 形式。Ascend 定义使用 `launch: {"backend":"ascend","block_dim":24,"workspace_bytes":8192}`，tiling 数据沿显式参数 ABI 传递。Ascend 定义中 CUDA 的 grid/block/shared/cooperative 必须省略或为零/false；混用后端或几何字段会在校验阶段失败。动态行 launch 和 Graph 的具体实现仍由对应设备后端提供。
 
@@ -76,7 +73,7 @@ orinfer devices --backend ascend
 ORINFER_ASCEND_LIBRARY=/path/to/libascendcl.so orinfer devices --backend ascend
 ```
 
-Ascend 探测共享进程内 ACL 初始化，读取卡数与 SoC，不分配设备内存或执行 kernel。最后一个会话、buffer、图和完成事件释放后才结束本进程持有的初始化。输出中的 `api_symbols` 仅表示当前库存在对应入口，芯片能力需要实际验证。`model_execution_available` 表示已注册实验性 DSv4.1 原生 provider；服务范围见下文。现有 CUDA 执行包 schema 1、C ABI v1、`--cuda-graph` 和统计字段保留；`--graph` 是相同参数的别名。
+Ascend 探测共享进程内 ACL 初始化，读取卡数与 SoC，不分配设备内存或执行 kernel。最后一个会话、buffer、图和完成事件释放后才结束本进程持有的初始化。输出中的 `api_symbols` 仅表示当前库存在对应入口，芯片能力需要实际验证。`model_execution_available` 表示已注册实验性 DSv4.1 原生 provider；服务范围见下文。`--graph` 是 `--cuda-graph` 的别名。
 
 原生设备资源位于 `backend/ascend/runtime.rs`：每会话独占 context、compute/transfer stream，显存与 pinned 内存受独立预算约束；异步提交持有 buffer、主机副本和原生算子资源直到事件完成。跨流等待也持有源事件。完成确认失败时隔离仍可能被 DMA 使用的存储和 context，避免提前释放；释放资源只销毁所属 context，不重置整卡。Ascend 数字错误码进入统一错误分类，执行失败会使 worker 退出而非按普通请求错误继续服务。
 
@@ -154,7 +151,7 @@ flock -w 5 artifacts/gpu-experiment.lock orinfer validate-ascend-kernels \
 
 离线编译显式选择 NPU storage rewrite，编译器身份记录 `storage_rewrite=explicit-npu-v1`。固定版本编译器原本根据容器中的设备可见性选择存储复用，在无卡编译时可能让循环临时 KV 覆盖仍存活的 query/累积状态。显式目标配置使无卡编译和板上编译使用相同的 NPU 存储规则；无卡生成的产物需经过上述板上验收。
 
-AOT 算子描述是独立的验收/编译格式，现有模型包与模型 C ABI 保持原版本。验收比较四组改变输入的结果，其中两组使用 Rust 原生 Graph replay；INT8 输出、行搬运和 ring 提交逐字节对照。FP32 敏感投影与 mHC 点积使用独立的 FP64 参考，再舍入到 FP32，避免 CPU BLAS 的累加顺序影响判断。C2 先读取上次残余再单独提交最后 32 个已接受位置，metadata 明确传递请求页、前驱行、位置和提交边界。完整模型绑定与分布式单流由下述实验入口执行；prefix 快照恢复和 AgentX 并发性能仍需接入。
+AOT 算子描述使用独立的验收和编译格式。验收比较四组改变输入的结果，其中两组使用 Rust 原生 Graph replay；INT8 输出、行搬运和 ring 提交逐字节对照。FP32 敏感投影与 mHC 点积使用独立的 FP64 参考，再舍入到 FP32，避免 CPU BLAS 的累加顺序影响判断。C2 先读取上次残余再单独提交最后 32 个已接受位置，metadata 明确传递请求页、前驱行、位置和提交边界。完整模型绑定与分布式单流由下述实验入口执行；prefix 快照恢复和 AgentX 并发性能仍需接入。
 
 `backend/ascend/hccl.rs` 提供原生 AllReduce SUM、AllGather、ReduceScatter SUM、变长 AlltoAllV 和异步错误检查。Bootstrap 在指定会话的 context 内生成，opaque root bytes 可传给其他 rank 进程。通信与计算使用同一 compute stream 顺序，完成事件持有 communicator、buffer 和 host count arrays；空 peer 计数和重复调用仍保持所有 rank 的共同 collective 顺序。调用者在 step 边界检查异步通信错误。
 
@@ -183,7 +180,7 @@ CPU 验收读取真实表的小批量行，检查所有 token 分块边界的 ha
 
 `backend/ascend/model/` 提供 DSv4.1 Flash-1017 原始 W4A8 checkpoint 的实验性单流执行入口 `bench-ascend`。八个 Rust worker 各持有独立 ACL context，以 TP8 执行 attention、每卡 48 个专家执行 MoE，并通过 HCCL 合并结果。执行计划包含全部 40 层、Engram CPU 行查找、C2/C1 缓存、索引 TopK 与输出头。W4 grouped matmul 保留 ACLNN，其余设备计算从 TileLang AOT 库加载；连续 TileLang、W4 和 HCCL 调用共同捕获为 ACL Graph，按原执行顺序复用同一 W4 workspace。设置 `ORINFER_A2_W4_NO_CAPTURE=1` 可单独提交 W4，供诊断使用。
 
-该入口使用独立的实验计划描述，公共模型包 schema 1 和 C ABI v1 保持原样；公共服务通过下述实验性原生 provider 接入。当前上下文容量限定为 128–16384，须为 32 的倍数；默认 8448，覆盖 8K 输入和 128 个输出。此范围内候选块覆盖完整历史。prefill 使用容量有界的动态行模板，`--prefill-capacity` 默认 16，支持 2–4096，且不超过上下文容量。单行 decode 复用独立 AOT；prefill 根据剩余长度和共享 `PrefillPlan` 契约选择真实块长，尾块保持真实长度。请求间清空历史和残余压缩状态，通过因果索引隔离旧 KV。prefix 复用、并发调度及 MTP 需要后续接入。
+该入口读取独立的实验计划描述。公共服务通过下述 DSv4.1 原生 provider 接入。当前上下文容量限定为 128–16384，须为 32 的倍数；默认 8448，覆盖 8K 输入和 128 个输出。此范围内候选块覆盖完整历史。prefill 使用容量有界的动态行模板，`--prefill-capacity` 默认 16，支持 2–4096，且不超过上下文容量。单行 decode 复用独立 AOT；prefill 根据剩余长度和共享 `PrefillPlan` 契约选择真实块长，尾块保持真实长度。请求间清空历史和残余压缩状态，通过因果索引隔离旧 KV。prefix 复用、并发调度及 MTP 需要后续接入。
 
 动态 AOT 的指针表 ABI v2 显式传递真实 token 行数；operand 描述保存容量几何，库内外同时固定容量和物理 grid 上限。专家算子保留 `6*m` 等行数倍率，各 kernel 使用同一个有界行标量。编译器将逻辑 grid 映射到有限物理块上的循环；显式 Cube/Vector 计算体拆成同一库内的两个 stream 有序阶段，阶段间通过原 workspace 传递结果。通信长度、W4 tensor 视图和输出头末行随真实块长绑定。新行数的 Graph 注册在请求 reset 之前完成；每个 Graph 保留不可变的行数、库与全部 operand。因果索引在设备上从位置生成。
 
@@ -212,7 +209,7 @@ HCCL_DETERMINISTIC=true HCCL_OP_EXPANSION_MODE=AIV HCCL_NPU_SOCKET_PORT_RANGE=au
   --inputs artifacts/ascend-inputs.json --output-tokens 128 --repeats 3
 ```
 
-大块 prefill 在构建时增加 `--strategy optimized --prefill-capacity 2048`。整数/BF16 投影可从同一模板离线测量多个真实长度，复用公共候选构建、Graph 测量及汇总选择，只替换每种几何的一个动态 fallback；decode AOT 保留原绑定：
+大块 prefill 在构建时增加 `--prefill-capacity 2048`。整数/BF16 投影可从同一模板离线测量多个真实长度，复用公共候选构建、Graph 测量及汇总选择，只替换每种几何的一个动态 fallback；decode AOT 保留原绑定：
 
 ```bash
 bash tools/environments/ascend/run.sh python3 -m tests.ascend.operators.validate_rows \
@@ -530,7 +527,7 @@ uv run --locked python -m orinfer_build.models.deepseek_v41.decoder_rows \
 
 八卡 910B3 的单流验收使用进程环境变量 `HCCL_OP_EXPANSION_MODE=AIV` 选择通信展开方式；先运行 `HCCL_OP_EXPANSION_MODE=AIV orinfer validate-hccl --devices 0,1,2,3,4,5,6,7` 验证目标设备，再以相同环境启动模型测量。
 
-构建参数 `--strategy optimized` 启用单流优化计划：decode 使用 Cube QK/PV 与 FP32 masked softmax；共享专家按 TP8 离线分片，down 投影保留实际 K288；Engram WKV 投影按输出列分片并 AllGather；HC 参数、Q/KV 与共享／路由专家通过嵌套 Graph 分支重叠；mHC post／下一次 pre 和量化行／scale gather 分别融合。`prepare` 同时生成共享专家 bank，在线直接读取物理文件。`--strategy baseline` 保留串行参考计划。优化计划的 attention 概率使用 BF16，共享专家使用分片激活 scale 和跨卡归约，需要独立质量验收。
+单流构建默认生成优化计划。Decode 使用 Cube QK/PV 与 FP32 masked softmax；共享专家按 TP8 离线分片，down 投影保留实际 K288；Engram WKV 投影按输出列分片并 AllGather；HC 参数、Q/KV 与共享／路由专家通过嵌套 Graph 分支重叠；mHC post／下一次 pre 和量化行／scale gather 分别融合。`prepare` 同时生成共享专家 bank，在线直接读取物理文件。优化计划的 attention 概率使用 BF16，共享专家使用分片激活 scale 和跨卡归约，需要独立质量验收。
 
 Graph 分支在捕获前校验实际 buffer 字节范围的读写依赖，禁止并行分支写入重叠视图，HCCL 保持在主分支。每个 fork／join 使用独立的捕获事件，Graph 持有辅助 stream、事件、通信组和所有算子资源；改变输入后的重放属于原生验收。
 
@@ -641,33 +638,23 @@ uv run --locked python -m orinfer_build.models.deepseek_v41.draft_calibration ex
 
 - `crates/orinfer-engine`：通用运行设施。
 - `crates/orinfer-device`：无驱动依赖的设备及执行契约。
-- `crates/orinfer-model-sdk`：计划、状态和原生 C ABI 契约。
+- `crates/orinfer-model-sdk` 保存 Rust 计划、状态和执行包数据契约。
 - `crates/orinfer-models`：模型适配器、独立的精度策略选择和注册表。
 - `kernels/`：可复用的 TileLang 算子与融合实现。
 - `tools/`：离线编译、权重准备、组装与验证。
 
 适配器描述架构语义与执行组合，策略决定可用精度路径；同一策略可被多个适配器支持，融合可以跨执行组件边界。架构/策略组合完成验证后注册。部署时只绑定模型配置实际需要的 kernel 资产。
 
-```bash
-make build
-# 或仅构建原生模型库：
-cargo build --release --locked --offline -p orinfer-models
-```
+`make build` 构建静态链接模型适配器的引擎。离线构建器用 Python 和 TileLang 生成匹配的设备资产，发布时将展开后的参数映射写成 `bindings.json`。构建执行包可复用已有引擎检查执行计划。
 
-该产物提供注册的模型逻辑；可部署库还需要离线构建工具生成匹配当前 kernel ABI 和物理 tensor 角色的绑定模块。发布器通过 `ORINFER_BINDINGS_SOURCE` 编译该模块，原生库的链接依赖限定为 SDK；结果位于包的 `lib/model.so`。包同时保存生成的 `lib/bindings.rs` 和 `lib/BUILD.txt`，与发行版内的 workspace 源码及 Cargo.lock 一起用于重建该库；在线执行使用编译后的原生库。
-
-在保留权重和 cubin 的情况下，重建原生库和目录：
+在保留权重和 cubin 的情况下，可重新生成执行包的数据描述：
 
 ```bash
 uv run --locked python -m orinfer_build.contracts.catalog \
   --model /path/to/prepared-model --output /path/to/rebuilt-model
 ```
 
-工具需要项目固定 Rust 工具链及已缓存的 Cargo 依赖，使用 `--locked --offline` 构建；同文件系统的不可变权重通过 hardlink 复用，模型描述和 `.so` 使用独立文件。构建输出经加载器验证后原子发布到新目录，源目录保持原样。普通在线启动直接使用已发布的二进制包。
-
-`orinfer_build.packaging.attach_execution` 要求替换库与原包具有**相同绑定注册表和目录身份**，并在替换前校验这些条件。更新注册模型逻辑后优先使用上述重建工具。
-
-在线数据与包统一使用 schema 1、`catalog` 及原生绑定导出接口。离线构建输入仍可包含展开的 bindings，用于精确对照与生成 Rust 模块。
+同文件系统的不可变权重通过 hardlink 复用，模型描述与绑定写入独立文件。构建输出经加载器校验后原子发布。`orinfer_build.packaging.attach_execution` 校验替换包的 digest、架构和计算策略，发布时再验证模型与包的兼容性。
 
 ## 安装执行包
 
@@ -680,11 +667,11 @@ orinfer plan-model /path/to/new-model
 orinfer validate-model /path/to/new-model
 ```
 
-安装器按文件内容识别 `.tar.xz` 和旧 `.tar.gz`，校验 package digest、schema/ABI、设备目标、目标主机的 ELF 库和全部独立／safetensors 内嵌 kernel 资产的 SHA256；安装期间对库文件做静态校验。路径越界、链接和重复归档成员被拒绝，全部校验成功才原子写入缓存，失败清理临时目录，已安装的同 digest 包保持原样。解压与校验只发生在安装时，后续启动直接读取已安装的资产。
+安装器按文件内容识别 `.tar.xz` 和 `.tar.gz`。CUDA 安装校验包 digest、schema、设备目标、绑定和 safetensors 资产的 SHA256，并穷举验证动态行数。Ascend 安装校验原生计划与 AOT 资产。路径越界、链接和重复归档成员会被拒绝。全部校验通过后原子写入缓存，失败时清理临时目录。
 
 默认安装位置与运行时一致：优先 `ORINFER_EXECUTION_CACHE`，其次 `$XDG_CACHE_HOME/orinfer/packages`，最后 `~/.cache/orinfer/packages`。`--cache /path/to/packages` 只改变本次安装位置；自定义位置需要同时为后续运行设置 `ORINFER_EXECUTION_CACHE`。
 
-`plan-model` 会在 CPU 加载原生执行库并生成计划；`validate-model` 还完整校验权重、CPU 表和全部 kernel 文件，均在 CPU 上执行。在线启动检查配置签名、原生 ABI、权重和 CPU 表的结构，不计算资产内容 SHA256；完整内容校验使用独立的 `validate-model`。CUDA 保留 `--verify-weights` 作为显式启动校验选项。JSON 创建请求的可选 `verify_weights` 字段由模型库处理 CPU 表，C ABI v1 和 schema 1 保持兼容；更新执行库后即可使用新的 CPU 表加载行为。
+`plan-model` 在 CPU 上通过 Rust 适配器展开计划，验证完整动态行数域及 Graph 分支。`validate-model` 还校验权重、CPU 表、前端、绑定和设备资产的内容。CUDA 默认在线检查配置签名、绑定、kernel ABI、权重和 CPU 表结构，跳过内容哈希；`--verify-weights` 显式开启加载校验。
 
 ### 安装已发布的 v0.1.3
 
@@ -726,13 +713,13 @@ orinfer validate-model /path/to/published-model
 
 输出目录及 Hugging Face、ModelScope 模型仓库保存配置、tokenizer、模型描述、GPU 权重与 CPU 表；匹配执行包通过 GitHub Release 独立发行，先安装到公共执行缓存再加载模型。模型描述中的 `execution_package` 固定对应包 digest，重打包保持该 digest。
 
-包内 `assets.safetensors` 用具名 U8 tensor 收纳 cubin、生成源码与 host ABI，去重字节相同的资产。schema 1 的文件身份可带 `tensor` 字段，SHA256 校验对应 tensor 的原始字节；原生 `.so` 保持独立文件。引擎复用 bundle 的 mmap 和头部索引，直接从 bundle 读取具名资产；CUDA 模块仍分别加载。此布局需要支持具名资产的引擎版本。
+CUDA 的 `assets.safetensors` 用具名 U8 tensor 收纳 cubin、生成源码与 host ABI，去重字节相同的资产。catalog 的资产身份通过 `tensor` 字段绑定对应 tensor 的原始字节。引擎复用 bundle 的 mmap 和头部索引，并按 kernel 加载 CUDA 模块。
 
-执行包单独归档和安装，模型通过 `execution_package` digest 在共享缓存中找到它。合并用于最终发布。离线调优工具通过 `plan-model` 从 Rust 库读取当前绑定，在编译阶段展开和修改，再重新生成原生模块及目录；在线格式保持一致。
+执行包单独归档和安装。离线调优工具通过 `plan-model` 读取展开后的执行契约，完成编译和测量后再发布更新的绑定与 catalog。
 
 ## 验证
 
-`make check` 统一执行引擎、SDK 及模型 crate 的格式、clippy、单元测试，同时覆盖 C ABI 跨语言加载、错误拒绝和更新原子性。更新还应比较完整程序、launch 参数、buffer 与状态契约；GPU 验证需要匹配模型权重，覆盖请求状态、graph 输入变化、prefix 恢复及 MTP 分支。
+`make check` 统一执行引擎、SDK 及模型 crate 的格式、clippy、单元测试，同时覆盖绑定展开、包校验与安装原子性。更新还应比较完整程序、launch 参数、buffer 与状态契约；GPU 验证需要匹配模型权重，覆盖请求状态、graph 输入变化、prefix 恢复及 MTP 分支。
 
 通用加载链的 GPU 夹具可独立运行：
 
@@ -785,7 +772,7 @@ A2 Graph 按 packet family、真实总行数、decoder 行数、输出数及 own
 
 `--length-input` 让同一索引 Cube 工厂读取每行的有效前缀长度，按 owner 内单调递增的位置决定实际 key tile 数，写入有效 score 前缀。TopK 使用相同长度屏蔽其余容量，完整有效候选与原有归约顺序保持一致。此模式以长度向量替代稠密因果索引矩阵，同时适用于 decode 和 prefill。`--gather-slots` 选择同一 INT8 gather 工厂每次转换的槽位数。可重复提供 `--reuse-cache /path/to/compiled/cache`，复用完整编译对象；编译器仍校验对象身份和库哈希。
 
-原生服务支持 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样、prefix 恢复及匹配执行包的 DSpark。声明 `metadata.chat_format=deepseek_v41` 的前端支持函数工具、工具结果回传、并行调用、增量参数和 thinking 历史。包含原生视觉程序及对应视觉权重的包支持单图、多图与带图片的工具交互；纯文本包收到图片时返回不支持错误。prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的原生计划封装。`package install` 在 CPU 上校验并原子安装执行包；`validate-model` 另行校验配置、前端和全部发布权重分片，分片内容依据 `release-manifest.json` 每个文件扫描一次。正常服务加载不计算资产内容 SHA256。A2 模型通过原生 provider 接入公共运行时，模型计划尚未迁移到通用模型 cdylib C ABI。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
+原生服务支持 system/user/developer/assistant 消息、连续 batch、流式与非流式生成、采样、prefix 恢复及匹配执行包的 DSpark。声明 `metadata.chat_format=deepseek_v41` 的前端支持函数工具、工具结果回传、并行调用、增量参数和 thinking 历史。包含原生视觉程序及对应视觉权重的包支持单图、多图与带图片的工具交互；纯文本包收到图片时返回不支持错误。prompt lookup、有限专家常驻及 `--verify-weights` 返回不支持错误。服务目录采用 schema 1 的原生计划封装。`package install` 在 CPU 上校验并原子安装执行包；`validate-model` 另行校验配置、前端和全部发布权重分片，分片内容依据 `release-manifest.json` 每个文件扫描一次。正常服务加载不计算资产内容 SHA256。A2 模型通过内建原生 provider 接入公共运行时。默认 HCCL 用于性能；`HCCL_DETERMINISTIC=strict` 用于逐值相等的独立状态诊断。状态恢复检查与官方 BF16／FP8 质量验收分别记录。
 
 DSv4.1 视觉的权重、Q/K、残差和 aligner 保持 BF16；softmax 使用 FP32，概率按当前前缀归一化后以 FP16 执行 PV，并以 FP32 累加、BF16 输出。V 先保留原始 BF16 边界，再转为 FP16；离线导出及构建依据实际 checkpoint 的 RMSNorm 和 QKV 权重证明幅值范围，超出范围时拒绝构建。同一套动态 TileLang 算子处理实际 patch 数和非对齐尾部。图缓存复用稳定输入地址；网格及二维 RoPE 由实际长宽更新。请求间将图片分配到现有 rank 并行编码，各请求的图片顺序、绝对 token 位置和视觉路由 bias 保持独立。有活动 decode 时，编码器依据实测 patch 成本和输出延迟预算合并离线声明的层段，再让出执行机会；没有 decode 时连续执行剩余层段。同一组算子和稳定地址同时用于完整执行及分段 Graph replay。冷图片按可并行编码的 rank 数组成准入批次，owner 数、显存及 decode 剩余时间仍共同约束准入。特征完成后按图片内容身份绑定请求，取消和 owner 复用不会安装旧请求的图片；关闭特征缓存时同样保留已完成的请求私有特征。prefix 身份同时包含图片内容与网格，替换图片不会复用旧图的 KV。每张图片至多 1024 个视觉 token。原生 A2 的请求图片历史按模型上下文校验，单图 encoder 容量与历史总量分开；运行时将已有包的历史总量声明提升到上下文容量，保留原算子和物理 workspace。编码只准备当前 prefill 范围内的图片，图片行消费后释放对应 owner 的特征；`image_processing` 可进一步限制图片数、像素、固定单图及合计 token 预算。
 

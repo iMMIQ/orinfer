@@ -1802,6 +1802,7 @@ dependencies = [
  "memmap2",
  "orinfer-device",
  "orinfer-model-sdk",
+ "orinfer-models",
  "rayon",
  "realfft",
  "safetensors",

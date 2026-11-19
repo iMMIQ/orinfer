@@ -1,5 +1,4 @@
-//! Shared data contracts and versioned C ABI for independently built model packages.
-pub mod abi;
+//! Shared model data and execution contracts.
 pub mod architecture;
 pub mod artifact;
 pub mod catalog;

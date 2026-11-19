@@ -144,7 +144,7 @@ def reuse_prepared_draft(model, old_ranks):
 def builder_class(block_size=DEFAULT_BLOCK):
     validate_block_size(block_size)
     # TileLang/Torch belong to the offline Ascend compiler environment.
-    from orinfer_build.models.deepseek_v41.build import Builder, Strategy
+    from orinfer_build.models.deepseek_v41.build import Builder, PrefillOptions
     from kernels.ascend import attention_cube, kv_int8, memory, model_ops, topk, vector
 
     class Draft(Builder):
@@ -404,7 +404,7 @@ def builder_class(block_size=DEFAULT_BLOCK):
             self.draft_output = dict(input_ids=ids, confidence=confidence, logits=proposals)
             return tokens, values
 
-    return Draft, Strategy
+    return Draft, PrefillOptions
 
 
 def compile_source(model, builders, tasks, root, name, workers, owners, rows, compiler=None):
@@ -521,13 +521,8 @@ def _build(base_plan, checkpoint, output, workers, compiler, base_model, block_s
 
         resize(target, root, HISTORY_ROWS, compiler)
         remove_draft(target)
-    Draft, Strategy = builder_class(block_size)
-    strategy = Strategy(
-        shared_tp=True,
-        cube_attention=True,
-        parallel=True,
-        fusion=True,
-        prefill=True,
+    Draft, PrefillOptions = builder_class(block_size)
+    prefill = PrefillOptions(
         parallel_regroup=True,
         batched_rope=True,
         active_expert_rows=True,
@@ -551,9 +546,7 @@ def _build(base_plan, checkpoint, output, workers, compiler, base_model, block_s
         model["capacity"] = 128 if name == "draft" else target["capacity"]
         model["ranks"], builders, kernels = [], [], {}
         for rank in range(8):
-            b = Draft(
-                root, rank, model["capacity"], kernels, strategy=strategy, model_dir=checkpoint
-            )
+            b = Draft(root, rank, model["capacity"], kernels, prefill=prefill, model_dir=checkpoint)
             if name == "draft":
                 packet = b.packet(rows, dynamic=True)
                 packet["coordinates"]["draft_swa_storage_rows"] = HISTORY_ROWS

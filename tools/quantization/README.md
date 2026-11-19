@@ -37,7 +37,7 @@ bash tools/environments/cuda/run.sh python/orinfer_build/quantization/check_e8p_
 
 Flash Next 的固定来源转换、PLE、非专家权重准备和原始 BF16 teacher 见[模型构建](../model/flash_next/README.md)。
 
-`row_q4.py` 与 `row_q4_gpu.py` 实现当前标量 Q4 组件，码表为 `±(3,10,19,31,46,67,93,127)`。`qwen35.py` 为 27B 分块准备标量 Q4、W8 例外及原始张量；两级 E8P 编码与 beam8 优化由 `qwen_e8p.py` 完成。27B E8P 部署向[原生构建器](../model/qwen35/README.md)提供完成两级编码的 checkpoint。
+`row_q4.py` 与 `row_q4_gpu.py` 实现当前标量 Q4 组件，码表为 `±(3,10,19,31,46,67,93,127)`。`qwen_e8p.py` 为 27B 分块准备两级 E8P、W8 例外及原始张量，并执行 beam8 优化。27B E8P 部署向[原生构建器](../model/qwen35/README.md)提供完成两级编码的 checkpoint。
 
 源信息需包含固定的 repository/revision、配置和 safetensors 索引。远端权重可按字节范围读取；已下载分片通过 `--source-dir` 复用。准备工具核对来源、编码实现、seed 和已完成分块，仅复用来源、身份及完整性均匹配的产物。
 

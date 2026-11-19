@@ -13,7 +13,6 @@ mod generation;
 #[cfg(test)]
 #[path = "../mtp_gpu_tests.rs"]
 mod mtp_gpu_tests;
-mod prefill_cost;
 mod prefix;
 #[cfg(test)]
 mod reference_generation;
@@ -37,7 +36,7 @@ pub(crate) struct ModelRuntime {
     host_kv_pool: crate::backend::kv::host::HostPool,
     pub(crate) prefix_statistics: crate::prefix::Statistics,
     pub(crate) prefix_hints: Vec<usize>,
-    prefill_costs: prefill_cost::Costs,
+    prefill_costs: crate::scheduler::prefill::Profiles,
     owner_id: u64,
     abandoned: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     reserved_requests: std::collections::BTreeMap<usize, requests::Reservation>,
@@ -52,7 +51,7 @@ pub(crate) struct ModelRuntime {
     dynamic_speculation: requests::speculation::control::Controller,
     prompt_lookup: bool,
     startup_costs: std::collections::BTreeMap<(usize, usize, bool), crate::scheduler::Estimate>,
-    model_package: crate::model_package::ModelPackage,
+    batch_plans: crate::batch_plan::BatchPlanCache,
     request_hidden_ring: Option<String>,
     idle_admission_since: Option<Instant>,
 }
@@ -92,10 +91,8 @@ impl ModelRuntime {
             .as_ref()
             .and_then(|s| s.hidden_ring.clone());
         options.configure_mtp(&mut prepared.plan)?;
-        prepared
-            .decode_programs
-            .retain(|name| prepared.plan.programs.contains_key(name));
-        let preload = startup::kernels(&prepared.plan, &prepared.execution_model)?;
+        let preload = startup::kernels(&prepared.plan, prepared.execution_model.as_ref())?;
+        let indirect_packets = prepared.plan.packet_table().is_some();
         let (execution, mut stats) = Executor::load(&prepared, options, &preload)?;
         stats.load_to_ready_s = started.elapsed().as_secs_f64();
         eprintln!(
@@ -125,7 +122,7 @@ impl ModelRuntime {
             host_kv_pool: Default::default(),
             prefix_statistics: crate::prefix::Statistics::default(),
             prefix_hints: vec![],
-            prefill_costs: prefill_cost::Costs::new(shapes),
+            prefill_costs: crate::scheduler::prefill::Profiles::new(shapes),
             owner_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -143,7 +140,10 @@ impl ModelRuntime {
             dynamic_speculation: Default::default(),
             prompt_lookup: options.prompt_lookup,
             startup_costs: Default::default(),
-            model_package: prepared.execution_model,
+            batch_plans: crate::batch_plan::BatchPlanCache::new(
+                prepared.execution_model,
+                indirect_packets,
+            ),
             request_hidden_ring,
             idle_admission_since: None,
         })
@@ -202,7 +202,7 @@ impl ModelRuntime {
     ) -> Result<()> {
         let manifest = &self.manifest;
         let execution = &mut self.execution;
-        self.model_package
+        self.batch_plans
             .prepare_inputs(program, tokens, history, |name, bytes| {
                 let buffer = manifest
                     .buffers
@@ -219,7 +219,7 @@ impl ModelRuntime {
             })
     }
     fn prepare_program_inputs(&self, program: &str, tokens: &[u32], history: &[u32]) -> Result<()> {
-        self.model_package
+        self.batch_plans
             .prepare_inputs(program, tokens, history, |name, bytes| {
                 let buffer = self
                     .manifest

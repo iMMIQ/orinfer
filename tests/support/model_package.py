@@ -1,31 +1,38 @@
-"""Small deterministic stateful kernel for native-package integration tests."""
+"""Small data execution package for CPU packaging and release tests."""
 
-import tilelang.language as T
-from orinfer_build.compiler.cuda.common import orin_jit
+import hashlib
+
+from orinfer_build.packaging.compact import compact_package
 
 
-@orin_jit
-def transition(prefill: bool):
-    @T.prim_func
-    def main(
-        Input: T.Tensor((1,), T.int32),
-        Weight: T.Tensor((4, 4), T.float32),
-        Token: T.Tensor((1,), T.int32),
-        Status: T.Tensor((1,), T.int32),
-        Position: T.Tensor((1,), T.int32),
-        Logits: T.Tensor((4,), T.float32),
-    ):
-        with T.Kernel(1, threads=32):
-            selected = T.alloc_shared((1,), T.int32)
-            for i in T.Parallel(1):
-                selected[0] = Input[0] if prefill else Token[0]
-            T.sync_threads()
-            for i in T.Parallel(4):
-                Logits[i] = Weight[selected[0], i]
-            T.sync_threads()
-            for i in T.Parallel(1):
-                Token[0] = (selected[0] + 1) % 4
-                Status[0] = 0
-                Position[0] = Position[0] + 1
-
-    return main
+def data_package(root, payload=b"fixture cubin bytes", **metadata):
+    source = root / "compiler"
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "kernel.cubin").write_bytes(payload)
+    identity = dict(file="kernel.cubin", sha256=hashlib.sha256(payload).hexdigest())
+    package = dict(
+        architecture="qwen3_5",
+        compute_policy="int8_quality",
+        target="sm_87",
+        config_signature={},
+        prefill_profiles=[],
+        buffer_contracts=[],
+        toolchain={},
+        kernels=[
+            dict(
+                name="test",
+                symbol="main",
+                grid=[1, 1, 1],
+                block=[32, 1, 1],
+                shared_memory_bytes=0,
+                cooperative=False,
+                args=[],
+                module=identity,
+                source=identity,
+                host_abi=identity,
+            )
+        ],
+    )
+    package.update(metadata)
+    cache = root / "packages"
+    return cache / compact_package(source, package, cache)

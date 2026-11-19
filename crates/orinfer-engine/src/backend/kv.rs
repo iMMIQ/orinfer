@@ -68,7 +68,7 @@ impl Mapping {
 }
 pub(crate) trait MappingOps {
     fn allocate(&self, bytes: usize) -> Result<u64>;
-    fn release(&self, handle: u64) -> Result<()>;
+    fn release(&self, handle: u64, bytes: usize) -> Result<()>;
     fn map(&self, offset: usize, bytes: usize, handle: u64, shared: bool) -> Result<()>;
     fn access(&self, _offset: usize, _bytes: usize, _shared: bool) -> Result<()> {
         Ok(())
@@ -81,6 +81,188 @@ pub(crate) trait MappingOps {
     /// Adopt an owned physical handle into stable immutable backing, without copying.
     fn publish(&self, mapping: &Mapping, used: usize) -> Result<Rc<Allocation>>;
 }
+pub(crate) fn align(bytes: usize, granularity: usize) -> Result<usize> {
+    if granularity == 0 {
+        return Err("Empty VMM allocation granularity".into());
+    }
+    bytes
+        .checked_next_multiple_of(granularity)
+        .ok_or("VMM alignment overflow".into())
+}
+
+/// Device-independent virtual range and physical ownership. Device adapters
+/// provide native operations and decide when their streams must be fenced.
+pub(crate) struct Reservation {
+    pub bytes: usize,
+    pub granularity: usize,
+    pub mapped: usize,
+    pub mappings: Vec<Mapping>,
+    pub retained: Vec<Rc<Allocation>>,
+    pub poisoned: bool,
+}
+
+impl Reservation {
+    pub fn new(bytes: usize, granularity: usize) -> Self {
+        Self {
+            bytes,
+            granularity,
+            mapped: 0,
+            mappings: vec![],
+            retained: vec![],
+            poisoned: false,
+        }
+    }
+
+    pub fn extent(&self, bytes: usize) -> Result<usize> {
+        let extent = align(bytes, self.granularity)?;
+        if extent > self.bytes {
+            return Err("KV growth exceeds reservation".into());
+        }
+        Ok(extent)
+    }
+
+    /// CUDA initializes immediately. Ascend returns the span for initialization
+    /// after all mappings in the stream batch have been installed.
+    pub fn grow(
+        &mut self,
+        bytes: usize,
+        ops: &impl MappingOps,
+        initialize: bool,
+    ) -> Result<Option<MemoryRange>> {
+        self.require_healthy()?;
+        let extent = self.extent(bytes)?;
+        if extent <= self.mapped {
+            return Ok(None);
+        }
+        let range = MemoryRange {
+            offset: self.mapped,
+            bytes: extent - self.mapped,
+        };
+        self.map_owned(range, ops, initialize)?;
+        self.mapped = extent;
+        Ok(Some(range))
+    }
+
+    pub fn map_sparse(&mut self, offset: usize, ops: &impl MappingOps) -> Result<()> {
+        self.require_healthy()?;
+        let bytes = self.granularity;
+        self.check_mapping(offset, bytes)?;
+        if self.mappings.iter().any(|page| page.offset == offset) {
+            return Err("Invalid sparse weight page transition".into());
+        }
+        self.map_owned(MemoryRange { offset, bytes }, ops, false)
+    }
+
+    fn map_owned(
+        &mut self,
+        range: MemoryRange,
+        ops: &impl MappingOps,
+        initialize: bool,
+    ) -> Result<()> {
+        let id = allocation_id()?;
+        let handle = ops.allocate(range.bytes)?;
+        let mut page = Mapping {
+            id,
+            offset: range.offset,
+            bytes: range.bytes,
+            handle,
+            mapped: false,
+            shared: None,
+        };
+        let result = map(&mut page, ops).and_then(|()| {
+            if initialize {
+                ops.zero(page.offset, page.bytes)?;
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.poisoned = true;
+            if initialize
+                && release_mapping(&mut page, &mut |p| ops.unmap(p.offset, p.bytes), &mut |p| {
+                    ops.release(p.handle, p.bytes)
+                })
+                .is_ok()
+            {
+                return result;
+            }
+        }
+        // Retain ownership when rollback could not detach the mapping or the
+        // enclosing Ascend batch is quarantined.
+        self.mappings.push(page);
+        result
+    }
+
+    pub fn map_shared(
+        &mut self,
+        offset: usize,
+        allocation: Rc<Allocation>,
+        owner: DeviceOwner,
+        ops: &impl MappingOps,
+    ) -> Result<()> {
+        self.require_healthy()?;
+        owner.require(allocation.owner)?;
+        let bytes = allocation.bytes;
+        self.check_mapping(offset, bytes)?;
+        if offset != self.mapped {
+            return Err("Noncontiguous shared KV mappings".into());
+        }
+        let handle = allocation
+            .handle
+            .ok_or("Prefix allocation is not VMM backed")?;
+        self.mappings.push(Mapping {
+            id: allocation.id,
+            offset,
+            bytes,
+            handle,
+            mapped: false,
+            shared: Some(allocation),
+        });
+        let result = map(self.mappings.last_mut().unwrap(), ops);
+        self.poisoned |= result.is_err();
+        result?;
+        self.mapped += bytes;
+        Ok(())
+    }
+
+    pub fn clear(
+        &mut self,
+        unmap: impl FnMut(&Mapping) -> Result<()>,
+        release: impl FnMut(&Mapping) -> Result<()>,
+    ) -> Result<()> {
+        let result = release_mappings(&mut self.mappings, &mut self.retained, unmap, release);
+        self.poisoned = result.is_err();
+        if result.is_ok() {
+            self.mapped = 0;
+        }
+        result
+    }
+
+    fn check_mapping(&self, offset: usize, bytes: usize) -> Result<()> {
+        if bytes == 0
+            || !offset.is_multiple_of(self.granularity)
+            || !bytes.is_multiple_of(self.granularity)
+        {
+            return Err("Invalid VMM mapping alignment".into());
+        }
+        MemoryRange { offset, bytes }.within(self.bytes)?;
+        Ok(())
+    }
+
+    fn require_healthy(&self) -> Result<()> {
+        if self.poisoned {
+            return Err("KV reservation is quarantined after a failed transition".into());
+        }
+        Ok(())
+    }
+}
+
+fn map(page: &mut Mapping, ops: &impl MappingOps) -> Result<()> {
+    let shared = page.shared.is_some();
+    ops.map(page.offset, page.bytes, page.handle, shared)?;
+    page.mapped = true;
+    ops.access(page.offset, page.bytes, shared)
+}
+
 pub(crate) fn overlaps(offset: usize, bytes: usize, start: usize, end: usize) -> bool {
     start < end && start < offset.saturating_add(bytes) && offset < end
 }
@@ -134,7 +316,7 @@ pub(crate) fn make_writable(
             shared: None,
         };
         if let Err(error) = ops.unmap(mappings[index].offset, mappings[index].bytes) {
-            if ops.release(handle).is_err() {
+            if ops.release(handle, replacement.bytes).is_err() {
                 replacement.offset = usize::MAX;
                 mappings.push(replacement);
             }
@@ -143,9 +325,7 @@ pub(crate) fn make_writable(
         retained.push(source.clone());
         std::mem::swap(&mut mappings[index], &mut replacement);
         let page = &mut mappings[index];
-        ops.map(page.offset, page.bytes, page.handle, false)?;
-        page.mapped = true;
-        ops.access(page.offset, page.bytes, false)?;
+        map(page, ops)?;
         ops.zero(page.offset, page.bytes)?;
         ops.copy(page.offset, &source, source.used)?;
         changed = true;
@@ -212,24 +392,16 @@ pub(crate) fn release_mappings(
     mappings: &mut Vec<Mapping>,
     retained: &mut Vec<Rc<Allocation>>,
     mut unmap: impl FnMut(&Mapping) -> Result<()>,
-    mut release: impl FnMut(u64) -> Result<()>,
+    mut release: impl FnMut(&Mapping) -> Result<()>,
 ) -> Result<()> {
     let mut errors = vec![];
     mappings.retain_mut(|page| {
-        if page.mapped {
-            if let Err(e) = unmap(page) {
-                errors.push(e);
-                return true;
-            }
-            page.mapped = false;
+        if let Err(error) = release_mapping(page, &mut unmap, &mut release) {
+            errors.push(error);
+            true
+        } else {
+            false
         }
-        if page.shared.is_none()
-            && let Err(e) = release(page.handle)
-        {
-            errors.push(e);
-            return true;
-        }
-        false
     });
     if errors.is_empty() {
         retained.clear();
@@ -238,6 +410,21 @@ pub(crate) fn release_mappings(
         Err(errors.join("; "))
     }
 }
+fn release_mapping(
+    page: &mut Mapping,
+    unmap: &mut impl FnMut(&Mapping) -> Result<()>,
+    release: &mut impl FnMut(&Mapping) -> Result<()>,
+) -> Result<()> {
+    if page.mapped {
+        unmap(page)?;
+        page.mapped = false;
+    }
+    if page.shared.is_none() {
+        release(page)?;
+    }
+    Ok(())
+}
+
 /// A valid slice can alias its whole physical allocation, including a private
 /// zero/uncommitted suffix. Subsequent writes use the same COW transition.
 pub(crate) fn alias_offset(
@@ -568,6 +755,8 @@ mod tests {
         copies: Cell<usize>,
         creates: Cell<usize>,
         deferred: Cell<bool>,
+        fail_access: Cell<bool>,
+        fail_unmap: Cell<bool>,
     }
     impl Fake {
         fn new() -> Self {
@@ -579,6 +768,8 @@ mod tests {
                 copies: Cell::new(0),
                 creates: Cell::new(0),
                 deferred: Cell::new(false),
+                fail_access: Cell::new(false),
+                fail_unmap: Cell::new(false),
             }
         }
     }
@@ -590,7 +781,7 @@ mod tests {
             self.data.borrow_mut().insert(id, vec![0; bytes]);
             Ok(id)
         }
-        fn release(&self, h: u64) -> Result<()> {
+        fn release(&self, h: u64, _bytes: usize) -> Result<()> {
             assert!(!self.mapped.borrow().values().any(|v| *v == h));
             self.data
                 .borrow_mut()
@@ -602,7 +793,16 @@ mod tests {
             assert!(self.mapped.borrow_mut().insert(o, h).is_none());
             Ok(())
         }
+        fn access(&self, _offset: usize, _bytes: usize, _shared: bool) -> Result<()> {
+            if self.fail_access.get() {
+                return Err("injected access fault".into());
+            }
+            Ok(())
+        }
         fn unmap(&self, o: usize, _b: usize) -> Result<()> {
+            if self.fail_unmap.get() {
+                return Err("injected unmap fault".into());
+            }
             self.mapped.borrow_mut().remove(&o).ok_or("Double unmap")?;
             Ok(())
         }
@@ -639,6 +839,38 @@ mod tests {
             }))
         }
     }
+    #[test]
+    fn growth_fault_preserves_committed_extent_and_retains_failed_cleanup() {
+        let ops = Fake::new();
+        let mut reservation = Reservation::new(256, 64);
+        reservation.grow(1, &ops, true).unwrap();
+        let committed = reservation.mappings[0].handle;
+
+        ops.fail_access.set(true);
+        ops.fail_unmap.set(true);
+        assert!(reservation.grow(65, &ops, true).is_err());
+        assert_eq!(reservation.mapped, 64);
+        assert!(reservation.poisoned);
+        assert_eq!(reservation.mappings.len(), 2);
+        assert!(ops.data.borrow().contains_key(&committed));
+        assert!(reservation.grow(129, &ops, true).is_err());
+
+        ops.fail_unmap.set(false);
+        reservation
+            .clear(
+                |page| ops.unmap(page.offset, page.bytes),
+                |page| ops.release(page.handle, page.bytes),
+            )
+            .unwrap();
+        assert!(ops.data.borrow().is_empty());
+        assert_eq!(reservation.mapped, 0);
+
+        // With a successful rollback, failed growth leaves no physical pages.
+        assert!(reservation.grow(1, &ops, true).is_err());
+        assert!(reservation.mappings.is_empty());
+        assert!(ops.data.borrow().is_empty());
+    }
+
     #[test]
     fn publication_shares_physical_memory_and_cow_preserves_only_committed_prefix() {
         let ops = Fake::new();
@@ -724,7 +956,7 @@ mod tests {
             &mut maps,
             &mut retained,
             |p| ops.unmap(p.offset, p.bytes),
-            |h| ops.release(h),
+            |page| ops.release(page.handle, page.bytes),
         )
         .unwrap();
         assert!(

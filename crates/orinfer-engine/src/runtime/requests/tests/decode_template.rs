@@ -29,8 +29,11 @@ fn profile_flash_mixed_layer() {
         .prepare_batch_inputs(&mut [&mut prefill, &mut decoder], &[(0, 512), (1, 1)])
         .unwrap();
     let (calls, _) = model
-        .model_package
-        .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Ordinary)
+        .batch_plans
+        .cached_batch(
+            &segments,
+            orinfer_model_sdk::packet::BatchOperation::Ordinary,
+        )
         .unwrap();
     let end=calls.iter().position(|call|matches!(&call.operation,crate::model::Operation::Kernel {name} if name.contains("/layer1/"))).unwrap();
     let calls = &calls[..end];

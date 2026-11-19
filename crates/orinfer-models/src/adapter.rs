@@ -1,7 +1,7 @@
 //! Model semantics and execution composition, independent of precision selection.
-use orinfer_model_sdk::{abi, architecture::BatchSegment, artifact::Result};
+use orinfer_model_sdk::{architecture::BatchSegment, artifact::Result, packet};
 
-pub(crate) trait Adapter {
+pub trait Adapter {
     fn prepare(
         &self,
         _program: &str,
@@ -11,14 +11,14 @@ pub(crate) trait Adapter {
         Ok(vec![])
     }
     fn prefetch_inputs(&self, _tokens: &[u32], _history: &[u32]) {}
-    fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<abi::BatchPlan>;
+    fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<packet::BatchPlan>;
     fn batch_operation(
         &self,
         segments: &[BatchSegment],
-        operation: abi::BatchOperation,
+        operation: packet::BatchOperation,
         include_plan: bool,
-    ) -> Result<abi::BatchPlan> {
-        if operation != abi::BatchOperation::Ordinary {
+    ) -> Result<packet::BatchPlan> {
+        if operation != packet::BatchOperation::Ordinary {
             return Err("Model adapter does not provide this batch operation".into());
         }
         self.batch(segments, include_plan)
@@ -26,7 +26,7 @@ pub(crate) trait Adapter {
     fn visual(
         &self,
         _tokens: &[u32],
-        _images: &[abi::ImageGrid],
+        _images: &[orinfer_model_sdk::architecture::ImageGrid],
         _capacity: usize,
     ) -> Result<(Vec<i32>, Vec<u32>)> {
         Err("Model package has no visual layout adapter".into())

@@ -146,20 +146,20 @@ def resolve_package(model, *, schema=None):
 def load_model(model, *, plan=None):
     data, origin, package = resolve_package(model)
     if "catalog" in package:
-        # Offline tools reuse the registered Rust binding generator. This is
-        # compiler staging data, never an alternative online package format.
-        engine = Path(os.environ.get("ORINFER_ENGINE", str(ROOT / "target/release/orinfer")))
-        completed = subprocess.run(
-            [str(engine), "plan-model", str(model)], check=True, capture_output=True, text=True
-        )
-        report = json.loads(completed.stdout)
-        manifest = report["manifest"]
+        from orinfer_build.packaging.package import read_bindings
+
+        kernels, dynamic, contracts = read_bindings(package, origin)
         if plan is not None:
-            plan.update(manifest)
+            engine = Path(os.environ.get("ORINFER_ENGINE", str(ROOT / "target/release/orinfer")))
+            completed = subprocess.run(
+                [str(engine), "plan-model", str(model)], check=True, capture_output=True, text=True
+            )
+            plan.update(json.loads(completed.stdout)["manifest"])
         package.pop("catalog")
-        package["kernels"] = manifest["kernels"]
-        package["dynamic_batch_kernels"] = list(manifest["dynamic_batch_kernels"].values())
-        package["plan_kernel_contracts"] = report["plan_kernel_contracts"]
+        package.pop("bindings")
+        package["kernels"] = kernels
+        package["dynamic_batch_kernels"] = dynamic
+        package["plan_kernel_contracts"] = contracts
     return data, origin, package
 
 

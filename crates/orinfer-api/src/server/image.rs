@@ -112,6 +112,10 @@ fn feature_limits(demand: &[(usize, usize)], budget: usize) -> Result<Vec<usize>
 
 fn load(url: &str, preparation: &super::preparation::Context) -> Result<Vec<u8>> {
     preparation.checkpoint(MAX_BYTES)?;
+    load_source(url, false)
+}
+
+pub(crate) fn load_source(url: &str, allow_local: bool) -> Result<Vec<u8>> {
     if let Some(data) = url.strip_prefix("data:") {
         let (mime, payload) = data.split_once(',').ok_or("Invalid image data URI")?;
         if !["image/png;base64", "image/jpeg;base64", "image/webp;base64"].contains(&mime)
@@ -119,9 +123,16 @@ fn load(url: &str, preparation: &super::preparation::Context) -> Result<Vec<u8>>
         {
             return Err("Unsupported or oversized image data URI".into());
         }
-        return STANDARD
+        let bytes = STANDARD
             .decode(payload)
-            .map_err(|e| format!("Image base64: {e}"));
+            .map_err(|e| format!("Image base64: {e}"))?;
+        if bytes.len() > MAX_BYTES {
+            return Err("Image exceeds byte limit".into());
+        }
+        return Ok(bytes);
+    }
+    if allow_local && !url.starts_with("http://") && !url.starts_with("https://") {
+        return read_bounded(std::fs::File::open(url).map_err(|e| e.to_string())?);
     }
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("Image URL: {e}"))?;
     if !["http", "https"].contains(&parsed.scheme()) {
@@ -142,8 +153,12 @@ fn load(url: &str, preparation: &super::preparation::Context) -> Result<Vec<u8>>
     {
         return Err("Image exceeds byte limit".into());
     }
+    read_bounded(response)
+}
+
+fn read_bounded(reader: impl Read) -> Result<Vec<u8>> {
     let mut data = Vec::new();
-    response
+    reader
         .take((MAX_BYTES + 1) as u64)
         .read_to_end(&mut data)
         .map_err(|e| e.to_string())?;
@@ -152,6 +167,21 @@ fn load(url: &str, preparation: &super::preparation::Context) -> Result<Vec<u8>>
     }
     Ok(data)
 }
+pub(crate) fn decode_rgb(data: &[u8], max_side: u32) -> Result<image::RgbImage> {
+    let mut reader = ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    limits.max_image_width = Some(max_side);
+    limits.max_image_height = Some(max_side);
+    reader.limits(limits);
+    Ok(reader
+        .decode()
+        .map_err(|e| format!("Image decode: {e}"))?
+        .to_rgb8())
+}
+
 fn round_even(x: f64) -> usize {
     x.round_ties_even() as usize
 }
@@ -228,19 +258,8 @@ fn preprocess_with_limit(
     }
     // Decode may hold RGBA/16-bit source, RGB conversion and resized patch FP32 together.
     preparation.checkpoint(data.len() + source_pixels * 12 + rh * rw * 16)?;
-    let mut reader = ImageReader::new(Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|e| e.to_string())?;
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(256 * 1024 * 1024);
-    limits.max_image_width = Some(32768);
-    limits.max_image_height = Some(32768);
-    reader.limits(limits);
     preparation.checkpoint(0)?;
-    let decoded = reader
-        .decode()
-        .map_err(|e| format!("Image decode: {e}"))?
-        .to_rgb8();
+    let decoded = decode_rgb(data, 32768)?;
     let (height, width) = (rh, rw);
     let (content_height, content_width) = if v.layout == ImageLayout::DeepseekV41 {
         deepseek::content_dimensions(

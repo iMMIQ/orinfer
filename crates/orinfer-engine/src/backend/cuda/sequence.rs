@@ -28,10 +28,10 @@ impl BatchOperations<'_> {
 }
 
 fn packet_graph_rows(
-    operation: orinfer_model_sdk::abi::BatchOperation,
+    operation: orinfer_model_sdk::packet::BatchOperation,
     segments: &[(usize, usize)],
 ) -> usize {
-    if operation == orinfer_model_sdk::abi::BatchOperation::Commit {
+    if operation == orinfer_model_sdk::packet::BatchOperation::Commit {
         segments.len()
     } else {
         segments.iter().map(|(_, tokens)| tokens).sum()
@@ -162,20 +162,17 @@ impl Executor {
         source_bytes: usize,
         slots: &[usize],
     ) -> Result<()> {
-        let bytes = stride
-            .checked_mul(slots.len())
-            .ok_or("Scratch rows overflow")?;
         if slots.is_empty()
             || slots.len() > 128
             || stride == 0
             || !self.pointers.is_private(source)
-            || slots
-                .len()
-                .checked_mul(16)
-                .is_none_or(|n| n > self.sizes.get(table).copied().unwrap_or(0))
+            || slots.len() * 16 > self.sizes.get(table).copied().unwrap_or(0)
         {
             return Err("Invalid scratch row table".into());
         }
+        let bytes = stride
+            .checked_mul(slots.len())
+            .ok_or("Scratch rows overflow")?;
         self.ensure_workspace(scratch, bytes)?;
         let mut addresses = Vec::with_capacity(slots.len() * 16);
         for (row, &slot) in slots.iter().enumerate() {
@@ -276,7 +273,7 @@ impl Executor {
     pub(crate) fn upload_sequence_addresses(
         &self,
         name: &str,
-        bindings: std::rc::Rc<orinfer_model_sdk::abi::StateBindings>,
+        bindings: std::rc::Rc<orinfer_model_sdk::packet::StateBindings>,
     ) -> Result<()> {
         let bytes = self
             .state_table
@@ -286,7 +283,7 @@ impl Executor {
     }
     pub(crate) fn upload_sequence_address_ranges(
         &self,
-        bindings: std::rc::Rc<orinfer_model_sdk::abi::StateBindings>,
+        bindings: std::rc::Rc<orinfer_model_sdk::packet::StateBindings>,
         tables: &[(&str, std::ops::Range<usize>)],
     ) -> Result<()> {
         let bytes = self
@@ -294,20 +291,10 @@ impl Executor {
             .borrow_mut()
             .resolve(bindings, &self.sequences)?;
         for (name, range) in tables {
-            let start = range
-                .start
-                .checked_mul(8)
-                .ok_or("Address table range overflow")?;
-            let end = range
-                .end
-                .checked_mul(8)
-                .ok_or("Address table range overflow")?;
-            self.upload_bytes(
-                name,
-                bytes
-                    .get(start..end)
-                    .ok_or("Address table range exceeds bindings")?,
-            )?;
+            if range.end > bytes.len() / 8 || range.start > range.end {
+                return Err("Address table range exceeds bindings".into());
+            }
+            self.upload_bytes(name, &bytes[range.start * 8..range.end * 8])?;
         }
         Ok(())
     }
@@ -1335,7 +1322,7 @@ impl Executor {
             }
             _ => false,
         };
-        if self.allocations.weights.addresses.contains_key(target) && writing {
+        if self.weight_buffers.contains(target) && writing {
             return Err("Invocation writes immutable weights".into());
         }
         let start = v.map_or(0, |v| v.offset);
@@ -1425,7 +1412,7 @@ impl Executor {
         operations: &[Invocation],
     ) -> Result<u64> {
         #[cfg(test)]
-        let test_policy = self.parallel_priority.borrow();
+        let test_policy = self.graph_profile.priority.borrow();
         #[cfg(test)]
         let policy = test_policy.as_str();
         #[cfg(not(test))]
@@ -1592,7 +1579,7 @@ impl Executor {
                     )?;
                 }
                 #[cfg(test)]
-                let gate_first = self.parallel_gate_first.get();
+                let gate_first = self.graph_profile.gate_first.get();
                 #[cfg(not(test))]
                 let gate_first = false;
                 if gate_first {
@@ -1670,7 +1657,7 @@ impl Executor {
             && self.batch_graphs.borrow().keys().any(|cached| {
                 cached == &key.to_vec().into()
                     || cached.shared.is_some()
-                        && cached.operation == orinfer_model_sdk::abi::BatchOperation::Ordinary
+                        && cached.operation == orinfer_model_sdk::packet::BatchOperation::Ordinary
                         && cached.rows == key.len()
                         && key.iter().all(|(_, tokens)| *tokens == 1)
             })
@@ -1683,7 +1670,7 @@ impl Executor {
         allow_capture: bool,
     ) -> Result<()> {
         self.execute_batch_operation(
-            orinfer_model_sdk::abi::BatchOperation::Ordinary,
+            orinfer_model_sdk::packet::BatchOperation::Ordinary,
             key,
             operations,
             decode,
@@ -1884,7 +1871,7 @@ impl Executor {
     /// pointer table; its request-owned contents are refreshed before replay.
     fn replay_cached_batch(
         &self,
-        operation: orinfer_model_sdk::abi::BatchOperation,
+        operation: orinfer_model_sdk::packet::BatchOperation,
         segments: &[(usize, usize)],
         operations: BatchOperations<'_>,
         decode: bool,
@@ -1934,7 +1921,7 @@ impl Executor {
     }
     pub(crate) fn execute_batch_operation(
         &mut self,
-        operation: orinfer_model_sdk::abi::BatchOperation,
+        operation: orinfer_model_sdk::packet::BatchOperation,
         segments: Vec<(usize, usize)>,
         operations: &[Invocation],
         decode: bool,
@@ -1951,7 +1938,7 @@ impl Executor {
     }
     pub(crate) fn execute_batch_operation_with(
         &mut self,
-        operation: orinfer_model_sdk::abi::BatchOperation,
+        operation: orinfer_model_sdk::packet::BatchOperation,
         segments: Vec<(usize, usize)>,
         operations: &[Invocation],
         decode: bool,
@@ -1972,7 +1959,7 @@ impl Executor {
     }
     pub(crate) fn execute_cached_batch_operation(
         &mut self,
-        operation: orinfer_model_sdk::abi::BatchOperation,
+        operation: orinfer_model_sdk::packet::BatchOperation,
         segments: Vec<(usize, usize)>,
         operations: &std::rc::Rc<Vec<Invocation>>,
         decode: bool,
@@ -1989,7 +1976,7 @@ impl Executor {
     }
     pub(crate) fn execute_cached_batch_operation_with(
         &mut self,
-        operation: orinfer_model_sdk::abi::BatchOperation,
+        operation: orinfer_model_sdk::packet::BatchOperation,
         segments: Vec<(usize, usize)>,
         operations: &std::rc::Rc<Vec<Invocation>>,
         decode: bool,
@@ -2010,7 +1997,7 @@ impl Executor {
     }
     fn execute_batch_operations(
         &mut self,
-        operation: orinfer_model_sdk::abi::BatchOperation,
+        operation: orinfer_model_sdk::packet::BatchOperation,
         segments: Vec<(usize, usize)>,
         prepared: BatchOperations<'_>,
         decode: bool,
@@ -2248,7 +2235,8 @@ impl Executor {
                 .find(|(cached, _)| {
                     **cached == super::executor::BatchGraphKey::from(key.to_vec())
                         || cached.shared.is_some()
-                            && cached.operation == orinfer_model_sdk::abi::BatchOperation::Ordinary
+                            && cached.operation
+                                == orinfer_model_sdk::packet::BatchOperation::Ordinary
                             && cached.rows == key.len()
                             && key.iter().all(|(_, tokens)| *tokens == 1)
                 })
@@ -2581,7 +2569,7 @@ mod graph_cache_tests {
             addresses: vec![42],
         };
         let first = BatchGraphKey {
-            operation: orinfer_model_sdk::abi::BatchOperation::Ordinary,
+            operation: orinfer_model_sdk::packet::BatchOperation::Ordinary,
             segments: vec![],
             rows: 2,
             shared: Some(graph.clone()),
@@ -2594,7 +2582,7 @@ mod graph_cache_tests {
         next.rows = 3;
         assert_ne!(first, next);
         next = first.clone();
-        next.operation = orinfer_model_sdk::abi::BatchOperation::Verification;
+        next.operation = orinfer_model_sdk::packet::BatchOperation::Verification;
         assert_ne!(first, next);
     }
 
@@ -2661,7 +2649,7 @@ mod graph_cache_tests {
     #[test]
     fn verification_graphs_cannot_alias_ordinary_batches() {
         use super::super::executor::BatchGraphKey;
-        use orinfer_model_sdk::abi::BatchOperation;
+        use orinfer_model_sdk::packet::BatchOperation;
         let ordinary = BatchGraphKey::from(vec![(2, 4), (3, 4)]);
         let verification = BatchGraphKey {
             operation: BatchOperation::Verification,
@@ -2706,7 +2694,7 @@ mod graph_cache_tests {
     }
     #[test]
     fn commit_graph_shape_counts_owners_while_target_counts_token_rows() {
-        use orinfer_model_sdk::abi::BatchOperation;
+        use orinfer_model_sdk::packet::BatchOperation;
         assert_eq!(
             packet_graph_rows(BatchOperation::Commit, &[(7, 3), (31, 8)]),
             2

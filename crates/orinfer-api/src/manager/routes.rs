@@ -21,16 +21,7 @@ fn result(value: Result<Value>) -> Response {
     }
 }
 pub(super) fn authorized(headers: &HeaderMap) -> bool {
-    std::env::var("ORINFER_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .is_none_or(|key| {
-            headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-                == Some(key.as_str())
-        })
+    crate::server::bearer_authorized(crate::server::api_key().as_deref(), headers)
 }
 async fn models(State(manager): State<Arc<Manager>>, headers: HeaderMap) -> Response {
     if !authorized(&headers) {

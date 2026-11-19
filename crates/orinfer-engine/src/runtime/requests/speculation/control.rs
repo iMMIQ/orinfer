@@ -38,7 +38,6 @@ pub(in crate::runtime) struct Controller {
     single_policy: SinglePolicy,
     costs: Costs,
     budget: Budget,
-    calibration_limit: f64,
     prefill_calibration: Option<(super::super::cost::Key, usize)>,
     trace: bool,
     #[cfg(test)]
@@ -58,7 +57,6 @@ impl Default for Controller {
             single_policy,
             costs: Costs::default(),
             budget: Budget::default(),
-            calibration_limit: 0.4,
             prefill_calibration: None,
             trace: std::env::var("ORINFER_MTP_TRACE").as_deref() == Ok("1"),
             #[cfg(test)]
@@ -90,9 +88,8 @@ fn select(
         .iter()
         .map(|c| {
             let shape = costs.arms.get(&c.width);
-            let hot = shape
-                .filter(|s| s.time.samples() > 0)
-                .map_or_else(|| prior(c), Cost::mean);
+            let measured = shape.and_then(Cost::measured);
+            let hot = measured.map_or_else(|| prior(c), Cost::mean);
             adaptive::Candidate {
                 id: c.width,
                 width: c.width,
@@ -100,9 +97,7 @@ fn select(
                 maximum_tokens: (input.batch * c.width) as f64,
                 remaining_tokens: c.remaining_tokens,
                 mean_s: hot,
-                upper_s: shape
-                    .filter(|s| s.time.samples() > 0)
-                    .map_or(hot, Cost::upper),
+                upper_s: measured.map_or(hot, Cost::upper),
                 transition_s: shape
                     .filter(|_| !c.warm_ready)
                     .map_or(0., |s| s.transition_s),
@@ -121,9 +116,7 @@ impl Controller {
         self.trace
     }
     pub(in crate::runtime) fn set_calibration_limit(&mut self, seconds: f64) {
-        if seconds.is_finite() && seconds > 0. {
-            self.calibration_limit = seconds;
-        }
+        self.budget.set_limit(seconds);
     }
     /// Mixed packets perform their prompt work once. Extra accepted tokens
     /// displace only standalone decoder work, not another copy of the prompt.
@@ -136,7 +129,7 @@ impl Controller {
         }
         self.costs
             .normal(Key { prefill: 0, ..key })
-            .filter(|cost| cost.time.samples() >= adaptive::HOT_SAMPLES)
+            .filter(|cost| cost.calibrated())
             .map(|cost| (normal - cost.time.mean()).max(0.))
     }
     /// A waiting prompt gets the next calibration opportunity after existing
@@ -154,9 +147,7 @@ impl Controller {
                 self.prefill_calibration = None;
             }
             Some(excess)
-                if excess
-                    <= self.calibration_limit
-                        + (self.calibration_limit - self.budget.startup_spent).max(0.)
+                if self.budget.can_reserve(excess)
                     && self.prefill_calibration.is_none_or(|(pending, until)| {
                         pending == key || self.costs.clock >= until
                     }) =>
@@ -171,7 +162,7 @@ impl Controller {
     }
     pub(in crate::runtime) fn exploration_credit(&self, calibrating: bool) -> f64 {
         if calibrating {
-            self.budget.available(self.calibration_limit)
+            self.budget.available()
         } else {
             self.budget.balance
         }
@@ -183,24 +174,11 @@ impl Controller {
         measured: bool,
         calibrating: bool,
     ) {
-        if !seconds.is_finite() || seconds <= 0. || !baseline.is_finite() {
-            return;
-        }
-        let delta = baseline - seconds;
-        self.budget.settle_delta(
-            if measured { delta } else { delta.min(0.) },
-            self.calibration_limit,
-            calibrating,
-        );
+        self.budget
+            .settle_action(seconds, baseline, measured, calibrating);
     }
     pub(in crate::runtime) fn earn_ordinary(&mut self, seconds: f64, preparation_s: f64) {
-        if seconds.is_finite() && seconds > 0. && preparation_s.is_finite() && preparation_s >= 0. {
-            self.budget.settle_delta(
-                (seconds - preparation_s).max(0.) * 0.02,
-                self.calibration_limit,
-                false,
-            );
-        }
+        self.budget.earn_ordinary(seconds, preparation_s);
     }
     /// The single settlement path charges preparation, rejection and zero yield.
     /// Returned hot marginal cost trains the runtime's unmeasured-shape prior.
@@ -226,7 +204,7 @@ impl Controller {
         let normal = self
             .costs
             .normal(key)
-            .filter(|s| s.time.samples() >= 3)
+            .filter(|s| s.calibrated())
             .map_or(0., |s| s.time.mean());
         let calibrating = width > 1
             && self
@@ -234,7 +212,7 @@ impl Controller {
                 .profiles
                 .get(&key)
                 .and_then(|p| p.arms.get(&width))
-                .is_none_or(|s| s.time.samples() < 3);
+                .is_none_or(|s| !s.calibrated());
         if let Some(alternative) = alternative {
             self.settle_action(
                 measurement.seconds,
@@ -253,14 +231,8 @@ impl Controller {
                 calibrating,
             );
         } else {
-            self.budget.settle(
-                width,
-                measurement,
-                normal,
-                key.batch,
-                self.calibration_limit,
-                calibrating,
-            );
+            self.budget
+                .settle(width, measurement, normal, key.batch, calibrating);
         }
         self.costs.observe(key, width, measurement);
         if self.trace {
@@ -297,12 +269,12 @@ impl Controller {
         }
         let profile = self.costs.profiles.get(&key)?;
         let base = profile.arms.get(&1)?;
-        if base.time.samples() < 3 || key.batch == 0 {
+        if !base.calibrated() {
             return None;
         }
         let normal = base.time.mean();
         let fixed_s = self.fixed_work(key, normal)?;
-        let available = self.budget.available(self.calibration_limit);
+        let available = self.budget.available();
         let decision = select(
             profile,
             candidates,
