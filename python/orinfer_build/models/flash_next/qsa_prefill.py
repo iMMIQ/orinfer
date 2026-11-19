@@ -146,7 +146,7 @@ def publish(data, package, manifest, compiler):
                 (
                     old,
                     1,
-                    "attention",
+                    "attention-paired",
                     operands | expanded,
                     partial(_packed_qsa, rows, context, limit, skip_empty=True),
                 ),

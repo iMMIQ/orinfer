@@ -231,6 +231,7 @@ def _packed_qsa(rows, context, expanded_capacity=0, *, skip_empty=False):
         explicit_barriers=True,
         expanded_capacity=expanded_capacity,
         skip_empty=skip_empty,
+        partitions_per_cta=2 if expanded_capacity and skip_empty else 1,
     )
 
 
