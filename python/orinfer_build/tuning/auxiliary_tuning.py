@@ -349,15 +349,26 @@ def publish_qsa_prefill(package, manifest, compiler, *, attention_only=False):
                 or any(dynamics[k["name"]]["capacity"] != rows for k in (producer, selector))
             ):
                 raise ValueError("Unexpected QSA prefill score producer/consumer contract")
-            stripes, parts = producer["grid"][1], selector["grid"][1]
+            # Reuse each key tile across eight queries and preserve the measured
+            # 4096-block stripe span when doubling the number of keys per tile.
+            query_tile, key_tile = 8, 128
+            tokens_per_tile = 4 * key_tile
+            stripes = min(32, (context + tokens_per_tile - 1) // tokens_per_tile)
+            parts = selector["grid"][1]
             threads = selector["block"][0]
             for old, pointers, kind, build, constants in (
                 (
                     producer,
                     a,
-                    f"score-{stripes}",
+                    f"score-{query_tile}x{key_tile}-{stripes}",
                     lambda: qsa.index_scores.__wrapped__(
-                        rows, context, True, None, query_major=True
+                        rows,
+                        context,
+                        True,
+                        None,
+                        query_major=True,
+                        query_tile=query_tile,
+                        key_tile=key_tile,
                     ),
                     {"stripes": stripes},
                 ),
