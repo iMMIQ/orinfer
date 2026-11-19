@@ -134,18 +134,20 @@ python -m tools.bench.encoders --compare vllm-results.json native-results.json \
 
 ## 合成 Mini-Weka 短测
 
-`mini_weka_synthetic.py` 生成 16 条可复现的合成 Weka 轨迹及 SHA256 manifest。默认 `compact` 的冷首轮为 2、3、4 和 6 Ki tokens，每档 4 条，后续调用新增 256–768 tokens。每条包含 5 个主会话请求和 2 个共享前缀的并行子会话请求，输出上限为 32–256 tokens。实际长度及缓存命中以服务 usage 为准。
+`mini_weka_synthetic.py` 生成可复现的合成 Weka 轨迹及 SHA256 manifest。默认 `compact` 有 512 条轨迹，冷首轮为 2、3、4 和 6 Ki tokens，每档 128 条，后续调用新增 256–768 tokens。每条包含 5 个主会话请求和 2 个共享前缀的并行子会话请求，输出上限为 32–256 tokens。实际长度及缓存命中以服务 usage 为准。
 
-`--profile long` 复现历史合成长输入压力测的 8、24、48、80 Ki tokens 四档。性能 A/B 使用同一 profile 和 manifest。
+`--profile long` 默认生成 16 条轨迹，冷首轮为 8、24、48、80 Ki tokens。两个 profile 均可用 `--trajectories` 指定轨迹数，取值为 4 的正整数倍。性能 A/B 使用同一 profile 和 manifest。
 
 ```bash
 uv run --locked python -m tools.bench.mini_weka_synthetic \
-  --profile compact --output artifacts/bench/mini-weka-synthetic-compact-v1
+  --profile compact --output artifacts/bench/mini-weka-synthetic-compact-512-v1
 
 uv run --locked python -m tools.bench.mini_weka_compact \
-  --manifest artifacts/bench/mini-weka-synthetic-compact-v1/manifest.json \
+  --manifest artifacts/bench/mini-weka-synthetic-compact-512-v1/manifest.json \
   --tokenizer "$TOKENIZER_DIR" --url http://127.0.0.1:18828/v1 \
   --model qwen-flash-next --concurrency 4 --wall-limit 240 --output "$MINI_OUTPUT_DIR"
 ```
 
-Compact 回放连接已启动的 Flash Next 服务。父子请求复用同一段 Chat 消息，两个子会话完成后主会话再继续。历史中的助手消息和工具输入使用冻结的合成文本，模型真实生成本轮输出。回放记录每个已完成请求的实际 token 用量、首 token 时间和完成时间，以及输入身份与完成轨迹数。(长输入压力测通过 `agentx_mini.py` 回放 `--profile long` 生成的轨迹。 [AgentX Harness](https://github.com/SemiAnalysisAI/agentx-harness) · [配对口径](../../docs/performance.md)
+Compact 回放连接已启动的 Chat 服务。启动时核验所有轨迹 SHA256，准入时渲染对话。父子请求复用同一段 Chat 消息，两个子会话完成后主会话再继续。历史中的助手消息和工具输入使用冻结的合成文本，模型真实生成本轮输出。
+
+回放总时限默认 240 秒，`--request-count` 默认允许提交 100000 个 profiling 请求。512 条轨迹并发 4 时包含 4 个 warmup 请求和 3580 个可用 profiling 请求。回放记录每个已完成请求的 token 用量、首 token 时间和完成时间，汇总记录 manifest SHA256、输入身份和完成轨迹数。长输入压力测通过 `agentx_mini.py` 回放。 [AgentX Harness](https://github.com/SemiAnalysisAI/agentx-harness) · [配对口径](../../docs/performance.md)

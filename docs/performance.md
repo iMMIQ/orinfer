@@ -208,67 +208,76 @@ Attention 保留 16-token 块的 FP32 打分、在线 softmax 和逐块累积，
 
 ## 全模型 Mini-Weka 短测基线与 Schema 2 验收（2026-11-19）
 
-Jetson AGX Orin 64GB Developer Kit，aarch64、CUDA SM87、Jetson Linux R36.4.3。运行 `f78dd74`（P0–P3 合并）构建的 release 二进制，SHA256 为 `9adfddd647161439f9e9a560784febf9f639c8c863fab8ea3cad06a0aa18b27b`。八个模型逐个持有服务 GPU 锁，上一服务经 SIGTERM 退出后启动下一服务。六个 Chat/VL 模型使用统一的 4096 MiB GPU prefix cache 预算。
+Jetson AGX Orin 64GB Developer Kit，aarch64、CUDA SM87、Jetson Linux R36.4.3。运行 `f78dd74`（P0–P3 合并）构建的 release 二进制，SHA256 为 `9adfddd647161439f9e9a560784febf9f639c8c863fab8ea3cad06a0aa18b27b`。服务逐个持有 GPU 锁，上一服务经 SIGTERM 退出后启动下一服务。六个 Chat/VL 模型使用统一的 4096 MiB GPU prefix cache 预算。
 
-回放 `orinfer-synthetic-mini-weka-compact-v1` 的 16 条合成文本轨迹。并发 4，包含 4 个单 token warmup 请求和最多 108 个 profiling 请求，240 秒总时限，`temperature=1.0`、`seed=20261002`、`ignore_eos=true`。服务在一个终端运行，`/health` 就绪后从另一个终端启动回放。服务 ID 依表序为 `index-translate-2b`、`qwen3.5-4b`、`index-translate-9b`、`qwen3.8-27b`、`index-translate-35b`、`qwen-flash-next`。
+回放 512 条合成文本轨迹，冷首轮为 2、3、4、6 Ki tokens，每档 128 条。并发 4，包含 4 个单 token warmup 请求和 3580 个可用 profiling 请求，240 秒总时限，`temperature=1.0`、`seed=20261002`、`ignore_eos=true`。Manifest SHA256 为 `b27c6d8713b1ca045cc4d7cac873dd57d1026513f6aa4d7d5452c469ac157bb7`。
+
+先生成数据，再启动服务。`/health` 就绪后，在设有相同变量的另一个终端启动回放。服务 ID 依表序为 `index-translate-2b`、`qwen3.5-4b`、`index-translate-9b`、`qwen3.8-27b`、`index-translate-35b`、`qwen-flash-next`。
 
 ```bash
-base=artifacts/bench/schema2-baseline-20261119
-# model_id 为下表模型对应的服务 ID
-./target/release/orinfer serve "$base/models/$model_id" \
+models=artifacts/bench/schema2-baseline-20261119/models
+dataset=artifacts/bench/mini-weka-synthetic-compact-512-v1
+output=artifacts/bench/schema2-baseline-20261119-512
+model_id=index-translate-2b
+uv run --locked python -m tools.bench.mini_weka_synthetic \
+  --profile compact --output "$dataset"
+
+./target/release/orinfer serve "$models/$model_id" \
   --listen 127.0.0.1:18828 --model "$model_id" \
   --cuda-graph decode_only --mtp-drafts auto --resident-experts full \
   --prefix-cache-mib 4096 --max-active-requests 4 --prompt-lookup
 
 uv run --locked python -m tools.bench.mini_weka_compact \
-  --manifest artifacts/bench/mini-weka-synthetic-compact-v1/manifest.json \
-  --tokenizer "$base/models/$model_id" --url http://127.0.0.1:18828/v1 \
-  --model "$model_id" --concurrency 4 --request-count 112 --wall-limit 240 \
-  --output "$base/mini/$model_id"
+  --manifest "$dataset/manifest.json" \
+  --tokenizer "$models/$model_id" --url http://127.0.0.1:18828/v1 \
+  --model "$model_id" --concurrency 4 --wall-limit 240 \
+  --output "$output/mini/$model_id"
 ```
 
 ### 六模型端到端短测
 
-| 模型 | 启动至就绪（s） | Warmup 请求 / s | Profiling 请求 | 完整轨迹 | 总时长 / Profiling 窗（s） | Prompt / 缓存 / 未缓存 token | 缓存命中率 | 输出 token | 输出 TPS | TTFT P50 / P95（s） | 结束条件 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Index-Translate-2B | 0.964 | 4 / 2.16 | 108/108 | 16/16 | 95.02 / 92.86 | 540,054 / 321,190 / 218,864 | 59.5% | 11,392 | 122.68 | 0.61 / 2.29 | 完成 |
-| Qwen3.5-4B | 1.235 | 4 / 4.85 | 108/108 | 16/16 | 201.51 / 196.67 | 539,838 / 356,859 / 182,979 | 66.1% | 11,392 | 57.93 | 1.34 / 6.46 | 完成 |
-| Index-Translate-9B | 1.843 | 4 / 7.66 | 91/108 | 12/16 | 240.00 / 232.34 | 439,703 / 273,907 / 165,796 | 62.3% | 9,376 | 40.36 | 2.05 / 10.68 | 时限 |
-| Qwen3.8-27B | 6.247 | 4 / 27.00 | 35/108 | 4/16 | 240.00 / 213.00 | 165,836 / 125,785 / 40,051 | 75.8% | 3,392 | 15.93 | 7.16 / 33.69 | 时限 |
-| Index-Translate-35B-A3B-preview | 7.023 | 4 / 5.51 | 67/108 | 8/16 | 240.00 / 234.49 | 322,390 / 195,302 / 127,088 | 60.6% | 6,608 | 28.18 | 1.81 / 7.73 | 时限 |
-| Qwen3.8-Flash-Next | 15.899 | 4 / 16.50 | 71/108 | 8/16 | 240.00 / 223.50 | 347,679 / 276,534 / 71,145 | 79.5% | 7,168 | 32.07 | 2.58 / 18.49 | 时限 |
+| 模型 | 启动至就绪（s） | Warmup 请求 / s | Profiling 完成请求 | 完整轨迹 | 总时长 / Profiling 窗（s） | Prompt / 缓存 / 未缓存 token | 缓存命中率 | 输出 token | 输出 TPS | TTFT P50 / P95（s） |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Index-Translate-2B | 0.898 | 4 / 2.27 | 288/3,580 | 39/512 | 240.00 / 237.73 | 1,407,133 / 813,993 / 593,140 | 57.8% | 29,488 | 124.04 | 0.59 / 2.57 |
+| Qwen3.5-4B | 1.162 | 4 / 5.26 | 133/3,580 | 17/512 | 240.00 / 234.74 | 644,433 / 413,812 / 230,621 | 64.2% | 13,520 | 57.60 | 1.47 / 7.04 |
+| Index-Translate-9B | 32.035 | 4 / 7.82 | 90/3,580 | 12/512 | 240.00 / 232.18 | 435,817 / 269,492 / 166,325 | 61.8% | 9,120 | 39.28 | 2.03 / 10.59 |
+| Qwen3.8-27B | 6.628 | 4 / 26.96 | 26/3,580 | 4/512 | 240.00 / 213.04 | 129,712 / 90,043 / 39,669 | 69.4% | 2,880 | 13.52 | 7.41 / 30.53 |
+| Index-Translate-35B-A3B-preview | 7.446 | 4 / 5.65 | 68/3,580 | 8/512 | 240.00 / 234.35 | 329,466 / 201,152 / 128,314 | 61.1% | 6,656 | 28.40 | 1.68 / 7.48 |
+| Qwen3.8-Flash-Next | 15.373 | 4 / 16.21 | 72/3,580 | 8/512 | 240.00 / 223.79 | 355,079 / 282,902 / 72,177 | 79.7% | 7,232 | 32.32 | 2.60 / 16.45 |
 
-Index-Translate-2B、Qwen3.5-4B 提前完成全部请求和轨迹。Index-Translate-9B、Qwen3.8-27B、Index-Translate-35B-A3B-preview、Qwen3.8-Flash-Next 达到 240 秒时限。2B 采用离线校验全部结束后的复测，首轮与权重哈希校验重叠。Profiling 输出 TPS 使用已完成请求的输出 token 除以总时长减去 warmup 时长，包含排队、prefill、生成及 HTTP/SSE。TTFT 取完成的 profiling 请求首个 SSE 输出事件，P95 使用线性插值。缓存命中率为已完成 profiling 请求的缓存 token 除以 prompt token。启动时间取服务日志的 `API READY`。
+六个模型的 latency 回放与 Flash Next 的 throughput 回放均达到 240 秒时限，七个服务均正常退出。完成最多的一轮处理了 288 个 profiling 请求，占请求池的 8.0%。输出 TPS 使用已完成 profiling 请求的输出 token 除以总时长减去 warmup 时长，包含排队、prefill、生成及 HTTP/SSE。TTFT 取已完成 profiling 请求的首个 SSE 输出事件，P95 使用线性插值。缓存命中率为缓存 token 除以 prompt token。服务启动时间取 `API READY` 日志，其中 9B 本轮读取权重等待 30.36 秒。
+
+回放前准备耗时 0.73–0.86 秒，时窗内按需加载和渲染合计 0.23–1.58 秒。客户端进程峰值 RSS 为 141–223 MiB，主要来自完整 tokenizer。使用两种 tokenizer 格式模拟回放全部 512 条轨迹时，加载 tokenizer 后的 Python 分配峰值约 16.3 MiB，进程 RSS 峰值出现在 tokenizer 加载阶段。
 
 | 模型 | Prefill / decode token | 推测轮数 / 接受 / 提议 | 其中 lookup 轮数 / 接受 / 提议 | Graph 命中 / 未命中 / 捕获延后 | 准入延后 / 冷准入延后 / 前缀等待 | 父前缀恢复不足 / 缓存淘汰 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Index-Translate-2B | 234,291 / 11,284 | 44 / 35 / 44 | 0 / 0 / 0 | 7,146 / 49 / 55 | 0 / 0 / 0 | 60 / 98 |
-| Qwen3.5-4B | 198,398 / 11,284 | 1,287 / 1,378 / 1,972 | 0 / 0 / 0 | 5,540 / 433 / 603 | 0 / 0 / 22 | 44 / 256 |
-| Index-Translate-9B | 187,436 / 9,427 | 103 / 91 / 122 | 0 / 0 / 0 | 3,396 / 57 / 95 | 0 / 0 / 22 | 40 / 153 |
-| Qwen3.8-27B | 56,401 / 3,363 | 987 / 1,256 / 1,620 | 0 / 0 / 0 | 2,382 / 410 / 324 | 0 / 0 / 0 | 1 / 65 |
-| Index-Translate-35B-A3B-preview | 146,734 / 6,742 | 201 / 197 / 258 | 0 / 0 / 0 | 2,129 / 174 / 154 | 0 / 0 / 66 | 32 / 101 |
-| Qwen3.8-Flash-Next | 88,273 / 7,320 | 119 / 83 / 156 | 0 / 0 / 0 | 3,150 / 109 / 96 | 0 / 0 / 91 | 0 / 104 |
+| Index-Translate-2B | 614,571 / 29,682 | 90 / 76 / 113 | 0 / 0 / 0 | 18,018 / 68 / 114 | 0 / 0 / 0 | 154 / 404 |
+| Qwen3.5-4B | 248,224 / 13,387 | 1,548 / 1,808 / 2,547 | 0 / 0 / 0 | 6,390 / 544 / 825 | 0 / 0 / 64 | 54 / 313 |
+| Index-Translate-9B | 188,318 / 9,371 | 95 / 96 / 115 | 0 / 0 / 0 | 3,355 / 66 / 89 | 0 / 0 / 0 | 39 / 151 |
+| Qwen3.8-27B | 60,106 / 2,886 | 459 / 556 / 758 | 0 / 0 / 0 | 1,910 / 225 / 183 | 0 / 0 / 0 | 4 / 62 |
+| Index-Translate-35B-A3B-preview | 147,471 / 6,777 | 204 / 182 / 240 | 0 / 0 / 0 | 2,135 / 139 / 152 | 0 / 0 / 52 | 32 / 106 |
+| Qwen3.8-Flash-Next | 90,397 / 7,664 | 187 / 167 / 269 | 0 / 0 / 0 | 3,384 / 169 / 137 | 0 / 0 / 0 | 0 / 89 |
 
-Prefill、decode、Graph 和准入为回放前后 `/health` 的计数差，覆盖 warmup 和时限内已执行的在途工作。推测计数与缓存淘汰从已完成请求的服务日志汇总。父前缀恢复不足按恢复 token 少于所属父请求 prompt token 的 90% 统计。缓存只能恢复保存过的状态端点。例如 2B 第一条后续请求匹配 2061 个 token，恢复了 516 个 token 的检查点。Graph 捕获延后与请求准入延后分别计数。
+Prefill、decode、Graph 和准入为回放前后 `/health` 的计数差，覆盖 warmup 和时限内已执行的在途工作。推测计数与缓存淘汰从已完成请求的服务日志汇总。父前缀恢复不足按缓存 token 少于所属父请求 prompt token 的 90% 统计。
 
-### Flash Next 同输入对照
+### Flash Next 调度对照
 
-冻结对照来自 `artifacts/bench/flash-qsa-prefill-memory.fNlcmDE8/comparison.json` 的 `candidate` 记录及对应服务日志和 SSE 记录。渲染输入 SHA256 为 `7469b4ec6053d85d9461329e1ceae82412c53238cc478daac9a40876cb3191e8`。旧服务在温度 1.0 下记录了 441 轮采样 prompt lookup，该路径由 throughput 调度启用。上表沿用 `serve` 默认的 latency 调度。同策略对照只在服务启动命令增加 `--scheduler-policy throughput`。
+两组 `f78dd74` 使用相同的 512 条轨迹和输入身份。Throughput 组在服务命令增加 `--scheduler-policy throughput`，并使用独立输出目录 `$output/mini/qwen-flash-next-throughput`。历史 `4c66a6f` 来自 `artifacts/bench/flash-qsa-prefill-memory.fNlcmDE8/comparison.json` 的 `candidate`，使用 16 条轨迹并达到 240 秒时限。核对其已完成的 96 个请求，payload 与新池的同序号轨迹逐项相等。
 
-| 指标 | `4c66a6f` throughput | `f78dd74` latency | `f78dd74` throughput |
+| 指标 | `4c66a6f` throughput（历史，16 条） | `f78dd74` latency（512 条） | `f78dd74` throughput（512 条） |
 | --- | ---: | ---: | ---: |
-| 启动至 API 就绪（s） | 15.088 | 15.899 | 15.124 |
-| Warmup 4 请求（s） | 15.45 | 16.50 | 15.45 |
-| 总时长 / Profiling 窗（s） | 240.00 / 224.55 | 240.00 / 223.50 | 240.00 / 224.55 |
-| Profiling 请求 / 完整轨迹 | 92 / 12 | 71 / 8 | 92 / 12 |
-| Profiling prompt / 缓存 / 未缓存 token | 452,879 / 356,011 / 96,868 | 347,679 / 276,534 / 71,145 | 452,879 / 356,012 / 96,867 |
-| Profiling 缓存命中率 | 78.61% | 79.54% | 78.61% |
-| Profiling 输出 token / 输出 TPS | 9,312 / 41.47 | 7,168 / 32.07 | 9,312 / 41.47 |
-| TTFT P50 / P95（s） | 0.93 / 3.99 | 2.58 / 18.49 | 0.92 / 4.00 |
-| 采样 lookup 轮数 | 441 | 0 | 437 |
+| 启动至 API 就绪（s） | 15.088 | 15.373 | 15.144 |
+| Warmup 4 请求（s） | 15.45 | 16.21 | 15.58 |
+| 总时长 / Profiling 窗（s） | 240.00 / 224.55 | 240.00 / 223.79 | 240.00 / 224.42 |
+| Profiling 完成请求 / 完整轨迹 | 92 / 12 | 72 / 8 | 92 / 12 |
+| Profiling prompt / 缓存 / 未缓存 token | 452,879 / 356,011 / 96,868 | 355,079 / 282,902 / 72,177 | 453,906 / 356,927 / 96,979 |
+| Profiling 缓存命中率 | 78.61% | 79.67% | 78.63% |
+| Profiling 输出 token / 输出 TPS | 9,312 / 41.47 | 7,232 / 32.32 | 9,312 / 41.49 |
+| TTFT P50 / P95（s） | 0.93 / 3.99 | 2.60 / 16.45 | 0.92 / 3.97 |
+| 采样 lookup 轮数 | 441 | 0 | 453 |
 | 父前缀恢复不足 | 0 | 0 | 0 |
 
-默认 latency 的输出 TPS 比历史 throughput 对照低 22.66%，采样 lookup 为 0 轮。同为 throughput 时，两轮均完成 92 个请求并生成 9312 个 token，输出速率均为 41.47 TPS，P95 TTFT 增加 0.25%。
+512 条轨迹同版本对照中，throughput 的输出 TPS 比 latency 高 28.40%。两次 throughput 短测各完成 92 个请求和 12 条轨迹，输出 TPS 分别为 41.47 和 41.49。
 
 ### 八模型 Schema 2 验收
 
@@ -289,7 +298,7 @@ Prefill、decode、Graph 和准入为回放前后 `/health` 的计数差，覆�
 
 Chat 回放及功能检查使用文本输入。ASR 使用 16 kHz mono LibriSpeech 录音 `heldout-librispeech16.wav`，`/v1/audio/transcriptions` 返回 “I really was very much afraid of showing him how much shocked I was at some parts of what he said.”。Reranker 比较火星和京都文档，相关及不相关分数分别为 0.99402441 和 0.00000571。ASR 和 reranker 通过音频转写、相关性评分入口验收。Reranker 只执行 prefill，`decode_only` 下直接提交 GPU 程序。八个服务均正常关闭，日志中 CUDA/runtime 错误、panic 与 OOM 均为 0。
 
-原始记录位于 `artifacts/bench/schema2-baseline-20261119/` 的 `plans/`、`logs/`、`mini/` 及 `non-chat/`，汇总和健康计数差见 `baseline.json`。
+本轮短测的请求、服务日志、前后 `/health` 和汇总记录位于 `artifacts/bench/schema2-baseline-20261119-512/`。八模型 Schema 2 验收记录位于 `artifacts/bench/schema2-baseline-20261119/`。
 
 ## 六模型统一基准（2026-10-21）
 
