@@ -1,7 +1,7 @@
 """Sparse QSA with shared INT8 KV tiles for twelve GQA heads on SM87.
 
-FP16 tensor-core QK/PV with FP32 accumulators and softmax. Dequantization is
-local to each selected tile; no expanded KV cache persists between launches.
+FP16 tensor-core QK/PV use FP32 accumulators and softmax. Native prefill can
+stage FP16 KV in reusable layer workspace; all other launches unpack each tile.
 """
 
 import tilelang.language as T
@@ -62,6 +62,7 @@ def sparse_attention(
     async_scales: bool = False,
     vector_dequant: bool = False,
     explicit_barriers: bool = False,
+    expanded_capacity: int = 0,
 ):
     geometry(m, capacity)
 
@@ -100,6 +101,8 @@ def sparse_attention(
         and not (packed and single_buffer and async_scales and vector_dequant)
     ):
         raise ValueError("Explicit QSA barriers require the single-buffer packed prefill path")
+    if expanded_capacity and not (0 < expanded_capacity <= capacity and explicit_barriers):
+        raise ValueError("QSA expansion requires bounded KV and explicit barriers")
     block = block_size
     kv_width = 64 if packed else 256
     kv_dtype = T.uint32 if packed else T.int8
@@ -129,19 +132,19 @@ def sparse_attention(
                 output[j, pair * 2] = T.reinterpret(T.float16, T.cast(values & 65535, T.uint16))
                 output[j, pair * 2 + 1] = T.reinterpret(T.float16, T.cast(values >> 16, T.uint16))
 
-    @T.prim_func
-    def main(
-        Query: T.Tensor((m, 24, 256), T.float16),
-        K: T.Tensor((capacity, 2, kv_width), kv_dtype),
-        V: T.Tensor((capacity, 2, kv_width), kv_dtype),
-        KS: T.Tensor((capacity, 2, 4), T.float16),
-        VS: T.Tensor((capacity, 2, 4), T.float16),
-        Selected: T.Tensor((m, 2051), T.int32),
-        Position: T.Tensor((1,), T.int32),
-        Max: T.Tensor((m, 24, splits), T.float32),
-        Den: T.Tensor((m, 24, splits), T.float32),
-        Out: T.Tensor((m, 24, splits, 256), T.float32),
-    ):
+    @T.macro
+    def copy_expanded(Rows, Tokens, target, cursor, kh):
+        for j, group in T.Parallel(block, 32, coalesced_width=T.int32(1)):
+            token = Tokens[j]
+            T.ptx_cp_async(
+                T.access_ptr(target[j, group * 8], "w", 8),
+                T.access_ptr(Rows[T.max(token, 0), kh, group * 8], "r", 8),
+                8,
+                predicate=token >= 0 and token <= cursor,
+            )
+
+    @T.macro
+    def attend(Query, K, V, KS, VS, Selected, Position, Max, Den, Out, ExpandedK, ExpandedV):
         with T.Kernel(m, 2, splits, threads=threads) as (row, kh, split):
             if packed:
                 T.import_source(PACKED_SOURCE)
@@ -187,6 +190,7 @@ def sparse_attention(
                 if split_size
                 else T.min(start + count, length)
             )
+            expanded = Position[0] + m <= expanded_capacity if expanded_capacity else False
             for tile in T.serial(T.ceildiv(T.max(0, end - start), block)):
                 # Retire all readers before reusing metadata for another tile.
                 # Prefetch once instead of serializing each channel on the
@@ -199,38 +203,112 @@ def sparse_attention(
                         slot < end, Selected[row, T.min(slot, 2050)], -1
                     )
                 T.sync_threads()
-                if not async_scales:
-                    for j, g in T.Parallel(block, 4):
-                        token = selected_tile[j]
-                        key_scales[j, g] = 0
-                        value_scales[j, g] = 0
-                        if token >= 0 and token <= Position[0] + row:
-                            key_scales[j, g] = KS[token, kh, g]
-                            value_scales[j, g] = VS[token, kh, g]
+                if expanded_capacity and expanded:
+                    copy_expanded(ExpandedK, selected_tile, k, Position[0] + row, kh)
+                    T.ptx_commit_group()
+                    T.ptx_wait_group(0)
                     T.sync_threads()
-                # Gather packed INT8 KV in 16-byte asynchronous loads. Keep
-                # packed V until softmax finishes so K and V can share one
-                # FP16 tensor-core tile without increasing shared memory.
-                if packed:
-                    for j, segment in T.Parallel(block, 16):
-                        token = selected_tile[j]
-                        valid = token >= 0 and token <= Position[0] + row
-                        safe = T.max(token, 0)
-                        T.ptx_cp_async(
-                            T.tvm_access_ptr(
-                                T.type_annotation(T.uint32), raw_k.data, j * 64 + segment * 4, 4, 2
-                            ),
-                            T.tvm_access_ptr(
-                                T.type_annotation(T.uint32),
-                                K.data,
-                                (safe * 2 + kh) * 64 + segment * 4,
+                else:
+                    if not async_scales:
+                        for j, g in T.Parallel(block, 4):
+                            token = selected_tile[j]
+                            key_scales[j, g] = 0
+                            value_scales[j, g] = 0
+                            if token >= 0 and token <= Position[0] + row:
+                                key_scales[j, g] = KS[token, kh, g]
+                                value_scales[j, g] = VS[token, kh, g]
+                        T.sync_threads()
+                    # Gather packed INT8 KV in 16-byte asynchronous loads. Keep
+                    # packed V until softmax finishes so K and V can share one
+                    # FP16 tensor-core tile without increasing shared memory.
+                    if packed:
+                        for j, segment in T.Parallel(block, 16):
+                            token = selected_tile[j]
+                            valid = token >= 0 and token <= Position[0] + row
+                            safe = T.max(token, 0)
+                            T.ptx_cp_async(
+                                T.tvm_access_ptr(
+                                    T.type_annotation(T.uint32),
+                                    raw_k.data,
+                                    j * 64 + segment * 4,
+                                    4,
+                                    2,
+                                ),
+                                T.tvm_access_ptr(
+                                    T.type_annotation(T.uint32),
+                                    K.data,
+                                    (safe * 2 + kh) * 64 + segment * 4,
+                                    4,
+                                    1,
+                                ),
                                 4,
-                                1,
-                            ),
-                            4,
-                            predicate=valid,
-                        )
-                        if not single_buffer:
+                                predicate=valid,
+                            )
+                            if not single_buffer:
+                                T.ptx_cp_async(
+                                    T.tvm_access_ptr(
+                                        T.type_annotation(T.uint32),
+                                        raw_v.data,
+                                        j * 64 + segment * 4,
+                                        4,
+                                        2,
+                                    ),
+                                    T.tvm_access_ptr(
+                                        T.type_annotation(T.uint32),
+                                        V.data,
+                                        (safe * 2 + kh) * 64 + segment * 4,
+                                        4,
+                                        1,
+                                    ),
+                                    4,
+                                    predicate=valid,
+                                )
+                        if async_scales:
+                            # Each group-64 scale row is one aligned 8-byte copy.
+                            # Retire it with the packed K tile before dequantizing.
+                            for j in T.Parallel(block):
+                                token = selected_tile[j]
+                                valid = token >= 0 and token <= Position[0] + row
+                                safe = T.max(token, 0)
+                                T.ptx_cp_async(
+                                    T.access_ptr(key_scales[j, 0], "w", 4),
+                                    T.access_ptr(KS[safe, kh, 0], "r", 4),
+                                    4,
+                                    predicate=valid,
+                                )
+                                T.ptx_cp_async(
+                                    T.access_ptr(value_scales[j, 0], "w", 4),
+                                    T.access_ptr(VS[safe, kh, 0], "r", 4),
+                                    4,
+                                    predicate=valid,
+                                )
+                        T.ptx_commit_group()
+                        T.ptx_wait_group(0)
+                        T.sync_threads()
+                        dequantize(raw_k, key_scales, k)
+                    else:
+                        for j, d in T.Parallel(block, 256, coalesced_width=T.int32(1)):
+                            slot = start + tile * block + j
+                            k[j, d] = 0
+                            v[j, d] = 0
+                            if slot < end:
+                                token = selected_tile[j]
+                                if token >= 0 and token <= Position[0] + row:
+                                    k[j, d] = T.cast(K[token, kh, d], T.float32) * T.cast(
+                                        key_scales[j, d // 64], T.float32
+                                    )
+                                    v[j, d] = T.cast(V[token, kh, d], T.float32) * T.cast(
+                                        value_scales[j, d // 64], T.float32
+                                    )
+                    if single_buffer:
+                        # All K words have been decoded into the separate FP16
+                        # tile. Retire their readers, then overlap packed V loads
+                        # into the same raw storage with QK and softmax.
+                        T.sync_threads()
+                        for j, segment in T.Parallel(block, 16):
+                            token = selected_tile[j]
+                            valid = token >= 0 and token <= Position[0] + row
+                            safe = T.max(token, 0)
                             T.ptx_cp_async(
                                 T.tvm_access_ptr(
                                     T.type_annotation(T.uint32),
@@ -249,67 +327,7 @@ def sparse_attention(
                                 4,
                                 predicate=valid,
                             )
-                    if async_scales:
-                        # Each group-64 scale row is one aligned 8-byte copy.
-                        # Retire it with the packed K tile before dequantizing.
-                        for j in T.Parallel(block):
-                            token = selected_tile[j]
-                            valid = token >= 0 and token <= Position[0] + row
-                            safe = T.max(token, 0)
-                            T.ptx_cp_async(
-                                T.access_ptr(key_scales[j, 0], "w", 4),
-                                T.access_ptr(KS[safe, kh, 0], "r", 4),
-                                4,
-                                predicate=valid,
-                            )
-                            T.ptx_cp_async(
-                                T.access_ptr(value_scales[j, 0], "w", 4),
-                                T.access_ptr(VS[safe, kh, 0], "r", 4),
-                                4,
-                                predicate=valid,
-                            )
-                    T.ptx_commit_group()
-                    T.ptx_wait_group(0)
-                    T.sync_threads()
-                    dequantize(raw_k, key_scales, k)
-                else:
-                    for j, d in T.Parallel(block, 256, coalesced_width=T.int32(1)):
-                        slot = start + tile * block + j
-                        k[j, d] = 0
-                        v[j, d] = 0
-                        if slot < end:
-                            token = selected_tile[j]
-                            if token >= 0 and token <= Position[0] + row:
-                                k[j, d] = T.cast(K[token, kh, d], T.float32) * T.cast(
-                                    key_scales[j, d // 64], T.float32
-                                )
-                                v[j, d] = T.cast(V[token, kh, d], T.float32) * T.cast(
-                                    value_scales[j, d // 64], T.float32
-                                )
-                if single_buffer:
-                    # All K words have been decoded into the separate FP16
-                    # tile. Retire their readers, then overlap packed V loads
-                    # into the same raw storage with QK and softmax.
-                    T.sync_threads()
-                    for j, segment in T.Parallel(block, 16):
-                        token = selected_tile[j]
-                        valid = token >= 0 and token <= Position[0] + row
-                        safe = T.max(token, 0)
-                        T.ptx_cp_async(
-                            T.tvm_access_ptr(
-                                T.type_annotation(T.uint32), raw_v.data, j * 64 + segment * 4, 4, 2
-                            ),
-                            T.tvm_access_ptr(
-                                T.type_annotation(T.uint32),
-                                V.data,
-                                (safe * 2 + kh) * 64 + segment * 4,
-                                4,
-                                1,
-                            ),
-                            4,
-                            predicate=valid,
-                        )
-                    T.ptx_commit_group()
+                        T.ptx_commit_group()
                 T.gemm(q, k, scores, transpose_B=True, clear_accum=True)
                 for i in T.Parallel(16):
                     previous[i] = maximum[i]
@@ -331,18 +349,26 @@ def sparse_attention(
                     denom[i] = denom[i] * correction[i] + rowsum[i]
                 for i, d in T.Parallel(16, 256):
                     acc[i, d] *= correction[i]
-                if packed:
-                    if single_buffer:
-                        T.ptx_wait_group(0)
+                if expanded_capacity and expanded:
                     T.sync_threads()
-                    dequantize(raw_v, value_scales, k)
-                    if explicit_barriers:
-                        # All probability and dequantized value writes must
-                        # finish before any warp starts the shared PV tile.
-                        T.sync_threads()
+                    copy_expanded(ExpandedV, selected_tile, k, Position[0] + row, kh)
+                    T.ptx_commit_group()
+                    T.ptx_wait_group(0)
+                    T.sync_threads()
                     T.gemm(p, k, acc)
                 else:
-                    T.gemm(p, v, acc)
+                    if packed:
+                        if single_buffer:
+                            T.ptx_wait_group(0)
+                        T.sync_threads()
+                        dequantize(raw_v, value_scales, k)
+                        if explicit_barriers:
+                            # All probability and dequantized value writes must
+                            # finish before any warp starts the shared PV tile.
+                            T.sync_threads()
+                        T.gemm(p, k, acc)
+                    else:
+                        T.gemm(p, v, acc)
             for i, d in T.Parallel(16, 256):
                 if i < 12:
                     Out[row, kh * 12 + i, split, d] = acc[i, d]
@@ -350,6 +376,41 @@ def sparse_attention(
                 if i < 12:
                     Max[row, kh * 12 + i, split] = maximum[i]
                     Den[row, kh * 12 + i, split] = denom[i]
+
+    if expanded_capacity:
+
+        @T.prim_func
+        def main(
+            Query: T.Tensor((m, 24, 256), T.float16),
+            K: T.Tensor((capacity, 2, kv_width), kv_dtype),
+            V: T.Tensor((capacity, 2, kv_width), kv_dtype),
+            KS: T.Tensor((capacity, 2, 4), T.float16),
+            VS: T.Tensor((capacity, 2, 4), T.float16),
+            ExpandedK: T.Tensor((expanded_capacity, 2, 256), T.float16),
+            ExpandedV: T.Tensor((expanded_capacity, 2, 256), T.float16),
+            Selected: T.Tensor((m, 2051), T.int32),
+            Position: T.Tensor((1,), T.int32),
+            Max: T.Tensor((m, 24, splits), T.float32),
+            Den: T.Tensor((m, 24, splits), T.float32),
+            Out: T.Tensor((m, 24, splits, 256), T.float32),
+        ):
+            attend(Query, K, V, KS, VS, Selected, Position, Max, Den, Out, ExpandedK, ExpandedV)
+    else:
+
+        @T.prim_func
+        def main(
+            Query: T.Tensor((m, 24, 256), T.float16),
+            K: T.Tensor((capacity, 2, kv_width), kv_dtype),
+            V: T.Tensor((capacity, 2, kv_width), kv_dtype),
+            KS: T.Tensor((capacity, 2, 4), T.float16),
+            VS: T.Tensor((capacity, 2, 4), T.float16),
+            Selected: T.Tensor((m, 2051), T.int32),
+            Position: T.Tensor((1,), T.int32),
+            Max: T.Tensor((m, 24, splits), T.float32),
+            Den: T.Tensor((m, 24, splits), T.float32),
+            Out: T.Tensor((m, 24, splits, 256), T.float32),
+        ):
+            attend(Query, K, V, KS, VS, Selected, Position, Max, Den, Out, K, V)
 
     if type(skip_empty) is not bool:
         raise ValueError("Invalid QSA empty partition policy")
@@ -391,4 +452,47 @@ def sparse_attention(
             main.buffer_map,
             main.attrs,
         )
+    return main
+
+
+def expand_prefill_kv(m, capacity, limit):
+    """Dequantize the live prefill context into two reusable FP16 workspaces."""
+    if not 0 < limit <= capacity:
+        raise ValueError("Invalid QSA expansion capacity")
+    m = row_count(m, True)
+
+    @T.prim_func
+    def main(
+        K: T.Tensor((capacity, 2, 64), T.uint32),
+        V: T.Tensor((capacity, 2, 64), T.uint32),
+        KS: T.Tensor((capacity, 2, 4), T.float16),
+        VS: T.Tensor((capacity, 2, 4), T.float16),
+        Position: T.Tensor((1,), T.int32),
+        ExpandedK: T.Tensor((limit, 2, 256), T.float16),
+        ExpandedV: T.Tensor((limit, 2, 256), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(limit, 4), 2, threads=128) as (group, h):
+            T.import_source(PACKED_SOURCE)
+            end = Position[0] + m
+            if end <= limit:
+                for row, lane in T.Parallel(4, 32, coalesced_width=T.int32(1)):
+                    token = group * 4 + row
+                    if token < end:
+                        T.call_extern(
+                            "void",
+                            "qsa_dequant_store_eight",
+                            T.access_ptr(ExpandedK[token, h, lane * 8], "w", 8),
+                            K[token, h, lane * 2],
+                            K[token, h, lane * 2 + 1],
+                            T.reinterpret(T.uint16, KS[token, h, lane // 8]),
+                        )
+                        T.call_extern(
+                            "void",
+                            "qsa_dequant_store_eight",
+                            T.access_ptr(ExpandedV[token, h, lane * 8], "w", 8),
+                            V[token, h, lane * 2],
+                            V[token, h, lane * 2 + 1],
+                            T.reinterpret(T.uint16, VS[token, h, lane // 8]),
+                        )
+
     return main

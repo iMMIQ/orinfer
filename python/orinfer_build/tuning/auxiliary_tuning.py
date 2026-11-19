@@ -217,7 +217,7 @@ _QSA_STATE = {"K", "V", "KS", "VS", "Position"}
 _QSA_ATTENTION = _QSA_STATE | {"Query", "Selected", "Max", "Den", "Out"}
 
 
-def _packed_qsa(rows, context):
+def _packed_qsa(rows, context, expanded_capacity=0):
     from kernels.cuda.model.qsa_attention import sparse_attention
 
     return sparse_attention.__wrapped__(
@@ -229,6 +229,7 @@ def _packed_qsa(rows, context):
         async_scales=True,
         vector_dequant=True,
         explicit_barriers=True,
+        expanded_capacity=expanded_capacity,
     )
 
 
