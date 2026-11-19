@@ -18,18 +18,34 @@ def dense_selection(local, merge, compiler, rows, context):
         or any(kernel["block"] != [128, 1, 1] for kernel in (local, merge))
     ):
         raise ValueError(f"Unexpected native QSA selection pair: {local['name']}")
+    direct_blocks = 2048
     return (
         (
             local,
             producer,
-            partial(select.__wrapped__, rows, context, True, query_major=True, dense_scores=True),
+            partial(
+                select.__wrapped__,
+                rows,
+                context,
+                True,
+                query_major=True,
+                dense_scores=True,
+                direct_blocks=direct_blocks,
+            ),
             "partial",
         ),
         (
             merge,
             consumer | {"Scores": producer["Scores"]},
             partial(
-                merge_selection.__wrapped__, rows, 2, True, warp_sort=True, score_capacity=context
+                merge_selection.__wrapped__,
+                rows,
+                2,
+                True,
+                threads=256,
+                warp_sort=True,
+                score_capacity=context,
+                direct_blocks=direct_blocks,
             ),
             "merge",
         ),
@@ -100,7 +116,7 @@ def publish(data, package, manifest, compiler):
                         bindings,
                         rows,
                         build=build,
-                        key=f"flash-qsa-dense-{role}-{context}-{rows}",
+                        key=f"flash-qsa-bounded-select-{role}-{context}-{rows}",
                     )
                 continue
             if old["grid"] != [rows, 2, 8]:

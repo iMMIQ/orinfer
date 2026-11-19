@@ -11,6 +11,11 @@ from kernels.shared.rows import row_count
 from orinfer_build.compiler.cuda.common import orin_jit
 
 
+def _direct_limit(blocks: int, query_major: bool):
+    if type(blocks) is not int or blocks not in (0, 2048) or (blocks and not query_major):
+        raise ValueError("Direct sparse QSA selection requires query-major scores")
+
+
 @orin_jit
 def select(
     m: int,
@@ -22,12 +27,15 @@ def select(
     *,
     query_major: bool = False,
     dense_scores: bool = False,
+    direct_blocks: int = 0,
 ):
     blocks = geometry(m, capacity)
     if tile not in (256, 512, 1024) or threads not in (128, 256) or parts not in (2, 4, 8):
         raise ValueError("Invalid QSA selection geometry")
     if dense_scores and not query_major:
         raise ValueError("Direct dense QSA selection requires query-major scores")
+    _direct_limit(direct_blocks, dense_scores)
+    partitioned_after = max(512, direct_blocks)
     m = row_count(m, dynamic_rows)
     score_shape = (m * blocks,) if query_major else (blocks, m)
 
@@ -92,9 +100,9 @@ def select(
             start = part * T.ceildiv(causal_full, parts)
             full = T.max(0, T.min(T.ceildiv(causal_full, parts), causal_full - start))
             tiles = T.ceildiv(full, tile)
-            # Fully dense rows read Scores in the merger. A local
+            # Bounded rows read Scores in the merger. A local
             # partition that fits can retain its candidates in ID order.
-            if not dense_scores or causal_full > 512:
+            if not dense_scores or causal_full > partitioned_after:
                 if dense_scores and full <= 512:
                     for i in T.Parallel(512):
                         key = T.alloc_var(T.int32, -1)
@@ -196,6 +204,7 @@ def merge(
     *,
     warp_sort=False,
     score_capacity: int = 0,
+    direct_blocks: int = 0,
 ):
     """Merge bounded local winners, then sort IDs in the original emission order.
 
@@ -204,6 +213,7 @@ def merge(
     """
     if parts not in (2, 4, 8) or threads not in (128, 256):
         raise ValueError("Invalid QSA candidate merge geometry")
+    _direct_limit(direct_blocks, score_capacity > 0)
     blocks = geometry(m, score_capacity) if score_capacity else 0
     m = row_count(m, dynamic_rows)
     if score_capacity:
@@ -254,6 +264,47 @@ __device__ __forceinline__ void qsa_sort_keys(int* keys) {
 """
     )
 
+    def cutoff(length):
+        @T.macro
+        def search(values, hist, control, cumulative):
+            for digit in T.unroll(4):
+                T.clear(hist)
+                T.sync_threads()
+                for i in T.Parallel(length):
+                    bucket = T.alloc_var(T.int32, 256)
+                    key = values[i]
+                    if key >= 0:
+                        if digit == 0 or key >> 32 - digit * 8 == control[0] >> 32 - digit * 8:
+                            bucket = key >> 24 - digit * 8 & 255
+                    peers = T.call_pure_extern(
+                        "uint32", "__match_any_sync", T.uint32(4294967295), bucket
+                    )
+                    if (
+                        bucket < 256
+                        and T.get_thread_binding() % 32
+                        == T.call_pure_extern("int32", "__ffs", peers) - 1
+                    ):
+                        T.atomic_add(hist[bucket], T.call_pure_extern("int32", "__popc", peers))
+                T.sync_threads()
+                for i in T.Parallel(256):
+                    cumulative[i] = hist[255 - i]
+                T.cumsum(cumulative, dim=0)
+                for i in T.Parallel(256):
+                    before = cumulative[i] - hist[255 - i]
+                    if before < control[1] and cumulative[i] >= control[1]:
+                        control[0] = control[0] | 255 - i << 24 - digit * 8
+                        control[2] = control[1] - before
+                T.sync_threads()
+                if T.get_thread_binding() == 0:
+                    control[1] = control[2]
+                T.sync_threads()
+
+        return search
+
+    merged_cutoff = cutoff(width)
+    bounded_cutoff = cutoff(direct_blocks) if direct_blocks else None
+    tie_stride = 4096
+
     @T.prim_func
     def main(
         Candidates: T.Tensor((m, parts * 1024), T.int32),
@@ -295,6 +346,38 @@ __device__ __forceinline__ void qsa_sort_keys(int* keys) {
                     if i < full:
                         order = ranks[i] - 1 if flags[i] != 0 else chosen[0] + i - ranks[i]
                         Selected[row, order * 4 + j] = i * 4 + j
+            elif direct_blocks and full <= direct_blocks:
+                score = T.alloc_fragment((direct_blocks,), T.int32)
+                ranks = T.alloc_fragment((direct_blocks,), T.int32)
+                live_blocks = (Position[0] + m) // 4
+                for i in T.Parallel(direct_blocks):
+                    score[i] = -1
+                    if i < full:
+                        score[i] = T.reinterpret(T.int32, scores[row * live_blocks + i])
+                T.clear(control)
+                if T.get_thread_binding() == 0:
+                    control[1] = 512
+                T.sync_threads()
+                bounded_cutoff(score, hist, control, cumulative)
+                # Both ranks fit in 12 bits. One inclusive scan preserves ID
+                # order in each group without materializing local winners.
+                for i in T.Parallel(direct_blocks):
+                    ranks[i] = T.if_then_else(
+                        score[i] > control[0],
+                        1,
+                        T.if_then_else(score[i] == control[0], tie_stride, 0),
+                    )
+                T.cumsum(ranks, dim=0)
+                for i in T.Parallel(3):
+                    Selected[row, 2048 + i] = T.if_then_else(i < tail, full * 4 + i, -1)
+                for i, j in T.Parallel(direct_blocks, 4):
+                    equal_rank = ranks[i] // tie_stride
+                    if score[i] > control[0]:
+                        output_block = ranks[i] % tie_stride - 1
+                        Selected[row, output_block * 4 + j] = i * 4 + j
+                    elif score[i] == control[0] and equal_rank <= control[1]:
+                        output_block = 512 - control[1] + equal_rank - 1
+                        Selected[row, output_block * 4 + j] = i * 4 + j
             else:
                 for i in T.Parallel(width):
                     values[i] = Candidates[row, i // 512 * 1024 + i % 512]
@@ -303,42 +386,7 @@ __device__ __forceinline__ void qsa_sort_keys(int* keys) {
                     control[1] = T.min(512, full)
                 T.sync_threads()
                 if full > 0:
-                    for digit in T.unroll(4):
-                        T.clear(hist)
-                        T.sync_threads()
-                        for i in T.Parallel(width):
-                            bucket = T.alloc_var(T.int32, 256)
-                            key = values[i]
-                            if key >= 0:
-                                if (
-                                    digit == 0
-                                    or key >> 32 - digit * 8 == control[0] >> 32 - digit * 8
-                                ):
-                                    bucket = key >> 24 - digit * 8 & 255
-                            peers = T.call_pure_extern(
-                                "uint32", "__match_any_sync", T.uint32(4294967295), bucket
-                            )
-                            if (
-                                bucket < 256
-                                and T.get_thread_binding() % 32
-                                == T.call_pure_extern("int32", "__ffs", peers) - 1
-                            ):
-                                T.atomic_add(
-                                    hist[bucket], T.call_pure_extern("int32", "__popc", peers)
-                                )
-                        T.sync_threads()
-                        for i in T.Parallel(256):
-                            cumulative[i] = hist[255 - i]
-                        T.cumsum(cumulative, dim=0)
-                        for i in T.Parallel(256):
-                            before = cumulative[i] - hist[255 - i]
-                            if before < control[1] and cumulative[i] >= control[1]:
-                                control[0] = control[0] | 255 - i << 24 - digit * 8
-                                control[2] = control[1] - before
-                        T.sync_threads()
-                        if T.get_thread_binding() == 0:
-                            control[1] = control[2]
-                        T.sync_threads()
+                    merged_cutoff(values, hist, control, cumulative)
                 for i in T.Parallel(width):
                     keys[i] = 2147483647
                     if values[i] >= control[0] and values[i] >= 0:
