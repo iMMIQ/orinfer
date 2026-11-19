@@ -4,6 +4,7 @@ FP16 tensor-core QK/PV use FP32 accumulators and softmax. Native prefill can
 stage FP16 KV in reusable layer workspace; all other launches unpack each tile.
 """
 
+import tilelang
 import tilelang.language as T
 from orinfer_build.compiler.cuda.common import orin_jit
 from kernels.shared.rows import row_count
@@ -104,11 +105,32 @@ def sparse_attention(
     if expanded_capacity and not (0 < expanded_capacity <= capacity and explicit_barriers):
         raise ValueError("QSA expansion requires bounded KV and explicit barriers")
     block = block_size
-    # This prefill layout gives each thread two query heads. Reduce them
-    # together to share CTA barriers while preserving each head's sum tree.
-    reduction_batch = 2 if expanded_capacity and block == 32 and threads == 128 else 1
+    shared_softmax = bool(expanded_capacity and block == 32 and threads == 128)
     kv_width = 64 if packed else 256
     kv_dtype = T.uint32 if packed else T.int8
+
+    @T.macro
+    def reduce_tile(scores, pairs, scratch, partial, result, maximum):
+        # Each lane owns two adjacent scores. Publish their reduction once,
+        # then combine the four warps in the original XOR-butterfly order.
+        tile = T.reshape(scores, (16, 16, 2))
+        if maximum:
+            T.reduce_max(tile, pairs, dim=2)
+        else:
+            T.reduce_sum(tile, pairs, dim=2)
+        for i, pair in T.Parallel(16, 16):
+            scratch[pair // 4, i, pair % 4] = pairs[i, pair]
+        T.sync_threads()
+        for i, slot in T.Parallel(16, 4):
+            a = scratch[0, i, slot]
+            b = scratch[1, i, slot]
+            c = scratch[2, i, slot]
+            d = scratch[3, i, slot]
+            partial[i, slot] = T.max(T.max(a, c), T.max(b, d)) if maximum else (a + c) + (b + d)
+        if maximum:
+            T.reduce_max(partial, result, dim=1, clear=False)
+        else:
+            T.reduce_sum(partial, result, dim=1)
 
     @T.macro
     def dequantize(raw, scales, output):
@@ -169,6 +191,23 @@ def sparse_attention(
             previous = T.alloc_fragment((16,), T.float32)
             correction = T.alloc_fragment((16,), T.float32)
             rowsum = T.alloc_fragment((16,), T.float32)
+            if shared_softmax:
+                pairs = T.alloc_fragment((16, 16), T.float32)
+                # Separate buffers let sum publication overlap earlier max
+                # readers. The leading tile barrier protects their reuse.
+                maximum_scratch = T.alloc_shared((4, 16, 4), T.float32)
+                sum_scratch = T.alloc_shared((4, 16, 4), T.float32)
+                partial = T.alloc_fragment((16, 4), T.float32)
+                T.annotate_layout(
+                    {
+                        partial: tilelang.Fragment(
+                            (16, 4),
+                            forward_thread_fn=lambda i, j, replica: (i % 8) * 4 + j + replica * 32,
+                            forward_index_fn=lambda i, j: i // 8,
+                            replicate=4,
+                        )
+                    }
+                )
             T.clear(acc)
             T.clear(denom)
             T.fill(maximum, -3.402823466e38)
@@ -348,7 +387,10 @@ def sparse_attention(
                                 scores[i, j] * 0.0625,
                                 -3.402823466e38,
                             )
-                    T.reduce_max(scores, maximum, dim=1, clear=False, batch=reduction_batch)
+                    if shared_softmax:
+                        reduce_tile(scores, pairs, maximum_scratch, partial, maximum, True)
+                    else:
+                        T.reduce_max(scores, maximum, dim=1, clear=False)
                     if start + (tile + 1) * block <= end:
                         for i, j in T.Parallel(16, block):
                             scores[i, j] = T.exp(scores[i, j] - maximum[i])
@@ -374,7 +416,10 @@ def sparse_attention(
                         else:
                             scores[i, j] = 0
                         p[i, j] = scores[i, j]
-                T.reduce_sum(scores, rowsum, dim=1, batch=reduction_batch)
+                if shared_softmax:
+                    reduce_tile(scores, pairs, sum_scratch, partial, rowsum, False)
+                else:
+                    T.reduce_sum(scores, rowsum, dim=1)
                 for i in T.Parallel(16):
                     correction[i] = T.exp(previous[i] - maximum[i])
                     denom[i] = denom[i] * correction[i] + rowsum[i]
