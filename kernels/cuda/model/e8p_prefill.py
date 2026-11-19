@@ -150,6 +150,7 @@ def e8p_prefill_grouped(
     block_m=16,
     block_n=128,
     specialize_tails=False,
+    merge_routed_tiles=False,
 ):
     """One routed-tile mainloop; optionally predicate empty MMA row stripes.
 
@@ -157,6 +158,7 @@ def e8p_prefill_grouped(
     mask complete hardware M8 stripes inside this body. Offline tuning selects
     both row reuse and whether masking pays off. The wide Q2 tail variant
     uses constant M8/M16 loops when a routed tile has at most 16 live rows.
+    Gate/up can merge adjacent 16-row tiles from a shared routing table.
     """
     if (
         any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
@@ -172,6 +174,9 @@ def e8p_prefill_grouped(
         or type(specialize_tails) is not bool
         or specialize_tails
         and (block_m != 32 or codec != "e8p_q2")
+        or type(merge_routed_tiles) is not bool
+        or merge_routed_tiles
+        and not specialize_tails
         or K % 128
         or K * 128 * 128 > 2**31 - 1
     ):
@@ -184,7 +189,10 @@ def e8p_prefill_grouped(
     rows = row_count(rows, dynamic_rows)
     # Group-major strides depend on live rows, rather than allocation capacity.
     group_stride, row_stride = (32, K // 2) if row_major else (rows * 32, 32)
-    launch_tiles = T.min(tiles, T.ceildiv(rows, BM) + T.min(E, rows)) if dynamic_rows else tiles
+    routing_rows = BM // 2 if merge_routed_tiles else BM
+    launch_tiles = (
+        T.min(tiles, T.ceildiv(rows, routing_rows) + T.min(E, rows)) if dynamic_rows else tiles
+    )
 
     @T.macro
     def prefetch_weight(P, packed, slot, step, bx, expert, tid):
@@ -214,13 +222,29 @@ def e8p_prefill_grouped(
                 predicate=bx * BN + tid < N,
             )
 
-    tile_rows = BM
-    multiply = folded_pair(tile_rows) if q4 else mma_pair(tile_rows)
-    store = store_folded_rows(tile_rows, BN, N, 5) if q4 else store_rows(tile_rows, BN, N)
+    multiply = folded_pair(BM) if q4 else mma_pair(BM)
+    store = store_folded_rows(BM, BN, N, 5) if q4 else store_rows(BM, BN, N)
+    multiply_short = mma_pair(8)
+    store_short = store_rows(8, BN, N)
 
     @T.macro
     def project(
-        Low, High, Sum, P, WS, AS, Out, packed, inputs, book, bx, expert, offset, count, stripes
+        Low,
+        High,
+        Sum,
+        P,
+        WS,
+        AS,
+        Out,
+        packed,
+        inputs,
+        book,
+        bx,
+        expert,
+        offset,
+        count,
+        tile_rows,
+        stripes,
     ):
         tid = T.get_thread_binding()
         lane, warp = tid % 32, tid // 32
@@ -425,10 +449,14 @@ def e8p_prefill_grouped(
                                             multiply(lo, v, a, nt, stripe, 8)
                                         else:
                                             multiply(lo, v, a, nt, stripe, 2)
+                                    elif tile_rows == 8:
+                                        multiply_short(lo, hi, v, a, nt, stripe)
                                     else:
                                         multiply(lo, hi, v, a, nt, stripe)
         if q4:
             store(lo, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset)
+        elif tile_rows == 8:
+            store_short(lo, hi, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset, offset)
         else:
             store(lo, hi, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset, offset)
 
@@ -455,7 +483,9 @@ def e8p_prefill_grouped(
             packed = T.alloc_shared((2, BN, 16) if q4 else (4, BN, 8), packed_dtype)
             inputs = T.alloc_shared((4, 2, BM, input_stride), T.int8)
             book = T.alloc_shared((256,), T.uint32)
-            if tile < TC[0]:
+            # Each pair has consecutive offsets in one expert. The second
+            # entry remains available to the 16-row down projection.
+            if tile < TC[0] and (not merge_routed_tiles or TR[tile] % BM == 0):
                 if q4:
                     metadata = T.alloc_local((3,), T.int32)
                     metadata[0] = TE[tile]
@@ -486,6 +516,7 @@ def e8p_prefill_grouped(
                         expert,
                         offset,
                         count,
+                        8 if merge_routed_tiles else BM,
                         1,
                     )
                 elif specialize_tails and count <= 16:
@@ -504,6 +535,7 @@ def e8p_prefill_grouped(
                         expert,
                         offset,
                         count,
+                        BM,
                         2,
                     )
                 else:
@@ -522,6 +554,7 @@ def e8p_prefill_grouped(
                         expert,
                         offset,
                         count,
+                        BM,
                         BM // 8,
                     )
 

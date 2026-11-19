@@ -107,6 +107,7 @@ def publish(data, package, manifest, compiler):
     # SM87 gate/up benefits from smaller output tiles and fixed short-tail
     # loops. Real prefill routing favors the wider row tile from 1200 rows.
     first, block_m = 1200, 32
+    merge_from, base_tile = 640, 16
     text = package["config_signature"]["text"]
     experts, top = text["num_experts"], text["num_experts_per_tok"]
     kernels = {k["name"]: k for k in package["kernels"]}
@@ -118,6 +119,7 @@ def publish(data, package, manifest, compiler):
             continue
         capacity = tile_capacity(rows, experts, top, block_m)
         suffix = f"/choice/{first}-{rows}/1/k0"
+        merged = f"/choice/{merge_from}-{first - 1}/1/k0"
         groups = {}
         for op in manifest["programs"][plan["prefill_program"]]:
             if op["kind"] == "kernel":
@@ -160,11 +162,11 @@ def publish(data, package, manifest, compiler):
                 ):
                     raise ValueError("Wide expert tile exceeds its routing workspace")
 
-            def emit(old, pointers, build, key, multiplier=1):
-                name = old["name"] + suffix
+            def emit(old, pointers, build, key, multiplier=1, *, selection=suffix, extra=()):
+                name = old["name"] + selection
                 previous = {old["name"] + f"/choice/{start}-{rows}/1/k0" for start in (1280, 2048)}
                 choices = {n for n in kernels if n.startswith(old["name"] + "/choice/")}
-                if choices - ({name} | previous):
+                if choices - ({name} | previous | {old["name"] + choice for choice in extra}):
                     raise ValueError("Overlapping Flash prefill expert choices")
                 obsolete.update(choices & previous)
                 if old["name"] in dynamic and dynamic[old["name"]]["capacity"] != rows:
@@ -228,7 +230,38 @@ def publish(data, package, manifest, compiler):
                     ),
                     f"expert-wide-{'gate-up-ldm4' if gate_up else 'down'}-{rows}-{experts}-{top}-{n}-{k}",
                     multiplier=top,
+                    extra=(merged,) if gate_up else (),
                 )
+                if gate_up:
+                    # The base router and down projection retain 16-row
+                    # tiles in this interval. Gate/up consumes pairs from
+                    # the same offsets and writes the original routed rows.
+                    base_capacity = tile_capacity(rows, experts, top, base_tile)
+                    if any(
+                        compiler.buffers[tile_args[role]["name"]]["shape"][0] < base_capacity
+                        for role in ("TileExpert", "TileRow")
+                    ):
+                        raise ValueError("Paired gate/up exceeds its routing workspace")
+                    emit(
+                        projection,
+                        pointers,
+                        lambda: e8p_prefill.e8p_prefill_grouped.__wrapped__(
+                            rows * top,
+                            experts,
+                            base_capacity,
+                            n,
+                            k,
+                            dynamic_rows=True,
+                            block_m=block_m,
+                            block_n=64,
+                            specialize_tails=True,
+                            merge_routed_tiles=True,
+                        ),
+                        f"expert-gate-up-paired-{rows}-{experts}-{top}-{n}-{k}",
+                        multiplier=top,
+                        selection=merged,
+                        extra=(suffix,),
+                    )
     if not added:
         raise ValueError("Missing wide Flash prefill expert bindings")
     for name in obsolete:
