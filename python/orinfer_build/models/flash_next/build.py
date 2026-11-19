@@ -161,8 +161,8 @@ def rebuild(args):
             from orinfer_build.tuning.auxiliary_tuning import publish_qsa_prefill
 
             def publish(package, manifest, compiler):
-                packed = publish_qsa_prefill(package, manifest, compiler, attention_only=True)
-                return packed + publish_qsa(data, package, manifest, compiler)
+                canonical = publish_qsa_prefill(package, manifest, compiler)
+                return canonical + publish_qsa(data, package, manifest, compiler)
         elif args.hc_prefill_only:
             from functools import partial
             from orinfer_build.models.flash_next.hc_prefill import publish as publish_hc_prefill
@@ -490,7 +490,7 @@ def main():
     auxiliary.add_argument(
         "--qsa-attention-only",
         action="store_true",
-        help="Rebuild Flash QSA prefill attention and bounded FP16 KV expansion",
+        help="Rebuild Flash prefill QSA selection, attention and bounded KV expansion",
     )
     auxiliary.add_argument(
         "--gdn-prefill-only",

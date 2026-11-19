@@ -1,6 +1,39 @@
-"""Stage short-context FP16 KV for the native prefill attention pass."""
+"""Publish Flash Next native prefill QSA selections and FP16 KV staging."""
 
 from functools import partial
+
+
+def dense_selection(local, merge, compiler, rows, context):
+    from kernels.cuda.model.qsa_selection import select, merge as merge_selection
+
+    producer = compiler.pointers(local)
+    consumer = compiler.pointers(merge)
+    if (
+        producer.keys() != {"Scores", "Position", "Selected"}
+        or consumer.keys() != {"Candidates", "Position", "Selected"}
+        or producer["Selected"] != consumer["Candidates"]
+        or producer["Position"] != consumer["Position"]
+        or local["grid"] != [rows, 2, 1]
+        or merge["grid"] != [rows, 1, 1]
+        or any(kernel["block"] != [128, 1, 1] for kernel in (local, merge))
+    ):
+        raise ValueError(f"Unexpected native QSA selection pair: {local['name']}")
+    return (
+        (
+            local,
+            producer,
+            partial(select.__wrapped__, rows, context, True, query_major=True, dense_scores=True),
+            "partial",
+        ),
+        (
+            merge,
+            consumer | {"Scores": producer["Scores"]},
+            partial(
+                merge_selection.__wrapped__, rows, 2, True, warp_sort=True, score_capacity=context
+            ),
+            "merge",
+        ),
+    )
 
 
 def publish(data, package, manifest, compiler):
@@ -51,6 +84,25 @@ def publish(data, package, manifest, compiler):
                 continue
             name = op["name"]
             old = kernels[name]
+            if old["symbol"] == "qsa_select_partial_kernel":
+                merge = kernels.get(following.get("name"))
+                if merge is None or merge["symbol"] != "qsa_select_merge_kernel":
+                    raise ValueError(f"Missing native QSA candidate merge: {name}")
+                for kernel, bindings, build, role in dense_selection(
+                    old, merge, compiler, rows, context
+                ):
+                    choice = f"{kernel['name']}/choice/1-{rows}/1/k0"
+                    if dynamic[kernel["name"]]["capacity"] != rows:
+                        raise ValueError(f"Unexpected native QSA row capacity: {kernel['name']}")
+                    added[choice], launches[choice] = compiler.emit(
+                        kernel,
+                        choice,
+                        bindings,
+                        rows,
+                        build=build,
+                        key=f"flash-qsa-dense-{role}-{context}-{rows}",
+                    )
+                continue
             if old["grid"] != [rows, 2, 8]:
                 continue
             operands = compiler.pointers(old)
