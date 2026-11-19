@@ -331,18 +331,46 @@ def sparse_attention(
                 T.gemm(q, k, scores, transpose_B=True, clear_accum=True)
                 for i in T.Parallel(16):
                     previous[i] = maximum[i]
-                for i, j in T.Parallel(16, block):
-                    if i < 12 and start + tile * block + j < end:
-                        scores[i, j] *= 0.0625
+                if expanded_capacity:
+                    # Prefill uses the same softmax recurrence for complete and
+                    # partial tiles. Only the final partial tile needs a mask.
+                    # Padded query heads are independent and never written back.
+                    if start + (tile + 1) * block <= end:
+                        for i, j in T.Parallel(16, block):
+                            scores[i, j] *= 0.0625
                     else:
-                        scores[i, j] = -3.402823466e38
-                T.reduce_max(scores, maximum, dim=1, clear=False)
-                for i, j in T.Parallel(16, block):
-                    if i < 12 and start + tile * block + j < end:
-                        scores[i, j] = T.exp(scores[i, j] - maximum[i])
+                        for i, j in T.Parallel(16, block):
+                            scores[i, j] = T.if_then_else(
+                                start + tile * block + j < end,
+                                scores[i, j] * 0.0625,
+                                -3.402823466e38,
+                            )
+                    T.reduce_max(scores, maximum, dim=1, clear=False)
+                    if start + (tile + 1) * block <= end:
+                        for i, j in T.Parallel(16, block):
+                            scores[i, j] = T.exp(scores[i, j] - maximum[i])
+                            p[i, j] = scores[i, j]
                     else:
-                        scores[i, j] = 0
-                    p[i, j] = scores[i, j]
+                        for i, j in T.Parallel(16, block):
+                            scores[i, j] = T.if_then_else(
+                                start + tile * block + j < end,
+                                T.exp(scores[i, j] - maximum[i]),
+                                0,
+                            )
+                            p[i, j] = scores[i, j]
+                else:
+                    for i, j in T.Parallel(16, block):
+                        if i < 12 and start + tile * block + j < end:
+                            scores[i, j] *= 0.0625
+                        else:
+                            scores[i, j] = -3.402823466e38
+                    T.reduce_max(scores, maximum, dim=1, clear=False)
+                    for i, j in T.Parallel(16, block):
+                        if i < 12 and start + tile * block + j < end:
+                            scores[i, j] = T.exp(scores[i, j] - maximum[i])
+                        else:
+                            scores[i, j] = 0
+                        p[i, j] = scores[i, j]
                 T.reduce_sum(scores, rowsum, dim=1)
                 for i in T.Parallel(16):
                     correction[i] = T.exp(previous[i] - maximum[i])
