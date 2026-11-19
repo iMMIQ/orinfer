@@ -104,6 +104,9 @@ def sparse_attention(
     if expanded_capacity and not (0 < expanded_capacity <= capacity and explicit_barriers):
         raise ValueError("QSA expansion requires bounded KV and explicit barriers")
     block = block_size
+    # This prefill layout gives each thread two query heads. Reduce them
+    # together to share CTA barriers while preserving each head's sum tree.
+    reduction_batch = 2 if expanded_capacity and block == 32 and threads == 128 else 1
     kv_width = 64 if packed else 256
     kv_dtype = T.uint32 if packed else T.int8
 
@@ -345,7 +348,7 @@ def sparse_attention(
                                 scores[i, j] * 0.0625,
                                 -3.402823466e38,
                             )
-                    T.reduce_max(scores, maximum, dim=1, clear=False)
+                    T.reduce_max(scores, maximum, dim=1, clear=False, batch=reduction_batch)
                     if start + (tile + 1) * block <= end:
                         for i, j in T.Parallel(16, block):
                             scores[i, j] = T.exp(scores[i, j] - maximum[i])
@@ -371,7 +374,7 @@ def sparse_attention(
                         else:
                             scores[i, j] = 0
                         p[i, j] = scores[i, j]
-                T.reduce_sum(scores, rowsum, dim=1)
+                T.reduce_sum(scores, rowsum, dim=1, batch=reduction_batch)
                 for i in T.Parallel(16):
                     correction[i] = T.exp(previous[i] - maximum[i])
                     denom[i] = denom[i] * correction[i] + rowsum[i]
