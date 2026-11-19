@@ -121,7 +121,7 @@ def publish(package, manifest, compiler):
                         block_n=64 if gate_up else 128,
                         specialize_tails=gate_up,
                     ),
-                    f"expert-wide-tail-{rows}-{experts}-{top}-{n}-{k}-{int(gate_up)}",
+                    f"expert-wide-{'gate-up-ldm4' if gate_up else 'down'}-{rows}-{experts}-{top}-{n}-{k}",
                     multiplier=top,
                 )
     if not added:

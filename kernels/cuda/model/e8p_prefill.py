@@ -364,40 +364,38 @@ def e8p_prefill_grouped(
                         if not sparse_rows or stripe * 8 < count:
                             r_index = lane % 8 + stripe * 8
                             col = (lane // 8 % 2) * 16
-                            T.evaluate(
-                                T.call_extern(
-                                    "void",
-                                    "nib_ldm2",
-                                    T.access_ptr(
-                                        inputs[
-                                            slot,
-                                            0,
-                                            r_index,
-                                            col ^ (((r_index // 4) % 2) * input_mask),
-                                        ],
-                                        "r",
-                                        16,
-                                    ),
-                                    T.access_ptr(a[stripe * 2], "w", 2),
+                            address = col ^ (((r_index // 4) % 2) * input_mask)
+                            if specialize_tails:
+                                # Lanes 0–15 supply low-plane addresses and
+                                # lanes 16–31 supply high-plane addresses.
+                                planes = T.alloc_local((4,), T.uint32)
+                                T.evaluate(
+                                    T.call_extern(
+                                        "void",
+                                        "nib_ldm4",
+                                        T.access_ptr(
+                                            inputs[slot, lane // 16, r_index, address], "r", 16
+                                        ),
+                                        T.access_ptr(planes[0], "w", 4),
+                                    )
                                 )
-                            )
-                            T.evaluate(
-                                T.call_extern(
-                                    "void",
-                                    "nib_ldm2",
-                                    T.access_ptr(
-                                        inputs[
-                                            slot,
-                                            1,
-                                            r_index,
-                                            col ^ (((r_index // 4) % 2) * input_mask),
-                                        ],
-                                        "r",
-                                        16,
-                                    ),
-                                    T.access_ptr(a[tile_rows // 4 + stripe * 2], "w", 2),
-                                )
-                            )
+                                for word in T.unroll(2):
+                                    a[stripe * 2 + word] = planes[word]
+                                    a[tile_rows // 4 + stripe * 2 + word] = planes[word + 2]
+                            else:
+                                for plane in T.unroll(2):
+                                    T.evaluate(
+                                        T.call_extern(
+                                            "void",
+                                            "nib_ldm2",
+                                            T.access_ptr(
+                                                inputs[slot, plane, r_index, address], "r", 16
+                                            ),
+                                            T.access_ptr(
+                                                a[plane * (tile_rows // 4) + stripe * 2], "w", 2
+                                            ),
+                                        )
+                                    )
                     for nt in T.unroll(2):
                         for level in T.unroll(2 if q4 else 1):
                             for rr in T.unroll(4):

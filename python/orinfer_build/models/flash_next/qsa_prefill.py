@@ -4,6 +4,7 @@ from functools import partial
 
 
 def publish(data, package, manifest, compiler):
+    from kernels.cuda.model.qsa import sparse_merge
     from kernels.cuda.model.qsa_attention import expand_prefill_kv
     from orinfer_build.tuning.auxiliary_tuning import (
         _QSA_ATTENTION,
@@ -44,7 +45,8 @@ def publish(data, package, manifest, compiler):
     added, launches = {}, {}
     for plan in manifest["prefill_plans"]:
         rows = plan["chunk_tokens"]
-        for op in manifest["programs"][plan["prefill_program"]]:
+        operations = manifest["programs"][plan["prefill_program"]]
+        for op, following in zip(operations, operations[1:]):
             if op["kind"] != "kernel":
                 continue
             name = op["name"]
@@ -56,17 +58,42 @@ def publish(data, package, manifest, compiler):
                 continue
             if dynamic[name]["capacity"] != rows or old["block"] != [128, 1, 1]:
                 raise ValueError(f"Unexpected native QSA attention geometry: {name}")
-            stage = {role: operands[role] for role in _QSA_STATE} | expanded
-            for i, (bindings, build) in enumerate(
-                (
-                    (stage, partial(expand_prefill_kv, rows, context, limit)),
-                    (operands | expanded, partial(_packed_qsa, rows, context, limit)),
-                )
+            merge = kernels.get(following.get("name"))
+            if merge is None or merge["grid"] != [rows, 24, 1]:
+                raise ValueError(f"Missing native QSA partition merge: {name}")
+            merge_args = compiler.pointers(merge)
+            position = operands["Position"]
+            if (
+                merge_args.keys() - {"Position"} != {"Max", "Den", "Out", "Gate", "Output"}
+                or any(operands[role] != merge_args[role] for role in ("Max", "Den", "Out"))
+                or merge_args.get("Position", position) != position
+                or dynamic[merge["name"]]["capacity"] != rows
             ):
-                choice = f"{name}/choice/{first}-{rows}/1/k{i}"
-                key = f"flash-qsa-expanded-kv-{context}-{limit}-{rows}-{i}"
-                added[choice], launches[choice] = compiler.emit(
+                raise ValueError(f"Unexpected native QSA merge contract: {merge['name']}")
+            stage = {role: operands[role] for role in _QSA_STATE} | expanded
+            # The merge and attention choices use the same row interval.
+            # The merge reads only partitions the attention CTA populated.
+            for kernel, i, role, bindings, build in (
+                (old, 0, "expand", stage, partial(expand_prefill_kv, rows, context, limit)),
+                (
                     old,
+                    1,
+                    "attention",
+                    operands | expanded,
+                    partial(_packed_qsa, rows, context, limit, skip_empty=True),
+                ),
+                (
+                    merge,
+                    0,
+                    "merge",
+                    merge_args | {"Position": position},
+                    partial(sparse_merge.__wrapped__, rows, dynamic_rows=True, split_size=256),
+                ),
+            ):
+                choice = f"{kernel['name']}/choice/{first}-{rows}/1/k{i}"
+                key = f"flash-qsa-live-{role}-{context}-{limit}-{rows}"
+                added[choice], launches[choice] = compiler.emit(
+                    kernel,
                     choice,
                     bindings,
                     rows,
