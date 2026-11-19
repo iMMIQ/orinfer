@@ -171,7 +171,10 @@ def rebuild(args):
         elif args.expert_decode_only:
             from orinfer_build.models.flash_next.expert_decode import publish
         else:
-            from orinfer_build.models.flash_next.expert_prefill import publish
+            from functools import partial
+            from orinfer_build.models.flash_next.expert_prefill import publish as publish_expert
+
+            publish = partial(publish_expert, data)
 
         configure()
         with atomic_model(args.model_output) as staging:

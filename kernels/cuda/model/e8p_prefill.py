@@ -587,3 +587,69 @@ def dispatch_prefill_a8(M, K=2560, E=512, top_k=10, dynamic_rows=False):
                     SlotMap[row, rank] = slot
 
     return dispatch_planes
+
+
+def pack_expert_tokens(M, K, E, top_k):
+    """Pack each live source token once and record the inverse dispatch map."""
+    m = row_count(M, True)
+    pack = _split_a8_block(K)
+
+    @T.prim_func
+    def pack_tokens(
+        A: T.Tensor((m, K), T.int8),
+        IDs: T.Tensor((m, top_k), T.int32),
+        RelativeSlot: T.Tensor((m, top_k), T.int32),
+        RowOffsets: T.Tensor((E,), T.int32),
+        Low: T.Tensor((K // 64, m, 8), T.uint32),
+        High: T.Tensor((K // 64, m, 8), T.uint32),
+        Sum: T.Tensor((m,), T.int32),
+        Sources: T.Tensor((m * top_k,), T.int32),
+        SlotMap: T.Tensor((m, top_k), T.int32),
+    ):
+        with T.Kernel(T.ceildiv(m, 4), threads=128) as block:
+            first = block * 4
+            pack(A, Low, High, Sum, first, T.min(4, m - first))
+            for i, rank in T.Parallel(4, top_k):
+                row = first + i
+                if row < m:
+                    slot = RowOffsets[IDs[row, rank]] + RelativeSlot[row, rank]
+                    SlotMap[row, rank] = slot
+                    Sources[slot] = row
+
+    return pack_tokens
+
+
+def expand_expert_slots(M, K, top_k):
+    """Copy packed activations to contiguous K64-major expert slots."""
+    m = row_count(M, True)
+    assignments = m * top_k
+    tile = 64
+
+    @T.prim_func
+    def expand_slots(
+        SrcLow: T.Tensor((K // 64, m, 8), T.uint32),
+        SrcHigh: T.Tensor((K // 64, m, 8), T.uint32),
+        SrcSum: T.Tensor((m,), T.int32),
+        Scale: T.Tensor((m, 1), T.float16),
+        Sources: T.Tensor((assignments,), T.int32),
+        Low: T.Tensor((K // 64, assignments, 8), T.uint32),
+        High: T.Tensor((K // 64, assignments, 8), T.uint32),
+        Sum: T.Tensor((assignments,), T.int32),
+        DS: T.Tensor((assignments, 1), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(assignments, tile), K // 64, threads=128) as (block, group):
+            for i, word in T.Parallel(tile, 8):
+                slot = block * tile + i
+                if slot < assignments:
+                    token = Sources[slot]
+                    Low[group, slot, word] = SrcLow[group, token, word]
+                    High[group, slot, word] = SrcHigh[group, token, word]
+            if group == 0:
+                for i in T.Parallel(tile):
+                    slot = block * tile + i
+                    if slot < assignments:
+                        token = Sources[slot]
+                        Sum[slot] = SrcSum[token]
+                        DS[slot, 0] = Scale[token, 0]
+
+    return expand_slots

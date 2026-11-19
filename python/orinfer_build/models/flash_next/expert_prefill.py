@@ -1,9 +1,107 @@
-"""Publish the wide Flash Next expert tile for long native prefill."""
+"""Publish expert dispatch and wide expert tiles for Flash Next native prefill."""
+
+from functools import partial
 
 from orinfer_build.tuning.expert_tuning import tile_capacity
 
 
-def publish(package, manifest, compiler):
+def _token_workspace(data, package, compiler, rows, width, top):
+    shapes = {
+        "Low": ("u32", [width // 64, rows, 8]),
+        "High": ("u32", [width // 64, rows, 8]),
+        "Sum": ("i32", [rows]),
+        "Sources": ("i32", [rows * top]),
+    }
+    workspace = {}
+    for role, (dtype, shape) in shapes.items():
+        name = f"FlashPrefillExpertToken{role}"
+        desc = dict(
+            name=name,
+            dtype=dtype,
+            shape=shape,
+            alignment=256,
+            layout="native_contiguous",
+            access="read_write",
+        )
+        if name in compiler.buffers:
+            buffer = compiler.buffers[name]
+            if (
+                any(buffer.get(key) != value for key, value in desc.items())
+                or buffer.get("data") is not None
+                or data["buffer_scopes"].get(name) != "workspace"
+            ):
+                raise ValueError(f"Invalid expert token workspace: {name}")
+        else:
+            compiler.buffers[name] = desc
+            data["metadata"]["buffers"].append(dict(desc, data=None))
+            data["buffer_scopes"][name] = "workspace"
+            package["buffer_contracts"].append(desc)
+        workspace[role] = dict(kind="buffer", name=name)
+    return workspace
+
+
+def _dispatch_choices(data, package, compiler, preceding, projection, kernels, dynamic, rows):
+    from kernels.cuda.model.e8p_prefill import expand_expert_slots, pack_expert_tokens
+
+    first = 256
+    for op in preceding:
+        slot = op["name"]
+        wide = f"{slot}/choice/56-{rows}/1/k0"
+        small = f"{slot}/choice/56-{first - 1}/1/k0"
+        old = kernels.get(wide, kernels.get(small))
+        if old is None or old["symbol"] != "dispatch_planes_kernel":
+            continue
+        old_args = compiler.pointers(old)
+        expected = {
+            "A",
+            "Scale",
+            "IDs",
+            "RelativeSlot",
+            "RowOffsets",
+            "Low",
+            "High",
+            "Sum",
+            "DS",
+            "SlotMap",
+        }
+        if old_args.keys() != expected or dynamic[old["name"]]["capacity"] != rows:
+            raise ValueError(f"Unexpected native expert dispatch contract: {slot}")
+        projection_args = compiler.pointers(projection)
+        if any(old_args[role] != projection_args[role] for role in ("Low", "High", "Sum")) or (
+            old_args["DS"] != projection_args["AS"]
+            or old_args["RowOffsets"] != projection_args["Offsets"]
+        ):
+            raise ValueError(f"Expert dispatch and projection views differ: {slot}")
+        text = package["config_signature"]["text"]
+        width, experts, top = text["hidden_size"], text["num_experts"], text["num_experts_per_tok"]
+        workspace = _token_workspace(data, package, compiler, rows, width, top)
+        pack_args = {
+            role: old_args[role] for role in ("A", "IDs", "RelativeSlot", "RowOffsets", "SlotMap")
+        } | workspace
+        expand_args = {role: old_args[role] for role in ("Scale", "Low", "High", "Sum", "DS")} | {
+            **{f"Src{role}": workspace[role] for role in ("Low", "High", "Sum")},
+            "Sources": workspace["Sources"],
+        }
+        bindings = {small: dict(old, name=small)}
+        launches = {small: dict(dynamic[old["name"]], name=small)}
+        for i, arguments, build in (
+            (0, pack_args, partial(pack_expert_tokens, rows, width, experts, top)),
+            (1, expand_args, partial(expand_expert_slots, rows, width, top)),
+        ):
+            name = f"{slot}/choice/{first}-{rows}/1/k{i}"
+            bindings[name], launches[name] = compiler.emit(
+                old,
+                name,
+                arguments,
+                rows,
+                build=build,
+                key=f"flash-expert-token-dispatch-{rows}-{width}-{experts}-{top}-{i}",
+            )
+        return bindings, launches, {wide} & kernels.keys()
+    return {}, {}, set()
+
+
+def publish(data, package, manifest, compiler):
     from kernels.cuda.model import e8p_prefill, moe
 
     # SM87 gate/up benefits from smaller output tiles and fixed short-tail
@@ -31,13 +129,20 @@ def publish(package, manifest, compiler):
                 continue
             if len(projections) != 2:
                 raise ValueError("Expected paired Flash prefill expert projections")
+            preceding = operations[: operations.index(projections[0])]
             prefix, tiles = None, None
-            for old in operations[: operations.index(projections[0])]:
+            for old in preceding:
                 pointers = compiler.pointers(old)
                 if set(pointers) == {"Counts", "RowOffsets", "TileOffsets", "TileCount"}:
                     prefix = old, pointers
                 if set(pointers) == {"Counts", "TileOffsets", "TileExpert", "TileRow"}:
                     tiles = old, pointers
+            dispatch, dispatch_launches, replaced = _dispatch_choices(
+                data, package, compiler, preceding, projections[0], kernels, dynamic, rows
+            )
+            added.update(dispatch)
+            launches.update(dispatch_launches)
+            obsolete.update(replaced)
             if prefix is None or tiles is None:
                 raise ValueError("Missing Flash prefill expert routing")
             prefix_kernel, prefix_args = prefix
