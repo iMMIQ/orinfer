@@ -72,7 +72,7 @@ Startup columns are medians of three fresh Rust `serve` processes: process launc
 | `--default-request-params` | `{}` | JSON request defaults; explicit request fields take priority |
 | `--cuda-graph` | `decode_only` | CUDA Graph mode |
 | `--resident-experts` | `full` | Keep all experts resident; Flash Next also supports an SSD-backed capacity |
-| `--prefix-cache-mib` | `12288` | GPU prefix-cache budget in MiB; 0 disables caching |
+| `--prefix-cache-mib` | `4096` | GPU prefix-cache budget in MiB; 0 disables caching |
 | `--max-active-requests` | `32` | Active request limit, 1–128 |
 | `--max-batch-tokens` | `128` | Decode row budget; mixed prefill uses the package capacity |
 | `--max-speculative-tokens` | `0` | MTP verification row budget; 0 uses the package capacity |

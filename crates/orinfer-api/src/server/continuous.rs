@@ -527,7 +527,11 @@ pub(super) fn worker(
         let mut admitted_count = 0;
         let mut cached_count = 0;
         let mut cold_deferrals = 0;
-        let cold_prompt_capacity = model.prefill_packet_capacity();
+        let cold_prompt_capacity = if latency {
+            model.latency_prefill_capacity()
+        } else {
+            model.prefill_packet_capacity()
+        };
         while lifecycle.is_ready() && active.len() < options.max_active && !waiting.is_empty() {
             let pending_prefill: usize = active
                 .iter()

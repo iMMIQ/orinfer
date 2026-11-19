@@ -25,7 +25,7 @@ pub struct LoadOptions {
     pub kv_offload_bytes: usize,
     /// None keeps the package default; zero disables speculative execution.
     pub mtp_drafts: Option<usize>,
-    /// Opt in to request-local copied proposals for greedy speculation.
+    /// Opt in to target-verified proposals copied from the request history.
     pub prompt_lookup: bool,
 }
 

@@ -73,6 +73,7 @@ pub struct StepOutput {
 enum Work {
     Speculative(usize, usize),
     SpeculativeBatch(speculation::BatchChoice),
+    SampledLookup(speculation::LookupChoice),
     MixedSpeculative(Vec<(usize, usize)>),
     Prefill(usize, usize, bool, f64),
     Batch(Vec<(usize, usize)>),
@@ -85,6 +86,7 @@ pub(super) struct Reservation {
     sampling: bool,
     vision: bool,
     audio: bool,
+    pub(super) prompt_prefix: Option<u64>,
 }
 
 impl ModelRuntime {
@@ -414,7 +416,7 @@ impl ModelRuntime {
             return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
         }
         while self.admission_free_bytes()? < needed {
-            if !self.evict_prefix(None, None)? {
+            if !self.evict_prefix(None)? {
                 return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
             }
         }
@@ -549,12 +551,35 @@ impl ModelRuntime {
             .prefix_cache_limit
             .min(self.prefix_cache.device.bytes.saturating_add(available));
         while self.prefix_cache.device.bytes > self.prefix_cache.device.budget {
-            if !self.evict_prefix(None, None)? {
+            if !self.evict_prefix(None)? {
                 break;
             }
         }
         Ok(())
     }
+    fn lookup_warm_capacity(
+        &self,
+        spec: &crate::mtp::Spec,
+        sampling: &crate::sampling::Options,
+    ) -> Option<usize> {
+        if !self.prompt_lookup
+            || !spec.batch_commit
+            || !spec.commit_always
+            || self.manifest.packet_table().is_none()
+            || sampling.temperature <= 0.
+            || sampling.top_logprobs.is_some()
+        {
+            return None;
+        }
+        let ring = spec.hidden_ring.as_ref()?;
+        self.manifest
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == *ring)
+            .and_then(|buffer| buffer.shape.first().copied())
+            .filter(|&rows| rows != 0)
+    }
+
     pub(crate) fn start_request(
         &mut self,
         mut input: GenerationInput,
@@ -599,16 +624,24 @@ impl ModelRuntime {
                 if warm.tokens != offset - 1 {
                     return Err("Restored prefix contains an inconsistent MTP cursor".into());
                 }
-                let at = Instant::now();
-                self.mtp_warm_state(
-                    &spec,
-                    &input.input_tokens[offset..offset + 1],
-                    cancelled,
-                    ExecutionPhase::Prefill,
-                    false,
-                )?;
-                warm.tokens = offset;
-                warm.seconds += at.elapsed().as_secs_f64();
+                // The oldest hidden row needed by the restored bridge is
+                // h[offset-1]. If the entire suffix fits beside it, the
+                // first suffix warm can consume the bridge in the same packet.
+                if self
+                    .lookup_warm_capacity(&spec, &input.sampling)
+                    .is_none_or(|rows| prompt_len - offset >= rows)
+                {
+                    let at = Instant::now();
+                    self.mtp_warm_state(
+                        &spec,
+                        &input.input_tokens[offset..offset + 1],
+                        cancelled,
+                        ExecutionPhase::Prefill,
+                        false,
+                    )?;
+                    warm.tokens = offset;
+                    warm.seconds += at.elapsed().as_secs_f64();
+                }
             }
             let mut checkpoints = BTreeSet::new();
             if self.prefix_enabled() {
@@ -641,6 +674,7 @@ impl ModelRuntime {
                         && input.sampling.top_logprobs.is_none(),
                     vision: !input.images.is_empty(),
                     audio: !input.audios.is_empty(),
+                    prompt_prefix: None,
                 },
             );
             self.scheduler_statistics.peak_active = self
@@ -896,6 +930,10 @@ impl ModelRuntime {
                 true,
                 &mut req.prefix,
             )?;
+            self.reserved_requests
+                .get_mut(&req.slot)
+                .ok_or("Missing prompt checkpoint reservation")?
+                .prompt_prefix = req.prefix.device_parent();
         }
         let pending = match self.select_request_token(req) {
             Ok(token) => token,
@@ -907,10 +945,17 @@ impl ModelRuntime {
         req.generated += 1;
         req.prefilling = false;
         if let Some(spec) = self.manifest.mtp.clone() {
-            let at = Instant::now();
-            self.mtp_warm(&spec, &[pending], &|| false, ExecutionPhase::Prefill)?;
-            req.warm.tokens = req.input.len();
-            req.mtp.initial_warm_s = req.warm.seconds + at.elapsed().as_secs_f64();
+            req.mtp.initial_warm_s = req.warm.seconds;
+            // Sampled lookup reads target state only. The hidden ring can
+            // supply this endpoint when model drafting or a checkpoint needs it.
+            if self.lookup_warm_capacity(&spec, &req.sampling).is_none()
+                || req.decoder.has_constraint()
+            {
+                let at = Instant::now();
+                self.mtp_warm(&spec, &[pending], &|| false, ExecutionPhase::Prefill)?;
+                req.warm.tokens = req.input.len();
+                req.mtp.initial_warm_s += at.elapsed().as_secs_f64();
+            }
         }
         req.mtp.committed_tokens = req.generated;
         Ok(vec![pending])
@@ -954,6 +999,9 @@ impl ModelRuntime {
             &req.input[req.offset..req.offset + chunk],
             &req.input[..req.offset],
         )?;
+        if let Some(plan) = plan.filter(|p| !p.stages.is_empty()) {
+            self.prefetch_next_prefill(req, plan, chunk);
+        }
         self.upload_segment_controls(chunk)?;
         self.launch_rows(&program, chunk, ExecutionPhase::Prefill)?;
         if let Some(spec) = &self.manifest.mtp {
@@ -1331,6 +1379,13 @@ impl ModelRuntime {
             _ => false,
         };
         let executed = !matches!(prefill_work, Work::Idle);
+        let native = matches!(prefill_work, Work::Prefill(..));
+        let speculative = matches!(
+            prefill_work,
+            Work::Speculative(..) | Work::SpeculativeBatch(_) | Work::SampledLookup(_)
+        );
+        let lookup = matches!(prefill_work, Work::SampledLookup(_));
+        let work_at = Instant::now();
         match prefill_work {
             Work::MixedSpeculative(selected) => {
                 let prefills: Vec<_> = selected
@@ -1353,6 +1408,17 @@ impl ModelRuntime {
                     .batch_histogram
                     .entry(selected.len())
                     .or_default() += 1;
+            }
+            Work::SampledLookup(choice) => {
+                let owners = choice.ordinary.len() + choice.proposals.len();
+                self.execute_sampled_lookup(requests, choice, &mut output, &mut overlap)?;
+                self.scheduler_statistics.speculative_iterations += 1;
+                *self
+                    .scheduler_statistics
+                    .batch_histogram
+                    .entry(owners)
+                    .or_default() += 1;
+                self.unmerged_prefill_s = 0.;
             }
             Work::SpeculativeBatch(choice) => {
                 let selected = choice.selected;
@@ -1420,6 +1486,19 @@ impl ModelRuntime {
                 self.execute_selected_with(requests, &selected, &mut output, &mut overlap)?;
             }
             Work::Idle => {}
+        }
+        if executed {
+            let statistics = &mut self.scheduler_statistics;
+            let seconds = work_at.elapsed().as_secs_f64();
+            if native {
+                statistics.native_prefill_s += seconds;
+            } else if does_prefill {
+                statistics.mixed_packet_s += seconds;
+            } else if speculative {
+                statistics.speculative_decode_s += seconds;
+            } else {
+                statistics.ordinary_decode_s += seconds;
+            }
         }
         if options.policy == scheduler::Policy::Latency
             && does_prefill
@@ -1491,7 +1570,7 @@ impl ModelRuntime {
                 alternative.measured,
                 alternative.calibrating,
             );
-        } else if executed {
+        } else if executed && !lookup {
             self.dynamic_speculation.earn_ordinary(
                 feedback_at.elapsed().as_secs_f64(),
                 self.execution
@@ -1612,6 +1691,13 @@ impl ModelRuntime {
                     return Ok(Work::Speculative(i, width));
                 }
             }
+        }
+        if decode_round
+            && throughput
+            && let Some(choice) =
+                self.select_sampled_lookup(requests, &target, options.max_speculative_tokens)
+        {
+            return Ok(Work::SampledLookup(choice));
         }
         if decode_round && !decode.is_empty() {
             let slack = if throughput {
@@ -2146,6 +2232,27 @@ impl ModelRuntime {
         }
         Ok(segments)
     }
+    fn commit_sampled_tokens(
+        &mut self,
+        req: &mut RequestState,
+        index: usize,
+        tokens: Vec<u32>,
+        output: &mut Vec<StepOutput>,
+    ) -> Result<()> {
+        let token = *tokens.last().ok_or("Missing sampled token")?;
+        self.execution
+            .upload_sequence_ids(req.slot, &self.manifest.token, &[token])?;
+        req.history.extend_from_slice(&tokens);
+        req.generated += tokens.len();
+        req.mtp.committed_tokens = req.generated;
+        self.scheduler_statistics.decode_tokens += tokens.len();
+        output.push(StepOutput {
+            request: index,
+            tokens,
+        });
+        Ok(())
+    }
+
     fn commit_batch(
         &mut self,
         requests: &mut [&mut RequestState],
@@ -2184,16 +2291,7 @@ impl ModelRuntime {
             }
             if let Some(&token) = sampled.get(&i) {
                 let req = &mut requests[i];
-                self.execution
-                    .upload_sequence_ids(req.slot, &self.manifest.token, &[token])?;
-                req.history.push(token);
-                req.generated += 1;
-                req.mtp.committed_tokens = req.generated;
-                self.scheduler_statistics.decode_tokens += 1;
-                output.push(StepOutput {
-                    request: i,
-                    tokens: vec![token],
-                });
+                self.commit_sampled_tokens(req, i, vec![token], output)?;
                 continue;
             }
             if controls.peek().is_some_and(|((index, _), _)| *index == i) {
@@ -2322,7 +2420,11 @@ impl ModelRuntime {
             return Ok(());
         }
         let stored = self.with_request(req, |model, req| {
-            if cache && req.cache_generated && !req.prefilling && model.prefix_enabled() {
+            if cache
+                && req.cache_generated
+                && !req.prefilling
+                && model.should_store_decoded_prefix(&req.prefix)
+            {
                 let consistent = model.refresh_request_mtp(req, false)?;
                 if consistent {
                     model.store_decoded_prefix(
@@ -2338,7 +2440,12 @@ impl ModelRuntime {
         self.release_prefill_frame(req)?;
         self.execution
             .release_sequence(req.slot, &self.manifest.reset_buffers)?;
-        self.reserved_requests.remove(&req.slot);
+        let reservation = self.reserved_requests.remove(&req.slot);
+        if cache && let Some(id) = reservation.and_then(|r| r.prompt_prefix) {
+            // The prompt has just served a complete request. Keep it recent
+            // while a client prepares the next turn.
+            let _ = self.prefix_cache.device.mark_recent(id);
+        }
         req.released = true;
         self.execution.collect_snapshots()?;
         stored

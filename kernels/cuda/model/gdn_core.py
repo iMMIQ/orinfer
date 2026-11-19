@@ -17,20 +17,27 @@ def state_layout(value_tile, threads):
     )
 
 
-def predict(value_tile, *, prefetched=False):
+def predict(value_tile, *, prefetched=False, register_qk=False):
     @T.macro
     def apply(state, product, predicted, Key, Gate, kh, t, h):
+        if register_qk:
+            decay = T.exp(Gate[t % 2])
         for i, j in T.Parallel(128, value_tile):
-            state[i, j] = state[i, j] * T.exp(Gate[t % 2] if prefetched else Gate[t, h])
-            product[i, j] = state[i, j] * T.cast(
-                Key[t % 2, i] if prefetched else Key[kh, t, i], T.float32
+            state[i, j] = state[i, j] * (
+                decay if register_qk else T.exp(Gate[t % 2] if prefetched else Gate[t, h])
             )
+            key = (
+                Key[i]
+                if register_qk
+                else T.cast(Key[t % 2, i] if prefetched else Key[kh, t, i], T.float32)
+            )
+            product[i, j] = state[i, j] * key
         T.reduce_sum(product, predicted, dim=0)
 
     return apply
 
 
-def update_readout(value_tile, q_scale, *, prefetched=False, saved_delta=False):
+def update_readout(value_tile, q_scale, *, prefetched=False, saved_delta=False, register_qk=False):
     @T.macro
     def apply(state, product, result, Query, Key, Value, Beta, predicted, update, kh, t, h, bv):
         for i, j in T.Parallel(128, value_tile):
@@ -42,13 +49,20 @@ def update_readout(value_tile, q_scale, *, prefetched=False, saved_delta=False):
             )
             if saved_delta:
                 delta = update[j]
-            state[i, j] = (
-                state[i, j]
-                + T.cast(Key[t % 2, i] if prefetched else Key[kh, t, i], T.float32) * delta
+            key = (
+                Key[i]
+                if register_qk
+                else T.cast(Key[t % 2, i] if prefetched else Key[kh, t, i], T.float32)
             )
-            product[i, j] = state[i, j] * (
-                T.cast(Query[t % 2, i] if prefetched else Query[kh, t, i], T.float32) * q_scale
+            query = (
+                Query[i]
+                if register_qk
+                else (
+                    T.cast(Query[t % 2, i] if prefetched else Query[kh, t, i], T.float32) * q_scale
+                )
             )
+            state[i, j] = state[i, j] + key * delta
+            product[i, j] = state[i, j] * query
         T.reduce_sum(product, result, dim=0)
 
     return apply

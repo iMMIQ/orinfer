@@ -7,6 +7,7 @@ In-place prefill writes only the final state and supports chunks through 4096.
 Convolution history, position, and attention KV require separate handling.
 """
 
+import tilelang
 import tilelang.language as T
 from orinfer_build.compiler.cuda.common import orin_jit
 from kernels.shared.rows import row_count
@@ -29,6 +30,7 @@ def _gdn_sequence(
     value_heads: int = 48,
     shared_state: bool = False,
     initial_state=None,
+    register_qk: bool = False,
 ):
     HK, HV = key_heads, value_heads
     if min(HK, HV) <= 0 or HV % HK:
@@ -42,8 +44,16 @@ def _gdn_sequence(
         raise ValueError("Invalid GDN token unrolling")
     if token_unroll != 1 and not prefetch_qk:
         raise ValueError("GDN token unrolling requires the prefetch recurrence")
-    prediction = predict(value_tile, prefetched=prefetch_qk)
-    advance = update_readout(value_tile, q_scale, prefetched=prefetch_qk, saved_delta=compact)
+    if type(register_qk) is not bool or register_qk and not prefetch_qk:
+        raise ValueError("GDN register operands require the warp prefetch recurrence")
+    prediction = predict(value_tile, prefetched=prefetch_qk, register_qk=register_qk)
+    advance = update_readout(
+        value_tile,
+        q_scale,
+        prefetched=prefetch_qk,
+        saved_delta=compact or register_qk,
+        register_qk=register_qk,
+    )
     tokens = count = row_count(tokens, dynamic_rows)
     if (
         type(prefetch_qk) is not bool
@@ -81,6 +91,22 @@ def _gdn_sequence(
             T.annotate_layout(
                 {buffer: state_layout(value_tile, threads) for buffer in (state, product)}
             )
+            if register_qk:
+                query = T.alloc_fragment((DK,), T.float32)
+                key = T.alloc_fragment((DK,), T.float32)
+                # Every pair of lanes uses the same key positions with
+                # disjoint value columns in the original reduction tree.
+                T.annotate_layout(
+                    {
+                        buf: tilelang.Fragment(
+                            (DK,),
+                            forward_thread_fn=lambda i, replica: (i % 16) * 2 + replica,
+                            forward_index_fn=lambda i: i // 16,
+                            replicate=2,
+                        )
+                        for buf in (query, key)
+                    }
+                )
             predicted = T.alloc_fragment((value_tile,), T.float32)
             result = T.alloc_fragment((value_tile,), T.float32)
             update = T.alloc_fragment((value_tile,), T.float32)
@@ -153,28 +179,39 @@ def _gdn_sequence(
                                         1,
                                     )
                                 T.ptx_commit_group()
+                        if register_qk:
+                            for i in T.Parallel(DK):
+                                query[i] = T.cast(qs[t % 2, i], T.float32) * q_scale
+                                key[i] = T.cast(ks[t % 2, i], T.float32)
                         prediction(
                             state,
                             product,
                             predicted,
-                            ks if prefetch_qk else K,
+                            key if register_qk else ks if prefetch_qk else K,
                             gs if prefetch_qk else G,
                             kh,
                             t,
                             h,
                         )
-                        if compact:
+                        if compact or register_qk:
                             for j in T.Parallel(value_tile):
-                                update[j] = Beta[t, h] * (
-                                    T.cast(V[h, t, bv * value_tile + j], T.float32) - predicted[j]
+                                update[j] = (bs[t % 2] if register_qk else Beta[t, h]) * (
+                                    T.cast(
+                                        vs[t % 2, j]
+                                        if register_qk
+                                        else V[h, t, bv * value_tile + j],
+                                        T.float32,
+                                    )
+                                    - predicted[j]
                                 )
-                                Prefix[t, h, bv * value_tile + j] = update[j]
+                                if compact:
+                                    Prefix[t, h, bv * value_tile + j] = update[j]
                         advance(
                             state,
                             product,
                             result,
-                            qs if prefetch_qk else Q,
-                            ks if prefetch_qk else K,
+                            query if register_qk else qs if prefetch_qk else Q,
+                            key if register_qk else ks if prefetch_qk else K,
                             vs if prefetch_qk else V,
                             bs if prefetch_qk else Beta,
                             predicted,
@@ -184,17 +221,17 @@ def _gdn_sequence(
                             h,
                             bv,
                         )
-                        for i, j in T.Parallel(DK, value_tile):
-                            if in_place:
-                                if t == count - 1:
-                                    if shared_state:
-                                        state_tile[i, j] = state[i, j]
-                                    else:
-                                        State[h, i, bv * value_tile + j] = state[i, j]
-                            elif not compact:
+                        if not in_place and not compact:
+                            for i, j in T.Parallel(DK, value_tile):
                                 Prefix[t, h, i, bv * value_tile + j] = state[i, j]
                         for j in T.Parallel(value_tile):
                             Out[t, h * DV + bv * value_tile + j] = result[j]
+            if in_place:
+                for i, j in T.Parallel(DK, value_tile):
+                    if shared_state:
+                        state_tile[i, j] = state[i, j]
+                    else:
+                        State[h, i, bv * value_tile + j] = state[i, j]
             if shared_state:
                 T.copy(state_tile, State[h, 0:DK, bv * value_tile : (bv + 1) * value_tile])
 

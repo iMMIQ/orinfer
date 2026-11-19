@@ -158,37 +158,47 @@ impl Executor {
         table: &str,
         scratch: &str,
         stride: usize,
-        source: &str,
         source_bytes: usize,
-        slots: &[usize],
+        sources: &[(&str, usize, usize)],
     ) -> Result<()> {
-        if slots.is_empty()
-            || slots.len() > 128
+        let bytes = stride
+            .checked_mul(sources.len())
+            .ok_or("Scratch rows overflow")?;
+        if sources.is_empty()
+            || sources.len() > 128
             || stride == 0
-            || !self.pointers.is_private(source)
-            || slots.len() * 16 > self.sizes.get(table).copied().unwrap_or(0)
+            || sources
+                .len()
+                .checked_mul(16)
+                .is_none_or(|n| n > self.sizes.get(table).copied().unwrap_or(0))
         {
             return Err("Invalid scratch row table".into());
         }
-        let bytes = stride
-            .checked_mul(slots.len())
-            .ok_or("Scratch rows overflow")?;
         self.ensure_workspace(scratch, bytes)?;
-        let mut addresses = Vec::with_capacity(slots.len() * 16);
-        for (row, &slot) in slots.iter().enumerate() {
+        let mut addresses = Vec::with_capacity(sources.len() * 16);
+        for (row, &(source, slot, source_row)) in sources.iter().enumerate() {
             let arena = self
                 .sequences
                 .get(slot)
                 .filter(|s| s.leased && !s.quarantined)
                 .ok_or("Scratch rows require a live arena")?;
-            if arena.sizes.get(source).is_none_or(|&n| n < source_bytes) {
-                return Err("Scratch row source exceeds arena".into());
+            let offset = source_row
+                .checked_mul(source_bytes)
+                .ok_or("Scratch row source offset overflow")?;
+            if !self.pointers.is_private(source)
+                || offset
+                    .checked_add(source_bytes)
+                    .is_none_or(|end| arena.sizes.get(source).is_none_or(|&n| end > n))
+            {
+                return Err("Scratch row source exceeds private arena".into());
             }
             addresses.extend_from_slice(
                 &arena
                     .addresses
                     .get(source)
                     .ok_or("Missing scratch row source")?
+                    .checked_add(offset as u64)
+                    .ok_or("Scratch row source address overflow")?
                     .to_le_bytes(),
             );
             let address = self.pointers[scratch]
@@ -2299,12 +2309,13 @@ impl Executor {
         &mut self,
         operations: &[Invocation],
         position: (&str, u32),
+        exact_state: bool,
     ) -> Result<Vec<Vec<f32>>> {
         self.sync()?;
         self.ensure_invocation_kernels(operations)?;
         let events = self.profile_events(operations.len() + 1)?;
         let mut trials = vec![];
-        for trial in 0..4 {
+        for trial in 0..if exact_state { 1 } else { 4 } {
             self.upload_ids(position.0, &[position.1])?;
             for (i, operation) in operations.iter().enumerate() {
                 // SAFETY: Owned events and live worker stream; ordinary launches.
@@ -2324,7 +2335,7 @@ impl Executor {
                 )?;
             }
             self.sync()?;
-            if trial == 0 {
+            if trial == 0 && !exact_state {
                 continue;
             }
             let mut times = vec![];

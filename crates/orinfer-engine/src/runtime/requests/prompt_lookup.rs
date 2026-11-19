@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 
 const KEY: usize = 4;
 const CONTEXT: usize = 8;
+const SAMPLED_CONTEXT: usize = 7;
 const WINDOW: usize = 8192;
 
 #[derive(Default)]
@@ -17,6 +18,19 @@ pub(super) struct PromptLookup {
 
 impl PromptLookup {
     pub fn propose(&mut self, history: &[u32], count: usize) -> Option<Vec<u32>> {
+        self.propose_after_match(history, count, KEY)
+    }
+
+    pub fn propose_confident(&mut self, history: &[u32], count: usize) -> Option<Vec<u32>> {
+        self.propose_after_match(history, count, SAMPLED_CONTEXT)
+    }
+
+    fn propose_after_match(
+        &mut self,
+        history: &[u32],
+        count: usize,
+        minimum: usize,
+    ) -> Option<Vec<u32>> {
         if history.len() < KEY || count == 0 {
             return None;
         }
@@ -38,7 +52,7 @@ impl PromptLookup {
             }
         }
         self.indexed = history.len() - KEY + 1;
-        self.find(history, count, KEY)
+        self.find(history, count, minimum)
             .map(|end| history[end..end + count].to_vec())
     }
 
@@ -144,6 +158,30 @@ mod tests {
         assert_eq!(lookup.propose(&resumed, 2), Some(vec![0, 0]));
         lookup.observe(1, 2, resumed.len());
         assert_eq!(lookup.misses, 0);
+    }
+
+    #[test]
+    fn sampled_proposals_admit_seven_matching_tokens_and_keep_the_longest_match() {
+        let seven = [
+            11, 2, 3, 4, 5, 6, 7, 8, 90, 91, 92, 93, 94, 95, 96, 1, 2, 3, 4, 5, 6, 7, 8,
+        ];
+        let mut lookup = PromptLookup::default();
+        assert_eq!(
+            lookup.propose_confident(&seven, 7),
+            Some((90..97).collect())
+        );
+        assert!(!lookup.available(&seven, 7));
+
+        let mut six = seven;
+        six[1] = 11;
+        assert_eq!(PromptLookup::default().propose_confident(&six, 7), None);
+
+        let mut competing = vec![1, 2, 3, 4, 5, 6, 7, 8, 80, 81, 82, 83, 84, 85, 86];
+        competing.extend_from_slice(&seven);
+        assert_eq!(
+            PromptLookup::default().propose_confident(&competing, 7),
+            Some((80..87).collect())
+        );
     }
 
     #[test]

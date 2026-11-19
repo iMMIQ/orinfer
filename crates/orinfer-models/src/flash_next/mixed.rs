@@ -143,13 +143,21 @@ fn plan_kind(
         Kind::MixedRows(n) => segments[n..].iter().map(|s| s.slot).collect(),
         _ => BTreeSet::new(),
     };
+    // A leading group of ordinary one-row segments carries no prefill
+    // work. It can use the same batched private state and verification
+    // widths as ordinary target and verification packets.
+    let decode_only = matches!(kind, Kind::MixedRows(n) if
+        segments[..n].iter().all(|s| s.tokens == 1));
     let mixed = matches!(kind, Kind::MixedVerification | Kind::MixedRows(_));
     let verified = |s: &BatchSegment| {
         kind != Kind::Ordinary
             && m.mtp.as_ref().is_some_and(|spec| {
                 if matches!(kind, Kind::MixedRows(_)) {
                     explicit_verify.contains(&s.slot)
-                        && spec.mixed_verification_tokens.contains(&s.tokens)
+                        && (spec.mixed_verification_tokens.contains(&s.tokens)
+                            || (decode_only
+                                && !spec.mixed_verification_tokens.is_empty()
+                                && spec.batch_verification_tokens.contains(&s.tokens)))
                 } else if kind == Kind::MixedVerification {
                     spec.mixed_verification_tokens.contains(&s.tokens)
                 } else {
@@ -209,7 +217,9 @@ fn plan_kind(
         return Ok(vec![]);
     }
     let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
-    let parallel = kind == Kind::Ordinary && decoders >= 2 && !layout.state_columns.is_empty();
+    let parallel = (kind == Kind::Ordinary || decode_only)
+        && decoders >= 2
+        && !layout.state_columns.is_empty();
 
     let prefix = "flash_decode";
     let empty = BTreeMap::new();

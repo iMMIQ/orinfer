@@ -686,6 +686,12 @@ pub(crate) struct Profiles {
     weight_pass_s: f64,
     timings: Curves,
     restore_s_per_byte: f64,
+    dynamic: Option<DynamicPrefill>,
+}
+
+struct DynamicPrefill {
+    capacity: usize,
+    seconds_per_row: Option<f64>,
 }
 
 impl Profiles {
@@ -699,7 +705,16 @@ impl Profiles {
             weight_pass_s: 0.1,
             timings: Default::default(),
             restore_s_per_byte: 1. / 20e9,
+            dynamic: None,
         }
+    }
+
+    pub fn with_dynamic_capacity(mut self, capacity: usize) -> Self {
+        self.dynamic = Some(DynamicPrefill {
+            capacity,
+            seconds_per_row: None,
+        });
+        self
     }
 
     pub fn observe(&mut self, chunk: usize, seconds: f64) {
@@ -712,7 +727,24 @@ impl Profiles {
     }
 
     pub fn observe_at(&mut self, chunk: usize, context: usize, seconds: f64) {
+        if !seconds.is_finite() || seconds <= 0. {
+            return;
+        }
         self.observe(chunk, seconds);
+        if let Some(dynamic) = &mut self.dynamic
+            && (128..=dynamic.capacity).contains(&chunk)
+            && seconds > self.weight_pass_s
+        {
+            // Fit the variable work after one weight pass. Small tails are
+            // dominated by launch cost and give unstable throughput samples.
+            let sample = (seconds - self.weight_pass_s) / chunk as f64;
+            let weight = 0.2 * (chunk as f64 / 1024.).min(1.);
+            dynamic.seconds_per_row = Some(
+                dynamic
+                    .seconds_per_row
+                    .map_or(sample, |old| old * (1. - weight) + sample * weight),
+            );
+        }
         self.observe_exact(chunk, context, 0, seconds);
     }
 
@@ -805,6 +837,13 @@ impl Profiles {
             .unwrap_or(1)
     }
     fn span(&self, mut tokens: usize) -> f64 {
+        if let Some(dynamic) = &self.dynamic {
+            // The native plan executes one exact-sized forward pass per
+            // chunk. Measurements of other lengths are not chunk boundaries.
+            let passes = tokens.div_ceil(dynamic.capacity);
+            let per_row = dynamic.seconds_per_row.unwrap_or(self.weight_pass_s / 64.);
+            return passes as f64 * self.weight_pass_s + tokens as f64 * per_row;
+        }
         let mut total = 0.;
         for &chunk in self.shapes.keys().rev() {
             let count = tokens / chunk;
@@ -876,6 +915,21 @@ impl Profiles {
 #[cfg(test)]
 mod profile_tests {
     use super::*;
+    #[test]
+    fn dynamic_restore_prices_the_real_tail_instead_of_observed_partitions() {
+        let mut costs = Profiles::new([4096]).with_dynamic_capacity(4096);
+        costs.observe_at(1203, 4508, 1.3);
+        costs.observe_at(21, 4508, 0.4);
+        let ancestor = costs.score(3303, 4508, 150 << 20).unwrap();
+        let parent = costs.score(3970, 4508, 180 << 20).unwrap();
+        assert!(parent < ancestor);
+        for tail in [1, 537, 538, 1203, 4096] {
+            assert!(costs.remaining(0, tail) < costs.remaining(0, tail + 1));
+        }
+        let two_passes = costs.remaining(0, 4097);
+        let split = costs.remaining(0, 4096) + costs.remaining(0, 1);
+        assert!((two_passes - split).abs() < 1e-12);
+    }
     #[test]
     fn confirmed_reuse_pays_for_a_checkpoint_but_not_an_unprofitable_split() {
         let mut costs = Profiles::new((2..=16).chain([128, 512, 2048, 4096]));

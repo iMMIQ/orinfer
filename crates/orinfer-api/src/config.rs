@@ -102,7 +102,7 @@ impl Default for ServerConfig {
             resident_experts: ResidentExperts::default(),
             mtp_drafts: None,
             prompt_lookup: false,
-            prefix_cache_bytes: 12usize << 30,
+            prefix_cache_bytes: 4usize << 30,
             kv_offload_bytes: 0,
             scheduler: Default::default(),
             limits: Default::default(),

@@ -295,7 +295,7 @@ fn validate_layered_prefill() {
     let expected_state = hash_state(&mut model, &mut reference);
     model.finish_request(&mut reference, false).unwrap();
     let mut rows = vec![];
-    for (interruption, budget_s) in [(false, 0.), (true, 0.), (true, 0.2)] {
+    for (interruption, budget_s) in [(false, f64::INFINITY), (false, 0.), (true, 0.), (true, 0.2)] {
         let before = model.scheduling_statistics();
         let mut req = model.start_request(input(&source, 1), &|| false).unwrap();
         let mut short = input(&source, 1024);
@@ -311,7 +311,7 @@ fn validate_layered_prefill() {
         while req.prefilling {
             model
                 .with_request(&mut req, |m, r| {
-                    m.advance_prefill_step(r, chunk, true, budget_s)
+                    m.advance_prefill_step(r, chunk, budget_s.is_finite(), budget_s)
                 })
                 .unwrap();
             steps += 1;
@@ -335,6 +335,8 @@ fn validate_layered_prefill() {
         }
         if budget_s == 0. {
             assert!(steps >= model.manifest.prefill_plan(chunk).unwrap().stages.len());
+        } else if !budget_s.is_finite() {
+            assert_eq!(steps, 1);
         }
         let scores = distribution(&mut model, &mut req);
         let kl: f64 = expected

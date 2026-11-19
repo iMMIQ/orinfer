@@ -1,7 +1,7 @@
 """Build the shared GPU sampler into a current native execution package.
 
 The CLI atomically republishes a model with unchanged weights and frontend.
-Both model builders call append() to publish the same six TileLang bodies.
+Both model builders call append() to publish the same TileLang bodies.
 """
 
 import argparse
@@ -29,9 +29,21 @@ FUNCTIONS = {
         "Maximum",
         "Invalid",
     ),
-    "masses": ("Scores", "Keys", "Maximum", "Invalid", "Parameters", "Mass", "Output"),
-    "radix_histogram": ("Keys", "Mass", "State", "Control", "Parameters", "Hist"),
-    "radix_choose": ("Hist", "State", "Control", "Parameters", "Output"),
+    "shortlist_bound": ("Maximum", "State", "Control", "Invalid", "Output"),
+    "shortlist_collect": ("Keys", "State", "Control", "Counts", "Output"),
+    "shortlist_sample": (
+        "Keys",
+        "Scores",
+        "State",
+        "Counts",
+        "Control",
+        "Parameters",
+        "Invalid",
+        "Output",
+    ),
+    "fallback_masses": ("Scores", "Keys", "State", "Invalid", "Parameters", "Mass", "Output"),
+    "radix_histogram": ("Keys", "Mass", "State", "Control", "Parameters", "Invalid", "Hist"),
+    "radix_choose": ("Hist", "State", "Control", "Parameters", "Invalid", "Output"),
 }
 
 
@@ -185,7 +197,7 @@ def append(data, package, root, output):
     # Native registration needs these final program contracts even when the
     # online create request omits build-only operator definitions.
     package["plan_kernel_contracts"] = sorted(
-        set(package.get("plan_kernel_contracts", []))
+        {name for name in package.get("plan_kernel_contracts", []) if not sampler(name)}
         | {k["name"] for k in package["kernels"] if sampler(k["name"])}
     )
 
@@ -222,12 +234,18 @@ def main():
         if completed.returncode:
             raise ValueError("Native sampling plan validation failed: " + completed.stderr.strip())
         report = json.loads(completed.stdout)["manifest"]
-        if (
-            not report.get("sampling", {}).get("batch")
-            or len(report["programs"].get("sampling", [])) != 76
-            or len(report["programs"].get("sampling_rows", [])) != 76
+        fast_count = len(FUNCTIONS) - 3
+        fallback_count = 1 + 2 * 3 * 12
+        if not report.get("sampling", {}).get("batch") or any(
+            len(report["programs"].get(name, [])) != count
+            for name, count in (
+                ("sampling", fast_count),
+                ("sampling_rows", fast_count),
+                ("sampling_fallback", fallback_count),
+                ("sampling_rows_fallback", fallback_count),
+            )
         ):
-            raise ValueError("Native library omitted the shared sampling program")
+            raise ValueError("Native library omitted part of the shared sampling program")
     write_json(a.output / "result.json", dict(model=str(a.model_output), execution_package=digest))
     print("COMPLETE", digest, flush=True)
 

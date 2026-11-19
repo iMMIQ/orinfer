@@ -70,7 +70,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 | `--default-request-params` | `{}` | JSON 请求默认值，显式请求字段优先 |
 | `--cuda-graph` | `decode_only` | CUDA Graph 模式 |
 | `--resident-experts` | `full` | 专家全量常驻；Flash Next 也支持 SSD 按需加载容量 |
-| `--prefix-cache-mib` | `12288` | GPU 前缀缓存预算，单位 MiB；0 关闭 |
+| `--prefix-cache-mib` | `4096` | GPU 前缀缓存预算，单位 MiB；0 关闭 |
 | `--max-active-requests` | `32` | 活跃请求上限，1–128 |
 | `--max-batch-tokens` | `128` | Decode 行预算；混合 prefill 使用执行包容量 |
 | `--max-speculative-tokens` | `0` | MTP 验证行预算；0 使用执行包容量 |

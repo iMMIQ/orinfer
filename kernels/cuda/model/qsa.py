@@ -200,12 +200,21 @@ def index_scores(
     stripes: int | None = 8,
     *,
     query_major: bool = False,
+    query_tile: int = 4,
+    key_tile: int = 64,
 ):
     blocks = geometry(m, capacity)
     if stripes is not None and (type(stripes) is not int or stripes <= 0):
         raise ValueError("Invalid QSA stripe count")
+    if query_tile not in (4, 8) or key_tile not in (64, 128):
+        raise ValueError("Invalid QSA index score tile")
+    heads = query_tile * 4
     symbolic_stripes = stripes is None
-    stripes = T.dynamic("stripes") if symbolic_stripes else min((blocks + 63) // 64, stripes)
+    stripes = (
+        T.dynamic("stripes")
+        if symbolic_stripes
+        else min((blocks + key_tile - 1) // key_tile, stripes)
+    )
 
     m = count = row_count(m, dynamic_rows)
     score_shape = (m * blocks,) if query_major else (blocks, m)
@@ -217,43 +226,51 @@ def index_scores(
         Position: T.Tensor((1,), T.int32),
         Scores: T.Tensor(score_shape, T.float32),
     ):
-        with T.Kernel(T.ceildiv(m, 4), stripes, threads=128) as (qr, stripe):
-            q = T.alloc_shared((16, 128), T.float16)
-            k = T.alloc_shared((64, 128), T.float16)
-            acc = T.alloc_fragment((16, 64), T.float32)
-            reduced = T.alloc_fragment((4, 64), T.float32)
-            view = T.reshape(acc, (4, 4, 64))
+        with T.Kernel(T.ceildiv(m, query_tile), stripes, threads=128) as (qr, stripe):
+            q = T.alloc_shared((heads, 128), T.float16)
+            k = T.alloc_shared((key_tile, 128), T.float16)
+            acc = T.alloc_fragment((heads, key_tile), T.float32)
+            reduced = T.alloc_fragment((query_tile, key_tile), T.float32)
+            view = T.reshape(acc, (query_tile, 4, key_tile))
             live_blocks = (Position[0] + count) // 4
             # Stable graph/workspace addresses, but only live causal tiles run.
             for turn in T.serial(
                 T.ceildiv(
-                    T.max(0, T.ceildiv((Position[0] + T.min(count, qr * 4 + 4)) // 4, 64) - stripe),
+                    T.max(
+                        0,
+                        T.ceildiv(
+                            (Position[0] + T.min(count, (qr + 1) * query_tile)) // 4, key_tile
+                        )
+                        - stripe,
+                    ),
                     stripes,
                 )
             ):
                 kb = stripe + turn * stripes
                 T.clear(reduced)
-                for i, d in T.Parallel(16, 128):
+                for i, d in T.Parallel(heads, 128):
+                    row = qr * query_tile + i // 4
                     q[i, d] = 0
-                    if qr * 4 + i // 4 < count:
-                        q[i, d] = Query[qr * 4 + i // 4, i % 4, d]
-                for i, d in T.Parallel(64, 128):
+                    if row < count:
+                        q[i, d] = Query[row, i % 4, d]
+                for i, d in T.Parallel(key_tile, 128):
+                    block = kb * key_tile + i
                     k[i, d] = 0
-                    if kb * 64 + i < (Position[0] + count) // 4:
-                        k[i, d] = Cache[kb * 64 + i, d]
+                    if block < live_blocks:
+                        k[i, d] = Cache[block, d]
                 T.gemm(q, k, acc, transpose_B=True, clear_accum=True)
-                for i, j in T.Parallel(16, 64):
+                for i, j in T.Parallel(heads, key_tile):
                     acc[i, j] = T.max(acc[i, j], 0.0)
                 T.reduce_sum(view, reduced, dim=1)
-                for i, j in T.Parallel(4, 64):
-                    if qr * 4 + i < m and kb * 64 + j < (Position[0] + qr * 4 + i + 1) // 4:
+                for i, j in T.Parallel(query_tile, key_tile):
+                    row = qr * query_tile + i
+                    block = kb * key_tile + j
+                    if row < m and block < (Position[0] + row + 1) // 4:
                         if query_major:
                             # Demand mapping covers only the live score prefix.
-                            Scores[(qr * 4 + i) * live_blocks + kb * 64 + j] = (
-                                reduced[i, j] * 128**-0.5
-                            )
+                            Scores[row * live_blocks + block] = reduced[i, j] * 128**-0.5
                         else:
-                            Scores[kb * 64 + j, qr * 4 + i] = reduced[i, j] * 128**-0.5
+                            Scores[block, row] = reduced[i, j] * 128**-0.5
 
     return explicit_scalar(main, stripes) if symbolic_stripes else main
 

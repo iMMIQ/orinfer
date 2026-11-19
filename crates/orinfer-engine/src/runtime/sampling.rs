@@ -1,6 +1,8 @@
 //! GPU sampling shares the ordinary request's history, seed and grammar law.
 use super::*;
 
+const SAMPLING_NEEDS_RADIX: u32 = 2;
+
 impl ModelRuntime {
     pub(super) fn gpu_sample(
         &self,
@@ -38,8 +40,38 @@ impl ModelRuntime {
         }
         self.execution
             .submit_program(&spec.program, ExecutionPhase::Decode)?;
-        let output = self.read_controls(&spec.output, 2)?;
+        let output = self.read_sampling_output(&spec.output, None)?;
         validate_output(&output, self.manifest.vocab).map(Some)
+    }
+
+    pub(super) fn read_sampling_output(
+        &self,
+        output: &str,
+        rows: Option<usize>,
+    ) -> Result<Vec<u32>> {
+        let count = rows.unwrap_or(1) * 2;
+        let samples = self.read_controls(output, count)?;
+        if !samples
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|pair| pair[1] == SAMPLING_NEEDS_RADIX)
+        {
+            return Ok(samples);
+        }
+        // The fast stage leaves the radix state live only for rows that need
+        // fallback. Reuse the same pointers and preserve completed samples.
+        if let Some(rows) = rows {
+            self.execution.submit_program_rows(
+                "sampling_rows_fallback",
+                rows,
+                ExecutionPhase::Decode,
+            )?;
+        } else {
+            self.execution
+                .submit_program("sampling_fallback", ExecutionPhase::Decode)?;
+        }
+        self.read_controls(output, count)
     }
 }
 

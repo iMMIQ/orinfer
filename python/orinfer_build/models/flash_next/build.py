@@ -140,10 +140,47 @@ def rebuild(args):
     manifest = {}
     data, origin, package = load_model(args.model, plan=manifest)
     buffers = {b["name"]: b for b in data["metadata"]["buffers"]}
-    if args.expert_prefill_only:
+    if (
+        args.expert_prefill_only
+        or args.expert_decode_only
+        or args.hc_prefill_only
+        or args.qsa_attention_only
+        or args.gdn_prefill_only
+        or args.q4_prefill_only
+    ):
         from orinfer_build.compiler.cuda.common import configure
-        from orinfer_build.models.flash_next.expert_prefill import publish
         from orinfer_build.packaging.compact import compact_package
+
+        if args.gdn_prefill_only:
+            from functools import partial
+            from orinfer_build.models.flash_next.gdn_prefill import publish as publish_gdn
+
+            publish = partial(publish_gdn, scopes=data["buffer_scopes"])
+        elif args.qsa_attention_only:
+            from functools import partial
+            from orinfer_build.models.flash_next.qsa_prefill import publish as publish_qsa
+            from orinfer_build.tuning.auxiliary_tuning import publish_qsa_prefill
+
+            def publish(package, manifest, compiler):
+                canonical = publish_qsa_prefill(package, manifest, compiler)
+                return canonical + publish_qsa(data, package, manifest, compiler)
+        elif args.hc_prefill_only:
+            from functools import partial
+            from orinfer_build.models.flash_next.hc_prefill import publish as publish_hc_prefill
+
+            publish = partial(publish_hc_prefill, scopes=data["buffer_scopes"])
+        elif args.q4_prefill_only:
+            from functools import partial
+            from orinfer_build.tuning.auxiliary_tuning import publish_q4_prefill
+
+            publish = partial(publish_q4_prefill, data)
+        elif args.expert_decode_only:
+            from orinfer_build.models.flash_next.expert_decode import publish
+        else:
+            from functools import partial
+            from orinfer_build.models.flash_next.expert_prefill import publish as publish_expert
+
+            publish = partial(publish_expert, data)
 
         configure()
         with atomic_model(args.model_output) as staging:
@@ -443,10 +480,36 @@ def main():
         p.add_argument("--" + name, required=True, type=Path)
     p.add_argument("--cache", type=Path, default=work_path("cache", "build", "flash-next"))
     p.add_argument("--plan-only", action="store_true")
-    p.add_argument(
+    auxiliary = p.add_mutually_exclusive_group()
+    auxiliary.add_argument(
         "--expert-prefill-only",
         action="store_true",
         help="Publish the measured native Flash prefill expert routing and projection tiles",
+    )
+    auxiliary.add_argument(
+        "--expert-decode-only",
+        action="store_true",
+        help="Rebuild the exact expert projections for small Flash decode and verification packets",
+    )
+    auxiliary.add_argument(
+        "--hc-prefill-only",
+        action="store_true",
+        help="Rebuild native HC prefill up/mix for arbitrary live row counts",
+    )
+    auxiliary.add_argument(
+        "--qsa-attention-only",
+        action="store_true",
+        help="Rebuild Flash prefill QSA selection, attention and bounded KV expansion",
+    )
+    auxiliary.add_argument(
+        "--gdn-prefill-only",
+        action="store_true",
+        help="Rebuild native prefill with register-resident GDN operands",
+    )
+    auxiliary.add_argument(
+        "--q4-prefill-only",
+        action="store_true",
+        help="Publish the measured temporary INT8 expansion for native Flash prefill",
     )
     p.add_argument(
         "--prefill-only",
@@ -476,14 +539,21 @@ def main():
     args = p.parse_args()
     if args.model.resolve() == args.model_output.resolve():
         p.error("model-output must differ from the immutable input")
-    if args.expert_prefill_only and (
+    if (
+        args.expert_prefill_only
+        or args.expert_decode_only
+        or args.hc_prefill_only
+        or args.qsa_attention_only
+        or args.gdn_prefill_only
+        or args.q4_prefill_only
+    ) and (
         args.plan_only
         or args.prefill_only
         or args.hc_combine_norm
         or args.projection_kinds
         or args.projection_shape
     ):
-        p.error("expert-prefill-only cannot be combined with other rebuild modes")
+        p.error("Auxiliary-only options cannot be combined with other rebuild modes")
     if any(r < 1 for r in args.prefill_tuning_rows):
         p.error("prefill-tuning-rows must be positive")
     if any(n < 1 or k < 1 for n, k in args.projection_shape or []):

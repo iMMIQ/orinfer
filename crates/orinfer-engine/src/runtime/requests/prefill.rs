@@ -15,6 +15,25 @@ pub(super) struct Frame {
 }
 
 impl ModelRuntime {
+    pub(super) fn prefetch_next_prefill(
+        &self,
+        req: &RequestState,
+        plan: &crate::model::PrefillPlan,
+        chunk: usize,
+    ) {
+        let end = req.offset + chunk;
+        let boundary = req
+            .checkpoints
+            .range((std::ops::Bound::Excluded(end), std::ops::Bound::Unbounded))
+            .next()
+            .copied()
+            .unwrap_or(req.input.len());
+        if let Some(next) = plan.chunk(boundary - end) {
+            self.batch_plans
+                .prefetch_inputs(&req.input[end..end + next], &req.input[..end]);
+        }
+    }
+
     pub(super) fn release_prefill_frame(&mut self, req: &mut RequestState) -> Result<()> {
         drop(req.prefill_frame.take());
         self.execution.collect_snapshots()
@@ -75,7 +94,14 @@ impl ModelRuntime {
             .prefill_frame
             .as_ref()
             .map(|f| f.plan.clone())
-            .or_else(|| self.manifest.prefill_plan(chunk).cloned());
+            .or_else(|| {
+                // A fresh, unbounded tile can stream the full program.
+                if !bounded && budget_s == f64::INFINITY {
+                    None
+                } else {
+                    self.manifest.prefill_plan(chunk).cloned()
+                }
+            });
         let Some(plan) = plan.filter(|p| !p.stages.is_empty()) else {
             let result = self.advance_prefill(req, chunk, bounded)?;
             self.observe_iteration(key, timer.finish(self.execution.batch_statistics()));
@@ -104,17 +130,7 @@ impl ModelRuntime {
                 &req.input[req.offset..req.offset + chunk],
                 &req.input[..req.offset],
             )?;
-            let end = req.offset + chunk;
-            let boundary = req
-                .checkpoints
-                .range((std::ops::Bound::Excluded(end), std::ops::Bound::Unbounded))
-                .next()
-                .copied()
-                .unwrap_or(req.input.len());
-            if let Some(next) = plan.chunk(boundary - end) {
-                self.batch_plans
-                    .prefetch_inputs(&req.input[end..end + next], &req.input[..end]);
-            }
+            self.prefetch_next_prefill(req, &plan, chunk);
             Frame {
                 plan,
                 tokens: chunk,

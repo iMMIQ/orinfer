@@ -148,12 +148,17 @@ def e8p_prefill_grouped(
     codec="e8p_q2",
     minimum_blocks=1,
     block_m=16,
+    block_n=128,
+    specialize_tails=False,
+    merge_routed_tiles=False,
 ):
     """One routed-tile mainloop; optionally predicate empty MMA row stripes.
 
     Routing and computation share the selected row tile. Sparse candidates
     mask complete hardware M8 stripes inside this body. Offline tuning selects
-    both row reuse and whether masking pays off.
+    both row reuse and whether masking pays off. The wide Q2 tail variant
+    uses constant M8/M16 loops when a routed tile has at most 16 live rows.
+    Gate/up can merge adjacent 16-row tiles from a shared routing table.
     """
     if (
         any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
@@ -163,11 +168,20 @@ def e8p_prefill_grouped(
         or type(minimum_blocks) is not int
         or not 1 <= minimum_blocks <= 16
         or block_m not in (16, 32)
+        or block_n not in (64, 128)
+        or block_n != 128
+        and codec != "e8p_q2"
+        or type(specialize_tails) is not bool
+        or specialize_tails
+        and (block_m != 32 or codec != "e8p_q2")
+        or type(merge_routed_tiles) is not bool
+        or merge_routed_tiles
+        and not specialize_tails
         or K % 128
         or K * 128 * 128 > 2**31 - 1
     ):
         raise ValueError("Invalid exact E8P geometry")
-    BM, BN, BK = block_m, 128, 64
+    BM, BN, BK = block_m, block_n, 64
     q4 = codec == "e8p_q4"
     packed_k, packed_dtype = (128, T.uint32) if q4 else (64, T.uint16)
     # Matching swizzle for sixteen-byte activation halves and ldmatrix reads.
@@ -175,7 +189,10 @@ def e8p_prefill_grouped(
     rows = row_count(rows, dynamic_rows)
     # Group-major strides depend on live rows, rather than allocation capacity.
     group_stride, row_stride = (32, K // 2) if row_major else (rows * 32, 32)
-    launch_tiles = T.min(tiles, T.ceildiv(rows, BM) + T.min(E, rows)) if dynamic_rows else tiles
+    routing_rows = BM // 2 if merge_routed_tiles else BM
+    launch_tiles = (
+        T.min(tiles, T.ceildiv(rows, routing_rows) + T.min(E, rows)) if dynamic_rows else tiles
+    )
 
     @T.macro
     def prefetch_weight(P, packed, slot, step, bx, expert, tid):
@@ -205,12 +222,30 @@ def e8p_prefill_grouped(
                 predicate=bx * BN + tid < N,
             )
 
-    tile_rows = BM
-    multiply = folded_pair(tile_rows) if q4 else mma_pair(tile_rows)
-    store = store_folded_rows(tile_rows, BN, N, 5) if q4 else store_rows(tile_rows, BN, N)
+    multiply = folded_pair(BM) if q4 else mma_pair(BM)
+    store = store_folded_rows(BM, BN, N, 5) if q4 else store_rows(BM, BN, N)
+    multiply_short = mma_pair(8)
+    store_short = store_rows(8, BN, N)
 
     @T.macro
-    def project(Low, High, Sum, P, WS, AS, Out, packed, inputs, book, bx, expert, offset, count):
+    def project(
+        Low,
+        High,
+        Sum,
+        P,
+        WS,
+        AS,
+        Out,
+        packed,
+        inputs,
+        book,
+        bx,
+        expert,
+        offset,
+        count,
+        tile_rows,
+        stripes,
+    ):
         tid = T.get_thread_binding()
         lane, warp = tid % 32, tid // 32
         lo = T.alloc_local((tile_rows,), T.int32)
@@ -226,7 +261,7 @@ def e8p_prefill_grouped(
         for initial in T.unroll(min(3, K // BK)):
             if not q4 or initial % 2 == 0:
                 prefetch_weight(P, packed, initial, initial, bx, expert, tid)
-            if tid < tile_rows * 2:
+            if tid < stripes * 16:
                 T.ptx_cp_async(
                     T.access_ptr(
                         inputs[
@@ -301,7 +336,7 @@ def e8p_prefill_grouped(
                         # of the old pair have completed their reads.
                         if not q4 or (step >= 2 and step % 2 == 0):
                             prefetch_weight(P, packed, nxt, step + 3, bx, expert, tid)
-                        if tid < tile_rows * 2:
+                        if tid < stripes * 16:
                             T.ptx_cp_async(
                                 T.access_ptr(
                                     inputs[
@@ -349,44 +384,42 @@ def e8p_prefill_grouped(
                                 predicate=offset + tid // 2 < rows,
                             )
                         T.ptx_commit_group()
-                    for stripe in T.unroll(tile_rows // 8):
+                    for stripe in T.unroll(stripes):
                         if not sparse_rows or stripe * 8 < count:
                             r_index = lane % 8 + stripe * 8
                             col = (lane // 8 % 2) * 16
-                            T.evaluate(
-                                T.call_extern(
-                                    "void",
-                                    "nib_ldm2",
-                                    T.access_ptr(
-                                        inputs[
-                                            slot,
-                                            0,
-                                            r_index,
-                                            col ^ (((r_index // 4) % 2) * input_mask),
-                                        ],
-                                        "r",
-                                        16,
-                                    ),
-                                    T.access_ptr(a[stripe * 2], "w", 2),
+                            address = col ^ (((r_index // 4) % 2) * input_mask)
+                            if specialize_tails:
+                                # Lanes 0–15 supply low-plane addresses and
+                                # lanes 16–31 supply high-plane addresses.
+                                planes = T.alloc_local((4,), T.uint32)
+                                T.evaluate(
+                                    T.call_extern(
+                                        "void",
+                                        "nib_ldm4",
+                                        T.access_ptr(
+                                            inputs[slot, lane // 16, r_index, address], "r", 16
+                                        ),
+                                        T.access_ptr(planes[0], "w", 4),
+                                    )
                                 )
-                            )
-                            T.evaluate(
-                                T.call_extern(
-                                    "void",
-                                    "nib_ldm2",
-                                    T.access_ptr(
-                                        inputs[
-                                            slot,
-                                            1,
-                                            r_index,
-                                            col ^ (((r_index // 4) % 2) * input_mask),
-                                        ],
-                                        "r",
-                                        16,
-                                    ),
-                                    T.access_ptr(a[tile_rows // 4 + stripe * 2], "w", 2),
-                                )
-                            )
+                                for word in T.unroll(2):
+                                    a[stripe * 2 + word] = planes[word]
+                                    a[tile_rows // 4 + stripe * 2 + word] = planes[word + 2]
+                            else:
+                                for plane in T.unroll(2):
+                                    T.evaluate(
+                                        T.call_extern(
+                                            "void",
+                                            "nib_ldm2",
+                                            T.access_ptr(
+                                                inputs[slot, plane, r_index, address], "r", 16
+                                            ),
+                                            T.access_ptr(
+                                                a[plane * (tile_rows // 4) + stripe * 2], "w", 2
+                                            ),
+                                        )
+                                    )
                     for nt in T.unroll(2):
                         for level in T.unroll(2 if q4 else 1):
                             for rr in T.unroll(4):
@@ -409,17 +442,21 @@ def e8p_prefill_grouped(
                                     v[rr] = T.call_pure_extern(
                                         "uint32", "nib_prefill", code, book[code >> 8]
                                     )
-                            for stripe in T.unroll(tile_rows // 8):
+                            for stripe in T.unroll(stripes):
                                 if not sparse_rows or stripe * 8 < count:
                                     if q4:
                                         if level == 0:
                                             multiply(lo, v, a, nt, stripe, 8)
                                         else:
                                             multiply(lo, v, a, nt, stripe, 2)
+                                    elif tile_rows == 8:
+                                        multiply_short(lo, hi, v, a, nt, stripe)
                                     else:
                                         multiply(lo, hi, v, a, nt, stripe)
         if q4:
             store(lo, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset)
+        elif tile_rows == 8:
+            store_short(lo, hi, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset, offset)
         else:
             store(lo, hi, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset, offset)
 
@@ -439,14 +476,16 @@ def e8p_prefill_grouped(
         TC: T.Tensor((1,), T.int32),
         Out: T.Tensor((rows, N), T.float16),
     ):
-        with T.Kernel(T.ceildiv(N, BN), launch_tiles, threads=128) as (bx, tile):
+        with T.Kernel(T.ceildiv(N, BN), launch_tiles, threads=BN) as (bx, tile):
             T.import_source(SOURCE)
             T.annotate_min_blocks_per_sm(minimum_blocks)
             tid = T.get_thread_binding()
             packed = T.alloc_shared((2, BN, 16) if q4 else (4, BN, 8), packed_dtype)
             inputs = T.alloc_shared((4, 2, BM, input_stride), T.int8)
             book = T.alloc_shared((256,), T.uint32)
-            if tile < TC[0]:
+            # Each pair has consecutive offsets in one expert. The second
+            # entry remains available to the 16-row down projection.
+            if tile < TC[0] and (not merge_routed_tiles or TR[tile] % BM == 0):
                 if q4:
                     metadata = T.alloc_local((3,), T.int32)
                     metadata[0] = TE[tile]
@@ -459,24 +498,65 @@ def e8p_prefill_grouped(
                     expert, first = TE[tile], TR[tile]
                     offset = Offsets[expert] + first
                     count = T.min(BM, Counts[expert] - first)
-                    for i in T.unroll(2):
-                        book[tid + i * 128] = Book[0, tid + i * 128, 0]
-                project(
-                    Low,
-                    High,
-                    Sum,
-                    P,
-                    WS,
-                    AS,
-                    Out,
-                    packed,
-                    inputs,
-                    book,
-                    bx,
-                    expert,
-                    offset,
-                    count,
-                )
+                    for i in T.unroll(256 // BN):
+                        book[tid + i * BN] = Book[0, tid + i * BN, 0]
+                if specialize_tails and count <= 8:
+                    project(
+                        Low,
+                        High,
+                        Sum,
+                        P,
+                        WS,
+                        AS,
+                        Out,
+                        packed,
+                        inputs,
+                        book,
+                        bx,
+                        expert,
+                        offset,
+                        count,
+                        8 if merge_routed_tiles else BM,
+                        1,
+                    )
+                elif specialize_tails and count <= 16:
+                    project(
+                        Low,
+                        High,
+                        Sum,
+                        P,
+                        WS,
+                        AS,
+                        Out,
+                        packed,
+                        inputs,
+                        book,
+                        bx,
+                        expert,
+                        offset,
+                        count,
+                        BM,
+                        2,
+                    )
+                else:
+                    project(
+                        Low,
+                        High,
+                        Sum,
+                        P,
+                        WS,
+                        AS,
+                        Out,
+                        packed,
+                        inputs,
+                        book,
+                        bx,
+                        expert,
+                        offset,
+                        count,
+                        BM,
+                        BM // 8,
+                    )
 
     return exact_e8p_int4
 
@@ -540,3 +620,69 @@ def dispatch_prefill_a8(M, K=2560, E=512, top_k=10, dynamic_rows=False):
                     SlotMap[row, rank] = slot
 
     return dispatch_planes
+
+
+def pack_expert_tokens(M, K, E, top_k):
+    """Pack each live source token once and record the inverse dispatch map."""
+    m = row_count(M, True)
+    pack = _split_a8_block(K)
+
+    @T.prim_func
+    def pack_tokens(
+        A: T.Tensor((m, K), T.int8),
+        IDs: T.Tensor((m, top_k), T.int32),
+        RelativeSlot: T.Tensor((m, top_k), T.int32),
+        RowOffsets: T.Tensor((E,), T.int32),
+        Low: T.Tensor((K // 64, m, 8), T.uint32),
+        High: T.Tensor((K // 64, m, 8), T.uint32),
+        Sum: T.Tensor((m,), T.int32),
+        Sources: T.Tensor((m * top_k,), T.int32),
+        SlotMap: T.Tensor((m, top_k), T.int32),
+    ):
+        with T.Kernel(T.ceildiv(m, 4), threads=128) as block:
+            first = block * 4
+            pack(A, Low, High, Sum, first, T.min(4, m - first))
+            for i, rank in T.Parallel(4, top_k):
+                row = first + i
+                if row < m:
+                    slot = RowOffsets[IDs[row, rank]] + RelativeSlot[row, rank]
+                    SlotMap[row, rank] = slot
+                    Sources[slot] = row
+
+    return pack_tokens
+
+
+def expand_expert_slots(M, K, top_k):
+    """Copy packed activations to contiguous K64-major expert slots."""
+    m = row_count(M, True)
+    assignments = m * top_k
+    tile = 64
+
+    @T.prim_func
+    def expand_slots(
+        SrcLow: T.Tensor((K // 64, m, 8), T.uint32),
+        SrcHigh: T.Tensor((K // 64, m, 8), T.uint32),
+        SrcSum: T.Tensor((m,), T.int32),
+        Scale: T.Tensor((m, 1), T.float16),
+        Sources: T.Tensor((assignments,), T.int32),
+        Low: T.Tensor((K // 64, assignments, 8), T.uint32),
+        High: T.Tensor((K // 64, assignments, 8), T.uint32),
+        Sum: T.Tensor((assignments,), T.int32),
+        DS: T.Tensor((assignments, 1), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(assignments, tile), K // 64, threads=128) as (block, group):
+            for i, word in T.Parallel(tile, 8):
+                slot = block * tile + i
+                if slot < assignments:
+                    token = Sources[slot]
+                    Low[group, slot, word] = SrcLow[group, token, word]
+                    High[group, slot, word] = SrcHigh[group, token, word]
+            if group == 0:
+                for i in T.Parallel(tile):
+                    slot = block * tile + i
+                    if slot < assignments:
+                        token = Sources[slot]
+                        Sum[slot] = SrcSum[token]
+                        DS[slot, 0] = Scale[token, 0]
+
+    return expand_slots
