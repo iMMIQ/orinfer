@@ -551,11 +551,12 @@ def publish_q4_prefill(data, package, manifest, compiler):
             ):
                 raise ValueError("Unexpected dense Q4 prefill geometry")
             expanded = workspaces["GdnGate" if outputs == 6144 else "Attention"]
-            old_choice = f"{old['name']}/choice/2048-{rows - 1}/1"
-            retired.update((f"{old_choice}/k0", f"{old_choice}/k1"))
-            # Expansion pays for the matrix reuse from 1200 rows. At a full
-            # block the smaller INT8 row tile gives more independent CTAs.
-            for first, last, block in ((1200, rows - 1, 128), (rows, rows, 64)):
+            for start in (1200, 2048):
+                old_choice = f"{old['name']}/choice/{start}-{rows - 1}/1"
+                retired.update((f"{old_choice}/k0", f"{old_choice}/k1"))
+            # Expansion wins from the seventh 128-row tile. A full block
+            # uses the smaller INT8 row tile for more independent CTAs.
+            for first, last, block in ((769, rows - 1, 128), (rows, rows, 64)):
                 base = f"{old['name']}/choice/{first}-{last}/1"
                 for idx, (bindings, key, build, symbolic) in enumerate(
                     (
