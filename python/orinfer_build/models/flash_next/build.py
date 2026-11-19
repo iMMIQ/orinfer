@@ -146,6 +146,7 @@ def rebuild(args):
         or args.hc_prefill_only
         or args.qsa_attention_only
         or args.gdn_prefill_only
+        or args.q4_prefill_only
     ):
         from orinfer_build.compiler.cuda.common import configure
         from orinfer_build.packaging.compact import compact_package
@@ -168,6 +169,11 @@ def rebuild(args):
             from orinfer_build.models.flash_next.hc_prefill import publish as publish_hc_prefill
 
             publish = partial(publish_hc_prefill, scopes=data["buffer_scopes"])
+        elif args.q4_prefill_only:
+            from functools import partial
+            from orinfer_build.tuning.auxiliary_tuning import publish_q4_prefill
+
+            publish = partial(publish_q4_prefill, data)
         elif args.expert_decode_only:
             from orinfer_build.models.flash_next.expert_decode import publish
         else:
@@ -500,6 +506,11 @@ def main():
         action="store_true",
         help="Rebuild native prefill with register-resident GDN operands",
     )
+    auxiliary.add_argument(
+        "--q4-prefill-only",
+        action="store_true",
+        help="Publish the measured temporary INT8 expansion for native Flash prefill",
+    )
     p.add_argument(
         "--prefill-only",
         action="store_true",
@@ -534,6 +545,7 @@ def main():
         or args.hc_prefill_only
         or args.qsa_attention_only
         or args.gdn_prefill_only
+        or args.q4_prefill_only
     ) and (
         args.plan_only
         or args.prefill_only

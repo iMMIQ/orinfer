@@ -499,13 +499,11 @@ def publish_q4_prefill(data, package, manifest, compiler):
     if package["architecture"] != "flash_next":
         raise ValueError("Dense Q4 prefill expansion requires Flash Next")
     originals = {k["name"]: k for k in package["kernels"]}
-    replacements, launches = {}, {}
+    replacements, launches, retired = {}, {}, set()
     width = 2560
     workspaces = {}
     for role, outputs in (("Attention", 12288), ("GdnGate", 6144)):
         name = f"FlashPrefillExpanded{role}"
-        if name in compiler.buffers:
-            raise ValueError("Duplicate Q4 expansion workspace")
         desc = dict(
             name=name,
             dtype="i8",
@@ -514,10 +512,19 @@ def publish_q4_prefill(data, package, manifest, compiler):
             layout="native_contiguous",
             access="read_write",
         )
-        data["metadata"]["buffers"].append(dict(desc, data=None))
-        data["buffer_scopes"][name] = "workspace"
-        package["buffer_contracts"].append(desc)
-        compiler.buffers[name] = desc
+        if name in compiler.buffers:
+            existing = compiler.buffers[name]
+            if (
+                any(existing.get(key) != value for key, value in desc.items())
+                or existing.get("data") is not None
+                or data["buffer_scopes"].get(name) != "workspace"
+            ):
+                raise ValueError(f"Invalid Q4 expansion workspace: {name}")
+        else:
+            data["metadata"]["buffers"].append(dict(desc, data=None))
+            data["buffer_scopes"][name] = "workspace"
+            package["buffer_contracts"].append(desc)
+            compiler.buffers[name] = desc
         workspaces[role] = dict(kind="buffer", name=name)
     for plan in manifest["prefill_plans"]:
         rows = plan["chunk_tokens"]
@@ -544,9 +551,11 @@ def publish_q4_prefill(data, package, manifest, compiler):
             ):
                 raise ValueError("Unexpected dense Q4 prefill geometry")
             expanded = workspaces["GdnGate" if outputs == 6144 else "Attention"]
-            # Use the smaller row tile at the complete native block, where
-            # its extra CTA parallelism paid for the expansion on SM87.
-            for first, last, block in ((2048, rows - 1, 128), (rows, rows, 64)):
+            old_choice = f"{old['name']}/choice/2048-{rows - 1}/1"
+            retired.update((f"{old_choice}/k0", f"{old_choice}/k1"))
+            # Expansion pays for the matrix reuse from 1200 rows. At a full
+            # block the smaller INT8 row tile gives more independent CTAs.
+            for first, last, block in ((1200, rows - 1, 128), (rows, rows, 64)):
                 base = f"{old['name']}/choice/{first}-{last}/1"
                 for idx, (bindings, key, build, symbolic) in enumerate(
                     (
@@ -593,10 +602,16 @@ def publish_q4_prefill(data, package, manifest, compiler):
                         launches[name] = launch
     if not replacements:
         raise ValueError("Missing Flash Next dense Q4 prefill bindings")
-    package["kernels"].extend(replacements.values())
-    package["dynamic_batch_kernels"].extend(launches.values())
+    package["kernels"] = [
+        k for k in package["kernels"] if k["name"] not in retired and k["name"] not in replacements
+    ] + list(replacements.values())
+    package["dynamic_batch_kernels"] = [
+        k
+        for k in package["dynamic_batch_kernels"]
+        if k["name"] not in retired and k["name"] not in launches
+    ] + list(launches.values())
     package["plan_kernel_contracts"] = sorted(
-        set(package["plan_kernel_contracts"]) | replacements.keys()
+        (set(package["plan_kernel_contracts"]) - retired) | replacements.keys()
     )
     return sorted(replacements)
 
