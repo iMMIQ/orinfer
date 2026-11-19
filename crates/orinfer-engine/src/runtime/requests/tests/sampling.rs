@@ -277,29 +277,36 @@ fn validate_sampled_lookup_requests() {
         LoadOptions {
             cuda_graph: f.cuda_graph.parse().unwrap(),
             prompt_lookup: true,
+            prefix_cache_bytes: 0,
             ..Default::default()
         },
     )
     .unwrap();
+    let source = |lane| {
+        let mut source = input(&f.cases[lane], 44);
+        source.sampling = crate::sampling::Options {
+            temperature: 0.8,
+            top_k: 20,
+            top_p: 0.9,
+            seed: crate::sampling::EVALUATION_SEED + lane as u64,
+            ..Default::default()
+        };
+        source
+    };
     let start = |model: &mut ModelRuntime| {
         (0..4)
             .map(|lane| {
-                let mut source = input(&f.cases[lane], 44);
-                source.sampling = crate::sampling::Options {
-                    temperature: 0.8,
-                    top_k: 20,
-                    top_p: 0.9,
-                    seed: crate::sampling::EVALUATION_SEED + lane as u64,
-                    ..Default::default()
-                };
-                let mut request = model.start_request(source, &|| false).unwrap();
+                let mut request = model.start_request(source(lane), &|| false).unwrap();
                 prefill_reference(model, &mut request);
                 request
             })
             .collect::<Vec<_>>()
     };
     let ordinary = [(0, 1), (1, 1), (2, 1), (3, 1)];
+    model.prompt_lookup = false;
     let mut baseline = start(&mut model);
+    assert!(baseline.iter().all(|r| r.warm.tokens == r.input.len()));
+    model.prompt_lookup = true;
     let mut baseline_times = vec![];
     for _ in 0..34 {
         let at = Instant::now();
@@ -321,6 +328,7 @@ fn validate_sampled_lookup_requests() {
     }
 
     let mut requests = start(&mut model);
+    assert!(requests.iter().all(|r| r.warm.tokens + 1 == r.input.len()));
     let mut packet_times = vec![];
     for (iteration, lookup) in [3, 1, 2, 0, 3, 1].into_iter().enumerate() {
         let mut draft = expected[lookup][requests[lookup].generated..][..7].to_vec();
@@ -387,6 +395,89 @@ fn validate_sampled_lookup_requests() {
             .unwrap();
         model.finish_request(request, false).unwrap();
     }
+    model.prefix_cache_limit = 4 << 30;
+    model.prefix_cache.device.budget = 4 << 30;
+    let mut prefixes = Vec::new();
+    for restored in [false, true] {
+        let mut request = model
+            .start_request(input(&source(0), 4), &|| false)
+            .unwrap();
+        let prompt = request.input.len();
+        assert_eq!(
+            request.prefix.statistics.cached_tokens,
+            if restored { prompt } else { 0 }
+        );
+        while request.prefilling {
+            model
+                .advance_requests(&mut [&mut request], &scheduler::Options::default())
+                .unwrap();
+        }
+        assert_eq!(request.warm.tokens + 1, prompt);
+        while !request.is_finished() {
+            model
+                .execute_selected(&mut [&mut request], &[(0, 1)], &mut vec![])
+                .unwrap();
+        }
+        prefixes.push(request.history.clone());
+        let position = request.history.len() - 1;
+        model.finish_request(&mut request, true).unwrap();
+        assert_eq!(request.warm.tokens, position);
+        assert!(model.prefix_cache.device.entries.values().any(|entry| {
+            entry.tokens == request.history[..position] && entry.warm_tokens + 1 == position
+        }));
+    }
+    assert_eq!(prefixes[0], prefixes[1]);
+
+    let mut suffix_request = input(&source(0), 4);
+    let prefix = suffix_request.input_tokens.len();
+    let suffix = &f.cases[1].input_tokens[..312];
+    suffix_request.input_tokens.extend_from_slice(suffix);
+    let mut shifted = Vec::new();
+    for deferred in [false, true] {
+        model.prompt_lookup = deferred;
+        let mut request = model
+            .start_request(input(&suffix_request, 4), &|| false)
+            .unwrap();
+        assert_eq!(request.offset, prefix);
+        assert_eq!(request.warm.tokens, prefix - usize::from(deferred));
+        request.cache_prompt = false;
+        shifted.push(
+            model
+                .with_request(&mut request, |m, req| {
+                    m.advance_prefill(req, suffix.len(), false)?;
+                    assert_eq!(req.warm.tokens, req.input.len() - usize::from(deferred));
+                    assert!(m.refresh_request_mtp(req, true)?);
+                    let state = m
+                        .prefix_ranges(req.offset)?
+                        .into_iter()
+                        .map(|(name, range)| {
+                            let raw = m
+                                .execution
+                                .download_bytes(&name, range.offset + range.bytes)?;
+                            Ok((name, crate::artifact::sha256(&raw[range.offset..])))
+                        })
+                        .collect::<Result<BTreeMap<_, _>>>()?;
+                    Ok((req.history.clone(), state))
+                })
+                .unwrap(),
+        );
+        model.finish_request(&mut request, false).unwrap();
+    }
+    assert_eq!(shifted[0], shifted[1]);
+    let mut wrapping_request = input(&source(0), 4);
+    let ring = model
+        .lookup_warm_capacity(
+            model.manifest.mtp.as_ref().unwrap(),
+            &wrapping_request.sampling,
+        )
+        .unwrap();
+    wrapping_request
+        .input_tokens
+        .extend_from_slice(&f.cases[3].input_tokens[..ring]);
+    let mut wrapping = model.start_request(wrapping_request, &|| false).unwrap();
+    assert_eq!(wrapping.offset, prefix);
+    assert_eq!(wrapping.warm.tokens, prefix);
+    model.finish_request(&mut wrapping, false).unwrap();
     std::fs::write(
         &f.output,
         json!({

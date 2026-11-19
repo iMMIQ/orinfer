@@ -621,6 +621,29 @@ impl ModelRuntime {
         }
         Ok(())
     }
+    fn lookup_warm_capacity(
+        &self,
+        spec: &crate::mtp::Spec,
+        sampling: &crate::sampling::Options,
+    ) -> Option<usize> {
+        if !self.prompt_lookup
+            || !spec.batch_commit
+            || !spec.commit_always
+            || self.manifest.packet_table().is_none()
+            || sampling.temperature <= 0.
+            || sampling.top_logprobs.is_some()
+        {
+            return None;
+        }
+        let ring = spec.hidden_ring.as_ref()?;
+        self.manifest
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == *ring)
+            .and_then(|buffer| buffer.shape.first().copied())
+            .filter(|&rows| rows != 0)
+    }
+
     pub(crate) fn start_request(
         &mut self,
         mut input: GenerationInput,
@@ -665,16 +688,24 @@ impl ModelRuntime {
                 if warm.tokens != offset - 1 {
                     return Err("Restored prefix contains an inconsistent MTP cursor".into());
                 }
-                let at = Instant::now();
-                self.mtp_warm_state(
-                    &spec,
-                    &input.input_tokens[offset..offset + 1],
-                    cancelled,
-                    ExecutionPhase::Prefill,
-                    false,
-                )?;
-                warm.tokens = offset;
-                warm.seconds += at.elapsed().as_secs_f64();
+                // The oldest hidden row needed by the restored bridge is
+                // h[offset-1]. If the entire suffix fits beside it, the
+                // first suffix warm can consume the bridge in the same packet.
+                if self
+                    .lookup_warm_capacity(&spec, &input.sampling)
+                    .is_none_or(|rows| prompt_len - offset >= rows)
+                {
+                    let at = Instant::now();
+                    self.mtp_warm_state(
+                        &spec,
+                        &input.input_tokens[offset..offset + 1],
+                        cancelled,
+                        ExecutionPhase::Prefill,
+                        false,
+                    )?;
+                    warm.tokens = offset;
+                    warm.seconds += at.elapsed().as_secs_f64();
+                }
             }
             let mut checkpoints = BTreeSet::new();
             if self.prefix_enabled() {
@@ -987,10 +1018,17 @@ impl ModelRuntime {
         req.generated += 1;
         req.prefilling = false;
         if let Some(spec) = self.manifest.mtp.clone() {
-            let at = Instant::now();
-            self.mtp_warm(&spec, &[pending], &|| false, ExecutionPhase::Prefill)?;
-            req.warm.tokens = req.input.len();
-            req.mtp.initial_warm_s = req.warm.seconds + at.elapsed().as_secs_f64();
+            req.mtp.initial_warm_s = req.warm.seconds;
+            // Sampled lookup reads target state only. The hidden ring can
+            // supply this endpoint when model drafting or a checkpoint needs it.
+            if self.lookup_warm_capacity(&spec, &req.sampling).is_none()
+                || req.decoder.has_constraint()
+            {
+                let at = Instant::now();
+                self.mtp_warm(&spec, &[pending], &|| false, ExecutionPhase::Prefill)?;
+                req.warm.tokens = req.input.len();
+                req.mtp.initial_warm_s += at.elapsed().as_secs_f64();
+            }
         }
         req.mtp.committed_tokens = req.generated;
         Ok(vec![pending])
