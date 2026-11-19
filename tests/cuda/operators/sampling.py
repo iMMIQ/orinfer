@@ -62,7 +62,7 @@ class BatchedPipeline:
                 target.copy_(source.reshape(-1).view(torch.uint8))
         self.pointers.copy_(table)
 
-    def run(self, rows):
+    def run(self, rows, phase="both"):
         stream = torch.cuda.current_stream().cuda_stream
 
         def launch(name, **scalars):
@@ -70,9 +70,13 @@ class BatchedPipeline:
             values = {None: self.pointers, "Output": self.output, "__rows__": rows, **scalars}
             kernel.adapter.func(*(values[name] for name in arguments), stream=stream)
 
-        for name in FUNCTIONS:
-            if not name.startswith("radix_"):
-                launch(name)
+        if phase != "fallback":
+            for name in FUNCTIONS:
+                if name != "fallback_masses" and not name.startswith("radix_"):
+                    launch(name)
+        if phase == "fast":
+            return
+        launch("fallback_masses")
         for mode in range(3):
             for digit in range(12):
                 launch("radix_histogram", digit=digit, mode=mode)
@@ -106,11 +110,20 @@ def check_batched(sanitizer=False):
         for rows in (n for n in (1, 3, 8, 17, 128) if n <= maximum):
             owners = list(reversed(range(rows)))
             batch.inputs(owners)
-            batch.run(rows)
-            assert batch.output[:rows].cpu().tolist() == [expected[i] for i in owners]
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                batch.run(rows)
+                batch.run(rows, phase="fast")
+            fallback = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(fallback):
+                batch.run(rows, phase="fallback")
+            graph.replay()
+            pending = batch.output[:rows, 1].cpu().tolist()
+            assert all(
+                pending[row] == s.NEEDS_RADIX for row, owner in enumerate(owners) if owner % 4 == 0
+            )
+            if s.NEEDS_RADIX in pending:
+                fallback.replay()
+            assert batch.output[:rows].cpu().tolist() == [expected[i] for i in owners]
             # Change membership and every live row's logits/parameters. Reuse
             # the same captured addresses, including an inactive interior row.
             owners.reverse()
@@ -156,7 +169,7 @@ class Pipeline:
         blocks = (vocab + s.TILE - 1) // s.TILE
         self.kernels = {
             name: getattr(s, name)(vocab, *([context] if name == "history" else []))
-            for name in FUNCTIONS
+            for name in (*FUNCTIONS, "masses")
         }
 
         def empty(shape, dtype):
@@ -198,28 +211,38 @@ class Pipeline:
             self.maximum,
             self.invalid,
         )
-        k["masses"](
-            self.scores,
-            self.keys,
-            self.maximum,
-            self.invalid,
-            self.parameters,
-            self.mass,
-            self.output,
-        )
         if shortlist:
             k["shortlist_bound"](self.maximum, self.state, self.control, self.invalid, self.output)
             k["shortlist_collect"](self.keys, self.state, self.control, self.counts, self.output)
             k["shortlist_sample"](
                 self.keys,
-                self.mass,
+                self.scores,
+                self.state,
                 self.counts,
                 self.control,
                 self.parameters,
                 self.invalid,
                 self.output,
             )
+            k["fallback_masses"](
+                self.scores,
+                self.keys,
+                self.state,
+                self.invalid,
+                self.parameters,
+                self.mass,
+                self.output,
+            )
         else:
+            k["masses"](
+                self.scores,
+                self.keys,
+                self.maximum,
+                self.invalid,
+                self.parameters,
+                self.mass,
+                self.output,
+            )
             self.invalid[0].zero_()
         for mode in range(3):
             for digit in range(12):

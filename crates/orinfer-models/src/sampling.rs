@@ -7,25 +7,36 @@ use std::collections::BTreeSet;
 
 pub(crate) fn register(m: &mut Manifest, bindings: &BTreeSet<String>) -> Result<()> {
     m.sampling = None;
-    let mut names: Vec<String> = ["initialize", "history", "scores", "masses"]
+    let mut names: Vec<String> = ["initialize", "history", "scores"]
         .into_iter()
         .map(|s| format!("sampling/{s}"))
         .collect();
+    let deferred = bindings.contains("sampling/fallback_masses");
+    if !deferred {
+        names.push("sampling/masses".into());
+    }
     let shortlist = [
         "sampling/shortlist_bound",
         "sampling/shortlist_collect",
         "sampling/shortlist_sample",
     ];
-    if shortlist.iter().any(|name| bindings.contains(*name)) {
+    if deferred || shortlist.iter().any(|name| bindings.contains(*name)) {
         names.extend(shortlist.map(str::to_owned));
+    }
+    let mut radix = Vec::new();
+    if deferred {
+        radix.push("sampling/fallback_masses".to_owned());
     }
     for mode in 0..3 {
         for digit in 0..12 {
-            names.extend([
+            radix.extend([
                 format!("sampling/{mode}/{digit}/hist"),
                 format!("sampling/{mode}/{digit}/choose"),
             ]);
         }
+    }
+    if !deferred {
+        names.append(&mut radix);
     }
     let count = bindings
         .iter()
@@ -37,16 +48,24 @@ pub(crate) fn register(m: &mut Manifest, bindings: &BTreeSet<String>) -> Result<
         }
         return Ok(());
     }
-    if count != names.len() || names.iter().any(|n| !bindings.contains(n)) {
+    if count != names.len() + radix.len()
+        || names.iter().chain(&radix).any(|n| !bindings.contains(n))
+    {
         return Err("Incomplete shared GPU sampling bindings".into());
     }
-    m.programs.insert(
-        "sampling".into(),
-        names
-            .into_iter()
-            .map(|name| Operation::Kernel { name })
-            .collect(),
-    );
+    let programs = [("sampling", names), ("sampling_fallback", radix)];
+    for (program, names) in &programs {
+        if !names.is_empty() {
+            m.programs.insert(
+                (*program).into(),
+                names
+                    .iter()
+                    .cloned()
+                    .map(|name| Operation::Kernel { name })
+                    .collect(),
+            );
+        }
+    }
     m.sampling = Some(Sampling {
         program: "sampling".into(),
         history: "SamplingHistory".into(),
@@ -58,13 +77,17 @@ pub(crate) fn register(m: &mut Manifest, bindings: &BTreeSet<String>) -> Result<
         output: "SamplingOutput".into(),
         batch: None,
     });
-    let batch_names: Vec<_> = m.programs["sampling"]
-        .iter()
-        .map(|op| {
-            let Operation::Kernel { name } = op else {
-                unreachable!()
-            };
-            name.replacen("sampling/", "sampling_rows/", 1)
+    let batch_programs: Vec<_> = programs
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(program, names)| {
+            (
+                program.replacen("sampling", "sampling_rows", 1),
+                names
+                    .into_iter()
+                    .map(|n| n.replacen("sampling/", "sampling_rows/", 1))
+                    .collect::<Vec<_>>(),
+            )
         })
         .collect();
     let count = bindings
@@ -72,16 +95,10 @@ pub(crate) fn register(m: &mut Manifest, bindings: &BTreeSet<String>) -> Result<
         .filter(|n| n.starts_with("sampling_rows/"))
         .count();
     if count != 0 {
-        if count != batch_names.len() || batch_names.iter().any(|n| !bindings.contains(n)) {
+        let mut expected = batch_programs.iter().flat_map(|(_, names)| names);
+        if count != expected.clone().count() || expected.any(|n| !bindings.contains(n)) {
             return Err("Incomplete batched GPU sampling bindings".into());
         }
-        m.programs.insert(
-            "sampling_rows".into(),
-            batch_names
-                .into_iter()
-                .map(|name| Operation::Kernel { name })
-                .collect(),
-        );
         let rows = m
             .row_execution
             .get_or_insert_with(|| crate::operators::rows::RowExecution {
@@ -91,8 +108,17 @@ pub(crate) fn register(m: &mut Manifest, bindings: &BTreeSet<String>) -> Result<
                 variants: Default::default(),
             });
         rows.capacity = rows.capacity.max(128);
-        rows.programs.insert("sampling_rows".into());
-        rows.program_capacities.insert("sampling_rows".into(), 128);
+        for (program, names) in batch_programs {
+            rows.programs.insert(program.clone());
+            rows.program_capacities.insert(program.clone(), 128);
+            m.programs.insert(
+                program,
+                names
+                    .into_iter()
+                    .map(|name| Operation::Kernel { name })
+                    .collect(),
+            );
+        }
         let (offsets, stride) = BatchedSampling::layout(m.vocab, m.max_context)?;
         m.sampling.as_mut().unwrap().batch = Some(BatchedSampling {
             program: "sampling_rows".into(),

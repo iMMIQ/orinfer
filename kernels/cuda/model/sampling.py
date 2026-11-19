@@ -13,6 +13,14 @@ from orinfer_build.compiler.cuda.common import orin_jit
 TILE = 1024
 SHORTLIST = 256
 SHORTLIST_TOP_K = 64
+NEEDS_RADIX = 2
+
+
+def _fixed_mass(score, maximum, temperature, scale):
+    return T.cast(
+        T.call_pure_extern("float64", "exp", (score - maximum) / temperature) * T.float64(scale),
+        T.uint64,
+    )
 
 
 @orin_jit
@@ -151,13 +159,7 @@ def masses(vocab: int):
                 if j < vocab:
                     Mass[j] = 0
                     if Keys[j] != 0 and invalid[0] == 0:
-                        Mass[j] = T.cast(
-                            T.call_pure_extern(
-                                "float64", "exp", (Scores[j] - maximum[0]) / Parameters[0]
-                            )
-                            * T.float64(scale),
-                            T.uint64,
-                        )
+                        Mass[j] = _fixed_mass(Scores[j], maximum[0], Parameters[0], scale)
             if b == 0 and T.get_thread_binding() == 0:
                 Output[0] = 0
                 Output[1] = invalid[0]
@@ -321,9 +323,11 @@ def radix_choose(vocab: int):
 
 @orin_jit
 def shortlist_bound(vocab: int):
+    # Reduce validity once. The radix threshold slot is free until fallback.
     blocks = (vocab + TILE - 1) // TILE
     extent = min(256, max(32, 1 << (blocks - 1).bit_length()))
     levels = (extent - 1).bit_length()
+    reduction_width = 1 << (blocks - 1).bit_length()
 
     @T.prim_func
     def main(
@@ -336,10 +340,30 @@ def shortlist_bound(vocab: int):
         with T.Kernel(1, threads=extent):
             lane = T.get_thread_binding()
             cache = T.alloc_shared((extent,), T.uint64)
+            maxima = T.alloc_fragment((reduction_width,), T.float64)
+            invalids = T.alloc_fragment((reduction_width,), T.int32)
+            maximum = T.alloc_fragment((1,), T.float64)
+            invalid = T.alloc_fragment((1,), T.int32)
+            for tile in T.Parallel(reduction_width):
+                maxima[tile] = -T.infinity(T.float64)
+                invalids[tile] = 0
+                if tile < blocks:
+                    maxima[tile] = Maximum[tile]
+                    invalids[tile] = Invalid[tile]
+            T.reduce_max(maxima, maximum, dim=0)
+            T.reduce_max(invalids, invalid, dim=0)
+            invalid[0] = T.max(
+                invalid[0],
+                T.cast(not T.call_pure_extern("bool", "isfinite", maximum[0]), T.int32),
+            )
+            T.sync_threads()
             if lane == 0:
+                State[4] = T.reinterpret(T.uint64, maximum[0])
                 State[6] = 0
-                Invalid[0] = 0
-            if Control[3] > 0 and Control[3] <= SHORTLIST_TOP_K and Output[1] == 0:
+                Invalid[0] = invalid[0]
+                Output[0] = 0
+                Output[1] = T.if_then_else(invalid[0] != 0, 1, NEEDS_RADIX)
+            if Control[3] > 0 and Control[3] <= SHORTLIST_TOP_K and invalid[0] == 0:
                 key = T.alloc_var(T.uint64, T.uint64(0))
                 # Each sampled tile supplies one distinct witness. Its kth
                 # maximum bounds the true kth key from below. Padded tiles
@@ -379,7 +403,7 @@ def shortlist_collect(vocab: int):
         Output: T.Tensor((2,), T.int32),
     ):
         with T.Kernel(T.ceildiv(vocab, TILE), threads=256) as block:
-            if Control[3] > 0 and Control[3] <= SHORTLIST_TOP_K and Output[1] == 0:
+            if Control[3] > 0 and Control[3] <= SHORTLIST_TOP_K and Output[1] == NEEDS_RADIX:
                 for i in T.Parallel(TILE):
                     token = block * TILE + i
                     if token < vocab:
@@ -396,11 +420,13 @@ def shortlist_collect(vocab: int):
 def shortlist_sample(vocab: int):
     blocks = (vocab + TILE - 1) // TILE
     rank_bits = (SHORTLIST - 1).bit_length()
+    scale = 1 << min(52, 63 - (vocab - 1).bit_length())
 
     @T.prim_func
     def main(
         Keys: T.Tensor((vocab,), T.uint64),
-        Mass: T.Tensor((vocab,), T.uint64),
+        Scores: T.Tensor((vocab,), T.float64),
+        State: T.Tensor((7,), T.uint64),
         Counts: T.Tensor((vocab,), T.int32),
         Control: T.Tensor((4,), T.int32),
         Parameters: T.Tensor((6,), T.float64),
@@ -412,7 +438,7 @@ def shortlist_sample(vocab: int):
             id_order = T.alloc_shared((SHORTLIST,), T.int32)
             token_order = T.alloc_shared((SHORTLIST,), T.int32)
             prefix = T.alloc_shared((SHORTLIST,), T.uint64)
-            if Control[3] > 0 and Control[3] <= SHORTLIST_TOP_K and Output[1] == 0:
+            if Control[3] > 0 and Control[3] <= SHORTLIST_TOP_K and Output[1] == NEEDS_RADIX:
                 count = Output[0]
                 if count > 0 and count <= SHORTLIST:
                     for i in T.Parallel(SHORTLIST):
@@ -432,12 +458,15 @@ def shortlist_sample(vocab: int):
                                     key_order[j] == key and id_order[j] < token
                                 ):
                                     rank += 1
-                            prefix[rank] = Mass[token]
-                            token_order[rank] = token
+                            if rank < Control[3]:
+                                maximum = T.reinterpret(T.float64, State[4])
+                                prefix[rank] = _fixed_mass(
+                                    Scores[token], maximum, Parameters[0], scale
+                                )
+                                token_order[rank] = token
                     T.cumsum(prefix, dim=0)
                     if T.get_thread_binding() == 0:
-                        # Masses already copied per-tile validity to Output[1].
-                        # Invalid[0] now signals whether radix can exit early.
+                        Output[1] = 0
                         Invalid[0] = 1
                         active = T.min(count, Control[3])
                         total = prefix[active - 1]
@@ -477,7 +506,39 @@ def shortlist_sample(vocab: int):
                             Output[0] = token_order[first]
 
                 elif T.get_thread_binding() == 0:
-                    # The exact radix fallback owns an overflowed shortlist.
+                    # Leave the row pending for the exact radix fallback.
                     Output[0] = 0
+
+    return main
+
+
+@orin_jit
+def fallback_masses(vocab: int):
+    # Completed rows retain their sample and never enter the radix stages.
+    blocks = (vocab + TILE - 1) // TILE
+    scale = 1 << min(52, 63 - (vocab - 1).bit_length())
+
+    @T.prim_func
+    def main(
+        Scores: T.Tensor((vocab,), T.float64),
+        Keys: T.Tensor((vocab,), T.uint64),
+        State: T.Tensor((7,), T.uint64),
+        Invalid: T.Tensor((blocks,), T.int32),
+        Parameters: T.Tensor((6,), T.float64),
+        Mass: T.Tensor((vocab,), T.uint64),
+        Output: T.Tensor((2,), T.int32),
+    ):
+        with T.Kernel(blocks, threads=256) as b:
+            if Invalid[0] == 0:
+                maximum = T.reinterpret(T.float64, State[4])
+                for i in T.Parallel(TILE):
+                    j = b * TILE + i
+                    if j < vocab:
+                        Mass[j] = 0
+                        if Keys[j] != 0:
+                            Mass[j] = _fixed_mass(Scores[j], maximum, Parameters[0], scale)
+                if b == 0 and T.get_thread_binding() == 0:
+                    Output[0] = 0
+                    Output[1] = 0
 
     return main

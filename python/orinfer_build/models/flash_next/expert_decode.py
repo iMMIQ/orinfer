@@ -1,4 +1,4 @@
-"""Rebuild the measured Flash Next expert projections for four and eight rows."""
+"""Rebuild the measured Flash Next expert projections for small decode and verification packets."""
 
 import re
 from functools import partial
@@ -14,13 +14,15 @@ def publish(package, manifest, compiler):
     geometry = {(1280, 2560), (2560, 640)}
     launches = manifest["dynamic_batch_kernels"]
     replacements, pairs = {}, {}
+    ranges = {"4-4": 4, "8-8": 8, "9-15": 1024}
     for old in package["kernels"]:
         name = old["name"]
-        match = re.fullmatch(r"(flash_decode/layer\d+/post)/k\d+/rows/([48])-\2", name)
+        match = re.fullmatch(r"(flash_decode/layer\d+/post)/k\d+/rows/(4-4|8-8|9-15)", name)
         if match is None or old["symbol"] != "exact_e8p_int4_kernel":
             continue
         section, extent = match.groups()
-        rows = int(extent)
+        rows = ranges[extent]
+        dynamic = extent == "9-15"
         pointers = compiler.pointers(old)
         bank = compiler.buffers[pointers["P"]["name"]]
         count, blocks, outputs, words = bank["shape"]
@@ -35,16 +37,20 @@ def publish(package, manifest, compiler):
             or old["grid"] != [(outputs + 127) // 128, tiles, 1]
             or old["block"] != [128, 1, 1]
             or launch is None
-            or launch["arguments"]
-            or launch["grid"] != [dict(op="constant", value=n) for n in old["grid"]]
+            or launch["capacity"] != 1024
+            or (not dynamic and launch["arguments"])
+            or (
+                not dynamic
+                and launch["grid"] != [dict(op="constant", value=n) for n in old["grid"]]
+            )
         ):
             raise ValueError(f"Unexpected Flash decode expert contract: {name}")
-        seen = pairs.setdefault((section, rows), set())
+        seen = pairs.setdefault((section, extent), set())
         if (outputs, inputs) in seen:
             raise ValueError(f"Duplicate Flash decode expert geometry: {name}")
         seen.add((outputs, inputs))
 
-        new, _ = compiler.emit(
+        new, rebuilt_launch = compiler.emit(
             old,
             name,
             pointers,
@@ -59,18 +65,25 @@ def publish(package, manifest, compiler):
                 block_m=8,
                 stages=4,
                 warp_private=True,
+                dynamic_rows=dynamic,
             ),
             key=f"expert-decode-warp-{rows}-{experts}-{top}-{outputs}-{inputs}",
-            symbolic=False,
+            symbolic=dynamic,
+            multiplier=top if dynamic else 1,
         )
-        if new["grid"] != old["grid"] or new["block"] != old["block"]:
+        if (
+            new["grid"] != old["grid"]
+            or new["block"] != old["block"]
+            or new["args"] != old["args"]
+            or (dynamic and rebuilt_launch != launch)
+        ):
             raise ValueError(f"Changed Flash decode expert routing geometry: {name}")
         replacements[name] = new
 
     sections = [
         name for name in manifest["programs"] if re.fullmatch(r"flash_decode/layer\d+/post", name)
     ]
-    expected = {(section, rows) for section in sections for rows in (4, 8)}
+    expected = {(section, rows) for section in sections for rows in ranges}
     if not expected or pairs.keys() != expected or any(pair != geometry for pair in pairs.values()):
         raise ValueError("Missing paired Flash decode expert projections")
     package["kernels"] = [replacements.get(k["name"], k) for k in package["kernels"]]

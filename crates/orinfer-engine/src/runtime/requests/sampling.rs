@@ -159,7 +159,7 @@ impl ModelRuntime {
             .submit_program_rows(&batch.program, rows.len(), ExecutionPhase::Decode)?;
         #[cfg(test)]
         profile::mark("sampling_submit");
-        let output = self.read_controls(&batch.output, rows.len() * 2)?;
+        let output = self.read_sampling_output(&batch.output, Some(rows.len()))?;
         #[cfg(test)]
         profile::mark("sampling_readback");
         let mut stats = self.execution.batch_statistics();

@@ -477,7 +477,7 @@ def main():
     auxiliary.add_argument(
         "--expert-decode-only",
         action="store_true",
-        help="Rebuild the exact expert projections for four- and eight-row Flash packets",
+        help="Rebuild the exact expert projections for small Flash decode and verification packets",
     )
     auxiliary.add_argument(
         "--hc-prefill-only",
