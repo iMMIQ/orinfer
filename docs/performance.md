@@ -279,6 +279,86 @@ Prefill、decode、Graph 和准入为回放前后 `/health` 的计数差，覆�
 
 512 条轨迹同版本对照中，throughput 的输出 TPS 比 latency 高 28.40%。两次 throughput 短测各完成 92 个请求和 12 条轨迹，输出 TPS 分别为 41.47 和 41.49。
 
+### P1–P5 全模型复测（2026-11-20）
+
+历史列取自 `58ab647cd95acde3850303188cfa86b47e4d148f` 记录的 512 轨迹基线，历史二进制由 `f78dd74a76f3e9930215358b4a8af77b94681e92` 构建，SHA256 为 `9adfddd647161439f9e9a560784febf9f639c8c863fab8ea3cad06a0aa18b27b`。P5 二进制以 `dabc7562f63a98ca0fb5176a9064de518ce99300` 为父提交，加入本节所在提交的 `prefill.rs` 修改（Git blob `b3f47e43bc640fa1cd576ae3d56c86700ae49a62`），release SHA256 为 `4c68713e9c42c38368df967f4a26caac6fbe609dedb8a4f1f209961fb5b5fabc`。
+
+两轮使用同一 manifest 与八模型验收表中的同一批 Schema 2 包。逐组核对回放输入身份及两轮均完成的请求 payload。服务逐个取得同一 GPU 锁，使用 `/health` 确认就绪和调度策略，回放结束后发送 SIGTERM 并等待退出。六个 latency 组使用空的 `policy_args`，Flash Next throughput 组设置 `policy_args=(--scheduler-policy throughput)` 和 `run_id=qwen-flash-next-throughput`。
+
+```bash
+cargo build --release --locked --offline
+sha256sum target/release/orinfer
+
+models=artifacts/bench/schema2-baseline-20261119/models
+dataset=artifacts/bench/mini-weka-synthetic-compact-512-v1
+output=artifacts/bench/p5-all-models-baseline
+model_id=index-translate-2b
+run_id="$model_id"
+policy_args=()
+
+./target/release/orinfer serve "$models/$model_id" \
+  --listen 127.0.0.1:18828 --model "$model_id" \
+  --cuda-graph decode_only --mtp-drafts auto --resident-experts full \
+  --prefix-cache-mib 4096 --max-active-requests 4 --prompt-lookup "${policy_args[@]}" &
+server_pid=$!
+
+# /health 就绪后开始回放。
+uv run --locked python -m tools.bench.mini_weka_compact \
+  --manifest "$dataset/manifest.json" \
+  --tokenizer "$models/$model_id" --url http://127.0.0.1:18828/v1 \
+  --model "$model_id" --concurrency 4 --wall-limit 240 \
+  --output "$output/mini/$run_id"
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+```
+
+七组均达到 240 秒时限，服务经 SIGTERM 退出码均为 0，CUDA/runtime 错误、panic 与 OOM 均为 0。下表箭头从 `58ab647` 指向 P5。完成请求、缓存命中、输出 TPS 与 TTFT 沿用上节的 profiling 口径。
+
+#### 六模型 latency
+
+| 模型 | 完成请求 | 完整轨迹 | 缓存命中率 | 输出 TPS | TTFT P50 / P95（s） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Index-Translate-2B | 288 → 358 | 39 → 50 | 57.85% → 78.60% | 124.04 → 156.21 | 0.59 / 2.57 → 0.24 / 0.80 |
+| Qwen3.5-4B | 133 → 168 | 17 → 24 | 64.21% → 77.90% | 57.60 → 73.58 | 1.47 / 7.04 → 0.52 / 1.95 |
+| Index-Translate-9B | 90 → 125 | 12 → 16 | 61.84% → 78.72% | 39.28 → 53.80 | 2.03 / 10.59 → 0.76 / 2.98 |
+| Qwen3.8-27B | 26 → 34 | 4 → 4 | 69.42% → 78.65% | 13.52 → 15.77 | 7.41 / 30.53 → 3.86 / 26.43 |
+| Index-Translate-35B-A3B-preview | 68 → 124 | 8 → 16 | 61.05% → 78.75% | 28.40 → 52.76 | 1.68 / 7.48 → 0.72 / 2.29 |
+| Qwen3.8-Flash-Next | 72 → 86 | 8 → 12 | 79.67% → 79.68% | 32.32 → 39.84 | 2.60 / 16.45 → 1.53 / 6.70 |
+
+六组 latency 的输出 TPS 提升 16.6%–85.8%，TTFT P95 均下降。2B、4B、9B、27B 与 35B 的缓存命中率达到 77.90%–78.75%。35B 的完整轨迹从 8 增至 16，批量提交累计耗时从 93.98 秒降至 33.43 秒。
+
+#### Flash Next latency 与 throughput
+
+| 调度策略 | 完成请求 | 完整轨迹 | 缓存命中率 | 输出 TPS | TTFT P50 / P95（s） | 采样 lookup 轮数 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| latency | 72 → 86 | 8 → 12 | 79.67% → 79.68% | 32.32 → 39.84 | 2.60 / 16.45 → 1.53 / 6.70 | 0 → 444 |
+| throughput | 92 → 93 | 12 → 12 | 78.63% → 78.33% | 41.49 → 41.76 | 0.92 / 3.97 → 0.99 / 3.93 | 453 → 446 |
+
+P5 对距末尾 2–8 token 的生成提示边界保留快速准入，距末尾 1 token 的提示按成本与复用准入。Flash Next throughput 完成 93 个请求，达到 41.76 TPS。从 P4 到 P5，27B latency 的 1-token prefill 块也从 41 降至 9。
+
+| 版本 | 1-token prefill 块 | 混合迭代 | mixed_packet_s | direct_s |
+| --- | ---: | ---: | ---: | ---: |
+| `58ab647` | 17 | 40 | 14.68 | 13.45 |
+| `P4` | 98 | 113 | 21.91 | 19.49 |
+| `P5` | 13 | 23 | 9.32 | 8.84 |
+
+#### 调度、前缀缓存与 Graph 计数
+
+| 模型 | batch_commit_s | 父前缀恢复不足 | 前缀淘汰 | Graph 命中 / 未命中 / 捕获延后 | Graph 淘汰 | Graph 失效 | max_decode_gap_s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Index-Translate-2B | 29.34 → 44.97 | 154 → 0 | 404 → 492 | 18,018 / 68 / 114 → 18,369 / 114 / 134 | 0 → 0 | 13 → 7 | 0.625 → 0.269 |
+| Qwen3.5-4B | 24.28 → 36.29 | 54 → 0 | 313 → 207 | 6,390 / 544 / 825 → 4,714 / 208 / 325 | 379 → 4 | 105 → 100 | 0.321 → 0.318 |
+| Index-Translate-9B | 16.11 → 23.21 | 39 → 0 | 151 → 145 | 3,355 / 66 / 89 → 3,388 / 194 / 208 | 0 → 23 | 24 → 61 | 0.418 → 0.350 |
+| Qwen3.8-27B | 4.00 → 1.90 | 4 → 1 | 62 → 33 | 1,910 / 225 / 183 → 2,752 / 125 / 120 | 206 → 70 | 0 → 0 | 0.588 → 0.526 |
+| Index-Translate-35B-A3B-preview | 93.98 → 33.43 | 32 → 0 | 106 → 128 | 2,135 / 139 / 152 → 3,441 / 169 / 225 | 71 → 14 | 37 → 55 | 0.408 → 0.353 |
+| Qwen3.8-Flash-Next | 1.58 → 1.12 | 0 → 0 | 89 → 89 | 3,384 / 169 / 137 → 3,159 / 57 / 74 | 155 → 7 | 0 → 0 | 0.545 → 0.420 |
+| Qwen3.8-Flash-Next throughput | 2.10 → 1.62 | 0 → 0 | 115 → 91 | 2,654 / 58 / 54 → 2,784 / 35 / 44 | 35 → 0 | 0 → 0 | 5.893 → 5.856 |
+
+Graph 与调度计数取回放前后 `/health` 差值，最长 decode 间隔取回放结束快照。前缀淘汰与恢复不足按已完成请求统计。Graph 淘汰在 4B、27B、35B 与两组 Flash Next 中下降，9B 的淘汰和失效计数上升，35B 的失效计数也上升。
+
+回放计数采集后，六个 latency 服务各执行两次温度 0、seed 20261002、最多 24 token 的固定英译中请求。六组的两次输出均一致，第二次请求恢复 27 或 31 个 prompt token，原始 prompt 为 31 token。本轮原始请求、健康快照、服务日志和汇总见 `artifacts/bench/p5-all-models-baseline/baseline.json` 及同目录记录。
+
 ### 八模型 Schema 2 验收
 
 模型权重、CPU 表与 TileLang 资产使用与源文件相同的 inode。独立 `bindings.json` 与 `package.json` 固定新包摘要。八个包均通过 `validate-model`，覆盖前端、CPU 资产、执行包、绑定与权重 tensor SHA256。两个 `plan-model` 的 kernel bindings 按名称逐项相等，动态 launch、prefill、sampling、MTP、动态行契约相等。Flash Next 的 `head_m1` 删除的调用仅写入无读取方的临时缓冲区 `Scratch2249`，保留从同一输入计算的融合算子 `hc_up13_finish_kernel`。其余程序操作逐项相同。Schema 2 输出省略空的 `batch_layout.small_mixed_shapes` 字段。

@@ -906,8 +906,8 @@ impl Profiles {
         if prefix <= start || self.score(prefix, end, bytes).is_none() {
             return false;
         }
-        if prefix >= 64 && (1..=8).contains(&end.saturating_sub(prefix)) {
-            // A generation-prompt boundary protects almost the entire prompt.
+        if prefix >= 64 && (2..=8).contains(&end.saturating_sub(prefix)) {
+            // The boundary before <think> can be reused after template rendering.
             return true;
         }
         let mut trial = checkpoints.clone();
@@ -974,12 +974,30 @@ mod profile_tests {
         let mut costs = Profiles::new([2048]).with_dynamic_capacity(4096);
         costs.observe_at(2048, 2048, 0.4);
         let checkpoints = BTreeSet::new();
-        for tail in [1, 2, 4, 8] {
+        for tail in 2..=8 {
             assert!(costs.admit(2048 - tail, 2048, 100 << 20, 0, &checkpoints));
         }
         assert!(!costs.admit(2039, 2048, 100 << 20, 0, &checkpoints));
         costs.observe_restore(100 << 20, 100.);
         assert!(!costs.admit(2044, 2048, 100 << 20, 0, &checkpoints));
+    }
+    #[test]
+    fn one_token_tail_uses_the_split_cost_and_confirmed_reuse() {
+        let mut costs = Profiles::new([2048]).with_dynamic_capacity(4096);
+        costs.observe_at(2048, 2048, 0.8);
+        let checkpoints = BTreeSet::new();
+        let bytes = 100 << 20;
+        for suffix in [256, 312, 768] {
+            let start = 2048 - suffix;
+            assert!(costs.score(2047, 2048, bytes).is_some());
+            assert!(!costs.admit(2047, 2048, bytes, start, &checkpoints));
+            for tail in 2..=8 {
+                assert!(costs.admit(2048 - tail, 2048, bytes, start, &checkpoints));
+            }
+        }
+        assert!(costs.admit_with_reuse(2047, 2048, bytes, 2048 - 768, &checkpoints, true));
+        costs.observe_at(1, 2048, 0.01);
+        assert!(costs.admit(2047, 2048, bytes, 2048 - 312, &checkpoints));
     }
     #[test]
     fn first_short_pass_replaces_the_cold_estimate() {
