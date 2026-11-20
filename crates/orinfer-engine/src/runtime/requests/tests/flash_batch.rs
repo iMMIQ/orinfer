@@ -133,7 +133,7 @@ fn validate_flash_mixed_speculation() {
                 selected.reverse();
             }
             if tokens == 128 && width == 2 && count == 1 && !reverse {
-                model.decode_until = None;
+                model.decode_turn = false;
                 let selected_work = model
                     .select_work(&mut requests, &options, &BTreeSet::new())
                     .unwrap();

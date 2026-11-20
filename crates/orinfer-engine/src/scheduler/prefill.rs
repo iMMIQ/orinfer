@@ -679,12 +679,12 @@ mod tests {
     }
 }
 
-/// Greedy registered prefill profiles and checkpoint policy. Stage and
-/// context observations use the same timing table as continuous packets.
+/// Greedy registered prefill profiles and checkpoint policy.
 pub(crate) struct Profiles {
     shapes: BTreeMap<usize, Estimate>,
     weight_pass: Option<f64>,
     timings: Curves,
+    stages: BTreeMap<(usize, usize, bool), f64>,
     restore_s_per_byte: f64,
     dynamic: Option<DynamicPrefill>,
 }
@@ -704,6 +704,7 @@ impl Profiles {
                 .collect(),
             weight_pass: None,
             timings: Default::default(),
+            stages: BTreeMap::new(),
             restore_s_per_byte: 1. / 20e9,
             dynamic: None,
         }
@@ -749,41 +750,43 @@ impl Profiles {
                     .map_or(sample, |old| old * (1. - weight) + sample * weight),
             );
         }
-        self.observe_exact(chunk, context, 0, seconds);
+        self.timings
+            .sample(Self::work(chunk, context), Path::Direct)
+            .time
+            .observe_recurring(seconds);
     }
 
-    fn observe_exact(&mut self, chunk: usize, context: usize, domain: usize, seconds: f64) {
-        if seconds.is_finite() && seconds > 0. {
-            self.timings
-                .sample(Self::work(chunk, context, domain), Path::Direct)
-                .time
-                .observe_recurring(seconds);
-        }
-    }
-
-    fn work(chunk: usize, context: usize, domain: usize) -> Work {
+    fn work(chunk: usize, context: usize) -> Work {
         Work {
             tokens: chunk,
             context,
-            domain,
             ..Work::default()
         }
     }
 
     pub fn chunk_upper(&self, chunk: usize, context: usize) -> f64 {
         self.timings
-            .exact_upper(Self::work(chunk, context, 0))
+            .exact_upper(Self::work(chunk, context))
             .unwrap_or_else(|| self.chunk_cost(chunk) * 1.2)
     }
 
-    pub fn observe_stage(&mut self, chunk: usize, stage: usize, context: usize, seconds: f64) {
-        self.observe_exact(chunk, context, stage + 1, seconds);
+    pub fn observe_stage(&mut self, chunk: usize, context: usize, warm: bool, seconds: f64) {
+        if seconds.is_finite() && seconds > 0. {
+            // Charge the slowest observed layer in this geometry. Draft warm
+            // runs in a separate stage with a different amount of work.
+            let peak = self
+                .stages
+                .entry((bucket(chunk), bucket(context), warm))
+                .or_default();
+            *peak = peak.max(seconds);
+        }
     }
 
-    pub fn stage_upper(&self, chunk: usize, stage: usize, context: usize, count: usize) -> f64 {
-        self.timings
-            .exact_upper(Self::work(chunk, context, stage + 1))
-            .unwrap_or_else(|| (self.chunk_upper(chunk, context) / count.max(1) as f64).max(0.02))
+    pub fn stage_upper(&self, chunk: usize, context: usize, count: usize, warm: bool) -> f64 {
+        self.stages
+            .get(&(bucket(chunk), bucket(context), warm))
+            .copied()
+            .unwrap_or_else(|| (self.chunk_upper(chunk, context) / count.max(1) as f64).max(0.001))
     }
     pub fn bounded_chunk_at(&self, remaining: usize, context: usize, budget_ms: f64) -> usize {
         let fitting = self
@@ -830,7 +833,13 @@ impl Profiles {
             .get(&tokens)
             .filter(|estimate| estimate.samples > 0)
             .map(|estimate| estimate.mean)
-            .unwrap_or_else(|| self.weight_pass_s() * (tokens as f64 / 64.).max(1.))
+            .unwrap_or_else(|| {
+                if self.dynamic.is_some() {
+                    self.span(tokens)
+                } else {
+                    self.weight_pass_s() * (tokens as f64 / 64.).max(1.)
+                }
+            })
     }
     /// Largest real profile within the estimated budget; one token guarantees
     /// progress even when no profile fits. This is a soft scheduling target.
@@ -927,6 +936,39 @@ impl Profiles {
 #[cfg(test)]
 mod profile_tests {
     use super::*;
+
+    #[test]
+    fn stage_buckets_reuse_observations_across_layers_and_dynamic_lengths() {
+        let mut costs = Profiles::new([2048]).with_dynamic_capacity(4096);
+        costs.observe_at(600, 4096, 0.2);
+        for chunk in 513..=640 {
+            for layer in 0..64 {
+                let seconds = if chunk == 513 && layer == 0 {
+                    0.008
+                } else {
+                    0.002
+                };
+                costs.observe_stage(chunk, 4096, false, seconds);
+            }
+        }
+        costs.observe_stage(600, 4096, true, 0.07);
+        assert_eq!(costs.stages.len(), 2);
+        assert_eq!(costs.timings.cells.len(), 1);
+        assert_eq!(costs.stage_upper(900, 4096, 64, false), 0.008);
+        assert_eq!(costs.stage_upper(900, 4096, 64, true), 0.07);
+    }
+
+    #[test]
+    fn cold_stage_uses_the_fitted_dynamic_cost_and_a_millisecond_floor() {
+        let mut costs = Profiles::new([2048]).with_dynamic_capacity(4096);
+        costs.observe_at(4, 4, 0.005);
+        costs.observe_at(2048, 2048, 0.21);
+        let fitted = 0.005 + (0.21 - 0.005) * 1024. / 2048.;
+        assert!((costs.chunk_cost(1024) - fitted).abs() < 1e-12);
+        assert!((costs.stage_upper(1024, 4096, 64, false) - fitted * 1.2 / 64.).abs() < 1e-12);
+        assert_eq!(costs.stage_upper(4, 4096, 64, false), 0.001);
+    }
+
     #[test]
     fn near_end_boundaries_are_admitted_before_a_short_pass_is_measured() {
         let mut costs = Profiles::new([2048]).with_dynamic_capacity(4096);

@@ -52,9 +52,19 @@ pub(super) struct LookupChoice {
 }
 
 impl LookupChoice {
-    fn operation(&self) -> BatchOperation {
+    pub(super) fn operation(&self) -> BatchOperation {
         verification_operation(self.ordinary.len())
     }
+}
+
+fn lookup_cost_key(
+    requests: &[&mut RequestState],
+    owners: impl Iterator<Item = usize>,
+) -> (usize, usize) {
+    let (count, context) = owners.fold((0, 0), |(count, context), i| {
+        (count + 1, context + requests[i].history.len())
+    });
+    (count, context.max(1).next_power_of_two())
 }
 
 fn verification_operation(ordinary: usize) -> BatchOperation {
@@ -720,24 +730,24 @@ impl ModelRuntime {
         requests: &mut [&mut RequestState],
         target: &[(usize, usize)],
         max_rows: usize,
+        slack: f64,
     ) -> Option<LookupChoice> {
         let spec = self.manifest.mtp.as_ref()?;
         let batch = self.manifest.sampling.as_ref()?.batch.as_ref()?;
         // The commit must preserve the target hidden history for lazy draft
         // catch-up. Lookup never mutates the draft state.
-        // The hot four-owner decode path uses one fixed verification shape.
-        // Longer windows are available to a copied continuation without
-        // running extra draft forwards or growing the model-draft depth.
+        // Verify one copied continuation alongside up to three ordinary rows.
         const OWNERS: usize = 4;
         const WIDTH: usize = 8;
-        let total = OWNERS + WIDTH - 1;
+        let total = target.len() + WIDTH - 1;
         if !self.prompt_lookup
             || !spec.batch_commit
             || !spec.commit_always
             || spec.hidden_ring.is_none()
             || self.manifest.packet_table().is_none()
             || !spec.batch_verification_tokens.contains(&WIDTH)
-            || target.len() != OWNERS
+            || target.is_empty()
+            || target.len() > OWNERS
             || total > batch.capacity
             || (max_rows != 0 && total > max_rows)
             || target.iter().any(|&(i, _)| {
@@ -748,6 +758,24 @@ impl ModelRuntime {
             })
         {
             return None;
+        }
+        if slack.is_finite() {
+            let key = lookup_cost_key(requests, target.iter().map(|&(i, _)| i));
+            let upper = self.sampled_lookup_costs.get(&key).map_or_else(
+                || {
+                    let context = target
+                        .iter()
+                        .map(|&(i, _)| requests[i].history.len())
+                        .max()
+                        .unwrap();
+                    self.predict_iteration(requests, target)
+                        + self.prefill_costs.chunk_upper(WIDTH, context + WIDTH)
+                },
+                Profile::upper,
+            );
+            if upper > slack {
+                return None;
+            }
         }
         let (index, proposal) = target.iter().find_map(|&(i, _)| {
             let req = &mut requests[i];
@@ -798,6 +826,15 @@ impl ModelRuntime {
         output: &mut Vec<StepOutput>,
         overlap: &mut dyn FnMut(),
     ) -> Result<()> {
+        let started = Instant::now();
+        let cost_key = lookup_cost_key(
+            requests,
+            choice
+                .ordinary
+                .iter()
+                .map(|&(i, _)| i)
+                .chain(choice.proposals.iter().map(|(i, _)| *i)),
+        );
         let mut rounds = Vec::with_capacity(choice.proposals.len());
         let spec = self
             .manifest
@@ -979,6 +1016,10 @@ impl ModelRuntime {
             req.mtp.restore_s += at.elapsed().as_secs_f64() / slots.len() as f64;
             self.commit_sampled_tokens(req, i, tokens, output)?;
         }
+        self.sampled_lookup_costs
+            .entry(cost_key)
+            .or_default()
+            .observe(started.elapsed().as_secs_f64());
         Ok(())
     }
 

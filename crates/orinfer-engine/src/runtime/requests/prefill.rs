@@ -45,26 +45,12 @@ impl ModelRuntime {
             .map(|f| &f.plan)
             .or_else(|| self.manifest.prefill_plan(chunk));
         if let Some(plan) = plan.filter(|p| !p.stages.is_empty()) {
-            if let Some(frame) = &req.prefill_frame {
-                return self.prefill_costs.stage_upper(
-                    chunk,
-                    frame.next,
-                    req.offset + chunk,
-                    plan.stages.len(),
-                );
-            }
-            // A new tile must fit its slowest measured layer, not just its
-            // first layer. An in-flight tile keeps its original extent.
-            (0..plan.stages.len())
-                .map(|stage| {
-                    self.prefill_costs.stage_upper(
-                        chunk,
-                        stage,
-                        req.offset + chunk,
-                        plan.stages.len(),
-                    )
-                })
-                .fold(0., f64::max)
+            let warm = req
+                .prefill_frame
+                .as_ref()
+                .is_some_and(|f| f.next == plan.stages.len());
+            self.prefill_costs
+                .stage_upper(chunk, req.offset + chunk, plan.stages.len(), warm)
         } else {
             self.prefill_costs.chunk_upper(chunk, req.offset + chunk)
         }
@@ -196,20 +182,19 @@ impl ModelRuntime {
                 - before.sequence_capture_s;
             self.prefill_costs.observe_stage(
                 chunk,
-                stage,
                 req.offset + chunk,
+                stage == frame.plan.stages.len(),
                 (began.elapsed().as_secs_f64() - cold).max(0.000001),
             );
             if frame.next < frame.plan.stages.len() {
-                // Short layers share one latency window. Returning after each
-                // one would buy a whole decode burst for only a few ms of
-                // prefill progress. The token tile and layer order stay fixed.
+                // Short layers share one latency window. The token tile and
+                // layer order stay fixed when yielding to decoders.
                 if at.elapsed().as_secs_f64()
                     + self.prefill_costs.stage_upper(
                         chunk,
-                        frame.next,
                         req.offset + chunk,
                         frame.plan.stages.len(),
+                        false,
                     )
                     <= budget_s
                 {
@@ -259,12 +244,9 @@ impl ModelRuntime {
                 end + usize::from(end < req.input.len() && !req.checkpoints.contains(&end));
             if self.manifest.mtp.is_some() && req.warm.tokens + 1 < warm_end {
                 if at.elapsed().as_secs_f64()
-                    + self.prefill_costs.stage_upper(
-                        chunk,
-                        frame.next,
-                        end,
-                        frame.plan.stages.len(),
-                    )
+                    + self
+                        .prefill_costs
+                        .stage_upper(chunk, end, frame.plan.stages.len(), true)
                     <= budget_s
                 {
                     continue;

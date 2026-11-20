@@ -329,15 +329,82 @@ fn validate_sampled_lookup_requests() {
 
     let mut requests = start(&mut model);
     assert!(requests.iter().all(|r| r.warm.tokens + 1 == r.input.len()));
+    // Selection only: a committed suffix has a confident seven-token copy.
+    // Restore the real history before dispatching any GPU work.
+    let history = (1..=15).chain(1..=8).collect();
+    let original = std::mem::replace(&mut requests[0].core.history, history);
+    for owners in 1..=4 {
+        for (policy, target_tpot_ms, expected) in [
+            (scheduler::Policy::Latency, 2000., true),
+            (scheduler::Policy::Latency, 1., false),
+            (scheduler::Policy::Throughput, 1., true),
+        ] {
+            for request in &mut requests[..owners] {
+                request.last_output = Instant::now() - std::time::Duration::from_millis(20);
+            }
+            let options = scheduler::Options {
+                policy,
+                target_tpot_ms,
+                ..Default::default()
+            };
+            let work = model
+                .select_work(
+                    &mut requests[..owners].iter_mut().collect::<Vec<_>>(),
+                    &options,
+                    &BTreeSet::new(),
+                )
+                .unwrap();
+            if let Work::SampledLookup(choice) = work {
+                use orinfer_model_sdk::packet::BatchOperation;
+                assert!(expected);
+                assert_eq!(choice.proposals, vec![(0, (9..=15).collect())]);
+                assert_eq!(choice.ordinary.len(), owners - 1);
+                assert_eq!(
+                    choice.operation(),
+                    if owners == 1 {
+                        BatchOperation::Verification
+                    } else {
+                        BatchOperation::MixedRows {
+                            prefills: (owners - 1) as u8,
+                        }
+                    }
+                );
+            } else {
+                assert!(
+                    !expected,
+                    "{policy:?} lookup with {owners} owners was not selected"
+                );
+            }
+        }
+    }
+    requests[0].core.history = original;
+    for request in &mut requests {
+        request.prompt_lookup = Default::default();
+    }
     let mut packet_times = vec![];
-    for (iteration, lookup) in [3, 1, 2, 0, 3, 1].into_iter().enumerate() {
+    let packets = [
+        (4, 3),
+        (4, 1),
+        (4, 2),
+        (4, 0),
+        (4, 3),
+        (4, 1),
+        (3, 2),
+        (2, 1),
+        (1, 0),
+    ];
+    for (iteration, (owners, lookup)) in packets.into_iter().enumerate() {
         let mut draft = expected[lookup][requests[lookup].generated..][..7].to_vec();
         let accepted = if iteration.is_multiple_of(2) { 7 } else { 3 };
         if accepted < draft.len() {
             draft[accepted] = (draft[accepted] + 1) % model.manifest.vocab as u32;
         }
         let proposals = vec![(lookup, draft)];
-        let other = ordinary.into_iter().filter(|&(i, _)| i != lookup).collect();
+        let other = ordinary[..owners]
+            .iter()
+            .copied()
+            .filter(|&(i, _)| i != lookup)
+            .collect();
         let positions: Vec<_> = requests.iter().map(|r| r.warm.tokens).collect();
         let mut steps = vec![];
         let graph_hits = model.execution.batch_statistics().graph_hits;
@@ -354,10 +421,10 @@ fn validate_sampled_lookup_requests() {
             )
             .unwrap();
         packet_times.push(at.elapsed().as_secs_f64());
-        if iteration >= 2 && f.cuda_graph == "decode_only" {
+        if owners == 4 && iteration >= 2 && f.cuda_graph == "decode_only" {
             assert!(model.execution.batch_statistics().graph_hits >= graph_hits + 2);
         }
-        assert_eq!(steps.len(), 4);
+        assert_eq!(steps.len(), owners);
         for step in steps {
             let req = &requests[step.request];
             assert_eq!(req.warm.tokens, positions[step.request]);

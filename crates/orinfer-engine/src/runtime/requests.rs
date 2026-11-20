@@ -1360,10 +1360,6 @@ impl ModelRuntime {
             .iter()
             .enumerate()
             .any(|(i, r)| !r.prefilling && !r.is_finished() && !initialized.contains(&i));
-        if !has_decoders {
-            self.unmerged_prefill_s = 0.;
-            self.decode_until = None;
-        }
         let feedback_at = Instant::now();
         let feedback_stats = self.execution.batch_statistics();
         let catchup_before = self.scheduler_statistics.mtp_catchup_s;
@@ -1415,7 +1411,6 @@ impl ModelRuntime {
                     requests[i].credit_s -= began.elapsed().as_secs_f64() * n as f64 / rows as f64;
                     requests[i].last_prefill = Instant::now();
                 }
-                self.unmerged_prefill_s = 0.;
                 self.scheduler_statistics.speculative_iterations += 1;
                 *self
                     .scheduler_statistics
@@ -1432,7 +1427,6 @@ impl ModelRuntime {
                     .batch_histogram
                     .entry(owners)
                     .or_default() += 1;
-                self.unmerged_prefill_s = 0.;
             }
             Work::SpeculativeBatch(choice) => {
                 let selected = choice.selected;
@@ -1443,10 +1437,8 @@ impl ModelRuntime {
                     .batch_histogram
                     .entry(selected.len())
                     .or_default() += 1;
-                self.unmerged_prefill_s = 0.;
             }
             Work::Speculative(i, rows) => {
-                self.unmerged_prefill_s = 0.;
                 let began = Instant::now();
                 let lookup_rounds = requests[i].mtp.lookup_rounds;
                 let result = self.with_request(requests[i], |model, req| {
@@ -1485,18 +1477,17 @@ impl ModelRuntime {
                 })?;
                 requests[i].served = self.scheduler_statistics.iterations;
                 requests[i].credit_s -= at.elapsed().as_secs_f64();
-                if has_decoders {
-                    self.unmerged_prefill_s += at.elapsed().as_secs_f64();
-                }
+                // An exclusive prefill slice owes continuing decoders one
+                // round. A mixed packet already advances them.
+                self.decode_turn = options.policy == scheduler::Policy::Latency
+                    && has_decoders
+                    && requests.iter().any(|r| r.prefilling);
                 requests[i].last_prefill = Instant::now();
                 if !tokens.is_empty() {
                     output.push(StepOutput { request: i, tokens });
                 }
             }
             Work::Batch(selected) => {
-                if selected.iter().any(|&(i, _)| !requests[i].prefilling) {
-                    self.unmerged_prefill_s = 0.;
-                }
                 self.execute_selected_with(requests, &selected, &mut output, &mut overlap)?;
             }
             Work::Idle => {}
@@ -1513,18 +1504,6 @@ impl ModelRuntime {
             } else {
                 statistics.ordinary_decode_s += seconds;
             }
-        }
-        if options.policy == scheduler::Policy::Latency
-            && does_prefill
-            && requests.iter().any(|r| !r.prefilling && !r.is_finished())
-        {
-            self.decode_until = Some(
-                Instant::now()
-                    + std::time::Duration::from_secs_f64(scheduler::decode_quantum_s(
-                        at.elapsed().as_secs_f64(),
-                        options,
-                    )),
-            );
         }
         for step in &output {
             if !step.tokens.is_empty() {
@@ -1655,28 +1634,25 @@ impl ModelRuntime {
             requests[i].last_prefill.elapsed().as_secs_f64()
                 >= (options.target_tpot_ms / 1000. * 4.).max(2.)
         });
-        let decode_round = prefill.is_none()
-            || (!throughput
-                && !decode.is_empty()
-                && !progress_due
-                && self
-                    .decode_until
-                    .is_some_and(|until| Instant::now() < until));
+        let turn = std::mem::take(&mut self.decode_turn);
+        let decode_round = prefill.is_none() || (!throughput && !decode.is_empty() && turn);
         if decode_round && prefill.is_some() {
             self.scheduler_statistics.decode_burst_iterations += 1;
         }
+        let slack = if throughput {
+            f64::INFINITY
+        } else {
+            decode
+                .iter()
+                .filter_map(|&i| requests[i].decode_slack_s(options.target_tpot_ms))
+                .fold(f64::INFINITY, f64::min)
+        };
         // Prompt lookup remains an explicitly enabled proposal source. Its
         // timing/acceptance never trains the model-draft controller.
         if decode_round && decode.len() == 1 && self.prompt_lookup {
             let i = decode[0];
             if let Some(spec) = &self.manifest.mtp {
                 let req = &requests[i];
-                let slack = if throughput {
-                    f64::INFINITY
-                } else {
-                    req.decode_slack_s(options.target_tpot_ms)
-                        .unwrap_or(f64::INFINITY)
-                };
                 if req.sampling.is_greedy()
                     && req.sampling.top_logprobs.is_none()
                     && let Some(width) = spec
@@ -1707,36 +1683,28 @@ impl ModelRuntime {
             }
         }
         if decode_round
-            && throughput
             && let Some(choice) =
-                self.select_sampled_lookup(requests, &target, options.max_speculative_tokens)
+                self.select_sampled_lookup(requests, &target, options.max_speculative_tokens, slack)
         {
             return Ok(Work::SampledLookup(choice));
         }
-        if decode_round && !decode.is_empty() {
-            let slack = if throughput {
-                f64::INFINITY
-            } else {
-                decode
-                    .iter()
-                    .filter_map(|&i| requests[i].decode_slack_s(options.target_tpot_ms))
-                    .fold(f64::INFINITY, f64::min)
-            };
-            if let Some(choice) = self.select_auto_speculation(requests, &target, options, slack) {
-                if choice.selected.len() == 1
-                    && self.manifest.mtp.as_ref().is_some_and(|spec| {
-                        !spec
-                            .batch_verification_tokens
-                            .contains(&choice.selected[0].1)
-                    })
-                {
-                    return Ok(Work::Speculative(
-                        choice.selected[0].0,
-                        choice.selected[0].1,
-                    ));
-                }
-                return Ok(Work::SpeculativeBatch(choice));
+        if decode_round
+            && !decode.is_empty()
+            && let Some(choice) = self.select_auto_speculation(requests, &target, options, slack)
+        {
+            if choice.selected.len() == 1
+                && self.manifest.mtp.as_ref().is_some_and(|spec| {
+                    !spec
+                        .batch_verification_tokens
+                        .contains(&choice.selected[0].1)
+                })
+            {
+                return Ok(Work::Speculative(
+                    choice.selected[0].0,
+                    choice.selected[0].1,
+                ));
             }
+            return Ok(Work::SpeculativeBatch(choice));
         }
         let mixed = self.manifest.batch_layout.as_ref().is_none_or(|layout| {
             layout.segment_tokens > 0 || self.manifest.batch_profiles.is_empty()
@@ -1815,14 +1783,7 @@ impl ModelRuntime {
             return Ok(Work::Batch(selected));
         }
         let decode_s = self.predict_iteration(requests, &selected);
-        let slack_s = decode
-            .iter()
-            .filter_map(|&i| requests[i].decode_slack_s(options.target_tpot_ms))
-            .fold(f64::INFINITY, f64::min);
-        let mut window_s = scheduler::prefill_window(slack_s, decode_s, options.prefill_budget_ms);
-        if self.unmerged_prefill_s > 0. {
-            window_s = window_s.min((decode_s - self.unmerged_prefill_s).max(0.));
-        }
+        let window_s = scheduler::prefill_window(slack, decode_s, options.prefill_budget_ms);
         let native = prefill.and_then(|i| {
             self.native_prefill_chunk(requests, i, window_s, progress_due)
                 .map(|n| (i, n))
@@ -1834,9 +1795,15 @@ impl ModelRuntime {
                 &prefills,
                 &mut joint,
                 cap,
-                (decode_s + window_s).min(slack_s).max(0.) * 1000.,
+                (decode_s + window_s).min(slack).max(0.) * 1000.,
             )?;
-            if joint.len() > selected.len() && self.prefer_joint_prefill(requests, &joint, window_s)
+            // A short prompt that fits alongside decode can start streaming
+            // in this packet, without paying for a second target pass.
+            let finishes_prompt = joint.iter().any(|&(i, n)| {
+                Some(i) == prefill && requests[i].offset + n == requests[i].input.len()
+            });
+            if joint.len() > selected.len()
+                && (finishes_prompt || self.prefer_joint_prefill(requests, &joint, window_s))
             {
                 self.scheduler_statistics.joint_prefill_choices += 1;
                 for &(i, _) in &joint {
@@ -1846,7 +1813,7 @@ impl ModelRuntime {
                 }
                 joint.sort_unstable_by_key(|(i, _)| requests[*i].slot);
                 if let Some(speculative) =
-                    self.select_mixed_speculation(requests, &joint, options, slack_s)
+                    self.select_mixed_speculation(requests, &joint, options, slack)
                 {
                     return Ok(Work::MixedSpeculative(speculative));
                 }
