@@ -7,7 +7,7 @@ use std::time::Instant;
 
 // Count nodes as well as entries: a large batch graph has thousands of nodes.
 // Oversized plans retain direct execution rather than exceeding this budget.
-const BATCH_GRAPH_NODES: usize = 12288;
+const BATCH_GRAPH_NODES: usize = 49_152;
 
 #[derive(Clone, Copy)]
 struct BatchOperations<'a> {
@@ -41,9 +41,9 @@ fn packet_graph_rows(
 fn fixed_resize_cost(current: usize, needed: usize, limited: bool) -> usize {
     if current < needed {
         needed - current
-    } else if limited && current - needed >= 65536 {
-        // A shrink replaces storage and invalidates captures too. Prefer an
-        // already fitting idle arena before resizing another recording's slot.
+    } else if limited && current - needed >= 4 * 1024 * 1024 {
+        // Reclaim substantial excess storage. Smaller shrinks keep the
+        // existing allocation and its captured graphs reusable.
         needed
     } else {
         0
@@ -102,7 +102,7 @@ fn batch_graph_victim(
     cache: &super::executor::BatchGraphCache,
     incoming: usize,
 ) -> Option<super::executor::BatchGraphKey> {
-    if cache.len() < 16
+    if cache.len() < 48
         && cache.values().map(|(_, _, nodes)| nodes).sum::<usize>() + incoming <= BATCH_GRAPH_NODES
     {
         return None;
@@ -2137,7 +2137,7 @@ impl Executor {
         let graph_enabled = configured
             && (self.batch_graphs.borrow().contains_key(&key) || {
                 let mut trials = self.batch_graph_trials.borrow_mut();
-                if trials.len() >= 32 && !trials.contains_key(&key) {
+                if trials.len() >= 128 && !trials.contains_key(&key) {
                     trials.clear();
                 }
                 let count = trials.entry(key.clone()).or_default();
@@ -2680,7 +2680,7 @@ mod graph_cache_tests {
         let mut cache = super::super::executor::BatchGraphCache::new();
         let large = BATCH_GRAPH_NODES * 2 / 3;
         let small = BATCH_GRAPH_NODES / 4;
-        let remaining = BATCH_GRAPH_NODES - large - small;
+        let remaining = 49_152 - large - small;
         cache.insert(vec![(2, 1)].into(), (ptr::null_mut(), 8, large));
         cache.insert(vec![(0, 1)].into(), (ptr::null_mut(), 3, small));
         assert_eq!(batch_graph_victim(&cache, remaining), None);
@@ -2694,14 +2694,29 @@ mod graph_cache_tests {
             Some(vec![(2, 1)].into())
         );
         cache.remove(&vec![(0, 1)].into());
-        assert_eq!(batch_graph_victim(&cache, BATCH_GRAPH_NODES - large), None);
+        assert_eq!(batch_graph_victim(&cache, 49_152 - large), None);
     }
     #[test]
     fn entry_limit_bounds_small_graphs() {
-        let cache = (0..16)
+        let mut cache: super::super::executor::BatchGraphCache = (0..48)
             .map(|slot| (vec![(slot, 1)].into(), (ptr::null_mut(), slot as u64, 1)))
             .collect();
         assert_eq!(batch_graph_victim(&cache, 1), Some(vec![(0, 1)].into()));
+        cache.remove(&vec![(47, 1)].into());
+        assert_eq!(batch_graph_victim(&cache, 1), None);
+    }
+    #[test]
+    fn fixed_resize_cost_preserves_small_shrinks_and_reclaims_large_excess() {
+        let needed = 1024 * 1024;
+        let shrink_threshold = 4 * 1024 * 1024;
+        assert_eq!(fixed_resize_cost(needed - 1, needed, true), 1);
+        for excess in [0, 64 * 1024, 512 * 1024, shrink_threshold - 1] {
+            assert_eq!(fixed_resize_cost(needed + excess, needed, true), 0);
+        }
+        for excess in [shrink_threshold, shrink_threshold + 1] {
+            assert_eq!(fixed_resize_cost(needed + excess, needed, true), needed);
+            assert_eq!(fixed_resize_cost(needed + excess, needed, false), 0);
+        }
     }
     #[test]
     fn commit_graph_shape_counts_owners_while_target_counts_token_rows() {
