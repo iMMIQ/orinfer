@@ -1,26 +1,9 @@
 """Build a complete-sequence causal Qwen3-Reranker E8P execution package."""
 
-from orinfer_build.common.paths import ROOT, gpu_lock_path, work_path
-
-
-import argparse
-import hashlib
-import json
-from pathlib import Path
-import shutil
-import subprocess
-import numpy as np
-
-from orinfer_build.common.files import file_hash, write_json
-from orinfer_build.common.gpu import gpu_lock
 from orinfer_build.compiler.compile import primitive
-from orinfer_build.models.encoder import Projections
-from orinfer_build.packaging.compact import compact_package
-from orinfer_build.packaging.frontend import prepare_tokenizer
-from orinfer_build.packaging.publication import atomic_model
-from orinfer_build.models.qwen35.compiler import Aot
-from orinfer_build.models.qwen35.storage import Weights
+from orinfer_build.models.encoder import Projections, encoder_parser
 from orinfer_build.models.qwen_reranker.config import configuration, signature
+from orinfer_build.packaging.publication import atomic_model
 
 
 class Builder(Projections):
@@ -28,35 +11,16 @@ class Builder(Projections):
     norm_epsilon = 1e-6
 
     def __init__(self, args, root):
-        self.args, self.root = args, root
-        self.config = json.loads((args.source / "config.json").read_text())
-        configuration(self.config, quantized=True)
-        self.state = json.loads((args.source / "progress.json").read_text())
-        if not self.state.get("complete"):
-            raise ValueError("Quantization is incomplete")
-        self.capacity, self.patches = args.context, 0
-        self.w = Weights(args.source, root, packed_k=128)
-        self.lock = None if args.gpu_lock_held else args.gpu_lock
-        self.aot = Aot(
-            root / "cache",
-            args.output,
-            args.cache,
-            self.w.buffers,
-            compile_lock=lambda: gpu_lock(self.lock),
+        self.init_encoder(
+            args,
+            root,
+            validate_config=configuration,
+            capacity=args.context,
+            patches=0,
+            identity_key="reranker_capacity",
+            identity_value=args.context,
+            sign_widths=(1024, 2048, 3072),
         )
-        self.aot.identity["weights"] = hashlib.sha256(self.state["contract"].encode()).hexdigest()
-        self.aot.identity["reranker_capacity"] = str(self.capacity)
-        self.tuned = {}
-        self.signs = {
-            k: self.w.immutable(f"orinfer.rotation.k{k}.signs") for k in (1024, 2048, 3072)
-        }
-        from orinfer_build.quantization.e8p import basis
-        from orinfer_build.quantization.vq import e8p_selector_table
-
-        original = self.w.array("orinfer.e8p_q4.basis")
-        if not np.array_equal(original, basis()):
-            raise ValueError("Unexpected E8P basis")
-        self.book = self.w.constant("E8PBook", e8p_selector_table(original))
         self.row_workspace()
         self.workspace()
         self.text()
@@ -189,105 +153,43 @@ class Builder(Projections):
         )
 
     def publish(self):
-        total = self.w.finish()
-        names = [
-            "config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "generation_config.json",
-            "chat_template.jinja",
-            "README.md",
-            "LICENSE",
-        ]
-        for name in names:
-            if (self.args.source / name).is_file():
-                shutil.copyfile(self.args.source / name, self.root / name)
-        prepare_tokenizer(self.args.source, self.root / "tokenizer.json")
         ids = self.config["quantization_config"]["classifier_token_ids"]
-        spec = dict(
-            rows=self.row_spec(),
-            program="rerank",
-            length="Length",
-            output="ClassLogits",
-            false_token_id=ids[0],
-            true_token_id=ids[1],
-        )
-        metadata = dict(
-            schema_version=2,
-            target="sm_87",
-            model="Qwen3-Reranker-0.6B-E8P-Q4A8",
-            chunk_tokens=self.capacity,
-            max_context=self.capacity,
-            vocab=151669,
-            toolchain=self.aot.identity,
-            buffers=list(self.w.buffers.values()),
-            reset_buffers=[],
-            input="Input",
-            token="Control",
-            status="Control",
-            logits="ClassLogits",
-            position="Control",
-            weight_bytes=total,
-            weight_parameters=self.state["parameters"],
-            weight_scope="Two-stage E8P Q4A8; attention output and protected text blocks W8; norms and original two-class head FP16; one packed embedding bank",
-            reranking=spec,
-        )
-        package = dict(
-            target="sm_87",
+        self.publish_encoder(
             architecture="qwen3_reranker",
-            compute_policy="int8_quality",
+            model_name="Qwen3-Reranker-0.6B-E8P-Q4A8",
+            vocab=151669,
+            logits="ClassLogits",
+            weight_scope="Two-stage E8P Q4A8; attention output and protected text blocks W8; norms and original two-class head FP16; one packed embedding bank",
             config_signature=signature(self.config),
-            prefill_profiles=[],
-            kernels=self.aot.kernels,
-            dynamic_batch_kernels=self.aot.dynamic,
-            buffer_contracts=[
-                {k: v for k, v in b.items() if k != "data"} for b in self.w.buffers.values()
+            copy_files=[
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "generation_config.json",
+                "chat_template.jinja",
+                "README.md",
+                "LICENSE",
             ],
-            toolchain=self.aot.identity,
-        )
-        digest = compact_package(self.root / "cache", package, self.root / "cache/packages")
-        write_json(
-            self.root / "cache/model.json",
-            dict(
-                schema_version=1,
-                architecture="qwen3_reranker",
-                compute_policy="int8_quality",
-                execution_package=digest,
-                buffer_scopes=self.w.scopes,
-                metadata=metadata,
-                frontend_assets={
-                    name: file_hash(self.root / name)
-                    for name in [
-                        "tokenizer.json",
-                        "tokenizer_config.json",
-                        "chat_template.jinja",
-                        "generation_config.json",
-                    ]
-                },
-            ),
-        )
-        subprocess.run([str(self.args.engine), "validate-model", str(self.root)], check=True)
-        self.validate_published_rows()
-        write_json(
-            self.args.output / "result.json",
-            dict(
-                weight_bytes=total,
-                parameters=self.state["parameters"],
-                effective_weight_bits=total * 8 / self.state["parameters"],
-                execution_package=digest,
+            frontend_files=[
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "chat_template.jinja",
+                "generation_config.json",
+            ],
+            spec_key="reranking",
+            spec=dict(
+                rows=self.row_spec(),
+                program="rerank",
+                length="Length",
+                output="ClassLogits",
+                false_token_id=ids[0],
+                true_token_id=ids[1],
             ),
         )
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    for name in ["source", "model-output", "output"]:
-        p.add_argument("--" + name, type=Path, required=True)
-    p.add_argument("--context", type=int, default=32768)
-    p.add_argument("--cache", type=Path, default=work_path("cache", "build", "qwen-reranker"))
-    p.add_argument("--engine", type=Path, default=ROOT / "target/release/orinfer")
-    p.add_argument("--gpu-lock", type=Path, default=gpu_lock_path())
-    p.add_argument("--gpu-lock-held", action="store_true")
+    p = encoder_parser(__doc__, "qwen-reranker")
     args = p.parse_args()
     if not 512 <= args.context <= 32768 or args.context % 32:
         p.error("Context must be a multiple of 32 in 512..32768")

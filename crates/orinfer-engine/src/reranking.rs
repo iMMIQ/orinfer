@@ -1,13 +1,13 @@
 //! Independent causal reranking through the shared native CUDA executor.
-pub use crate::embedding::Statistics;
+pub use crate::encoder_rows::Statistics;
 use crate::{
     artifact::Result,
-    backend::Executor,
+    encoder_rows::LoadedEncoder,
     execution::{ExecutionPhase, LoadOptions},
 };
 pub use orinfer_model_sdk::reranking::Spec;
 use serde::Serialize;
-use std::{collections::BTreeMap, path::Path, time::Instant};
+use std::{collections::BTreeMap, path::Path};
 
 #[derive(Debug, Serialize)]
 pub struct Score {
@@ -16,73 +16,40 @@ pub struct Score {
     pub logit_difference: f64,
     pub relevance_score: f64,
 }
-pub struct Model {
-    execution: Executor,
-    spec: Spec,
-    context: usize,
-    vocab: usize,
-    input: String,
-    frontend_assets: BTreeMap<String, String>,
-    statistics: Statistics,
-}
+pub struct Model(LoadedEncoder<Spec>);
 impl Model {
     pub fn load(path: &Path, options: LoadOptions) -> Result<Self> {
-        let started = Instant::now();
-        let prepared = crate::loader::load_with_experts(path, options.verify_weights, false)?;
-        let m = &prepared.plan;
-        let spec = m
-            .reranking
-            .clone()
-            .ok_or("Model package does not provide reranking")?;
-        let preload = m.kernels.iter().map(|k| k.name.clone()).collect();
-        let (execution, stats) = Executor::load(&prepared, options, &preload)?;
-        let padding = stats.load_stages.weight_arena_padding_bytes;
-        let resident = m
-            .weight_bytes
-            .checked_add(padding)
-            .ok_or("Reranking weight accounting overflow")?;
-        let statistics = Statistics {
-            load_to_ready_s: started.elapsed().as_secs_f64(),
-            weight_bytes: m.weight_bytes,
-            weight_arena_padding_bytes: padding,
-            resident_weight_bytes: resident,
-            effective_weight_bits: resident as f64 * 8.0 / m.weight_parameters as f64,
-            allocated_bytes: stats.buffer_bytes,
-        };
-        Ok(Self {
-            execution,
-            spec,
-            context: m.max_context,
-            vocab: m.vocab,
-            input: m.input.clone(),
-            frontend_assets: prepared.frontend_assets,
-            statistics,
-        })
+        LoadedEncoder::load(
+            path,
+            options,
+            |m| m.reranking.clone(),
+            "Model package does not provide reranking",
+            "Reranking weight accounting overflow",
+        )
+        .map(Self)
     }
     pub fn max_context(&self) -> usize {
-        self.context
+        self.0.context
     }
     pub fn spec(&self) -> &Spec {
-        &self.spec
+        &self.0.spec
     }
     pub fn frontend_assets(&self) -> &BTreeMap<String, String> {
-        &self.frontend_assets
+        &self.0.frontend_assets
     }
     pub fn statistics(&self) -> &Statistics {
-        &self.statistics
+        &self.0.statistics
     }
     pub fn score_many(&mut self, inputs: &[&[u32]]) -> Result<Vec<Score>> {
-        let Some(rows) = self.spec.rows.clone() else {
+        let Some(rows) = self.0.spec.rows.clone() else {
             return inputs.iter().map(|tokens| self.score(tokens)).collect();
         };
-        if inputs.iter().any(|t| {
-            t.is_empty() || t.len() > self.context || t.iter().any(|&id| id as usize >= self.vocab)
-        }) {
+        if inputs.iter().any(|t| !self.0.tokens_valid(t)) {
             return Err("Invalid reranking tokens or context length".into());
         }
         let packets = rows.packets(
             &inputs.iter().map(|t| t.len()).collect::<Vec<_>>(),
-            self.context,
+            self.0.context,
         )?;
         let mut output = Vec::with_capacity(inputs.len());
         for packet in packets {
@@ -90,12 +57,12 @@ impl Model {
             for (owner, &[start, end]) in packet.segments.iter().enumerate() {
                 tokens[start as usize..end as usize].copy_from_slice(inputs[packet.first + owner]);
             }
-            let e = &self.execution;
-            e.upload_ids(&self.input, &tokens)?;
+            let e = &self.0.execution;
+            e.upload_ids(&self.0.input, &tokens)?;
             crate::encoder_rows::upload(e, &rows, &packet)?;
-            e.submit_program_rows(&self.spec.program, packet.rows, ExecutionPhase::Prefill)?;
+            e.submit_program_rows(&self.0.spec.program, packet.rows, ExecutionPhase::Prefill)?;
             for pair in e
-                .download_bytes(&self.spec.output, packet.segments.len() * 8)?
+                .download_bytes(&self.0.spec.output, packet.segments.len() * 8)?
                 .as_chunks::<8>()
                 .0
             {
@@ -105,24 +72,22 @@ impl Model {
         Ok(output)
     }
     pub fn score(&mut self, tokens: &[u32]) -> Result<Score> {
-        if self.spec.rows.is_some() {
+        if self.0.spec.rows.is_some() {
             return Ok(self.score_many(&[tokens])?.remove(0));
         }
-        if tokens.is_empty()
-            || tokens.len() > self.context
-            || tokens.iter().any(|&t| t as usize >= self.vocab)
-        {
+        if !self.0.tokens_valid(tokens) {
             return Err("Invalid reranking tokens or context length".into());
         }
-        self.execution.upload_ids(&self.input, tokens)?;
-        self.execution
-            .upload_ids(&self.spec.length, &[tokens.len() as u32])?;
-        self.execution.submit_program_rows(
-            &self.spec.program,
+        self.0.execution.upload_ids(&self.0.input, tokens)?;
+        self.0
+            .execution
+            .upload_ids(&self.0.spec.length, &[tokens.len() as u32])?;
+        self.0.execution.submit_program_rows(
+            &self.0.spec.program,
             tokens.len(),
             ExecutionPhase::Prefill,
         )?;
-        let bytes = self.execution.download_bytes(&self.spec.output, 8)?;
+        let bytes = self.0.execution.download_bytes(&self.0.spec.output, 8)?;
         score_from_bytes(&bytes)
     }
 }

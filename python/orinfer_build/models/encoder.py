@@ -1,8 +1,33 @@
 """Shared AOT row bindings and integer projections for independent encoders."""
 
-from orinfer_build.common.files import write_json
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+
+import numpy as np
+
+from orinfer_build.common.files import file_hash, write_json
+from orinfer_build.common.gpu import gpu_lock
+from orinfer_build.common.paths import ROOT, gpu_lock_path, work_path
 from orinfer_build.compiler.compile import primitive
 from orinfer_build.contracts.projection_policy import encoder_configs
+from orinfer_build.packaging.compact import compact_package
+from orinfer_build.packaging.frontend import prepare_tokenizer
+
+
+def encoder_parser(description, cache_name):
+    p = argparse.ArgumentParser(description=description)
+    for name in ["source", "model-output", "output"]:
+        p.add_argument("--" + name, type=Path, required=True)
+    p.add_argument("--context", type=int, default=32768)
+    p.add_argument("--cache", type=Path, default=work_path("cache", "build", cache_name))
+    p.add_argument("--engine", type=Path, default=ROOT / "target/release/orinfer")
+    p.add_argument("--gpu-lock", type=Path, default=gpu_lock_path())
+    p.add_argument("--gpu-lock-held", action="store_true")
+    return p
 
 
 def validate_row_choices(plan, expected):
@@ -20,6 +45,125 @@ def validate_row_choices(plan, expected):
 
 class Projections:
     norm_epsilon = 1e-5
+
+    def init_encoder(
+        self,
+        args,
+        root,
+        *,
+        validate_config,
+        capacity,
+        patches,
+        identity_key,
+        identity_value,
+        sign_widths,
+    ):
+        from orinfer_build.models.qwen35.compiler import Aot
+        from orinfer_build.models.qwen35.storage import Weights
+        from orinfer_build.quantization.e8p import basis
+        from orinfer_build.quantization.vq import e8p_selector_table
+
+        self.args, self.root = args, root
+        self.config = json.loads((args.source / "config.json").read_text())
+        validate_config(self.config, quantized=True)
+        self.state = json.loads((args.source / "progress.json").read_text())
+        if not self.state.get("complete"):
+            raise ValueError("Quantization must finish before building")
+        self.capacity, self.patches = capacity, patches
+        self.w = Weights(args.source, root, packed_k=128)
+        self.lock = None if args.gpu_lock_held else args.gpu_lock
+        self.aot = Aot(
+            root / "cache",
+            args.output,
+            args.cache,
+            self.w.buffers,
+            compile_lock=lambda: gpu_lock(self.lock),
+        )
+        self.aot.identity["weights"] = hashlib.sha256(self.state["contract"].encode()).hexdigest()
+        self.aot.identity[identity_key] = str(identity_value)
+        self.tuned = {}
+        self.signs = {k: self.w.immutable(f"orinfer.rotation.k{k}.signs") for k in sign_widths}
+        original_basis = self.w.array("orinfer.e8p_q4.basis")
+        if not np.array_equal(original_basis, basis()):
+            raise ValueError("Encoded E8P basis differs from the kernel codebook")
+        self.book = self.w.constant("E8PBook", e8p_selector_table(original_basis))
+
+    def publish_encoder(
+        self,
+        *,
+        architecture,
+        model_name,
+        vocab,
+        logits,
+        weight_scope,
+        config_signature,
+        copy_files,
+        frontend_files,
+        spec_key,
+        spec,
+    ):
+        total = self.w.finish()
+        for name in copy_files:
+            if (self.args.source / name).is_file():
+                shutil.copyfile(self.args.source / name, self.root / name)
+        prepare_tokenizer(self.args.source, self.root / "tokenizer.json")
+        metadata = dict(
+            schema_version=2,
+            target="sm_87",
+            model=model_name,
+            chunk_tokens=self.capacity,
+            max_context=self.capacity,
+            vocab=vocab,
+            toolchain=self.aot.identity,
+            buffers=list(self.w.buffers.values()),
+            reset_buffers=[],
+            input="Input",
+            token="Control",
+            status="Control",
+            logits=logits,
+            position="Control",
+            weight_bytes=total,
+            weight_parameters=self.state["parameters"],
+            weight_scope=weight_scope,
+            **{spec_key: spec},
+        )
+        package = dict(
+            target="sm_87",
+            architecture=architecture,
+            compute_policy="int8_quality",
+            config_signature=config_signature,
+            prefill_profiles=[],
+            kernels=self.aot.kernels,
+            dynamic_batch_kernels=self.aot.dynamic,
+            buffer_contracts=[
+                {k: v for k, v in b.items() if k != "data"} for b in self.w.buffers.values()
+            ],
+            toolchain=self.aot.identity,
+        )
+        digest = compact_package(self.root / "cache", package, self.root / "cache/packages")
+        write_json(
+            self.root / "cache/model.json",
+            dict(
+                schema_version=1,
+                architecture=architecture,
+                compute_policy="int8_quality",
+                execution_package=digest,
+                buffer_scopes=self.w.scopes,
+                metadata=metadata,
+                frontend_assets={name: file_hash(self.root / name) for name in frontend_files},
+            ),
+        )
+        subprocess.run([str(self.args.engine), "validate-model", str(self.root)], check=True)
+        self.validate_published_rows()
+        write_json(
+            self.args.output / "result.json",
+            dict(
+                weight_bytes=total,
+                parameters=self.state["parameters"],
+                effective_weight_bits=total * 8 / self.state["parameters"],
+                execution_package=digest,
+            ),
+        )
 
     def validate_published_rows(self):
         import json

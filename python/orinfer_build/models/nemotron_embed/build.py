@@ -1,62 +1,27 @@
 """Build the native E8P Q4A8 Nemotron-3.5-Embed-1B execution package."""
 
-from orinfer_build.common.paths import ROOT, gpu_lock_path, work_path
-
-
-import argparse
-import hashlib
-import json
-from pathlib import Path
-import shutil
-import subprocess
-
 import numpy as np
 
-from orinfer_build.common.files import file_hash, write_json
-from orinfer_build.common.gpu import gpu_lock
 from orinfer_build.compiler.compile import primitive
-from orinfer_build.models.encoder import Projections
-from orinfer_build.packaging.compact import compact_package
+from orinfer_build.models.encoder import Projections, encoder_parser
 from orinfer_build.models.nemotron_embed.config import configuration, signature
 from orinfer_build.packaging.publication import atomic_model
-from orinfer_build.models.qwen35.compiler import Aot
-from orinfer_build.models.qwen35.storage import Weights
 
 
 class Builder(Projections):
     kernel_prefix = "nemotron"
 
     def __init__(self, args, root):
-        self.args, self.root = args, root
-        self.config = json.loads((args.source / "config.json").read_text())
-        configuration(self.config, quantized=True)
-        self.state = json.loads((args.source / "progress.json").read_text())
-        if not self.state.get("complete"):
-            raise ValueError("Quantization must finish before building")
-        self.capacity, self.patches = args.context, args.max_patches
-        self.w = Weights(args.source, root, packed_k=128)
-        self.lock = None if args.gpu_lock_held else args.gpu_lock
-        self.aot = Aot(
-            root / "cache",
-            args.output,
-            args.cache,
-            self.w.buffers,
-            compile_lock=lambda: gpu_lock(self.lock),
+        self.init_encoder(
+            args,
+            root,
+            validate_config=configuration,
+            capacity=args.context,
+            patches=args.max_patches,
+            identity_key="embedding_capacity",
+            identity_value=(args.context, args.max_patches),
+            sign_widths=(1024, 2048, 3072, 4096, 6144),
         )
-        self.aot.identity["weights"] = hashlib.sha256(self.state["contract"].encode()).hexdigest()
-        self.aot.identity["embedding_capacity"] = str((self.capacity, self.patches))
-        self.tuned = {}
-        self.signs = {
-            k: self.w.immutable(f"orinfer.rotation.k{k}.signs")
-            for k in (1024, 2048, 3072, 4096, 6144)
-        }
-        from orinfer_build.quantization.e8p import basis
-        from orinfer_build.quantization.vq import e8p_selector_table
-
-        original_basis = self.w.array("orinfer.e8p_q4.basis")
-        if not np.array_equal(original_basis, basis()):
-            raise ValueError("Encoded E8P basis differs from the kernel codebook")
-        self.book = self.w.constant("E8PBook", e8p_selector_table(original_basis))
         self.row_workspace()
         self.workspace()
         self.text()
@@ -334,119 +299,56 @@ class Builder(Projections):
                 )
 
     def publish(self):
-        total = self.w.finish()
-        for name in [
-            "config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "processor_config.json",
-            "chat_template.jinja",
-            "config_sentence_transformers.json",
-            "sentence_bert_config.json",
-            "modules.json",
-            "README.md",
-            "LICENSE",
-        ]:
-            if (self.args.source / name).is_file():
-                shutil.copyfile(self.args.source / name, self.root / name)
-        from orinfer_build.packaging.frontend import prepare_tokenizer
-
-        prepare_tokenizer(self.args.source, self.root / "tokenizer.json")
-        spec = dict(
-            rows=self.row_spec(),
-            dimension=2048,
-            output="Embedding",
-            program="embed",
-            length="Length",
-            feature_index="FeatureIndex",
-            vision_program="embed_vision",
-            pixels="Pixels",
-            grid="Grid",
-            vision_length="VisionLength",
-            vision_output="VisionOutput",
-            features="Features",
-            image_token_id=10,
-            max_patches=self.patches,
-            patch_size=14,
-            merge_size=2,
-        )
-        metadata = dict(
-            schema_version=2,
-            target="sm_87",
-            model="Nemotron-3.5-Embed-1B-E8P-Q4A8",
-            chunk_tokens=self.capacity,
-            max_context=self.capacity,
-            vocab=131072,
-            toolchain=self.aot.identity,
-            buffers=list(self.w.buffers.values()),
-            reset_buffers=[],
-            input="Input",
-            token="Control",
-            status="Control",
-            logits="Embedding",
-            position="Control",
-            weight_bytes=total,
-            weight_parameters=self.state["parameters"],
-            weight_scope="Two-stage E8P Q4A8 text, embedding and vision; sensitive outputs W8; patch/norm FP16; one packed bank",
-            embedding=spec,
-        )
-        package = dict(
-            target="sm_87",
+        self.publish_encoder(
             architecture="nemotron_embed",
-            compute_policy="int8_quality",
+            model_name="Nemotron-3.5-Embed-1B-E8P-Q4A8",
+            vocab=131072,
+            logits="Embedding",
+            weight_scope="Two-stage E8P Q4A8 text, embedding and vision; sensitive outputs W8; patch/norm FP16; one packed bank",
             config_signature=signature(self.config),
-            prefill_profiles=[],
-            kernels=self.aot.kernels,
-            dynamic_batch_kernels=self.aot.dynamic,
-            buffer_contracts=[
-                {k: v for k, v in b.items() if k != "data"} for b in self.w.buffers.values()
+            copy_files=[
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "processor_config.json",
+                "chat_template.jinja",
+                "config_sentence_transformers.json",
+                "sentence_bert_config.json",
+                "modules.json",
+                "README.md",
+                "LICENSE",
             ],
-            toolchain=self.aot.identity,
-        )
-        digest = compact_package(self.root / "cache", package, self.root / "cache/packages")
-        write_json(
-            self.root / "cache/model.json",
-            dict(
-                schema_version=1,
-                architecture="nemotron_embed",
-                compute_policy="int8_quality",
-                execution_package=digest,
-                buffer_scopes=self.w.scopes,
-                metadata=metadata,
-                frontend_assets={
-                    name: file_hash(self.root / name)
-                    for name in [
-                        "tokenizer.json",
-                        "tokenizer_config.json",
-                        "processor_config.json",
-                        "chat_template.jinja",
-                    ]
-                },
-            ),
-        )
-        subprocess.run([str(self.args.engine), "validate-model", str(self.root)], check=True)
-        self.validate_published_rows()
-        write_json(
-            self.args.output / "result.json",
-            dict(
-                weight_bytes=total,
-                parameters=self.state["parameters"],
-                effective_weight_bits=total * 8 / self.state["parameters"],
-                execution_package=digest,
+            frontend_files=[
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "processor_config.json",
+                "chat_template.jinja",
+            ],
+            spec_key="embedding",
+            spec=dict(
+                rows=self.row_spec(),
+                dimension=2048,
+                output="Embedding",
+                program="embed",
+                length="Length",
+                feature_index="FeatureIndex",
+                vision_program="embed_vision",
+                pixels="Pixels",
+                grid="Grid",
+                vision_length="VisionLength",
+                vision_output="VisionOutput",
+                features="Features",
+                image_token_id=10,
+                max_patches=self.patches,
+                patch_size=14,
+                merge_size=2,
             ),
         )
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    for name in ["source", "model-output", "output"]:
-        p.add_argument("--" + name, type=Path, required=True)
-    p.add_argument("--context", type=int, default=32768)
+    p = encoder_parser(__doc__, "nemotron-embed")
     p.add_argument("--max-patches", type=int, default=6400)
-    p.add_argument("--cache", type=Path, default=work_path("cache", "build", "nemotron-embed"))
-    p.add_argument("--engine", type=Path, default=ROOT / "target/release/orinfer")
-    p.add_argument("--gpu-lock", type=Path, default=gpu_lock_path())
-    p.add_argument("--gpu-lock-held", action="store_true")
     args = p.parse_args()
     if (
         not 512 <= args.context <= 32768
