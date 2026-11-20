@@ -1,6 +1,9 @@
 //! Counter uniforms for op25. Request identity and committed step are stable
 //! across queueing, batch permutations and replay. This does not allocate state.
 
+use std::borrow::Cow;
+use std::cmp::Ordering;
+
 /// Seed used by the fixed local evaluation protocol.
 pub const EVALUATION_SEED: u64 = 20_261_002;
 
@@ -116,12 +119,24 @@ impl Options {
         Ok(())
     }
     pub fn is_greedy(&self) -> bool {
-        self.temperature == 0.0
-            && self.presence_penalty == 0.0
-            && self.frequency_penalty == 0.0
-            && self.repetition_penalty == 1.0
-            && self.logit_bias.is_empty()
+        self.temperature == 0.0 && !self.processes_scores()
     }
+    fn processes_scores(&self) -> bool {
+        self.presence_penalty != 0.0
+            || self.frequency_penalty != 0.0
+            || self.repetition_penalty != 1.0
+            || !self.logit_bias.is_empty()
+    }
+}
+
+fn validate_logits(logits: &[f32]) -> Result<(), String> {
+    if logits.is_empty()
+        || logits.len() > u32::MAX as usize
+        || logits.iter().any(|x| !x.is_finite())
+    {
+        return Err("Invalid sampling logits".into());
+    }
+    Ok(())
 }
 fn processed_scores(
     logits: &[f32],
@@ -129,17 +144,8 @@ fn processed_scores(
     options: &Options,
     mask: Option<&[u32]>,
 ) -> Result<Vec<(u32, f64)>, String> {
-    if logits.is_empty()
-        || logits.len() > u32::MAX as usize
-        || logits.iter().any(|x| !x.is_finite())
-    {
-        return Err("Invalid sampling logits".into());
-    }
-    let mut scores = if options.repetition_penalty == 1.0
-        && options.presence_penalty == 0.0
-        && options.frequency_penalty == 0.0
-        && options.logit_bias.is_empty()
-    {
+    validate_logits(logits)?;
+    let mut scores = if !options.processes_scores() {
         // Adding zero preserves the generic processors' signed-zero result.
         // Input validation already guarantees these f64 scores are finite.
         logits
@@ -199,13 +205,200 @@ fn processed_scores(
     Ok(scores)
 }
 
+type Score = (u32, f64);
+const SPARSE_SUPPORT: usize = 128;
+const SHORTLIST_LIMIT: usize = 4096;
+
+fn compare(a: &Score, b: &Score) -> Ordering {
+    b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+}
+
+#[derive(Clone, Debug)]
+enum Scores<'a> {
+    Logits(Cow<'a, [f32]>),
+    Processed(Vec<Score>),
+}
+
+impl Scores<'_> {
+    fn iter(&self) -> impl Iterator<Item = Score> {
+        let (logits, processed) = match self {
+            Self::Logits(logits) => (logits.as_ref(), &[][..]),
+            Self::Processed(scores) => (&[][..], scores.as_slice()),
+        };
+        logits
+            .iter()
+            .enumerate()
+            // Match the signed-zero behavior of the history processors.
+            .map(|(id, &score)| (id as u32, f64::from(score) + 0.0))
+            .chain(processed.iter().copied())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Logits(logits) => logits.len(),
+            Self::Processed(scores) => scores.len(),
+        }
+    }
+
+    fn for_fallback(self) -> Scores<'static> {
+        // Rounded probabilities can collapse distinct scores into a tie.
+        // Keep their original ordering keys for an exact tail draw.
+        match self {
+            Self::Logits(logits) => Scores::Logits(Cow::Owned(logits.into_owned())),
+            Self::Processed(scores) => Scores::Processed(scores),
+        }
+    }
+
+    fn full_order(self, options: &Options) -> Vec<Score> {
+        let mut ordered = match self {
+            Self::Logits(_) => self.iter().collect(),
+            Self::Processed(scores) => scores,
+        };
+        if options.temperature == 0.0 {
+            let best = ordered.iter().min_by(|a, b| compare(a, b)).unwrap().0;
+            return vec![(best, 1.0)];
+        }
+        if options.top_k > 0 && options.top_k < ordered.len() {
+            ordered.select_nth_unstable_by(options.top_k, compare);
+            ordered.truncate(options.top_k);
+        }
+        ordered.sort_unstable_by(compare);
+        let maximum = ordered[0].1;
+        for (_, score) in &mut ordered {
+            *score = weight(*score, maximum, options.temperature);
+        }
+        let total = ordered.iter().map(|x| x.1).sum::<f64>();
+        let (cutoff, _, mass) = nucleus(&ordered, total * options.top_p).unwrap();
+        ordered.truncate(cutoff);
+        normalize(&mut ordered, mass);
+        ordered
+    }
+}
+
+fn weight(score: f64, maximum: f64, temperature: f64) -> f64 {
+    ((score - maximum) / temperature).exp()
+}
+
+fn normalize(ordered: &mut [Score], total: f64) {
+    for (_, p) in ordered {
+        *p /= total;
+    }
+}
+
+// Return the retained length and cumulative weights on both sides of the cut.
+fn nucleus(ordered: &[Score], threshold: f64) -> Option<(usize, f64, f64)> {
+    let mut mass = 0.0;
+    for (i, &(_, w)) in ordered.iter().enumerate() {
+        let previous = mass;
+        mass += w;
+        if mass >= threshold {
+            return Some((i + 1, previous, mass));
+        }
+    }
+    None
+}
+
+struct Shortlist {
+    ordered: Vec<Score>,
+    total: f64,
+    // Bounds the effects of a different summation order on the normalized CDF.
+    error: f64,
+}
+
+impl Shortlist {
+    fn new(scores: &Scores<'_>, temperature: f64, mut store_weight: impl FnMut(u32, f64)) -> Self {
+        let maximum = scores.iter().map(|(_, s)| s).reduce(f64::max).unwrap();
+        let mut threshold = (u32::MAX, maximum - 18.0 * temperature);
+        // Such weights round away in the legacy descending sum, which
+        // starts at 1. Even top_p=1 cuts off before these tokens.
+        let negligible = maximum - 38.0 * temperature;
+        let mut ordered = Vec::new();
+        let mut total = 0.0;
+        for (id, score) in scores.iter() {
+            if score < negligible {
+                continue;
+            }
+            let entry = (id, score);
+            if score > threshold.1 || (score == threshold.1 && compare(&entry, &threshold).is_le())
+            {
+                ordered.push(entry);
+                if ordered.len() == SHORTLIST_LIMIT {
+                    // Bound storage on broad rows while retaining a prefix
+                    // of the full law, including ties at its edge.
+                    let middle = SHORTLIST_LIMIT / 2;
+                    let (_, last, _) = ordered.select_nth_unstable_by(middle - 1, compare);
+                    threshold = *last;
+                    ordered.truncate(middle);
+                }
+            }
+            let w = weight(score, maximum, temperature);
+            total += w;
+            store_weight(id, w);
+        }
+        ordered.sort_unstable_by(compare);
+        for (_, score) in &mut ordered {
+            *score = weight(*score, maximum, temperature);
+        }
+        Self {
+            ordered,
+            total,
+            error: 4.0 * scores.len() as f64 * f64::EPSILON,
+        }
+    }
+
+    fn truncate(&mut self, top_p: f64) -> bool {
+        let threshold = self.total * top_p;
+        let margin = self.error * self.total;
+        let Some((cutoff, before, after)) = nucleus(&self.ordered, threshold) else {
+            return false;
+        };
+        // A rounded normalizer can move the nucleus by one or more tokens.
+        // Recompute in descending score order if the cutoff is ambiguous.
+        if (before > 0.0 && threshold - before <= margin) || after - threshold <= margin {
+            return false;
+        }
+        self.ordered.truncate(cutoff);
+        normalize(&mut self.ordered, after);
+        true
+    }
+}
+
+fn draw_ordered(ordered: &[Score], uniform: f64, margin: f64) -> Option<u32> {
+    let mut mass = 0.0;
+    for &(id, p) in ordered {
+        let previous = mass;
+        mass += p;
+        if uniform < mass {
+            return (margin == 0.0
+                || (uniform == 0.0 || uniform - previous > margin) && mass - uniform > margin)
+                .then_some(id);
+        }
+    }
+    None
+}
+
+fn draw_complete(ordered: &[Score], uniform: f64) -> Result<u32, String> {
+    // The CDF can finish slightly below one. Find the last live token.
+    draw_ordered(ordered, uniform, 0.0)
+        .or_else(|| ordered.iter().rev().find(|(_, p)| *p > 0.0).map(|x| x.0))
+        .ok_or_else(|| "Empty sampling distribution".into())
+}
+
+#[derive(Clone, Debug)]
+struct Tail {
+    scores: Scores<'static>,
+    temperature: f64,
+    margin: f64,
+}
+
 /// Normalized target or draft law after applying the same history processors.
 /// Small truncated laws store only their support; large laws retain dense lookup.
 #[derive(Clone, Debug)]
 pub struct Distribution {
     probabilities: Option<Vec<f64>>,
     vocab: usize,
-    ordered: Vec<(u32, f64)>,
+    ordered: Vec<Score>,
+    fallback: Option<Tail>,
 }
 impl Distribution {
     /// A deterministic proposer is an exact point mass, including when its
@@ -218,6 +411,7 @@ impl Distribution {
             probabilities: None,
             vocab,
             ordered: vec![(token, 1.0)],
+            fallback: None,
         })
     }
     pub fn from_logits(logits: &[f32], history: &[u32], options: &Options) -> Result<Self, String> {
@@ -238,48 +432,61 @@ impl Distribution {
         options: &Options,
         mask: Option<&[u32]>,
     ) -> Result<Self, String> {
-        let scores = processed_scores(logits, history, options, mask)?;
-        Ok(Self::from_scores(logits.len(), scores, options))
-    }
-    // Only called after processing/validation; the score vector may have been
-    // partitioned for reporting, but total ordering fixes the same sampling CDF.
-    fn from_scores(vocab: usize, mut scores: Vec<(u32, f64)>, options: &Options) -> Self {
-        let compare =
-            |a: &(u32, f64), b: &(u32, f64)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
-        if options.temperature == 0.0 {
-            let best = *scores
-                .iter()
-                .min_by(|a, b| compare(a, b))
-                .expect("Nonempty logits");
-            scores = vec![(best.0, 1.0)];
+        if mask.is_none() && !options.processes_scores() && options.temperature > 0.0 {
+            validate_logits(logits)?;
+            Ok(Self::from_source(
+                logits.len(),
+                Scores::Logits(Cow::Borrowed(logits)),
+                options,
+            ))
         } else {
-            if options.top_k > 0 && options.top_k < scores.len() {
-                scores.select_nth_unstable_by(options.top_k, compare);
-                scores.truncate(options.top_k);
-            }
-            scores.sort_unstable_by(compare);
-            let maximum = scores[0].1;
-            for (_, score) in &mut scores {
-                *score = ((*score - maximum) / options.temperature).exp();
-            }
-            let total: f64 = scores.iter().map(|x| x.1).sum();
-            let mut mass = 0.0;
-            let cutoff = scores
-                .iter()
-                .position(|x| {
-                    mass += x.1;
-                    mass >= total * options.top_p
-                })
-                .unwrap_or(scores.len() - 1);
-            scores.truncate(cutoff + 1);
-            let total: f64 = scores.iter().map(|x| x.1).sum();
-            for (_, mass) in &mut scores {
-                *mass /= total;
+            let scores = processed_scores(logits, history, options, mask)?;
+            Ok(Self::from_scores(logits.len(), scores, options))
+        }
+    }
+
+    // Reporting may have partitioned the processed scores.
+    fn from_scores(vocab: usize, scores: Vec<Score>, options: &Options) -> Self {
+        Self::from_source(vocab, Scores::Processed(scores), options)
+    }
+
+    fn from_source(vocab: usize, scores: Scores<'_>, options: &Options) -> Self {
+        if options.temperature > 0.0 && options.top_k == 0 && scores.len() > SPARSE_SUPPORT {
+            if options.top_p == 1.0 {
+                let mut dense = vec![0.0; vocab];
+                let mut shortlist = Shortlist::new(&scores, options.temperature, |id, w| {
+                    dense[id as usize] = w;
+                });
+                if shortlist.ordered.len() < scores.len() {
+                    normalize(&mut shortlist.ordered, shortlist.total);
+                    for p in &mut dense {
+                        *p /= shortlist.total;
+                    }
+                    return Self {
+                        probabilities: Some(dense),
+                        vocab,
+                        ordered: shortlist.ordered,
+                        fallback: Some(Tail {
+                            scores: scores.for_fallback(),
+                            temperature: options.temperature,
+                            margin: shortlist.error,
+                        }),
+                    };
+                }
+            } else {
+                let mut shortlist = Shortlist::new(&scores, options.temperature, |_, _| {});
+                if shortlist.truncate(options.top_p) {
+                    return Self::from_ordered(vocab, shortlist.ordered);
+                }
             }
         }
-        let probabilities = (scores.len() > 128).then(|| {
+        Self::from_ordered(vocab, scores.full_order(options))
+    }
+
+    fn from_ordered(vocab: usize, ordered: Vec<Score>) -> Self {
+        let probabilities = (ordered.len() > SPARSE_SUPPORT).then(|| {
             let mut dense = vec![0.0; vocab];
-            for &(id, mass) in &scores {
+            for &(id, mass) in &ordered {
                 dense[id as usize] = mass;
             }
             dense
@@ -287,7 +494,8 @@ impl Distribution {
         Self {
             probabilities,
             vocab,
-            ordered: scores,
+            ordered,
+            fallback: None,
         }
     }
     pub fn probability(&self, token: u32) -> f64 {
@@ -315,22 +523,17 @@ impl Distribution {
         if !uniform.is_finite() || !(0.0..1.0).contains(&uniform) {
             return Err("Sampling uniform outside [0,1)".into());
         }
-        let mut mass = 0.0;
-        for &(id, p) in &self.ordered {
-            mass += p;
-            if uniform < mass {
+        if let Some(tail) = &self.fallback {
+            if let Some(id) = draw_ordered(&self.ordered, uniform, tail.margin) {
                 return Ok(id);
             }
+            let ordered = Scores::Processed(tail.scores.iter().collect()).full_order(&Options {
+                temperature: tail.temperature,
+                ..Options::default()
+            });
+            return draw_complete(&ordered, uniform);
         }
-        // Floating-point cumulative mass can finish slightly below one. Never
-        // fall back to an underflowed zero-probability token.
-        Ok(self
-            .ordered
-            .iter()
-            .rev()
-            .find(|(_, p)| *p > 0.0)
-            .ok_or("Empty sampling distribution")?
-            .0)
+        draw_complete(&self.ordered, uniform)
     }
     /// On a rejected proposal the correction law is proportional to (p-q)+.
     pub fn residual(&self, draft: &Self) -> Result<Self, String> {
@@ -356,6 +559,7 @@ impl Distribution {
                 probabilities: None,
                 vocab: self.vocab,
                 ordered,
+                fallback: None,
             });
         }
         let mut probabilities: Vec<f64> = self
@@ -381,6 +585,7 @@ impl Distribution {
             probabilities: Some(probabilities),
             vocab: self.vocab,
             ordered,
+            fallback: None,
         })
     }
 }
@@ -395,11 +600,32 @@ pub fn sample(
     if options.temperature == 0.0 {
         return greedy(logits, history, options);
     }
-    Distribution::from_validated(logits, history, options, None)?.draw(counter_uniform(
-        options.seed,
-        0,
-        step as u64,
-    ))
+    let scores = if options.processes_scores() {
+        Scores::Processed(processed_scores(logits, history, options, None)?)
+    } else {
+        validate_logits(logits)?;
+        Scores::Logits(Cow::Borrowed(logits))
+    };
+    draw_stochastic(
+        scores,
+        options,
+        counter_uniform(options.seed, 0, step as u64),
+    )
+}
+
+fn draw_stochastic(scores: Scores<'_>, options: &Options, uniform: f64) -> Result<u32, String> {
+    if options.top_k == 0 && scores.len() > SPARSE_SUPPORT {
+        let mut shortlist = Shortlist::new(&scores, options.temperature, |_, _| {});
+        if options.top_p == 1.0 {
+            normalize(&mut shortlist.ordered, shortlist.total);
+            if let Some(id) = draw_ordered(&shortlist.ordered, uniform, shortlist.error) {
+                return Ok(id);
+            }
+        } else if shortlist.truncate(options.top_p) {
+            return draw_complete(&shortlist.ordered, uniform);
+        }
+    }
+    draw_complete(&scores.full_order(options), uniform)
 }
 
 /// Greedy needs neither sorting nor a dense probability distribution. Retain
@@ -443,6 +669,323 @@ fn greedy(logits: &[f32], history: &[u32], options: &Options) -> Result<u32, Str
 #[cfg(test)]
 mod sampling_tests {
     use super::*;
+
+    fn naive_law(vocab: usize, mut ordered: Vec<Score>, options: &Options) -> Distribution {
+        ordered.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if options.top_k > 0 {
+            ordered.truncate(options.top_k);
+        }
+        let maximum = ordered[0].1;
+        for (_, mass) in &mut ordered {
+            *mass = ((*mass - maximum) / options.temperature).exp();
+        }
+        let threshold = ordered.iter().map(|x| x.1).sum::<f64>() * options.top_p;
+        let mut total = 0.0;
+        let mut count = 0;
+        for &(_, mass) in &ordered {
+            total += mass;
+            count += 1;
+            if total >= threshold {
+                break;
+            }
+        }
+        ordered.truncate(count);
+        for (_, mass) in &mut ordered {
+            *mass /= total;
+        }
+        let probabilities = (count > 128).then(|| {
+            let mut probabilities = vec![0.0; vocab];
+            for &(id, p) in &ordered {
+                probabilities[id as usize] = p;
+            }
+            probabilities
+        });
+        Distribution {
+            probabilities,
+            vocab,
+            ordered,
+            fallback: None,
+        }
+    }
+
+    fn naive_draw(ordered: &[Score], uniform: f64) -> u32 {
+        let mut mass = 0.0;
+        let mut last = None;
+        for &(id, p) in ordered {
+            if p > 0.0 {
+                last = Some(id);
+            }
+            mass += p;
+            if uniform < mass {
+                break;
+            }
+        }
+        last.unwrap()
+    }
+
+    #[test]
+    fn shortlist_matches_full_sort_with_ties_processors_and_masks() {
+        let mut peaked: Vec<_> = (0..1025)
+            .map(|i| -22.0 - (i * 17 % 101) as f32 / 7.0)
+            .collect();
+        peaked[..8].copy_from_slice(&[-0.0, 0.0, -0.0, 0.0, -0.25, -1.0, -3.0, -18.125]);
+        let flat = vec![2.0; SHORTLIST_LIMIT + 1];
+        let history = [0, 0, 1, 4, 4, 16, u32::MAX];
+        for logits in [&peaked, &flat] {
+            let mask = vec![0x5555_5555; logits.len().div_ceil(32)];
+            for processors in [
+                Options::default(),
+                Options {
+                    repetition_penalty: 1.3,
+                    presence_penalty: -0.2,
+                    frequency_penalty: 0.5,
+                    logit_bias: [(1, -0.5), (4, 1.0), (256, 8.0)].into(),
+                    ..Options::default()
+                },
+            ] {
+                for temperature in [0.2, 1.0, 2.0] {
+                    for top_p in [1.0, 0.9, 0.5, 0.1] {
+                        for top_k in [0, 20] {
+                            let options = Options {
+                                temperature,
+                                top_p,
+                                top_k,
+                                ..processors.clone()
+                            };
+                            for mask in [None, Some(mask.as_slice())] {
+                                let scores =
+                                    processed_scores(logits, &history, &options, mask).unwrap();
+                                let expected = naive_law(logits.len(), scores.clone(), &options);
+                                let law = Distribution::from_scores(logits.len(), scores, &options);
+                                for id in 0..logits.len() as u32 {
+                                    assert!(
+                                        (law.probability(id) - expected.probability(id)).abs()
+                                            < 1e-12
+                                    );
+                                }
+                                for uniform in [0.0, 1e-15, 0.5, 0.999999999, 1.0 - f64::EPSILON] {
+                                    assert_eq!(
+                                        law.draw(uniform).unwrap(),
+                                        naive_draw(&expected.ordered, uniform)
+                                    );
+                                }
+                                if mask.is_none() {
+                                    for step in 0..8 {
+                                        let uniform = counter_uniform(options.seed, 0, step);
+                                        assert_eq!(
+                                            sample(logits, &history, &options, step as usize)
+                                                .unwrap(),
+                                            naive_draw(&expected.ordered, uniform)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let options = Options::default();
+        let mut flat_shortlist =
+            Shortlist::new(&Scores::Logits(Cow::Borrowed(&flat)), 1.0, |_, _| {});
+        assert!(!flat_shortlist.truncate(0.9));
+        assert_eq!(
+            Distribution::from_logits(&peaked, &[], &options)
+                .unwrap()
+                .draw(0.0),
+            Ok(0)
+        );
+        assert_eq!(
+            sample(&[], &[], &options, 0),
+            Err("Invalid sampling logits".into())
+        );
+        assert_eq!(
+            sample(&[1.0, f32::INFINITY], &[], &options, 0),
+            Err("Invalid sampling logits".into())
+        );
+        assert_eq!(
+            Distribution::from_masked(&peaked, &[], &options, Some(&[0])).unwrap_err(),
+            "Grammar permits no tokens"
+        );
+    }
+
+    #[test]
+    fn untruncated_draws_preserve_tail_order_and_cdf_boundaries() {
+        let mut logits = vec![-1000.0; 257];
+        logits[..5].copy_from_slice(&[0.0, -0.0, -18.125, -18.25, -42.0]);
+        let options = Options::default();
+        let expected = naive_law(
+            logits.len(),
+            processed_scores(&logits, &[], &options, None).unwrap(),
+            &options,
+        );
+        let law = Distribution::from_logits(&logits, &[], &options).unwrap();
+        assert_eq!(law.ordered.iter().map(|x| x.0).collect::<Vec<_>>(), [0, 1]);
+        assert!(law.fallback.is_some());
+        assert!(0.999999999 >= law.ordered.iter().map(|x| x.1).sum());
+        let boundary = expected.probability(0);
+        for uniform in [
+            0.0,
+            boundary.next_down(),
+            boundary,
+            0.999999999,
+            1.0_f64.next_down(),
+        ] {
+            let token = naive_draw(&expected.ordered, uniform);
+            assert_eq!(law.draw(uniform), Ok(token));
+            assert_eq!(
+                draw_stochastic(Scores::Logits(Cow::Borrowed(&logits)), &options, uniform),
+                Ok(token)
+            );
+        }
+
+        // A broad tail can hold enough mass to move a nucleus beyond 18T.
+        let mut broad = vec![-18.125; 1025];
+        broad[0] = 0.0;
+        let options = Options {
+            top_p: 0.999999,
+            ..options
+        };
+        let reference = naive_law(
+            broad.len(),
+            processed_scores(&broad, &[], &options, None).unwrap(),
+            &options,
+        );
+        let law = Distribution::from_logits(&broad, &[], &options).unwrap();
+        assert!(law.ordered.len() > 128);
+        assert_eq!(law.ordered, reference.ordered);
+    }
+
+    #[test]
+    fn shortlist_residual_and_verification_match_full_sort() {
+        let mut first = vec![-24.0; 257];
+        first[..4].copy_from_slice(&[1.25, 0.0, 0.25, 1.0]);
+        let mut second = first.clone();
+        second.swap(0, 2);
+        let mut draft_logits = first.clone();
+        draft_logits.swap(0, 3);
+        let mut logits = first.clone();
+        logits.extend(&second);
+        for top_p in [1.0, 0.9, 0.5, 0.1] {
+            let options = Options {
+                top_p,
+                ..Options::default()
+            };
+            let reference = |row| {
+                naive_law(
+                    first.len(),
+                    processed_scores(row, &[], &options, None).unwrap(),
+                    &options,
+                )
+            };
+            let p = reference(&first);
+            let q = reference(&draft_logits);
+            let next = reference(&second);
+            let target = Distribution::from_logits(&first, &[], &options).unwrap();
+            let draft = Distribution::from_logits(&draft_logits, &[], &options).unwrap();
+            let residual: Vec<_> = (0..first.len() as u32)
+                .map(|id| (id, (p.probability(id) - q.probability(id)).max(0.0)))
+                .filter(|x| x.1 > 0.0)
+                .collect();
+            let total: f64 = residual.iter().map(|x| x.1).sum();
+            let residual: Vec<_> = residual
+                .into_iter()
+                .map(|(id, w)| (id, w / total))
+                .collect();
+            let actual = target.residual(&draft).unwrap();
+            for &(id, probability) in &residual {
+                assert!((actual.probability(id) - probability).abs() < 1e-12);
+            }
+            let token = naive_draw(&q.ordered, 0.0);
+            let proposal = crate::mtp::Proposal {
+                token,
+                distribution: draft,
+            };
+            for step in 0..32 {
+                let accept = counter_uniform(options.seed, 0x4d54_5002, step as u64)
+                    < (p.probability(token) / q.probability(token)).min(1.0);
+                let expected = if accept {
+                    vec![
+                        token,
+                        naive_draw(
+                            &next.ordered,
+                            counter_uniform(options.seed, 0, step as u64 + 1),
+                        ),
+                    ]
+                } else {
+                    vec![naive_draw(
+                        &residual,
+                        counter_uniform(options.seed, 0x4d54_5003, step as u64),
+                    )]
+                };
+                assert_eq!(
+                    verify(
+                        std::slice::from_ref(&proposal),
+                        &logits,
+                        &[],
+                        &options,
+                        &mut Decoder::default(),
+                        step,
+                        first.len()
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release timing diagnostic"]
+    fn sampling_release_timing() {
+        use std::{hint::black_box, time::Instant};
+
+        let logits: Vec<_> = (0usize..248_320)
+            .map(|i| {
+                let score = ((i * 12_307 % 248_321) as f32) / 248_321.0;
+                if i % 1021 == 0 {
+                    -6.0 * score
+                } else {
+                    -20.0 - 24.0 * score
+                }
+            })
+            .collect();
+        let options = Options::default();
+        let measure = |f: &mut dyn FnMut(u64)| {
+            for i in 0..8 {
+                f(i);
+            }
+            let start = Instant::now();
+            for i in 0..64 {
+                f(i);
+            }
+            start.elapsed().as_secs_f64() * 1e3 / 64.0
+        };
+        let reference = || {
+            let scores = processed_scores(black_box(&logits), &[], &options, None).unwrap();
+            naive_law(logits.len(), scores, &options)
+        };
+        let reference_sample_ms = measure(&mut |i| {
+            black_box(naive_draw(
+                &reference().ordered,
+                counter_uniform(options.seed, 0, i),
+            ));
+        });
+        let reference_distribution_ms = measure(&mut |_| {
+            black_box(reference());
+        });
+        let sample_ms = measure(&mut |i| {
+            black_box(sample(black_box(&logits), &[], &options, i as usize).unwrap());
+        });
+        let distribution_ms = measure(&mut |_| {
+            black_box(Distribution::from_logits(black_box(&logits), &[], &options).unwrap());
+        });
+        eprintln!(
+            "vocab={} sample_ms={reference_sample_ms:.3}->{sample_ms:.3} distribution_ms={reference_distribution_ms:.3}->{distribution_ms:.3}",
+            logits.len()
+        );
+    }
+
     #[test]
     fn unprocessed_scores_preserve_generic_bits_masks_and_seeded_sampling() {
         let mut logits = vec![
@@ -531,6 +1074,7 @@ mod sampling_tests {
                 probabilities: Some(law.dense_probabilities().into_owned()),
                 vocab: law.vocab,
                 ordered: law.ordered.clone(),
+                fallback: None,
             };
             let a = target.residual(&draft).unwrap();
             let b = dense(&target).residual(&dense(&draft)).unwrap();
@@ -574,6 +1118,7 @@ mod sampling_tests {
             probabilities: Some(vec![1.0 - 1e-12, 0.0]),
             vocab: 2,
             ordered: vec![(0, 1.0 - 1e-12), (1, 0.0)],
+            fallback: None,
         };
         assert_eq!(law.draw(1.0 - f64::EPSILON).unwrap(), 0);
     }

@@ -144,28 +144,29 @@ impl Decoder {
                 return Err(error);
             }
         };
-        let scores = super::processed_scores(logits, history, options, mask.as_deref());
-        if let Err(error) = &scores
+        let law = if options.top_logprobs.is_none() {
+            Distribution::from_validated(logits, history, options, mask.as_deref()).map(
+                |distribution| Law {
+                    distribution,
+                    reporting: None,
+                },
+            )
+        } else {
+            super::processed_scores(logits, history, options, mask.as_deref()).map(|mut scores| {
+                // Greedy selects an argmax but reports the actual T=1 softmax.
+                let reporting = super::reporting::Report::new(&mut scores, logits.len(), options);
+                Law {
+                    distribution: Distribution::from_scores(logits.len(), scores, options),
+                    reporting: Some(reporting),
+                }
+            })
+        };
+        if let Err(error) = &law
             && error == "Grammar permits no tokens"
         {
             self.fail(error.clone());
         }
-        let mut scores = scores?;
-        // Report the target law before top-k/nucleus truncation. Greedy selects
-        // an argmax but still reports real softmax probabilities at T=1.
-        let reporting = if options.top_logprobs.is_some() {
-            Some(super::reporting::Report::new(
-                &mut scores,
-                logits.len(),
-                options,
-            ))
-        } else {
-            None
-        };
-        Ok(Law {
-            distribution: Distribution::from_scores(logits.len(), scores, options),
-            reporting,
-        })
+        law
     }
     /// Consume an owned parser fork along the proposal prefix. After an illegal
     /// proposal or termination, remaining rows are unused and need no reports.
