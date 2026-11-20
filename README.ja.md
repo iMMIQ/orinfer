@@ -1,84 +1,124 @@
 # Orinfer
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
-Rust と TileLang による NVIDIA Jetson 向けテキスト・視覚言語・音声推論エンジン。
+**Rust** と **TileLang** で実装した、テキスト・視覚言語・音声・埋め込み・リランキング向け高性能推論エンジン。
 
-**Jetson AGX Orin 64GB / CUDA SM87** 向けに設計しています。Rust がエンジンと API を実行し、TileLang がデプロイ前に GPU カーネルを実行パッケージへコンパイルします。Qwen3.8-27B、Qwen3.8-Flash-Next、Qwen3.5-4B、Index-Translate-2B/9B/35B-A3B-preview に対応します。Qwen3-ASR-1.7B は音声文字起こしに対応します。入力の対応範囲は各モデルパッケージが定義します。
+主に **NVIDIA Jetson AGX Orin 64GB（CUDA SM87）** 向けに設計されており、バックエンド非依存の共通ランタイムによって **Huawei Ascend 910B / A2（CANN 9.2）** での DeepSeek-V4.1 Flash-1017 W4A8 TP8 実験的サービングにも対応します。
 
-## 機能
+---
 
-- OpenAI Chat Completions と Ollama の chat/generate API：ストリーミング、thinking、サンプリング、関数呼び出し、JSON Schema 制約、トークン確率。
-- [音声認識](docs/audio.md)：Qwen3-ASR-1.7B、Rust によるファイル文字起こしと Chat 音声入力。
-- [JSONL オフライン推論](docs/batch.md)：Rust CLI による連続バッチ処理、結果の逐次保存、途中再開。
-- Qwen3_5 系は E8P Q4A8/W8 混合重み、Flash Next は E8P Q2 エキスパートと Q4/W8 投影を使用。精度に敏感な処理は BF16/FP16/FP32 を維持します。
-- チャンク化 prefill、リクエストごとの状態分離、prefix cache、INT8 KV、モデル設定による最大 256K トークンのコンテキスト。
-- ネイティブ MTP が実測コストと受理率から草稿の深さを自動選択します。`--mtp-drafts 1..7` で上限を指定し、`0` で無効化、`auto` でパッケージの上限を使用します。
-- CUDA Graph は `decode_only`（既定）、`full`、`off` の 3 モード。
+## 主な機能
 
-## クイックスタート
+- **OpenAI & Ollama API**：ストリーミング Chat Completions、Ollama `/api/chat`・`/api/generate`、thinking と `thinking_token_budget`、関数呼び出し、厳密な JSON Schema 制約（`llguidance`）、`logprobs`。
+- **マルチモーダル & マルチタスク**：
+  - **テキスト・視覚言語**：Qwen3.8-27B、Qwen3.8-Flash-Next、Qwen3.5-4B、Index-Translate-2B/9B/35B-A3B-preview、および Ascend 910B TP8 の DSv4.1 Flash-1017。
+  - **音声認識**：Qwen3-ASR-1.7B。Rust ネイティブのデコード・リサンプリングにより `/v1/audio/transcriptions` と Chat `input_audio` に対応（[音声認識ガイド](docs/audio.md)）。
+  - **埋め込み**：Nemotron-3.5-Embed-1B。テキスト・画像・複数画像検索を `/v1/embeddings` とオフライン CLI で提供（[埋め込みガイド](docs/embeddings.md)）。
+  - **リランキング**：Qwen3-Reranker-0.6B。`/v1/rerank` とオフライン CLI を提供（[リランキングガイド](docs/reranking.md)）。
+  - **JSONL オフライン推論**：連続バッチ処理、プレフィックス計画、逐次保存、途中再開に対応（[バッチ推論ガイド](docs/batch.md)）。
+- **量子化と省メモリ設計**：Qwen3.5/ASR/Embed/Reranker は 2 段 E8P Q4A8/W8 混合精度、Flash Next は E8P Q2A8 エキスパート + Q4/W8 投影を採用。INT8 KV キャッシュと最大 256K コンテキストに対応（[量子化ノート](docs/quantization.md)）。
+- **プロダクション向けランタイム**：チャンク化 prefill、リクエストごとの状態分離、Radix Prefix Cache とオプションの CPU KV オフロード、CUDA/ACL Graph（`decode_only`、`full`、`off`）、適応型ネイティブ MTP / DSpark 投機デコード（`--mtp-drafts 0..31` または `auto`）。
 
-実行環境は **aarch64 Linux、NVIDIA CUDA Driver、コンパイル済みエンジンと対応する実行パッケージ**です。
+---
 
-[Releases](https://github.com/iMMIQ/orinfer/releases) からエンジン、対応する実行パッケージ、`SHA256SUMS` をダウンロードします。検証後にエンジンを展開し、`bin/orinfer` を `PATH` に追加します。準備済みモデルは別途ダウンロードします。モデルディレクトリには設定、tokenizer、chat template、量子化 safetensors が入り、`execution_package` の digest はインストールしたパッケージと一致する必要があります。
+## 対応モデル一覧
+
+| モデル | モダリティ / タスク | バックエンド | 重み形式 | 最大コンテキスト |
+| --- | --- | --- | --- | ---: |
+| **Index-Translate-2B / 9B / 35B-A3B** | テキスト・画像・複数画像 | CUDA SM87 | E8P Q4A8 / W8 | 256K |
+| **Qwen3.5-4B** | テキスト・画像・複数画像 | CUDA SM87 | E8P Q4A8 / W8 | 256K |
+| **Qwen3.8-27B** | テキスト・画像・複数画像 | CUDA SM87 | E8P Q4A8 / W8 | 256K |
+| **Qwen3.8-Flash-Next** | テキスト・画像・複数画像 | CUDA SM87 | E8P Q2A8 エキスパート + Q4/W8 | 256K |
+| **Qwen3-ASR-1.7B** | 音声文字起こし | CUDA SM87 | E8P Q4A8 / W8 + FP16 音声 | 64K |
+| **Nemotron-3.5-Embed-1B** | テキスト・画像埋め込み | CUDA SM87 | E8P Q4A8 / W8 | 32K |
+| **Qwen3-Reranker-0.6B** | クエリ・文書リランキング | CUDA SM87 | E8P Q4A8 / W8 | 32K |
+| **DSv4.1 Flash-1017** *(実験的)* | テキスト・画像・ツール・DSpark | Ascend 910B TP8 | ネイティブ W4A8 + INT8 KV | 256K |
+
+---
+
+## クイックスタート（Jetson AGX Orin）
+
+### 前提条件
+- `aarch64` Linux および NVIDIA CUDA Driver
+- [Releases](https://github.com/iMMIQ/orinfer/releases) から取得したコンパイル済み `orinfer` エンジンと対応する実行パッケージ
+- 準備済みモデルディレクトリ（設定、tokenizer、chat template、量子化 safetensors を含み、`execution_package` digest がインストール済みパッケージと一致すること）
+
+### インストールと起動
 
 ```bash
+# 1. チェックサムを検証し、bin/orinfer を PATH に追加
 sha256sum --ignore-missing -c SHA256SUMS
+
+# 2. 対応する実行パッケージをローカルキャッシュへインストール
 orinfer package install /path/to/matching-execution.tar.xz
+
+# 3. モデルファイル・実行パッケージ・重みハッシュを検証
 orinfer validate-model /path/to/prepared-model
+
+# 4. OpenAI / Ollama 互換 HTTP サーバーを起動
 orinfer serve /path/to/prepared-model --model qwen3.8-27b
 ```
 
-既定の待受アドレスは `[::]:8088` です。`ORINFER_API_KEY` を設定すると `/v1` と `/api` の Bearer 認証が有効になります。
+既定の待受アドレスは `[::]:8088` です。`ORINFER_API_KEY` を設定すると `/v1` と `/api` で Bearer 認証が必須になります。
 
 ```bash
 curl http://127.0.0.1:8088/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"Introduce yourself in one sentence."}],"max_tokens":512,"stream":true}'
+  -d '{
+    "model": "qwen3.8-27b",
+    "messages": [{"role": "user", "content": "Introduce yourself in one sentence."}],
+    "max_tokens": 512,
+    "stream": true
+  }'
 ```
 
-`/health`、`/v1/models`、`/v1/chat/completions` を提供します。[サービスガイド](docs/serving.md) に Ollama の起動、画像、リクエスト既定値、[OpenCode](examples/opencode.json) / [Pi](examples/pi-models.json) との接続方法を記載しています。
+複数モデル管理モード（モデルパスなしの `orinfer serve`）、Ollama API、画像入力、[OpenCode](examples/opencode.json) / [Pi](examples/pi-models.json) / [DeepSeek Harness](docs/deepseek-harness.md) 連携は [Serving Guide](docs/serving.md) を参照してください。
 
-## 性能
+Ascend 910B / A2 環境では `orinfer devices --backend ascend` と `orinfer validate-ascend --device 0` で検証でき、本番運用手順は [DSv4.1 A2 Production Guide](docs/deepseek-v41-production.md) に記載しています。
 
-テキスト・視覚言語の 6 モデルを Jetson AGX Orin 64GB と開発版実行パッケージで **2026-10-21** に測定しました。入力は固定した英中翻訳プロンプトです。ベンチマークは単一リクエストで自動調整 MTP（草稿最大 3 個）を有効にし、複数リクエストでは自動的に MTP を無効にします。
+---
 
-| モデル | Prefill 512 トークン | Prefill 8K トークン | 単一 decode・MTP 有効 | 8 リクエスト decode | 最大同時数 / decode | 起動→API（秒） | 起動→最初の出力（秒） |
+## 性能概要（Jetson AGX Orin 64GB）
+
+固定の英中翻訳ベンチマーク（2026-10-21、`decode_only`、greedy、seed `20261002`、thinking・prefix cache 無効。単一リクエストは最大 3 草稿の適応型 MTP を有効化、複数リクエストは MTP 無効）。スループットは **tok/s**、起動時間は新規プロセス 3 回の中央値（秒）です。
+
+| モデル | Prefill 512 | Prefill 8K | 単一 Decode (MTP) | 8 並行 Decode | 最大同時数 / Decode | 起動→API（秒） | 起動→初回出力（秒） |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Index-Translate-2B | 8121.13 | 7507.67 | 171.47 | 757.39 | 128 / 2361.11 | 1.12 | 1.26 |
-| Qwen3.5-4B | 3592.58 | 3416.98 | 90.71 | 360.49 | 128 / 1071.29 | 1.68 | 1.83 |
-| Index-Translate-9B | 2213.52 | 2223.34 | 56.49 | 233.87 | 128 / 890.74 | 2.92 | 3.10 |
-| Qwen3.8-27B | 658.87 | 598.46 | 33.64 | 67.56 | 64 / 135.89 | 6.68 | 7.05 |
-| Index-Translate-35B-A3B-preview | 2233.16 | 3222.22 | 82.98 | 338.65 | 128 / 824.98 | 8.01 | 8.18 |
-| Qwen3.8-Flash-Next | 925.57 | 858.11 | 56.35 | 157.25 | 32 / 282.87 | 15.79 | 15.96 |
+| Index-Translate-2B | 8,121.1 | 7,507.7 | 171.5 | 757.4 | 128 / 2,361.1 | 1.12 | 1.26 |
+| Qwen3.5-4B | 3,592.6 | 3,417.0 | 90.7 | 360.5 | 128 / 1,071.3 | 1.68 | 1.83 |
+| Index-Translate-9B | 2,213.5 | 2,223.3 | 56.5 | 233.9 | 128 / 890.7 | 2.92 | 3.10 |
+| Qwen3.8-27B | 658.9 | 598.5 | 33.6 | 67.6 | 64 / 135.9 | 6.68 | 7.05 |
+| Index-Translate-35B-A3B | 2,233.2 | 3,222.2 | 83.0 | 338.7 | 128 / 825.0 | 8.01 | 8.18 |
+| Qwen3.8-Flash-Next | 925.6 | 858.1 | 56.4 | 157.3 | 32 / 282.9 | 15.79 | 15.96 |
 
-スループットは **tok/s**、起動時間は秒で表示し、複数リクエストの列は合計スループットです。単一リクエストの入力は 512 または 8192 トークン、出力は 257 トークン固定です。単一 decode 列は入力 512 トークンの結果です。Prefill は初期化、出力ヘッド、最初の出力選択を含み、decode は最初の出力ステップを除いて計測します。最大同時数の列は 8/16/32/64/128 のうち測定を完了した最大の同時数と合計 tok/s です。複数リクエストは各入力 256 トークン、各出力 65 トークンで、全リクエストの最初の出力が揃った後の 64 トークンを計測します。
+最新の **Schema 2 + P1–P6 Mini-Weka エンドツーエンド基準（2026-11-20）**、vLLM 比較、JSONL バッチ処理、Ascend 910B3 TP8 の計測結果は [Performance Reference](docs/performance.md) を参照してください。
 
-各条件で 1 回ウォームアップ後、3 回のリクエストまたは固定並行グループを測定し、中央値を採用します。`decode_only`、greedy、seed `20261002` を使用し、thinking と prefix cache は無効です。固定長診断では EOS を無視します。
+---
 
-起動時間は新しい Rust `serve` プロセス 3 回の中央値です。プロセス起動から `/health` の準備完了、および短い英中翻訳リクエスト（出力上限 32 トークン）の最初の空でない SSE 出力までを計測します。ファイルキャッシュを保持し、モデル読込、GPU 初期化、初回リクエスト処理を含みます。SSE 出力には複数トークンが含まれる場合があります。
+## 主な起動オプション
 
-[性能リファレンス](docs/performance.md) に実行パッケージの識別情報、8K decode、MTP 回数、vLLM 比較、起動、オフライン処理、品質検証の範囲を記載しています。複雑な画像翻訳の品質改善を進めています。
-
-## 主な設定
-
-| オプション | 既定値 | 用途 |
+| オプション | 既定値 | 説明 |
 | --- | --- | --- |
 | `--listen` | `[::]:8088` | HTTP 待受アドレス |
-| `--default-request-params` | `{}` | JSON リクエスト既定値。明示したリクエスト値を優先 |
-| `--cuda-graph` | `decode_only` | CUDA Graph モード |
-| `--resident-experts` | `full` | 全エキスパートを常駐。Flash Next は SSD からのオンデマンド読み込みにも対応 |
-| `--prefix-cache-mib` | `4096` | GPU prefix cache の MiB 予算。0 で無効 |
-| `--max-active-requests` | `32` | アクティブなリクエスト数の上限。1–128 |
-| `--max-batch-tokens` | `128` | Decode 行数予算。混合 prefill はパッケージ容量を使用 |
-| `--max-speculative-tokens` | `0` | MTP 検証行数予算。0 はパッケージ容量を使用 |
-| `--prefill-budget-ms` | `200` | 混合 prefill の予測実行時間の目標 |
+| `--default-request-params` | `{}` | JSON 形式の Chat リクエスト既定値 |
+| `--cuda-graph` / `--graph` | `decode_only` | Graph モード（`decode_only`、`full`、`off`） |
+| `--mtp-drafts` | `auto` | 適応型 MTP 上限（`auto`、`0` 無効、または `1..31`） |
+| `--resident-experts` | `full` | 全エキスパート常駐、または層あたり SLRU 容量 `N`（Flash Next） |
+| `--prefix-cache-mib` | `4096` | デバイスごとの prefix cache 予算（MiB、`0` で無効） |
+| `--kv-offload-mib` | `0` | グローバル CPU prefix 状態キャッシュ予算（MiB、`0` で無効） |
+| `--max-active-requests` | `32` | 最大同時アクティブ数（`1..128`） |
+| `--max-batch-tokens` | `128` | 通常 decode の行数予算（`1..128`） |
+| `--max-speculative-tokens` | `0` | MTP 検証行数予算（`0` はパッケージ容量を使用） |
+| `--prefill-budget-ms` | `200` | `latency` ポリシー下の混合 prefill 予測時間目標 |
 
-並行処理数とコンテキスト容量は実行パッケージと空きメモリに従います。実行パッケージの既定保存先は `~/.cache/orinfer/packages` です。`ORINFER_EXECUTION_CACHE` で変更できます。全オプションは `orinfer serve --help` を参照してください。
+実行パッケージの既定保存先は `~/.cache/orinfer/packages` です（`ORINFER_EXECUTION_CACHE` で変更可能）。全オプションは `orinfer serve --help` を参照してください。
 
-## 開発とドキュメント
+---
 
-Rust がオンラインの読み込み、スケジューリング、モデル実行、API 提供を担当します。Python はオフラインの量子化、コンパイル、検証に使用します。
+## ソースからのビルド
+
+オンライン推論エンジンと CLI は Rust でビルドし、オフライン量子化・TileLang コンパイル・検証には Python 3.12+（`uv`）を使用します。
 
 ```bash
 git clone https://github.com/iMMIQ/orinfer.git
@@ -89,12 +129,19 @@ make python-env
 make check
 ```
 
-- [サービスガイド](docs/serving.md) · [オフライン JSONL](docs/batch.md) · [性能](docs/performance.md)。
-- [ビルドとリリース](tools/build/README.md) · [実行パッケージ](docs/model-packages.md)。
-- [モデルのビルド](tools/model/README.md) · [GPU カーネル](kernels/README.md) · [品質評価](tools/eval/README.md)。
+---
 
-詳細ガイドは現在、中国語で提供しています。
+## ドキュメント
+
+全体の構成は [Documentation Hub](docs/README.md) を参照してください（詳細ガイドは英語で提供しています）：
+
+- **サービング・クライアント**：[Serving Guide](docs/serving.md) · [Offline JSONL Batch](docs/batch.md) · [DeepSeek Harness](docs/deepseek-harness.md) · [DSv4.1 A2 Production](docs/deepseek-v41-production.md)
+- **モデル・モダリティ**：[Speech Recognition](docs/audio.md) · [Embeddings](docs/embeddings.md) · [Reranking](docs/reranking.md)
+- **アーキテクチャ・パッケージ**：[Model Execution Packages](docs/model-packages.md) · [Ascend A2 Build Pipeline](docs/ascend-a2-build.md) · [E8P Quantization Note](docs/quantization.md)
+- **ベンチマーク・開発**：[Performance Reference](docs/performance.md) · [Development Guide](docs/development.md) · [Build & Release](tools/build/README.md) · [GPU/NPU Kernels](kernels/README.md)
+
+---
 
 ## ライセンス
 
-**LGPL-3.0-or-later**。[LICENSE](LICENSE) と [COPYING](COPYING) を参照してください。サードパーティーのコンポーネントとモデル重みには、それぞれのライセンスが適用されます。
+**LGPL-3.0-or-later**。[LICENSE](LICENSE)、[COPYING](COPYING)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。モデル重みとサードパーティー製コンポーネントにはそれぞれのライセンスが適用されます。

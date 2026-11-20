@@ -1,88 +1,124 @@
 # Orinfer
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
-Text, vision-language and speech inference on NVIDIA Jetson, powered by Rust and TileLang.
+High-performance text, vision-language, speech, embedding, and reranking inference engine written in **Rust** and **TileLang**.
 
-Built for **Jetson AGX Orin 64GB / CUDA SM87**. Rust runs the engine and APIs; TileLang compiles GPU kernels into execution packages ahead of deployment. Models include Qwen3.8-27B, Qwen3.8-Flash-Next, Qwen3.5-4B, and Index-Translate-2B/9B/35B-A3B-preview. Qwen3-ASR-1.7B provides speech transcription. Each model package declares its input capabilities.
+Built primarily for **NVIDIA Jetson AGX Orin 64GB (CUDA SM87)**, with a backend-agnostic runtime that also supports **Huawei Ascend 910B / A2 (CANN 9.2)** for experimental TP8 serving of DeepSeek-V4.1 Flash-1017 W4A8.
 
-The shared runtime separates device execution from scheduling, model semantics and prefix state. The Ascend 910B / A2 backend provides native ACL resources, asynchronous transfers, grouped W4A8, TileLang AOT operators and ACL Graph validation. An experimental native provider executes the complete 40-layer DSv4.1 Flash-1017 W4A8 model through the shared HTTP/SSE service, continuous worker and prefix cache. Run `orinfer devices --backend ascend` to inspect devices or `orinfer validate-ascend --device 0` for bounded native checks in a configured CANN environment. Existing CUDA packages and the model C ABI remain compatible. See [A2 text serving](docs/model-packages.md#a2-文本服务与长上下文).
+---
 
-## Features
+## Highlights
 
-- OpenAI Chat Completions and Ollama chat/generate APIs: streaming, thinking, sampling, function calling, JSON Schema constraints and token probabilities.
-- [Speech recognition](docs/audio.md): Qwen3-ASR-1.7B, file transcription and Chat audio input through the Rust runtime.
-- [Embeddings](docs/embeddings.md): Nemotron-3.5-Embed-1B with E8P Q4A8 text, image and multi-image document retrieval, an embeddings API and offline CLI.
-- [Reranking](docs/reranking.md): Qwen3-Reranker-0.6B with E8P Q4A8, causal yes/no scoring, a document reranking API and offline CLI.
-- [JSONL offline inference](docs/batch.md): continuous batching, incremental output and resumable jobs through the Rust CLI.
-- E8P Q4A8/W8 mixed weights for Qwen3_5 models; E8P Q2 experts and Q4/W8 projections for Flash Next. Sensitive paths retain BF16/FP16/FP32.
-- Chunked prefill, isolated request state, prefix cache, INT8 KV and model-configured context up to 256K tokens.
-- Adaptive native MTP chooses draft depth from measured cost and acceptance. `--mtp-drafts 1..31` sets an upper bound within the execution package capacity, `0` disables it, and `auto` uses the package default.
-- CUDA Graph modes: `decode_only` (default), `full` and `off`.
+- **OpenAI & Ollama APIs**: Streaming Chat Completions, Ollama `/api/chat` & `/api/generate`, thinking & `thinking_token_budget`, function calling, strict JSON Schema constraints (`llguidance`), and `logprobs`.
+- **Multi-Modal & Multi-Task**:
+  - **Text & Vision-Language**: Qwen3.8-27B, Qwen3.8-Flash-Next, Qwen3.5-4B, Index-Translate-2B/9B/35B-A3B-preview, and DSv4.1 Flash-1017 (Ascend 910B TP8).
+  - **Speech Recognition**: Qwen3-ASR-1.7B with native Rust audio decoding/resampling and `/v1/audio/transcriptions` + Chat `input_audio` ([Audio Guide](docs/audio.md)).
+  - **Embeddings**: Nemotron-3.5-Embed-1B for text, image, and multi-image retrieval via `/v1/embeddings` ([Embeddings Guide](docs/embeddings.md)).
+  - **Reranking**: Qwen3-Reranker-0.6B via `/v1/rerank` ([Reranking Guide](docs/reranking.md)).
+  - **Offline Batching**: Resumable JSONL inference with prefix-aware scheduling ([Batch Guide](docs/batch.md)).
+- **Quantization & Memory Efficiency**: Two-stage E8P Q4A8/W8 for Qwen3.5/Embed/Reranker/ASR, E8P Q2A8 experts + Q4/W8 projections for Flash Next, INT8 KV cache, and up to 256K context ([Quantization Note](docs/quantization.md)).
+- **Production Runtime**: Chunked prefill, isolated per-request state, radix prefix cache with optional CPU KV offload, CUDA/ACL Graph capture (`decode_only`, `full`, `off`), and adaptive native MTP / DSpark speculative decoding (`--mtp-drafts 0..31` or `auto`).
 
-## Quick start
+---
 
-Deployment uses **aarch64 Linux, the NVIDIA CUDA Driver, a precompiled engine and a matching execution package**.
+## Supported Models
 
-Download the engine archive, matching execution package and `SHA256SUMS` from [Releases](https://github.com/iMMIQ/orinfer/releases). Verify the files, extract the engine and add `bin/orinfer` to `PATH`. Download the prepared model separately; its directory contains configuration, tokenizer, chat template and quantized safetensors. Its `execution_package` digest must match the installed package.
+| Model | Modalities / Task | Backend | Weight Format | Max Context |
+| --- | --- | --- | --- | ---: |
+| **Index-Translate-2B / 9B / 35B-A3B** | Text, Image, Multi-Image | CUDA SM87 | E8P Q4A8 / W8 | 256K |
+| **Qwen3.5-4B** | Text, Image, Multi-Image | CUDA SM87 | E8P Q4A8 / W8 | 256K |
+| **Qwen3.8-27B** | Text, Image, Multi-Image | CUDA SM87 | E8P Q4A8 / W8 | 256K |
+| **Qwen3.8-Flash-Next** | Text, Image, Multi-Image | CUDA SM87 | E8P Q2A8 experts + Q4/W8 | 256K |
+| **Qwen3-ASR-1.7B** | Speech Transcription | CUDA SM87 | E8P Q4A8 / W8 + FP16 audio | 64K |
+| **Nemotron-3.5-Embed-1B** | Text & Image Embeddings | CUDA SM87 | E8P Q4A8 / W8 | 32K |
+| **Qwen3-Reranker-0.6B** | Query-Document Reranking | CUDA SM87 | E8P Q4A8 / W8 | 32K |
+| **DSv4.1 Flash-1017** *(experimental)* | Text, Image, Tools, DSpark | Ascend 910B TP8 | Native W4A8 + INT8 KV | 256K |
+
+---
+
+## Quick Start (Jetson AGX Orin)
+
+### Prerequisites
+- `aarch64` Linux with NVIDIA CUDA Driver
+- Precompiled `orinfer` engine archive and matching execution package from [Releases](https://github.com/iMMIQ/orinfer/releases)
+- Prepared model directory (config, tokenizer, chat template, and quantized safetensors whose `execution_package` digest matches the installed package)
+
+### Install & Serve
 
 ```bash
+# 1. Verify release checksums and extract bin/orinfer into PATH
 sha256sum --ignore-missing -c SHA256SUMS
+
+# 2. Install the matching execution package into the local cache
 orinfer package install /path/to/matching-execution.tar.xz
+
+# 3. Validate model files, execution package, and weight hashes
 orinfer validate-model /path/to/prepared-model
+
+# 4. Start the OpenAI / Ollama HTTP server
 orinfer serve /path/to/prepared-model --model qwen3.8-27b
 ```
 
-The server listens on `[::]:8088`. Set `ORINFER_API_KEY` to enable Bearer authentication for `/v1` and `/api`.
+The server listens on `[::]:8088` by default. Set `ORINFER_API_KEY` to require Bearer authentication on `/v1` and `/api`.
 
 ```bash
 curl http://127.0.0.1:8088/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"Introduce yourself in one sentence."}],"max_tokens":512,"stream":true}'
+  -d '{
+    "model": "qwen3.8-27b",
+    "messages": [{"role": "user", "content": "Introduce yourself in one sentence."}],
+    "max_tokens": 512,
+    "stream": true
+  }'
 ```
 
-Endpoints include `/health`, `/v1/models` and `/v1/chat/completions`. The [serving guide](docs/serving.md) covers Ollama deployment, images, request defaults and [OpenCode](examples/opencode.json) / [Pi](examples/pi-models.json) integration.
+For multi-model managed serving (`orinfer serve` without a model path), Ollama API, images, and [OpenCode](examples/opencode.json) / [Pi](examples/pi-models.json) / [DeepSeek Harness](docs/deepseek-harness.md) integration, see the [Serving Guide](docs/serving.md).
 
-## Performance
+For Ascend 910B / A2 deployment, run `orinfer devices --backend ascend` and `orinfer validate-ascend --device 0`, and see the [DSv4.1 A2 Production Guide](docs/deepseek-v41-production.md).
 
-Text and vision-language models, Jetson AGX Orin 64GB, development execution packages, measured **2026-10-21**. Inputs are fixed English-to-Chinese translation prompts. The benchmark enables adaptive MTP (up to 3 drafts) for single-request runs and automatically disables MTP for multi-request runs.
+---
 
-| Model | Prefill, 512 tokens | Prefill, 8K tokens | Single decode, MTP | 8-request decode | Max requests / decode | Serve → API (s) | Serve → first output (s) |
+## Performance Snapshot (Jetson AGX Orin 64GB)
+
+Fixed English-to-Chinese translation benchmark (2026-10-21, `decode_only`, greedy, seed `20261002`, thinking off, prefix cache off; single-request uses adaptive MTP up to 3 drafts, multi-request disables MTP). Throughput is in **tok/s**; startup times are medians of 3 fresh processes in seconds.
+
+| Model | Prefill 512 | Prefill 8K | Single Decode (MTP) | 8-Req Decode | Max Concurrency / Decode | Serve → API (s) | Serve → First Output (s) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Index-Translate-2B | 8121.13 | 7507.67 | 171.47 | 757.39 | 128 / 2361.11 | 1.12 | 1.26 |
-| Qwen3.5-4B | 3592.58 | 3416.98 | 90.71 | 360.49 | 128 / 1071.29 | 1.68 | 1.83 |
-| Index-Translate-9B | 2213.52 | 2223.34 | 56.49 | 233.87 | 128 / 890.74 | 2.92 | 3.10 |
-| Qwen3.8-27B | 658.87 | 598.46 | 33.64 | 67.56 | 64 / 135.89 | 6.68 | 7.05 |
-| Index-Translate-35B-A3B-preview | 2233.16 | 3222.22 | 82.98 | 338.65 | 128 / 824.98 | 8.01 | 8.18 |
-| Qwen3.8-Flash-Next | 925.57 | 858.11 | 56.35 | 157.25 | 32 / 282.87 | 15.79 | 15.96 |
+| Index-Translate-2B | 8,121.1 | 7,507.7 | 171.5 | 757.4 | 128 / 2,361.1 | 1.12 | 1.26 |
+| Qwen3.5-4B | 3,592.6 | 3,417.0 | 90.7 | 360.5 | 128 / 1,071.3 | 1.68 | 1.83 |
+| Index-Translate-9B | 2,213.5 | 2,223.3 | 56.5 | 233.9 | 128 / 890.7 | 2.92 | 3.10 |
+| Qwen3.8-27B | 658.9 | 598.5 | 33.6 | 67.6 | 64 / 135.9 | 6.68 | 7.05 |
+| Index-Translate-35B-A3B | 2,233.2 | 3,222.2 | 83.0 | 338.7 | 128 / 825.0 | 8.01 | 8.18 |
+| Qwen3.8-Flash-Next | 925.6 | 858.1 | 56.4 | 157.3 | 32 / 282.9 | 15.79 | 15.96 |
 
-Throughput is **tok/s**; startup times are seconds; multi-request columns report aggregate throughput. Single-request input is 512 or 8192 tokens, with 257 output tokens; the single-decode column uses the 512-token input. Prefill includes request setup, the output head and first-output selection. Decode excludes the first emitted step. The maximum-concurrency column shows the highest completed tier among 8/16/32/64/128 requests and its aggregate tok/s. Multi-request runs use 256 input tokens and 65 output tokens per request, timing the 64 tokens after every first output is ready.
+See [Performance Reference](docs/performance.md) for the latest **Schema 2 + P1–P6 Mini-Weka end-to-end baselines (2026-11-20)**, vLLM comparisons, JSONL batch throughput, and Ascend 910B3 TP8 results.
 
-Each configuration has one warmup followed by three measured requests or cohorts; the table reports medians. All runs use `decode_only`, greedy sampling, seed `20261002`, thinking off and prefix cache off. Fixed-length diagnostics ignore EOS.
+---
 
-Startup columns are medians of three fresh Rust `serve` processes: process launch → `/health` ready, then launch → the first nonempty SSE output of a short English-to-Chinese translation request (32-token output budget). File caches are preserved; model loading, GPU setup and first-request work are included. SSE output can contain multiple tokens.
+## Common CLI Options
 
-[Performance reference](docs/performance.md) records execution-package identities, 8K decode, MTP rounds, vLLM comparisons, startup, offline throughput and quality scope. Complex image translation is an active quality-improvement area.
-
-## Common options
-
-| Option | Default | Purpose |
+| Option | Default | Description |
 | --- | --- | --- |
-| `--listen` | `[::]:8088` | HTTP listener |
-| `--default-request-params` | `{}` | JSON request defaults; explicit request fields take priority |
-| `--cuda-graph` | `decode_only` | CUDA Graph mode |
-| `--resident-experts` | `full` | Keep all experts resident; Flash Next also supports an SSD-backed capacity |
-| `--prefix-cache-mib` | `4096` | GPU prefix-cache budget in MiB; 0 disables caching |
-| `--max-active-requests` | `32` | Active request limit, 1–128 |
-| `--max-batch-tokens` | `128` | Decode row budget; mixed prefill uses the package capacity |
-| `--max-speculative-tokens` | `0` | MTP verification row budget; 0 uses the package capacity |
-| `--prefill-budget-ms` | `200` | Predicted mixed-prefill time target |
+| `--listen` | `[::]:8088` | HTTP listen address |
+| `--default-request-params` | `{}` | JSON object of default Chat request fields |
+| `--cuda-graph` / `--graph` | `decode_only` | Graph capture mode (`decode_only`, `full`, `off`) |
+| `--mtp-drafts` | `auto` | Adaptive MTP cap (`auto`, `0` off, or `1..31`) |
+| `--resident-experts` | `full` | Keep all experts resident, or set per-layer SLRU budget `N` (Flash Next) |
+| `--prefix-cache-mib` | `4096` | Device prefix-cache budget per device in MiB (`0` disables) |
+| `--kv-offload-mib` | `0` | Global CPU prefix-state cache in MiB (`0` disables) |
+| `--max-active-requests` | `32` | Maximum concurrent active requests (`1..128`) |
+| `--max-batch-tokens` | `128` | Ordinary decode row budget (`1..128`) |
+| `--max-speculative-tokens` | `0` | MTP verification row budget (`0` uses package capacity) |
+| `--prefill-budget-ms` | `200` | Predicted mixed-prefill budget under `latency` policy |
 
-Concurrency and context capacity follow the execution package and available memory. Execution packages are installed in `~/.cache/orinfer/packages`; `ORINFER_EXECUTION_CACHE` selects another location. See `orinfer serve --help` for all options.
+Execution packages are stored in `~/.cache/orinfer/packages` by default (override via `ORINFER_EXECUTION_CACHE`). Run `orinfer serve --help` for the full option list.
 
-## Development and documentation
+---
 
-Rust handles online loading, scheduling, model execution and serving. Python 3.12 or later is used for offline quantization, compilation and validation.
+## Build from Source
+
+Rust builds the online engine and CLI; Python 3.12+ (`uv`) handles offline quantization, TileLang compilation, and validation.
 
 ```bash
 git clone https://github.com/iMMIQ/orinfer.git
@@ -93,12 +129,19 @@ make python-env
 make check
 ```
 
-- [Serving](docs/serving.md) · [Offline JSONL](docs/batch.md) · [Performance](docs/performance.md).
-- [Development layout](docs/development.md) · [Build and release](tools/build/README.md) · [Model packages](docs/model-packages.md).
-- [Model builders](tools/model/README.md) · [GPU kernels](kernels/README.md) · [Quality evaluation](tools/eval/README.md).
+---
 
-Additional guides are available in Chinese.
+## Documentation
+
+Browse the full [Documentation Hub](docs/README.md) (all detailed guides are in English):
+
+- **Serving & Clients**: [Serving Guide](docs/serving.md) · [Offline JSONL Batch](docs/batch.md) · [DeepSeek Harness](docs/deepseek-harness.md) · [DSv4.1 A2 Production](docs/deepseek-v41-production.md)
+- **Models & Modalities**: [Speech Recognition](docs/audio.md) · [Embeddings](docs/embeddings.md) · [Reranking](docs/reranking.md)
+- **Architecture & Packages**: [Model Execution Packages](docs/model-packages.md) · [Ascend A2 Build Pipeline](docs/ascend-a2-build.md) · [E8P Quantization Note](docs/quantization.md)
+- **Benchmarks & Development**: [Performance Reference](docs/performance.md) · [Development Guide](docs/development.md) · [Build & Release](tools/build/README.md) · [GPU/NPU Kernels](kernels/README.md)
+
+---
 
 ## License
 
-**LGPL-3.0-or-later**. See [LICENSE](LICENSE) and [COPYING](COPYING). Third-party components and model weights retain their respective licenses.
+**LGPL-3.0-or-later**. See [LICENSE](LICENSE), [COPYING](COPYING), and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Model weights and third-party components retain their respective licenses.

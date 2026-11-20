@@ -1,7 +1,11 @@
-# orinfer-model-sdk
+# `orinfer-model-sdk`
 
-独立模型执行包的共享数据契约和 C ABI v1。模型包的依赖限定为此 SDK；Rust 实现可以导出 `cdylib`，其他语言实现可使用 [C 头文件](include/orinfer_model.h)。
+Shared Rust data contracts for execution plans, dynamic row launches, packet bindings, request-private state descriptors, and Schema 2 execution packages.
 
-配置与计划描述在创建阶段序列化；batch 使用 C 数组传递。内存由分配方释放，原生库保持加载到对象销毁。SDK 中的 Rust trait 用于包内实现，跨库调用统一使用 C ABI。
+## Role in the Workspace
 
-协议和资源所有权见[模型执行包](../../docs/model-packages.md)。ABI 版本与 crate 版本分别管理；修改跨库结构或函数表时，必须同步升级 ABI 版本。
+- Consumed by both **`orinfer-models`** (statically linked model adapters) and **`orinfer-engine`** (runtime loader, scheduler, and graph executor).
+- Defines backend-independent descriptions for model architectures, operator catalogs, dynamic row expressions, MTP/speculation contracts, vision/audio/embedding/reranking metadata, and conditional memory.
+- Keeps no CUDA or CANN driver dependencies so `plan-model` and `validate-model` run purely on CPU.
+
+See [Model Execution Packages](../../docs/model-packages.md) for the Schema 2 package specification.

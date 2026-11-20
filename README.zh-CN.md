@@ -1,86 +1,124 @@
 # Orinfer
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
-以 Rust 和 TileLang 实现的 NVIDIA Jetson 文本、视觉语言与语音推理引擎。
+基于 **Rust** 与 **TileLang** 构建的高性能文本、视觉语言、语音、嵌入与重排推理引擎。
 
-面向 **Jetson AGX Orin 64GB / CUDA SM87**。Rust 负责引擎与 API，TileLang 在部署前将 GPU 算子编译为执行包。支持 Qwen3.8-27B、Qwen3.8-Flash-Next、Qwen3.5-4B，以及 Index-Translate-2B/9B/35B-A3B-preview，以及语音转写模型 Qwen3-ASR-1.7B；各模型包声明输入能力。
+主要面向 **NVIDIA Jetson AGX Orin 64GB（CUDA SM87）**；同时通过后端无关的共享运行时，实验性支持 **华为 Ascend 910B / A2（CANN 9.2）** 上的 DeepSeek-V4.1 Flash-1017 W4A8 TP8 原生服务。
 
-共享运行时已将设备执行与调度、模型语义、prefix 状态分离。Ascend 910B / A2 后端提供原生 ACL 资源、异步传输、W4A8 grouped matmul、TileLang AOT 算子和 ACL Graph 验收，实验性 `bench-ascend` 提供 DSv4.1 Flash-1017 W4A8 完整 40 层的单流测量，Ascend 服务执行器仍在接入。在已配置 CANN 环境的主机上运行 `orinfer devices --backend ascend` 可查看设备，`orinfer validate-ascend --device 0` 执行有界原生验收；现有 CUDA 执行包和模型 C ABI 保持兼容。详见[设备后端边界](docs/model-packages.md#设备后端边界)。
+---
 
-## 功能
+## 核心特性
 
-- OpenAI Chat Completions 和 Ollama 聊天/生成 API：流式输出、thinking、采样、函数调用、JSON Schema 约束及 token 概率。
-- [语音识别](docs/audio.md)：Qwen3-ASR-1.7B，Rust 原生文件转写和 Chat 音频输入。
-- [JSONL 离线推理](docs/batch.md)：通过 Rust CLI 连续批处理、逐条写入结果和断点续跑。
-- Qwen3_5 系列使用 E8P Q4A8/W8 混合权重；Flash Next 使用 E8P Q2 专家和 Q4/W8 投影。敏感路径保留 BF16/FP16/FP32。
-- 分块 prefill、独立请求状态、prefix cache、INT8 KV，以及由模型配置的最长 256K 上下文。
-- 原生 MTP 根据实测成本和接受率动态选择草稿深度。`--mtp-drafts 1..7` 设置上限，`0` 关闭，`auto` 使用执行包上限。
-- CUDA Graph 提供 `decode_only`（默认）、`full` 和 `off` 三种模式。
+- **OpenAI 与 Ollama API**：支持流式 Chat Completions、Ollama `/api/chat` 与 `/api/generate`、thinking 与 `thinking_token_budget`、函数调用、严格 JSON Schema 约束（`llguidance`）及 `logprobs`。
+- **多模态与多任务**：
+  - **文本与视觉语言**：支持 Qwen3.8-27B、Qwen3.8-Flash-Next、Qwen3.5-4B、Index-Translate-2B/9B/35B-A3B-preview，以及 Ascend 910B TP8 上的 DSv4.1 Flash-1017。
+  - **语音识别**：Qwen3-ASR-1.7B，内置 Rust 音频解码与重采样，支持 `/v1/audio/transcriptions` 与 Chat `input_audio`（见[语音识别指南](docs/audio.md)）。
+  - **文档嵌入**：Nemotron-3.5-Embed-1B，支持文本、单图与多图检索，提供 `/v1/embeddings` 与离线 CLI（见[嵌入指南](docs/embeddings.md)）。
+  - **文档重排**：Qwen3-Reranker-0.6B，提供 `/v1/rerank` 与离线 CLI（见[重排指南](docs/reranking.md)）。
+  - **JSONL 离线批处理**：支持连续批处理、前缀感知规划、逐条落盘与断点续跑（见[离线批处理指南](docs/batch.md)）。
+- **量化与显存优化**：Qwen3.5/ASR/Embed/Reranker 采用两级 E8P Q4A8/W8 混合精度；Flash Next 采用 E8P Q2A8 专家 + Q4/W8 投影；支持 INT8 KV 缓存与最高 256K 上下文（见[量化技术说明](docs/quantization.md)）。
+- **生产级运行时**：分块 prefill、请求级状态隔离、Radix Prefix Cache 与可选 CPU KV 卸载、CUDA/ACL Graph（`decode_only`、`full`、`off`），以及自适应原生 MTP / DSpark 投机解码（`--mtp-drafts 0..31` 或 `auto`）。
 
-## 快速开始
+---
 
-部署环境为 **aarch64 Linux、NVIDIA CUDA Driver、已编译的引擎及匹配执行包**。
+## 支持模型一览
 
-从 [Releases](https://github.com/iMMIQ/orinfer/releases) 下载引擎归档、匹配执行包和 `SHA256SUMS`。校验文件后解压引擎，将 `bin/orinfer` 加入 `PATH`。准备好的模型单独下载，目录包含配置、tokenizer、chat template 和量化 safetensors；其中的 `execution_package` digest 须与已安装执行包一致。
+| 模型 | 模态 / 任务 | 后端 | 权重精度 | 最大上下文 |
+| --- | --- | --- | --- | ---: |
+| **Index-Translate-2B / 9B / 35B-A3B** | 文本、单图、多图 | CUDA SM87 | E8P Q4A8 / W8 | 256K |
+| **Qwen3.5-4B** | 文本、单图、多图 | CUDA SM87 | E8P Q4A8 / W8 | 256K |
+| **Qwen3.8-27B** | 文本、单图、多图 | CUDA SM87 | E8P Q4A8 / W8 | 256K |
+| **Qwen3.8-Flash-Next** | 文本、单图、多图 | CUDA SM87 | E8P Q2A8 专家 + Q4/W8 | 256K |
+| **Qwen3-ASR-1.7B** | 语音转写 | CUDA SM87 | E8P Q4A8 / W8 + FP16 音频 | 64K |
+| **Nemotron-3.5-Embed-1B** | 图文文档嵌入 | CUDA SM87 | E8P Q4A8 / W8 | 32K |
+| **Qwen3-Reranker-0.6B** | 查询-文档重排 | CUDA SM87 | E8P Q4A8 / W8 | 32K |
+| **DSv4.1 Flash-1017** *(实验性)* | 文本、图片、工具、DSpark | Ascend 910B TP8 | 原生 W4A8 + INT8 KV | 256K |
+
+---
+
+## 快速开始（Jetson AGX Orin）
+
+### 环境要求
+- `aarch64` Linux 与 NVIDIA CUDA Driver
+- 从 [Releases](https://github.com/iMMIQ/orinfer/releases) 下载预编译 `orinfer` 引擎与匹配的执行包
+- 准备好的模型目录（包含配置、tokenizer、chat template 与量化 safetensors，其 `execution_package` digest 须与已安装执行包一致）
+
+### 安装与启动
 
 ```bash
+# 1. 校验发行包并将 bin/orinfer 加入 PATH
 sha256sum --ignore-missing -c SHA256SUMS
+
+# 2. 将匹配的执行包安装到本地缓存
 orinfer package install /path/to/matching-execution.tar.xz
+
+# 3. 完整校验模型文件、执行包与权重哈希
 orinfer validate-model /path/to/prepared-model
+
+# 4. 启动 OpenAI / Ollama 兼容 HTTP 服务
 orinfer serve /path/to/prepared-model --model qwen3.8-27b
 ```
 
-服务默认监听 `[::]:8088`。设置 `ORINFER_API_KEY` 可为 `/v1` 和 `/api` 启用 Bearer 鉴权。
+服务默认监听 `[::]:8088`。设置环境变量 `ORINFER_API_KEY` 可为 `/v1` 与 `/api` 启用 Bearer 鉴权。
 
 ```bash
 curl http://127.0.0.1:8088/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"Introduce yourself in one sentence."}],"max_tokens":512,"stream":true}'
+  -d '{
+    "model": "qwen3.8-27b",
+    "messages": [{"role": "user", "content": "用一句话介绍一下你自己。"}],
+    "max_tokens": 512,
+    "stream": true
+  }'
 ```
 
-接口包括 `/health`、`/v1/models` 和 `/v1/chat/completions`。[服务指南](docs/serving.md)提供 Ollama 部署、图片、请求默认值，以及 [OpenCode](examples/opencode.json) / [Pi](examples/pi-models.json) 接入说明。
+多模型管理模式（无路径运行 `orinfer serve`）、Ollama 接口、图片输入，以及 [OpenCode](examples/opencode.json) / [Pi](examples/pi-models.json) / [DeepSeek Harness](docs/deepseek-harness.md) 接入方式，请见[服务指南](docs/serving.md)。
 
-## 性能
+Ascend 910B / A2 部署可运行 `orinfer devices --backend ascend` 与 `orinfer validate-ascend --device 0`，完整说明见 [DSv4.1 A2 生产部署指南](docs/deepseek-v41-production.md)。
 
-六个文本与视觉语言模型统一在 Jetson AGX Orin 64GB 上测量，使用开发版执行包，日期 **2026-10-21**。输入为固定英译中翻译请求。基准按并发数切换：单流启用自适应 MTP（最多 3 个草稿），多流自动关闭 MTP。
+---
 
-| 模型 | Prefill 512 tokens | Prefill 8K tokens | 单流 decode，开 MTP | 8 并发 decode | 最高并发 / decode | 启动→API 就绪（秒） | 启动→首输出（秒） |
+## 性能速览（Jetson AGX Orin 64GB）
+
+固定英译中翻译基准（2026-10-21，`decode_only`、greedy、seed `20261002`，关闭 thinking 与 prefix cache；单流启用自适应 MTP 最多 3 草稿，多流关闭 MTP）。吞吐单位为 **tok/s**，启动时延为三次全新进程中位数（秒）。
+
+| 模型 | Prefill 512 | Prefill 8K | 单流 Decode (MTP) | 8 并发 Decode | 最高并发 / Decode | 启动→API（秒） | 启动→首输出（秒） |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Index-Translate-2B | 8121.13 | 7507.67 | 171.47 | 757.39 | 128 / 2361.11 | 1.12 | 1.26 |
-| Qwen3.5-4B | 3592.58 | 3416.98 | 90.71 | 360.49 | 128 / 1071.29 | 1.68 | 1.83 |
-| Index-Translate-9B | 2213.52 | 2223.34 | 56.49 | 233.87 | 128 / 890.74 | 2.92 | 3.10 |
-| Qwen3.8-27B | 658.87 | 598.46 | 33.64 | 67.56 | 64 / 135.89 | 6.68 | 7.05 |
-| Index-Translate-35B-A3B-preview | 2233.16 | 3222.22 | 82.98 | 338.65 | 128 / 824.98 | 8.01 | 8.18 |
-| Qwen3.8-Flash-Next | 925.57 | 858.11 | 56.35 | 157.25 | 32 / 282.87 | 15.79 | 15.96 |
+| Index-Translate-2B | 8,121.1 | 7,507.7 | 171.5 | 757.4 | 128 / 2,361.1 | 1.12 | 1.26 |
+| Qwen3.5-4B | 3,592.6 | 3,417.0 | 90.7 | 360.5 | 128 / 1,071.3 | 1.68 | 1.83 |
+| Index-Translate-9B | 2,213.5 | 2,223.3 | 56.5 | 233.9 | 128 / 890.7 | 2.92 | 3.10 |
+| Qwen3.8-27B | 658.9 | 598.5 | 33.6 | 67.6 | 64 / 135.9 | 6.68 | 7.05 |
+| Index-Translate-35B-A3B | 2,233.2 | 3,222.2 | 83.0 | 338.7 | 128 / 825.0 | 8.01 | 8.18 |
+| Qwen3.8-Flash-Next | 925.6 | 858.1 | 56.4 | 157.3 | 32 / 282.9 | 15.79 | 15.96 |
 
-吞吐单位为 **tok/s**，启动时延单位为秒；多流列为总吞吐。单流输入为 512 或 8192 tokens，输出固定 257 tokens；表中单流 decode 使用 512-token 输入。Prefill 包含请求初始化、输出头和首输出选择，decode 排除首个输出步骤。最高并发列列出 8/16/32/64/128 档中完成测量的最高并发数及对应总 TPS。多流每请求输入 256 tokens、输出 65 tokens，全部首输出就绪后计量后续 64 tokens。
+最新的 **Schema 2 + P1–P6 Mini-Weka 端到端基线（2026-11-20）**、vLLM 对照、JSONL 离线吞吐与 Ascend 910B3 TP8 数据，见[性能参考](docs/performance.md)。
 
-每项预热一次，再测三条完整请求或三组固定并发，表格取中位数。统一使用 `decode_only`、greedy、seed `20261002`，关闭 thinking 和 prefix cache；固定长度诊断忽略 EOS。
+---
 
-启动列取三次全新 Rust `serve` 进程的中位数，分别计量进程启动→`/health` 就绪、进程启动→短英译中首请求的首个非空 SSE 输出（输出预算 32 tokens）。保留系统文件缓存，计时包含模型加载、GPU 初始化及首请求工作；一个 SSE 输出可能包含多个 token。
+## 常用启动参数
 
-[性能参考](docs/performance.md)记录执行包身份、8K decode、MTP 轮次、vLLM 对比、启动、离线吞吐及质量范围。复杂图片翻译持续改进中。
-
-## 常用配置
-
-| 参数 | 默认值 | 用途 |
+| 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--listen` | `[::]:8088` | HTTP 监听地址 |
-| `--default-request-params` | `{}` | JSON 请求默认值，显式请求字段优先 |
-| `--cuda-graph` | `decode_only` | CUDA Graph 模式 |
-| `--resident-experts` | `full` | 专家全量常驻；Flash Next 也支持 SSD 按需加载容量 |
-| `--prefix-cache-mib` | `4096` | GPU 前缀缓存预算，单位 MiB；0 关闭 |
-| `--max-active-requests` | `32` | 活跃请求上限，1–128 |
-| `--max-batch-tokens` | `128` | Decode 行预算；混合 prefill 使用执行包容量 |
-| `--max-speculative-tokens` | `0` | MTP 验证行预算；0 使用执行包容量 |
-| `--prefill-budget-ms` | `200` | 混合 prefill 的预测耗时目标 |
+| `--default-request-params` | `{}` | JSON 格式的默认 Chat 请求参数 |
+| `--cuda-graph` / `--graph` | `decode_only` | Graph 模式（`decode_only`、`full`、`off`） |
+| `--mtp-drafts` | `auto` | 自适应 MTP 上限（`auto`、`0` 关闭或 `1..31`） |
+| `--resident-experts` | `full` | 专家全量常驻，或设置每层等效 SLRU 容量 `N`（Flash Next） |
+| `--prefix-cache-mib` | `4096` | 单卡设备前缀缓存预算，单位 MiB（`0` 关闭） |
+| `--kv-offload-mib` | `0` | 全局 CPU 前缀状态缓存预算，单位 MiB（`0` 关闭） |
+| `--max-active-requests` | `32` | 活跃请求上限（`1..128`） |
+| `--max-batch-tokens` | `128` | 普通 decode 行预算（`1..128`） |
+| `--max-speculative-tokens` | `0` | MTP 验证行预算（`0` 使用执行包容量） |
+| `--prefill-budget-ms` | `200` | `latency` 策略下的混合 prefill 预测耗时预算 |
 
-实际并发和上下文容量由执行包及可用内存决定。执行包默认安装到 `~/.cache/orinfer/packages`，可用 `ORINFER_EXECUTION_CACHE` 指定位置。完整参数见 `orinfer serve --help`。
+执行包默认安装在 `~/.cache/orinfer/packages`（可通过 `ORINFER_EXECUTION_CACHE` 覆盖）。完整参数见 `orinfer serve --help`。
 
-## 开发与文档
+---
 
-Rust 完成在线加载、调度、模型执行与服务；Python 用于离线量化、编译和验证。
+## 从源码构建
+
+Rust 负责在线引擎与 CLI；Python 3.12+（`uv`）负责离线量化、TileLang 编译与验证。
 
 ```bash
 git clone https://github.com/iMMIQ/orinfer.git
@@ -91,13 +129,19 @@ make python-env
 make check
 ```
 
-- [服务指南](docs/serving.md) · [离线 JSONL](docs/batch.md) · [性能参考](docs/performance.md)。
-- [构建与发布](tools/build/README.md) · [模型执行包](docs/model-packages.md)。
-- [模型构建](tools/model/README.md) · [GPU 算子](kernels/README.md) · [质量评测](tools/eval/README.md)。
-- [量化技术 Wiki](docs/quantization.md)：E8P Q2 码本、编解码与 Tensor Core 算子，Q2_K 对比及两级 Q4 扩展。
+---
 
-详细指南目前以中文提供。
+## 文档导航
+
+完整索引请访问[文档中心](docs/README.md)（所有详细技术文档均使用英文编写）：
+
+- **服务与客户端**：[Serving Guide](docs/serving.md) · [Offline JSONL Batch](docs/batch.md) · [DeepSeek Harness](docs/deepseek-harness.md) · [DSv4.1 A2 Production](docs/deepseek-v41-production.md)
+- **模型与模态**：[Speech Recognition](docs/audio.md) · [Embeddings](docs/embeddings.md) · [Reranking](docs/reranking.md)
+- **架构与执行包**：[Model Execution Packages](docs/model-packages.md) · [Ascend A2 Build Pipeline](docs/ascend-a2-build.md) · [E8P Quantization Note](docs/quantization.md)
+- **性能与开发**：[Performance Reference](docs/performance.md) · [Development Guide](docs/development.md) · [Build & Release](tools/build/README.md) · [GPU/NPU Kernels](kernels/README.md)
+
+---
 
 ## 许可证
 
-**LGPL-3.0-or-later**，见 [LICENSE](LICENSE) 和 [COPYING](COPYING)。第三方组件及模型权重遵循各自许可证。
+采用 **LGPL-3.0-or-later** 许可，详见 [LICENSE](LICENSE)、[COPYING](COPYING) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。模型权重与第三方组件遵循各自原始许可证。

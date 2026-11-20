@@ -1,320 +1,133 @@
-# E8P Q2 编码与算子笔记
+# E8P Quantization Technical Note
 
-## 1. 码本目标与输入旋转
+Orinfer uses **E8P lattice vector quantization** with input Hadamard rotation for both **2-bit MoE experts (E8P Q2)** and **4-bit two-stage dense/projection weights (E8P Q4)**. All compressed weights stay single-resident in memory and decode on the fly inside Tensor Core tiles.
 
-八个权重使用 16 bits，总共有 `2^16 = 65,536` 个重构向量可选。八个独立 2-bit 标量把这些点排成笛卡尔网格；E8P 改为联合安排八维向量的位置。
+---
 
-码本设计采用输入旋转和格点对称性：
+## 1. Codebook Goal & Input Rotation
 
-- **先旋转权重**：将少数坐标上的大幅值分散，得到更适合使用固定码本的分布。
-- **使用有对称性的格点码本**：让重构点覆盖八维空间，同时可以用小表和少量位运算解码。
+Encoding 8 weights in 16 bits provides `2^16 = 65,536` reconstruction vectors. Instead of an 8-dimensional Cartesian grid of independent 2-bit scalars, E8P arranges reconstruction points on a shifted **E8 lattice** and exploits lattice symmetry so the lookup table shrinks from 512 KiB down to **1–2 KiB**.
 
-如果直接保存 65,536 个八维 INT8 向量，码表需要 **512 KiB**。利用格点对称性，可将查询表压缩到几 KiB。
+### Signed Block-128 Hadamard Rotation
 
-### 输入旋转
-
-项目按 128 个输入通道分块，先乘固定随机符号，再做归一化 Hadamard。令 `D` 为符号对角矩阵，`H` 为块对角 Hadamard，定义：
+Input channels are grouped into blocks of 128, multiplied by fixed random signs `D`, and transformed by a normalized block-diagonal Hadamard matrix `H`:
 
 $$
-R=HD,\qquad \tilde x=Rx,\qquad \tilde W=WR^T.
+R = HD, \qquad \tilde{x} = Rx, \qquad \tilde{W} = WR^T.
 $$
 
-因为 `R` 正交，`Wx = W̃x̃`。权重离线旋转，输入激活在线做对应变换。128 点 Hadamard 需要七级蝶形加减和归一化。
+Because `R` is orthogonal, `Wx = W̃x̃`. Weights are rotated offline (spreading outlier magnitudes across coordinates), and activations are rotated online in 7 butterfly stages before A8 quantization. Each output row shares one FP16 scale.
 
-码本搜索在 `W̃` 上进行，同一输出行共用一个 FP16 scale。
+---
 
-## 2. 从格点结构得到有限码本
+## 2. Lattice Construction & 256 Basis Patterns
 
-### 格点与偏移
-
-[QuIP# 的 E8P 构造](https://arxiv.org/html/2402.04396v2#S4.SS2)从下面的半整数格出发：
+Following [QuIP# E8P](https://arxiv.org/html/2402.04396v2#S4.SS2), start from the half-integer lattice:
 
 $$
-\widehat D_8=\left\{t\in(\mathbb Z+\tfrac12)^8:\sum_j t_j\in2\mathbb Z\right\}.
+\widehat{D}_8 = \left\{ t \in (\mathbb{Z} + \tfrac{1}{2})^8 : \sum_j t_j \in 2\mathbb{Z} \right\}, \qquad
+(\widehat{D}_8 - \tfrac{1}{4}\mathbf{1}) \cup (\widehat{D}_8 + \tfrac{1}{4}\mathbf{1}) = E_8 + \tfrac{1}{4}\mathbf{1}.
 $$
 
-八个坐标都是半整数，坐标和为偶数。将它分别平移 `±1/4`，两部分合起来是一份平移后的 E8 格：
+Scaling coordinates by 4 converts this to pure integers (the factor of 4 is absorbed into the row scale):
 
 $$
-(\widehat D_8-\tfrac14\mathbf1)\cup
-(\widehat D_8+\tfrac14\mathbf1)=E_8+\tfrac14\mathbf1.
+B = 4t, \qquad q = B \pm \mathbf{1}.
 $$
 
-项目把坐标整体乘 4，改成整数表示：
+Every basis coordinate `B_j` is **even**, so shifting by `+1` or `-1` produces **odd** integer coordinates `q_j`.
 
-$$
-B=4t,\qquad q=B\pm\mathbf1.
-$$
+### Enumerating the 256 Basis Patterns
 
-**basis 坐标是偶数，统一加 1 或减 1 后得到奇数坐标**。乘 4 带来的尺度由行 scale 吸收。
+Magnitude patterns `A_j ∈ {2, 6, 10}` with `Σ A_j² ≤ 160` satisfy `n_6 + 3 n_10 ≤ 4`:
 
-### 256 个基本模式
-
-有限码本优先保留离原点较近的幅值模式。项目在整数坐标中枚举：
-
-$$
-A_j\in\{2,6,10\},\qquad \sum_j A_j^2\le160.
-$$
-
-把八个坐标全为 2 的模式作为起点，平方范数为 32。每把一个 2 换成 6，范数增加 32；换成 10，增加 96。因此，若 `n6`、`n10` 为对应坐标数，条件变成：
-
-$$
-n_6+3n_{10}\le4.
-$$
-
-| 模式 | 数量 |
+| Pattern Class | Count |
 | --- | ---: |
-| 没有 10，至多四个 6 | `C(8,0)+…+C(8,4) = 163` |
-| 一个 10，至多一个 6 | `8 + 8×7 = 64` |
-| 内层合计 | **227** |
+| No `10`, at most four `6`s | `C(8,0) + … + C(8,4) = 163` |
+| One `10`, at most one `6` | `8 + 8 × 7 = 64` |
+| **Inner patterns** | **227** |
+| **Outer padding** (five `6`s, three `2`s; `‖A‖² = 192`, selected from `C(8,5) = 56`) | **29** |
+| **Total ("Padded" E8P)** | **256** |
 
-模式索引使用八位，再补 **29 个外层模式**。外层每个模式有五个 6、三个 2，平方范数为 192；项目从 `C(8,5)=56` 种位置组合中按固定顺序分散选择 29 个。
-
-E8P 的 P 表示 Padded：**227 个内层模式 + 29 个补充模式 = 256 个模式**。
-
-### 符号代表
-
-正的幅值模式未必满足 `Σ(B/4)` 为偶数。项目检查这个和，必要时将最后一个坐标取负，得到合法的 basis 代表。
-
-例如：
-
-```text
-幅值模式 A = [6, 2, 2, 2, 2, 2, 2,  2]，Σ(A/4) = 5
-基本向量 B = [6, 2, 2, 2, 2, 2, 2, -2]，Σ(B/4) = 4
-```
-
-从合法的 `B` 出发，每翻转一个符号，`Σ(B/4)` 的奇偶性就变一次。因此，**保持合法性需要翻转偶数个符号**。
-
-八个位置的偶数次符号翻转共有 `2^7=128` 种。再乘两种整体偏移，每个 basis 产生 256 个码字：
+If `Σ(A/4)` is odd, the last coordinate is negated so the canonical basis representative `B` has even `Σ(B/4)`. Flipping any **even** number of coordinate signs preserves validity (`2^7 = 128` sign patterns). Combined with 2 shifts (`±1`):
 
 $$
-256\text{ 个 basis}\times128\text{ 种符号}\times2\text{ 种偏移}
-=65,536.
+256 \text{ bases} \times 128 \text{ sign flips} \times 2 \text{ shifts} = 65,536 \text{ codewords (16 bits)}.
 $$
 
-16 bits 分配为：**8 bits 模式 + 7 bits 自由符号 + 1 bit 偏移**。
+---
 
-## 3. U16 位布局
+## 3. U16 Bit Layout & Nearest-Neighbor Encoding
 
-高八位直接保存 basis 索引。低八位把七位符号信息和一位偏移合在一起，利用奇偶性恢复。
-
-位字段：
-
-- `m`：相对 basis 的符号翻转掩码，置位数量为偶数。
-- `p`：偏移选择，`0` 表示 `+1`，`1` 表示 `−1`。
-- `u`：实际保存的低八位，令 `u = m XOR p`。这里仅切换最低位。
-
-因为 `m` 的奇偶性是 0，所以 `popcount(u) & 1` 恰好等于 `p`。解码时先取回 `p`，再用 `u XOR p` 取回 `m`，无需额外存一个偏移位。
-
-项目用 `P=[0,4,1,5,2,6,3,7]` 将坐标对应到掩码位。`P` 只改变位的排列，不改变置位数量的奇偶性。
+- **High byte (`b = code >> 8`)**: 8-bit basis index (`0..255`).
+- **Low byte (`u = m XOR p`)**: Packs the 7-bit even-parity sign-flip mask `m` and 1-bit shift `p` (`0 → +1`, `1 → -1`). Because `popcount(m)` is even, `p = popcount(u) & 1` and `m = u XOR p`.
+- **Permutation**: `P = [0, 4, 1, 5, 2, 6, 3, 7]` maps coordinates to mask bits without changing parity.
 
 ```text
 b = code >> 8
 u = code & 0xff
 p = popcount(u) & 1
 m = u XOR p
-q[j] = B[b,j] * (1 - 2*((m >> P[j]) & 1)) + (1 - 2*p)
+q[j] = B[b, j] * (1 - 2 * ((m >> P[j]) & 1)) + (1 - 2 * p)
 ```
 
-### 编码示例
+### Nearest-Neighbor Search & Scale Fitting
 
-`B[148]=[6,2,2,2,2,2,2,-2]`。翻转第 0、1 个坐标，对应掩码位 `P[0]=0`、`P[1]=4`：
+Given normalized `z = w̃ / s`, for each of the `256 × 2 = 512` `(basis, shift)` pairs:
+1. Subtract shift: `y = z - (1 - 2p)`.
+2. Align signs to `y`; if the sign-flip count relative to `B` is odd, flip the coordinate minimizing `4 |y_j| |B_j|`.
+3. Pick the global minimum squared distance across all 512 pairs (1 warp per 8D vector on GPU).
+4. Update the FP16 row scale via least squares `s = (Σ w̃_k q_k) / (Σ q_k²)` and alternate until convergence.
 
-```text
-b = 148 = 0x94
-m = 0x11                 # 两个位置翻转，popcount 为偶数
-p = 1                    # 整体减 1
-u = m XOR p = 0x10
-code = (b << 8) | u = 0x9410
-```
+---
 
-解码先得到 `p=1`、`m=0x11`，再恢复：
+## 4. Storage Layout & Full-A8 INT4 Tensor Core Execution
 
-```text
-翻转符号后：[-6, -2, 2, 2, 2, 2, 2, -2]
-整体减 1 后：[-7, -3, 1, 1, 1, 1, 1, -3]
-```
+For an `N × K` weight matrix:
 
-最终旋转空间权重为 `w̃ ≈ scale[row] × q`。同一行的所有八元组共用 scale，各自保存一个 U16。
-
-## 4. 最近邻编码
-
-固定行 scale 后，令归一化的八维权重为 `z=w̃/s`，目标是找到使 `||z−q||²` 最小的码字。
-
-搜索分为 256 个 basis × 两种偏移。对每一组：
-
-1. 去掉偏移，令 `y=z−(1−2p)`。
-2. 令重构坐标的符号尽量与 `y` 一致，此时逐坐标距离由 `|y|` 与 basis 幅值决定。
-3. 检查相对 basis 的翻转次数。如果为奇数，就再翻转一个坐标，使其成为偶数。
-
-符号翻转代价可以直接计算。幅值为 `a`、输入幅值为 `|y|` 时，将正确符号改成相反符号，距离增加：
-
-$$
-(|y|+a)^2-(|y|-a)^2=4|y|a.
-$$
-
-所以只需翻转 `4|y_j||B_j|` 最小的位置。这就得到当前 basis/偏移组中的最近点；比较 **512 组**的结果，得到整个码本的最近点。
-
-GPU 实现每个 warp 处理一个八维向量，每个 lane 在每种偏移下处理八个 basis，最后归约最小距离。
-
-### 行 scale 拟合
-
-固定整行选中的整数 `q` 后，按最小二乘更新：
-
-$$
-s=\frac{\sum_k\tilde w_kq_k}{\sum_k q_k^2}.
-$$
-
-编码器以行 RMS 初始化 scale，交替更新码字和 scale；scale 存为 FP16，再用于下一轮搜索。输出为每组 U16 编号、每行 FP16 scale 和固定旋转符号。
-
-## 5. 存储与执行布局
-
-对 `N×K` 权重矩阵，`N` 是输出通道数，`K` 是输入通道数：
-
-| 数据 | 逻辑形状 | 含义 |
+| Tensor | Logical Shape | Description |
 | --- | --- | --- |
-| U16 码字 | `[N,K/8]` | 每八个相邻输入权重一个码字 |
-| FP16 scale | `[N]` | 每输出行一个 scale |
-| INT8 旋转符号 | `[K]` | 对应输入变换 |
-| INT8 basis | `[256,8]` | 共享基本向量，共 2 KiB |
+| U16 codewords | `[N, K/8]` | 1 codeword per 8 input weights |
+| FP16 scale | `[N]` | 1 scale per output row |
+| INT8 rotation signs | `[K]` | Input Hadamard sign vector |
+| INT8 basis / U32 selector | `[256, 8]` / `[256]` | 2 KiB basis or 1 KiB `PRMT` selector table |
 
-专家 bank 再增加专家维 `E`。执行时将码字从按行排列重排为按 K 块排列：
+At build time, codewords are losslessly repacked into K-major tiles (`[E, K/128, N, 16]` or `[E, K/64, N, 8]`).
 
-```text
-K128 布局：[E, K/128, N, 16]  # 16 个码字覆盖 128 个输入通道
-K64  布局：[E, K/64,  N,  8]  #  8 个码字覆盖  64 个输入通道
-```
+### Lossless INT4 Bit-Plane Decomposition
 
-重排保持码字值不变。K64 对应 Tensor Core 计算粒度，便于同一个 K 块读取一片输出通道，并与激活块配对。
-
-### 小表解码
-
-basis 只有少数幅值，可以把每项八个坐标的选择信息装进一个 U32，形成 **1 KiB selector 表**。GPU 用 `PRMT` 字节置换从常量中选择数值，再合并符号和偏移修正。
-
-INT8 路径恢复完整整数；直接 INT4 路径恢复下面的 `(q−1)/2`。当前 basis 坐标非零，符号与偏移修正可以折叠进最终 XOR，缩短解码依赖链。
-
-### 完整 A8 的 INT4 点积
-
-`q` 是 `[-11,11]` 内的奇数。因此：
+Because every `q ∈ [-11, 11]` is odd, `q = 2v + 1` with signed INT4 `v = (q - 1) / 2 ∈ [-6, 5]`. Splitting signed INT8 activation `a` into unsigned low nibble `a_lo = a & 0x0f` and signed high nibble `a_hi = a >> 4` gives `a = a_lo + 16 a_hi`, so:
 
 $$
-q=2v+1,\qquad v=(q-1)/2\in[-6,5].
+\sum q a = 2 \left( \sum v a_{lo} + 16 \sum v a_{hi} \right) + \sum a.
 $$
 
-`v` 能精确放进 signed INT4。signed INT8 激活则按位拆开：
+Two INT4 Tensor Core MMAs (`S4×U4` and `S4×S4`) plus the reused activation row sum recover the **exact INT32 dot product** at full A8 precision, followed by `(FP32(dot) * FP32(weight_scale)) * FP32(token_scale)`.
 
-```text
-a_lo = a & 0x0f    # unsigned INT4，0…15
-a_hi = a >> 4      # 算术右移，signed INT4，−8…7
-a = a_lo + 16*a_hi
-```
+---
 
-例如 `−17 = 15 + 16×(−2)`。两部分代入点积：
+## 5. Comparison with `Q2_K` / `Q2_0` (Flash Next)
 
-$$
-\sum qa=2\left(\sum va_{lo}+16\sum va_{hi}\right)+\sum a.
-$$
-
-前两项分别使用 `S4×U4`、`S4×S4` Tensor Core，最后加激活行和。行和在多个输出通道之间复用，结果在 INT32 中合并。
-
-### 流水与输出
-
-压缩权重保持单份常驻，计算块按需解码。`cp.async` 预取下一块权重和激活，与当前解码、MMA 重叠；共享内存布局做 swizzle，分散 bank 访问。
-
-行数少时重点降低读取延迟和解码成本；batch/prefill 行数多时，提高一块权重的复用，同时平衡寄存器和共享内存占用。
-
-完整 K 维的 INT32 结果合并后，按以下顺序缩放：
-
-```text
-(FP32(dot) * FP32(weight_scale)) * FP32(token_scale)
-```
-
-gate/up 输出在进入 SwiGLU 前舍入到 FP16。
-
-## 6. 与 Q2_K 对照
-
-Q2_K 每 256 个权重一块，内部每 16 个权重一组。2-bit 码值占 64 bytes，小组 scale/min 占 16 bytes，两个 FP16 全局参数占 4 bytes，共 **84 bytes，即 2.625 bit/weight**。
-
-解码式为 `ŵ=(d×s_g)×c−dmin×m_g`，`c∈{0,1,2,3}`。[Q2_K 块定义](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-common.h)。
-
-| 对比项 | E8P Q2 | Q2_K |
+| Dimension | E8P Q2 | `Q2_K` (llama.cpp) |
 | --- | --- | --- |
-| 表达方式 | 每八个权重联合选择格点向量 | 每个权重选择一个标量码值 |
-| 分布适应 | 旋转、八维码本、行 scale | 每 16 权重的 scale/min |
-| 位宽 | 码字 2 bit/weight，另加行 scale、符号和共享小表 | 含块参数 2.625 bit/weight |
-| 解码 | 小表查询、符号和偏移恢复 | 码值提取、组参数恢复 |
-| 计算参数 | 完整 K 维累加后统一缩放 | 按组参数缩放局部结果并修正偏移 |
-| 额外执行工作 | 输入旋转、结构化解码 | 分组参数处理、解包与数据重排 |
+| Representation | Joint 8D lattice vector per 8 weights | Independent 2-bit scalar per weight |
+| Effective bitwidth | ~2.02 bits/weight (incl. row scale, signs, LUT) | 2.625 bits/weight (84 B / 256 weights) |
+| Scaling | Single FP16 row scale after full-K INT32 accumulation | Per-16-weight scale & min with local rescaling |
 
-Q2_K 用细分组参数适应局部幅值和偏置；E8P 用联合码本描述八维形状，再以旋转和行 scale 配套。两者的压缩表示都需要转换成乘法操作数，解码吞吐、参数处理和乘法流水共同决定算子速度。
+### Flash Next Quality & Speed Snapshot (Jetson AGX Orin 64GB, 1300.5 MHz)
 
-### Flash Next 质量数据
+- **Weight L2 error (`‖Ŵ - W‖₂ / ‖W‖₂` vs. BF16)**: E8P Q2 gate/up = **0.3026** vs. GSQ-RCO `Q2_0` = **0.5360** (10-expert avg).
+- **Whole-model 48-layer teacher-forced probabilities (64 positions, seed `20261002`)**: **62/64 (96.88%)** top-1 match, **64/64** inside BF16 top-3, non-thinking ΔNLL **+0.0224 nats/token**.
+- **Single-stream speed (512 / 8192 input)**: Orinfer E8P Q2 + Q4/W8 (MTP ≤ 3) achieves **925.6 / 858.1 prefill TPS** and **56.35 / 48.03 decode TPS**, vs. `llama.cpp` `Q2_0` (MTP off) at **269.0 / 251.8 prefill TPS** and **16.26 / 15.93 decode TPS**.
 
-**权重误差**：`||Ŵ−W||₂ / ||W||₂`，参考权重为官方 BF16。
+---
 
-| 方案 | 样本 | 相对 L2 误差 |
-| --- | --- | ---: |
-| E8P Q2 | gate/up，1280×2560 | 0.302576 |
-| GSQ-RCO Q2_0 | 第 0 层专家 0，gate/up，1280×2560 | 0.549156 |
-| GSQ-RCO Q2_0 | 第 0 层 10 个专家，gate/up 平均 | 0.535970 |
-| GSQ-RCO Q2_0 | 第 0 层 10 个专家，down 平均 | 0.474213 |
+## 6. Two-Stage E8P Q4 Extension
 
-专家编号：`0,7,63,127,191,255,319,383,447,511`。Q2_0 的 gate/up 误差范围为 **0.490327–0.633679**，down 为 **0.410070–0.576076**。E8P Q2 的该矩阵占 **2.0175 bit/weight**，包含 scale、符号和码表。
-
-**整模型概率**：48 层文本模型，八个场景，提示 22–52 tokens，seed `20261002`，相同 teacher-forced 历史。
-
-| 指标 | BF16 | E8P Q2 混合精度 |
-| --- | ---: | ---: |
-| 64 个位置的首选 token 与 BF16 相同 | 64/64 | 62/64，96.875% |
-| 选择位于 BF16 top3 | 64/64 | 64/64 |
-| 非 thinking 32 位置的目标 NLL（nats/token） | 0.318775 | 0.341158 |
-| 非 thinking 平均 NLL 增量（nats/token） | — | +0.022383 |
-
-GGUF 使用 GSQ-RCO Q2_0，64 个权重占 18 bytes；专家 down 的输入维度为 640。
-
-### Flash Next 性能数据
-
-Jetson AGX Orin 64GB，GPU 1300.5 MHz。
-
-**E8P Q2 专家＋Q4/W8 主干，Orinfer Rust release，2026-10-21**
-
-配置：单流英译中，INT8 KV，`decode_only`，MTP 最多三个草稿，关闭 thinking 和 prefix cache。
-
-| 输入 tokens | Prefill TPS | MTP decode TPS |
-| ---: | ---: | ---: |
-| 512 | 925.57 | 56.35 |
-| 8192 | 858.11 | 48.03 |
-
-固定输出 257 tokens，忽略 EOS；预热一次后测三次取中位数。Prefill 计至首输出，decode 统计后续已提交 tokens。
-
-**GSQ-RCO Q2_0，llama.cpp**
-
-配置：FP16 KV，关闭 MTP，`llama-bench` 随机 token 输入，每个上下文深度生成 64 步，重复三次。
-
-| 上下文 tokens | Prefill TPS | Decode TPS |
-| ---: | ---: | ---: |
-| 512 | 269.04 | 16.26 |
-| 2048 | 268.70 | 16.10 |
-| 8192 | 251.76 | 15.93 |
-
-**E8P 代码生成**：512/2048/8191-token 输入，6176–7598-token 输出，medium thinking，prefix 全命中。关闭 MTP 的 decode 为 **29.49–29.72 TPS**，开启后为 **44.99–45.82 TPS**。[性能数据](performance.md)。
-
-## 7. 两级 Q4 扩展
-
-两级 Q4 用同一张 E8P 表分别编码粗值和残差。每八个权重保存两个 U16，项目采用整数系数 `[4,1]`：
+Dense models (`Qwen3.8-27B`, `Qwen3.5-4B`, `Index-Translate-2B/9B/35B`, `Qwen3-ASR-1.7B`, `Nemotron-3.5-Embed-1B`, `Qwen3-Reranker-0.6B`) encode coarse and residual codewords using the **same** E8P table and fixed integer coefficients `[4, 1]`, packed as one `U32` per 8 weights (`4 bits/weight`):
 
 $$
-\hat{\tilde w}=s(4q_0+q_1).
+\hat{\tilde{w}} = s (4 q_0 + q_1) = s \left( 2 (4 v_0 + v_1) + 5 \right).
 $$
 
-两个阶段共用一张 E8P 表和一个行 scale。存储为一个 U32：低 16 位粗码，高 16 位残差码，码字成本为 `32/8=4 bit/weight`。
-
-编码令 `z=w̃/s`，先求 `q0=Q(z/4)`，再求 `q1=Q(z−4q0)`；之后交替更新两组码字和 scale。beam8 在粗码处尝试八个候选，按与残差组合后的误差选取。
-
-固定整数系数让重构 `4q0+q1` 保持在 INT8 范围内，也让 Q2 的算术可以直接复用：
-
-$$
-4q_0+q_1=2(4v_0+v_1)+5.
-$$
-
-直接 INT4 路径对每个阶段各做高低位两个点积，共四次，再加入共享的 `5×Σa` 修正。
+Offline encoding uses **beam-8 search** over coarse candidates jointly with residual error and alternating least-squares FP16 scale refinement. The direct INT4 path executes two bit-plane MMAs per stage plus a shared `5 × Σa` correction, recovering exact INT32 dot products.
