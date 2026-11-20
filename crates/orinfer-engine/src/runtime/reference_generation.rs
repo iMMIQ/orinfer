@@ -1,3 +1,4 @@
+use super::prefix::Checkpoint;
 use super::*;
 
 impl ModelRuntime {
@@ -180,7 +181,9 @@ impl ModelRuntime {
                 if let Some(head) = &head {
                     self.launch_rows(head, chunk, ExecutionPhase::Prefill)?;
                 }
-                self.store_prefix(&input[..endpoint], &media, warm.tokens, true, prefix)?;
+                let kind =
+                    Checkpoint::prefill(endpoint, input.len(), prefix.statistics.matched_tokens);
+                self.store_prefix(&input[..endpoint], &media, warm.tokens, kind, prefix)?;
             }
             if let Some(spec) = &mtp
                 && spec.hidden_ring.is_some()
@@ -225,7 +228,7 @@ impl ModelRuntime {
             warm.tokens = input.len() - 1;
             warm.seconds += at.elapsed().as_secs_f64();
         }
-        self.store_prefix(input, &media, warm.tokens, true, prefix)?;
+        self.store_prefix(input, &media, warm.tokens, Checkpoint::Reusable, prefix)?;
         let m = &self.manifest;
         if let Some(spec) = &mtp {
             return self.mtp_generate(

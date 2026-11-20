@@ -683,7 +683,7 @@ mod tests {
 /// context observations use the same timing table as continuous packets.
 pub(crate) struct Profiles {
     shapes: BTreeMap<usize, Estimate>,
-    weight_pass_s: f64,
+    weight_pass: Option<f64>,
     timings: Curves,
     restore_s_per_byte: f64,
     dynamic: Option<DynamicPrefill>,
@@ -702,7 +702,7 @@ impl Profiles {
                 .chain([1])
                 .map(|n| (n, Estimate::default()))
                 .collect(),
-            weight_pass_s: 0.1,
+            weight_pass: None,
             timings: Default::default(),
             restore_s_per_byte: 1. / 20e9,
             dynamic: None,
@@ -719,8 +719,11 @@ impl Profiles {
 
     pub fn observe(&mut self, chunk: usize, seconds: f64) {
         if seconds.is_finite() && seconds > 0. {
-            if chunk <= 8 {
-                self.weight_pass_s = self.weight_pass_s * 0.8 + seconds * 0.2;
+            if (1..=8).contains(&chunk) {
+                self.weight_pass = Some(
+                    self.weight_pass
+                        .map_or(seconds, |old| old * 0.8 + seconds * 0.2),
+                );
             }
             self.shapes.entry(chunk).or_default().observe(seconds);
         }
@@ -731,13 +734,14 @@ impl Profiles {
             return;
         }
         self.observe(chunk, seconds);
+        let weight_pass_s = self.weight_pass_s();
         if let Some(dynamic) = &mut self.dynamic
             && (128..=dynamic.capacity).contains(&chunk)
-            && seconds > self.weight_pass_s
+            && seconds > weight_pass_s
         {
             // Fit the variable work after one weight pass. Small tails are
             // dominated by launch cost and give unstable throughput samples.
-            let sample = (seconds - self.weight_pass_s) / chunk as f64;
+            let sample = (seconds - weight_pass_s) / chunk as f64;
             let weight = 0.2 * (chunk as f64 / 1024.).min(1.);
             dynamic.seconds_per_row = Some(
                 dynamic
@@ -818,12 +822,15 @@ impl Profiles {
     pub fn restore_cost(&self, bytes: usize) -> f64 {
         bytes as f64 * self.restore_s_per_byte
     }
+    fn weight_pass_s(&self) -> f64 {
+        self.weight_pass.unwrap_or(0.1)
+    }
     pub fn chunk_cost(&self, tokens: usize) -> f64 {
         self.shapes
             .get(&tokens)
             .filter(|estimate| estimate.samples > 0)
             .map(|estimate| estimate.mean)
-            .unwrap_or(self.weight_pass_s * (tokens as f64 / 64.).max(1.))
+            .unwrap_or_else(|| self.weight_pass_s() * (tokens as f64 / 64.).max(1.))
     }
     /// Largest real profile within the estimated budget; one token guarantees
     /// progress even when no profile fits. This is a soft scheduling target.
@@ -841,8 +848,9 @@ impl Profiles {
             // The native plan executes one exact-sized forward pass per
             // chunk. Measurements of other lengths are not chunk boundaries.
             let passes = tokens.div_ceil(dynamic.capacity);
-            let per_row = dynamic.seconds_per_row.unwrap_or(self.weight_pass_s / 64.);
-            return passes as f64 * self.weight_pass_s + tokens as f64 * per_row;
+            let weight_pass_s = self.weight_pass_s();
+            let per_row = dynamic.seconds_per_row.unwrap_or(weight_pass_s / 64.);
+            return passes as f64 * weight_pass_s + tokens as f64 * per_row;
         }
         let mut total = 0.;
         for &chunk in self.shapes.keys().rev() {
@@ -889,6 +897,10 @@ impl Profiles {
         if prefix <= start || self.score(prefix, end, bytes).is_none() {
             return false;
         }
+        if prefix >= 64 && (1..=8).contains(&end.saturating_sub(prefix)) {
+            // A generation-prompt boundary protects almost the entire prompt.
+            return true;
+        }
         let mut trial = checkpoints.clone();
         trial.insert(prefix);
         let (mut previous, mut split) = (start, 0.);
@@ -915,6 +927,28 @@ impl Profiles {
 #[cfg(test)]
 mod profile_tests {
     use super::*;
+    #[test]
+    fn near_end_boundaries_are_admitted_before_a_short_pass_is_measured() {
+        let mut costs = Profiles::new([2048]).with_dynamic_capacity(4096);
+        costs.observe_at(2048, 2048, 0.4);
+        let checkpoints = BTreeSet::new();
+        for tail in [1, 2, 4, 8] {
+            assert!(costs.admit(2048 - tail, 2048, 100 << 20, 0, &checkpoints));
+        }
+        assert!(!costs.admit(2039, 2048, 100 << 20, 0, &checkpoints));
+        costs.observe_restore(100 << 20, 100.);
+        assert!(!costs.admit(2044, 2048, 100 << 20, 0, &checkpoints));
+    }
+    #[test]
+    fn first_short_pass_replaces_the_cold_estimate() {
+        let mut costs = Profiles::new([2048]).with_dynamic_capacity(4096);
+        costs.observe_at(4, 2048, f64::NAN);
+        assert_eq!(costs.weight_pass_s(), 0.1);
+        costs.observe_at(4, 2048, 0.005);
+        assert_eq!(costs.weight_pass_s(), 0.005);
+        costs.observe_at(8, 2048, 0.01);
+        assert!((costs.weight_pass_s() - 0.006).abs() < 1e-12);
+    }
     #[test]
     fn dynamic_restore_prices_the_real_tail_instead_of_observed_partitions() {
         let mut costs = Profiles::new([4096]).with_dynamic_capacity(4096);

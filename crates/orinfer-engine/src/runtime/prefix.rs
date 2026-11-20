@@ -1,6 +1,6 @@
 use super::*;
 use crate::backend::snapshot::Range;
-use crate::prefix::{Entry, Media, hash_floats};
+use crate::prefix::{Admission, Entry, Media, hash_floats};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,6 +15,40 @@ impl Context {
     pub(super) fn device_parent(&self) -> Option<u64> {
         self.parent.and_then(|(host, id)| (!host).then_some(id))
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Checkpoint {
+    Reusable,
+    Intermediate,
+    Decoded,
+}
+
+impl Checkpoint {
+    pub(super) fn prefill(position: usize, end: usize, matched: usize) -> Self {
+        if position == matched || end - position <= 8 {
+            Self::Reusable
+        } else {
+            Self::Intermediate
+        }
+    }
+
+    fn allows_eviction(self, adjacent: bool) -> bool {
+        self == Self::Reusable && !adjacent
+    }
+
+    fn admits_device(self, admission: &Admission, adjacent: bool, headroom: bool) -> bool {
+        match admission {
+            Admission::Ready => headroom || self.allows_eviction(adjacent),
+            Admission::Reclaim => self.allows_eviction(adjacent),
+            Admission::TooLarge => false,
+        }
+    }
+}
+
+fn checkpoint_headroom(private_bytes: usize, projected_bytes: usize, budget: usize) -> bool {
+    // Reserve half the cache for reusable endpoints when private state is costly.
+    private_bytes <= budget / 32 || projected_bytes <= budget / 2
 }
 
 impl ModelRuntime {
@@ -246,24 +280,29 @@ impl ModelRuntime {
         Ok(ranges)
     }
     pub(super) fn should_store_decoded_prefix(&self, context: &Context) -> bool {
+        let device = &self.prefix_cache.device;
+        let projected = device
+            .bytes
+            .saturating_add(context.private_checkpoint_bytes);
         self.prefix_enabled()
             && (self.prefix_cache.host.budget != 0
-                || context.private_checkpoint_bytes
-                    <= self
-                        .prefix_cache
-                        .device
-                        .budget
-                        .saturating_sub(self.prefix_cache.device.bytes))
+                || (projected <= device.budget
+                    && checkpoint_headroom(
+                        context.private_checkpoint_bytes,
+                        projected,
+                        device.budget,
+                    )))
     }
     pub(super) fn store_prefix(
         &mut self,
         input: &[u32],
         media: &Media,
         warm_tokens: usize,
-        logits_valid: bool,
+        checkpoint: Checkpoint,
         context: &mut Context,
     ) -> Result<()> {
         let at = Instant::now();
+        let logits_valid = checkpoint != Checkpoint::Decoded;
         if self.prefix_enabled()
             && self.manifest.mtp.is_some()
             && (input.is_empty() || warm_tokens != input.len() - 1)
@@ -331,51 +370,60 @@ impl ModelRuntime {
                     input.starts_with(&e.tokens)
                         && e.media.common_tokens(media, e.tokens.len()) == e.tokens.len()
                 });
-            // A generated continuation has no reuse evidence at insertion.
-            // Admit it to spare GPU capacity, or offload it independently.
-            // If a prompt can already resume from the preceding token, keep
-            // that checkpoint when another dense state would force eviction.
             let adjacent = parent.is_some_and(|e| {
-                e.logits_valid && e.tokens.len().checked_add(1) == Some(input.len())
+                e.logits_valid && e.tokens.len() < input.len() && input.len() - e.tokens.len() <= 8
             });
             let plan =
                 self.execution
                     .plan_snapshot(ranges, &kv_names, parent.map(|e| &e.snapshot))?;
-            let admission = self.prefix_cache.device.admission(&plan, plan.new_bytes);
-            if admission == crate::prefix::Admission::TooLarge
-                || (admission != crate::prefix::Admission::Ready && (!logits_valid || adjacent))
-            {
-                self.store_host_prefix(input, media, warm_tokens, logits_valid, &plan, context)?;
+            let device = &self.prefix_cache.device;
+            let headroom = checkpoint_headroom(
+                context.private_checkpoint_bytes,
+                device
+                    .resident_with(Some(&plan))
+                    .saturating_add(plan.new_bytes),
+                device.budget,
+            );
+            let mut admission = device.admission(&plan, plan.new_bytes);
+            if !checkpoint.admits_device(&admission, adjacent, headroom) {
+                // Keep the nearby device parent for subsequent tokens and for
+                // the request's reservation when the final snapshot is redundant.
+                if !adjacent {
+                    self.store_host_prefix(
+                        input,
+                        media,
+                        warm_tokens,
+                        logits_valid,
+                        &plan,
+                        context,
+                    )?;
+                }
                 context.statistics.store_s += at.elapsed().as_secs_f64();
                 self.update_prefix_usage(context);
                 return Ok(());
             }
+            let allow_evict = checkpoint.allows_eviction(adjacent);
             // Reclaim before allocating so capture itself respects the budget,
             // including shared blocks pinned by the pending checkpoint.
-            while self.prefix_cache.device.admission(&plan, plan.new_bytes)
-                != crate::prefix::Admission::Ready
-            {
-                if !(logits_valid && self.evict_prefix(Some(context))?) {
+            while admission != Admission::Ready {
+                if !(allow_evict && self.evict_prefix(Some(context))?) {
                     return Err("Prefix budget planning failure".into());
                 }
+                admission = self.prefix_cache.device.admission(&plan, plan.new_bytes);
             }
             let snapshot = loop {
                 if let Some(s) = self.execution.snapshot(&plan)? {
                     break Some(s);
                 }
-                if !(logits_valid && self.evict_prefix(Some(context))?) {
+                if !(allow_evict && self.evict_prefix(Some(context))?) {
                     break None;
                 }
             };
             if let Some(snapshot) = snapshot {
                 let fitting = self.prefix_cache.device.admission(&snapshot, 0);
-                if fitting == crate::prefix::Admission::Ready
-                    || (fitting == crate::prefix::Admission::Reclaim && logits_valid)
-                {
-                    while self.prefix_cache.device.admission(&snapshot, 0)
-                        != crate::prefix::Admission::Ready
-                    {
-                        if !(logits_valid && self.evict_prefix(Some(context))?) {
+                if fitting == Admission::Ready || (fitting == Admission::Reclaim && allow_evict) {
+                    while self.prefix_cache.device.admission(&snapshot, 0) != Admission::Ready {
+                        if !(allow_evict && self.evict_prefix(Some(context))?) {
                             return Err("Prefix budget accounting failure".into());
                         }
                     }
@@ -409,16 +457,18 @@ impl ModelRuntime {
                     context.statistics.checkpoints_stored += 1;
                 } else {
                     self.execution.release_snapshot(snapshot)?;
-                    self.store_host_prefix(
-                        input,
-                        media,
-                        warm_tokens,
-                        logits_valid,
-                        &plan,
-                        context,
-                    )?;
+                    if !adjacent {
+                        self.store_host_prefix(
+                            input,
+                            media,
+                            warm_tokens,
+                            logits_valid,
+                            &plan,
+                            context,
+                        )?;
+                    }
                 }
-            } else {
+            } else if !adjacent {
                 self.store_host_prefix(input, media, warm_tokens, logits_valid, &plan, context)?;
             }
         }
@@ -595,7 +645,13 @@ impl ModelRuntime {
             } else {
                 0
             };
-            let result = self.store_prefix(&history[..position], media, warm, false, context);
+            let result = self.store_prefix(
+                &history[..position],
+                media,
+                warm,
+                Checkpoint::Decoded,
+                context,
+            );
             if let Some(s) = &spec {
                 self.upload_ids(&s.position, &[position as u32])?;
             }
@@ -608,6 +664,30 @@ impl ModelRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn costly_checkpoints_leave_room_for_other_requests() {
+        let budget = 4 << 30;
+        let private = 150 << 20;
+        let spare = checkpoint_headroom(private, 1500 << 20, budget);
+        let tight = checkpoint_headroom(private, 3500 << 20, budget);
+        let small = checkpoint_headroom(18 << 20, 3500 << 20, budget);
+        assert!(spare && small && !tight);
+        for headroom in [spare, small] {
+            assert!(Checkpoint::Reusable.admits_device(&Admission::Ready, true, headroom));
+        }
+        for admission in [Admission::Ready, Admission::Reclaim] {
+            for kind in [Checkpoint::Intermediate, Checkpoint::Decoded] {
+                assert!(!kind.admits_device(&admission, false, tight));
+            }
+            assert!(!Checkpoint::Reusable.admits_device(&admission, true, tight));
+            assert!(Checkpoint::Reusable.admits_device(&admission, false, tight));
+        }
+        assert!(!Checkpoint::Reusable.admits_device(&Admission::Reclaim, true, spare));
+        assert!(Checkpoint::prefill(8184, 8192, 0) == Checkpoint::Reusable);
+        assert!(Checkpoint::prefill(8183, 8192, 0) == Checkpoint::Intermediate);
+        assert!(Checkpoint::prefill(4096, 8192, 4096) == Checkpoint::Reusable);
+    }
 
     #[test]
     fn media_hash_preserves_little_endian_float_bits_and_tails() {

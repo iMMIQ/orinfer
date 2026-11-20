@@ -170,6 +170,7 @@ pub struct ChatCodec {
     pub tokenizer: Tokenizer,
     pub asset_hashes: std::collections::BTreeMap<String, String>,
     template: Environment<'static>,
+    preserves_historical_thinking: bool,
     pub eos: BTreeSet<u32>,
     defaults: generation_defaults::Defaults,
     pub grammar: super::grammar::Factory,
@@ -276,6 +277,9 @@ impl ChatCodec {
             // trie instead of building it on the first constrained request.
             grammar.prepare()?;
         }
+        let preserves_historical_thinking = tool_format == ToolFormat::Qwen
+            && tokenizer.token_to_id("<think>").is_some()
+            && Self::probe_historical_thinking(&environment);
         let defaults = generation_defaults::Defaults::load(directory, &descriptor, &generation)?;
         Ok(Self {
             boundary,
@@ -287,9 +291,32 @@ impl ChatCodec {
             tokenizer,
             asset_hashes,
             template: environment,
+            preserves_historical_thinking,
             eos,
             grammar,
         })
+    }
+    fn probe_historical_thinking(environment: &Environment<'_>) -> bool {
+        let messages = json!([
+            {"role":"user","content":"a"},
+            {"role":"assistant","reasoning_content":"r","content":"b"},
+            {"role":"user","content":"c"}
+        ]);
+        environment
+            .get_template("chat")
+            .and_then(|template| {
+                template.render(context! {
+                    messages => Serde(&messages), tools => Serde(&[] as &[Value]),
+                    add_generation_prompt => false, enable_thinking => true, thinking => true,
+                    preserve_thinking => true, reasoning_effort => "medium",
+                })
+            })
+            .is_ok_and(|rendered| {
+                rendered.split("<think>").skip(1).any(|tail| {
+                    tail.split_once("</think>")
+                        .is_some_and(|(reasoning, _)| reasoning.trim() == "r")
+                })
+            })
     }
     fn thinking(&self, request: &ChatRequest) -> bool {
         request.enable_thinking.unwrap_or(
@@ -749,14 +776,25 @@ impl ChatCodec {
         if ends.len() >= 2 {
             prefix_hints.push(ends[ends.len() - 2]);
         }
-        // The generation prompt ends in <think> and a newline. When a later
-        // message fills this assistant turn, BPE can merge the newline with
-        // the beginning of the reasoning. The control token itself is stable.
-        if let [.., open, tail] = input.as_slice()
-            && Some(*open) == self.tokenizer.token_to_id("<think>")
-            && Some(*tail) == self.tokenizer.token_to_id("Ċ")
+        let trailing = ends
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .max(input.len().saturating_sub(12));
+        if self.tool_format == ToolFormat::Qwen
+            && let Some(open) = self.tokenizer.token_to_id("<think>")
+            && let Some(position) = input[trailing..].iter().rposition(|&id| id == open)
         {
-            prefix_hints.push(input.len() - 1);
+            let think_pos = trailing + position;
+            if !thinking || !preserve_thinking || !self.preserves_historical_thinking {
+                // History can omit reasoning or replace the empty generation stub.
+                prefix_hints.push(think_pos);
+            } else if think_pos + 2 == input.len()
+                && input.last().copied() == self.tokenizer.token_to_id("Ċ")
+            {
+                // BPE can merge the trailing newline with the start of reasoning.
+                prefix_hints.push(think_pos + 1);
+            }
         }
         prefix_hints.sort_unstable();
         prefix_hints.dedup();

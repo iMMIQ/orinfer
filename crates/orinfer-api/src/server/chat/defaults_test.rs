@@ -20,17 +20,11 @@ fn codec(deepseek: bool) -> ChatCodec {
 }
 
 fn configured_codec(
-    mut generation: Value,
+    generation: Value,
     metadata: Value,
     config: Value,
     template: &str,
 ) -> ChatCodec {
-    let directory = std::env::temp_dir().join(format!(
-        "orinfer-defaults-{}-{}",
-        std::process::id(),
-        SERIAL.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(directory.join("cache")).unwrap();
     let model = WordLevel::builder()
         .vocab(
             [
@@ -47,13 +41,30 @@ fn configured_codec(
     let mut tokenizer = Tokenizer::new(model);
     tokenizer.with_pre_tokenizer(Some(Whitespace));
     tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+    load_codec(generation, metadata, config, template, &tokenizer)
+}
+
+fn load_codec(
+    mut generation: Value,
+    metadata: Value,
+    config: Value,
+    template: &str,
+    tokenizer: &Tokenizer,
+) -> ChatCodec {
+    let directory = std::env::temp_dir().join(format!(
+        "orinfer-defaults-{}-{}",
+        std::process::id(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(directory.join("cache")).unwrap();
     tokenizer
         .save(directory.join("tokenizer.json"), false)
         .unwrap();
     generation
         .as_object_mut()
         .unwrap()
-        .insert("eos_token_id".into(), json!(0));
+        .entry("eos_token_id")
+        .or_insert(json!(0));
     if !config.is_null() {
         std::fs::write(
             directory.join("config.json"),
@@ -93,6 +104,97 @@ fn prepare(codec: &ChatCodec, extra: Value, context: usize) -> Result<Prepared> 
         None,
         &mut Context::unbounded(),
     )
+}
+
+#[test]
+fn qwen_generation_hints_follow_the_historical_thinking_boundary() {
+    let model = WordLevel::builder()
+        .vocab(
+            ["[UNK]", "a", "b", "c", "r", "user", "assistant", "Ċ", "ĊĊ"]
+                .into_iter()
+                .enumerate()
+                .map(|(id, token)| (token.to_string(), id as u32))
+                .collect(),
+        )
+        .unk_token("[UNK]".into())
+        .build()
+        .unwrap();
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(
+        tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, true),
+    ));
+    tokenizer
+        .add_special_tokens(
+            ["<|im_start|>", "<|im_end|>", "<think>", "</think>"]
+                .map(|token| tokenizers::AddedToken::from(token, true)),
+        )
+        .unwrap();
+    let template = r#"
+        {%- set ns = namespace(last_query_index=0) %}
+        {%- for message in messages %}
+            {%- if message.role == 'user' %}
+                {%- set ns.last_query_index = loop.index0 %}
+            {%- endif %}
+        {%- endfor %}
+        {%- for message in messages %}
+            {{- '<|im_start|>' + message.role + '\n' }}
+            {%- if message.role == 'assistant' and (RETAIN_THINKING) %}
+                {{- '<think>\n' + message.reasoning_content + '\n</think>\n\n' }}
+            {%- endif %}
+            {{- message.content + '<|im_end|>\n' }}
+        {%- endfor %}
+        {%- if add_generation_prompt %}
+            {{- '<|im_start|>assistant\n' }}
+            {%- if enable_thinking %}{{- '<think>\n' }}
+            {%- else %}{{- '<think>\n\n</think>\n\n' }}
+            {%- endif %}
+        {%- endif -%}
+    "#;
+    for (retains, condition) in [
+        (false, "loop.index0 > ns.last_query_index"),
+        (
+            true,
+            "preserve_thinking or loop.index0 > ns.last_query_index",
+        ),
+    ] {
+        let codec = load_codec(
+            json!({"eos_token_id":tokenizer.token_to_id("<|im_end|>").unwrap()}),
+            json!({}),
+            Value::Null,
+            &template.replace("RETAIN_THINKING", condition),
+            &tokenizer,
+        );
+        assert_eq!(codec.preserves_historical_thinking, retains);
+        for (thinking, preserve) in [(true, true), (false, true), (true, false)] {
+            let mut body = json!({
+                "messages":[{"role":"user","content":"a"}],
+                "enable_thinking":thinking,
+                "chat_template_kwargs":{"preserve_thinking":preserve},
+            });
+            let prompt = prepare(&codec, body.clone(), 128).unwrap();
+            let hint = prompt.input.len()
+                - if !thinking {
+                    4
+                } else if retains && preserve {
+                    1
+                } else {
+                    2
+                };
+            assert_eq!(
+                prompt.prefix_hints,
+                [hint],
+                "retains={retains}, thinking={thinking}, preserve={preserve}, input={:?}",
+                prompt.input
+            );
+            body["messages"] = json!([
+                {"role":"user","content":"a"},
+                {"role":"assistant","reasoning_content":"r","content":"b"},
+                {"role":"user","content":"c"}
+            ]);
+            let next = prepare(&codec, body, 128).unwrap();
+            assert!(next.input.starts_with(&prompt.input[..hint]));
+        }
+    }
 }
 
 #[test]

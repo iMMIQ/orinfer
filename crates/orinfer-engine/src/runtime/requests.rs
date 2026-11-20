@@ -1,6 +1,7 @@
 //! Persistent requests and iteration-level execution. API transport owns output
 //! parsing; this module owns GPU state, sampling counters and prefix endpoints.
 pub(super) mod cost;
+use super::prefix::Checkpoint;
 use super::*;
 use crate::{architecture::BatchSegment, model::request::RequestCore, prefix::Media, scheduler};
 use std::collections::{BTreeMap, BTreeSet};
@@ -674,7 +675,7 @@ impl ModelRuntime {
                         && input.sampling.top_logprobs.is_none(),
                     vision: !input.images.is_empty(),
                     audio: !input.audios.is_empty(),
-                    prompt_prefix: None,
+                    prompt_prefix: prefix.device_parent(),
                 },
             );
             self.scheduler_statistics.peak_active = self
@@ -881,13 +882,26 @@ impl ModelRuntime {
             req.warm.seconds += at.elapsed().as_secs_f64();
         }
         if checkpoint {
+            let kind = Checkpoint::prefill(
+                req.offset,
+                req.input.len(),
+                req.prefix.statistics.matched_tokens,
+            );
             self.store_prefix(
                 &req.core.input[..req.offset],
                 &req.media,
                 req.warm.tokens,
-                true,
+                kind,
                 &mut req.prefix,
             )?;
+            if kind == Checkpoint::Reusable
+                && let Some(id) = req.prefix.device_parent()
+            {
+                self.reserved_requests
+                    .get_mut(&req.slot)
+                    .ok_or("Missing prompt checkpoint reservation")?
+                    .prompt_prefix = Some(id);
+            }
             // Bridge only after saving the prefix-consistent P-1 draft state.
             // This consumes h[P-1] before the next target block can overwrite
             // its slot in the bounded hidden ring.
@@ -927,7 +941,7 @@ impl ModelRuntime {
                 &req.core.input,
                 &req.media,
                 req.warm.tokens,
-                true,
+                Checkpoint::Reusable,
                 &mut req.prefix,
             )?;
             self.reserved_requests
