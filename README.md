@@ -81,18 +81,20 @@ For Ascend 910B / A2 deployment, run `orinfer devices --backend ascend` and `ori
 
 ## Performance Snapshot (Jetson AGX Orin 64GB)
 
-Fixed English-to-Chinese translation benchmark (2026-10-21, `decode_only`, greedy, seed `20261002`, thinking off, prefix cache off; single-request uses adaptive MTP up to 3 drafts, multi-request disables MTP). Throughput is in **tok/s**; startup times are medians of 3 fresh processes in seconds.
+Fixed English-to-Chinese translation benchmark (**2026-11-20**, Schema 2 packages, `decode_only`, greedy, seed `20261002`, thinking off, prefix cache off; single-request enables adaptive MTP up to 3 drafts, multi-request disables MTP). Throughput is in **tok/s**; startup times are medians of 3 fresh `orinfer serve` processes in seconds (warm page cache).
 
 | Model | Prefill 512 | Prefill 8K | Single Decode (MTP) | 8-Req Decode | Max Concurrency / Decode | Serve → API (s) | Serve → First Output (s) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Index-Translate-2B | 8,121.1 | 7,507.7 | 171.5 | 757.4 | 128 / 2,361.1 | 1.12 | 1.26 |
-| Qwen3.5-4B | 3,592.6 | 3,417.0 | 90.7 | 360.5 | 128 / 1,071.3 | 1.68 | 1.83 |
-| Index-Translate-9B | 2,213.5 | 2,223.3 | 56.5 | 233.9 | 128 / 890.7 | 2.92 | 3.10 |
-| Qwen3.8-27B | 658.9 | 598.5 | 33.6 | 67.6 | 64 / 135.9 | 6.68 | 7.05 |
-| Index-Translate-35B-A3B | 2,233.2 | 3,222.2 | 83.0 | 338.7 | 128 / 825.0 | 8.01 | 8.18 |
-| Qwen3.8-Flash-Next | 925.6 | 858.1 | 56.4 | 157.3 | 32 / 282.9 | 15.79 | 15.96 |
+| Index-Translate-2B | 8,100.7 | 7,551.6 | 153.8 | 759.2 | 128 / 2,475.0 | 0.95 | 1.05 |
+| Qwen3.5-4B | 3,582.9 | 3,379.8 | 114.7 | 360.6 | 128 / 1,094.2 | 1.19 | 1.35 |
+| Index-Translate-9B | 2,223.4 | 2,243.9 | 53.7 | 234.3 | 128 / 909.0 | 1.93 | 2.12 |
+| Qwen3.8-27B | 655.2 | 596.9 | 24.6 | 61.0\* | 64 / 115.7\* | 6.08 | 6.43 |
+| Index-Translate-35B-A3B | 2,204.5 | 3,206.6 | 75.7 | 350.1 | 128 / 848.8 | 7.14 | 7.40 |
+| Qwen3.8-Flash-Next | 979.3 | 1,081.8 | 62.9 | 163.3 | 32 / 284.8 | 15.10 | 15.27 |
 
-See [Performance Reference](docs/performance.md) for the latest **Schema 2 + P1–P6 Mini-Weka end-to-end baselines (2026-11-20)**, vLLM comparisons, JSONL batch throughput, and Ascend 910B3 TP8 results.
+\* `Qwen3.8-27B` multi-request decode measured end-to-end through `orinfer serve --mtp-drafts auto` (HTTP/SSE, throughput policy); the other five models use the engine `benchmark_fixed_requests` harness.
+
+See [Performance Reference](docs/performance.md) for package digests, 8K MTP decode, **Schema 2 + P1–P6 Mini-Weka end-to-end baselines (2026-11-20)**, vLLM comparisons, JSONL batch throughput, and Ascend 910B3 TP8 results.
 
 ---
 

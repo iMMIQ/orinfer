@@ -37,18 +37,20 @@ uv run --locked python -m tools.bench.mini_weka_compact \
 
 ---
 
-## 2. Orin SM87 — 6-Model Throughput & Startup Matrix (2026-10-21)
+## 2. Orin SM87 — 6-Model Throughput & Startup Matrix (2026-11-20)
 
-Fixed English-to-Chinese translation inputs (`decode_only`, greedy, `seed=20261002`, thinking off, prefix cache off; median of 3 measured runs after 1 warmup). Single-request enables adaptive MTP (≤3 drafts); multi-request disables MTP (256 in / 65 out per request). Startup columns are medians of 3 fresh `orinfer serve` processes (warm page cache).
+Fixed English-to-Chinese translation inputs using the latest Schema 2 packages (`decode_only`, greedy, `seed=20261002`, thinking off, prefix cache off; median of 3 measured runs after 1 warmup). Single-request enables adaptive MTP (≤3 drafts, 512/8192 input, 257 output); multi-request disables MTP (256 in / 65 out per request). Startup columns are medians of 3 fresh `orinfer serve` processes (warm page cache).
 
 | Model | Prefill 512 | Prefill 8K | Single Decode 512 (MTP) | Single Decode 8K (MTP) | 8-Req Decode | Max Reqs / Decode | Serve → API (s) | Serve → First Output (s) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Index-Translate-2B** | 8,121.1 | 7,507.7 | 171.5 | 149.9 | 757.4 | 128 / 2,361.1 | 1.12 | 1.26 |
-| **Qwen3.5-4B** | 3,592.6 | 3,417.0 | 90.7 | 76.3 | 360.5 | 128 / 1,071.3 | 1.68 | 1.83 |
-| **Index-Translate-9B** | 2,213.5 | 2,223.3 | 56.5 | 50.4 | 233.9 | 128 / 890.7 | 2.92 | 3.10 |
-| **Qwen3.8-27B** | 658.9 | 598.5 | 33.6 | 30.6 | 67.6 | 64 / 135.9 | 6.68 | 7.05 |
-| **Index-Translate-35B-A3B** | 2,233.2 | 3,222.2 | 83.0 | 74.9 | 338.7 | 128 / 825.0 | 8.01 | 8.18 |
-| **Qwen3.8-Flash-Next** | 925.6 | 858.1 | 56.4 | 48.0 | 157.3 | 32 / 282.9 | 15.79 | 15.96 |
+| **Index-Translate-2B** | 8,100.7 | 7,551.6 | 153.8 | 137.6 | 759.2 | 128 / 2,475.0 | 0.95 | 1.05 |
+| **Qwen3.5-4B** | 3,582.9 | 3,379.8 | 114.7 | 94.7 | 360.6 | 128 / 1,094.2 | 1.19 | 1.35 |
+| **Index-Translate-9B** | 2,223.4 | 2,243.9 | 53.7 | 48.5 | 234.3 | 128 / 909.0 | 1.93 | 2.12 |
+| **Qwen3.8-27B** | 655.2 | 596.9 | 24.6 | 22.2 | 61.0\* | 64 / 115.7\* | 6.08 | 6.43 |
+| **Index-Translate-35B-A3B** | 2,204.5 | 3,206.6 | 75.7 | 70.1 | 350.1 | 128 / 848.8 | 7.14 | 7.40 |
+| **Qwen3.8-Flash-Next** | 979.3 | 1,081.8 | 62.9 | 31.5 | 163.3 | 32 / 284.8 | 15.10 | 15.27 |
+
+\* `Qwen3.8-27B` 8/64-request decode measured end-to-end through `orinfer serve --mtp-drafts auto` (HTTP/SSE, `throughput` policy); the other five models use `benchmark_fixed_requests`. Package digests: 2B `cfc11bc2`, 4B `5ee0cdf3`, 9B `6d283b0c`, 27B `cca4c6fe`, 35B `793b8064`, Flash-Next `fc87e2ca`.
 
 ---
 
