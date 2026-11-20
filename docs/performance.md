@@ -359,6 +359,50 @@ Graph 与调度计数取回放前后 `/health` 差值，最长 decode 间隔取�
 
 回放计数采集后，六个 latency 服务各执行两次温度 0、seed 20261002、最多 24 token 的固定英译中请求。六组的两次输出均一致，第二次请求恢复 27 或 31 个 prompt token，原始 prompt 为 31 token。本轮原始请求、健康快照、服务日志和汇总见 `artifacts/bench/p5-all-models-baseline/baseline.json` 及同目录记录。
 
+### P6 批量 GPU 采样执行包（2026-11-20）
+
+P6 以 `746c71b` 对应的同一 release 二进制运行五个升级后的 Schema 2 包。2B、4B、9B、27B 与 35B 共用词表 248,320、上下文容量 262,144 的 TileLang 采样 cubin，各包沿用冻结基线的权重分片与 tokenizer。五个包均通过 `plan-model` 与 `validate-model`。`sampling` 和 `sampling_rows` 的 shortlist 路径各含 6 个操作，待回退的采样行使用各含 73 个操作的延迟 radix 路径。`sampling.batch` 提供按行绑定的批量入口。
+
+| 模型 | P6 Schema 2 execution_package（SHA256） | bindings.json（B） |
+| --- | --- | ---: |
+| Index-Translate-2B | `cfc11bc2ce0c206e6f9029127c01334f2e64e19bc2d7a14c1624695da5f58fea` | 280,248 |
+| Qwen3.5-4B | `5ee0cdf35a05a1eb3bbf37bea4e8982f15a152a2f5bbd9b975e14b028b340d5e` | 316,015 |
+| Index-Translate-9B | `6d283b0c8c22be736ab1bc490a26bac7a3371c20d6a200e9b9e2bae78f2d6f3c` | 318,902 |
+| Qwen3.8-27B | `cca4c6fed0b9fe1a3cb2f4363b1345627afadbccc1a2a393c476b81f41d60cb6` | 596,057 |
+| Index-Translate-35B-A3B-preview | `793b80643006adaaa919dbda8c5cf40826a8dfde0973437aef188a919e408086` | 450,532 |
+
+在仓库根目录用下列命令逐个构建。CUDA 包装脚本取得共享 GPU 锁并复用同一编译缓存。构建结束后沿用 P5 的服务与回放参数，将 `models` 和 `output` 分别设为 `$p6/models` 和 `$p6`。
+
+```bash
+p6=artifacts/bench/p6-fast-gpu-sampling
+frozen=artifacts/bench/schema2-baseline-20261119/models
+for model_id in index-translate-2b qwen3.5-4b index-translate-9b qwen3.8-27b index-translate-35b; do
+  PATH="$PWD/.venv/bin:$PATH" bash tools/environments/cuda/run.sh --resume \
+    python/orinfer_build/models/sampling.py "$p6/compile-cache" \
+    --model "$frozen/$model_id" --model-output "$p6/models/$model_id"
+  ./target/release/orinfer plan-model "$p6/models/$model_id"
+  ./target/release/orinfer validate-model "$p6/models/$model_id"
+done
+```
+
+回放显式设定 `temperature=1.0` 并继承各模型的 `top_k`。4B 和 27B 使用 `top_k=20`，进入支持 `1–64` 的 shortlist 路径。Index-Translate 2B、9B、35B 使用 `top_k=0`，采样行经精确 radix 路径处理，因而仍承担全词表采样成本。
+
+各指标按 `58ab647` 历史基线 → `746c71b` P1–P5 纯 Rust 优化 → P6 执行包升级排列。五组 P6 latency 回放使用同一份 512 轨迹 manifest、并发 4 和 240 秒时限。逐组核对输入身份及与两轮历史均完成的请求 payload。Flash Next 两种策略提供历史对照。输出 TPS 沿用上节口径，`batch_commit_s` 和 `sampling_packets` 取回放前后 `/health` 差值，`lookup_rounds` 按已完成请求统计。
+
+| 模型 | 完成请求 | 完整轨迹 | 输出 TPS | batch_commit_s（s） | sampling_packets | lookup_rounds |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Index-Translate-2B | 288 → 358 → 356 | 39 → 50 → 48 | 124.04 → 156.21 → 155.58 | 29.34 → 44.97 → 43.21 | 8,575 → 9,497 → 9,410 | 0 → 0 → 0 |
+| Qwen3.5-4B | 133 → 168 → 198 | 17 → 24 → 28 | 57.60 → 73.58 → 86.62 | 24.28 → 36.29 → 7.97 | 0 → 0 → 5,075 | 0 → 0 → 0 |
+| Index-Translate-9B | 90 → 125 → 128 | 12 → 16 → 16 | 39.28 → 53.80 → 55.47 | 16.11 → 23.21 → 14.21 | 0 → 0 → 3,366 | 0 → 0 → 0 |
+| Qwen3.8-27B | 26 → 34 → 34 | 4 → 4 → 4 | 13.52 → 15.77 → 15.76 | 4.00 → 1.90 → 0.62 | 612 → 332 → 316 | 0 → 73 → 85 |
+| Index-Translate-35B-A3B-preview | 68 → 124 → 133 | 8 → 16 → 17 | 28.40 → 52.76 → 59.74 | 93.98 → 33.43 → 16.86 | 0 → 0 → 3,496 | 0 → 0 → 0 |
+| Qwen3.8-Flash-Next | 72 → 86 → — | 8 → 12 → — | 32.32 → 39.84 → — | 1.58 → 1.12 → — | 2,178 → 1,785 → — | 0 → 444 → — |
+| Qwen3.8-Flash-Next throughput | 92 → 93 → — | 12 → 12 → — | 41.49 → 41.76 → — | 2.10 → 1.62 → — | 1,830 → 1,846 → — | 453 → 446 → — |
+
+P6 的批量提交累计耗时在五组均下降。4B、9B、35B 首次记录批量采样 packet，输出 TPS 较 P5 分别提高 17.7%、3.1%、13.2%，三组 lookup 计数均为 0。27B 的 lookup 从 73 增至 85 轮，输出 TPS 持平。2B 的批量提交仍耗时 43.21 秒，输出 TPS 下降 0.4%。
+
+五组均记录到 CUDA Graph 命中，达到 240 秒时限并经 SIGTERM 以状态 0 退出，CUDA/runtime 错误、panic 与 OOM 均为 0。每组回放后重复同一温度 0 英译中请求，两次输出文本与完成 token 数一致。第二次请求分别恢复 27／27／27／31／31 个 prompt token，原始 prompt 均为 31 token。执行包、原始请求、服务日志与健康快照保存在 `artifacts/bench/p6-fast-gpu-sampling/`，三阶段汇总见该目录的 `baseline.json`。
+
 ### 八模型 Schema 2 验收
 
 模型权重、CPU 表与 TileLang 资产使用与源文件相同的 inode。独立 `bindings.json` 与 `package.json` 固定新包摘要。八个包均通过 `validate-model`，覆盖前端、CPU 资产、执行包、绑定与权重 tensor SHA256。两个 `plan-model` 的 kernel bindings 按名称逐项相等，动态 launch、prefill、sampling、MTP、动态行契约相等。Flash Next 的 `head_m1` 删除的调用仅写入无读取方的临时缓冲区 `Scratch2249`，保留从同一输入计算的融合算子 `hc_up13_finish_kernel`。其余程序操作逐项相同。Schema 2 输出省略空的 `batch_layout.small_mixed_shapes` 字段。
