@@ -142,7 +142,15 @@ impl HostSnapshot {
                 });
             }
         }
-        session.synchronize()?;
+        if groups.is_empty() {
+            return Ok(());
+        }
+        if groups
+            .keys()
+            .any(|name| buffers.get(*name).is_some_and(Buffer::has_mapped_pages))
+        {
+            session.synchronize()?;
+        }
         for (name, pieces) in groups {
             session.restore_kv(&get(buffers, name)?, &pieces)?;
         }
@@ -190,7 +198,7 @@ impl HostSnapshot {
             })
             .collect::<Result<Vec<_>>>()?;
         if !regions.is_empty() {
-            session.upload_regions(&regions)?.wait()?;
+            session.upload_regions(&regions)?;
         }
         Ok(())
     }
@@ -250,7 +258,17 @@ impl Worker {
         id: usize,
         snapshot: &HostSnapshot,
     ) -> Result<()> {
-        self.reset_owner(id)?;
+        let clean = self
+            .batch
+            .as_ref()
+            .ok_or("Missing batch runtime")?
+            .owners
+            .get(&id)
+            .ok_or("Unknown owner")?
+            .clean;
+        if !clean {
+            self.reset_owner(id)?;
+        }
         {
             let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
             snapshot.restore_shared_into(
@@ -263,6 +281,7 @@ impl Worker {
         let owner = runtime.owners.get_mut(&id).ok_or("Unknown A2 owner")?;
         snapshot.restore_mutable_host_into(&self.session, &owner.buffers)?;
         owner.history.clone_from(&snapshot.history);
+        owner.clean = false;
         runtime.bound_tables = None;
         Ok(())
     }

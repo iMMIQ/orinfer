@@ -3,7 +3,7 @@ mod tiered;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-pub(crate) use tiered::{Admission, Tiered};
+pub(crate) use tiered::{Admission, CheckpointMemo, Tiered};
 
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct Statistics {
@@ -221,6 +221,34 @@ impl<T: Resident> Cache<T> {
         media: &Media,
         score: impl Fn(&Entry<T>) -> Option<f64>,
     ) -> Match {
+        self.probe::<true>(tokens, media, score)
+    }
+    /// O(depth) radix walk returning all endpoint IDs whose token prefix and
+    /// media identities match `tokens` exactly.
+    pub fn exact_matches(&self, tokens: &[u32], media: &Media) -> Vec<u64> {
+        let (mut node, mut depth) = (&self.root, 0);
+        while depth < tokens.len() {
+            let Some(child) = node.children.get(&tokens[depth]) else {
+                return vec![];
+            };
+            if !tokens[depth..].starts_with(&child.label) {
+                return vec![];
+            }
+            depth += child.label.len();
+            node = child;
+        }
+        node.endpoints
+            .iter()
+            .copied()
+            .filter(|id| self.entries[id].media.common_tokens(media, depth) == depth)
+            .collect()
+    }
+    fn probe<const TRACK_OVERLAP: bool>(
+        &self,
+        tokens: &[u32],
+        media: &Media,
+        score: impl Fn(&Entry<T>) -> Option<f64>,
+    ) -> Match {
         let mut result = Match::default();
         let mut best = f64::INFINITY;
         let (mut node, mut depth) = (&self.root, 0);
@@ -228,7 +256,9 @@ impl<T: Resident> Cache<T> {
             for id in &node.endpoints {
                 let e = &self.entries[id];
                 let common = e.media.common_tokens(media, depth);
-                result.matched_tokens = result.matched_tokens.max(common);
+                if TRACK_OVERLAP {
+                    result.matched_tokens = result.matched_tokens.max(common);
+                }
                 if common == depth
                     && (depth < tokens.len() || e.logits_valid)
                     && let Some(cost) = score(e)
@@ -241,38 +271,45 @@ impl<T: Resident> Cache<T> {
             let child = tokens.get(depth).and_then(|id| node.children.get(id));
             // A deeper token match can fail on an image identity. Off-path
             // siblings may still provide a longer media-compatible overlap.
-            for (key, sibling) in &node.children {
-                if Some(key) == tokens.get(depth) {
+            if TRACK_OVERLAP {
+                for (key, sibling) in &node.children {
+                    if Some(key) == tokens.get(depth) {
+                        continue;
+                    }
+                    let mut ids = vec![];
+                    sibling.descendants(&mut ids);
+                    for id in ids {
+                        result.matched_tokens = result
+                            .matched_tokens
+                            .max(self.entries[&id].media.common_tokens(media, depth));
+                    }
+                }
+            }
+            if let Some(child) = child {
+                let remaining = &tokens[depth..];
+                if remaining.starts_with(&child.label) {
+                    depth += child.label.len();
+                    node = child;
                     continue;
                 }
-                let mut ids = vec![];
-                sibling.descendants(&mut ids);
-                for id in ids {
+                if TRACK_OVERLAP {
+                    depth += child
+                        .label
+                        .iter()
+                        .zip(remaining)
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    node = child;
+                }
+            }
+            if TRACK_OVERLAP {
+                let mut descendants = vec![];
+                node.descendants(&mut descendants);
+                for id in descendants {
                     result.matched_tokens = result
                         .matched_tokens
                         .max(self.entries[&id].media.common_tokens(media, depth));
                 }
-            }
-            if let Some(child) = child {
-                let common = child
-                    .label
-                    .iter()
-                    .zip(&tokens[depth..])
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                depth += common;
-                if common == child.label.len() {
-                    node = child;
-                    continue;
-                }
-                node = child;
-            }
-            let mut descendants = vec![];
-            node.descendants(&mut descendants);
-            for id in descendants {
-                result.matched_tokens = result
-                    .matched_tokens
-                    .max(self.entries[&id].media.common_tokens(media, depth));
             }
             return result;
         }
@@ -433,10 +470,12 @@ pub(crate) fn match_tiers<D: Resident, H: Resident>(
     device_score: impl Fn(&Entry<D>) -> Option<f64>,
     host_score: impl Fn(&Entry<H>) -> Option<f64>,
 ) -> Option<(bool, u64)> {
+    // Tier selection consumes only restorable endpoints. Other branches can
+    // contribute partial-overlap statistics, while endpoints must be on path.
     let d = device
-        .match_prefix_by(tokens, media, device_score)
+        .probe::<false>(tokens, media, device_score)
         .checkpoint;
-    let h = host.match_prefix_by(tokens, media, host_score).checkpoint;
+    let h = host.probe::<false>(tokens, media, host_score).checkpoint;
     match (d, h) {
         (Some(d), Some(h)) if host.entries[&h].tokens.len() > device.entries[&d].tokens.len() => {
             Some((true, h))
@@ -665,5 +704,35 @@ mod tests {
                 expected_checkpoint
             );
         }
+    }
+    #[test]
+    fn exact_matches_returns_only_same_tokens_and_media() {
+        let mut c = Cache::new(1_000_000);
+        let m1 = Media(vec![(1, [1u8; 32])]);
+        let m2 = Media(vec![(1, [2u8; 32])]);
+        let mut a = entry(&[10, 20, 30], &[(1, 10)], false);
+        a.media = m1.clone();
+        let id_a = c.insert(a);
+        let mut b = entry(&[10, 20, 30], &[(2, 10)], true);
+        b.media = m1.clone();
+        let id_b = c.insert(b);
+        let mut diff_media = entry(&[10, 20, 30], &[(3, 10)], true);
+        diff_media.media = m2.clone();
+        let id_m2 = c.insert(diff_media);
+        let mut shorter = entry(&[10, 20], &[(4, 10)], true);
+        shorter.media = m1.clone();
+        c.insert(shorter);
+        let mut longer = entry(&[10, 20, 30, 40], &[(5, 10)], true);
+        longer.media = m1.clone();
+        c.insert(longer);
+
+        let mut got = c.exact_matches(&[10, 20, 30], &m1);
+        got.sort_unstable();
+        let mut expected = vec![id_a, id_b];
+        expected.sort_unstable();
+        assert_eq!(got, expected);
+        assert_eq!(c.exact_matches(&[10, 20, 30], &m2), vec![id_m2]);
+        assert!(c.exact_matches(&[10, 20, 99], &m1).is_empty());
+        assert!(c.exact_matches(&[10], &m1).is_empty());
     }
 }

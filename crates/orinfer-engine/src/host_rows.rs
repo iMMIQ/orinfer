@@ -224,6 +224,18 @@ impl Plane {
         self.resident = Some((first, data));
         Ok(())
     }
+    fn resident_slice(&self, row: usize) -> Result<&[u8]> {
+        let (first, data) = self
+            .resident
+            .as_ref()
+            .ok_or("Host-row plane is not resident")?;
+        let begin = row
+            .checked_sub(*first)
+            .and_then(|v| v.checked_mul(self.row_bytes))
+            .ok_or("Resident host row outside table")?;
+        data.get(begin..begin + self.row_bytes)
+            .ok_or_else(|| "Resident host row outside table".into())
+    }
     /// pread one row into an exact slice. ZFS mmap page-fault readiness
     /// contends badly when several rank threads randomly read a
     /// multi-hundred-GiB table, while positional reads resolve through the
@@ -232,15 +244,8 @@ impl Plane {
         if row >= self.rows || target.len() != self.row_bytes {
             return Err("Host-row read exceeds source or target extent".into());
         }
-        if let Some((first, data)) = &self.resident {
-            let begin = row
-                .checked_sub(*first)
-                .map(|v| v * self.row_bytes)
-                .ok_or("Resident host row outside table")?;
-            let source = data
-                .get(begin..begin + target.len())
-                .ok_or("Resident host row outside table")?;
-            target.copy_from_slice(source);
+        if self.resident.is_some() {
+            target.copy_from_slice(self.resident_slice(row)?);
             return Ok(());
         }
         self.read_bytes(row * self.row_bytes, target)
@@ -279,6 +284,7 @@ pub struct HostRowCacheStatistics {
 }
 struct SharedState {
     last: Option<RowBatch>,
+    last_split: Option<SplitBatch>,
     cache: Option<RowCache>,
     statistics: HostRowCacheStatistics,
 }
@@ -286,12 +292,17 @@ struct RowBatch {
     ids: Vec<u64>,
     bytes: Arc<Vec<u8>>,
 }
+struct SplitBatch {
+    ids: Vec<u64>,
+    planes: Arc<(Vec<u8>, Vec<u8>)>,
+}
 impl SharedInt8Rows {
     pub fn new(store: Int8Rows) -> Self {
         Self {
             store,
             state: Mutex::new(SharedState {
                 last: None,
+                last_split: None,
                 cache: None,
                 statistics: HostRowCacheStatistics::default(),
             }),
@@ -354,6 +365,55 @@ impl SharedInt8Rows {
             bytes: Arc::clone(&bytes),
         });
         Ok(bytes)
+    }
+    /// Gather separate INT8 values and FP32 scales directly, reusing the latest
+    /// query packet across replicated TP workers without an intermediate record copy.
+    pub fn gather_split(&self, ids: &[u64], max_bytes: usize) -> Result<Arc<(Vec<u8>, Vec<u8>)>> {
+        ids.len()
+            .checked_mul(self.store.row_bytes())
+            .filter(|&n| n <= max_bytes)
+            .ok_or("Host-row staging budget exceeded")?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Shared host-row reader poisoned")?;
+        if let Some(planes) = state
+            .last_split
+            .as_ref()
+            .filter(|batch| batch.ids == ids)
+            .map(|batch| Arc::clone(&batch.planes))
+        {
+            state.statistics.gathers += 1;
+            state.statistics.packet_hits += 1;
+            return Ok(planes);
+        }
+        let (values, scales, hits, reads) = if self.store.is_resident() && state.cache.is_none() {
+            let (values, scales) = self.store.gather_split_resident(ids, max_bytes)?;
+            (values, scales, 0, ids.len())
+        } else {
+            let mut packed = vec![];
+            let (hits, reads) =
+                self.store
+                    .gather_cached_into(ids, &mut packed, max_bytes, state.cache.as_mut())?;
+            let (val_width, scale_width) = self.store.split_widths();
+            let row_width = self.store.row_bytes();
+            let mut values = Vec::with_capacity(ids.len() * val_width);
+            let mut scales = Vec::with_capacity(ids.len() * scale_width);
+            for record in packed.chunks_exact(row_width) {
+                values.extend_from_slice(&record[..val_width]);
+                scales.extend_from_slice(&record[val_width..]);
+            }
+            (values, scales, hits, reads)
+        };
+        state.statistics.gathers += 1;
+        state.statistics.unique_row_hits += hits as u64;
+        state.statistics.unique_row_reads += reads as u64;
+        let planes = Arc::new((values, scales));
+        state.last_split = Some(SplitBatch {
+            ids: ids.to_vec(),
+            planes: Arc::clone(&planes),
+        });
+        Ok(planes)
     }
 }
 impl Drop for SharedInt8Rows {
@@ -433,6 +493,84 @@ impl Int8Rows {
     }
     pub fn row_bytes(&self) -> usize {
         self.row_bytes
+    }
+    pub fn split_widths(&self) -> (usize, usize) {
+        match &self.storage {
+            RowStorage::Split(weight, scale) => (weight.row_bytes, scale.row_bytes),
+            RowStorage::Records(records) => {
+                let groups = records.row_bytes / 36;
+                (groups * 32, groups * 4)
+            }
+        }
+    }
+    pub fn is_resident(&self) -> bool {
+        match &self.storage {
+            RowStorage::Split(weight, scale) => {
+                weight.resident.is_some() && scale.resident.is_some()
+            }
+            RowStorage::Records(records) => records.resident.is_some(),
+        }
+    }
+    /// Direct parallel gather from RAM-resident tables straight into separated
+    /// INT8 values and FP32 scales, bypassing HashMap dedup and intermediate staging.
+    fn gather_split_resident(&self, ids: &[u64], max_bytes: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+        use rayon::prelude::*;
+        ids.len()
+            .checked_mul(self.row_bytes)
+            .filter(|&n| n <= max_bytes)
+            .ok_or("Host-row staging budget exceeded")?;
+        for &row in ids {
+            self.shard.local(row)?;
+        }
+        let (val_width, scale_width) = self.split_widths();
+        let mut values = vec![0u8; ids.len() * val_width];
+        let mut scales = vec![0u8; ids.len() * scale_width];
+        if ids.is_empty() {
+            return Ok((values, scales));
+        }
+        let fill_chunk =
+            |chunk_ids: &[u64], val_out: &mut [u8], scale_out: &mut [u8]| -> Result<()> {
+                match &self.storage {
+                    RowStorage::Records(records) => {
+                        for ((&row, v_dst), s_dst) in chunk_ids
+                            .iter()
+                            .zip(val_out.chunks_exact_mut(val_width))
+                            .zip(scale_out.chunks_exact_mut(scale_width))
+                        {
+                            let src = records.resident_slice(
+                                usize::try_from(row).map_err(|_| "Host row offset overflow")?,
+                            )?;
+                            v_dst.copy_from_slice(&src[..val_width]);
+                            s_dst.copy_from_slice(&src[val_width..]);
+                        }
+                    }
+                    RowStorage::Split(weight, scale) => {
+                        for ((&row, v_dst), s_dst) in chunk_ids
+                            .iter()
+                            .zip(val_out.chunks_exact_mut(val_width))
+                            .zip(scale_out.chunks_exact_mut(scale_width))
+                        {
+                            let idx =
+                                usize::try_from(row).map_err(|_| "Host row offset overflow")?;
+                            v_dst.copy_from_slice(weight.resident_slice(idx)?);
+                            s_dst.copy_from_slice(scale.resident_slice(idx)?);
+                        }
+                    }
+                }
+                Ok(())
+            };
+        if ids.len() < 1024 {
+            fill_chunk(ids, &mut values, &mut scales)?;
+        } else {
+            // Bound parallelism to <=16 contiguous stripes to avoid waking all
+            // host cores across NUMA nodes on a few megabytes of RAM copies.
+            let stripe = (ids.len() / 16).max(256);
+            ids.par_chunks(stripe)
+                .zip(values.par_chunks_mut(stripe * val_width))
+                .zip(scales.par_chunks_mut(stripe * scale_width))
+                .try_for_each(|((chunk_ids, v_out), s_out)| fill_chunk(chunk_ids, v_out, s_out))?;
+        }
+        Ok((values, scales))
     }
     /// Payload and bounded allocation overhead for this shard, without staging.
     pub fn required_resident_bytes(&self) -> Result<usize> {
@@ -717,6 +855,53 @@ mod tests {
         assert_eq!(&*shared.gather(&ids, expected.len()).unwrap(), &expected);
         assert_eq!(&*shared.gather(&ids, expected.len()).unwrap(), &expected);
         assert_eq!(shared.statistics().unwrap().packet_hits, 1);
+        let split = shared.gather_split(&ids, expected.len()).unwrap();
+        let expected_values: Vec<u8> = expected
+            .as_chunks::<72>()
+            .0
+            .iter()
+            .flat_map(|row| &row[..64])
+            .copied()
+            .collect();
+        let expected_scales: Vec<u8> = expected
+            .as_chunks::<72>()
+            .0
+            .iter()
+            .flat_map(|row| &row[64..])
+            .copied()
+            .collect();
+        assert_eq!(split.0, expected_values);
+        assert_eq!(split.1, expected_scales);
+        // Second identical gather_split hits the shared split packet cache.
+        assert_eq!(
+            &*shared.gather_split(&ids, expected.len()).unwrap(),
+            &*split
+        );
+        assert_eq!(shared.statistics().unwrap().packet_hits, 2);
+        // Large batch (>1024) exercises bounded parallel chunked resident gather.
+        let big_ids: Vec<u64> = (0..2500).map(|i| 1 + (i % 6) as u64).collect();
+        let big_expected: Vec<u8> = big_ids
+            .iter()
+            .flat_map(|&id| expected_rows[id as usize].clone())
+            .collect();
+        let big_split = shared.gather_split(&big_ids, big_ids.len() * 72).unwrap();
+        let big_exp_v: Vec<u8> = big_expected
+            .as_chunks::<72>()
+            .0
+            .iter()
+            .flat_map(|row| &row[..64])
+            .copied()
+            .collect();
+        let big_exp_s: Vec<u8> = big_expected
+            .as_chunks::<72>()
+            .0
+            .iter()
+            .flat_map(|row| &row[64..])
+            .copied()
+            .collect();
+        assert_eq!(big_split.0, big_exp_v);
+        assert_eq!(big_split.1, big_exp_s);
+        assert!(shared.gather_split(&[0], 72).is_err());
     }
     #[test]
     fn stable_deduplication_preserves_query_order_and_empty_ranks() {

@@ -299,13 +299,7 @@ impl Worker {
             let head = self.compile(&packet.head, &base, self.snapshots, (packet.rows, rows))?;
             self.packets.insert(
                 rows,
-                Rc::new(Execution {
-                    packet,
-                    body,
-                    head,
-                    captured: true,
-                    direct_uses: std::cell::Cell::new(0),
-                }),
+                Rc::new(Execution::monolithic(packet, body, head, true)),
             );
         }
         self.touch_packet(rows);
@@ -338,15 +332,14 @@ impl Worker {
             && std::env::var_os("ORINFER_A2_SYNC_PROFILE").is_none()
             && std::env::var_os("ORINFER_A2_STEP_FENCES").is_none()
             && !execution
-                .body
-                .iter()
-                .chain(&execution.head)
+                .body_steps()
+                .chain(execution.head_steps())
                 .any(|s| matches!(s, Step::Route { .. }));
         let t = Instant::now();
         if batched {
             self.enqueue_packet(Rc::clone(&execution), tokens, &hashes, &valid, logits)?;
         } else {
-            for step in &execution.body {
+            for step in execution.body_steps() {
                 self.step(step, tokens, &hashes, &valid, history.len(), trace)?;
             }
         }
@@ -362,7 +355,7 @@ impl Worker {
         }
         let t = Instant::now();
         if !batched {
-            for step in &execution.head {
+            for step in execution.head_steps() {
                 self.step(step, tokens, &hashes, &valid, history.len(), trace)?;
             }
         }
@@ -453,14 +446,10 @@ impl Worker {
             first,
             next,
         } = input;
-        let head = if logits {
-            execution.head.as_slice()
-        } else {
-            &[]
-        };
+        let head = if logits { execution.head_steps() } else { &[] };
         let mut embeddings = vec![];
         let mut device_embeddings = vec![];
-        for step in execution.body.iter().chain(head) {
+        for step in execution.body_steps().chain(head) {
             let input = match step {
                 Step::Embed {
                     destination,
@@ -490,12 +479,17 @@ impl Worker {
                 embeddings.push(vec![(destination.slice(0, data.len())?, data)])
             }
         }
+        let total_lookups = execution
+            .body_steps()
+            .filter(|step| matches!(step, Step::Lookup { .. }))
+            .count();
+        let mut next_window = next;
         let mut embeddings = embeddings.into_iter();
         let mut device_embeddings = device_embeddings.iter();
+        let mut lookup_cursor = 0usize;
         // SAFETY: Execution owns the stable graphs and W4 plans; each graph
         // retains its kernels/collectives, and W4 retains tensors/workspace.
-        // submit_compute fences partial submission on failure. Each forward
-        // completes before these packet resources can be invoked again.
+        // submit_compute fences partial submission on failure.
         unsafe {
             self.session.submit_compute(
                 vec![],
@@ -521,12 +515,8 @@ impl Worker {
                             )?;
                         }
                     }
-                    let head = if logits {
-                        execution.head.as_slice()
-                    } else {
-                        &[]
-                    };
-                    for step in execution.body.iter().chain(head) {
+                    let head = if logits { execution.head_steps() } else { &[] };
+                    for step in execution.body_steps().chain(head) {
                         match step {
                             Step::Graph(graph) => graph.execute_on_stream(stream)?,
                             Step::Segment(segment) => segment.execute_on_stream(stream)?,
@@ -575,34 +565,7 @@ impl Worker {
                                 scales,
                                 mask,
                             } => {
-                                if let Some(first) = first.filter(|f| f.layer == *layer) {
-                                    let table =
-                                        self.tables.get(layer).ok_or("Engram table missing")?;
-                                    let data = first.get(
-                                        table,
-                                        || self.lookup_ids(*layer, tokens.len(), hashes, valid),
-                                        valid,
-                                    )?;
-                                    let buffers = [values, scales, mask];
-                                    let regions = data
-                                        .regions()
-                                        .map(|(plane, offset, bytes)| {
-                                            (Buffer::clone(buffers[plane]), offset, bytes)
-                                        })
-                                        .collect::<Vec<_>>();
-                                    self.session.upload_regions(&regions)?;
-                                    // This frame now owns its immutable bytes; a
-                                    // future read can replace the store cache
-                                    // while late ranks consume the same frame.
-                                    if let Some(next) = next {
-                                        next.start();
-                                    }
-                                    continue;
-                                }
-                                // Earlier graph segments are already queued.
-                                // Prepare CPU rows while they execute, then
-                                // update reused inputs at this stream boundary.
-                                let inputs = self.lookup_inputs(
+                                self.upload_lookup(
                                     *layer,
                                     tokens.len(),
                                     hashes,
@@ -610,8 +573,14 @@ impl Worker {
                                     values,
                                     scales,
                                     mask,
+                                    first,
                                 )?;
-                                self.session.upload_inputs(&inputs)?;
+                                lookup_cursor += 1;
+                                if lookup_cursor == total_lookups
+                                    && let Some(next) = next_window.take()
+                                {
+                                    next.start();
+                                }
                             }
                             Step::Snapshot { .. } => {}
                             Step::Route { .. } => {
@@ -639,9 +608,8 @@ impl Worker {
             || std::env::var_os("ORINFER_A2_BATCH_TRACE_ALL_RANKS").is_some())
         .then_some(path);
         for step in execution
-            .body
-            .iter()
-            .chain(if head { execution.head.as_slice() } else { &[] })
+            .body_steps()
+            .chain(if head { execution.head_steps() } else { &[] })
         {
             if let Step::Embed {
                 destination,
@@ -948,6 +916,44 @@ impl Worker {
         Ok(ids)
     }
     #[allow(clippy::too_many_arguments)]
+    fn upload_lookup(
+        &self,
+        layer: usize,
+        rows: usize,
+        hashes: &[i64],
+        valid: &[bool],
+        values: &Buffer,
+        scales: &Buffer,
+        mask: &Buffer,
+        first: Option<&super::host_inputs::First>,
+    ) -> Result<Ticket> {
+        if let Some(first) = first.filter(|f| f.handles_layer(layer)) {
+            let table = self.tables.get(&layer).ok_or("Engram table missing")?;
+            let data = first.get(
+                layer,
+                table,
+                || self.lookup_ids(layer, rows, hashes, valid),
+                valid,
+            )?;
+            let buffers = [values, scales, mask];
+            let regions = data
+                .regions()
+                .map(|(plane, offset, bytes)| (Buffer::clone(buffers[plane]), offset, bytes))
+                .collect::<Vec<_>>();
+            return self.session.upload_regions(&regions);
+        }
+        let ids = self.lookup_ids(layer, rows, hashes, valid)?;
+        let table = self.tables.get(&layer).ok_or("Engram table missing")?;
+        let planes = table.gather_split(&ids, rows * 24 * 288)?;
+        let mask_bytes: Vec<u8> = valid.iter().map(|&v| u8::from(v)).collect();
+        let regions = [
+            (values.clone(), 0usize, planes.0.as_slice()),
+            (scales.clone(), 0usize, planes.1.as_slice()),
+            (mask.clone(), 0usize, mask_bytes.as_slice()),
+        ];
+        self.session.upload_regions(&regions)
+    }
+    #[allow(clippy::too_many_arguments)]
     fn lookup_inputs(
         &self,
         layer: usize,
@@ -960,16 +966,10 @@ impl Worker {
     ) -> Result<Vec<(Buffer, Vec<u8>)>> {
         let ids = self.lookup_ids(layer, rows, hashes, valid)?;
         let table = self.tables.get(&layer).ok_or("Engram table missing")?;
-        let packed = table.gather(&ids, rows * 24 * 288)?;
-        let mut q = Vec::with_capacity(rows * 24 * 256);
-        let mut scale = Vec::with_capacity(rows * 24 * 32);
-        for data in packed.as_chunks::<288>().0.iter() {
-            q.extend_from_slice(&data[..256]);
-            scale.extend_from_slice(&data[256..]);
-        }
+        let planes = table.gather_split(&ids, rows * 24 * 288)?;
         Ok(vec![
-            (values.slice(0, q.len())?, q),
-            (scales.slice(0, scale.len())?, scale),
+            (values.slice(0, planes.0.len())?, planes.0.clone()),
+            (scales.slice(0, planes.1.len())?, planes.1.clone()),
             (
                 mask.slice(0, valid.len())?,
                 valid.iter().map(|&v| u8::from(v)).collect(),

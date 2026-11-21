@@ -373,13 +373,7 @@ impl Worker {
                 .packets
                 .insert(
                     actual,
-                    Rc::new(Execution {
-                        packet,
-                        body,
-                        head,
-                        captured: true,
-                        direct_uses: Cell::new(0),
-                    }),
+                    Rc::new(Execution::monolithic(packet, body, head, true)),
                 )
                 .is_some()
             {

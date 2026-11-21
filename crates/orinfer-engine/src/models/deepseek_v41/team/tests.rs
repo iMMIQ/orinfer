@@ -259,7 +259,8 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
                 preparation::direct_plan(&statuses)
             }
             .unwrap();
-            let (recapture, capture) = (plan.invalidate, plan.capture());
+            let action = part_action(&plan);
+            let (recapture, prepare_mode) = (action.invalidate, action.prepare);
             for hit in statuses {
                 let (send, commands) = mpsc::channel();
                 let (reply, receive) = reply_channel();
@@ -271,28 +272,26 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
                         commands.recv_timeout(Duration::from_secs(5)).unwrap(),
                         Command::GrowCached(_)
                     ));
-                    reply.send(Ok(Reply::Cached(hit))).unwrap();
+                    reply
+                        .send(Ok(Reply::SplitCached(SplitStates::monolithic(hit), true)))
+                        .unwrap();
                     if recapture {
                         assert!(matches!(
                             commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                            Command::Invalidate(_)
+                            Command::InvalidateParts(_, true, false, false)
                         ));
                         reply.send(Ok(Reply::Ready)).unwrap();
                     }
-                    let cached_prepare = !recapture
-                        && statuses.iter().all(|state| {
-                            matches!(state, CacheState::Graph) == capture
-                        });
-                    if !cached_prepare {
+                    if let Some(mode) = prepare_mode {
                         assert!(matches!(
                             commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                            Command::Prepare(_, mode) if mode == capture
+                            Command::PrepareParts(_, sp) if sp.trunk.prepare == Some(mode)
                         ));
                         reply.send(Ok(Reply::Ready)).unwrap();
                     }
                     assert!(matches!(
                         commands.recv_timeout(Duration::from_secs(5)).unwrap(),
-                        Command::Forward(_, _, Readout { full: false, .. }, mode, _) if mode == cached_prepare.then_some(capture)
+                        Command::Forward(_, _, Readout { full: false, .. }, _)
                     ));
                     // Workers cannot complete until host maintenance has run.
                     completed.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -330,4 +329,72 @@ fn collective_capture_is_coordinated_after_an_asymmetric_cache_eviction() {
             );
         });
     }
+}
+
+#[test]
+fn split_packet_reuses_trunk_graph_while_building_tail_and_head_direct_without_invalidation() {
+    std::thread::scope(|scope| {
+        let mut peers = Transport::new(Duration::from_secs(5));
+        let split_state = SplitStates {
+            trunk: CacheState::Graph,
+            tail: Some(CacheState::Missing),
+            head: Some(CacheState::Missing),
+        };
+        for _ in 0..2 {
+            let (send, commands) = mpsc::channel();
+            let (reply, receive) = reply_channel();
+            peers.push(Peer { send, receive });
+            scope.spawn(move || {
+                assert!(matches!(
+                    commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    Command::GrowCached(_)
+                ));
+                reply
+                    .send(Ok(Reply::SplitCached(split_state, true)))
+                    .unwrap();
+                // Trunk is Graph and Tail/Head are all-Missing -> NO InvalidateParts!
+                assert!(matches!(
+                    commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    Command::PrepareParts(_, sp)
+                        if !sp.any_invalidate()
+                            && sp.trunk.prepare.is_none()
+                            && sp.tail.is_some_and(|a| a.prepare == Some(false))
+                            && sp.head.is_some_and(|a| a.prepare == Some(false))
+                ));
+                reply.send(Ok(Reply::Ready)).unwrap();
+                assert!(matches!(
+                    commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    Command::Forward(_, _, _, _)
+                ));
+                reply.send(Ok(Reply::Outputs(vec![], false))).unwrap();
+            });
+        }
+        let layout = Layout::new(
+            vec![
+                orinfer_model_sdk::architecture::BatchSegment {
+                    slot: 0,
+                    tokens: 512,
+                },
+                orinfer_model_sdk::architecture::BatchSegment { slot: 1, tokens: 1 },
+            ],
+            vec![0, 1],
+            false,
+            2048,
+            8,
+        )
+        .unwrap();
+        let (_, timing) = forward_with(
+            &peers,
+            layout,
+            vec![vec![0; 512], vec![0; 1]],
+            false.into(),
+            None,
+            || {},
+            true,
+        )
+        .unwrap();
+        assert!(!timing.invalidated);
+        assert!(!timing.replay);
+        assert!(timing.shared);
+    });
 }

@@ -160,7 +160,10 @@ fn measured_verification_surface() {
                             .team
                             .profile_forward(layout.clone(), input.clone(), readout, graph)
                             .unwrap();
-                        runtime.team.exchange(Command::EndVerification).unwrap();
+                        runtime
+                            .team
+                            .exchange(Command::FinishVerification(vec![]))
+                            .unwrap();
                         assert_eq!(timing.replay, graph);
                         setup = setup.max(timing.preparation);
                         if trial > 0 {

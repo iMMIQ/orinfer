@@ -298,11 +298,8 @@ impl Runtime {
             Layout::verification(segments, owners * block, owners)?
         };
         draft.role = super::super::PacketRole::Draft;
-        if self.team.needs_preparation(&draft)?
-            && !memory::ensure_budget(self, memory::Requirement::workspace())?
-        {
-            return Err("Insufficient DSpark graph workspace".into());
-        }
+        let draft_prepared =
+            self.begin_forward_with_workspace(&draft, "Insufficient DSpark graph workspace")?;
         let depths = selected.iter().copied().collect::<BTreeMap<_, _>>();
         // Only these owners execute the draft graph. A final prefill window
         // or a non-speculating tail cannot shorten its reuse forecast.
@@ -337,9 +334,14 @@ impl Runtime {
                 draw.seed ^= crate::mtp::DRAFT_STREAM;
             }
         }
-        let (proposals, draft_timing) =
-            self.team
-                .forward_with(draft, inputs, readout, Some(capture), maintenance)?;
+        let (proposals, draft_timing) = self.team.finish_forward(
+            draft_prepared,
+            draft,
+            inputs,
+            readout,
+            Some(capture),
+            maintenance,
+        )?;
         draft_timing.record(&mut self.statistics.batch_execution);
         let draft_s = draft_timing.seconds;
         let draft_prepare = draft_timing.preparation;
@@ -393,11 +395,8 @@ impl Runtime {
         {
             return Err("Verification packet changed its retained launch envelope".into());
         }
-        if self.team.needs_preparation(&layout)?
-            && !memory::ensure_budget(self, memory::Requirement::workspace())?
-        {
-            return Err("Insufficient DSpark verification workspace".into());
-        }
+        let verify_prepared = self
+            .begin_forward_with_workspace(&layout, "Insufficient DSpark verification workspace")?;
         let verified_work = packet::work(&packet_requests, requests, prefill_rows);
         let prefill_work = self.prefill_work(
             &packet_requests,
@@ -468,9 +467,14 @@ impl Runtime {
             }
         }
         self.prepare_host_inputs(&layout, &packet_requests, requests, &mut readout);
-        let (verified, verify_timing) =
-            self.team
-                .forward_with(layout, inputs, readout, Some(capture), || {})?;
+        let (verified, verify_timing) = self.team.finish_forward(
+            verify_prepared,
+            layout,
+            inputs,
+            readout,
+            Some(capture),
+            || {},
+        )?;
         verify_timing.record(&mut self.statistics.batch_execution);
         self.observe_prefill(prefill_work, &verify_timing);
         let verify_s = verify_timing.seconds;
@@ -593,11 +597,7 @@ impl Runtime {
         let sampling_s = started.elapsed().as_secs_f64();
         self.speculation.sampling_s += sampling_s;
         let started = Instant::now();
-        if !rollback.is_empty() {
-            self.team
-                .exchange(Command::RollbackVerification(rollback))?;
-        }
-        self.team.exchange(Command::EndVerification)?;
+        self.team.exchange(Command::FinishVerification(rollback))?;
         let restore_s = started.elapsed().as_secs_f64() + save_s;
         self.speculation_policy.observe(
             selected.len(),

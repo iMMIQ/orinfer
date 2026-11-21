@@ -113,6 +113,9 @@ impl Boundary {
         (self.index - self.prepare..self.index).contains(&index)
             || (self.index + 1..=self.index + self.select).contains(&index)
     }
+    pub fn split_index(&self) -> usize {
+        self.index - self.prepare
+    }
 }
 
 pub(super) fn validate_contract(

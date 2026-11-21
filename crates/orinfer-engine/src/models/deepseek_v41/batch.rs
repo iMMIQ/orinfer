@@ -1,6 +1,6 @@
 //! Owner-private state and shared token rows for native A2 packets.
 mod memory;
-use super::{Buffer, Execution, Instruction, Worker, get};
+use super::{Buffer, Execution, Instruction, SubProgram, Worker, get};
 use crate::artifact::Result;
 use orinfer_model_sdk::{
     architecture::BatchSegment, operators::dynamic::RowExpression, packet::Rows,
@@ -145,16 +145,99 @@ pub(super) struct Access {
     pub write: bool,
 }
 pub(super) struct Owner {
+    pub bank: Option<Buffer>,
     pub buffers: BTreeMap<String, Buffer>,
     pub history: Vec<u32>,
     pub limit: Option<usize>,
     pub vision: std::sync::Arc<Vec<super::vision::Span>>,
+    pub clean: bool,
+}
+pub(super) struct IdleOwner {
+    pub bank: Buffer,
+    pub buffers: BTreeMap<String, Buffer>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CacheState {
     Missing,
     Direct { uses: u8, consecutive: u8 },
     Graph,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SplitStates {
+    pub trunk: CacheState,
+    pub tail: Option<CacheState>,
+    pub head: Option<CacheState>,
+}
+impl SplitStates {
+    pub(super) fn monolithic(state: CacheState) -> Self {
+        Self {
+            trunk: state,
+            tail: None,
+            head: None,
+        }
+    }
+    pub(super) fn all_graphs(&self) -> bool {
+        self.trunk == CacheState::Graph
+            && self.tail.is_none_or(|s| s == CacheState::Graph)
+            && self.head.is_none_or(|s| s == CacheState::Graph)
+    }
+    pub(super) fn any_missing(&self) -> bool {
+        self.trunk == CacheState::Missing
+            || self.tail.is_some_and(|s| s == CacheState::Missing)
+            || self.head.is_some_and(|s| s == CacheState::Missing)
+    }
+    #[cfg(test)]
+    pub(super) fn summary(&self) -> CacheState {
+        let mut min_uses = u8::MAX;
+        let mut min_consecutive = u8::MAX;
+        let mut all_graph = true;
+        for state in std::iter::once(self.trunk)
+            .chain(self.tail)
+            .chain(self.head)
+        {
+            match state {
+                CacheState::Missing => return CacheState::Missing,
+                CacheState::Graph => {}
+                CacheState::Direct { uses, consecutive } => {
+                    all_graph = false;
+                    min_uses = min_uses.min(uses);
+                    min_consecutive = min_consecutive.min(consecutive);
+                }
+            }
+        }
+        if all_graph {
+            CacheState::Graph
+        } else {
+            CacheState::Direct {
+                uses: min_uses,
+                consecutive: min_consecutive,
+            }
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PartAction {
+    pub invalidate: bool,
+    /// None = already resident in requested mode; Some(false) = BuildDirect; Some(true) = CaptureReplay.
+    pub prepare: Option<bool>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SplitPlan {
+    pub trunk: PartAction,
+    pub tail: Option<PartAction>,
+    pub head: Option<PartAction>,
+}
+impl SplitPlan {
+    pub(super) fn any_invalidate(&self) -> bool {
+        self.trunk.invalidate
+            || self.tail.is_some_and(|a| a.invalidate)
+            || self.head.is_some_and(|a| a.invalidate)
+    }
+    pub(super) fn any_prepare(&self) -> bool {
+        self.trunk.prepare.is_some()
+            || self.tail.is_some_and(|a| a.prepare.is_some())
+            || self.head.is_some_and(|a| a.prepare.is_some())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Key {
@@ -163,6 +246,34 @@ pub(super) struct Key {
     decoder_rows: Option<usize>,
     outputs: usize,
     work_rows: Vec<usize>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct TrunkKey {
+    family: (super::PacketRole, bool, usize),
+    rows: usize,
+    clipped: bool,
+    work_rows: Vec<usize>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct TailKey {
+    family: (super::PacketRole, bool, usize),
+    rows: usize,
+    decoder_rows: usize,
+    clipped: bool,
+    work_rows: Vec<usize>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct HeadKey {
+    family: (super::PacketRole, bool, usize),
+    rows: usize,
+    decoder_rows: Option<usize>,
+    outputs: usize,
+}
+pub(super) struct SplitKeys {
+    pub family: (super::PacketRole, bool, usize),
+    pub trunk: TrunkKey,
+    pub tail: Option<TailKey>,
+    pub head: Option<HeadKey>,
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct WorkLaunch {
@@ -190,9 +301,19 @@ pub(super) struct BoundTables {
 pub(super) struct Runtime {
     pub contract: Contract,
     pub owners: BTreeMap<usize, Owner>,
+    pub(super) idle_owners: Vec<IdleOwner>,
     pub(super) cache: BTreeMap<Key, Rc<Execution>>,
     recent: BTreeMap<(super::PacketRole, bool, usize), (Key, u8)>,
     lru: VecDeque<Key>,
+    pub(super) trunk_cache: BTreeMap<TrunkKey, Rc<SubProgram>>,
+    recent_trunk: BTreeMap<(super::PacketRole, bool, usize), (TrunkKey, u8)>,
+    trunk_lru: VecDeque<TrunkKey>,
+    pub(super) tail_cache: BTreeMap<TailKey, Rc<SubProgram>>,
+    recent_tail: BTreeMap<(super::PacketRole, bool, usize), (TailKey, u8)>,
+    tail_lru: VecDeque<TailKey>,
+    pub(super) head_cache: BTreeMap<HeadKey, Rc<SubProgram>>,
+    recent_head: BTreeMap<(super::PacketRole, bool, usize), (HeadKey, u8)>,
+    head_lru: VecDeque<HeadKey>,
     capacity: usize,
     tables: BTreeMap<(super::PacketRole, bool, usize), TableUse>,
     families: Vec<(super::PacketRole, bool, usize)>,
@@ -203,6 +324,8 @@ struct TableUse {
     max_rows: usize,
     draft_block: Option<usize>,
     draft_stride: Option<usize>,
+    decoder_split: Option<usize>,
+    trunk_uses_clipped: bool,
     pointers: BTreeSet<String>,
     work: BTreeSet<String>,
     columns: Vec<bool>,
@@ -211,6 +334,18 @@ impl Runtime {
     pub(super) fn touch_shared_packet(&mut self, key: Key) {
         self.lru.retain(|k| k != &key);
         self.lru.push_back(key);
+    }
+    fn touch_trunk(&mut self, key: TrunkKey) {
+        self.trunk_lru.retain(|k| k != &key);
+        self.trunk_lru.push_back(key);
+    }
+    fn touch_tail(&mut self, key: TailKey) {
+        self.tail_lru.retain(|k| k != &key);
+        self.tail_lru.push_back(key);
+    }
+    fn touch_head(&mut self, key: HeadKey) {
+        self.head_lru.retain(|k| k != &key);
+        self.head_lru.push_back(key);
     }
     fn consecutive_uses(&self, key: &Key) -> u8 {
         self.recent
@@ -221,6 +356,36 @@ impl Runtime {
     fn record_use(&mut self, key: Key) {
         let uses = self.consecutive_uses(&key).saturating_add(1);
         self.recent.insert(key.family, (key, uses));
+    }
+    fn consecutive_trunk(&self, key: &TrunkKey) -> u8 {
+        self.recent_trunk
+            .get(&key.family)
+            .filter(|(previous, _)| previous == key)
+            .map_or(0, |(_, uses)| *uses)
+    }
+    fn record_trunk_use(&mut self, key: TrunkKey) {
+        let uses = self.consecutive_trunk(&key).saturating_add(1);
+        self.recent_trunk.insert(key.family, (key, uses));
+    }
+    fn consecutive_tail(&self, key: &TailKey) -> u8 {
+        self.recent_tail
+            .get(&key.family)
+            .filter(|(previous, _)| previous == key)
+            .map_or(0, |(_, uses)| *uses)
+    }
+    fn record_tail_use(&mut self, key: TailKey) {
+        let uses = self.consecutive_tail(&key).saturating_add(1);
+        self.recent_tail.insert(key.family, (key, uses));
+    }
+    fn consecutive_head(&self, key: &HeadKey) -> u8 {
+        self.recent_head
+            .get(&key.family)
+            .filter(|(previous, _)| previous == key)
+            .map_or(0, |(_, uses)| *uses)
+    }
+    fn record_head_use(&mut self, key: HeadKey) {
+        let uses = self.consecutive_head(&key).saturating_add(1);
+        self.recent_head.insert(key.family, (key, uses));
     }
     fn remove(&mut self, key: &Key) -> bool {
         let removed = self.cache.remove(key).is_some();
@@ -233,9 +398,41 @@ impl Runtime {
         }
         removed
     }
-    pub(super) fn key(&self, layout: &Layout) -> Result<Key> {
-        let (family, _) = self
-            .families
+    fn remove_trunk(&mut self, key: &TrunkKey) -> bool {
+        let removed = self.trunk_cache.remove(key).is_some();
+        if self
+            .recent_trunk
+            .get(&key.family)
+            .is_some_and(|(last, _)| last == key)
+        {
+            self.recent_trunk.remove(&key.family);
+        }
+        removed
+    }
+    fn remove_tail(&mut self, key: &TailKey) -> bool {
+        let removed = self.tail_cache.remove(key).is_some();
+        if self
+            .recent_tail
+            .get(&key.family)
+            .is_some_and(|(last, _)| last == key)
+        {
+            self.recent_tail.remove(&key.family);
+        }
+        removed
+    }
+    fn remove_head(&mut self, key: &HeadKey) -> bool {
+        let removed = self.head_cache.remove(key).is_some();
+        if self
+            .recent_head
+            .get(&key.family)
+            .is_some_and(|(last, _)| last == key)
+        {
+            self.recent_head.remove(&key.family);
+        }
+        removed
+    }
+    fn resolve_family(&self, layout: &Layout) -> Result<(super::PacketRole, bool, usize)> {
+        self.families
             .iter()
             .find_map(|family| {
                 let used = &self.tables[family];
@@ -253,10 +450,90 @@ impl Runtime {
                         }))
                     && family.2 <= layout.rows.total
                     && layout.rows.total <= used.max_rows)
-                    .then_some((*family, used))
+                    .then_some(*family)
             })
-            .ok_or("Missing batch family")?;
+            .ok_or_else(|| "Missing batch family".into())
+    }
+    pub(super) fn key(&self, layout: &Layout) -> Result<Key> {
+        let family = self.resolve_family(layout)?;
         shape_key(&self.contract, layout, family, &self.launches)
+    }
+    pub(super) fn split_keys(&self, layout: &Layout) -> Result<Option<SplitKeys>> {
+        let family = self.resolve_family(layout)?;
+        let used = &self.tables[&family];
+        if used.decoder_split.is_none() {
+            return Ok(None);
+        }
+        let (decoder_rows, trunk_work, decoder_work) =
+            split_work_rows(&self.contract, layout, family, &self.launches)?;
+        let clipped = decoder_rows.is_some_and(|d| d < layout.rows.total);
+        let trunk = TrunkKey {
+            family,
+            rows: layout.rows.total,
+            clipped: used.trunk_uses_clipped && clipped,
+            work_rows: trunk_work,
+        };
+        let tail = decoder_rows.filter(|&d| d > 0).map(|d| TailKey {
+            family,
+            rows: layout.rows.total,
+            decoder_rows: d,
+            clipped,
+            work_rows: decoder_work,
+        });
+        let head = (!layout.outputs.is_empty()).then_some(HeadKey {
+            family,
+            rows: layout.rows.total,
+            decoder_rows,
+            outputs: layout.outputs.len(),
+        });
+        Ok(Some(SplitKeys {
+            family,
+            trunk,
+            tail,
+            head,
+        }))
+    }
+    pub(super) fn execution(
+        &self,
+        layout: &Layout,
+        templates: &[Rc<super::Packet>],
+    ) -> Result<Option<Rc<Execution>>> {
+        if let Some(split) = self.split_keys(layout)? {
+            let Some(trunk) = self.trunk_cache.get(&split.trunk).cloned() else {
+                return Ok(None);
+            };
+            let tail = match &split.tail {
+                Some(k) => match self.tail_cache.get(k) {
+                    Some(t) => Some(Rc::clone(t)),
+                    None => return Ok(None),
+                },
+                None => None,
+            };
+            let head = match &split.head {
+                Some(k) => match self.head_cache.get(k) {
+                    Some(h) => Some(Rc::clone(h)),
+                    None => return Ok(None),
+                },
+                None => None,
+            };
+            let packet = templates
+                .iter()
+                .find(|p| {
+                    p.role == layout.role
+                        && p.batch_decode == layout.decode
+                        && p.min_rows == split.family.2
+                })
+                .cloned()
+                .ok_or("Missing batch family")?;
+            return Ok(Some(Rc::new(Execution {
+                packet,
+                trunk,
+                tail,
+                head,
+            })));
+        }
+        let key = self.key(layout)?;
+        Ok(self.cache.get(&key).cloned())
     }
     pub fn new(
         contract: Contract,
@@ -266,10 +543,46 @@ impl Runtime {
     ) -> Self {
         let mut tables = BTreeMap::new();
         for packet in packets {
+            let split = super::replay::Boundary::find(&packet.body)
+                .ok()
+                .flatten()
+                .and_then(|b| {
+                    // Only split when no Fork/Switch/Join crosses the boundary
+                    // and no instruction in body uses owner-output counts.
+                    let split_idx = b.split_index();
+                    let mut depth = 0usize;
+                    for step in &packet.body[..split_idx] {
+                        match step {
+                            Instruction::Fork => depth += 1,
+                            Instruction::Join => depth = depth.saturating_sub(1),
+                            _ => {}
+                        }
+                    }
+                    let body_uses_owners = packet.body.iter().any(|s| match s {
+                        Instruction::Kernel { owners, .. } | Instruction::Gather { owners, .. } => {
+                            *owners
+                        }
+                        _ => false,
+                    });
+                    (depth == 0 && !body_uses_owners).then_some(split_idx)
+                });
+            let trunk_uses_clipped = split.is_some_and(|split_idx| {
+                packet.body[..split_idx].iter().any(|s| {
+                    matches!(
+                        s,
+                        Instruction::Kernel {
+                            uncompacted_manifest: Some(_),
+                            ..
+                        }
+                    )
+                })
+            });
             let mut used = TableUse {
                 max_rows: packet.dispatch_max(),
                 draft_block: packet.coordinates.draft_block,
                 draft_stride: packet.draft_stride,
+                decoder_split: split,
+                trunk_uses_clipped,
                 pointers: BTreeSet::new(),
                 work: BTreeSet::new(),
                 columns: vec![false; contract.columns.len()],
@@ -293,9 +606,19 @@ impl Runtime {
         Self {
             contract,
             owners: BTreeMap::new(),
+            idle_owners: Vec::new(),
             cache: BTreeMap::new(),
             recent: BTreeMap::new(),
             lru: VecDeque::new(),
+            trunk_cache: BTreeMap::new(),
+            recent_trunk: BTreeMap::new(),
+            trunk_lru: VecDeque::new(),
+            tail_cache: BTreeMap::new(),
+            recent_tail: BTreeMap::new(),
+            tail_lru: VecDeque::new(),
+            head_cache: BTreeMap::new(),
+            recent_head: BTreeMap::new(),
+            head_lru: VecDeque::new(),
             capacity,
             tables,
             families: packets
@@ -648,6 +971,90 @@ fn shape_key(
 ) -> Result<Key> {
     shape_key_with_scope(contract, layout, family, launches, true)
 }
+fn split_work_rows(
+    contract: &Contract,
+    layout: &Layout,
+    family: (super::PacketRole, bool, usize),
+    launches: &BTreeSet<WorkLaunch>,
+) -> Result<(Option<usize>, Vec<usize>, Vec<usize>)> {
+    if layout.outputs.len() > contract.output_capacity() {
+        return Err("Output rows exceed the published head capacity".into());
+    }
+    let work_layout;
+    let layout = if layout.work_shape.is_some() {
+        work_layout = layout.work_layout()?;
+        &work_layout
+    } else {
+        layout
+    };
+    let padded = padded_work(layout);
+    let decoder = contract
+        .decoder_replay
+        .as_ref()
+        .filter(|_| layout.role == super::PacketRole::Target && !layout.decode)
+        .map(|r| layout.decoder(r.keep, r.final_prompt_only))
+        .transpose()?;
+    let mut partitions = BTreeMap::new();
+    let mut trunk_work = Vec::new();
+    let mut decoder_work = Vec::new();
+    for launch in launches {
+        let applicable = launch.family.0 == layout.decode
+            && if layout.role == super::PacketRole::Draft {
+                launch.family.1 == family.2
+            } else {
+                (launch.family.1..=launch.family.2).contains(&layout.rows.total)
+            };
+        if launch.role != layout.role || !applicable {
+            continue;
+        }
+        if launch.decoder && decoder.as_ref().is_none_or(|d| d.rows.total == 0) {
+            continue;
+        }
+        let selected = if launch.decoder {
+            decoder.as_ref().ok_or("Missing decoder work layout")?
+        } else {
+            layout
+        };
+        for rank in 0..launch.partition {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                partitions.entry((launch.decoder, launch.partition, rank))
+            {
+                entry.insert(if launch.partition == 1 {
+                    selected
+                        .segments
+                        .iter()
+                        .map(|s| s.tokens)
+                        .collect::<Vec<_>>()
+                } else {
+                    selected.rows.partition(launch.partition, rank)?.lengths
+                });
+            }
+            let lengths = &partitions[&(launch.decoder, launch.partition, rank)];
+            let range = launch
+                .range
+                .map(|(min_rows, max_rows)| WorkRange { min_rows, max_rows });
+            let count = lengths.iter().copied().try_fold(0usize, |sum, tokens| {
+                sum.checked_add(work_blocks(tokens, &launch.grid, range.as_ref())?)
+                    .ok_or_else(|| "Owner work extent overflow".to_string())
+            })?;
+            if count > 8192 {
+                return Err("Owner work table exceeds its capacity".into());
+            }
+            let rows = work_capacity(count, padded) / 2;
+            if launch.decoder {
+                decoder_work.push(rows);
+            } else {
+                trunk_work.push(rows);
+            }
+        }
+    }
+    Ok((
+        decoder.as_ref().map(|d| d.rows.total),
+        trunk_work,
+        decoder_work,
+    ))
+}
+
 fn shape_key_with_scope(
     contract: &Contract,
     layout: &Layout,
@@ -815,40 +1222,129 @@ fn work_lengths(
     Ok(out)
 }
 impl Worker {
-    pub(super) fn batch_cached(&self, layout: &Layout) -> Result<CacheState> {
+    pub(super) fn batch_split_cached(&self, layout: &Layout) -> Result<SplitStates> {
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+        if let Some(split) = runtime.split_keys(layout)? {
+            let state = |sub: Option<&Rc<SubProgram>>, consecutive: u8| {
+                sub.map_or(CacheState::Missing, |e| {
+                    if e.captured {
+                        CacheState::Graph
+                    } else {
+                        CacheState::Direct {
+                            uses: e.direct_uses.get(),
+                            consecutive,
+                        }
+                    }
+                })
+            };
+            let trunk = state(
+                runtime.trunk_cache.get(&split.trunk),
+                runtime.consecutive_trunk(&split.trunk),
+            );
+            let tail = split
+                .tail
+                .as_ref()
+                .map(|k| state(runtime.tail_cache.get(k), runtime.consecutive_tail(k)));
+            let head = split
+                .head
+                .as_ref()
+                .map(|k| state(runtime.head_cache.get(k), runtime.consecutive_head(k)));
+            return Ok(SplitStates { trunk, tail, head });
+        }
         let key = runtime.key(layout)?;
-        Ok(runtime.cache.get(&key).map_or(CacheState::Missing, |e| {
-            if e.captured {
+        let state = runtime.cache.get(&key).map_or(CacheState::Missing, |e| {
+            if e.all_captured() {
                 CacheState::Graph
             } else {
                 CacheState::Direct {
-                    uses: e.direct_uses.get(),
+                    uses: e.trunk.direct_uses.get(),
                     consecutive: runtime.consecutive_uses(&key),
                 }
             }
-        }))
+        });
+        Ok(SplitStates::monolithic(state))
     }
+    #[cfg(test)]
+    pub(super) fn batch_cached(&self, layout: &Layout) -> Result<CacheState> {
+        Ok(self.batch_split_cached(layout)?.summary())
+    }
+    #[cfg(test)]
     pub(super) fn invalidate_batch(&mut self, layout: &Layout) -> Result<()> {
+        self.invalidate_parts(layout, true, true, true)
+    }
+    pub(super) fn invalidate_parts(
+        &mut self,
+        layout: &Layout,
+        trunk: bool,
+        tail: bool,
+        head: bool,
+    ) -> Result<()> {
         self.session.synchronize()?;
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
-        let key = runtime.key(layout)?;
-        runtime.remove(&key);
-        runtime.lru.retain(|k| k != &key);
+        if let Some(split) = runtime.split_keys(layout)? {
+            if trunk {
+                runtime.remove_trunk(&split.trunk);
+                runtime.trunk_lru.retain(|k| k != &split.trunk);
+            }
+            if tail && let Some(k) = &split.tail {
+                runtime.remove_tail(k);
+                runtime.tail_lru.retain(|x| x != k);
+            }
+            if head && let Some(k) = &split.head {
+                runtime.remove_head(k);
+                runtime.head_lru.retain(|x| x != k);
+            }
+        } else if trunk {
+            let key = runtime.key(layout)?;
+            runtime.remove(&key);
+            runtime.lru.retain(|k| k != &key);
+        }
         self.w4.retain(|_, w| w.strong_count() > 0);
         self.reserve_batch_memory(
             super::memory::Requirement::workspace(),
             "coordinated Graph preparation",
         )
     }
+    #[cfg(test)]
     pub(super) fn prepare_batch(&mut self, layout: &Layout, capture: bool) -> Result<()> {
+        let states = self.batch_split_cached(layout)?;
+        let action = |state: CacheState| PartAction {
+            invalidate: false,
+            prepare: match state {
+                CacheState::Missing => Some(capture),
+                CacheState::Direct { .. } if capture => Some(true),
+                _ => None,
+            },
+        };
+        self.prepare_parts(
+            layout,
+            SplitPlan {
+                trunk: action(states.trunk),
+                tail: states.tail.map(action),
+                head: states.head.map(action),
+            },
+        )
+    }
+    pub(super) fn prepare_parts(&mut self, layout: &Layout, plan: SplitPlan) -> Result<()> {
+        let split = self
+            .batch
+            .as_ref()
+            .ok_or("Missing batch runtime")?
+            .split_keys(layout)?;
+        if let Some(split) = split {
+            return self.prepare_split_parts(layout, split, plan);
+        }
+        let capture = plan.trunk.prepare.unwrap_or(false);
         let key = self
             .batch
             .as_ref()
             .ok_or("Missing batch runtime")?
             .key(layout)?;
         let previous = self.batch.as_ref().unwrap().cache.get(&key).cloned();
-        if previous.as_ref().is_none_or(|e| capture && !e.captured) {
+        if previous
+            .as_ref()
+            .is_none_or(|e| capture && !e.all_captured())
+        {
             let started = std::time::Instant::now();
             let before = (
                 self.phases.warmups.1,
@@ -881,17 +1377,20 @@ impl Worker {
                 .ok_or("Missing batch family")?;
             let packet_s = packet_started.elapsed().as_secs_f64();
             let guard_started = std::time::Instant::now();
-            // Every indirect state access checks this stream-ordered word.
-            // Capturing a new shape cannot overwrite live KV or C2 rings.
-            super::upload(
-                &self.session,
-                &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
-                &0i32.to_le_bytes(),
-            )?;
-            let guard_s = guard_started.elapsed().as_secs_f64();
-            let tables_started = std::time::Instant::now();
-            self.update_batch_tables(layout, &packet)?;
-            let tables_s = tables_started.elapsed().as_secs_f64();
+            let mut tables_s = 0.;
+            if capture {
+                // Every indirect state access checks this stream-ordered word.
+                // Capturing a new shape cannot overwrite live KV or C2 rings.
+                super::upload(
+                    &self.session,
+                    &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
+                    &0i32.to_le_bytes(),
+                )?;
+                let tables_started = std::time::Instant::now();
+                self.update_batch_tables(layout, &packet)?;
+                tables_s = tables_started.elapsed().as_secs_f64();
+            }
+            let guard_s = guard_started.elapsed().as_secs_f64() - tables_s;
             if layout.rows.total > packet.rows {
                 return Err("Batch exceeds its family row capacity".into());
             }
@@ -899,8 +1398,8 @@ impl Worker {
             let compile_started = std::time::Instant::now();
             let (body, head) = if let Some(previous) = &previous {
                 (
-                    self.capture_steps(&previous.body)?,
-                    self.capture_steps(&previous.head)?,
+                    self.capture_steps(&previous.trunk.steps)?,
+                    self.capture_steps(previous.head_steps())?,
                 )
             } else {
                 let body = self.compile_bound(
@@ -928,13 +1427,7 @@ impl Worker {
             let compile_s = compile_started.elapsed().as_secs_f64();
             self.batch.as_mut().unwrap().cache.insert(
                 key.clone(),
-                Rc::new(Execution {
-                    packet,
-                    body,
-                    head,
-                    captured: capture,
-                    direct_uses: std::cell::Cell::new(0),
-                }),
+                Rc::new(Execution::monolithic(packet, body, head, capture)),
             );
             if self.rank == 0 && std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
                 eprintln!(
@@ -943,7 +1436,7 @@ impl Worker {
                         "rows": key.rows, "decode": layout.decode, "capture": capture,
                         "promotion": previous.is_some(),
                         "family": format!("{:?}", key.family),
-                        "direct_uses": previous.as_ref().map_or(0, |e| e.direct_uses.get()),
+                        "direct_uses": previous.as_ref().map_or(0, |e| e.trunk.direct_uses.get()),
                         "consecutive_uses": self.batch.as_ref().unwrap().consecutive_uses(&key),
                         "owner_lengths": layout.segments.iter().map(|s| s.tokens).collect::<Vec<_>>(),
                         "decoder_rows": key.decoder_rows, "outputs": key.outputs,
@@ -972,6 +1465,200 @@ impl Worker {
         while runtime.cache.len() > runtime.capacity {
             let old = runtime.lru.pop_front().unwrap();
             runtime.remove(&old);
+        }
+        self.w4.retain(|_, w| w.strong_count() > 0);
+        Ok(())
+    }
+    fn prepare_split_parts(
+        &mut self,
+        layout: &Layout,
+        split: SplitKeys,
+        plan: SplitPlan,
+    ) -> Result<()> {
+        let need_trunk = plan.trunk.prepare.filter(|&cap| {
+            self.batch
+                .as_ref()
+                .unwrap()
+                .trunk_cache
+                .get(&split.trunk)
+                .is_none_or(|e| cap && !e.captured)
+        });
+        let need_tail = split.tail.as_ref().and_then(|k| {
+            plan.tail.and_then(|a| a.prepare).filter(|&cap| {
+                self.batch
+                    .as_ref()
+                    .unwrap()
+                    .tail_cache
+                    .get(k)
+                    .is_none_or(|e| cap && !e.captured)
+            })
+        });
+        let need_head = split.head.as_ref().and_then(|k| {
+            plan.head.and_then(|a| a.prepare).filter(|&cap| {
+                self.batch
+                    .as_ref()
+                    .unwrap()
+                    .head_cache
+                    .get(k)
+                    .is_none_or(|e| cap && !e.captured)
+            })
+        });
+        if need_trunk.is_some() || need_tail.is_some() || need_head.is_some() {
+            let started = std::time::Instant::now();
+            let any_capture =
+                need_trunk == Some(true) || need_tail == Some(true) || need_head == Some(true);
+            self.reserve_batch_memory(
+                super::memory::Requirement::workspace(),
+                "Graph preparation",
+            )?;
+            let packet = self
+                .packet_templates
+                .iter()
+                .find(|p| {
+                    p.role == layout.role
+                        && p.batch_decode == layout.decode
+                        && p.min_rows == split.family.2
+                })
+                .cloned()
+                .ok_or("Missing batch family")?;
+            if layout.rows.total > packet.rows {
+                return Err("Batch exceeds its family row capacity".into());
+            }
+            if any_capture {
+                super::upload(
+                    &self.session,
+                    &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
+                    &0i32.to_le_bytes(),
+                )?;
+                self.update_batch_tables(layout, &packet)?;
+            }
+            let split_idx = self.batch.as_ref().unwrap().tables[&split.family]
+                .decoder_split
+                .ok_or("Missing decoder split index")?;
+            let base = self.package.clone();
+            if let Some(capture) = need_trunk {
+                let prev = self
+                    .batch
+                    .as_ref()
+                    .unwrap()
+                    .trunk_cache
+                    .get(&split.trunk)
+                    .cloned();
+                let steps = if let Some(prev) = prev {
+                    self.capture_steps(&prev.steps)?
+                } else {
+                    self.compile_bound(
+                        &packet.body[..split_idx],
+                        &base,
+                        self.snapshots,
+                        (packet.rows, layout.rows.total),
+                        Some(layout),
+                        capture,
+                    )?
+                };
+                self.batch.as_mut().unwrap().trunk_cache.insert(
+                    split.trunk.clone(),
+                    Rc::new(SubProgram {
+                        steps,
+                        captured: capture,
+                        direct_uses: std::cell::Cell::new(0),
+                    }),
+                );
+            }
+            if let (Some(tail_key), Some(capture)) = (&split.tail, need_tail) {
+                let prev = self
+                    .batch
+                    .as_ref()
+                    .unwrap()
+                    .tail_cache
+                    .get(tail_key)
+                    .cloned();
+                let steps = if let Some(prev) = prev {
+                    self.capture_steps(&prev.steps)?
+                } else {
+                    self.compile_bound(
+                        &packet.body[split_idx..],
+                        &base,
+                        self.snapshots,
+                        (packet.rows, layout.rows.total),
+                        Some(layout),
+                        capture,
+                    )?
+                };
+                self.batch.as_mut().unwrap().tail_cache.insert(
+                    tail_key.clone(),
+                    Rc::new(SubProgram {
+                        steps,
+                        captured: capture,
+                        direct_uses: std::cell::Cell::new(0),
+                    }),
+                );
+            }
+            if let (Some(head_key), Some(capture)) = (&split.head, need_head) {
+                let prev = self
+                    .batch
+                    .as_ref()
+                    .unwrap()
+                    .head_cache
+                    .get(head_key)
+                    .cloned();
+                let steps = if let Some(prev) = prev {
+                    self.capture_steps(&prev.steps)?
+                } else {
+                    self.compile_bound(
+                        &packet.head,
+                        &base,
+                        false,
+                        (packet.rows, layout.rows.total),
+                        Some(layout),
+                        capture,
+                    )?
+                };
+                self.batch.as_mut().unwrap().head_cache.insert(
+                    head_key.clone(),
+                    Rc::new(SubProgram {
+                        steps,
+                        captured: capture,
+                        direct_uses: std::cell::Cell::new(0),
+                    }),
+                );
+            }
+            if self.rank == 0 && std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+                eprintln!(
+                    "A2 split prepare {}",
+                    serde_json::json!({
+                        "rows": layout.rows.total,
+                        "decoder_rows": split.tail.as_ref().map(|k| k.decoder_rows),
+                        "outputs": layout.outputs.len(),
+                        "trunk": need_trunk, "tail": need_tail, "head": need_head,
+                        "wall_s": started.elapsed().as_secs_f64(),
+                    })
+                );
+            }
+        }
+        let runtime = self.batch.as_mut().unwrap();
+        let cap = runtime.capacity;
+        runtime.touch_trunk(split.trunk);
+        while runtime.trunk_cache.len() > cap {
+            if let Some(old) = runtime.trunk_lru.pop_front() {
+                runtime.remove_trunk(&old);
+            }
+        }
+        if let Some(k) = split.tail {
+            runtime.touch_tail(k);
+            while runtime.tail_cache.len() > cap {
+                if let Some(old) = runtime.tail_lru.pop_front() {
+                    runtime.remove_tail(&old);
+                }
+            }
+        }
+        if let Some(k) = split.head {
+            runtime.touch_head(k);
+            while runtime.head_cache.len() > cap {
+                if let Some(old) = runtime.head_lru.pop_front() {
+                    runtime.remove_head(&old);
+                }
+            }
         }
         self.w4.retain(|_, w| w.strong_count() > 0);
         Ok(())
@@ -1192,14 +1879,38 @@ impl Worker {
         {
             return Err("Batch input differs from row layout".into());
         }
-        let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
-        let key = runtime.key(layout)?;
-        let execution = Rc::clone(
-            runtime
-                .cache
-                .get(&key)
-                .ok_or("Batch must be prepared before forward")?,
-        );
+        let (split_keys, mono_key, execution) = {
+            let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+            let split = runtime.split_keys(layout)?;
+            let mono = if split.is_none() {
+                Some(runtime.key(layout)?)
+            } else {
+                None
+            };
+            let execution = runtime
+                .execution(layout, &self.packet_templates)?
+                .ok_or("Batch must be prepared before forward")?;
+            (split, mono, execution)
+        };
+        {
+            let runtime = self.batch.as_mut().unwrap();
+            if let Some(split) = &split_keys {
+                runtime.touch_trunk(split.trunk.clone());
+                if let Some(k) = &split.tail {
+                    runtime.touch_tail(k.clone());
+                }
+                if let Some(k) = &split.head {
+                    runtime.touch_head(k.clone());
+                }
+            } else if let Some(k) = &mono_key {
+                runtime.touch_shared_packet(k.clone());
+            }
+            for segment in &layout.segments {
+                if let Some(owner) = runtime.owners.get_mut(&segment.slot) {
+                    owner.clean = false;
+                }
+            }
+        }
         let retained = self.update_batch_tables(layout, &execution.packet)?;
         let device_input = if std::env::var_os("ORINFER_A2_BATCH_TRACE").is_none() {
             if let Some(mut runtime) = self.device_inputs.take() {
@@ -1482,7 +2193,7 @@ impl Worker {
             pending.wait()?;
             sampled?
         };
-        if !execution.captured {
+        if !execution.all_captured() {
             execution.record_shared_use();
         }
         if readout.store_draft_distributions {
@@ -1559,11 +2270,12 @@ impl Worker {
                     .collect()
             };
             let mut logits = BTreeMap::new();
-            for range in readout.logit_ranges(
+            let ranges = readout.logit_ranges(
                 outputs
                     .iter()
                     .map(|&(row, lane)| (row, layout.segments[lane].slot)),
-            ) {
+            );
+            if !ranges.is_empty() {
                 let source = get(
                     &self.buffers,
                     execution
@@ -1572,20 +2284,36 @@ impl Worker {
                         .as_ref()
                         .ok_or("Missing batch logits")?,
                 )?;
-                let bytes = self.session.download(
-                    &source,
-                    range.start * 16160 * 4,
-                    range.len() * 16160 * 4,
-                )?;
-                for (offset, data) in bytes.as_chunks::<{ 16160 * 4 }>().0.iter().enumerate() {
-                    logits.insert(
-                        range.start + offset,
-                        data.as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|v| f32::from_le_bytes(*v))
-                            .collect::<Vec<_>>(),
-                    );
+                let total_bytes = ranges
+                    .iter()
+                    .try_fold(0usize, |sum, r| sum.checked_add(r.len() * 16160 * 4))
+                    .ok_or("Logit readback extent overflow")?;
+                let chunks = if total_bytes <= self.session.pinned_limit() {
+                    let spans = ranges
+                        .iter()
+                        .map(|r| (&source, r.start * 16160 * 4, r.len() * 16160 * 4))
+                        .collect::<Vec<_>>();
+                    self.session.download_compute_many(&spans)?
+                } else {
+                    ranges
+                        .iter()
+                        .map(|r| {
+                            self.session
+                                .download(&source, r.start * 16160 * 4, r.len() * 16160 * 4)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+                for (range, bytes) in ranges.into_iter().zip(chunks) {
+                    for (offset, data) in bytes.as_chunks::<{ 16160 * 4 }>().0.iter().enumerate() {
+                        logits.insert(
+                            range.start + offset,
+                            data.as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|v| f32::from_le_bytes(*v))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
                 }
             }
             for (i, lane) in outputs {
@@ -1634,12 +2362,38 @@ impl Worker {
                 .history
                 .extend_from_slice(input);
         }
-        if !execution.captured {
-            execution
-                .direct_uses
-                .set(execution.direct_uses.get().saturating_add(1));
+        if let Some(split) = split_keys {
+            if !execution.trunk.captured {
+                execution
+                    .trunk
+                    .direct_uses
+                    .set(execution.trunk.direct_uses.get().saturating_add(1));
+            }
+            let runtime = self.batch.as_mut().unwrap();
+            runtime.record_trunk_use(split.trunk);
+            if let (Some(tail_key), Some(tail)) = (split.tail, &execution.tail) {
+                if !tail.captured {
+                    tail.direct_uses
+                        .set(tail.direct_uses.get().saturating_add(1));
+                }
+                runtime.record_tail_use(tail_key);
+            }
+            if let (Some(head_key), Some(head)) = (split.head, &execution.head) {
+                if !head.captured {
+                    head.direct_uses
+                        .set(head.direct_uses.get().saturating_add(1));
+                }
+                runtime.record_head_use(head_key);
+            }
+        } else if let Some(key) = mono_key {
+            if !execution.all_captured() {
+                execution
+                    .trunk
+                    .direct_uses
+                    .set(execution.trunk.direct_uses.get().saturating_add(1));
+            }
+            self.batch.as_mut().unwrap().record_use(key);
         }
-        self.batch.as_mut().unwrap().record_use(key);
         Ok(output)
     }
     fn sample_batch(
@@ -1689,7 +2443,7 @@ impl Worker {
                 &source,
                 execution.packet.vocab_first,
                 (&controls, &proposals),
-                execution.captured,
+                execution.all_captured(),
             )?));
         }
         let sampled = self.sampling.as_mut().unwrap().enqueue_sample(
@@ -1698,7 +2452,7 @@ impl Worker {
             execution.packet.vocab_first,
             &readout.controls(layout)?,
             &readout.row_parameters(layout)?,
-            execution.captured,
+            execution.all_captured(),
         )?;
         // Return the already-produced local samples while device continuation
         // preparation proceeds on the same stream after this readback fence.

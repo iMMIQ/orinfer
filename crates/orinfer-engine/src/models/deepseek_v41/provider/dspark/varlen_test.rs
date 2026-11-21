@@ -200,7 +200,10 @@ fn retained_work(producer: bool, final_prompt: bool) {
                 .team
                 .forward_with(view, tokens.clone(), true, None, || {})
                 .unwrap();
-            runtime.team.exchange(Command::EndVerification).unwrap();
+            runtime
+                .team
+                .exchange(Command::FinishVerification(vec![]))
+                .unwrap();
             results.push((output, timing));
         }
         assert!(

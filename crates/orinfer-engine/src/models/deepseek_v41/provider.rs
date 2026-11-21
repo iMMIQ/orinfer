@@ -481,6 +481,7 @@ impl Runtime {
             tokens: input.to_vec(),
             media,
             image_work,
+            checkpoint: Default::default(),
         })
     }
     pub fn estimated_request_cost(
@@ -494,7 +495,7 @@ impl Runtime {
         if hint.owner != self.owner {
             return Err("Foreign A2 request hint".into());
         }
-        let hit = self.matched(&hint.tokens, &hint.media);
+        let hit = self.matched_hint(hint);
         let cached = hit.map_or(0, |h| self.entry(h).tokens.len());
         let remaining = hint.tokens.len().saturating_sub(cached);
         let image_s = hint.image_work as f64 * self.vision_seconds_per_patch
@@ -600,7 +601,30 @@ impl Runtime {
                 .ok_or("Owner token budget overflow")?,
             options.memory_reserve_bytes,
         )?;
-        memory::ensure_budget(self, needed)
+        let capacity = self.prefill_packet_capacity();
+        if options.policy != scheduler::Policy::Latency
+            || self.active.is_empty()
+            || input.input_tokens.len() <= capacity
+        {
+            return memory::ensure_budget(self, needed);
+        }
+        if self.team.has_budget(needed)? {
+            return Ok(true);
+        }
+        let media = Media::images(&input.input_tokens, &input.images, self.vision())?;
+        let cached = self
+            .matched(&input.input_tokens, &media)
+            .map_or(0, |hit| self.entry(hit).tokens.len());
+        if input.input_tokens.len().saturating_sub(cached) > capacity {
+            // Let live owners progress while the scheduler waits for memory
+            // to admit a cold prompt. Its aged memory guard prevents starvation.
+            return Ok(false);
+        }
+        if memory::reclaim_one(self)? {
+            memory::ensure_budget(self, needed)
+        } else {
+            self.team.has_budget(needed)
+        }
     }
 
     pub fn start_request(
@@ -621,32 +645,13 @@ impl Runtime {
             .ok_or("A2 owner capacity exhausted")?;
         let resident = !self.head_only(&input);
         let setup_s = started.elapsed().as_secs_f64() - reap_s;
-        let mut admit_s = 0.;
-        let mut limit_s = 0.;
-        if resident {
-            let at = Instant::now();
-            self.team.exchange(Command::Admit(vec![slot]))?;
-            admit_s = at.elapsed().as_secs_f64();
-            let at = Instant::now();
-            self.team.exchange(Command::Limit(
-                slot,
-                input
-                    .input_tokens
-                    .len()
-                    .checked_add(input.max_new_tokens)
-                    .ok_or("Owner token budget overflow")?,
-            ))?;
-            limit_s = at.elapsed().as_secs_f64();
-            self.resident.insert(slot);
-        }
-        self.active.insert(slot);
         let mut prefix = crate::prefix::Statistics::default();
         let mut offset = 0;
         let mut ready_output = None;
         let at = Instant::now();
         let matched = self.matched(&input.input_tokens, &media);
         let lookup_s = at.elapsed().as_secs_f64();
-        if let Some(id) = matched {
+        let snapshot_id = if let Some(id) = matched {
             let entry = if id.0 {
                 self.cache.host.touch(id.1)
             } else {
@@ -655,29 +660,40 @@ impl Runtime {
             if id.0 {
                 prefix.host_hits += 1;
             }
-            let at = Instant::now();
-            if resident {
-                let restored = self.team.exchange(Command::Restore {
-                    owner: slot,
-                    snapshot: entry.snapshot.id,
-                });
-                if let Err(error) = restored {
-                    self.active.remove(&slot);
-                    self.resident.remove(&slot);
-                    let _ = self.team.exchange(Command::Release(Some(slot)));
-                    return Err(error);
-                }
-                prefix.restore_s = at.elapsed().as_secs_f64();
-                self.prefill_costs
-                    .observe_restore(id.0, entry.tokens.len(), prefix.restore_s);
-            }
             prefix.cached_tokens = entry.tokens.len();
             prefix.matched_tokens = entry.tokens.len();
             offset = entry.tokens.len();
             if offset == input.input_tokens.len() {
                 ready_output.clone_from(&entry.snapshot.output);
             }
+            Some((id.0, entry.snapshot.id))
+        } else {
+            None
+        };
+        let mut admit_s = 0.;
+        if resident {
+            let limit = input
+                .input_tokens
+                .len()
+                .checked_add(input.max_new_tokens)
+                .ok_or("Owner token budget overflow")?;
+            let at = Instant::now();
+            self.team.exchange(Command::StartOwner {
+                slot,
+                limit,
+                snapshot: snapshot_id.map(|(_, sid)| sid),
+            })?;
+            let elapsed = at.elapsed().as_secs_f64();
+            if let Some((host_tier, _)) = snapshot_id {
+                prefix.restore_s = elapsed;
+                self.prefill_costs
+                    .observe_restore(host_tier, offset, prefix.restore_s);
+            } else {
+                admit_s = elapsed;
+            }
+            self.resident.insert(slot);
         }
+        self.active.insert(slot);
         self.statistics.admissions += 1;
         self.statistics.request_start_s += started.elapsed().as_secs_f64();
         self.statistics.prefix_restore_s += prefix.restore_s;
@@ -689,7 +705,7 @@ impl Runtime {
                     "owner": slot, "tokens": input.input_tokens.len(),
                     "cached_tokens": offset, "resident": resident,
                     "wall_s": started.elapsed().as_secs_f64(), "reap_s": reap_s,
-                    "setup_s": setup_s, "admit_s": admit_s, "limit_s": limit_s,
+                    "setup_s": setup_s, "admit_s": admit_s, "limit_s": 0.0,
                     "lookup_s": lookup_s, "restore_s": prefix.restore_s,
                 })
             );
@@ -730,19 +746,23 @@ impl Runtime {
         } else {
             request.history.len().saturating_sub(1)
         };
-        if count == 0
+        if count == 0 {
+            return Ok(());
+        }
+        let tokens = &request.history[..count];
+        let exists = self
+            .cache
+            .device
+            .exact_matches(tokens, &request.media)
+            .into_iter()
+            .any(|id| output.is_none() || self.cache.device.entries[&id].logits_valid)
             || self
                 .cache
-                .device
-                .entries
-                .values()
-                .chain(self.cache.host.entries.values())
-                .any(|e| {
-                    e.tokens == request.history[..count]
-                        && e.media.common_tokens(&request.media, count) == count
-                        && (output.is_none() || e.logits_valid)
-                })
-        {
+                .host
+                .exact_matches(tokens, &request.media)
+                .into_iter()
+                .any(|id| output.is_none() || self.cache.host.entries[&id].logits_valid);
+        if exists {
             return Ok(());
         }
         if output.is_some_and(|o| o.logits.len() != self.vocab()) {
@@ -760,12 +780,16 @@ impl Runtime {
         let (snapshot, bytes) = loop {
             // Eviction can remove the owner's parent lineage. Re-plan after
             // every reclamation, before allocating or committing any new bank.
-            let banks = if host {
-                self.team
-                    .host_allocations(request.slot, id, output.is_some(), true)?
+            let (banks, min_device_free, min_session_free) = if host {
+                (
+                    self.team
+                        .host_allocations(request.slot, id, output.is_some(), true)?,
+                    usize::MAX,
+                    usize::MAX,
+                )
             } else {
                 self.team
-                    .plan_snapshot_allocations(request.slot, id, output.is_some())?
+                    .plan_snapshot_with_budget(request.slot, id, output.is_some())?
             };
             let incoming = banks
                 .get(&crate::backend::kv::checkpoint_id(id)?)
@@ -822,9 +846,7 @@ impl Runtime {
             }
             if !host
                 && incoming != 0
-                && !self
-                    .team
-                    .has_budget(memory::Requirement::snapshot(incoming)?)?
+                && !memory::Requirement::snapshot(incoming)?.fits(min_device_free, min_session_free)
             {
                 if !memory::reclaim_one(self)? {
                     if self.cache.host.budget > 0 {
@@ -849,15 +871,7 @@ impl Runtime {
         };
         // Upgrade endpoints across both tiers after the new snapshot is complete.
         for cache in [&mut self.cache.device, &mut self.cache.host] {
-            let obsolete = cache
-                .entries
-                .iter()
-                .filter(|(_, e)| {
-                    e.tokens == request.history[..count]
-                        && e.media.common_tokens(&request.media, count) == count
-                })
-                .map(|(&id, _)| id)
-                .collect::<Vec<_>>();
+            let obsolete = cache.exact_matches(&request.history[..count], &request.media);
             for old in obsolete {
                 let entry = cache.remove(old).ok_or("Missing upgraded A2 prefix")?;
                 self.team.exchange(Command::Evict(entry.snapshot.id))?;
@@ -899,7 +913,7 @@ impl Runtime {
             return Ok(false);
         }
         let cached = self
-            .matched(&hint.tokens, &hint.media)
+            .matched_hint(hint)
             .map_or(0, |hit| self.entry(hit).tokens.len());
         if request.offset > cached
             && request.media.common_tokens(&hint.media, request.offset) == request.offset
@@ -908,7 +922,7 @@ impl Runtime {
         {
             self.store(request, None)?;
             Ok(self
-                .matched(&hint.tokens, &hint.media)
+                .matched_hint(hint)
                 .is_some_and(|hit| self.entry(hit).tokens.len() > cached))
         } else {
             let common = request
@@ -1040,6 +1054,20 @@ impl Runtime {
         };
         self.advance_selection(selection, requests, options, false, maintenance)
     }
+    pub(super) fn begin_forward_with_workspace(
+        &mut self,
+        layout: &Layout,
+        error: &str,
+    ) -> Result<super::team::PreparedForward> {
+        let prepared = self.team.begin_forward(layout)?;
+        if !prepared.all_graphs() && !prepared.workspace_fits {
+            if !memory::ensure_budget(self, memory::Requirement::workspace())? {
+                return Err(error.into());
+            }
+            return self.team.begin_forward(layout);
+        }
+        Ok(prepared)
+    }
     fn advance_selection(
         &mut self,
         selection: packet::Selection,
@@ -1058,11 +1086,10 @@ impl Runtime {
             prefill_requests,
             ..
         } = selection;
-        if self.team.needs_preparation(&layout)?
-            && !memory::ensure_budget(self, memory::Requirement::workspace())?
-        {
-            return Err("Insufficient A2 workspace after reclaiming cached state".into());
-        }
+        let prepared = self.begin_forward_with_workspace(
+            &layout,
+            "Insufficient A2 workspace after reclaiming cached state",
+        )?;
         let shared = packet::mark_shared(&selected, requests);
         let work = packet::work(&selected, requests, prefill_rows);
         let prefill_work = self.prefill_work(&selected, requests, full, layout.decode);
@@ -1094,9 +1121,14 @@ impl Runtime {
         let mut readout =
             packet::target_readout(requests, full, &BTreeMap::new(), self.vocab(), &selected)?;
         self.prepare_host_inputs(&layout, &selected, requests, &mut readout);
-        let (values, timing) =
-            self.team
-                .forward_with(layout, tokens, readout, Some(capture), maintenance)?;
+        let (values, timing) = self.team.finish_forward(
+            prepared,
+            layout,
+            tokens,
+            readout,
+            Some(capture),
+            maintenance,
+        )?;
         timing.record(&mut self.statistics.batch_execution);
         self.observe_prefill(prefill_work, &timing);
         let seconds = timing.seconds;

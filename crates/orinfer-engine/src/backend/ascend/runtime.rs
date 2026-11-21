@@ -65,11 +65,14 @@ pub(crate) struct Context {
     limits: Limits,
     device_bytes: Cell<usize>,
     pinned_bytes: Cell<usize>,
-    poisoned: Cell<bool>,
+    pub(crate) poisoned: Cell<bool>,
     graphs_enabled: Cell<bool>,
     // Only retired completion generations enter this context-local cache.
     // Raw handles avoid an Rc cycle back into their owning context.
     completion_events: RefCell<Vec<Handle>>,
+    // Fenced auxiliary branch streams/events returned by dropped Branches.
+    pub(crate) branch_streams: RefCell<Vec<Handle>>,
+    pub(crate) branch_events: RefCell<Vec<Handle>>,
 }
 
 pub(crate) struct Current<'a> {
@@ -156,6 +159,15 @@ impl Drop for Context {
             for event in self.completion_events.get_mut().drain(..) {
                 // Every cached event was fenced and lost its last Ticket/waiter.
                 (self.api.destroy_event)(event);
+            }
+            for event in self.branch_events.get_mut().drain(..) {
+                (self.api.destroy_event)(event);
+            }
+            for stream in self.branch_streams.get_mut().drain(..) {
+                if !stream.is_null() {
+                    (self.api.sync_stream)(stream, self.limits.timeout_ms);
+                    (self.api.destroy_stream)(stream);
+                }
             }
             for stream in [self.transfer, self.compute] {
                 if !stream.is_null() {
@@ -404,6 +416,8 @@ impl Session {
             poisoned: Cell::new(false),
             graphs_enabled: Cell::new(true),
             completion_events: RefCell::new(vec![]),
+            branch_streams: RefCell::new(vec![]),
+            branch_events: RefCell::new(vec![]),
         };
         let previous = api.current()?;
         // SAFETY: Valid device index and live output slots. Only successful
@@ -474,6 +488,9 @@ impl Session {
     /// Physical pinned storage, including idle reusable buffers.
     pub fn pinned_bytes(&self) -> usize {
         self.context.pinned_bytes.get()
+    }
+    pub(crate) fn pinned_limit(&self) -> usize {
+        self.context.limits.pinned_bytes
     }
     /// Release cached idle capacity. In-flight backing stays completion-owned.
     pub fn trim_pinned_cache(&self) {
@@ -789,6 +806,7 @@ impl Session {
     }
     /// Upload borrowed regions in compute order, retaining only bounded pinned slabs.
     pub(crate) fn upload_regions(&self, inputs: &[(Buffer, usize, &[u8])]) -> Result<Ticket> {
+        let stream = self.context.compute;
         let mut bytes = 0usize;
         for (buffer, offset, data) in inputs {
             self.require(buffer)?;
@@ -855,7 +873,7 @@ impl Session {
                 }
             }
             last = Some(self.submit(
-                self.context.compute,
+                stream,
                 Retained {
                     _buffers: pieces.iter().map(|(b, ..)| b.clone()).collect(),
                     _host: Some(Rc::clone(&host)),

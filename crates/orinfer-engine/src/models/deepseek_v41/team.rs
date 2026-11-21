@@ -1,7 +1,7 @@
 //! Thread-affine TP workers shared by benchmarks and continuous generation.
 use super::{
     Model, SharedTables, Worker, affinity,
-    batch::{CacheState, Layout},
+    batch::{CacheState, Layout, PartAction, SplitPlan, SplitStates},
     load_spec,
 };
 use crate::backend::ascend::{
@@ -25,29 +25,38 @@ use std::{
 #[derive(Clone)]
 pub(super) enum Command {
     Admit(Vec<usize>),
+    StartOwner {
+        slot: usize,
+        limit: usize,
+        snapshot: Option<u64>,
+    },
     BeginImages(Arc<Vec<crate::vision::ImageInput>>),
     AdvanceImages(usize),
     CancelImages,
     InstallImages(usize, Arc<Vec<super::vision::Span>>),
-    Limit(usize, usize),
     GrowCached(Layout),
     OwnerRequirement(usize, usize),
     Reset(Vec<usize>),
     Release(Option<usize>),
+    #[cfg(test)]
     Cached(Layout),
+    #[cfg(test)]
     Invalidate(Layout),
+    InvalidateParts(Layout, bool, bool, bool),
+    #[cfg(test)]
     Prepare(Layout, bool),
+    PrepareParts(Layout, SplitPlan),
     Shared(Layout),
     CaptureShared(Layout, String),
-    Forward(Layout, Vec<Vec<u32>>, Readout, Option<bool>, Vec<String>),
+    Forward(Layout, Vec<Vec<u32>>, Readout, Vec<String>),
     BeginVerification(Vec<(usize, usize)>),
-    RollbackVerification(Vec<(usize, usize)>),
-    EndVerification,
+    FinishVerification(Vec<(usize, usize)>),
     Save {
         owner: usize,
         snapshot: u64,
         complete: bool,
     },
+    #[cfg(test)]
     Restore {
         owner: usize,
         snapshot: u64,
@@ -78,10 +87,17 @@ pub(super) enum Command {
 pub(super) enum Reply {
     Ready,
     Image(Option<super::vision::Encoded>),
+    #[cfg(test)]
     Cached(CacheState),
+    SplitCached(SplitStates, bool),
     Outputs(Vec<Output>, bool),
     Shared(Vec<super::shared::State>),
     Allocations(BTreeMap<u64, usize>),
+    SnapshotPlan {
+        allocations: BTreeMap<u64, usize>,
+        device_free: usize,
+        session_free: usize,
+    },
     RoutingGroups(Vec<RoutingGroup>),
     Capacity(bool),
     Requirement(super::memory::Requirement),
@@ -505,15 +521,16 @@ impl Team {
                                         Ok(())
                                     })
                                     .and_then(|_| {
+                                        // Compute-stream ordered before verification forward.
                                         if !copies.is_empty() {
-                                            worker.session.copy_many(&copies)?.wait()?;
+                                            worker.session.copy_many(&copies)?;
                                         }
                                         Ok(Reply::Ready)
                                     })
                             }
-                            Command::RollbackVerification(owners) => {
+                            Command::FinishVerification(owners) => {
                                 let mut copies = vec![];
-                                owners
+                                let result = owners
                                     .into_iter()
                                     .try_for_each(|(id, keep)| {
                                         worker.restore_mutable(
@@ -526,19 +543,19 @@ impl Team {
                                         )
                                     })
                                     .and_then(|_| {
+                                        // Compute-stream ordered before subsequent draft/verify;
+                                        // copy_many retains journal buffers through completion.
                                         if !copies.is_empty() {
-                                            worker.session.copy_many(&copies)?.wait()?;
+                                            worker.session.copy_many(&copies)?;
                                         }
                                         Ok(Reply::Ready)
-                                    })
-                            }
-                            Command::EndVerification => {
+                                    });
                                 journal_pool.append(&mut journal);
-                                Ok(Reply::Ready)
+                                result
                             }
-                            Command::Budget(requirement) => worker
-                                .available_memory()
-                                .map(|m| Reply::Capacity(requirement.fits(m.0, m.1))),
+                            Command::Budget(requirement) => {
+                                worker.check_budget(requirement).map(Reply::Capacity)
+                            }
                             Command::Reclaim => worker.evict_batch_program().map(Reply::Capacity),
                             Command::PlanSnapshot {
                                 owner,
@@ -548,7 +565,22 @@ impl Team {
                                 let parent = lineage.get(&owner).and_then(|id| snapshots.get(id));
                                 worker
                                     .plan_owner_snapshot(owner, complete, snapshot, parent)
-                                    .map(Reply::Allocations)
+                                    .and_then(|allocations| {
+                                        let incoming = allocations
+                                            .get(&crate::backend::kv::checkpoint_id(snapshot)?)
+                                            .copied()
+                                            .unwrap_or(0);
+                                        let (device_free, session_free) = if incoming != 0 {
+                                            worker.available_memory()?
+                                        } else {
+                                            (usize::MAX, usize::MAX)
+                                        };
+                                        Ok(Reply::SnapshotPlan {
+                                            allocations,
+                                            device_free,
+                                            session_free,
+                                        })
+                                    })
                             }
                             Command::PlanHost {
                                 owner,
@@ -642,13 +674,46 @@ impl Team {
                                 Ok(Reply::Ready)
                             }
                             Command::Admit(ids) => worker.admit(&ids).map(|_| Reply::Ready),
-                            Command::Limit(id, tokens) => {
-                                worker.limit_owner(id, tokens).map(|_| Reply::Ready)
-                            }
+                            Command::StartOwner {
+                                slot,
+                                limit,
+                                snapshot,
+                            } => worker.admit(&[slot]).and_then(|()| {
+                                let step = worker.limit_owner(slot, limit).and_then(|()| {
+                                    if let Some(snapshot) = snapshot {
+                                        let restored = if let Some(saved) = snapshots.get(&snapshot)
+                                        {
+                                            worker.restore_owner(slot, saved)
+                                        } else if let Some(saved) = host_snapshots.get(&snapshot) {
+                                            worker.restore_host_snapshot(slot, saved)
+                                        } else {
+                                            Err("Missing A2 prefix snapshot".into())
+                                        };
+                                        restored.map(|()| {
+                                            lineage.insert(slot, snapshot);
+                                        })
+                                    } else {
+                                        Ok(())
+                                    }
+                                });
+                                if step.is_err() {
+                                    let _ = worker.release_owner(slot);
+                                }
+                                step.map(|()| Reply::Ready)
+                            }),
                             Command::GrowCached(layout) => worker
                                 .grow_batch(&layout)
-                                .and_then(|()| worker.batch_cached(&layout))
-                                .map(Reply::Cached),
+                                .and_then(|()| worker.batch_split_cached(&layout))
+                                .and_then(|states| {
+                                    let workspace_fits = if !states.any_missing() {
+                                        true
+                                    } else {
+                                        let (device, session) = worker.available_memory()?;
+                                        super::memory::Requirement::workspace()
+                                            .fits(device, session)
+                                    };
+                                    Ok(Reply::SplitCached(states, workspace_fits))
+                                }),
                             Command::OwnerRequirement(tokens, reserve) => worker
                                 .owner_requirement(tokens, reserve)
                                 .map(Reply::Requirement),
@@ -673,14 +738,23 @@ impl Team {
                                 lineage.remove(&owner);
                                 worker.release_owner(owner).map(|_| Reply::Ready)
                             }
+                            #[cfg(test)]
                             Command::Cached(layout) => {
                                 worker.batch_cached(&layout).map(Reply::Cached)
                             }
+                            #[cfg(test)]
                             Command::Invalidate(layout) => {
                                 worker.invalidate_batch(&layout).map(|_| Reply::Ready)
                             }
+                            Command::InvalidateParts(layout, trunk, tail, head) => worker
+                                .invalidate_parts(&layout, trunk, tail, head)
+                                .map(|_| Reply::Ready),
+                            #[cfg(test)]
                             Command::Prepare(layout, capture) => {
                                 worker.prepare_batch(&layout, capture).map(|_| Reply::Ready)
+                            }
+                            Command::PrepareParts(layout, plan) => {
+                                worker.prepare_parts(&layout, plan).map(|_| Reply::Ready)
                             }
                             Command::Shared(layout) => {
                                 worker.shared_state(&layout).map(Reply::Shared)
@@ -688,9 +762,8 @@ impl Team {
                             Command::CaptureShared(layout, id) => {
                                 worker.capture_shared(&layout, &id).map(Reply::Shared)
                             }
-                            Command::Forward(layout, tokens, readout, cached, shared) => cached
-                                .map_or(Ok(()), |capture| worker.prepare_batch(&layout, capture))
-                                .and_then(|()| worker.select_shared(&layout, &shared))
+                            Command::Forward(layout, tokens, readout, shared) => worker
+                                .select_shared(&layout, &shared)
                                 .and_then(|()| worker.forward_batch(&layout, &tokens, &readout))
                                 .map(|values| Reply::Outputs(values, !shared.is_empty())),
                             Command::Save {
@@ -708,6 +781,7 @@ impl Team {
                                         Reply::Allocations(allocations)
                                     })
                             }
+                            #[cfg(test)]
                             Command::Restore { owner, snapshot } => {
                                 let restored = if let Some(saved) = snapshots.get(&snapshot) {
                                     worker.restore_owner(owner, saved)
@@ -764,6 +838,7 @@ impl Team {
     ) -> Result<(Vec<Output>, f64, f64)> {
         forward(&self.peers, layout, tokens, full, self.graphs_enabled)
     }
+    #[cfg(test)]
     pub fn forward_with(
         &self,
         layout: Layout,
@@ -832,29 +907,81 @@ impl Team {
             complete,
         })
     }
-    pub fn plan_snapshot_allocations(
+    pub fn begin_forward(&self, layout: &Layout) -> Result<PreparedForward> {
+        begin_forward(&self.peers, layout)
+    }
+    pub fn finish_forward(
+        &self,
+        prepared: PreparedForward,
+        layout: Layout,
+        tokens: Vec<Vec<u32>>,
+        readout: impl Into<Readout>,
+        budget: Option<CaptureBudget>,
+        maintenance: impl FnOnce(),
+    ) -> Result<(Vec<Output>, Timing)> {
+        finish_forward(
+            &self.peers,
+            prepared,
+            layout,
+            tokens,
+            readout.into(),
+            budget,
+            maintenance,
+            self.graphs_enabled,
+        )
+    }
+    pub fn plan_snapshot_with_budget(
         &self,
         owner: usize,
         snapshot: u64,
         complete: bool,
-    ) -> Result<BTreeMap<u64, usize>> {
-        self.allocations(Command::PlanSnapshot {
-            owner,
-            snapshot,
-            complete,
-        })
+    ) -> Result<(BTreeMap<u64, usize>, usize, usize)> {
+        let mut result: Option<BTreeMap<u64, usize>> = None;
+        let mut min_device = usize::MAX;
+        let mut min_session = usize::MAX;
+        for (rank, reply) in self
+            .exchange(Command::PlanSnapshot {
+                owner,
+                snapshot,
+                complete,
+            })?
+            .into_iter()
+            .enumerate()
+        {
+            let Reply::SnapshotPlan {
+                allocations,
+                device_free,
+                session_free,
+            } = reply
+            else {
+                return Err("Invalid A2 snapshot plan reply".into());
+            };
+            min_device = min_device.min(device_free);
+            min_session = min_session.min(session_free);
+            if let Some(combined) = &mut result {
+                if !combined.keys().eq(allocations.keys()) {
+                    return Err(format!(
+                        "TP snapshot allocation lineage differs on rank {rank}"
+                    ));
+                }
+                for (id, bytes) in allocations {
+                    *combined.get_mut(&id).unwrap() = combined[&id].max(bytes);
+                }
+            } else {
+                result = Some(allocations);
+            }
+        }
+        Ok((
+            result.ok_or_else(|| "Empty A2 snapshot team".to_string())?,
+            min_device,
+            min_session,
+        ))
     }
     pub fn has_budget(&self, requirement: super::memory::Requirement) -> Result<bool> {
         Ok(self
             .capacities(Command::Budget(requirement))?
             .into_iter()
             .all(|v| v))
-    }
-    pub fn needs_preparation(&self, layout: &Layout) -> Result<bool> {
-        Ok(!self
-            .exchange(Command::Cached(layout.clone()))?
-            .into_iter()
-            .all(|reply| matches!(reply, Reply::Cached(CacheState::Graph))))
     }
     pub fn owner_requirement(
         &self,
@@ -1022,8 +1149,73 @@ fn preparation(states: &[CacheState], repeated: bool) -> Result<(bool, bool)> {
     Ok((plan.invalidate, plan.capture()))
 }
 
+pub(super) struct PreparedForward {
+    started: Instant,
+    states: Vec<SplitStates>,
+    pub workspace_fits: bool,
+}
+impl PreparedForward {
+    pub fn all_graphs(&self) -> bool {
+        self.states.iter().all(SplitStates::all_graphs)
+    }
+}
+
+fn begin_forward(peers: &Transport, layout: &Layout) -> Result<PreparedForward> {
+    let started = Instant::now();
+    let cached = exchange(peers, Command::GrowCached(layout.clone()))?;
+    let mut states = Vec::with_capacity(cached.len());
+    let mut workspace_fits = true;
+    for reply in cached {
+        let Reply::SplitCached(state, fits) = reply else {
+            return Err("Invalid A2 cache state reply".to_string());
+        };
+        states.push(state);
+        workspace_fits &= fits;
+    }
+    Ok(PreparedForward {
+        started,
+        states,
+        workspace_fits,
+    })
+}
+
+fn part_action(plan: &preparation::Plan) -> PartAction {
+    PartAction {
+        invalidate: plan.invalidate,
+        prepare: match plan.mode {
+            preparation::Mode::BuildDirect => Some(false),
+            preparation::Mode::CaptureReplay => Some(true),
+            preparation::Mode::Direct | preparation::Mode::Replay => None,
+        },
+    }
+}
+
 fn forward_with(
     peers: &Transport,
+    layout: Layout,
+    tokens: Vec<Vec<u32>>,
+    readout: Readout,
+    budget: Option<CaptureBudget>,
+    maintenance: impl FnOnce(),
+    graphs_enabled: bool,
+) -> Result<(Vec<Output>, Timing)> {
+    let prepared = begin_forward(peers, &layout)?;
+    finish_forward(
+        peers,
+        prepared,
+        layout,
+        tokens,
+        readout,
+        budget,
+        maintenance,
+        graphs_enabled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_forward(
+    peers: &Transport,
+    prepared: PreparedForward,
     layout: Layout,
     tokens: Vec<Vec<u32>>,
     readout: Readout,
@@ -1032,15 +1224,9 @@ fn forward_with(
     graphs_enabled: bool,
 ) -> Result<(Vec<Output>, Timing)> {
     let mut maintenance = Some(maintenance);
-    let started = Instant::now();
-    let cached = exchange(peers, Command::GrowCached(layout.clone()))?;
-    let states = cached
-        .into_iter()
-        .map(|reply| match reply {
-            Reply::Cached(state) => Ok(state),
-            _ => Err("Invalid A2 cache state reply".to_string()),
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let PreparedForward {
+        started, states, ..
+    } = prepared;
     let repeated = layout.decode
         || layout.role == super::PacketRole::Draft
         || layout.outputs.len() > layout.segments.len()
@@ -1051,40 +1237,111 @@ fn forward_with(
     if let Some(budget) = &mut budget {
         budget.slack_s -= started.elapsed().as_secs_f64();
     }
-    let plan = if graphs_enabled {
-        preparation::plan(&states, repeated, budget)?
-    } else {
-        preparation::direct_plan(&states)?
+    let trunk_states: Vec<CacheState> = states.iter().map(|s| s.trunk).collect();
+    let has_tail = states.first().is_some_and(|s| s.tail.is_some());
+    let has_head = states.first().is_some_and(|s| s.head.is_some());
+    if states
+        .iter()
+        .any(|s| s.tail.is_some() != has_tail || s.head.is_some() != has_head)
+    {
+        return Err("TP split packet shapes disagree across ranks".into());
+    }
+    let split_packet = has_tail || has_head;
+    let plan_part = |part_states: &[CacheState],
+                     part_repeated: bool,
+                     part_budget: Option<CaptureBudget>,
+                     allow_new_capture: bool| {
+        let mut plan = if graphs_enabled {
+            preparation::plan(part_states, part_repeated, part_budget)?
+        } else {
+            preparation::direct_plan(part_states)?
+        };
+        if !allow_new_capture && plan.mode == preparation::Mode::CaptureReplay {
+            plan.mode = if plan.invalidate {
+                preparation::Mode::BuildDirect
+            } else {
+                preparation::Mode::Direct
+            };
+            plan.reason = "trunk_direct";
+        }
+        Ok::<_, String>(plan)
     };
-    let invalidate = plan.invalidate;
-    let capture = plan.capture();
+    // Reuse compiled Trunk Graphs across large mixed cohorts (>=512 rows), but
+    // avoid spending capture time on cohort-specific Tail/Head slices there.
+    let allow_tail_head_capture = !(has_tail && !layout.decode && layout.rows.total >= 512);
+    let trunk_plan = plan_part(&trunk_states, repeated, budget, true)?;
+    let tail_plan = if has_tail {
+        let tail_states: Vec<CacheState> = states.iter().map(|s| s.tail.unwrap()).collect();
+        Some(plan_part(
+            &tail_states,
+            repeated,
+            budget,
+            allow_tail_head_capture && trunk_plan.capture(),
+        )?)
+    } else {
+        None
+    };
+    let head_plan = if has_head {
+        let head_states: Vec<CacheState> = states.iter().map(|s| s.head.unwrap()).collect();
+        let allow_head_capture = allow_tail_head_capture
+            && trunk_plan.capture()
+            && tail_plan.as_ref().is_none_or(preparation::Plan::capture);
+        Some(plan_part(
+            &head_states,
+            repeated,
+            budget,
+            allow_head_capture,
+        )?)
+    } else {
+        None
+    };
+    let split_plan = SplitPlan {
+        trunk: part_action(&trunk_plan),
+        tail: tail_plan.as_ref().map(part_action),
+        head: head_plan.as_ref().map(part_action),
+    };
+    let invalidate = split_plan.any_invalidate();
+    let capture = trunk_plan.capture()
+        && tail_plan.as_ref().is_none_or(preparation::Plan::capture)
+        && head_plan.as_ref().is_none_or(preparation::Plan::capture);
+    let any_captured = trunk_plan.mode == preparation::Mode::CaptureReplay
+        || tail_plan
+            .as_ref()
+            .is_some_and(|p| p.mode == preparation::Mode::CaptureReplay)
+        || head_plan
+            .as_ref()
+            .is_some_and(|p| p.mode == preparation::Mode::CaptureReplay);
+    let cached_prepare = !invalidate && !split_plan.any_prepare();
     if budget.is_some_and(|b| b.trace) {
         eprintln!(
             "A2_EXECUTION_PLAN {}",
             serde_json::json!({
                 "role":format!("{:?}",layout.role), "rows":layout.rows.total,
-                "mode":plan.mode,"reason":plan.reason,"invalidate":invalidate,
+                "mode":trunk_plan.mode,"reason":trunk_plan.reason,"invalidate":invalidate,
+                "tail_mode":tail_plan.as_ref().map(|p| p.mode),
+                "head_mode":head_plan.as_ref().map(|p| p.mode),
                 "budget":budget,
             })
         );
     }
-    // Only a cache miss or promotion can allocate/capture. Keep its global
-    // preparation barrier; a cache hit only refreshes host-side LRU state and
-    // can do that on the owning worker with the forward command.
-    let cached_prepare = !invalidate
-        && states
-            .iter()
-            .all(|state| matches!(state, CacheState::Graph) == capture);
     // A deferred response must not wait behind a new graph's warmup/capture.
     // Stable shapes run this callback after submission, below.
     if !cached_prepare && let Some(maintenance) = maintenance.take() {
         maintenance();
     }
     if invalidate {
-        exchange(peers, Command::Invalidate(layout.clone()))?;
+        exchange(
+            peers,
+            Command::InvalidateParts(
+                layout.clone(),
+                split_plan.trunk.invalidate,
+                split_plan.tail.is_some_and(|a| a.invalidate),
+                split_plan.head.is_some_and(|a| a.invalidate),
+            ),
+        )?;
     }
     if !cached_prepare {
-        exchange(peers, Command::Prepare(layout.clone(), capture))?;
+        exchange(peers, Command::PrepareParts(layout.clone(), split_plan))?;
     }
     let mut shared = vec![];
     let mut shared_setup = 0.;
@@ -1117,6 +1374,7 @@ fn forward_with(
     let started = Instant::now();
     let replicated = layout.role == super::PacketRole::Draft;
     let shared_mode = !shared.is_empty();
+    let partial_trunk_graph = split_packet && trunk_plan.capture() && !capture;
     if shared_mode
         && (budget.is_some_and(|b| b.trace)
             || std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some())
@@ -1130,13 +1388,7 @@ fn forward_with(
     let readout_rejection_empty = readout.rejection.is_empty();
     let parameters = Arc::clone(&readout.parameters);
     let first_input = readout.first_input.clone();
-    let command = Command::Forward(
-        layout,
-        tokens,
-        readout,
-        cached_prepare.then_some(capture),
-        shared,
-    );
+    let command = Command::Forward(layout, tokens, readout, shared);
     peers.send(command)?;
     if let Some(maintenance) = maintenance {
         maintenance();
@@ -1227,13 +1479,17 @@ fn forward_with(
                 .filter(|p| p.top_logprobs.is_some())
                 .count(),
             mask_prepare_s: parameters.seconds(),
-            captured: plan.mode == preparation::Mode::CaptureReplay,
+            captured: any_captured,
             invalidated: invalidate,
             seconds: started.elapsed().as_secs_f64(),
             preparation: prepare_s,
             replay: capture,
-            shared: shared_mode,
-            shared_setup,
+            shared: shared_mode || partial_trunk_graph,
+            shared_setup: if partial_trunk_graph && any_captured {
+                prepare_s
+            } else {
+                shared_setup
+            },
             setup: if cached_prepare {
                 shared_setup
             } else {

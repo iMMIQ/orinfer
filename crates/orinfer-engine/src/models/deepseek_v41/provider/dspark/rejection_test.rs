@@ -263,9 +263,8 @@ fn fixed_history_sampling_cost() {
                     .collect::<Vec<_>>();
                 runtime
                     .team
-                    .exchange(Command::RollbackVerification(commits.clone()))
+                    .exchange(Command::FinishVerification(commits.clone()))
                     .unwrap();
-                runtime.team.exchange(Command::EndVerification).unwrap();
                 let seconds = started.elapsed().as_secs_f64();
                 let committed: usize = commits.iter().map(|v| v.1).sum();
                 if probe {
@@ -322,7 +321,10 @@ fn fixed_history_sampling_cost() {
                                 .team
                                 .forward(view.clone(), inputs.clone(), true)
                                 .unwrap();
-                            runtime.team.exchange(Command::EndVerification).unwrap();
+                            runtime
+                                .team
+                                .exchange(Command::FinishVerification(vec![]))
+                                .unwrap();
                             let bytes = raw[0]
                                 .logits
                                 .iter()

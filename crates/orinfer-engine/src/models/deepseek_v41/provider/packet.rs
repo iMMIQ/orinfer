@@ -366,25 +366,27 @@ impl Runtime {
         requests: &[&mut Request],
         readout: &mut super::super::team::Readout,
     ) {
-        if layout.rows.total < 128 || !selected.iter().any(|&(i, _)| requests[i].prefilling) {
-            return;
-        }
-        let previous = self.input_window.take();
-        let hint = previous.as_ref().and_then(|window| {
-            selected.iter().enumerate().find_map(|(lane, &(i, rows))| {
-                let r = &requests[i];
-                let start = r.offset.checked_sub(window.offset)?;
-                (r.prefilling && r.slot == window.owner && start + rows <= window.rows).then(|| {
-                    super::super::host_inputs::Hint {
-                        window: Arc::clone(window),
-                        destination: layout.rows.starts[lane]..layout.rows.starts[lane] + rows,
-                        source: start..start + rows,
-                    }
+        let has_prefill = selected.iter().any(|&(i, _)| requests[i].prefilling);
+        let hint = if has_prefill && layout.rows.total >= 128 {
+            let previous = self.input_window.take();
+            previous.as_ref().and_then(|window| {
+                selected.iter().enumerate().find_map(|(lane, &(i, rows))| {
+                    let r = &requests[i];
+                    let start = r.offset.checked_sub(window.offset)?;
+                    (r.prefilling && r.slot == window.owner && start + rows <= window.rows).then(
+                        || super::super::host_inputs::Hint {
+                            window: Arc::clone(window),
+                            destination: layout.rows.starts[lane]..layout.rows.starts[lane] + rows,
+                            source: start..start + rows,
+                        },
+                    )
                 })
             })
-        });
+        } else {
+            None
+        };
         readout.first_input = self.team.first_input(hint);
-        if layout.rows.total < 1024 {
+        if !has_prefill || layout.rows.total < 256 {
             return;
         }
         let mut offsets = requests.iter().map(|r| r.offset).collect::<Vec<_>>();

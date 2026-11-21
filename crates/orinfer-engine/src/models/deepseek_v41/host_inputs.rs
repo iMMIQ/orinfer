@@ -1,8 +1,9 @@
-//! Immutable first-Engram inputs shared by one packet and one bounded forecast.
+//! Immutable multi-layer Engram inputs shared by one packet and one bounded forecast.
 use super::{SharedTables, team::Team};
 use crate::{artifact::Result, host_rows::SharedInt8Rows, sampling::Prepared};
 use orinfer_model_sdk::conditional_memory::Hasher;
 use std::{
+    collections::BTreeMap,
     ops::Range,
     sync::{Arc, atomic::AtomicBool},
     time::Instant,
@@ -14,8 +15,7 @@ const SCALES: usize = 32;
 const RECORD: usize = VALUES + SCALES;
 
 struct Payload {
-    values: Vec<u8>,
-    scales: Vec<u8>,
+    planes: Arc<(Vec<u8>, Vec<u8>)>,
     mask: Vec<u8>,
 }
 struct Part {
@@ -37,12 +37,12 @@ impl Rows {
                 (
                     0,
                     part.destination * LANES * VALUES,
-                    &part.data.values[s.start * LANES * VALUES..s.end * LANES * VALUES],
+                    &part.data.planes.0[s.start * LANES * VALUES..s.end * LANES * VALUES],
                 ),
                 (
                     1,
                     part.destination * LANES * SCALES,
-                    &part.data.scales[s.start * LANES * SCALES..s.end * LANES * SCALES],
+                    &part.data.planes.1[s.start * LANES * SCALES..s.end * LANES * SCALES],
                 ),
                 (2, part.destination, &part.data.mask[s.clone()]),
             ]
@@ -50,16 +50,9 @@ impl Rows {
     }
 }
 fn read(store: &SharedInt8Rows, ids: &[u64], valid: &[bool]) -> Result<Arc<Payload>> {
-    let packed = store.gather(ids, ids.len() * RECORD)?;
-    let mut values = Vec::with_capacity(ids.len() * VALUES);
-    let mut scales = Vec::with_capacity(ids.len() * SCALES);
-    for record in packed.as_chunks::<RECORD>().0 {
-        values.extend_from_slice(&record[..VALUES]);
-        scales.extend_from_slice(&record[VALUES..]);
-    }
+    let planes = store.gather_split(ids, ids.len() * RECORD)?;
     Ok(Arc::new(Payload {
-        values,
-        scales,
+        planes,
         mask: valid.iter().map(|&v| u8::from(v)).collect(),
     }))
 }
@@ -67,9 +60,9 @@ pub(super) struct Window {
     pub owner: usize,
     pub offset: usize,
     pub rows: usize,
-    ids: Arc<Vec<u64>>,
+    layer_ids: BTreeMap<usize, Arc<Vec<u64>>>,
     valid: Arc<Vec<bool>>,
-    prepared: Arc<Prepared<Arc<Payload>>>,
+    prepared: Arc<Prepared<BTreeMap<usize, Arc<Payload>>>>,
     active: Arc<AtomicBool>,
 }
 impl Window {
@@ -85,10 +78,15 @@ impl Window {
         let rows = tokens.len();
         let (mut hashes, mut valid) = (vec![], vec![]);
         hasher.hash_into(&history, &tokens, &mut hashes, &mut valid)?;
-        let ids = Arc::new(first_ids(&hasher, &hashes, &valid));
+        let mut layer_ids = BTreeMap::new();
+        for (layer_index, layer) in hasher.layout().layers.iter().enumerate() {
+            layer_ids.insert(
+                layer.layer,
+                Arc::new(layer_ids_for(&hasher, layer_index, &hashes, &valid)),
+            );
+        }
         let valid = Arc::new(valid);
-        let layer = hasher.layout().layers[0].layer;
-        let input_ids = Arc::clone(&ids);
+        let input_layers = layer_ids.clone();
         let input_valid = Arc::clone(&valid);
         let prepared = Prepared::new(move || {
             let stores = tables
@@ -96,17 +94,24 @@ impl Window {
                 .ok_or("Host tables not ready")?
                 .as_ref()
                 .map_err(Clone::clone)?;
-            read(
-                stores.get(&layer).ok_or("Engram table missing")?,
-                &input_ids,
-                &input_valid,
-            )
+            let mut payloads = BTreeMap::new();
+            for (layer, ids) in &input_layers {
+                payloads.insert(
+                    *layer,
+                    read(
+                        stores.get(layer).ok_or("Engram table missing")?,
+                        ids,
+                        &input_valid,
+                    )?,
+                );
+            }
+            Ok(payloads)
         });
         Ok(Arc::new(Self {
             owner,
             offset,
             rows,
-            ids,
+            layer_ids,
             valid,
             prepared: Arc::new(prepared),
             active,
@@ -129,34 +134,53 @@ pub(super) struct First {
     pub layer: usize,
     hint: Option<Hint>,
     pub prepared: Prepared<Rows>,
+    extras: BTreeMap<usize, Prepared<Rows>>,
 }
 impl First {
-    pub fn new(layer: usize, hint: Option<Hint>) -> Arc<Self> {
+    pub fn new(layers: &[usize], hint: Option<Hint>) -> Arc<Self> {
+        let primary = layers.first().copied().unwrap_or(0);
+        let extras = layers
+            .iter()
+            .skip(1)
+            .map(|&layer| (layer, Prepared::deferred()))
+            .collect();
         Arc::new(Self {
-            layer,
+            layer: primary,
             hint,
             prepared: Prepared::deferred(),
+            extras,
         })
+    }
+    pub fn handles_layer(&self, layer: usize) -> bool {
+        layer == self.layer || self.extras.contains_key(&layer)
     }
     pub fn get(
         &self,
+        layer: usize,
         store: &SharedInt8Rows,
         ids: impl FnOnce() -> Result<Vec<u64>>,
         valid: &[bool],
     ) -> Result<&Rows> {
-        self.prepared
-            .get_or(|| assemble(store, &ids()?, valid, self.hint.as_ref()))
+        let slot = if layer == self.layer {
+            &self.prepared
+        } else {
+            self.extras
+                .get(&layer)
+                .ok_or("Engram layer not prepared in host inputs")?
+        };
+        slot.get_or(|| assemble(layer, store, &ids()?, valid, self.hint.as_ref()))
     }
 }
-fn first_ids(hasher: &Hasher, hashes: &[i64], valid: &[bool]) -> Vec<u64> {
+fn layer_ids_for(hasher: &Hasher, layer_index: usize, hashes: &[i64], valid: &[bool]) -> Vec<u64> {
     let width = hasher.values_per_token();
+    let base = layer_index * LANES;
     valid
         .iter()
         .enumerate()
         .flat_map(|(row, &active)| {
             (0..LANES).map(move |lane| {
                 if active {
-                    hashes[row * width + lane] as u64
+                    hashes[row * width + base + lane] as u64
                 } else {
                     0
                 }
@@ -165,6 +189,7 @@ fn first_ids(hasher: &Hasher, hashes: &[i64], valid: &[bool]) -> Vec<u64> {
         .collect()
 }
 fn assemble(
+    layer: usize,
     store: &SharedInt8Rows,
     ids: &[u64],
     valid: &[bool],
@@ -179,13 +204,16 @@ fn assemble(
         if d.len() == s.len()
             && d.end <= valid.len()
             && s.end <= hint.window.rows
-            && ids[d.start * LANES..d.end * LANES]
-                == hint.window.ids[s.start * LANES..s.end * LANES]
+            && hint.window.layer_ids.get(&layer).is_some_and(|w_ids| {
+                ids[d.start * LANES..d.end * LANES] == w_ids[s.start * LANES..s.end * LANES]
+            })
             && valid[d.clone()] == hint.window.valid[s.clone()]
         {
             let started = Instant::now();
-            if let Ok(data) = hint.window.prepared.get() {
-                reused = Some((d, s, Arc::clone(data)));
+            if let Ok(data) = hint.window.prepared.get()
+                && let Some(payload) = data.get(&layer)
+            {
+                reused = Some((d, s, Arc::clone(payload)));
             }
             wait_s = started.elapsed().as_secs_f64();
         }
@@ -236,9 +264,10 @@ fn assemble(
 }
 impl Team {
     pub fn first_input(&self, hint: Option<Hint>) -> Option<Arc<First>> {
-        self.host_hasher
-            .as_ref()
-            .map(|hasher| First::new(hasher.layout().layers[0].layer, hint))
+        self.host_hasher.as_ref().map(|hasher| {
+            let layers: Vec<usize> = hasher.layout().layers.iter().map(|l| l.layer).collect();
+            First::new(&layers, hint)
+        })
     }
     pub fn forecast_input(
         &self,
@@ -320,23 +349,29 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let store = Int8Rows::open(&path, "w", &path, "s", Shard { first: 0, rows: 48 }).unwrap();
+        let store1 = Int8Rows::open(&path, "w", &path, "s", Shard { first: 0, rows: 48 }).unwrap();
+        let store14 = Int8Rows::open(&path, "w", &path, "s", Shard { first: 0, rows: 48 }).unwrap();
         let tables = Arc::new(SharedTables::new());
         tables
-            .set(Ok(Arc::new(BTreeMap::from([(
-                1,
-                SharedInt8Rows::new(store),
-            )]))))
+            .set(Ok(Arc::new(BTreeMap::from([
+                (1, SharedInt8Rows::new(store1)),
+                (14, SharedInt8Rows::new(store14)),
+            ]))))
             .ok()
             .unwrap();
         (Arc::new(Hasher::new(layout).unwrap()), tables)
     }
-    fn query(hasher: &Hasher, history: &[u32], tokens: &[u32]) -> (Vec<u64>, Vec<bool>) {
+    fn query(
+        hasher: &Hasher,
+        layer_index: usize,
+        history: &[u32],
+        tokens: &[u32],
+    ) -> (Vec<u64>, Vec<bool>) {
         let (mut hashes, mut valid) = (vec![], vec![]);
         hasher
             .hash_into(history, tokens, &mut hashes, &mut valid)
             .unwrap();
-        (first_ids(hasher, &hashes, &valid), valid)
+        (layer_ids_for(hasher, layer_index, &hashes, &valid), valid)
     }
     fn check(rows: &Rows, ids: &[u64], valid: &[bool]) {
         let values = ids
@@ -366,7 +401,8 @@ mod tests {
     #[test]
     fn partial_window_joins_rank_readers_and_preserves_mixed_owner_bytes() {
         let (hasher, tables) = assets();
-        let store = &tables.get().unwrap().as_ref().unwrap()[&1];
+        let store1 = &tables.get().unwrap().as_ref().unwrap()[&1];
+        let store14 = &tables.get().unwrap().as_ref().unwrap()[&14];
         let window = Window::new(
             hasher.clone(),
             tables.clone(),
@@ -378,15 +414,18 @@ mod tests {
         )
         .unwrap();
         window.start();
-        let (mut ids, mut valid) = query(&hasher, &[9], &[10]);
-        let (x, v) = query(&hasher, &[2, 3, 4], &[5, 15]);
-        ids.extend(x);
+        let (mut ids1, mut valid) = query(&hasher, 0, &[9], &[10]);
+        let (x, v) = query(&hasher, 0, &[2, 3, 4], &[5, 15]);
+        ids1.extend(x);
         valid.extend(v);
-        let (x, v) = query(&hasher, &[10, 11], &[7]);
-        ids.extend(x);
+        let (x, v) = query(&hasher, 0, &[10, 11], &[7]);
+        ids1.extend(x);
         valid.extend(v);
+        let (mut ids14, _) = query(&hasher, 1, &[9], &[10]);
+        ids14.extend(query(&hasher, 1, &[2, 3, 4], &[5, 15]).0);
+        ids14.extend(query(&hasher, 1, &[10, 11], &[7]).0);
         let first = First::new(
-            1,
+            &[1, 14],
             Some(Hint {
                 window,
                 destination: 1..3,
@@ -396,27 +435,31 @@ mod tests {
         let calls = AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..8 {
-                let (first, ids, valid, calls) = (&first, &ids, &valid, &calls);
+                let (first, ids1, ids14, valid, calls) = (&first, &ids1, &ids14, &valid, &calls);
                 scope.spawn(move || {
                     let rows = first
                         .get(
-                            store,
+                            1,
+                            store1,
                             || {
                                 calls.fetch_add(1, Ordering::Relaxed);
-                                Ok(ids.clone())
+                                Ok(ids1.clone())
                             },
                             valid,
                         )
                         .unwrap();
-                    check(rows, ids, valid);
+                    check(rows, ids1, valid);
                     assert_eq!(rows.reused_rows, 2);
+                    let rows14 = first.get(14, store14, || Ok(ids14.clone()), valid).unwrap();
+                    check(rows14, ids14, valid);
+                    assert_eq!(rows14.reused_rows, 2);
                 });
             }
         });
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         // Replacing the table's packet cache cannot change this frame's data.
-        store.gather(&[47, 3], 2 * RECORD).unwrap();
-        check(first.prepared.get().unwrap(), &ids, &valid);
+        store1.gather_split(&[47, 3], 2 * RECORD).unwrap();
+        check(first.prepared.get().unwrap(), &ids1, &valid);
     }
     #[test]
     fn changed_input_or_media_does_not_wait_for_an_unrelated_forecast() {
@@ -433,21 +476,21 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
             )
             .unwrap();
-            let (mut ids, mut valid) = query(&hasher, &[1, 2, 3], &[4, 5]);
+            let (mut ids, mut valid) = query(&hasher, 0, &[1, 2, 3], &[4, 5]);
             if mask {
                 valid[0] = !valid[0];
             } else {
                 ids[0] ^= 1;
             }
             let first = First::new(
-                1,
+                &[1, 14],
                 Some(Hint {
                     window: window.clone(),
                     destination: 0..2,
                     source: 0..2,
                 }),
             );
-            let rows = first.get(store, || Ok(ids.clone()), &valid).unwrap();
+            let rows = first.get(1, store, || Ok(ids.clone()), &valid).unwrap();
             check(rows, &ids, &valid);
             assert_eq!(rows.reused_rows, 0);
             assert!(!window.is_ready());
@@ -469,23 +512,28 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
-        let (ids, valid) = query(&hasher, &[], &[4]);
+        let (ids, valid) = query(&hasher, 0, &[], &[4]);
         let first = First::new(
-            1,
+            &[1, 14],
             Some(Hint {
                 window,
                 destination: 0..1,
                 source: 0..1,
             }),
         );
-        let rows = first.get(store, || Ok(ids.clone()), &valid).unwrap();
+        let rows = first.get(1, store, || Ok(ids.clone()), &valid).unwrap();
         check(rows, &ids, &valid);
         assert_eq!(rows.reused_rows, 0);
-        let bad = First::new(1, None);
-        assert!(bad.get(store, || Ok(vec![49; LANES]), &[true]).is_err());
+        let bad = First::new(&[1, 14], None);
+        assert!(bad.get(1, store, || Ok(vec![49; LANES]), &[true]).is_err());
         assert!(
-            bad.get(store, || panic!("failed frame must not run again"), &[true])
-                .is_err()
+            bad.get(
+                1,
+                store,
+                || panic!("failed frame must not run again"),
+                &[true]
+            )
+            .is_err()
         );
     }
 }

@@ -13,6 +13,7 @@ pub(crate) struct Branches {
     depths: Vec<usize>,
     events: Vec<(Handle, Handle)>,
     keepalive: Option<Box<dyn Any>>,
+    constructed: bool,
 }
 
 impl Branches {
@@ -53,16 +54,23 @@ impl Branches {
             depths: depths.to_vec(),
             events: Vec::with_capacity(depths.len()),
             keepalive: Some(keepalive),
+            constructed: false,
         };
-        // SAFETY: Handles are created in the retained owning context. All
+        // SAFETY: Handles are created or popped in the retained owning context. All
         // allocations precede capture; Drop rolls back partial construction.
         unsafe {
             for _ in 0..=depths.iter().copied().max().unwrap() {
-                let mut stream = ptr::null_mut();
-                check(
-                    (branches.context.api.create_stream)(&mut stream),
-                    "create ACL Graph branch stream",
-                )?;
+                let stream =
+                    if let Some(cached) = branches.context.branch_streams.borrow_mut().pop() {
+                        cached
+                    } else {
+                        let mut stream = ptr::null_mut();
+                        check(
+                            (branches.context.api.create_stream)(&mut stream),
+                            "create ACL Graph branch stream",
+                        )?;
+                        stream
+                    };
                 branches.streams.push(stream);
             }
             for _ in depths {
@@ -70,16 +78,25 @@ impl Branches {
                 let pair = branches.events.last_mut().unwrap();
                 // Captured cross-stream dependencies require Ex events with
                 // ACL_EVENT_SYNC=1. Each fork has its own event generation.
-                check(
-                    (branches.context.api.create_event)(&mut pair.0, 1),
-                    "create ACL Graph fork event",
-                )?;
-                check(
-                    (branches.context.api.create_event)(&mut pair.1, 1),
-                    "create ACL Graph join event",
-                )?;
+                if let Some(cached) = branches.context.branch_events.borrow_mut().pop() {
+                    pair.0 = cached;
+                } else {
+                    check(
+                        (branches.context.api.create_event)(&mut pair.0, 1),
+                        "create ACL Graph fork event",
+                    )?;
+                }
+                if let Some(cached) = branches.context.branch_events.borrow_mut().pop() {
+                    pair.1 = cached;
+                } else {
+                    check(
+                        (branches.context.api.create_event)(&mut pair.1, 1),
+                        "create ACL Graph join event",
+                    )?;
+                }
             }
         }
+        branches.constructed = true;
         Ok(Rc::new(branches))
     }
 
@@ -157,18 +174,33 @@ impl Drop for Branches {
             std::mem::forget(Rc::clone(&self.context));
             return;
         }
-        // SAFETY: No work remains; all successful allocations are owned.
+        // Return fenced streams and Ex events to the owning context pool so
+        // repeated direct prepares and LRU evictions avoid driver creation stalls.
+        const MAX_IDLE_STREAMS: usize = 16;
+        const MAX_IDLE_EVENTS: usize = 512;
+        let pool = self.constructed && !self.context.poisoned.get();
+        let mut idle_events = self.context.branch_events.borrow_mut();
+        let mut idle_streams = self.context.branch_streams.borrow_mut();
+        // SAFETY: No work remains on these streams after synchronize; all handles
+        // are uniquely owned by this Branches instance and either pooled or destroyed.
         unsafe {
             for &(start, done) in &self.events {
-                if !start.is_null() {
-                    (self.context.api.destroy_event)(start);
-                }
-                if !done.is_null() {
-                    (self.context.api.destroy_event)(done);
+                for event in [start, done] {
+                    if !event.is_null() {
+                        if pool && idle_events.len() < MAX_IDLE_EVENTS {
+                            idle_events.push(event);
+                        } else {
+                            (self.context.api.destroy_event)(event);
+                        }
+                    }
                 }
             }
             for &stream in &self.streams {
-                (self.context.api.destroy_stream)(stream);
+                if pool && idle_streams.len() < MAX_IDLE_STREAMS {
+                    idle_streams.push(stream);
+                } else {
+                    (self.context.api.destroy_stream)(stream);
+                }
             }
         }
     }
@@ -239,9 +271,15 @@ mod tests {
             assert_eq!(fixture.counter(2), 0);
             let branches = Branches::new(&session, &[0, 1], Box::new(())).unwrap();
             assert_eq!(fixture.counter(2), 4);
+            let created_before = fixture.counter(10);
             assert!(branches.fork(5, session.compute_stream()).is_err());
             drop(branches);
-            assert_eq!(fixture.counter(2), 0);
+            // Fenced streams and events remain pooled on the session context
+            // and are reused without driver allocations by later Branches.
+            assert_eq!(fixture.counter(2), 4);
+            let reused = Branches::new(&session, &[0, 1], Box::new(())).unwrap();
+            assert_eq!(fixture.counter(10), created_before);
+            drop(reused);
         }
         fixture.assert_clean();
     }

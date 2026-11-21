@@ -87,6 +87,7 @@ pub(super) fn plan(
         return Err("Missing A2 TP cache states".into());
     }
     let missing = states.contains(&CacheState::Missing);
+    let all_missing = states.iter().all(|s| *s == CacheState::Missing);
     let graphs = states.iter().filter(|s| **s == CacheState::Graph).count();
     if graphs == states.len() {
         return Ok(Plan {
@@ -95,7 +96,7 @@ pub(super) fn plan(
             reason: "resident_graph",
         });
     }
-    let invalidate = missing || graphs > 0;
+    let invalidate = (!all_missing && missing) || graphs > 0;
     let ready = !missing && (graphs > 0 || states.iter().all(|s| {
         matches!(s, CacheState::Direct { uses, .. } if *uses >= if repeated { 2 } else { 8 })
     }));
@@ -129,7 +130,7 @@ pub(super) fn plan(
         invalidate,
         mode: if capture {
             Mode::CaptureReplay
-        } else if invalidate {
+        } else if invalidate || all_missing {
             Mode::BuildDirect
         } else {
             Mode::Direct
@@ -150,12 +151,13 @@ pub(super) fn direct_plan(states: &[CacheState]) -> Result<Plan> {
     if states.is_empty() {
         return Err("Missing A2 TP cache states".into());
     }
-    let invalidate = states
-        .iter()
-        .any(|state| !matches!(state, CacheState::Direct { .. }));
+    let missing = states.contains(&CacheState::Missing);
+    let all_missing = states.iter().all(|s| *s == CacheState::Missing);
+    let graphs = states.contains(&CacheState::Graph);
+    let invalidate = (!all_missing && missing) || graphs;
     Ok(Plan {
         invalidate,
-        mode: if invalidate {
+        mode: if invalidate || all_missing {
             Mode::BuildDirect
         } else {
             Mode::Direct
@@ -475,5 +477,12 @@ mod tests {
             .mode,
             Mode::BuildDirect
         );
+        // All-Missing across every rank builds direct without an empty Invalidate barrier.
+        let cold = plan(&[CacheState::Missing; 8], true, Some(budget(64.))).unwrap();
+        assert!(!cold.invalidate);
+        assert_eq!(cold.mode, Mode::BuildDirect);
+        let cold_direct = direct_plan(&[CacheState::Missing; 8]).unwrap();
+        assert!(!cold_direct.invalidate);
+        assert_eq!(cold_direct.mode, Mode::BuildDirect);
     }
 }

@@ -348,6 +348,25 @@ fn publish_shared(
     buffers: &BTreeMap<String, Buffer>,
     preview: &[SharedPiece],
 ) -> Result<Vec<Piece<DeviceBuffer>>> {
+    if preview.is_empty() {
+        return Ok(vec![]);
+    }
+    if preview.iter().all(|p| p.allocation.native.is_some()) {
+        return Ok(preview
+            .iter()
+            .map(|p| Piece {
+                name: p.name.clone(),
+                offset: p.range.offset,
+                bank_id: p.allocation.id,
+                bank_bytes: p.allocation.bytes,
+                buffer: DeviceBuffer {
+                    allocation: Rc::clone(&p.allocation),
+                    source: p.source,
+                    bytes: p.range.bytes,
+                },
+            })
+            .collect());
+    }
     let mut extents = BTreeMap::<&str, usize>::new();
     for p in preview {
         extents
@@ -511,7 +530,15 @@ impl Snapshot {
                     .push(piece.buffer.shared_piece(&piece.name, piece.offset));
             }
         }
-        session.synchronize()?;
+        if groups.is_empty() {
+            return Ok(());
+        }
+        if groups
+            .keys()
+            .any(|name| buffers.get(*name).is_some_and(Buffer::has_mapped_pages))
+        {
+            session.synchronize()?;
+        }
         for (name, pieces) in groups {
             session.restore_kv(&get(buffers, name)?, &pieces)?;
         }
@@ -553,7 +580,8 @@ impl Snapshot {
             })
             .collect::<Result<Vec<_>>>()?;
         if !copies.is_empty() {
-            session.copy_many(&copies)?.wait()?;
+            // Compute-stream ordered; completion retains source and target buffers.
+            session.copy_many(&copies)?;
         }
         Ok(())
     }
@@ -583,15 +611,32 @@ fn grow_restored<'a>(
 
 impl Worker {
     pub(super) fn release_owner(&mut self, id: usize) -> Result<()> {
-        self.session.synchronize()?;
         if let Some(inputs) = &mut self.device_inputs {
             inputs.invalidate(id)?;
         }
         let runtime = self.batch.as_mut().ok_or("Missing A2 batch runtime")?;
         runtime.bound_tables = None;
-        runtime.owners.remove(&id).ok_or("Unknown A2 owner")?;
+        let owner = runtime.owners.remove(&id).ok_or("Unknown A2 owner")?;
         if id == 0 {
+            self.session.synchronize()?;
             self.clear_base_growth()?;
+        } else {
+            let kv_buffers = self
+                .growth
+                .keys()
+                .map(|name| get(&owner.buffers, name))
+                .collect::<Result<Vec<_>>>()?;
+            self.session.release_pages_many(&kv_buffers)?;
+            if let Some(bank) = owner.bank {
+                const MAX_IDLE_OWNERS: usize = 2;
+                let runtime = self.batch.as_mut().unwrap();
+                if runtime.idle_owners.len() < MAX_IDLE_OWNERS.min(runtime.contract.owners) {
+                    runtime.idle_owners.push(super::batch::IdleOwner {
+                        bank,
+                        buffers: owner.buffers,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -654,7 +699,17 @@ impl Worker {
     }
 
     pub(super) fn restore_owner(&mut self, id: usize, snapshot: &Snapshot) -> Result<()> {
-        self.reset_owner(id)?;
+        let clean = self
+            .batch
+            .as_ref()
+            .ok_or("Missing A2 runtime")?
+            .owners
+            .get(&id)
+            .ok_or("Unknown A2 owner")?
+            .clean;
+        if !clean {
+            self.reset_owner(id)?;
+        }
         {
             let runtime = self.batch.as_ref().ok_or("Missing A2 runtime")?;
             snapshot.restore_kv(
@@ -667,6 +722,7 @@ impl Worker {
         let owner = runtime.owners.get_mut(&id).ok_or("Unknown A2 owner")?;
         snapshot.restore_mutable_into(&self.session, &owner.buffers)?;
         owner.history.clone_from(&snapshot.history);
+        owner.clean = false;
         runtime.bound_tables = None;
         Ok(())
     }

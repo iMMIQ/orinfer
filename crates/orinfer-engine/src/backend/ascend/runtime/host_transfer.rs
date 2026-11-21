@@ -19,65 +19,77 @@ impl Session {
             .within(output.len())?;
         }
         let capacity = (4 << 20).min(self.context.limits.pinned_bytes);
+        let double_buffer = capacity.saturating_mul(2) <= self.context.limits.pinned_bytes;
         self.pinned_cache
             .borrow_mut()
             .retain(|h| h.bytes <= capacity || Rc::strong_count(h) != 1);
+        type Slab = (
+            Ticket,
+            Rc<Pinned>,
+            Vec<(Buffer, usize, usize, usize, usize)>,
+        );
         let mut index = 0;
         let mut offset = 0;
-        while index < regions.len() {
-            let host = self.input_pinned(capacity)?;
-            let mut pieces = vec![];
-            let mut written = 0;
-            while index < regions.len() && written < capacity {
-                let (buffer, source, destination, bytes) = &regions[index];
-                let count = (bytes - offset).min(capacity - written);
-                if count > 0 {
-                    pieces.push((
-                        buffer.clone(),
-                        source + offset,
-                        destination + offset,
-                        written,
-                        count,
-                    ));
-                }
-                written += count;
-                offset += count;
-                if offset == *bytes {
-                    index += 1;
-                    offset = 0;
-                }
-            }
-            if pieces.is_empty() {
-                continue;
-            }
-            let ticket = self.submit(
-                self.context.transfer,
-                Retained {
-                    _buffers: pieces.iter().map(|(b, ..)| b.clone()).collect(),
-                    _host: Some(Rc::clone(&host)),
-                    _extra: None,
-                },
-                |stream| {
-                    for (buffer, source, _, start, count) in &pieces {
-                        let pointer = buffer.range(*source, *count)?;
-                        check(
-                            // SAFETY: Validated extents; completion retains both DMA buffers. D2H=2.
-                            unsafe {
-                                (self.context.api.memcpy)(
-                                    host.pointer.cast::<u8>().add(*start).cast(),
-                                    *count,
-                                    pointer,
-                                    *count,
-                                    2,
-                                    stream,
-                                )
-                            },
-                            "ACL host-cache download",
-                        )?;
+        let next_slab = |index: &mut usize, offset: &mut usize| -> Result<Option<Slab>> {
+            while *index < regions.len() {
+                let host = self.input_pinned(capacity)?;
+                let mut pieces = vec![];
+                let mut written = 0;
+                while *index < regions.len() && written < capacity {
+                    let (buffer, source, destination, bytes) = &regions[*index];
+                    let count = (bytes - *offset).min(capacity - written);
+                    if count > 0 {
+                        pieces.push((
+                            buffer.clone(),
+                            source + *offset,
+                            destination + *offset,
+                            written,
+                            count,
+                        ));
                     }
-                    Ok(())
-                },
-            )?;
+                    written += count;
+                    *offset += count;
+                    if *offset == *bytes {
+                        *index += 1;
+                        *offset = 0;
+                    }
+                }
+                if pieces.is_empty() {
+                    continue;
+                }
+                let ticket = self.submit(
+                    self.context.transfer,
+                    Retained {
+                        _buffers: pieces.iter().map(|(b, ..)| b.clone()).collect(),
+                        _host: Some(Rc::clone(&host)),
+                        _extra: None,
+                    },
+                    |stream| {
+                        for (buffer, source, _, start, count) in &pieces {
+                            let pointer = buffer.range(*source, *count)?;
+                            check(
+                                // SAFETY: Validated extents; completion retains both DMA buffers. D2H=2.
+                                unsafe {
+                                    (self.context.api.memcpy)(
+                                        host.pointer.cast::<u8>().add(*start).cast(),
+                                        *count,
+                                        pointer,
+                                        *count,
+                                        2,
+                                        stream,
+                                    )
+                                },
+                                "ACL host-cache download",
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
+                return Ok(Some((ticket, host, pieces)));
+            }
+            Ok(None)
+        };
+        let finish_slab = |(ticket, host, pieces): Slab, output: &mut [u8]| -> Result<()> {
             ticket.wait()?;
             for (_, _, destination, start, count) in pieces {
                 // SAFETY: DMA completed; both host ranges span count bytes.
@@ -88,6 +100,18 @@ impl Session {
                         count,
                     );
                 }
+            }
+            Ok(())
+        };
+        let mut inflight = next_slab(&mut index, &mut offset)?;
+        while let Some(current) = inflight.take() {
+            if double_buffer {
+                let queued = next_slab(&mut index, &mut offset)?;
+                finish_slab(current, output)?;
+                inflight = queued;
+            } else {
+                finish_slab(current, output)?;
+                inflight = next_slab(&mut index, &mut offset)?;
             }
         }
         self.reap()

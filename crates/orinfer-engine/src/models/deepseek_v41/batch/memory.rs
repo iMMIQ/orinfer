@@ -24,7 +24,8 @@ impl Worker {
             return Err("Invalid owner token reservation".into());
         }
         let (_, allocation) = self.fixed_owner_layout()?;
-        let mut needed = Requirement::owners(allocation, 1, reserve)?;
+        let new_banks = usize::from(self.batch.as_ref().is_none_or(|r| r.idle_owners.is_empty()));
+        let mut needed = Requirement::owners(allocation, new_banks, reserve)?;
         for (name, layout) in &self.growth {
             let bytes = get(&self.buffers, name)?.physical_extent(layout.extent(tokens)?)?;
             needed.device = needed
@@ -68,6 +69,30 @@ impl Worker {
             self.session.memory_info()?.0.saturating_sub(held),
             self.session.remaining_device_bytes().saturating_sub(held),
         ))
+    }
+    /// Check budget, dropping any excess pooled idle owners beyond one before
+    /// reporting pressure so idle owner arenas never trigger false admission drains.
+    pub(in crate::models::deepseek_v41) fn check_budget(
+        &mut self,
+        needed: Requirement,
+    ) -> Result<bool> {
+        let (device, session) = self.available_memory()?;
+        if needed.fits(device, session) {
+            return Ok(true);
+        }
+        let mut dropped = false;
+        if let Some(runtime) = self.batch.as_mut() {
+            while runtime.idle_owners.len() > 1 {
+                runtime.idle_owners.pop();
+                dropped = true;
+            }
+        }
+        if !dropped {
+            return Ok(false);
+        }
+        self.session.synchronize()?;
+        let (device, session) = self.available_memory()?;
+        Ok(needed.fits(device, session))
     }
     pub(in crate::models::deepseek_v41) fn limit_owner(
         &mut self,
@@ -189,17 +214,43 @@ impl Worker {
         Ok(())
     }
     pub(in crate::models::deepseek_v41) fn clear_base_growth(&self) -> Result<()> {
-        for name in self.growth.keys() {
-            self.session.release_pages(&get(&self.buffers, name)?)?;
-        }
-        Ok(())
+        let buffers = self
+            .growth
+            .keys()
+            .map(|name| get(&self.buffers, name))
+            .collect::<Result<Vec<_>>>()?;
+        self.session.release_pages_many(&buffers)
     }
     pub(in crate::models::deepseek_v41) fn evict_batch_program(&mut self) -> Result<bool> {
         self.session.synchronize()?;
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
         let tables_released = runtime.bound_tables.take().is_some();
+        if runtime.idle_owners.pop().is_some() {
+            return Ok(true);
+        }
         while let Some(key) = runtime.lru.pop_front() {
             if runtime.remove(&key) {
+                self.w4.retain(|_, w| w.strong_count() > 0);
+                self.session.synchronize()?;
+                return Ok(true);
+            }
+        }
+        while let Some(key) = runtime.head_lru.pop_front() {
+            if runtime.remove_head(&key) {
+                self.w4.retain(|_, w| w.strong_count() > 0);
+                self.session.synchronize()?;
+                return Ok(true);
+            }
+        }
+        while let Some(key) = runtime.tail_lru.pop_front() {
+            if runtime.remove_tail(&key) {
+                self.w4.retain(|_, w| w.strong_count() > 0);
+                self.session.synchronize()?;
+                return Ok(true);
+            }
+        }
+        while let Some(key) = runtime.trunk_lru.pop_front() {
+            if runtime.remove_trunk(&key) {
                 self.w4.retain(|_, w| w.strong_count() > 0);
                 self.session.synchronize()?;
                 return Ok(true);
@@ -251,9 +302,10 @@ impl Worker {
             .filter(|id| *id != 0 && !runtime.owners.contains_key(id))
             .collect::<std::collections::BTreeSet<_>>()
             .len();
+        let new_banks = count.saturating_sub(runtime.idle_owners.len());
         let (arena, allocation) = self.fixed_owner_layout()?;
         let arena_bytes = allocation.bytes;
-        let needed = Requirement::owners(allocation, count, 0)?;
+        let needed = Requirement::owners(allocation, new_banks, 0)?;
         self.reserve_batch_memory(needed, "owner admission")?;
         for &id in ids {
             if self.batch.as_ref().unwrap().owners.contains_key(&id) {
@@ -264,6 +316,23 @@ impl Worker {
             {
                 return Err("Owner capacity exceeded".into());
             }
+            if id != 0
+                && let Some(idle) = self.batch.as_mut().unwrap().idle_owners.pop()
+            {
+                self.batch.as_mut().unwrap().owners.insert(
+                    id,
+                    Owner {
+                        bank: Some(idle.bank),
+                        buffers: idle.buffers,
+                        history: vec![],
+                        limit: None,
+                        vision: Default::default(),
+                        clean: false,
+                    },
+                );
+                self.reset_owner(id)?;
+                continue;
+            }
             let mut buffers = BTreeMap::new();
             let bank = if id == 0 {
                 None
@@ -271,7 +340,9 @@ impl Worker {
                 Some(self.session.allocate(arena_bytes)?)
             };
             let base = if let Some(bank) = &bank {
-                self.session.fill(bank, 0)?.wait()?;
+                // Async compute-stream zero covers every fixed private buffer
+                // (including packet.reset), so no second reset memset is needed.
+                self.session.fill(bank, 0)?;
                 usize::try_from(arena.base(bank.pointer() as usize as u64)?)
                     .map_err(|e| e.to_string())?
                     - (bank.pointer() as usize)
@@ -293,16 +364,25 @@ impl Worker {
                 };
                 buffers.insert(name.clone(), buffer);
             }
+            let zeroed = bank.is_some();
             self.batch.as_mut().unwrap().owners.insert(
                 id,
                 Owner {
+                    bank,
                     buffers,
                     history: vec![],
                     limit: None,
                     vision: Default::default(),
+                    clean: zeroed,
                 },
             );
-            self.reset_owner(id)?;
+            if zeroed {
+                if let Some(inputs) = &mut self.device_inputs {
+                    inputs.invalidate(id)?;
+                }
+            } else {
+                self.reset_owner(id)?;
+            }
         }
         Ok(())
     }
@@ -326,9 +406,11 @@ impl Worker {
             .into_iter()
             .map(|name| get(&owner.buffers, name))
             .collect::<Result<Vec<_>>>()?;
-        self.session.fill_many(&buffers, 0)?.wait()?;
+        // Compute-stream ordered before any subsequent restore or forward.
+        self.session.fill_many(&buffers, 0)?;
         owner.history.clear();
         owner.vision = Default::default();
+        owner.clean = true;
         Ok(())
     }
     pub(in crate::models::deepseek_v41) fn release_owners(&mut self) -> Result<()> {
@@ -339,6 +421,7 @@ impl Worker {
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
         runtime.bound_tables = None;
         runtime.owners.clear();
+        runtime.idle_owners.clear();
         self.clear_base_growth()?;
         Ok(())
     }

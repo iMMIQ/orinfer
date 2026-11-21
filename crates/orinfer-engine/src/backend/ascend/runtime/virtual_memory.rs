@@ -277,11 +277,28 @@ impl Session {
         }
         result
     }
+    #[cfg(test)]
     pub(crate) fn release_pages(&self, buffer: &Buffer) -> Result<()> {
-        self.require(buffer)?;
-        if let Some(memory) = &buffer.allocation.virtual_memory {
-            self.synchronize()?;
-            if let Err(error) = memory.borrow_mut().clear() {
+        self.release_pages_many(std::slice::from_ref(buffer))
+    }
+    /// Release physical pages across a batch of reservations behind one fence.
+    pub(crate) fn release_pages_many(&self, buffers: &[Buffer]) -> Result<()> {
+        let mut any = false;
+        for buffer in buffers {
+            self.require(buffer)?;
+            if buffer.has_mapped_pages() {
+                any = true;
+            }
+        }
+        if !any {
+            return Ok(());
+        }
+        self.synchronize()?;
+        for buffer in buffers {
+            if let Some(memory) = &buffer.allocation.virtual_memory
+                && memory.borrow().region.mapped > 0
+                && let Err(error) = memory.borrow_mut().clear()
+            {
                 self.context.retire();
                 return Err(error);
             }
@@ -453,6 +470,12 @@ impl MappingOps for Ops<'_> {
 impl Buffer {
     pub(crate) fn demand_mapped(&self) -> bool {
         self.offset == 0 && self.allocation.virtual_memory.is_some()
+    }
+    pub(crate) fn has_mapped_pages(&self) -> bool {
+        self.allocation
+            .virtual_memory
+            .as_ref()
+            .is_some_and(|m| m.borrow().region.mapped > 0)
     }
     pub(crate) fn kv_preview(&self, bytes: usize) -> Result<Vec<kv::Published>> {
         MemoryRange { offset: 0, bytes }.within(self.bytes)?;
@@ -693,9 +716,18 @@ impl Session {
             memory.region.mappings[0].mapped = true;
             memory.region.mapped = descriptor.bytes;
         }
-        self.fill(&canonical, 0)?;
-        self.upload_regions(&[(canonical.clone(), 0, bytes)])?
-            .wait()?;
+        if descriptor.used < descriptor.bytes {
+            self.fill(
+                &canonical.slice(descriptor.used, descriptor.bytes - descriptor.used)?,
+                0,
+            )?;
+        }
+        if !bytes.is_empty() {
+            self.upload_regions(&[(canonical.clone(), 0, bytes)])?
+                .wait()?;
+        } else {
+            self.synchronize()?;
+        }
         let allocation = Rc::new(SharedAllocation {
             owner: self.context.owner,
             id: descriptor.id,

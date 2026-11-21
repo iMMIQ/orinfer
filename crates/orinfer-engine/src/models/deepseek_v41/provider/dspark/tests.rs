@@ -358,9 +358,8 @@ fn block_draft_matches_target_with_prefix_restore_and_cancellation() {
             .unwrap();
         runtime
             .team
-            .exchange(Command::RollbackVerification(vec![(slot, keep)]))
+            .exchange(Command::FinishVerification(vec![(slot, keep)]))
             .unwrap();
-        runtime.team.exchange(Command::EndVerification).unwrap();
         let next = Layout::new(
             vec![BatchSegment { slot, tokens: 1 }],
             vec![0],

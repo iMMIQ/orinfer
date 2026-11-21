@@ -127,7 +127,10 @@ fn mixed_temperatures_select_from_the_same_forward_logits() {
             .team
             .forward_with(layout.clone(), tokens, readout, None, || {})
             .unwrap();
-        runtime.team.exchange(Command::EndVerification).unwrap();
+        runtime
+            .team
+            .exchange(Command::FinishVerification(vec![]))
+            .unwrap();
         assert!(timing.replay);
         let mut positions = BTreeMap::<usize, usize>::new();
         for output in &outputs {

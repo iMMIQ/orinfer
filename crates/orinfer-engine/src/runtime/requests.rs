@@ -224,6 +224,7 @@ impl ModelRuntime {
             tokens: input.to_vec(),
             media: self.prefix_media(input, images, audios)?,
             image_work,
+            checkpoint: Default::default(),
         })
     }
     pub(crate) fn waiting_cost(

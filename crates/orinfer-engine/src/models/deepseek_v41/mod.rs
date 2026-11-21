@@ -473,12 +473,50 @@ impl Segment {
         }
     }
 }
-struct Execution {
-    packet: Rc<Packet>,
-    body: Vec<Step>,
-    head: Vec<Step>,
+struct SubProgram {
+    steps: Vec<Step>,
     captured: bool,
     direct_uses: Cell<u8>,
+}
+struct Execution {
+    packet: Rc<Packet>,
+    trunk: Rc<SubProgram>,
+    tail: Option<Rc<SubProgram>>,
+    head: Option<Rc<SubProgram>>,
+}
+impl Execution {
+    fn monolithic(packet: Rc<Packet>, body: Vec<Step>, head: Vec<Step>, captured: bool) -> Self {
+        Self {
+            packet,
+            trunk: Rc::new(SubProgram {
+                steps: body,
+                captured,
+                direct_uses: Cell::new(0),
+            }),
+            tail: None,
+            head: (!head.is_empty()).then(|| {
+                Rc::new(SubProgram {
+                    steps: head,
+                    captured,
+                    direct_uses: Cell::new(0),
+                })
+            }),
+        }
+    }
+    fn body_steps(&self) -> impl Iterator<Item = &Step> {
+        self.trunk
+            .steps
+            .iter()
+            .chain(self.tail.iter().flat_map(|t| t.steps.iter()))
+    }
+    fn head_steps(&self) -> &[Step] {
+        self.head.as_deref().map_or(&[], |h| h.steps.as_slice())
+    }
+    fn all_captured(&self) -> bool {
+        self.trunk.captured
+            && self.tail.as_ref().is_none_or(|t| t.captured)
+            && self.head.as_ref().is_none_or(|h| h.captured)
+    }
 }
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct W4Key {

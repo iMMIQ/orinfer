@@ -305,7 +305,7 @@ fn forward(
         (values, timing.seconds, timing.preparation)
     };
     if frame.verification {
-        team.exchange(Command::EndVerification)?;
+        team.exchange(Command::FinishVerification(vec![]))?;
     }
     if values.len() != positions.len() {
         return Err("Native frame output positions differ".into());

@@ -364,6 +364,7 @@ def selected_int8(
     pv_l0_k=128,
     async_gather=False,
     dma_scales=False,
+    direct_bf16=False,
 ):
     """One paired-core selected-KV gather/QK/softmax/PV invocation per query.
 
@@ -466,7 +467,15 @@ def selected_int8(
                     for d in T.serial(dimension // tile_d):
                         T.copy(kv_workspace[row, :, d * tile_d : (d + 1) * tile_d], value_l1)
                         T.gemm_v0(probability_l1, value_l1, output_acc, init=True, kL0Size=pv_l0_k)
-                        T.copy(output_acc, output_workspace[row, :, d * tile_d : (d + 1) * tile_d])
+                        if direct_bf16:
+                            T.copy(
+                                output_acc,
+                                output[row, :heads, d * tile_d : (d + 1) * tile_d],
+                            )
+                        else:
+                            T.copy(
+                                output_acc, output_workspace[row, :, d * tile_d : (d + 1) * tile_d]
+                            )
                     T.set_cross_flag("FIX", 3)
                     T.wait_cross_flag(4)
                 with T.Scope("V"):
@@ -489,8 +498,6 @@ def selected_int8(
                     sink_value = T.alloc_ub((softmax_heads, 1), "float32")
                     probability = T.alloc_ub((softmax_heads, selected), "bfloat16")
                     expanded = T.alloc_ub((softmax_heads, selected), "float32")
-                    partial = T.alloc_ub((half_heads, tile_d), "float32")
-                    result = T.alloc_ub((half_heads, tile_d), "bfloat16")
                     for part in T.serial(produced // (2 * tile_slots)):
                         first = vid * (produced // 2) + part * tile_slots
                         gather_tile(
@@ -575,25 +582,28 @@ def selected_int8(
                             )
                     T.set_cross_flag("MTE3", 2)
                     T.wait_cross_flag(3)
-                    for d in T.serial(dimension // tile_d):
-                        first_head = vid * half_heads
-                        T.copy(
-                            output_workspace[
-                                row,
-                                first_head : first_head + half_heads,
-                                d * tile_d : (d + 1) * tile_d,
-                            ],
-                            partial,
-                        )
-                        T.tile.cast(result, partial, "CAST_RINT", half_heads * tile_d)
-                        T.copy(
-                            result,
-                            output[
-                                row,
-                                first_head : first_head + half_heads,
-                                d * tile_d : (d + 1) * tile_d,
-                            ],
-                        )
+                    if not direct_bf16:
+                        partial = T.alloc_ub((half_heads, tile_d), "float32")
+                        result = T.alloc_ub((half_heads, tile_d), "bfloat16")
+                        for d in T.serial(dimension // tile_d):
+                            first_head = vid * half_heads
+                            T.copy(
+                                output_workspace[
+                                    row,
+                                    first_head : first_head + half_heads,
+                                    d * tile_d : (d + 1) * tile_d,
+                                ],
+                                partial,
+                            )
+                            T.tile.cast(result, partial, "CAST_RINT", half_heads * tile_d)
+                            T.copy(
+                                result,
+                                output[
+                                    row,
+                                    first_head : first_head + half_heads,
+                                    d * tile_d : (d + 1) * tile_d,
+                                ],
+                            )
                     T.set_cross_flag("MTE3", 4)
                     T.pipe_barrier("ALL")
 

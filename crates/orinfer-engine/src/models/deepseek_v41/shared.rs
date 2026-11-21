@@ -343,9 +343,8 @@ fn ranges(kinds: &[Kind]) -> Result<Vec<Range<usize>>> {
 
 impl Execution {
     fn shared_entries(&self) -> Vec<Rc<Entry>> {
-        self.body
-            .iter()
-            .chain(&self.head)
+        self.body_steps()
+            .chain(self.head_steps())
             .flat_map(|s| match s {
                 Step::Segment(segment) => segment
                     .shared
@@ -403,8 +402,7 @@ impl Worker {
     pub fn shared_state(&mut self, layout: &batch::Layout) -> Result<Vec<State>> {
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
         let execution = runtime
-            .cache
-            .get(&runtime.key(layout)?)
+            .execution(layout, &self.packet_templates)?
             .ok_or("Missing shared packet")?;
         let entries = execution.shared_entries();
         for e in &entries {
@@ -444,8 +442,7 @@ impl Worker {
         }
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
         let execution = runtime
-            .cache
-            .get(&runtime.key(layout)?)
+            .execution(layout, &self.packet_templates)?
             .ok_or("Missing shared packet")?;
         let entries = execution.shared_entries();
         if ids.iter().any(|id| {
@@ -462,21 +459,20 @@ impl Worker {
     }
     pub fn capture_shared(&mut self, layout: &batch::Layout, id: &str) -> Result<Vec<State>> {
         let start = Instant::now();
-        let (key, execution, entry) = {
+        let (execution, entry) = {
             let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
-            let key = runtime.key(layout)?;
-            let execution = Rc::clone(runtime.cache.get(&key).ok_or("Missing shared packet")?);
+            let execution = runtime
+                .execution(layout, &self.packet_templates)?
+                .ok_or("Missing shared packet")?;
             let entry = execution
                 .shared_entries()
                 .into_iter()
                 .find(|e| e.id == id)
                 .ok_or("Missing shared piece")?;
-            (key, execution, entry)
+            (execution, entry)
         };
         self.reserve_batch_memory(memory::Requirement::workspace(), "shared graph capture")?;
-        let runtime = self.batch.as_mut().unwrap();
-        runtime.cache.insert(key.clone(), execution);
-        runtime.touch_shared_packet(key);
+        let _keepalive = execution;
         self.shared.touch(Rc::clone(&entry));
         entry.active.set(false);
         self.session.synchronize()?;
