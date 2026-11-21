@@ -54,6 +54,7 @@ pub(crate) struct ModelRuntime {
     batch_plans: crate::batch_plan::BatchPlanCache,
     request_hidden_ring: Option<String>,
     idle_admission_since: Option<Instant>,
+    last_cache_trim: Option<(Instant, requests::CacheTrimSnapshot)>,
 }
 impl ModelRuntime {
     pub(crate) fn expert_cache_statistics(
@@ -157,6 +158,7 @@ impl ModelRuntime {
             ),
             request_hidden_ring,
             idle_admission_since: None,
+            last_cache_trim: None,
         })
     }
     fn prepare_inputs(&self, tokens: &[u32], history: &[u32]) -> Result<()> {

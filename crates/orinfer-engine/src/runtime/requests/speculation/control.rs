@@ -39,6 +39,7 @@ pub(in crate::runtime) struct Controller {
     costs: Costs,
     budget: Budget,
     prefill_calibration: Option<(super::super::cost::Key, usize)>,
+    concurrent_sampling_ordinary_streak: usize,
     trace: bool,
     #[cfg(test)]
     pub(in crate::runtime) fixed_width: Option<usize>,
@@ -58,6 +59,7 @@ impl Default for Controller {
             costs: Costs::default(),
             budget: Budget::default(),
             prefill_calibration: None,
+            concurrent_sampling_ordinary_streak: 0,
             trace: std::env::var("ORINFER_MTP_TRACE").as_deref() == Ok("1"),
             #[cfg(test)]
             fixed_width: None,
@@ -114,6 +116,15 @@ fn select(
 impl Controller {
     pub(in crate::runtime) fn tracing(&self) -> bool {
         self.trace
+    }
+    /// True once concurrent sampled decoding has calibrated at least one native
+    /// speculative width and consecutively selected ordinary decoding.
+    pub(in crate::runtime) fn concurrent_sampling_prefers_ordinary(&self) -> bool {
+        #[cfg(test)]
+        if self.fixed_width.is_some() {
+            return false;
+        }
+        self.concurrent_sampling_ordinary_streak >= 8
     }
     pub(in crate::runtime) fn set_calibration_limit(&mut self, seconds: f64) {
         self.budget.set_limit(seconds);
@@ -294,6 +305,14 @@ impl Controller {
             |c| self.costs.prior(key, c.width, c.prior_seconds),
         );
         let decision = decision.map(|choice| (choice.id, choice.exploring));
+        let has_tried_spec = self.costs.profiles.iter().any(|(other, p)| {
+            other.batch >= 2
+                && other.sampling
+                && other.prefill == 0
+                && p.arms
+                    .iter()
+                    .any(|(&width, cost)| width >= 2 && cost.last > 0)
+        });
         if self.trace {
             let prices: Vec<_> = candidates
                 .iter()
@@ -312,6 +331,14 @@ impl Controller {
                 "MTP_CHOOSE {key:?} decision={decision:?} normal={normal:.6} calibration_credit={available:.6} earned_credit={:.6} prices={prices:?}",
                 self.budget.balance
             );
+        }
+        if key.batch >= 2 && key.sampling && key.prefill == 0 {
+            if matches!(decision, Some((_, false))) {
+                self.concurrent_sampling_ordinary_streak = 0;
+            } else if decision.is_none() && has_tried_spec {
+                self.concurrent_sampling_ordinary_streak =
+                    self.concurrent_sampling_ordinary_streak.saturating_add(1);
+            }
         }
         decision
     }

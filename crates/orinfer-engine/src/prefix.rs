@@ -93,6 +93,8 @@ pub(crate) struct Entry<T> {
     pub warm_tokens: usize,
     /// A decoded endpoint may have valid state but no matching target head.
     pub logits_valid: bool,
+    /// False for target-only checkpoints captured without warming the draft model.
+    pub mtp_warmed: bool,
     used: u64,
     hits: u64,
 }
@@ -107,6 +109,7 @@ impl<T> Entry<T> {
                 bytes: self.bytes,
                 warm_tokens: self.warm_tokens,
                 logits_valid: self.logits_valid,
+                mtp_warmed: self.mtp_warmed,
                 used: self.used,
                 hits: self.hits,
             },
@@ -128,9 +131,14 @@ impl<T> Entry<T> {
             bytes,
             warm_tokens,
             logits_valid,
+            mtp_warmed: true,
             used: 0,
             hits: 0,
         }
+    }
+    pub fn with_mtp_warmed(mut self, mtp_warmed: bool) -> Self {
+        self.mtp_warmed = mtp_warmed;
+        self
     }
 }
 

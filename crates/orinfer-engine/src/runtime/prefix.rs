@@ -123,31 +123,48 @@ impl ModelRuntime {
     pub(crate) fn prefix_enabled(&self) -> bool {
         self.prefix_cache.enabled()
     }
-    fn prefix_hit(&self, input: &[u32], media: &Media) -> Option<(bool, u64)> {
+    fn prefix_hit_for(
+        &self,
+        input: &[u32],
+        media: &Media,
+        require_mtp: bool,
+    ) -> Option<(bool, u64)> {
         self.prefix_cache.matched(
             input,
             media,
             |e| {
-                self.prefill_costs
-                    .score(e.tokens.len(), input.len(), e.bytes)
+                (!require_mtp || e.mtp_warmed)
+                    .then(|| {
+                        self.prefill_costs
+                            .score(e.tokens.len(), input.len(), e.bytes)
+                    })
+                    .flatten()
             },
             |e| {
-                self.prefill_costs
-                    .score(e.tokens.len(), input.len(), e.bytes)
+                (!require_mtp || e.mtp_warmed)
+                    .then(|| {
+                        self.prefill_costs
+                            .score(e.tokens.len(), input.len(), e.bytes)
+                    })
+                    .flatten()
             },
         )
+    }
+    fn prefix_hit(&self, input: &[u32], media: &Media) -> Option<(bool, u64)> {
+        self.prefix_hit_for(input, media, false)
     }
     pub(super) fn restore_prefix(
         &mut self,
         input: &[u32],
         media: &Media,
+        require_mtp: bool,
         context: &mut Context,
-    ) -> Result<(usize, super::speculation::PrefillWarm)> {
+    ) -> Result<(usize, super::speculation::PrefillWarm, bool)> {
         context.statistics = crate::prefix::Statistics::default();
         context.parent = None;
         self.execution.collect_snapshots()?;
         let at = Instant::now();
-        let hit = self.prefix_hit(input, media);
+        let hit = self.prefix_hit_for(input, media, require_mtp);
         let device_match = self
             .prefix_cache
             .device
@@ -161,18 +178,18 @@ impl ModelRuntime {
         context.statistics.matched_tokens = device_match.max(host_match);
         context.statistics.lookup_s = at.elapsed().as_secs_f64();
         let Some((host, id)) = hit else {
-            return Ok((0, super::speculation::PrefillWarm::default()));
+            return Ok((0, super::speculation::PrefillWarm::default(), true));
         };
         let at = Instant::now();
-        let (tokens, warm, bytes) = if host {
+        let (tokens, warm, bytes, mtp_warmed) = if host {
             let e = self.prefix_cache.host.touch(id);
             self.execution.restore_host_snapshot(&e.snapshot)?;
             context.statistics.host_hits += 1;
-            (e.tokens.len(), e.warm_tokens, e.bytes)
+            (e.tokens.len(), e.warm_tokens, e.bytes, e.mtp_warmed)
         } else {
             let e = self.prefix_cache.device.touch(id);
             self.execution.restore_snapshot(&e.snapshot)?;
-            (e.tokens.len(), e.warm_tokens, e.bytes)
+            (e.tokens.len(), e.warm_tokens, e.bytes, e.mtp_warmed)
         };
         context.parent = Some((host, id));
         context.statistics.cached_tokens = tokens;
@@ -185,6 +202,7 @@ impl ModelRuntime {
                 tokens: warm,
                 seconds: 0.0,
             },
+            mtp_warmed,
         ))
     }
     pub(super) fn admit_prefix_checkpoint(
@@ -207,6 +225,13 @@ impl ModelRuntime {
                 .admit_with_reuse(prefix, end, bytes, start, checkpoints, reused))
     }
     pub(super) fn prefix_ranges(&self, tokens: usize) -> Result<BTreeMap<String, Range>> {
+        self.prefix_ranges_for(tokens, true)
+    }
+    pub(super) fn prefix_ranges_for(
+        &self,
+        tokens: usize,
+        include_mtp: bool,
+    ) -> Result<BTreeMap<String, Range>> {
         let m = &self.manifest;
         let mut names: BTreeSet<String> = m.reset_buffers.iter().cloned().collect();
         names.extend([
@@ -221,10 +246,14 @@ impl ModelRuntime {
                 mtp_kv.extend(g.buffers.iter().cloned());
             }
         }
+        let mtp_enabled = include_mtp && m.mtp.is_some();
         if let Some(spec) = &m.mtp {
-            names.extend([spec.position.clone(), spec.target_length.clone()]);
-            if let Some(ring) = &spec.hidden_ring {
-                names.insert(ring.clone());
+            names.insert(spec.target_length.clone());
+            if include_mtp {
+                names.insert(spec.position.clone());
+                if let Some(ring) = &spec.hidden_ring {
+                    names.insert(ring.clone());
+                }
             }
             if let Some(kv) = &m.kv_cache {
                 for growth in kv.growth.values().filter(|g| g.position == spec.position) {
@@ -234,7 +263,14 @@ impl ModelRuntime {
         }
         let mut ranges = BTreeMap::new();
         for name in names {
-            if m.mtp.is_none() && mtp_kv.contains(&name) {
+            if !mtp_enabled && mtp_kv.contains(&name) {
+                continue;
+            }
+            if !include_mtp
+                && m.mtp
+                    .as_ref()
+                    .is_some_and(|s| name == s.position || s.hidden_ring.as_ref() == Some(&name))
+            {
                 continue;
             }
             let b = m
@@ -293,6 +329,7 @@ impl ModelRuntime {
                         device.budget,
                     )))
     }
+    #[cfg(test)]
     pub(super) fn store_prefix(
         &mut self,
         input: &[u32],
@@ -301,9 +338,22 @@ impl ModelRuntime {
         checkpoint: Checkpoint,
         context: &mut Context,
     ) -> Result<()> {
+        self.store_prefix_with_mtp(input, media, warm_tokens, true, checkpoint, context)
+    }
+    pub(super) fn store_prefix_with_mtp(
+        &mut self,
+        input: &[u32],
+        media: &Media,
+        warm_tokens: usize,
+        mtp_warmed: bool,
+        checkpoint: Checkpoint,
+        context: &mut Context,
+    ) -> Result<()> {
         let at = Instant::now();
         let logits_valid = checkpoint != Checkpoint::Decoded;
+        let include_mtp = mtp_warmed || self.manifest.mtp.is_none();
         if self.prefix_enabled()
+            && include_mtp
             && self.manifest.mtp.is_some()
             && (input.is_empty() || warm_tokens != input.len() - 1)
         {
@@ -313,10 +363,12 @@ impl ModelRuntime {
             e.tokens == input
                 && e.media.common_tokens(media, input.len()) == input.len()
                 && (!logits_valid || e.logits_valid)
+                && (!include_mtp || e.mtp_warmed)
         }) || self.prefix_cache.host.entries.values().any(|e| {
             e.tokens == input
                 && e.media.common_tokens(media, input.len()) == input.len()
                 && (!logits_valid || e.logits_valid)
+                && (!include_mtp || e.mtp_warmed)
         });
         if self.prefix_enabled()
             && !same
@@ -331,7 +383,7 @@ impl ModelRuntime {
                 .as_ref()
                 .is_none_or(|s| s.hidden_ring.is_some())
         {
-            let ranges = self.prefix_ranges(input.len())?;
+            let ranges = self.prefix_ranges_for(input.len(), include_mtp)?;
             let minimum = ranges.values().try_fold(0usize, |n, r| {
                 n.checked_add(r.bytes).ok_or("Prefix size overflow")
             })?;
@@ -394,6 +446,7 @@ impl ModelRuntime {
                         media,
                         warm_tokens,
                         logits_valid,
+                        include_mtp,
                         &plan,
                         context,
                     )?;
@@ -427,7 +480,7 @@ impl ModelRuntime {
                             return Err("Prefix budget accounting failure".into());
                         }
                     }
-                    // Upgrade a head-less endpoint, rather than keeping two states.
+                    // Upgrade a head-less or target-only endpoint, rather than keeping two states.
                     let obsolete: Vec<_> = self
                         .prefix_cache
                         .device
@@ -445,14 +498,17 @@ impl ModelRuntime {
                     }
                     let bytes = snapshot.bytes;
                     self.remove_host_endpoint(input, media);
-                    let id = self.prefix_cache.device.insert(Entry::new(
-                        input.to_vec(),
-                        media.clone(),
-                        snapshot,
-                        bytes,
-                        warm_tokens,
-                        logits_valid,
-                    ));
+                    let id = self.prefix_cache.device.insert(
+                        Entry::new(
+                            input.to_vec(),
+                            media.clone(),
+                            snapshot,
+                            bytes,
+                            warm_tokens,
+                            logits_valid,
+                        )
+                        .with_mtp_warmed(include_mtp),
+                    );
                     context.parent = Some((false, id));
                     context.statistics.checkpoints_stored += 1;
                 } else {
@@ -463,13 +519,22 @@ impl ModelRuntime {
                             media,
                             warm_tokens,
                             logits_valid,
+                            include_mtp,
                             &plan,
                             context,
                         )?;
                     }
                 }
             } else if !adjacent {
-                self.store_host_prefix(input, media, warm_tokens, logits_valid, &plan, context)?;
+                self.store_host_prefix(
+                    input,
+                    media,
+                    warm_tokens,
+                    logits_valid,
+                    include_mtp,
+                    &plan,
+                    context,
+                )?;
             }
         }
         context.statistics.store_s += at.elapsed().as_secs_f64();
@@ -507,12 +572,14 @@ impl ModelRuntime {
             .and_then(|n| n.checked_add(8192))
             .ok_or_else(|| "Host cache metadata overflow".into())
     }
+    #[allow(clippy::too_many_arguments)]
     fn store_host_prefix(
         &mut self,
         input: &[u32],
         media: &Media,
         warm: usize,
         logits: bool,
+        mtp_warmed: bool,
         plan: &crate::backend::snapshot::Plan,
         context: &mut Context,
     ) -> Result<()> {
@@ -541,14 +608,10 @@ impl ModelRuntime {
         snapshot.metadata_bytes = metadata;
         let bytes = snapshot.bytes;
         self.remove_host_endpoint(input, media);
-        let id = self.prefix_cache.host.insert(Entry::new(
-            input.to_vec(),
-            media.clone(),
-            snapshot,
-            bytes,
-            warm,
-            logits,
-        ));
+        let id = self.prefix_cache.host.insert(
+            Entry::new(input.to_vec(), media.clone(), snapshot, bytes, warm, logits)
+                .with_mtp_warmed(mtp_warmed),
+        );
         context.parent = Some((true, id));
         context.statistics.host_stores += 1;
         context.statistics.checkpoints_stored += 1;
@@ -623,6 +686,7 @@ impl ModelRuntime {
         self.prefix_cache
             .update_statistics(1, &mut context.statistics);
     }
+    #[cfg(test)]
     pub(super) fn store_decoded_prefix(
         &mut self,
         history: &[u32],
@@ -630,9 +694,19 @@ impl ModelRuntime {
         cancelled: &impl Fn() -> bool,
         context: &mut Context,
     ) -> Result<()> {
+        self.store_decoded_prefix_with_mtp(history, media, cancelled, true, context)
+    }
+    pub(super) fn store_decoded_prefix_with_mtp(
+        &mut self,
+        history: &[u32],
+        media: &Media,
+        cancelled: &impl Fn() -> bool,
+        mtp_warmed: bool,
+        context: &mut Context,
+    ) -> Result<()> {
         let position = self.read_control(&self.manifest.position)? as usize;
         if self.prefix_enabled() && !cancelled() && position != 0 && position <= history.len() {
-            let spec = self.manifest.mtp.clone();
+            let spec = mtp_warmed.then(|| self.manifest.mtp.clone()).flatten();
             let warm = if let Some(s) = &spec {
                 // The draft has already consumed the pending token's embedding.
                 // Cache only the prefix-consistent P-1 range; preserve the live cursor.
@@ -645,10 +719,11 @@ impl ModelRuntime {
             } else {
                 0
             };
-            let result = self.store_prefix(
+            let result = self.store_prefix_with_mtp(
                 &history[..position],
                 media,
                 warm,
+                mtp_warmed,
                 Checkpoint::Decoded,
                 context,
             );

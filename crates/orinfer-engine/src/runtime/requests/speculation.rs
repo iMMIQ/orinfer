@@ -105,11 +105,21 @@ impl ModelRuntime {
         let width = spec.verification_widths().into_iter().max().unwrap_or(1);
         let margin = requests.len().saturating_mul(width).max(ring / 4).min(ring);
         let threshold = ring.saturating_sub(margin);
+        let skip_sampled = requests.len() >= 2
+            && self
+                .dynamic_speculation
+                .concurrent_sampling_prefers_ordinary();
         let mut due: Vec<_> = requests
             .iter()
             .enumerate()
             .filter_map(|(i, r)| {
-                if r.prefilling || r.is_finished() || r.mtp_blocked {
+                if r.prefilling
+                    || r.is_finished()
+                    || r.mtp_blocked
+                    || (skip_sampled
+                        && !r.decoder.has_constraint()
+                        && self.lookup_warm_capacity(&spec, &r.sampling).is_some())
+                {
                     return None;
                 }
                 let lag = r

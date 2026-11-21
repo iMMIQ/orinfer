@@ -60,7 +60,8 @@ impl ModelRuntime {
         self.execution.reset_sequence(&m.reset_buffers)?;
         self.prepare_visual(input, images.unwrap_or(&[]), &cancelled)?;
         let media = self.prefix_media(input, images.unwrap_or(&[]), &[])?;
-        let (mut offset, mut warm) = self.restore_prefix(input, &media, prefix)?;
+        let (mut offset, mut warm, _) =
+            self.restore_prefix(input, &media, mtp.is_some(), prefix)?;
         if offset != 0
             && offset < input.len()
             && let Some(spec) = &mtp

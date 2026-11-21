@@ -6,6 +6,7 @@ const KEY: usize = 4;
 const CONTEXT: usize = 8;
 const SAMPLED_CONTEXT: usize = 7;
 const WINDOW: usize = 8192;
+const COOLDOWN: usize = 16;
 
 #[derive(Default)]
 pub(super) struct PromptLookup {
@@ -100,7 +101,7 @@ impl PromptLookup {
         } else {
             self.misses += 1;
             if self.misses >= 2 {
-                self.cooldown = progress.saturating_add(64);
+                self.cooldown = progress.saturating_add(COOLDOWN);
                 self.misses = 0;
             }
         }
@@ -153,7 +154,10 @@ mod tests {
         lookup.observe(0, 2, history.len());
         assert_eq!(lookup.propose(&history, 2), None);
         let mut resumed = history.to_vec();
-        resumed.extend_from_slice(&[0; 64]);
+        resumed.extend_from_slice(&[0; COOLDOWN - 5]);
+        resumed.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(lookup.propose(&resumed, 2), None);
+        resumed.extend_from_slice(&[0; 5]);
         resumed.extend_from_slice(&[1, 2, 3, 4]);
         assert_eq!(lookup.propose(&resumed, 2), Some(vec![0, 0]));
         lookup.observe(1, 2, resumed.len());

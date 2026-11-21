@@ -13,7 +13,10 @@ use std::{
     io::Read,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread::JoinHandle,
 };
 
@@ -124,14 +127,230 @@ impl Cache {
     }
 }
 type Uploads = Vec<(String, Vec<u8>)>;
+type DecodeTask = (bool, usize, usize);
 
-struct Lookup {
+/// Dispatch across the persistent worker pool whenever at least two cold rows
+/// need reading so concurrent pread calls overlap SSD latency without spawning
+/// fresh OS threads.
+const PARALLEL_DECODE_THRESHOLD: usize = 2;
+
+struct LookupData {
     assets: Assets,
     tables: Vec<Table>,
     embedding: Vec<Source>,
     ple: Vec<Source>,
+}
+
+struct ActiveJob {
+    keys: Vec<DecodeTask>,
+    chunk: usize,
+    next: AtomicUsize,
+    done_mu: Mutex<JobCollector>,
+    done_cv: Condvar,
+}
+
+struct JobCollector {
+    decoded: Vec<Option<Vec<u16>>>,
+    error: Option<String>,
+    workers_done: usize,
+}
+
+#[derive(Default)]
+struct PoolState {
+    job_id: u64,
+    job: Option<Arc<ActiveJob>>,
+    shutdown: bool,
+}
+
+/// Persistent worker pool for decoding large cold prefill batches without
+/// spawning fresh OS threads on every packet.
+struct RowPool {
+    data: Arc<LookupData>,
+    run_lock: Mutex<()>,
+    state: Arc<(Mutex<PoolState>, Condvar)>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl RowPool {
+    fn new(data: Arc<LookupData>) -> Self {
+        Self {
+            data,
+            run_lock: Mutex::new(()),
+            state: Arc::new((Mutex::new(PoolState::default()), Condvar::new())),
+            handles: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn ensure_workers(&self) -> usize {
+        let mut handles = self.handles.lock().unwrap();
+        if handles.is_empty() {
+            let count = std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .saturating_sub(1)
+                .min(11);
+            for index in 0..count {
+                let data = Arc::clone(&self.data);
+                let state = Arc::clone(&self.state);
+                if let Ok(handle) = std::thread::Builder::new()
+                    .name(format!("flash-row-{index}"))
+                    .spawn(move || {
+                        let mut seen = 0u64;
+                        loop {
+                            let job = {
+                                let (lock, cv) = &*state;
+                                let mut guard = lock.lock().unwrap();
+                                while !guard.shutdown && guard.job_id == seen {
+                                    guard = cv.wait(guard).unwrap();
+                                }
+                                if guard.shutdown {
+                                    return;
+                                }
+                                seen = guard.job_id;
+                                guard.job.clone()
+                            };
+                            let Some(job) = job else {
+                                continue;
+                            };
+                            let (local, error) = Self::drain_job(&data, &job);
+                            let mut collector = job.done_mu.lock().unwrap();
+                            if collector.error.is_none() {
+                                if let Some(err) = error {
+                                    collector.error = Some(err);
+                                } else {
+                                    for (idx, row) in local {
+                                        collector.decoded[idx] = Some(row);
+                                    }
+                                }
+                            }
+                            collector.workers_done += 1;
+                            job.done_cv.notify_one();
+                        }
+                    })
+                {
+                    handles.push(handle);
+                }
+            }
+        }
+        handles.len()
+    }
+
+    fn drain_job(data: &LookupData, job: &ActiveJob) -> (Vec<(usize, Vec<u16>)>, Option<String>) {
+        let mut local = Vec::new();
+        let total = job.keys.len();
+        loop {
+            let start = job.next.fetch_add(job.chunk, Ordering::Relaxed);
+            if start >= total {
+                break;
+            }
+            let end = (start + job.chunk).min(total);
+            for idx in start..end {
+                let (is_ple, shard, row) = job.keys[idx];
+                let res = if is_ple {
+                    decode_row(&data.ple, &data.tables, shard, row)
+                } else {
+                    decode_row(&data.embedding, &data.tables, shard, row)
+                };
+                match res {
+                    Ok(values) => local.push((idx, values)),
+                    Err(err) => {
+                        job.next.store(total, Ordering::Relaxed);
+                        return (local, Some(err));
+                    }
+                }
+            }
+        }
+        (local, None)
+    }
+
+    fn decode(&self, keys: Vec<DecodeTask>) -> Result<Vec<Vec<u16>>> {
+        let total = keys.len();
+        if total < PARALLEL_DECODE_THRESHOLD {
+            let mut decoded = Vec::with_capacity(total);
+            for &(is_ple, shard, row) in &keys {
+                decoded.push(if is_ple {
+                    decode_row(&self.data.ple, &self.data.tables, shard, row)?
+                } else {
+                    decode_row(&self.data.embedding, &self.data.tables, shard, row)?
+                });
+            }
+            return Ok(decoded);
+        }
+        let _run = self.run_lock.lock().unwrap();
+        let workers = self.ensure_workers();
+        if workers == 0 {
+            let mut decoded = Vec::with_capacity(total);
+            for &(is_ple, shard, row) in &keys {
+                decoded.push(if is_ple {
+                    decode_row(&self.data.ple, &self.data.tables, shard, row)?
+                } else {
+                    decode_row(&self.data.embedding, &self.data.tables, shard, row)?
+                });
+            }
+            return Ok(decoded);
+        }
+        let chunk = (total / ((workers + 1) * 4)).clamp(1, 16);
+        let job = Arc::new(ActiveJob {
+            keys,
+            chunk,
+            next: AtomicUsize::new(0),
+            done_mu: Mutex::new(JobCollector {
+                decoded: vec![None; total],
+                error: None,
+                workers_done: 0,
+            }),
+            done_cv: Condvar::new(),
+        });
+        {
+            let (lock, cv) = &*self.state;
+            let mut guard = lock.lock().unwrap();
+            guard.job = Some(Arc::clone(&job));
+            guard.job_id += 1;
+            cv.notify_all();
+        }
+        let (local, local_err) = Self::drain_job(&self.data, &job);
+        let mut collector = job.done_mu.lock().unwrap();
+        while collector.workers_done < workers {
+            collector = job.done_cv.wait(collector).unwrap();
+        }
+        {
+            let (lock, _) = &*self.state;
+            lock.lock().unwrap().job = None;
+        }
+        if let Some(err) = local_err.or_else(|| collector.error.take()) {
+            return Err(err);
+        }
+        for (idx, row) in local {
+            collector.decoded[idx] = Some(row);
+        }
+        Ok(collector
+            .decoded
+            .drain(..)
+            .map(|row| row.expect("every missing row was decoded"))
+            .collect())
+    }
+}
+
+impl Drop for RowPool {
+    fn drop(&mut self) {
+        let _run = self.run_lock.lock().unwrap();
+        {
+            let (lock, cv) = &*self.state;
+            let mut guard = lock.lock().unwrap();
+            guard.shutdown = true;
+            guard.job = None;
+            cv.notify_all();
+        }
+        for handle in self.handles.get_mut().unwrap().drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct Lookup {
+    data: Arc<LookupData>,
     embedding_cache: Mutex<Cache>,
     ple_cache: Mutex<Cache>,
+    pool: RowPool,
 }
 // The GPU worker owns the pending job. Only immutable token spans and CPU
 // lookup assets cross into the preparation thread.
@@ -199,7 +418,7 @@ impl Inputs {
         if program == "target"
             && history
                 .iter()
-                .all(|&token| (token as usize) < self.lookup.assets.vocab)
+                .all(|&token| (token as usize) < self.lookup.data.assets.vocab)
         {
             let mut pending = self.pending.borrow_mut();
             if pending.as_ref().is_some_and(|job| {
@@ -272,7 +491,8 @@ fn validate_rows(file: &mut File, part: &Part, width: usize, verify_weights: boo
         return Err("Invalid CPU row shard hash".into());
     }
     // SAFETY: Prepared assets remain immutable while open. Only the container
-    // header is accessed here; the mapping is dropped before row lookup begins.
+    // header is accessed here; the mapping is dropped before row lookup begins
+    // so multi-GiB PLE shards never trigger mmap readahead or page-table thrash.
     let mapping = unsafe { MmapOptions::new().map(&*file) }.map_err(|e| e.to_string())?;
     let (header, metadata) = SafeTensors::read_metadata(&mapping).map_err(|e| e.to_string())?;
     let start = 8 + header;
@@ -377,6 +597,7 @@ impl Lookup {
                 }
                 let mut file = File::open(path(&root, &part.file)?).map_err(|e| e.to_string())?;
                 validate_rows(&mut file, part, width, verify_weights)?;
+                let len = file.metadata().map_err(|e| e.to_string())?.len();
                 let bytes = (part.rows as u64)
                     .checked_mul(if part.book.is_some() {
                         (2 + width / 4) as u64
@@ -385,13 +606,13 @@ impl Lookup {
                     })
                     .and_then(|n| n.checked_add(part.offset))
                     .ok_or("CPU row extent overflow")?;
-                if bytes > file.metadata().map_err(|e| e.to_string())?.len() {
+                if bytes > len {
                     return Err("CPU rows exceed file".into());
                 }
                 if part.scale_offset.is_some_and(|offset| {
                     offset
                         .checked_add(part.rows as u64 * 2)
-                        .is_none_or(|end| end > file.metadata().map(|m| m.len()).unwrap_or(0))
+                        .is_none_or(|end| end > len)
                 }) {
                     return Err("CPU row scales exceed file".into());
                 }
@@ -430,119 +651,111 @@ impl Lookup {
         {
             return Err("PLE head outside CPU row table".into());
         }
-        Ok(Self {
+        let data = Arc::new(LookupData {
             assets,
             tables,
             embedding,
             ple,
+        });
+        Ok(Self {
+            pool: RowPool::new(Arc::clone(&data)),
+            data,
             embedding_cache: Default::default(),
             ple_cache: Default::default(),
         })
     }
-    fn row(
+    /// Resolve every row needed by one packet with batched cache locking and
+    /// pread-backed decoding. Single-row misses run inline; multi-row misses
+    /// reuse the persistent worker pool to overlap SSD reads and E8P decoding.
+    fn fetch_rows(
         &self,
-        sources: &[Source],
-        cache: &Mutex<Cache>,
-        row: usize,
-        budget: usize,
-    ) -> Result<Row> {
-        let key = shard_of(sources, row)?;
-        if let Some(value) = cache.lock().unwrap().get(key) {
-            return Ok(value);
-        }
-        let value = load_row(sources, &self.tables, key.0, key.1)?;
-        cache.lock().unwrap().put(key, Arc::clone(&value), budget);
-        Ok(value)
-    }
-    /// Read and decode every uncached row one packet needs before assembly.
-    /// Keys are sorted per table so each worker reads ascending file offsets;
-    /// decoded rows are inserted into the owning cache on the calling thread.
-    fn prefetch_rows(&self, embedding_rows: &[usize], ple_rows: &[usize]) -> Result<()> {
-        let missing = |sources: &[Source],
-                       rows: &[usize],
-                       cache: &Mutex<Cache>|
-         -> Result<Vec<(usize, usize)>> {
-            let mut need: Vec<(usize, usize)> = Vec::new();
-            {
-                let mut cache = cache.lock().unwrap();
+        embedding_rows: &[usize],
+        ple_rows: &[usize],
+    ) -> Result<(Vec<Row>, Vec<Row>)> {
+        type RowKey = (usize, usize);
+        type TableLookup = (Vec<Option<Row>>, Vec<RowKey>, Vec<RowKey>);
+        let lookup_table =
+            |sources: &[Source], rows: &[usize], cache: &Mutex<Cache>| -> Result<TableLookup> {
+                let mut keys = Vec::with_capacity(rows.len());
                 for &row in rows {
-                    let key = shard_of(sources, row)?;
-                    if cache.get(key).is_none() {
-                        need.push(key);
+                    keys.push(shard_of(sources, row)?);
+                }
+                let mut resolved = Vec::with_capacity(rows.len());
+                let mut need = Vec::new();
+                {
+                    let mut cache = cache.lock().unwrap();
+                    for &key in &keys {
+                        if let Some(hit) = cache.get(key) {
+                            resolved.push(Some(hit));
+                        } else {
+                            resolved.push(None);
+                            need.push(key);
+                        }
+                    }
+                }
+                need.sort_unstable();
+                need.dedup();
+                Ok((resolved, keys, need))
+            };
+        let (mut emb_resolved, emb_keys, emb_need) =
+            lookup_table(&self.data.embedding, embedding_rows, &self.embedding_cache)?;
+        let (mut ple_resolved, ple_keys, ple_need) = if ple_rows.is_empty() {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            lookup_table(&self.data.ple, ple_rows, &self.ple_cache)?
+        };
+        let total = emb_need.len() + ple_need.len();
+        if total != 0 {
+            let tasks: Vec<DecodeTask> = emb_need
+                .iter()
+                .map(|&(shard, local)| (false, shard, local))
+                .chain(ple_need.iter().map(|&(shard, local)| (true, shard, local)))
+                .collect();
+            let decoded = self.pool.decode(tasks)?;
+            let mut iter = decoded.into_iter();
+            if !emb_need.is_empty() {
+                let mut freshly = HashMap::with_capacity(emb_need.len());
+                {
+                    let mut cache = self.embedding_cache.lock().unwrap();
+                    for &key in &emb_need {
+                        let row = Arc::new(iter.next().expect("decoded embedding row"));
+                        cache.put(key, Arc::clone(&row), EMBEDDING_CACHE_BUDGET);
+                        freshly.insert(key, row);
+                    }
+                }
+                for (slot, &key) in emb_resolved.iter_mut().zip(&emb_keys) {
+                    if slot.is_none() {
+                        *slot = Some(Arc::clone(&freshly[&key]));
                     }
                 }
             }
-            need.sort_unstable();
-            need.dedup();
-            Ok(need)
-        };
-        let embedding_need = missing(&self.embedding, embedding_rows, &self.embedding_cache)?;
-        let ple_need = missing(&self.ple, ple_rows, &self.ple_cache)?;
-        let total = embedding_need.len() + ple_need.len();
-        if total == 0 {
-            return Ok(());
-        }
-        // Work items carry the owning table so one sorted list feeds a single
-        // parallel pass: false selects embedding shards, true selects PLE.
-        let keys: Vec<(bool, usize, usize)> = embedding_need
-            .iter()
-            .map(|&(shard, local)| (false, shard, local))
-            .chain(ple_need.iter().map(|&(shard, local)| (true, shard, local)))
-            .collect();
-        let mut decoded: Vec<Option<Vec<u16>>> = vec![None; total];
-        let threads = total.min(std::thread::available_parallelism().map_or(1, |n| n.get()));
-        let Lookup {
-            embedding,
-            ple,
-            tables,
-            ..
-        } = self;
-        if threads <= 1 {
-            for (key, out) in keys.iter().zip(decoded.iter_mut()) {
-                *out = Some(if key.0 {
-                    decode_row(ple, tables, key.1, key.2)?
-                } else {
-                    decode_row(embedding, tables, key.1, key.2)?
-                });
-            }
-        } else {
-            let chunk = total.div_ceil(threads);
-            std::thread::scope(|scope| -> Result<()> {
-                let mut handles = vec![];
-                for (keys, out) in keys.chunks(chunk).zip(decoded.chunks_mut(chunk)) {
-                    handles.push(scope.spawn(move || -> Result<()> {
-                        for (key, out) in keys.iter().zip(out.iter_mut()) {
-                            *out = Some(if key.0 {
-                                decode_row(ple, tables, key.1, key.2)?
-                            } else {
-                                decode_row(embedding, tables, key.1, key.2)?
-                            });
-                        }
-                        Ok(())
-                    }));
+            if !ple_need.is_empty() {
+                let mut freshly = HashMap::with_capacity(ple_need.len());
+                {
+                    let mut cache = self.ple_cache.lock().unwrap();
+                    for &key in &ple_need {
+                        let row = Arc::new(iter.next().expect("decoded PLE row"));
+                        cache.put(key, Arc::clone(&row), PLE_CACHE_BUDGET);
+                        freshly.insert(key, row);
+                    }
                 }
-                for handle in handles {
-                    handle.join().map_err(|_| "CPU row loader panicked")??;
+                for (slot, &key) in ple_resolved.iter_mut().zip(&ple_keys) {
+                    if slot.is_none() {
+                        *slot = Some(Arc::clone(&freshly[&key]));
+                    }
                 }
-                Ok(())
-            })?;
-        }
-        for (key, value) in keys.iter().zip(decoded) {
-            let row = Arc::new(value.expect("every missing row was decoded"));
-            if key.0 {
-                self.ple_cache
-                    .lock()
-                    .unwrap()
-                    .put((key.1, key.2), row, PLE_CACHE_BUDGET);
-            } else {
-                self.embedding_cache.lock().unwrap().put(
-                    (key.1, key.2),
-                    row,
-                    EMBEDDING_CACHE_BUDGET,
-                );
             }
         }
-        Ok(())
+        Ok((
+            emb_resolved
+                .into_iter()
+                .map(|row| row.expect("embedding row resolved"))
+                .collect(),
+            ple_resolved
+                .into_iter()
+                .map(|row| row.expect("PLE row resolved"))
+                .collect(),
+        ))
     }
     pub(super) fn prepare_for(
         &self,
@@ -555,6 +768,7 @@ impl Lookup {
         if !draft && program != "target" {
             return Err("Unknown Flash input program".into());
         }
+        let assets = &self.data.assets;
         if tokens.is_empty()
             || tokens.len() > capacity
             || !(1..=4096).contains(&capacity)
@@ -562,21 +776,18 @@ impl Lookup {
             || tokens
                 .iter()
                 .chain(history)
-                .any(|&t| t as usize >= self.assets.vocab)
+                .any(|&t| t as usize >= assets.vocab)
         {
             return Err("Unsupported Flash input shape/token".into());
         }
         let mut previous: Vec<u32> = history
             .iter()
             .rev()
-            .take_while(|&&t| t != self.assets.eos)
+            .take_while(|&&t| t != assets.eos)
             .take(2)
             .copied()
             .collect();
         previous.reverse();
-        // Pass 1 resolves every row this packet needs without I/O; the missing
-        // set is then read and decoded in parallel before assembly, so cold
-        // prompts no longer pay one synchronous row read per lookup.
         let mut embedding_rows: Vec<usize> = Vec::with_capacity(tokens.len());
         let mut ple_rows: Vec<usize> =
             Vec::with_capacity(if draft { 0 } else { tokens.len() * 16 });
@@ -585,21 +796,19 @@ impl Lookup {
             if draft {
                 continue;
             }
-            let mut mixed = token as u64 * self.assets.multipliers[0];
+            let mut mixed = token as u64 * assets.multipliers[0];
             for shift in 1..=2 {
                 let prior = previous
                     .len()
                     .checked_sub(shift)
                     .map(|i| previous[i])
-                    .unwrap_or(self.assets.eos);
-                mixed ^= prior as u64 * self.assets.multipliers[shift];
+                    .unwrap_or(assets.eos);
+                mixed ^= prior as u64 * assets.multipliers[shift];
                 for head in (shift - 1) * 8..shift * 8 {
-                    ple_rows.push(
-                        (mixed % self.assets.sizes[head] + self.assets.offsets[head]) as usize,
-                    );
+                    ple_rows.push((mixed % assets.sizes[head] + assets.offsets[head]) as usize);
                 }
             }
-            if token == self.assets.eos {
+            if token == assets.eos {
                 previous.clear();
             } else {
                 previous.push(token);
@@ -608,35 +817,14 @@ impl Lookup {
                 }
             }
         }
-        self.prefetch_rows(&embedding_rows, &ple_rows)?;
+        let (emb_values, ple_values) = self.fetch_rows(&embedding_rows, &ple_rows)?;
         let mut embedding = Vec::with_capacity(tokens.len() * 5120);
+        for row in &emb_values {
+            extend_u16_le(&mut embedding, row);
+        }
         let mut ple = Vec::with_capacity(if draft { 0 } else { tokens.len() * 5120 });
-        let mut ple_cursor = 0;
-        for &token in tokens {
-            let row = self.row(
-                &self.embedding,
-                &self.embedding_cache,
-                token as usize,
-                EMBEDDING_CACHE_BUDGET,
-            )?;
-            for &value in row.iter() {
-                embedding.extend(value.to_le_bytes());
-            }
-            if draft {
-                continue;
-            }
-            for _ in 0..16 {
-                let row = self.row(
-                    &self.ple,
-                    &self.ple_cache,
-                    ple_rows[ple_cursor],
-                    PLE_CACHE_BUDGET,
-                )?;
-                ple_cursor += 1;
-                for &value in row.iter() {
-                    ple.extend(value.to_le_bytes());
-                }
-            }
+        for row in &ple_values {
+            extend_u16_le(&mut ple, row);
         }
         if draft {
             let mut prepared = vec![(
@@ -667,6 +855,24 @@ impl Lookup {
         ])
     }
 }
+
+#[inline]
+fn extend_u16_le(dst: &mut Vec<u8>, src: &[u16]) {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: u16 has no padding bytes and target byte order is little-endian.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), std::mem::size_of_val(src))
+        };
+        dst.extend_from_slice(bytes);
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &value in src {
+            dst.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+}
 /// Decoded-row LRU budgets in bytes. Repetitive prompts stay cached across
 /// requests; cold rows are read and decoded in parallel instead.
 const EMBEDDING_CACHE_BUDGET: usize = 64 * 1024 * 1024;
@@ -683,6 +889,41 @@ fn shard_of(sources: &[Source], row: usize) -> Result<(usize, usize)> {
     }
     Ok((shard, local))
 }
+const fn paley_sign(i: usize, j: usize) -> f32 {
+    if j == 0 {
+        1.
+    } else if i == 0 {
+        -1.
+    } else {
+        let delta = (j + 19 - i) % 19;
+        if delta == 0 {
+            return 1.;
+        }
+        let mut k = 1;
+        while k < 19 {
+            if k * k % 19 == delta {
+                return 1.;
+            }
+            k += 1;
+        }
+        -1.
+    }
+}
+
+const PALEY_20: [[f32; 20]; 20] = {
+    let mut table = [[0.; 20]; 20];
+    let mut i = 0;
+    while i < 20 {
+        let mut j = 0;
+        while j < 20 {
+            table[i][j] = paley_sign(i, j);
+            j += 1;
+        }
+        i += 1;
+    }
+    table
+};
+
 fn decode_row(
     sources: &[Source],
     tables: &[Table],
@@ -696,13 +937,14 @@ fn decode_row(
     } else {
         width
     };
-    let mut packet = vec![0u8; stride];
+    let mut stack = [0u8; 2560];
+    let packet = &mut stack[..stride];
     source
         .file
-        .read_exact_at(&mut packet, source.offset + (local * stride) as u64)
+        .read_exact_at(packet, source.offset + (local * stride) as u64)
         .map_err(|e| e.to_string())?;
     if let Some(book) = source.book {
-        return decode(&packet, &tables[book]);
+        return decode(packet, &tables[book]);
     }
     let mut scale = [0u8; 2];
     source
@@ -721,49 +963,44 @@ fn decode_row(
         .map(|&v| f16::from_f32((v as i8) as f32 * scale).to_bits())
         .collect())
 }
-fn load_row(sources: &[Source], tables: &[Table], shard: usize, local: usize) -> Result<Row> {
-    Ok(Arc::new(decode_row(sources, tables, shard, local)?))
-}
 fn decode(packet: &[u8], table: &Table) -> Result<Vec<u16>> {
+    match table.signs.len() {
+        160 => decode_fixed::<160, 8>(packet, table),
+        2560 => decode_fixed::<2560, 128>(packet, table),
+        _ => Err("Invalid E8P row width".into()),
+    }
+}
+fn decode_fixed<const WIDTH: usize, const COLS: usize>(
+    packet: &[u8],
+    table: &Table,
+) -> Result<Vec<u16>> {
     let scale = f16::from_bits(u16::from_le_bytes([packet[0], packet[1]])).to_f32();
     if !scale.is_finite() || scale <= 0. {
         return Err("Invalid E8P row scale".into());
     }
-    let width = table.signs.len();
-    let columns = width / 20;
-    let mut rotated = vec![0f32; width];
+    let mut rotated = [0f32; WIDTH];
     for (i, code) in packet[2..].as_chunks::<2>().0.iter().enumerate() {
         let values = &table.values[u16::from_le_bytes([code[0], code[1]]) as usize];
+        let base = i * 8;
         for j in 0..8 {
-            rotated[i * 8 + j] = values[j] as f32 * scale;
+            rotated[base + j] = values[j] as f32 * scale;
         }
     }
-    let mut out = vec![0f32; width];
-    let norm = (20f32).sqrt().recip();
-    for i in 0..20 {
-        for j in 0..20 {
-            let sign = if j == 0 {
-                1.
-            } else if i == 0 {
-                -1.
-            } else {
-                let delta = (j + 19 - i) % 19;
-                if delta == 0 || (1..19).any(|k| k * k % 19 == delta) {
-                    1.
-                } else {
-                    -1.
-                }
-            };
-            let coefficient = sign * norm;
-            for col in 0..columns {
-                out[i * columns + col] += coefficient * rotated[j * columns + col];
+    let paley_norm = (20f32).sqrt().recip();
+    let col_norm = (COLS as f32).sqrt().recip();
+    let mut result = vec![0u16; WIDTH];
+    for (i, signs_row) in PALEY_20.iter().enumerate() {
+        let mut acc = [0f32; COLS];
+        for (j, &sign) in signs_row.iter().enumerate() {
+            let coefficient = sign * paley_norm;
+            let src = &rotated[j * COLS..(j + 1) * COLS];
+            for col in 0..COLS {
+                acc[col] += coefficient * src[col];
             }
         }
-    }
-    for row in out.chunks_exact_mut(columns) {
         let mut half = 1;
-        while half < columns {
-            for block in row.chunks_exact_mut(half * 2) {
+        while half < COLS {
+            for block in acc.chunks_exact_mut(half * 2) {
                 for j in 0..half {
                     let a = block[j];
                     let b = block[j + half];
@@ -773,13 +1010,14 @@ fn decode(packet: &[u8], table: &Table) -> Result<Vec<u16>> {
             }
             half *= 2;
         }
+        let base = i * COLS;
+        let dst = &mut result[base..base + COLS];
+        let sign_slice = &table.signs[base..base + COLS];
+        for col in 0..COLS {
+            dst[col] = f16::from_f32((acc[col] * col_norm) * sign_slice[col] as f32).to_bits();
+        }
     }
-    let norm = (columns as f32).sqrt().recip();
-    Ok(out
-        .iter()
-        .zip(&table.signs)
-        .map(|(&x, &s)| f16::from_f32((x * norm) * s as f32).to_bits())
-        .collect())
+    Ok(result)
 }
 #[cfg(test)]
 mod tests {
@@ -905,6 +1143,89 @@ mod tests {
         assert_eq!(hit.as_slice(), &[0x3c00; 64]);
         assert_eq!(cache.get((0, 1)).unwrap().as_slice(), &[0x4000; 64]);
         assert!(cache.bytes <= budget);
+    }
+
+    #[test]
+    fn fast_e8p_decode_matches_reference_bit_for_bit() {
+        let reference_decode = |packet: &[u8], table: &Table| -> Vec<u16> {
+            let scale = f16::from_bits(u16::from_le_bytes([packet[0], packet[1]])).to_f32();
+            let width = table.signs.len();
+            let columns = width / 20;
+            let mut rotated = vec![0f32; width];
+            for (i, code) in packet[2..].as_chunks::<2>().0.iter().enumerate() {
+                let values = &table.values[u16::from_le_bytes([code[0], code[1]]) as usize];
+                for j in 0..8 {
+                    rotated[i * 8 + j] = values[j] as f32 * scale;
+                }
+            }
+            let mut out = vec![0f32; width];
+            let norm = (20f32).sqrt().recip();
+            for i in 0..20 {
+                for j in 0..20 {
+                    let sign = if j == 0 {
+                        1.
+                    } else if i == 0 {
+                        -1.
+                    } else {
+                        let delta = (j + 19 - i) % 19;
+                        if delta == 0 || (1..19).any(|k| k * k % 19 == delta) {
+                            1.
+                        } else {
+                            -1.
+                        }
+                    };
+                    let coefficient = sign * norm;
+                    for col in 0..columns {
+                        out[i * columns + col] += coefficient * rotated[j * columns + col];
+                    }
+                }
+            }
+            for row in out.chunks_exact_mut(columns) {
+                let mut half = 1;
+                while half < columns {
+                    for block in row.chunks_exact_mut(half * 2) {
+                        for j in 0..half {
+                            let a = block[j];
+                            let b = block[j + half];
+                            block[j] = a + b;
+                            block[j + half] = a - b;
+                        }
+                    }
+                    half *= 2;
+                }
+            }
+            let norm = (columns as f32).sqrt().recip();
+            out.iter()
+                .zip(&table.signs)
+                .map(|(&x, &s)| f16::from_f32((x * norm) * s as f32).to_bits())
+                .collect()
+        };
+        let values: Vec<[i8; 8]> = (0..65536u32)
+            .map(|code| {
+                std::array::from_fn(|j| {
+                    (((code.wrapping_mul(17).wrapping_add(j as u32 * 31)) % 127) as i8) - 63
+                })
+            })
+            .collect();
+        for width in [160usize, 2560usize] {
+            let table = Table {
+                values: values.clone(),
+                signs: (0..width)
+                    .map(|i| if (i * 7 + 3) % 3 == 0 { -1 } else { 1 })
+                    .collect(),
+            };
+            let mut packet = vec![0u8; 2 + width / 4];
+            let scale_bits = f16::from_f32(0.03125).to_bits().to_le_bytes();
+            packet[0] = scale_bits[0];
+            packet[1] = scale_bits[1];
+            for (i, chunk) in packet[2..].as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let code = ((i as u32).wrapping_mul(4099).wrapping_add(13)) as u16;
+                chunk.copy_from_slice(&code.to_le_bytes());
+            }
+            let actual = decode(&packet, &table).unwrap();
+            let expected = reference_decode(&packet, &table);
+            assert_eq!(actual, expected, "width={width} mismatch");
+        }
     }
 
     #[test]

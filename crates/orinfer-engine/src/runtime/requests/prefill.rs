@@ -154,7 +154,9 @@ impl ModelRuntime {
                         self.launch_rows(&frame.plan.head_program, chunk, ExecutionPhase::Prefill)?;
                     }
                 }
-            } else if let Some(spec) = self.manifest.mtp.clone() {
+            } else if !req.mtp_blocked
+                && let Some(spec) = self.manifest.mtp.clone()
+            {
                 let end = req.offset + chunk;
                 let warm_end =
                     end + usize::from(end < req.input.len() && !req.checkpoints.contains(&end));
@@ -207,13 +209,17 @@ impl ModelRuntime {
                         .live_buffers
                         .iter()
                         .map(|name| {
-                            (
-                                name.clone(),
-                                Range {
-                                    offset: 0,
-                                    bytes: self.execution.buffer_size(name),
-                                },
-                            )
+                            let full = self.execution.buffer_size(name);
+                            let bytes = if frame.plan.min_tokens != 0
+                                && frame.tokens < frame.plan.chunk_tokens
+                                && full >= frame.plan.chunk_tokens
+                                && full.is_multiple_of(frame.plan.chunk_tokens)
+                            {
+                                full / frame.plan.chunk_tokens * frame.tokens
+                            } else {
+                                full
+                            };
+                            (name.clone(), Range { offset: 0, bytes })
                         })
                         .collect();
                     frame.workspace = self.execution.reserve_workspace(ranges)?;
@@ -242,7 +248,7 @@ impl ModelRuntime {
             let end = req.offset + chunk;
             let warm_end =
                 end + usize::from(end < req.input.len() && !req.checkpoints.contains(&end));
-            if self.manifest.mtp.is_some() && req.warm.tokens + 1 < warm_end {
+            if !req.mtp_blocked && self.manifest.mtp.is_some() && req.warm.tokens + 1 < warm_end {
                 if at.elapsed().as_secs_f64()
                     + self
                         .prefill_costs

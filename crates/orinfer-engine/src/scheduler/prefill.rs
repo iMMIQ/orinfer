@@ -628,7 +628,12 @@ impl Profiles {
         // Account from the restored endpoint and include already admitted
         // boundaries, rather than evaluating each split against a cold run.
         let extra = (split - baseline).max(0.);
-        extra <= (baseline * 0.1).max(0.05)
+        let allowance = if end.saturating_sub(prefix) == 1 {
+            (baseline * 0.1).min(0.05)
+        } else {
+            (baseline * 0.1).max(0.05)
+        };
+        extra <= allowance
             || (reused
                 && baseline - self.remaining(prefix, end) > extra + self.restore_cost(bytes) * 2.)
     }

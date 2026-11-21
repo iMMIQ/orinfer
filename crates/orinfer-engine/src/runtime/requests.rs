@@ -90,6 +90,19 @@ pub(super) struct Reservation {
     pub(super) prompt_prefix: Option<u64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct CacheTrimSnapshot {
+    reserved: usize,
+    prefix_bytes: usize,
+    prefix_budget: usize,
+    prefix_limit: usize,
+    active_kv_bytes: usize,
+    workspace_mappings: usize,
+    memory_reserve_bytes: usize,
+}
+
+const CACHE_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl ModelRuntime {
     pub(super) fn reap_abandoned(&mut self) -> Result<()> {
         let slots = std::mem::take(
@@ -525,6 +538,27 @@ impl ModelRuntime {
         }
         Ok(bytes)
     }
+    fn cache_trim_snapshot(&self, options: &scheduler::Options) -> CacheTrimSnapshot {
+        CacheTrimSnapshot {
+            reserved: self.reserved_requests.len(),
+            prefix_bytes: self.prefix_cache.device.bytes,
+            prefix_budget: self.prefix_cache.device.budget,
+            prefix_limit: self.prefix_cache_limit,
+            active_kv_bytes: self.execution.active_kv_bytes(),
+            workspace_mappings: self.execution.batch_statistics().workspace_mappings,
+            memory_reserve_bytes: options.memory_reserve_bytes,
+        }
+    }
+    fn maybe_trim_request_cache(&mut self, options: &scheduler::Options) -> Result<()> {
+        let snapshot = self.cache_trim_snapshot(options);
+        if self
+            .last_cache_trim
+            .is_some_and(|(at, prev)| prev == snapshot && at.elapsed() < CACHE_TRIM_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.trim_request_cache(options, 0, 0, false)
+    }
     fn trim_request_cache(
         &mut self,
         options: &scheduler::Options,
@@ -557,7 +591,21 @@ impl ModelRuntime {
                 break;
             }
         }
+        if additional == 0 && context == 0 && !additional_sampler {
+            self.last_cache_trim = Some((Instant::now(), self.cache_trim_snapshot(options)));
+        }
         Ok(())
+    }
+    fn should_skip_prefill_mtp_warm(
+        &self,
+        spec: &crate::mtp::Spec,
+        sampling: &crate::sampling::Options,
+    ) -> bool {
+        !self.reserved_requests.is_empty()
+            && self.lookup_warm_capacity(spec, sampling).is_some()
+            && self
+                .dynamic_speculation
+                .concurrent_sampling_prefers_ordinary()
     }
     fn lookup_warm_capacity(
         &self,
@@ -617,9 +665,13 @@ impl ModelRuntime {
             )?;
             self.prepare_audio_metadata(&input.input_tokens, &input.audios, context)?;
             let mut prefix = super::prefix::Context::default();
-            let (offset, mut warm) =
-                self.restore_prefix(&input.input_tokens, &media, &mut prefix)?;
-            if offset > 0
+            let (offset, mut warm, restored_mtp_warmed) =
+                self.restore_prefix(&input.input_tokens, &media, false, &mut prefix)?;
+            let mtp_blocked = self.manifest.mtp.as_ref().is_some_and(|spec| {
+                !restored_mtp_warmed || self.should_skip_prefill_mtp_warm(spec, &input.sampling)
+            });
+            if !mtp_blocked
+                && offset > 0
                 && offset < input.input_tokens.len()
                 && let Some(spec) = self.manifest.mtp.clone()
             {
@@ -702,7 +754,7 @@ impl ModelRuntime {
                 credit_s: 0.,
                 lookup_costs: Default::default(),
                 prompt_lookup: Default::default(),
-                mtp_blocked: false,
+                mtp_blocked,
                 draft_acceptance: Default::default(),
                 pending_audio: if offset < prompt_len {
                     input.audios
@@ -866,7 +918,9 @@ impl ModelRuntime {
             return Err("Request prefill position mismatch".into());
         }
         let checkpoint = req.checkpoints.contains(&req.offset);
-        if let Some(spec) = self.manifest.mtp.clone() {
+        if !req.mtp_blocked
+            && let Some(spec) = self.manifest.mtp.clone()
+        {
             let at = Instant::now();
             // A checkpoint must exclude the next prompt token from the draft
             // state. A different continuation can restore this same prefix.
@@ -888,10 +942,11 @@ impl ModelRuntime {
                 req.input.len(),
                 req.prefix.statistics.matched_tokens,
             );
-            self.store_prefix(
+            self.store_prefix_with_mtp(
                 &req.core.input[..req.offset],
                 &req.media,
                 req.warm.tokens,
+                !req.mtp_blocked,
                 kind,
                 &mut req.prefix,
             )?;
@@ -906,7 +961,8 @@ impl ModelRuntime {
             // Bridge only after saving the prefix-consistent P-1 draft state.
             // This consumes h[P-1] before the next target block can overwrite
             // its slot in the bounded hidden ring.
-            if req.offset < req.input.len()
+            if !req.mtp_blocked
+                && req.offset < req.input.len()
                 && let Some(spec) = self.manifest.mtp.clone()
             {
                 let at = Instant::now();
@@ -928,7 +984,9 @@ impl ModelRuntime {
         }
     }
     fn complete_prefill(&mut self, req: &mut RequestState) -> Result<Vec<u32>> {
-        if let Some(spec) = self.manifest.mtp.clone() {
+        if !req.mtp_blocked
+            && let Some(spec) = self.manifest.mtp.clone()
+        {
             let shifted = &req.input[req.warm.tokens + 1..];
             if !shifted.is_empty() {
                 let at = Instant::now();
@@ -938,10 +996,11 @@ impl ModelRuntime {
             }
         }
         if req.cache_prompt {
-            self.store_prefix(
+            self.store_prefix_with_mtp(
                 &req.core.input,
                 &req.media,
                 req.warm.tokens,
+                !req.mtp_blocked,
                 Checkpoint::Reusable,
                 &mut req.prefix,
             )?;
@@ -963,8 +1022,9 @@ impl ModelRuntime {
             req.mtp.initial_warm_s = req.warm.seconds;
             // Sampled lookup reads target state only. The hidden ring can
             // supply this endpoint when model drafting or a checkpoint needs it.
-            if self.lookup_warm_capacity(&spec, &req.sampling).is_none()
-                || req.decoder.has_constraint()
+            if !req.mtp_blocked
+                && (self.lookup_warm_capacity(&spec, &req.sampling).is_none()
+                    || req.decoder.has_constraint())
             {
                 let at = Instant::now();
                 self.mtp_warm(&spec, &[pending], &|| false, ExecutionPhase::Prefill)?;
@@ -1343,7 +1403,7 @@ impl ModelRuntime {
         // Encoder work follows the selected text packet. Encoding every admitted
         // recording here would delay existing decoders and the first prompt
         // behind media that cannot fit in this iteration's token budget.
-        self.trim_request_cache(options, 0, 0, false)?;
+        self.maybe_trim_request_cache(options)?;
         self.scheduler_statistics.iterations += 1;
         let at = Instant::now();
         let mut output = vec![];
@@ -1766,12 +1826,7 @@ impl ModelRuntime {
                 }
             }
             self.scheduler_statistics.independent_prefill_choices += 1;
-            return Ok(Work::Prefill(
-                i,
-                native,
-                false,
-                options.prefill_budget_ms / 1000.,
-            ));
+            return Ok(Work::Prefill(i, native, false, f64::INFINITY));
         }
         let rotate = self.scheduler_cursor % decode.len();
         decode.rotate_left(rotate);
@@ -2407,15 +2462,18 @@ impl ModelRuntime {
                 && !req.prefilling
                 && model.should_store_decoded_prefix(&req.prefix)
             {
-                let consistent = model.refresh_request_mtp(req, false)?;
-                if consistent {
-                    model.store_decoded_prefix(
-                        &req.core.history,
-                        &req.media,
-                        &|| false,
-                        &mut req.prefix,
-                    )?;
-                }
+                let warmed = if req.mtp_blocked {
+                    false
+                } else {
+                    model.refresh_request_mtp(req, false)?
+                };
+                model.store_decoded_prefix_with_mtp(
+                    &req.core.history,
+                    &req.media,
+                    &|| false,
+                    warmed,
+                    &mut req.prefix,
+                )?;
             }
             Ok(())
         });

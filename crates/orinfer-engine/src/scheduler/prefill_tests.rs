@@ -356,6 +356,10 @@ mod profile_tests {
             }
         }
         assert!(costs.admit_with_reuse(2047, 2048, bytes, 2048 - 768, &checkpoints, true));
+        // A cold prompt with a large baseline must still reject an unconfirmed
+        // one-token tail whose extra weight pass exceeds 50 ms.
+        assert!(!costs.admit(4095, 4096, bytes, 0, &checkpoints));
+        assert!(costs.admit_with_reuse(4095, 4096, bytes, 0, &checkpoints, true));
         costs.observe_at(1, 2048, 0.01);
         assert!(costs.admit(2047, 2048, bytes, 2048 - 312, &checkpoints));
     }

@@ -428,6 +428,33 @@ fn context_and_membership_changes_cannot_reset_budget_or_debt() {
 }
 
 #[test]
+fn concurrent_sampling_prefers_ordinary_only_after_calibrated_rejection() {
+    let mut c = Controller::default();
+    let k = Key {
+        sampling: true,
+        shared_work: true,
+        ..key(4)
+    };
+    normal(&mut c, k);
+    assert!(!c.concurrent_sampling_prefers_ordinary());
+    // Calibrate width=2 as slower than ordinary for the realized yield.
+    for _ in 0..4 {
+        hot(&mut c, k, 2, 0.06, 5);
+    }
+    let lossy = [candidate(2, 5.0, 0.06)];
+    for _ in 0..7 {
+        assert_eq!(c.choose(k, &lossy, 0.4), None);
+        assert!(!c.concurrent_sampling_prefers_ordinary());
+    }
+    assert_eq!(c.choose(k, &lossy, 0.4), None);
+    assert!(c.concurrent_sampling_prefers_ordinary());
+    // A genuinely profitable concurrent sampled selection resets the preference.
+    let profitable = [candidate(2, 9.0, 0.06)];
+    assert_eq!(c.choose(k, &profitable, 0.4), Some((2, false)));
+    assert!(!c.concurrent_sampling_prefers_ordinary());
+}
+
+#[test]
 fn earned_model_credit_funds_new_shapes_without_copying_timings() {
     let mut c = Controller::default();
     let one = key(1);
