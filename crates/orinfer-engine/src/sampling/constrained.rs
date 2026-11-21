@@ -28,6 +28,7 @@ pub struct TokenLogprob {
 pub(crate) struct RowParameters {
     pub mask: Option<std::sync::Arc<[u32]>>,
     pub top_logprobs: Option<usize>,
+    pub error: Option<String>,
 }
 impl RowParameters {
     pub fn processed(&self) -> bool {
@@ -204,6 +205,7 @@ impl Decoder {
             rows.push(RowParameters {
                 mask: mask.map(Into::into),
                 top_logprobs: if ignored { None } else { top_logprobs },
+                error: None,
             });
             if let Some(&token) = tokens.get(position)
                 && !ignored

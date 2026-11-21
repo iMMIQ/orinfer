@@ -241,14 +241,37 @@ pub(super) fn request_memory(
     }
 }
 
+fn json_estimated_bytes(value: &Value, depth: usize) -> usize {
+    if depth >= 64 {
+        return 1024;
+    }
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(_) => 16,
+        Value::String(s) => s.len().saturating_add(2),
+        Value::Array(items) => items.iter().fold(2usize, |acc, item| {
+            acc.saturating_add(json_estimated_bytes(item, depth + 1))
+                .saturating_add(1)
+        }),
+        Value::Object(map) => map.iter().fold(2usize, |acc, (k, v)| {
+            acc.saturating_add(k.len())
+                .saturating_add(4)
+                .saturating_add(json_estimated_bytes(v, depth + 1))
+        }),
+    }
+}
+
 pub(super) fn request_memory_mib(
     request: &ChatRequest,
     context: usize,
     default_max_tokens: usize,
 ) -> u32 {
-    let bytes = serde_json::to_vec(&request.messages)
-        .map(|v| v.len())
-        .unwrap_or(32 << 20);
+    let bytes = request.messages.iter().fold(2usize, |acc, msg| {
+        acc.saturating_add(json_estimated_bytes(msg, 0))
+            .saturating_add(1)
+    });
     let image = request.messages.iter().any(|m| {
         m["content"]
             .as_array()
@@ -447,6 +470,16 @@ mod tests {
         flag.store(true, Ordering::Release);
         assert!(context.checkpoint(0).is_err());
         assert!(Context::unbounded().checkpoint(usize::MAX).is_ok());
+    }
+    #[test]
+    fn json_size_estimator_avoids_serialization_and_bounds_deep_nesting() {
+        let mut nested = json!("leaf");
+        for _ in 0..100 {
+            nested = json!({"a": nested});
+        }
+        assert!(json_estimated_bytes(&nested, 0) > 0);
+        let big = json!({"role": "user", "content": "x".repeat(4 * 1024 * 1024)});
+        assert!(json_estimated_bytes(&big, 0) >= 4 * 1024 * 1024);
     }
 }
 

@@ -185,7 +185,8 @@ impl Runtime {
                     .map(|i| i.grid_height * i.grid_width)
                     .max()
                     .unwrap();
-                self.team.exchange(Command::BeginImages(Arc::new(images)))?;
+                self.team
+                    .exchange_heavy(Command::BeginImages(Arc::new(images)))?;
                 self.image_wave = Some(Wave {
                     identities,
                     started: at,
@@ -204,15 +205,28 @@ impl Runtime {
                 .any(|r| !r.prefilling && !r.is_finished() && r.ready_output.is_none());
             // Merge cheap segments in the same submission. Reserve most of the
             // output interval for admission, the language packet and its draft.
-            let budget = if bounded {
-                self.team.model.vision.as_ref().unwrap().advance_budget(
-                    wave.max_patches as f64 * self.vision_seconds_per_patch,
-                    (options.target_tpot_ms / 4000.).min(0.100),
+            let (budget, capture) = if bounded {
+                (
+                    self.team.model.vision.as_ref().unwrap().advance_budget(
+                        wave.max_patches as f64 * self.vision_seconds_per_patch,
+                        (options.target_tpot_ms / 4000.).min(0.100),
+                    ),
+                    super::super::vision::CapturePolicy::Never,
                 )
             } else {
-                usize::MAX
+                // Keep even idle vision waves chunked and capture graphs only on
+                // repeated frame shapes when HBM workspace is available.
+                (
+                    self.team.model.vision.as_ref().unwrap().advance_budget(
+                        wave.max_patches as f64 * self.vision_seconds_per_patch,
+                        0.500,
+                    ),
+                    super::super::vision::CapturePolicy::OnRepeat,
+                )
             };
-            let replies = self.team.exchange(Command::AdvanceImages(budget))?;
+            let replies = self
+                .team
+                .exchange_heavy(Command::AdvanceImages(budget, capture))?;
             let mut encoded = Vec::new();
             for (rank, reply) in replies.into_iter().enumerate() {
                 let super::super::team::Reply::Image(image) = reply else {

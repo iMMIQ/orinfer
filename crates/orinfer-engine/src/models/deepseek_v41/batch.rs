@@ -181,11 +181,6 @@ impl SplitStates {
             && self.tail.is_none_or(|s| s == CacheState::Graph)
             && self.head.is_none_or(|s| s == CacheState::Graph)
     }
-    pub(super) fn any_missing(&self) -> bool {
-        self.trunk == CacheState::Missing
-            || self.tail.is_some_and(|s| s == CacheState::Missing)
-            || self.head.is_some_and(|s| s == CacheState::Missing)
-    }
     #[cfg(test)]
     pub(super) fn summary(&self) -> CacheState {
         let mut min_uses = u8::MAX;
@@ -297,6 +292,14 @@ struct TableKey {
 pub(super) struct BoundTables {
     key: TableKey,
     retained: Vec<Buffer>,
+}
+#[derive(Default)]
+pub(in crate::models::deepseek_v41) struct ProtectedKeys<'a> {
+    pub mono: Option<&'a Key>,
+    pub trunk: Option<&'a TrunkKey>,
+    pub tail: Option<&'a TailKey>,
+    pub head: Option<&'a HeadKey>,
+    pub keep_idle_owner: bool,
 }
 pub(super) struct Runtime {
     pub contract: Contract,
@@ -430,6 +433,67 @@ impl Runtime {
             self.recent_head.remove(&key.family);
         }
         removed
+    }
+    /// Cap the combined population across monolithic and split caches so
+    /// 4x64 independent maps cannot exhaust 910B hardware stream/event/model quotas.
+    fn trim_total_programs(&mut self, protected: &ProtectedKeys<'_>) {
+        let total_cap = self.capacity.saturating_add(self.capacity / 2).max(1);
+        loop {
+            let total = self.cache.len()
+                + self.trunk_cache.len()
+                + self.tail_cache.len()
+                + self.head_cache.len();
+            if total <= total_cap {
+                break;
+            }
+            let evicted = Self::evict_oldest_unprotected(
+                &mut self.head_lru,
+                protected.head,
+                |k| self.head_cache.remove(k).is_some(),
+                &mut self.recent_head,
+                |k| k.family,
+            ) || Self::evict_oldest_unprotected(
+                &mut self.tail_lru,
+                protected.tail,
+                |k| self.tail_cache.remove(k).is_some(),
+                &mut self.recent_tail,
+                |k| k.family,
+            ) || Self::evict_oldest_unprotected(
+                &mut self.lru,
+                protected.mono,
+                |k| self.cache.remove(k).is_some(),
+                &mut self.recent,
+                |k| k.family,
+            ) || Self::evict_oldest_unprotected(
+                &mut self.trunk_lru,
+                protected.trunk,
+                |k| self.trunk_cache.remove(k).is_some(),
+                &mut self.recent_trunk,
+                |k| k.family,
+            );
+            if !evicted {
+                break;
+            }
+        }
+    }
+    fn evict_oldest_unprotected<K: PartialEq, F: Ord>(
+        lru: &mut VecDeque<K>,
+        protected: Option<&K>,
+        mut remove_entry: impl FnMut(&K) -> bool,
+        recent: &mut BTreeMap<F, (K, u8)>,
+        family: impl Fn(&K) -> F,
+    ) -> bool {
+        while let Some(pos) = lru.iter().position(|k| Some(k) != protected) {
+            let key = lru.remove(pos).unwrap();
+            if remove_entry(&key) {
+                let fam = family(&key);
+                if recent.get(&fam).is_some_and(|(last, _)| last == &key) {
+                    recent.remove(&fam);
+                }
+                return true;
+            }
+        }
+        false
     }
     fn resolve_family(&self, layout: &Layout) -> Result<(super::PacketRole, bool, usize)> {
         self.families
@@ -1280,29 +1344,49 @@ impl Worker {
         head: bool,
     ) -> Result<()> {
         self.session.synchronize()?;
-        let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
-        if let Some(split) = runtime.split_keys(layout)? {
-            if trunk {
-                runtime.remove_trunk(&split.trunk);
-                runtime.trunk_lru.retain(|k| k != &split.trunk);
+        let (split_keys, mono_key) = {
+            let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
+            if let Some(split) = runtime.split_keys(layout)? {
+                if trunk {
+                    runtime.remove_trunk(&split.trunk);
+                    runtime.trunk_lru.retain(|k| k != &split.trunk);
+                }
+                if tail && let Some(k) = &split.tail {
+                    runtime.remove_tail(k);
+                    runtime.tail_lru.retain(|x| x != k);
+                }
+                if head && let Some(k) = &split.head {
+                    runtime.remove_head(k);
+                    runtime.head_lru.retain(|x| x != k);
+                }
+                (Some(split), None)
+            } else {
+                let key = runtime.key(layout)?;
+                if trunk {
+                    runtime.remove(&key);
+                    runtime.lru.retain(|k| k != &key);
+                }
+                (None, Some(key))
             }
-            if tail && let Some(k) = &split.tail {
-                runtime.remove_tail(k);
-                runtime.tail_lru.retain(|x| x != k);
-            }
-            if head && let Some(k) = &split.head {
-                runtime.remove_head(k);
-                runtime.head_lru.retain(|x| x != k);
-            }
-        } else if trunk {
-            let key = runtime.key(layout)?;
-            runtime.remove(&key);
-            runtime.lru.retain(|k| k != &key);
-        }
+        };
         self.w4.retain(|_, w| w.strong_count() > 0);
-        self.reserve_batch_memory(
+        let protected = ProtectedKeys {
+            mono: mono_key.as_ref().filter(|_| !trunk),
+            trunk: split_keys.as_ref().filter(|_| !trunk).map(|s| &s.trunk),
+            tail: split_keys
+                .as_ref()
+                .filter(|_| !tail)
+                .and_then(|s| s.tail.as_ref()),
+            head: split_keys
+                .as_ref()
+                .filter(|_| !head)
+                .and_then(|s| s.head.as_ref()),
+            keep_idle_owner: false,
+        };
+        self.reserve_batch_memory_protected(
             super::memory::Requirement::workspace(),
             "coordinated Graph preparation",
+            &protected,
         )
     }
     #[cfg(test)]
@@ -1359,9 +1443,13 @@ impl Worker {
                 self.phases.template_paths_s,
                 self.phases.kernel_geometry_s,
             );
-            self.reserve_batch_memory(
+            self.reserve_batch_memory_protected(
                 super::memory::Requirement::workspace(),
                 "Graph preparation",
+                &ProtectedKeys {
+                    mono: Some(&key),
+                    ..ProtectedKeys::default()
+                },
             )?;
             let reserve_s = started.elapsed().as_secs_f64();
             let packet_started = std::time::Instant::now();
@@ -1460,12 +1548,19 @@ impl Worker {
             }
         }
         let runtime = self.batch.as_mut().unwrap();
+        let protected = ProtectedKeys {
+            mono: Some(&key),
+            ..ProtectedKeys::default()
+        };
         runtime.lru.retain(|k| k != &key);
-        runtime.lru.push_back(key);
+        runtime.lru.push_back(key.clone());
         while runtime.cache.len() > runtime.capacity {
-            let old = runtime.lru.pop_front().unwrap();
+            let Some(old) = runtime.lru.pop_front() else {
+                break;
+            };
             runtime.remove(&old);
         }
+        runtime.trim_total_programs(&protected);
         self.w4.retain(|_, w| w.strong_count() > 0);
         Ok(())
     }
@@ -1507,9 +1602,16 @@ impl Worker {
             let started = std::time::Instant::now();
             let any_capture =
                 need_trunk == Some(true) || need_tail == Some(true) || need_head == Some(true);
-            self.reserve_batch_memory(
+            self.reserve_batch_memory_protected(
                 super::memory::Requirement::workspace(),
                 "Graph preparation",
+                &ProtectedKeys {
+                    mono: None,
+                    trunk: Some(&split.trunk),
+                    tail: split.tail.as_ref(),
+                    head: split.head.as_ref(),
+                    keep_idle_owner: false,
+                },
             )?;
             let packet = self
                 .packet_templates
@@ -1638,28 +1740,38 @@ impl Worker {
         }
         let runtime = self.batch.as_mut().unwrap();
         let cap = runtime.capacity;
-        runtime.touch_trunk(split.trunk);
+        runtime.touch_trunk(split.trunk.clone());
         while runtime.trunk_cache.len() > cap {
-            if let Some(old) = runtime.trunk_lru.pop_front() {
-                runtime.remove_trunk(&old);
-            }
+            let Some(old) = runtime.trunk_lru.pop_front() else {
+                break;
+            };
+            runtime.remove_trunk(&old);
         }
-        if let Some(k) = split.tail {
-            runtime.touch_tail(k);
+        if let Some(k) = &split.tail {
+            runtime.touch_tail(k.clone());
             while runtime.tail_cache.len() > cap {
-                if let Some(old) = runtime.tail_lru.pop_front() {
-                    runtime.remove_tail(&old);
-                }
+                let Some(old) = runtime.tail_lru.pop_front() else {
+                    break;
+                };
+                runtime.remove_tail(&old);
             }
         }
-        if let Some(k) = split.head {
-            runtime.touch_head(k);
+        if let Some(k) = &split.head {
+            runtime.touch_head(k.clone());
             while runtime.head_cache.len() > cap {
-                if let Some(old) = runtime.head_lru.pop_front() {
-                    runtime.remove_head(&old);
-                }
+                let Some(old) = runtime.head_lru.pop_front() else {
+                    break;
+                };
+                runtime.remove_head(&old);
             }
         }
+        runtime.trim_total_programs(&ProtectedKeys {
+            mono: None,
+            trunk: Some(&split.trunk),
+            tail: split.tail.as_ref(),
+            head: split.head.as_ref(),
+            keep_idle_owner: false,
+        });
         self.w4.retain(|_, w| w.strong_count() > 0);
         Ok(())
     }
@@ -2344,6 +2456,7 @@ impl Worker {
                     logits: probs,
                     summary: sampled.as_ref().and_then(|s| s[i].summary.clone()),
                     report: None,
+                    error: None,
                 });
             }
         }

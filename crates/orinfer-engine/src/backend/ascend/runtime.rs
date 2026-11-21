@@ -610,15 +610,53 @@ impl Session {
         }
         Ok(host)
     }
+    pub fn is_poisoned(&self) -> bool {
+        self.context.poisoned.get()
+    }
     pub fn reap(&self) -> Result<()> {
         let mut pending = self.pending.borrow_mut();
+        if pending.is_empty() {
+            return Ok(());
+        }
         let mut fences = [None, None];
-        // Submission order is retained in this vector. One ready completion
-        // on a stream can hard-fence every earlier generation on that stream.
+        // Submission order is retained in this vector. Probe the newest
+        // completion on each stream first (O(1) fast path when idle); only
+        // walk forward from oldest to newest when tail work is still in flight,
+        // stopping immediately at the first incomplete event per stream.
+        let mut latest = [None, None];
         for (index, completion) in pending.iter().enumerate().rev() {
             let slot = usize::from(completion.stream == self.context.transfer);
-            if fences[slot].is_none() && completion.done()? {
-                fences[slot] = Some(index);
+            if latest[slot].is_none() {
+                latest[slot] = Some(index);
+                if latest[0].is_some() && latest[1].is_some() {
+                    break;
+                }
+            }
+        }
+        let mut scan_forward = [false, false];
+        for slot in 0..2 {
+            if let Some(index) = latest[slot] {
+                if pending[index].done()? {
+                    fences[slot] = Some(index);
+                } else {
+                    scan_forward[slot] = true;
+                }
+            }
+        }
+        if scan_forward[0] || scan_forward[1] {
+            for (index, completion) in pending.iter().enumerate() {
+                let slot = usize::from(completion.stream == self.context.transfer);
+                if !scan_forward[slot] || Some(index) == latest[slot] {
+                    continue;
+                }
+                if completion.done()? {
+                    fences[slot] = Some(index);
+                } else {
+                    scan_forward[slot] = false;
+                    if !scan_forward[0] && !scan_forward[1] {
+                        break;
+                    }
+                }
             }
         }
         for index in fences.into_iter().flatten() {

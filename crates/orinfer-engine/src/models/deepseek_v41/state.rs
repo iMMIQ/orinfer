@@ -154,7 +154,7 @@ pub(super) struct Journal {
     history: usize,
     rows: usize,
     pieces: Vec<Piece>,
-    bank: Buffer,
+    pub(super) bank: Buffer,
     circular: BTreeMap<String, usize>,
 }
 type PendingCopy = (String, Buffer, Range<usize>, usize);
@@ -628,7 +628,7 @@ impl Worker {
                 .collect::<Result<Vec<_>>>()?;
             self.session.release_pages_many(&kv_buffers)?;
             if let Some(bank) = owner.bank {
-                const MAX_IDLE_OWNERS: usize = 2;
+                const MAX_IDLE_OWNERS: usize = 4;
                 let runtime = self.batch.as_mut().unwrap();
                 if runtime.idle_owners.len() < MAX_IDLE_OWNERS.min(runtime.contract.owners) {
                     runtime.idle_owners.push(super::batch::IdleOwner {
@@ -735,6 +735,7 @@ impl Worker {
         id: usize,
         rows: usize,
         previous: Option<Journal>,
+        idle_journals: &mut Vec<Buffer>,
         copies: &mut Vec<(Buffer, usize, Buffer, usize, usize)>,
     ) -> Result<Journal> {
         if !(1..=crate::execution::MAX_MTP_DRAFTS + 1).contains(&rows) {
@@ -774,14 +775,22 @@ impl Worker {
             }
         }
         let bytes = bytes.checked_add(255).ok_or("Journal size overflow")?;
+        // Round journal buffers to power-of-two slabs (min 64 KiB) and recycle
+        // across released owners so varying draft widths avoid HBM fragmentation.
+        let slab = bytes
+            .checked_next_power_of_two()
+            .unwrap_or(bytes)
+            .max(64 << 10);
         let bank = if let Some(saved) = previous.filter(|saved| saved.bank.bytes() >= bytes) {
             saved.bank
+        } else if let Some(pos) = idle_journals.iter().position(|b| b.bytes() >= bytes) {
+            idle_journals.swap_remove(pos)
         } else {
             self.reserve_batch_memory(
-                super::memory::Requirement::snapshot(bytes)?,
+                super::memory::Requirement::snapshot(slab)?,
                 "DSpark state journal",
             )?;
-            self.session.allocate(bytes)?
+            self.session.allocate(slab)?
         };
         let address = bank.pointer() as usize;
         let base = address.div_ceil(256) * 256 - address;

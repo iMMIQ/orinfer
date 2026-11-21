@@ -70,17 +70,32 @@ impl Runtime {
             .and_then(|n| n.checked_add(8192))
             .ok_or_else(|| "Host metadata size overflow".into())
     }
-    pub(super) fn evict_host(&mut self) -> Result<bool> {
-        if let Some(snapshot) = self.cache.host.evict_one() {
-            self.team.exchange(Command::Evict(snapshot.id))?;
-            self.cache_reclamation.host += 1;
-            Ok(true)
-        } else {
-            Ok(false)
+    pub(super) fn evict_host_for(&mut self, incoming: &Snapshot) -> Result<bool> {
+        let started = Instant::now();
+        let mut victims = Vec::new();
+        while self.cache.host.admission(incoming, 0) == Admission::Reclaim {
+            let Some(snapshot) = self.cache.host.evict_one() else {
+                break;
+            };
+            victims.push(snapshot.id);
         }
+        if victims.is_empty() {
+            return Ok(false);
+        }
+        let count = victims.len();
+        self.team.exchange(Command::EvictMany(victims))?;
+        self.cache_reclamation.host += count;
+        self.health.host_evict_max_s = self
+            .health
+            .host_evict_max_s
+            .max(started.elapsed().as_secs_f64());
+        Ok(true)
     }
     pub(super) fn evict(&mut self) -> Result<bool> {
-        let Some(key) = self.cache.device.victim_except(None) else {
+        self.evict_except(None)
+    }
+    pub(super) fn evict_except(&mut self, protected: Option<u64>) -> Result<bool> {
+        let Some(key) = self.cache.device.victim_except(protected) else {
             return Ok(false);
         };
         let entry = &self.cache.device.entries[&key];
@@ -95,14 +110,13 @@ impl Runtime {
                 output: entry.snapshot.output.clone(),
             };
             if self.cache.host.admission(&snapshot, 0) != Admission::TooLarge {
-                while self.cache.host.admission(&snapshot, 0) == Admission::Reclaim {
-                    if !self.evict_host()? {
-                        break;
-                    }
-                }
+                self.evict_host_for(&snapshot)?;
                 if self.cache.host.admission(&snapshot, 0) == Admission::Ready {
-                    self.team.exchange(Command::Offload(id))?;
-                    host_snapshot = Some(snapshot);
+                    if self.team.try_offload(id)? {
+                        host_snapshot = Some(snapshot);
+                    } else {
+                        self.health.prefix_save_skips += 1;
+                    }
                 }
             }
         }

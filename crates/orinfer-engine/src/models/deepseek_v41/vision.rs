@@ -141,9 +141,16 @@ struct Prepared {
     buffers: Vec<Buffer>,
     features: bool,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CapturePolicy {
+    Never,
+    OnRepeat,
+    Immediate,
+}
 struct Frame {
     kernels: Rc<Vec<Kernel>>,
     graphs: Option<Rc<Vec<Graph>>>,
+    uses: u32,
 }
 struct Running {
     key: (usize, usize),
@@ -328,8 +335,16 @@ impl Encoder {
     }
     pub fn encode(&mut self, session: &Session, image: &ImageInput) -> Result<Encoded> {
         self.begin(session, image)?;
-        self.advance(session, usize::MAX)?
+        self.advance(session, usize::MAX, CapturePolicy::Immediate)?
             .ok_or_else(|| "Full vision execution did not complete".into())
+    }
+    pub(super) fn evict_frame(&mut self) -> bool {
+        let active = self.running.as_ref().map(|r| r.key);
+        let Some(pos) = self.order.iter().position(|&k| Some(k) != active) else {
+            return false;
+        };
+        let key = self.order.remove(pos).unwrap();
+        self.frames.remove(&key).is_some()
     }
     pub(super) fn cancel(&mut self) {
         // Every segment has completed before control returns to the scheduler.
@@ -411,6 +426,7 @@ impl Encoder {
                 Frame {
                     kernels: Rc::new(kernels),
                     graphs: None,
+                    uses: 0,
                 },
             );
         }
@@ -432,6 +448,7 @@ impl Encoder {
         &mut self,
         session: &Session,
         segments: usize,
+        capture: CapturePolicy,
     ) -> Result<Option<Encoded>> {
         if segments == 0 {
             return Err("Vision execution needs a positive frame budget".into());
@@ -503,8 +520,14 @@ impl Encoder {
             return Err("Vision output span differs".into());
         }
         let download_s = download_start.elapsed().as_secs_f64();
+        frame.uses = frame.uses.saturating_add(1);
+        let should_capture = match capture {
+            CapturePolicy::Never => false,
+            CapturePolicy::OnRepeat => frame.uses >= 2,
+            CapturePolicy::Immediate => true,
+        };
         // Capture only after the first real execution; capture itself is not an inference.
-        if session.graphs_enabled() && frame.graphs.is_none() {
+        if session.graphs_enabled() && should_capture && frame.graphs.is_none() {
             let mut graphs = Vec::with_capacity(self.segment_ends.len());
             let mut begin = 0;
             for &end in &self.segment_ends {
@@ -582,7 +605,11 @@ pub fn validate(
             std::fs::read(resolve_file(base, &input.expected)?).map_err(|e| e.to_string())?;
         // A cancelled partial image must not contribute state to the next one.
         encoder.begin(&session, &input.image)?;
-        if encoder.segment_ends.len() > 1 && encoder.advance(&session, 1)?.is_some() {
+        if encoder.segment_ends.len() > 1
+            && encoder
+                .advance(&session, 1, CapturePolicy::Immediate)?
+                .is_some()
+        {
             return Err("Partial vision frame completed before its boundary".into());
         }
         encoder.cancel();
@@ -593,7 +620,7 @@ pub fn validate(
             } else {
                 encoder.begin(&session, &input.image)?;
                 loop {
-                    if let Some(encoded) = encoder.advance(&session, 1)? {
+                    if let Some(encoded) = encoder.advance(&session, 1, CapturePolicy::Immediate)? {
                         break encoded;
                     }
                 }

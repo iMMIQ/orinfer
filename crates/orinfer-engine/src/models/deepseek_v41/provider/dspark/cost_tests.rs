@@ -151,7 +151,7 @@ fn capture_primer_is_not_a_stable_replay_cost() {
     assert_eq!(model.evidence(Stage::Target, 0, false, work), (2, 4));
 }
 #[test]
-fn full_cost_surface_cannot_leave_ordinary_capture_in_calibration() {
+fn full_cost_surface_learns_new_shapes_via_lru_and_finishes_calibration() {
     use super::super::Policy;
     let work = point(8, false, 0.06).work;
     for direct in [false, true] {
@@ -176,21 +176,40 @@ fn full_cost_surface_cannot_leave_ordinary_capture_in_calibration() {
         assert_eq!(policy.costs.cells.len(), 2048);
         assert_eq!(
             policy.baseline_budget(false, true, work, 128., 2.).max_uses,
-            if direct { Some(3.) } else { None }
+            if direct { Some(3.) } else { Some(4.) }
         );
-        if direct {
-            for _ in 0..3 {
-                policy.costs.observe(Point {
-                    stage: Stage::Decode,
-                    ..point(8, false, 0.06)
-                });
-            }
-            assert_eq!(
-                policy.baseline_budget(false, true, work, 128., 2.).max_uses,
-                None
-            );
+        let rounds = if direct { 3 } else { 4 };
+        for _ in 0..rounds {
+            policy.costs.observe(Point {
+                stage: Stage::Decode,
+                ..point(8, false, 0.06)
+            });
         }
+        assert_eq!(policy.costs.cells.len(), 2048);
+        assert_eq!(
+            policy.baseline_budget(false, true, work, 128., 2.).max_uses,
+            None
+        );
     }
+    // Modes evict oldest entries instead of wiping the entire table at 2048.
+    let mut model = Model::default();
+    for rows in 1..=2048 {
+        model.observe(point(rows, true, 0.05));
+    }
+    model.observe(point(3000, true, 0.05));
+    assert_eq!(model.modes.len(), 2048);
+    assert!(
+        model
+            .predict(Stage::Target, 0, false, point(2048, true, 0.05).work)
+            .unwrap()
+            .replay
+    );
+    assert!(
+        model
+            .predict(Stage::Target, 0, false, point(3000, true, 0.05).work)
+            .unwrap()
+            .replay
+    );
 }
 #[test]
 fn ordinary_calibration_does_not_buy_graph_reuse_after_auto_replans() {
@@ -670,7 +689,7 @@ fn unseen_batch_uses_shared_prior_and_replay_preserves_tiers() {
     );
     model
         .modes
-        .insert((family(Stage::Target, 0, false, work), 12), true);
+        .insert((family(Stage::Target, 0, false, work), 12), (true, 1));
     assert_eq!(
         model
             .predict(Stage::Target, 0, false, work)

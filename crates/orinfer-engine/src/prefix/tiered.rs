@@ -89,19 +89,20 @@ impl<T: Resident> Cache<T> {
     pub fn admission(&self, incoming: &dyn Resident, extra: usize) -> Admission {
         let mut own = BTreeMap::new();
         incoming.allocations(&mut own);
-        let fits = |banks: &BTreeMap<u64, usize>| {
-            banks
-                .values()
-                .try_fold(extra, |n, bytes| n.checked_add(*bytes))
-                .is_some_and(|n| n <= self.budget)
-        };
-        if !fits(&own) {
+        let standalone = own
+            .values()
+            .try_fold(extra, |n, bytes| n.checked_add(*bytes));
+        if standalone.is_none_or(|n| n > self.budget) {
             return Admission::TooLarge;
         }
-        for e in self.entries.values() {
-            e.snapshot.allocations(&mut own);
-        }
-        if fits(&own) {
+        let added = own
+            .iter()
+            .filter(|(id, _)| !self.bank_refs.contains_key(id))
+            .try_fold(extra, |n, (_, bytes)| n.checked_add(*bytes));
+        if added
+            .and_then(|n| self.bytes.checked_add(n))
+            .is_some_and(|n| n <= self.budget)
+        {
             Admission::Ready
         } else {
             Admission::Reclaim

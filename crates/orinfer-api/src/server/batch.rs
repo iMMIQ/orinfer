@@ -217,7 +217,7 @@ async fn submit(
         state
             .jobs
             .send(Job {
-                _slot: slot,
+                _slot: Some(slot),
                 _memory: Some(memory),
                 limits: state.limits,
                 prepared,

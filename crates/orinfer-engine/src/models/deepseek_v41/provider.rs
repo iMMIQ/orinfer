@@ -18,7 +18,33 @@ impl memory::Pressure for Runtime {
         self.evict()
     }
     fn evict_program(&mut self) -> Result<bool> {
-        self.team.reclaim_programs()
+        let reclaimed = self.team.reclaim_programs()?;
+        if reclaimed {
+            self.health.program_reclaims += 1;
+        }
+        Ok(reclaimed)
+    }
+}
+/// Admission pressure protects the incoming request's matched device prefix
+/// against self-eviction and keeps one idle owner arena so `owner_requirement`
+/// computed with `new_banks = 0` stays valid through `StartOwner`.
+struct AdmissionPressure<'a> {
+    runtime: &'a mut Runtime,
+    protected: Option<u64>,
+}
+impl memory::Pressure for AdmissionPressure<'_> {
+    fn fits(&mut self, requirement: memory::Requirement) -> Result<bool> {
+        self.runtime.team.has_budget(requirement)
+    }
+    fn evict_prefix(&mut self) -> Result<bool> {
+        self.runtime.evict_except(self.protected)
+    }
+    fn evict_program(&mut self) -> Result<bool> {
+        let reclaimed = self.runtime.team.reclaim_programs_for_admission()?;
+        if reclaimed {
+            self.runtime.health.program_reclaims += 1;
+        }
+        Ok(reclaimed)
     }
 }
 #[cfg(test)]
@@ -128,6 +154,15 @@ pub(crate) struct Runtime {
     rejection_sampling: bool,
     speculation_policy: dspark::Policy,
     speculation: crate::mtp::Statistics,
+    next_slot: usize,
+    health: HealthCounters,
+}
+#[derive(Default)]
+struct HealthCounters {
+    host_evict_max_s: f64,
+    prefix_save_skips: usize,
+    program_reclaims: usize,
+    sampling_request_failures: usize,
 }
 /// Shared-cache events belong to the runtime. Charge them once to the next
 /// completion so request-log aggregation survives overlapping request lifetimes.
@@ -187,6 +222,10 @@ impl Request {
         self.host_sampling() && !self.device_sample()
     }
     fn accept_device(&mut self, output: &Output) -> Result<u32> {
+        if let Some(error) = &output.error {
+            self.decoder.fail(error.clone());
+            return Err(error.clone());
+        }
         if self.sampling.top_logprobs.is_some() != output.report.is_some() {
             return Err("Device sampling probability record differs from request".into());
         }
@@ -206,6 +245,10 @@ impl Request {
         Ok(tokens)
     }
     fn accept_output(&mut self, output: &Output) -> Result<u32> {
+        if let Some(error) = &output.error {
+            self.decoder.fail(error.clone());
+            return Err(error.clone());
+        }
         let token = if self.host_sampling() && !(self.device_sample() && output.logits.is_empty()) {
             let core = &mut self.core;
             let law = core
@@ -241,11 +284,14 @@ fn cached_outputs(requests: &mut [&mut Request]) -> Result<Vec<StepOutput>> {
         if !request.is_finished()
             && let Some(output) = request.ready_output.take()
         {
-            let token = request.accept_output(&output)?;
-            steps.push(StepOutput {
-                request: i,
-                tokens: vec![token],
-            });
+            match request.accept_output(&output) {
+                Ok(token) => steps.push(StepOutput {
+                    request: i,
+                    tokens: vec![token],
+                }),
+                Err(_) if request.decoder.failure().is_some() => {}
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(steps)
@@ -368,6 +414,8 @@ impl Runtime {
             rejection_sampling,
             speculation_policy,
             speculation: Default::default(),
+            next_slot: 1,
+            health: Default::default(),
         })
     }
     pub fn expert_cache_statistics(&self) -> Option<crate::execution::ExpertCacheStatistics> {
@@ -388,6 +436,24 @@ impl Runtime {
     pub fn scheduler_statistics(&self) -> scheduler::Statistics {
         let mut statistics = self.statistics.clone();
         statistics.speculation = self.speculation_statistics().cloned();
+        let (min_rank_free_bytes, max_rank_free_bytes) = self.team.rank_free_range();
+        let (dspark_cost_cells, dspark_budget_balance_s) = self.speculation_policy.diagnostics();
+        statistics.backend_health = Some(scheduler::BackendHealthStatistics {
+            min_rank_free_bytes,
+            max_rank_free_bytes,
+            device_prefix_entries: self.cache.device.entries.len(),
+            device_prefix_bytes: self.cache.device.bytes,
+            host_prefix_entries: self.cache.host.entries.len(),
+            host_prefix_bytes: self.cache.host.bytes.saturating_mul(self.team.ranks()),
+            prefix_evictions: self.prefix.evictions + self.cache_reclamation.device,
+            host_prefix_evictions: self.prefix.host_evictions + self.cache_reclamation.host,
+            host_evict_max_s: self.health.host_evict_max_s,
+            prefix_save_skips: self.health.prefix_save_skips,
+            program_reclaims: self.health.program_reclaims,
+            sampling_request_failures: self.health.sampling_request_failures,
+            dspark_cost_cells,
+            dspark_budget_balance_s,
+        });
         statistics
     }
     pub fn max_context(&self) -> usize {
@@ -556,24 +622,25 @@ impl Runtime {
                         && self.entry(id).snapshot.output.is_some()
                 })
     }
-    pub fn can_admit(
+    pub fn can_admit_borrowed(
         &mut self,
-        input: &GenerationInput,
+        input: &crate::model::AdmissionInput<'_>,
         options: &scheduler::Options,
     ) -> Result<bool> {
         self.reap()?;
-        self.require_text(&input.images, &input.audios)?;
+        self.require_text(input.images, input.audios)?;
         if let Some(vision) = self.vision() {
-            vision.image_spans(&input.input_tokens, &input.images)?;
+            vision.image_spans(input.input_tokens, input.images)?;
         }
         input.sampling.validate()?;
+        let total_tokens = input
+            .input_tokens
+            .len()
+            .checked_add(input.max_new_tokens)
+            .ok_or("Owner token budget overflow")?;
         if input.input_tokens.is_empty()
             || input.max_new_tokens == 0
-            || input
-                .input_tokens
-                .len()
-                .checked_add(input.max_new_tokens)
-                .is_none_or(|n| n > self.max_context())
+            || total_tokens > self.max_context()
             || input
                 .input_tokens
                 .iter()
@@ -588,17 +655,29 @@ impl Runtime {
         {
             return Ok(false);
         }
+        let matched = if let Some(hint) = input.hint.filter(|h| h.owner == self.owner) {
+            self.matched_hint(hint)
+        } else {
+            let media = Media::images(input.input_tokens, input.images, self.vision())?;
+            self.matched(input.input_tokens, &media)
+        };
         // A complete cached head with one requested output never needs KV.
         // Allocating an owner here can evict the very checkpoints being hit.
-        if self.head_only(input) {
+        if input.max_new_tokens == 1
+            && matched.is_some_and(|id| {
+                let entry = self.entry(id);
+                entry.tokens.len() == input.input_tokens.len() && entry.snapshot.output.is_some()
+            })
+        {
             return Ok(true);
         }
+        let (shared_tokens, protected) = match matched {
+            Some((false, key)) => (self.cache.device.entries[&key].tokens.len(), Some(key)),
+            _ => (0, None),
+        };
         let needed = self.team.owner_requirement(
-            input
-                .input_tokens
-                .len()
-                .checked_add(input.max_new_tokens)
-                .ok_or("Owner token budget overflow")?,
+            total_tokens,
+            shared_tokens,
             options.memory_reserve_bytes,
         )?;
         let capacity = self.prefill_packet_capacity();
@@ -606,22 +685,27 @@ impl Runtime {
             || self.active.is_empty()
             || input.input_tokens.len() <= capacity
         {
-            return memory::ensure_budget(self, needed);
+            let mut pressure = AdmissionPressure {
+                runtime: self,
+                protected,
+            };
+            return memory::ensure_budget(&mut pressure, needed);
         }
         if self.team.has_budget(needed)? {
             return Ok(true);
         }
-        let media = Media::images(&input.input_tokens, &input.images, self.vision())?;
-        let cached = self
-            .matched(&input.input_tokens, &media)
-            .map_or(0, |hit| self.entry(hit).tokens.len());
+        let cached = matched.map_or(0, |hit| self.entry(hit).tokens.len());
         if input.input_tokens.len().saturating_sub(cached) > capacity {
             // Let live owners progress while the scheduler waits for memory
             // to admit a cold prompt. Its aged memory guard prevents starvation.
             return Ok(false);
         }
-        if memory::reclaim_one(self)? {
-            memory::ensure_budget(self, needed)
+        let mut pressure = AdmissionPressure {
+            runtime: self,
+            protected,
+        };
+        if memory::reclaim_one(&mut pressure)? {
+            memory::ensure_budget(&mut pressure, needed)
         } else {
             self.team.has_budget(needed)
         }
@@ -640,9 +724,27 @@ impl Runtime {
         let reap_s = started.elapsed().as_secs_f64();
         self.require_text(&input.images, &input.audios)?;
         let media = Media::images(&input.input_tokens, &input.images, self.vision())?;
-        let slot = (0..self.team.model.batch.as_ref().unwrap().owners)
-            .find(|slot| !self.active.contains(slot))
-            .ok_or("A2 owner capacity exhausted")?;
+        // Prefer pooled non-zero slots in round-robin order so short requests
+        // reuse idle owner arenas without slot-0 full-session syncs or hotspots.
+        let owners = self.team.model.batch.as_ref().unwrap().owners;
+        let slot = if owners > 1 {
+            let start = self.next_slot.clamp(1, owners - 1);
+            if let Some(slot) = (start..owners)
+                .chain(1..start)
+                .find(|slot| !self.active.contains(slot))
+            {
+                self.next_slot = if slot + 1 < owners { slot + 1 } else { 1 };
+                slot
+            } else if !self.active.contains(&0) {
+                0
+            } else {
+                return Err("A2 owner capacity exhausted".into());
+            }
+        } else if !self.active.contains(&0) {
+            0
+        } else {
+            return Err("A2 owner capacity exhausted".into());
+        };
         let resident = !self.head_only(&input);
         let setup_s = started.elapsed().as_secs_f64() - reap_s;
         let mut prefix = crate::prefix::Statistics::default();
@@ -678,11 +780,16 @@ impl Runtime {
                 .checked_add(input.max_new_tokens)
                 .ok_or("Owner token budget overflow")?;
             let at = Instant::now();
-            self.team.exchange(Command::StartOwner {
+            let start_cmd = Command::StartOwner {
                 slot,
                 limit,
                 snapshot: snapshot_id.map(|(_, sid)| sid),
-            })?;
+            };
+            if snapshot_id.is_some_and(|(host_tier, _)| host_tier) {
+                self.team.exchange_heavy(start_cmd)?;
+            } else {
+                self.team.exchange(start_cmd)?;
+            }
             let elapsed = at.elapsed().as_secs_f64();
             if let Some((host_tier, _)) = snapshot_id {
                 prefix.restore_s = elapsed;
@@ -836,7 +943,7 @@ impl Runtime {
             };
             if cache.admission(&snapshot, 0) != Admission::Ready {
                 if !(if host {
-                    self.evict_host()?
+                    self.evict_host_for(&snapshot)?
                 } else {
                     self.evict()?
                 }) {
@@ -859,10 +966,18 @@ impl Runtime {
             }
             let actual = if host {
                 self.team
-                    .host_allocations(request.slot, id, output.is_some(), false)?
+                    .try_host_allocations(request.slot, id, output.is_some(), false)?
             } else {
                 self.team
-                    .snapshot_allocations(request.slot, id, output.is_some())?
+                    .try_snapshot_allocations(request.slot, id, output.is_some())?
+            };
+            let Some(actual) = actual else {
+                self.health.prefix_save_skips += 1;
+                if !host && self.cache.host.budget > 0 {
+                    host = true;
+                    continue;
+                }
+                return Ok(());
             };
             if actual != snapshot.banks {
                 return Err("A2 snapshot allocation differs from its reserved plan".into());
@@ -870,12 +985,16 @@ impl Runtime {
             break (snapshot, bytes);
         };
         // Upgrade endpoints across both tiers after the new snapshot is complete.
+        let mut obsolete_ids = Vec::new();
         for cache in [&mut self.cache.device, &mut self.cache.host] {
             let obsolete = cache.exact_matches(&request.history[..count], &request.media);
             for old in obsolete {
                 let entry = cache.remove(old).ok_or("Missing upgraded A2 prefix")?;
-                self.team.exchange(Command::Evict(entry.snapshot.id))?;
+                obsolete_ids.push(entry.snapshot.id);
             }
+        }
+        if !obsolete_ids.is_empty() {
+            self.team.exchange(Command::EvictMany(obsolete_ids))?;
         }
         let cache = if host {
             &mut self.cache.host
@@ -1184,14 +1303,19 @@ impl Runtime {
                 self.statistics.decode_tokens += 1;
             }
             if let Some(output) = values.iter().find(|output| output.owner == request.slot) {
-                if request.prefilling && request.cache_prompt {
+                if request.prefilling && request.cache_prompt && output.error.is_none() {
                     self.store(request, complete_cache.then_some(output))?;
                 }
-                let token = request.accept_output(output)?;
-                steps.push(StepOutput {
-                    request: i,
-                    tokens: vec![token],
-                });
+                match request.accept_output(output) {
+                    Ok(token) => steps.push(StepOutput {
+                        request: i,
+                        tokens: vec![token],
+                    }),
+                    Err(_) if request.decoder.failure().is_some() => {
+                        self.health.sampling_request_failures += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             if request.prefilling
                 && request.cache_prompt

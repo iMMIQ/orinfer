@@ -275,7 +275,9 @@ curl http://127.0.0.1:8088/api/chat -d '{
 | `ORINFER_A2_HOST_TABLE_MIB` | Ascend | `0` | Resident RAM budget for DSv4.1 Engram tables (e.g. `212000`) |
 | `ORINFER_A2_HOST_ROW_CACHE_MIB` | Ascend | `2048` | Cross-packet Engram host row cache (`0` disables) |
 | `ORINFER_VISION_CACHE_MIB` | Ascend | `128` | Retained CPU vision feature cache (`0` disables) |
-| `ORINFER_A2_COMMAND_TIMEOUT_MS` | Ascend | `30000` | Per-command TP rank timeout (`1..1800000` ms) |
+| `ORINFER_A2_COMMAND_TIMEOUT_MS` | Ascend | `30000` | Per-command TP rank timeout for fast commands (`1..1800000` ms) |
+| `ORINFER_A2_HEAVY_COMMAND_TIMEOUT_MS` | Ascend | `max(4×base, 120000)` | Timeout for heavy capture/offload/host-restore/vision commands (`1..1800000` ms) |
+| `ORINFER_A2_WORKER_CPUS` | Ascend | unset | Semicolon-separated per-rank CPU affinity lists; keep host cores free for Tokio/Rayon |
 | `ORINFER_A2_DSPARK_COST_MODEL` | Ascend | auto | Explicit offline DSpark cost profile JSON |
 | `ORINFER_A2_DSPARK_SAMPLING` | Ascend | `coupled` | `coupled` (default) or experimental `rejection` |
 | `ORINFER_A2_SHARED_GRAPH` | Ascend | `0` | Set `1` to enable shared FFN fragment graph cache |
@@ -283,6 +285,7 @@ curl http://127.0.0.1:8088/api/chat -d '{
 | `ORINFER_A2_BATCH_PROFILE` | Ascend | `0` | Set `1` to log A2 cold-setup and prefill cost profiles |
 | `HCCL_OP_EXPANSION_MODE` | Ascend | — | Recommended `AIV` for 910B TP8 |
 | `HCCL_NPU_SOCKET_PORT_RANGE` | Ascend | — | Recommended `auto` |
+| `HCCL_EXEC_TIMEOUT` | Ascend | `1800` | Recommended `120` s to bound collective failure teardown |
 | `HCCL_DETERMINISTIC` | Ascend | unset | Set `strict` for bit-reproducible cross-batch diagnostics |
 | `ASCEND_COREDUMP_SIGNAL` | Ascend | `none` (auto) | Prevents CANN trace handler from intercepting SIGINT/SIGTERM |
 

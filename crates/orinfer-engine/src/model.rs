@@ -251,6 +251,29 @@ enum Implementation {
 pub struct Model(Implementation);
 pub(crate) mod request;
 pub use crate::runtime::requests::{GenerationInput, StepOutput};
+
+/// Borrowed admission probe view, avoiding deep clones of prompt tokens and
+/// image/audio buffers while probing queued requests under load.
+pub struct AdmissionInput<'a> {
+    pub input_tokens: &'a [u32],
+    pub images: &'a [crate::vision::ImageInput],
+    pub audios: &'a [crate::audio::AudioInput],
+    pub max_new_tokens: usize,
+    pub sampling: &'a crate::sampling::Options,
+    pub hint: Option<&'a crate::scheduler::RequestHint>,
+}
+impl<'a> From<&'a GenerationInput> for AdmissionInput<'a> {
+    fn from(input: &'a GenerationInput) -> Self {
+        Self {
+            input_tokens: &input.input_tokens,
+            images: &input.images,
+            audios: &input.audios,
+            max_new_tokens: input.max_new_tokens,
+            sampling: &input.sampling,
+            hint: None,
+        }
+    }
+}
 pub use crate::runtime::scoring::{Probe, ScoreCase, ScoreReport, ScoreRequests, TokenProbability};
 pub use request::RequestState;
 
@@ -408,10 +431,17 @@ impl Model {
         input: &GenerationInput,
         options: &crate::scheduler::Options,
     ) -> Result<bool> {
+        self.can_admit_borrowed(&AdmissionInput::from(input), options)
+    }
+    pub fn can_admit_borrowed(
+        &mut self,
+        input: &AdmissionInput<'_>,
+        options: &crate::scheduler::Options,
+    ) -> Result<bool> {
         dispatch!(
             mut self,
-            |inner| inner.can_admit_request(input, options),
-            inner.can_admit(input, options)
+            |inner| inner.can_admit_borrowed(input, options),
+            inner.can_admit_borrowed(input, options)
         )
     }
     /// Image work that the provider defers to its shared execution cohort.

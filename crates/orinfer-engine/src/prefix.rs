@@ -2,7 +2,7 @@
 mod tiered;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 pub(crate) use tiered::{Admission, CheckpointMemo, Tiered};
 
 #[derive(Default, Debug, Clone, Serialize)]
@@ -211,6 +211,9 @@ pub(crate) struct Cache<T> {
     root: Node,
     clock: u64,
     next_id: u64,
+    logical_bytes: usize,
+    bank_refs: HashMap<u64, (usize, usize)>,
+    entry_banks: HashMap<u64, Vec<(u64, usize)>>,
 }
 impl<T: Resident> Cache<T> {
     pub fn new(budget: usize) -> Self {
@@ -221,6 +224,9 @@ impl<T: Resident> Cache<T> {
             root: Node::default(),
             clock: 0,
             next_id: 0,
+            logical_bytes: 0,
+            bank_refs: HashMap::new(),
+            entry_banks: HashMap::new(),
         }
     }
     pub fn match_prefix_by(
@@ -342,25 +348,43 @@ impl<T: Resident> Cache<T> {
         Some(e)
     }
     pub fn resident_with(&self, extra: Option<&dyn Resident>) -> usize {
-        let mut allocations = BTreeMap::new();
-        for e in self.entries.values() {
-            e.snapshot.allocations(&mut allocations);
-        }
-        if let Some(extra) = extra {
-            extra.allocations(&mut allocations);
-        }
-        allocations.values().sum()
+        let Some(extra) = extra else {
+            return self.bytes;
+        };
+        let mut own = BTreeMap::new();
+        extra.allocations(&mut own);
+        let added: usize = own
+            .iter()
+            .filter(|(id, _)| !self.bank_refs.contains_key(id))
+            .map(|(_, bytes)| *bytes)
+            .sum();
+        self.bytes + added
     }
     pub fn update_statistics(&self, statistics: &mut Statistics) {
         statistics.resident_bytes = self.bytes;
-        statistics.logical_bytes = self.entries.values().map(|e| e.bytes).sum();
-        statistics.shared_bytes = statistics.logical_bytes.saturating_sub(self.bytes);
+        statistics.logical_bytes = self.logical_bytes;
+        statistics.shared_bytes = self.logical_bytes.saturating_sub(self.bytes);
         statistics.entries = self.entries.len();
     }
     pub fn remove(&mut self, id: u64) -> Option<Entry<T>> {
         let entry = self.entries.remove(&id)?;
         self.root.remove(&entry.tokens, id);
-        self.bytes = self.resident_with(None);
+        self.logical_bytes = self.logical_bytes.saturating_sub(entry.bytes);
+        if let Some(banks) = self.entry_banks.remove(&id) {
+            for (bank_id, _) in banks {
+                if let std::collections::hash_map::Entry::Occupied(mut slot) =
+                    self.bank_refs.entry(bank_id)
+                {
+                    let (bytes, refs) = slot.get_mut();
+                    if *refs <= 1 {
+                        self.bytes = self.bytes.saturating_sub(*bytes);
+                        slot.remove();
+                    } else {
+                        *refs -= 1;
+                    }
+                }
+            }
+        }
         Some(entry)
     }
     fn ancestor_depth(&self, entry: &Entry<T>) -> usize {
@@ -412,55 +436,73 @@ impl<T: Resident> Cache<T> {
         prefer_unproven: bool,
         active_prompt: impl Fn(u64) -> bool,
     ) -> Option<u64> {
-        let mut references: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
-        for e in self.entries.values() {
-            let mut own = BTreeMap::new();
-            e.snapshot.allocations(&mut own);
-            for (id, bytes) in own {
-                let r = references.entry(id).or_insert((bytes, 0));
-                r.1 += 1;
+        let mut best: Option<(u64, bool, bool, f64, u64)> = None;
+        for (&id, entry) in &self.entries {
+            if Some(id) == protected {
+                continue;
+            }
+            let active = active_prompt(id);
+            let prio = prefer_unproven && (entry.logits_valid || entry.hits != 0);
+            if let Some((_, best_active, best_prio, _, _)) = best
+                && (active, prio) > (best_active, best_prio)
+            {
+                continue;
+            }
+            let parent = self.ancestor_depth(entry);
+            let freed: usize = self.entry_banks.get(&id).map_or(0, |banks| {
+                banks
+                    .iter()
+                    .filter(|(bank_id, _)| self.bank_refs.get(bank_id).is_some_and(|r| r.1 == 1))
+                    .map(|(_, bytes)| *bytes)
+                    .sum()
+            });
+            let util = (entry.tokens.len() - parent).max(1) as f64 * (1.0 + entry.hits as f64)
+                / (freed.max(1) as f64 * (self.clock - entry.used + 1) as f64);
+            let is_better = match best {
+                None => true,
+                Some((_, best_active, best_prio, best_util, best_used)) => (active, prio)
+                    .cmp(&(best_active, best_prio))
+                    .then_with(|| util.total_cmp(&best_util))
+                    .then_with(|| entry.used.cmp(&best_used))
+                    .is_lt(),
+            };
+            if is_better {
+                best = Some((id, active, prio, util, entry.used));
             }
         }
-        self.entries
-            .iter()
-            .filter(|(id, _)| Some(**id) != protected)
-            .min_by(|(id_a, a), (id_b, b)| {
-                let utility = |e: &Entry<T>| {
-                    let parent = self.ancestor_depth(e);
-                    let mut own = BTreeMap::new();
-                    e.snapshot.allocations(&mut own);
-                    let freed: usize = own
-                        .iter()
-                        .filter(|(id, _)| references[id].1 == 1)
-                        .map(|(_, n)| *n)
-                        .sum();
-                    (e.tokens.len() - parent).max(1) as f64 * (1.0 + e.hits as f64)
-                        / (freed.max(1) as f64 * (self.clock - e.used + 1) as f64)
-                };
-                let priority =
-                    |entry: &Entry<T>| prefer_unproven && (entry.logits_valid || entry.hits != 0);
-                active_prompt(**id_a)
-                    .cmp(&active_prompt(**id_b))
-                    .then_with(|| priority(a).cmp(&priority(b)))
-                    .then_with(|| utility(a).total_cmp(&utility(b)))
-                    .then(a.used.cmp(&b.used))
-            })
-            .map(|(&id, _)| id)
+        best.map(|(id, ..)| id)
     }
     pub fn insert(&mut self, mut entry: Entry<T>) -> u64 {
         self.clock += 1;
         self.next_id += 1;
         entry.used = self.clock;
-        self.root.insert(&entry.tokens, self.next_id);
-        self.entries.insert(self.next_id, entry);
-        self.bytes = self.resident_with(None);
+        let id = self.next_id;
+        let mut own = BTreeMap::new();
+        entry.snapshot.allocations(&mut own);
+        let banks: Vec<(u64, usize)> = own.into_iter().collect();
+        for &(bank_id, bytes) in &banks {
+            self.bank_refs
+                .entry(bank_id)
+                .and_modify(|(_, refs)| *refs += 1)
+                .or_insert_with(|| {
+                    self.bytes += bytes;
+                    (bytes, 1)
+                });
+        }
+        self.logical_bytes = self.logical_bytes.saturating_add(entry.bytes);
+        self.entry_banks.insert(id, banks);
+        self.root.insert(&entry.tokens, id);
+        self.entries.insert(id, entry);
         debug_assert!(self.bytes <= self.budget);
-        self.next_id
+        id
     }
     #[cfg(test)]
     pub fn clear(&mut self) -> Vec<T> {
         self.root = Node::default();
         self.bytes = 0;
+        self.logical_bytes = 0;
+        self.bank_refs.clear();
+        self.entry_banks.clear();
         std::mem::take(&mut self.entries)
             .into_values()
             .map(|e| e.snapshot)
@@ -742,5 +784,36 @@ mod tests {
         assert_eq!(c.exact_matches(&[10, 20, 30], &m2), vec![id_m2]);
         assert!(c.exact_matches(&[10, 20, 99], &m1).is_empty());
         assert!(c.exact_matches(&[10], &m1).is_empty());
+    }
+    #[test]
+    fn incremental_accounting_matches_full_recomputation_at_scale() {
+        let mut c = Cache::new(100_000_000);
+        for i in 1..=600u64 {
+            let shared = (i % 17) + 1;
+            let tokens = vec![(i % 7) as u32, (i / 7) as u32, (i % 13) as u32];
+            c.insert(entry(
+                &tokens,
+                &[(shared, 1000), (1000 + i, 50)],
+                i % 2 == 0,
+            ));
+            if i % 5 == 0 {
+                c.evict_one().unwrap();
+            }
+        }
+        let mut oracle = BTreeMap::new();
+        let mut logical = 0usize;
+        for e in c.entries.values() {
+            e.snapshot.allocations(&mut oracle);
+            logical += e.bytes;
+        }
+        assert_eq!(c.bytes, oracle.values().sum::<usize>());
+        assert_eq!(c.resident_with(None), c.bytes);
+        let extra = Blocks(vec![(1, 1000), (999_999, 777)]);
+        assert_eq!(c.resident_with(Some(&extra)), c.bytes + 777);
+        let mut stats = Statistics::default();
+        c.update_statistics(&mut stats);
+        assert_eq!(stats.logical_bytes, logical);
+        assert_eq!(stats.resident_bytes, c.bytes);
+        assert_eq!(stats.shared_bytes, logical - c.bytes);
     }
 }

@@ -161,15 +161,21 @@ impl HostBuffer {
     }
 }
 #[derive(Default)]
-pub(crate) struct HostPool(BTreeMap<u64, Weak<HostBank>>);
+pub(crate) struct HostPool {
+    banks: std::collections::HashMap<u64, Weak<HostBank>>,
+    prune_at: usize,
+}
 impl HostPool {
     pub fn bank(&mut self, id: u64, bytes: usize) -> Result<Rc<HostBank>> {
-        self.0.retain(|_, bank| bank.strong_count() != 0);
-        if let Some(bank) = self.0.get(&id).and_then(Weak::upgrade) {
+        if let Some(bank) = self.banks.get(&id).and_then(Weak::upgrade) {
             if bank.bytes.borrow().len() != bytes {
                 return Err("Host KV bank extent changed".into());
             }
             return Ok(bank);
+        }
+        if self.banks.len() >= self.prune_at.max(256) {
+            self.banks.retain(|_, bank| bank.strong_count() != 0);
+            self.prune_at = self.banks.len().saturating_mul(2).max(256);
         }
         let mut storage = Vec::new();
         storage
@@ -182,7 +188,7 @@ impl HostPool {
             descriptor: Default::default(),
             device: Default::default(),
         });
-        self.0.insert(id, Rc::downgrade(&bank));
+        self.banks.insert(id, Rc::downgrade(&bank));
         Ok(bank)
     }
 }

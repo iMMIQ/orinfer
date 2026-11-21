@@ -49,11 +49,13 @@ Bind `orinfer` to localhost behind your internal API gateway (which handles TLS,
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
+export ASCEND_COREDUMP_SIGNAL=none
 export ORINFER_EXECUTION_CACHE=/srv/orinfer/execution-cache
 export ORINFER_A2_HOST_TABLE_MIB=212000
 export ORINFER_VISION_CACHE_MIB=1024
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_NPU_SOCKET_PORT_RANGE=auto
+export HCCL_EXEC_TIMEOUT=120
 
 bin/orinfer serve /data/model/dsv41-v0.3.13 \
   --model deepseek-v4.1 \
@@ -71,6 +73,7 @@ bin/orinfer serve /data/model/dsv41-v0.3.13 \
 
 ### Key Sizing Notes
 - **Memory**: `--prefix-cache-mib 8192` is **per NPU**; `--kv-offload-mib 262144` is **total across TP ranks** (allocated on demand, does not expand active NPU KV capacity); `ORINFER_A2_HOST_TABLE_MIB=212000` pins ~207 GiB of Engram tables in RAM.
+- **CPU / NUMA Placement**: When setting `ORINFER_A2_WORKER_CPUS` to bind the 8 `orinfer-a2-{0..7}` rank threads to NPU-local NUMA cores, leave dedicated unpinned host cores outside that set for `orinfer-gpu`, Tokio HTTP workers, preprocessing, Rayon Engram gathers, and host KV offload so host work does not preempt TP8 rank threads.
 - **Startup & Shutdown Probes**: Full host-table loading can take several minutes—configure startup probes to `/health` (HTTP 200) with a ≥600 s grace window. Set your process manager's `SIGKILL` timeout > `--drain-timeout-ms` (120 s) so NPU and host-table teardown completes cleanly.
 - **Sampling Defaults**: Unspecified requests default to `temperature=1`, `top_p=1`, `top_k=0` (set `temperature=0` explicitly for greedy output). Output budgets default to 8,192 (non-thinking), 65,536 (thinking), and 131,072 (thinking + `reasoning_effort=max`), clamped to remaining context.
 
@@ -94,7 +97,7 @@ uv run --locked python -m tools.bench.dspark_costs \
   - **Queue deadline (`--queue-timeout-ms`)**: HTTP `408` (non-streaming) or SSE terminal error `request_queue_timeout` (`retryable=true`, `retry_after_ms=1000`). Use exponential backoff with bounded retries.
   - **Output stall (`--output-timeout-ms`)**: `client_output_timeout` (`retryable=false`).
   - **Idempotency**: Stop automatic retries once any text, thinking, or tool-call delta has been received.
-- **Device Faults**: Any NPU driver error, rank timeout (`ORINFER_A2_COMMAND_TIMEOUT_MS`, default 30 s), or HCCL failure retires the TP team and exits the worker; let the process manager restart the service.
+- **Device Faults**: Any NPU driver error, rank timeout (`ORINFER_A2_COMMAND_TIMEOUT_MS` default 30 s for fast commands; `ORINFER_A2_HEAVY_COMMAND_TIMEOUT_MS` default 120 s for capture/offload/restore/vision), or HCCL failure (`HCCL_EXEC_TIMEOUT=120`) retires the TP team and exits `orinfer serve` with a non-zero exit code; configure systemd (`Restart=on-failure`) or Kubernetes to restart the service cleanly. Per-request constrained decoding dead-ends fail only that single request without retiring the TP team.
 
 ---
 

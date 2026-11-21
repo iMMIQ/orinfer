@@ -67,7 +67,7 @@ struct Service {
     activity: Arc<continuous::Activity>,
 }
 struct Job {
-    _slot: Arc<tokio::sync::OwnedSemaphorePermit>,
+    _slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     _memory: Option<Arc<preparation::Lease>>,
     limits: Limits,
     prepared: Prepared,
@@ -80,7 +80,7 @@ struct Job {
     shared_prefix: Option<usize>,
 }
 enum ModelEvent {
-    Chunk(Value),
+    Chunk(String),
     Complete(Value),
     Failed(String),
     Unavailable(String),
@@ -89,7 +89,7 @@ enum ModelEvent {
 
 fn stream_payload(event: Option<ModelEvent>) -> (String, bool) {
     match event {
-        Some(ModelEvent::Chunk(value)) => (value.to_string(), false),
+        Some(ModelEvent::Chunk(payload)) => (payload, false),
         Some(ModelEvent::Complete(_)) => ("[DONE]".into(), true),
         Some(ModelEvent::Failed(message)) => (json!({"error":{"message":message,"type":"server_error","code":"generation_error"}}).to_string(), true),
         Some(ModelEvent::Unavailable(message)) => (json!({"error":{"message":message,"type":"server_error","code":"service_unavailable"}}).to_string(), true),
@@ -110,8 +110,11 @@ pub fn run(settings: Settings) -> Result<()> {
     if !descriptor["metadata"]["reranking"].is_null() {
         return crate::reranking::serve(settings);
     }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(4);
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(workers)
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
@@ -185,11 +188,15 @@ async fn serve(settings: Settings) -> Result<()> {
     let signal_lifecycle = Arc::clone(&lifecycle);
     let result = {
         let shutdown = async move {
-            shutdown_signal().await;
+            tokio::select! {
+                _ = shutdown_signal() => {
+                    signal_lifecycle.drain();
+                }
+                _ = signal_lifecycle.failed() => {}
+            }
             if let Ok(mut started) = signal_shutdown_at.lock() {
                 *started = Some(Instant::now());
             }
-            signal_lifecycle.drain();
             signal_shutdown.store(true, Ordering::Relaxed);
             signal_draining.notify_one();
         };
@@ -217,6 +224,9 @@ async fn serve(settings: Settings) -> Result<()> {
         })
         .unwrap_or(limits.drain_ms);
     worker.stop(remaining_ms).await?;
+    if let Some(failure) = lifecycle.failure() {
+        return Err(format!("GPU worker failed: {}", failure.message));
+    }
     result
 }
 pub(crate) fn api_key() -> Option<Arc<str>> {
@@ -487,7 +497,7 @@ async fn prepare_chat(
         .as_secs();
     let serial = state.ids.fetch_add(1, Ordering::Relaxed);
     let job = Job {
-        _slot: slot,
+        _slot: Some(slot),
         _memory: Some(Arc::clone(&memory)),
         limits: state.limits,
         prepared,

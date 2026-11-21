@@ -469,9 +469,11 @@ impl Runtime {
             .epochs
             .get_mut(owner)
             .ok_or("Invalid device frontier owner")?;
-        *epoch = epoch
-            .checked_add(1)
-            .ok_or("Device frontier epoch exhausted")?;
+        // frontier.py only tests equality (state[owner, 3] == epoch) when mode != 0.
+        // Removing `owner` from `ready` forces mode = 0 on the next prepare, and the
+        // following commit overwrites state[owner, 3]. Wrapping 1..=i32::MAX (skipping
+        // initial zero) prevents long-uptime exhaustion without sacrificing isolation.
+        *epoch = next_epoch(*epoch);
         self.ready.remove(&owner);
         self.drafted.remove(&owner);
         Ok(())
@@ -903,5 +905,21 @@ impl Runtime {
             .enqueue(&worker.session)?;
         }
         Ok(())
+    }
+}
+
+fn next_epoch(current: i32) -> i32 {
+    if current == i32::MAX { 1 } else { current + 1 }
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::next_epoch;
+
+    #[test]
+    fn frontier_epoch_wraps_without_hitting_zero_or_overflow() {
+        assert_eq!(next_epoch(1), 2);
+        assert_eq!(next_epoch(i32::MAX - 1), i32::MAX);
+        assert_eq!(next_epoch(i32::MAX), 1);
     }
 }

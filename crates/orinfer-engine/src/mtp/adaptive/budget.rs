@@ -94,7 +94,22 @@ impl Budget {
         } else {
             0.
         };
-        self.balance += subsidy;
+        self.balance = (self.balance + subsidy).max(-2. * self.limit);
         self.startup_spent += subsidy;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catastrophic_stall_cannot_drive_balance_into_unbounded_debt() {
+        let mut budget = Budget::default();
+        budget.set_limit(0.4);
+        budget.settle_action(30.0, 0.05, true, false);
+        assert_eq!(budget.balance, -0.8);
+        budget.earn_ordinary(1.0, 0.0);
+        assert!(budget.balance > -0.8);
     }
 }

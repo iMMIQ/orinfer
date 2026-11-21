@@ -67,11 +67,24 @@ pub(super) fn target_readout(
         .collect::<Vec<_>>();
     if !jobs.is_empty() {
         result.parameters = Arc::new(crate::sampling::Prepared::new(move || {
-            jobs.into_par_iter()
+            Ok(jobs
+                .into_par_iter()
                 .map(|(slot, decoder, top_logprobs, tokens)| {
-                    Ok((slot, decoder.proposed_rows(&tokens, vocab, top_logprobs)?))
+                    let count = tokens.len() + 1;
+                    let rows = match decoder.proposed_rows(&tokens, vocab, top_logprobs) {
+                        Ok(rows) => rows,
+                        Err(error) => vec![
+                            crate::backend::ascend::sampling::Parameters {
+                                mask: None,
+                                top_logprobs: None,
+                                error: Some(error),
+                            };
+                            count
+                        ],
+                    };
+                    (slot, rows)
                 })
-                .collect::<Result<BTreeMap<_, _>>>()
+                .collect::<BTreeMap<_, _>>())
         }));
     }
 

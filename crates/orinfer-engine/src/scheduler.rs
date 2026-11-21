@@ -546,6 +546,27 @@ pub struct Statistics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speculation: Option<crate::mtp::Statistics>,
     pub batch_execution: BatchExecutionStatistics,
+    /// Native backend stability and memory health diagnostics when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_health: Option<BackendHealthStatistics>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BackendHealthStatistics {
+    pub min_rank_free_bytes: usize,
+    pub max_rank_free_bytes: usize,
+    pub device_prefix_entries: usize,
+    pub device_prefix_bytes: usize,
+    pub host_prefix_entries: usize,
+    pub host_prefix_bytes: usize,
+    pub prefix_evictions: usize,
+    pub host_prefix_evictions: usize,
+    pub host_evict_max_s: f64,
+    pub prefix_save_skips: usize,
+    pub program_reclaims: usize,
+    pub sampling_request_failures: usize,
+    pub dspark_cost_cells: usize,
+    pub dspark_budget_balance_s: f64,
 }
 
 #[cfg(test)]

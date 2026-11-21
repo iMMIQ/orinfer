@@ -1,10 +1,51 @@
 //! Continuous worker and bounded, nonblocking per-client output mailboxes.
 use super::*;
 use orinfer_engine::{
-    model::{GenerationInput, RequestState},
+    model::{AdmissionInput, GenerationInput, RequestState},
     scheduler,
 };
-use std::{collections::VecDeque, sync::atomic::AtomicUsize};
+use std::{
+    collections::VecDeque,
+    sync::{OnceLock, atomic::AtomicUsize, mpsc as std_mpsc},
+};
+
+/// Non-blocking bounded stderr logger for the continuous batching hot loop.
+/// A stalled log pipe drops excess per-request telemetry lines instead of
+/// blocking `orinfer-gpu`.
+fn log_async(line: String) {
+    static LOGGER: OnceLock<std_mpsc::SyncSender<String>> = OnceLock::new();
+    let tx = LOGGER.get_or_init(|| {
+        let (tx, rx) = std_mpsc::sync_channel::<String>(2048);
+        let _ = std::thread::Builder::new()
+            .name("orinfer-log".into())
+            .spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    eprintln!("{msg}");
+                }
+            });
+        tx
+    });
+    let _ = tx.try_send(line);
+}
+
+const MAX_COMPLETED_MAILBOXES: usize = 512;
+
+fn push_completed(completed: &mut Vec<Mailbox>, mut mailbox: Mailbox) {
+    // Inference is complete; release the GPU admission slot immediately so slow
+    // SSE consumers cannot starve healthy incoming requests with 429s.
+    mailbox.job._slot = None;
+    if completed.len() >= MAX_COMPLETED_MAILBOXES {
+        let mut dropped = completed.remove(0);
+        dropped.pending.clear();
+        dropped.bytes = 0;
+        dropped.failed = true;
+        let _ = dropped
+            .job
+            .events
+            .try_send(ModelEvent::Deadline(deadline::Deadline::Output));
+    }
+    completed.push(mailbox);
+}
 
 mod pipeline;
 
@@ -113,7 +154,8 @@ impl Mailbox {
             return false;
         }
         let size = match &event {
-            ModelEvent::Chunk(v) | ModelEvent::Complete(v) => v.to_string().len(),
+            ModelEvent::Chunk(s) => s.len(),
+            ModelEvent::Complete(v) => v.to_string().len(),
             ModelEvent::Failed(s) | ModelEvent::Unavailable(s) => s.len(),
             ModelEvent::Deadline(deadline) => deadline.message().len(),
         };
@@ -153,7 +195,7 @@ impl Mailbox {
         if let Some(logprobs) = logprobs {
             payload["choices"][0]["logprobs"] = logprobs;
         }
-        self.send(ModelEvent::Chunk(payload))
+        self.send(ModelEvent::Chunk(payload.to_string()))
     }
 }
 enum Ending {
@@ -399,13 +441,13 @@ impl<'a> Response<'a> {
         if job.prepared.stream {
             let ending = chunk(job, model, json!({}), Some(reason));
             let usage_chunk=job.prepared.include_usage.then(||json!({"id":job.id,"object":"chat.completion.chunk","created":job.created,"model":model,"choices":[],"usage":usage}));
-            self.mailbox.send(ModelEvent::Chunk(ending));
+            self.mailbox.send(ModelEvent::Chunk(ending.to_string()));
             if let Some(usage) = usage_chunk {
-                self.mailbox.send(ModelEvent::Chunk(usage));
+                self.mailbox.send(ModelEvent::Chunk(usage.to_string()));
             }
         }
         self.mailbox.send(ModelEvent::Complete(response));
-        eprintln!(
+        log_async(format!(
             "{}: {} prompt, {} completion, queue {:.3}s, generation {:.3}s, first_token {:.3}s, {} reasoning, finish {reason}",
             self.mailbox.job.id,
             self.mailbox.job.prepared.input.len(),
@@ -414,13 +456,13 @@ impl<'a> Response<'a> {
             self.started.elapsed().as_secs_f64(),
             self.first_token_s.unwrap_or(0.),
             self.reasoning_tokens
-        );
-        eprintln!(
+        ));
+        log_async(format!(
             "{}: prefix {}; MTP {}",
             self.mailbox.job.id,
             serde_json::to_string(request.prefix_statistics()).map_err(|e| e.to_string())?,
             serde_json::to_string(request.speculation_statistics()).map_err(|e| e.to_string())?
-        );
+        ));
         Ok(())
     }
 }
@@ -506,7 +548,7 @@ pub(super) fn worker(
                         a.request.prefix_statistics(),
                     );
                 }
-                completed.push(a.output.mailbox);
+                push_completed(&mut completed, a.output.mailbox);
             } else {
                 index += 1;
             }
@@ -678,24 +720,28 @@ pub(super) fn worker(
                         continue;
                     }
                 }
-                let job = &waiting[i];
-                let mut input = GenerationInput {
-                    input_tokens: job.prepared.input.clone(),
-                    images: job.prepared.images.clone(),
-                    audios: job.prepared.audios.clone(),
-                    max_new_tokens: job.prepared.max_tokens,
-                    sampling: job.prepared.sampling.clone(),
-                    prefix_hints: job.prepared.prefix_hints.clone(),
+                let probe = AdmissionInput {
+                    input_tokens: &waiting[i].prepared.input,
+                    images: &waiting[i].prepared.images,
+                    audios: &waiting[i].prepared.audios,
+                    max_new_tokens: waiting[i].prepared.max_tokens,
+                    sampling: &waiting[i].prepared.sampling,
+                    hint: waiting[i].hint.as_ref(),
                 };
-                match model.can_admit(&input, &options) {
+                match model.can_admit_borrowed(&probe, &options) {
                     Ok(true) => {
                         let mut job = waiting.remove(i);
                         if memory_guard.as_ref() == Some(&job.id) {
                             memory_guard = None;
                         }
-                        // Admission probes may inspect a copy, then transfer the original
-                        // pixels to encoding. The queued job need not retain another bank.
-                        input.images = std::mem::take(&mut job.prepared.images);
+                        let input = GenerationInput {
+                            input_tokens: job.prepared.input.clone(),
+                            images: std::mem::take(&mut job.prepared.images),
+                            audios: std::mem::take(&mut job.prepared.audios),
+                            max_new_tokens: job.prepared.max_tokens,
+                            sampling: job.prepared.sampling.clone(),
+                            prefix_hints: job.prepared.prefix_hints.clone(),
+                        };
                         let has_images = !input.images.is_empty();
                         let text_only = input.images.is_empty() && input.audios.is_empty();
                         let prompt_tokens = input.input_tokens.len();
@@ -744,7 +790,7 @@ pub(super) fn worker(
                                 } else {
                                     ModelEvent::Failed(error)
                                 });
-                                completed.push(mailbox);
+                                push_completed(&mut completed, mailbox);
                             }
                         }
                         admitted = true;
@@ -759,17 +805,36 @@ pub(super) fn worker(
                             lifecycle.fail(failure);
                         }
                         let job = waiting.remove(i);
+                        if memory_guard.as_ref() == Some(&job.id) {
+                            memory_guard = None;
+                        }
                         let mut mailbox = Mailbox::new(job);
                         mailbox.send(if unavailable {
                             ModelEvent::Unavailable(error)
                         } else {
                             ModelEvent::Failed(error)
                         });
-                        completed.push(mailbox);
+                        push_completed(&mut completed, mailbox);
                         admitted = true;
                         break;
                     }
                     Ok(false) => {
+                        if active.is_empty() {
+                            // Even on a completely idle device after cache reclamation,
+                            // this request cannot fit. Fail it immediately instead of
+                            // wedging the queue under memory_guard (especially with queue_ms=0).
+                            let job = waiting.remove(i);
+                            if memory_guard.as_ref() == Some(&job.id) {
+                                memory_guard = None;
+                            }
+                            let mut mailbox = Mailbox::new(job);
+                            mailbox.send(ModelEvent::Unavailable(
+                                "Request exceeds available device memory".into(),
+                            ));
+                            push_completed(&mut completed, mailbox);
+                            admitted = true;
+                            break;
+                        }
                         if costs[i].age_s >= 30. {
                             memory_guard = Some(waiting[i].id.clone());
                             break;
@@ -969,11 +1034,11 @@ mod tests {
     pub(super) fn mailbox() -> (Mailbox, mpsc::Receiver<ModelEvent>) {
         let (events, receiver) = mpsc::channel(1);
         let job = Job {
-            _slot: Arc::new(
+            _slot: Some(Arc::new(
                 Arc::new(tokio::sync::Semaphore::new(1))
                     .try_acquire_owned()
                     .unwrap(),
-            ),
+            )),
             _memory: None,
             limits: Limits::default(),
             prepared: Prepared {
@@ -1022,9 +1087,9 @@ mod tests {
     fn long_prefill_does_not_start_the_slow_reader_deadline_early() {
         let (mut mailbox, _receiver) = mailbox();
         mailbox.progress = Instant::now() - std::time::Duration::from_secs(120);
-        assert!(mailbox.send(ModelEvent::Chunk(json!(1))));
+        assert!(mailbox.send(ModelEvent::Chunk(json!(1).to_string())));
         assert!(!mailbox.failed);
-        assert!(mailbox.send(ModelEvent::Chunk(json!(2))));
+        assert!(mailbox.send(ModelEvent::Chunk(json!(2).to_string())));
         mailbox.progress = Instant::now() - std::time::Duration::from_secs(120);
         assert!(!mailbox.flush());
         assert!(mailbox.failed);
@@ -1069,7 +1134,7 @@ mod tests {
         assert!(live_receiver.try_recv().is_err());
         waiting[0]
             .events
-            .try_send(ModelEvent::Chunk(json!(1)))
+            .try_send(ModelEvent::Chunk(json!(1).to_string()))
             .unwrap();
         assert!(matches!(
             live_receiver.try_recv().unwrap(),
@@ -1081,11 +1146,12 @@ mod tests {
     fn full_transport_retains_event_order_without_blocking_worker() {
         let (mut mailbox, mut receiver) = mailbox();
         for id in 0..3 {
-            assert!(mailbox.send(ModelEvent::Chunk(json!(id))));
+            assert!(mailbox.send(ModelEvent::Chunk(json!(id).to_string())));
         }
         assert_eq!(mailbox.pending.len(), 2);
         for id in 0..3 {
-            assert!(matches!(receiver.try_recv().unwrap(), ModelEvent::Chunk(v) if v == json!(id)));
+            let expected = json!(id).to_string();
+            assert!(matches!(receiver.try_recv().unwrap(), ModelEvent::Chunk(v) if v == expected));
             assert!(mailbox.flush());
         }
         assert!(mailbox.pending.is_empty());
@@ -1095,8 +1161,8 @@ mod tests {
     #[test]
     fn slow_or_disconnected_client_has_bounded_retained_output() {
         let (mut mailbox, receiver) = mailbox();
-        assert!(mailbox.send(ModelEvent::Chunk(json!(0))));
-        assert!(!mailbox.send(ModelEvent::Chunk(json!("x".repeat(512 * 1024)))));
+        assert!(mailbox.send(ModelEvent::Chunk(json!(0).to_string())));
+        assert!(!mailbox.send(ModelEvent::Chunk(json!("x".repeat(512 * 1024)).to_string())));
         assert!(mailbox.failed);
         assert_eq!(mailbox.pending.len(), 1);
         assert!(!mailbox.send(ModelEvent::Complete(json!({}))));
@@ -1109,13 +1175,28 @@ mod tests {
         let (mut mailbox, _receiver) = mailbox();
         mailbox.job.prepared.sampling.top_logprobs = Some(20);
         mailbox.job.prepared.max_tokens = 1024;
-        assert!(mailbox.send(ModelEvent::Chunk(json!(0))));
+        assert!(mailbox.send(ModelEvent::Chunk(json!(0).to_string())));
         assert!(mailbox.send(ModelEvent::Complete(json!("x".repeat(640 * 1024)))));
         assert_eq!(mailbox.pending.len(), 1);
         assert!(!mailbox.failed);
         let (mut mailbox, _receiver) = self::mailbox();
         mailbox.job.prepared.sampling.top_logprobs = Some(20);
-        assert!(mailbox.send(ModelEvent::Chunk(json!(0))));
-        assert!(!mailbox.send(ModelEvent::Chunk(json!("x".repeat(640 * 1024)))));
+        assert!(mailbox.send(ModelEvent::Chunk(json!(0).to_string())));
+        assert!(!mailbox.send(ModelEvent::Chunk(json!("x".repeat(640 * 1024)).to_string())));
+    }
+    #[test]
+    fn completed_mailbox_releases_admission_slot_immediately() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let (events, _receiver) = mpsc::channel(1);
+        let mut job = mailbox().0.job;
+        job.events = events;
+        job._slot = Some(Arc::new(
+            Arc::clone(&semaphore).try_acquire_owned().unwrap(),
+        ));
+        assert_eq!(semaphore.available_permits(), 0);
+        let mut completed = Vec::new();
+        push_completed(&mut completed, Mailbox::new(job));
+        assert_eq!(semaphore.available_permits(), 1);
+        assert_eq!(completed.len(), 1);
     }
 }

@@ -259,6 +259,7 @@ mod tests {
         let p = Parameters {
             mask: Some(vec![0x8000_0001, 0x8000_0003, 0xff].into()),
             top_logprobs: Some(0),
+            error: None,
         };
         for (origin, vocab) in [(0, 33), (1, 35), (31, 37), (32, 33)] {
             let mut bytes = vec![0; mask_stride(vocab)];

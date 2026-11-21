@@ -405,7 +405,14 @@ impl Runtime {
             layout.decode,
         );
         let started = Instant::now();
-        self.team.exchange(Command::BeginVerification(journal))?;
+        if !self.team.try_begin_verification(journal.clone())?
+            && (!memory::ensure_budget(self, memory::Requirement::workspace())?
+                || !self.team.try_begin_verification(journal)?)
+        {
+            // Journal memory could not be reserved even after prefix/program
+            // reclamation; fall back cleanly to ordinary target decode.
+            return self.advance_selection(baseline, requests, options, false, || {});
+        }
         let save_s = started.elapsed().as_secs_f64();
         let (uses, slack) =
             self.capture_context(&packet_requests, requests, Some(&depths), block, options);
@@ -508,6 +515,12 @@ impl Runtime {
                     })
                 );
             }
+            if let Some(error) = target.iter().find_map(|o| o.error.as_ref()) {
+                request.decoder.fail(error.clone());
+                self.health.sampling_request_failures += 1;
+                rollback.push((request.slot, 0));
+                continue;
+            }
             let committed = if request.host_sampling()
                 && !(request.device_sample() && target.iter().all(|o| o.logits.is_empty()))
             {
@@ -525,7 +538,7 @@ impl Runtime {
                     .flat_map(|v| v.logits.iter().copied())
                     .collect::<Vec<_>>();
                 let core = &mut request.core;
-                crate::sampling::verify_validated(
+                match crate::sampling::verify_validated(
                     &proposals,
                     &logits,
                     &core.history,
@@ -533,9 +546,32 @@ impl Runtime {
                     &mut core.decoder,
                     core.generated,
                     129280,
-                )?
+                ) {
+                    Ok(tokens) => tokens,
+                    Err(error)
+                        if core.decoder.failure().is_some()
+                            || error == "Rejected proposal has no residual mass" =>
+                    {
+                        if core.decoder.failure().is_none() {
+                            core.decoder.fail(error);
+                        }
+                        self.health.sampling_request_failures += 1;
+                        rollback.push((request.slot, 0));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             } else if request.processed_sampling && request.device_sample() {
-                request.verify_device(&draft, &target)?
+                match request.verify_device(&draft, &target) {
+                    Ok(tokens) => tokens,
+                    Err(error) if request.decoder.failure().is_some() => {
+                        let _ = error;
+                        self.health.sampling_request_failures += 1;
+                        rollback.push((request.slot, 0));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 // Target draws use only their absolute position's randomness.
                 // A deterministic guess or a draft sharing that randomness can
@@ -545,7 +581,15 @@ impl Runtime {
                     &draft,
                     &target.iter().map(|v| v.token).collect::<Vec<_>>(),
                 )?;
-                let count = request.decoder.consume_unconstrained_prefix(&tokens)?;
+                let count = match request.decoder.consume_unconstrained_prefix(&tokens) {
+                    Ok(count) => count,
+                    Err(_) if request.decoder.failure().is_some() => {
+                        self.health.sampling_request_failures += 1;
+                        rollback.push((request.slot, 0));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if count == 0 {
                     return Err("Empty unconstrained verification prefix".into());
                 }

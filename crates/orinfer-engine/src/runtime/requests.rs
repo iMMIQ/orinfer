@@ -127,6 +127,9 @@ impl ModelRuntime {
         self.execution.collect_snapshots()
     }
     fn validate_generation(&self, input: &GenerationInput) -> Result<usize> {
+        self.validate_admission(&crate::model::AdmissionInput::from(input))
+    }
+    fn validate_admission(&self, input: &crate::model::AdmissionInput<'_>) -> Result<usize> {
         let context = input
             .input_tokens
             .len()
@@ -148,6 +151,13 @@ impl ModelRuntime {
     fn request_limits(
         &self,
         input: &GenerationInput,
+        context: usize,
+    ) -> Result<BTreeMap<String, usize>> {
+        self.request_limits_borrowed(&crate::model::AdmissionInput::from(input), context)
+    }
+    fn request_limits_borrowed(
+        &self,
+        input: &crate::model::AdmissionInput<'_>,
         context: usize,
     ) -> Result<BTreeMap<String, usize>> {
         let mut limits = BTreeMap::new();
@@ -371,9 +381,17 @@ impl ModelRuntime {
                 (active.len() + 1) as f64 / next.mean() >= active.len() as f64 / old.mean() * 0.99
             })
     }
+    #[cfg(test)]
     pub(crate) fn can_admit_request(
         &mut self,
         input: &GenerationInput,
+        options: &scheduler::Options,
+    ) -> Result<bool> {
+        self.can_admit_borrowed(&crate::model::AdmissionInput::from(input), options)
+    }
+    pub(crate) fn can_admit_borrowed(
+        &mut self,
+        input: &crate::model::AdmissionInput<'_>,
         options: &scheduler::Options,
     ) -> Result<bool> {
         self.reap_abandoned()?;
@@ -381,8 +399,8 @@ impl ModelRuntime {
         if self.reserved_requests.len() >= options.max_active {
             return Ok(false);
         }
-        let context = self.validate_generation(input)?;
-        let limits = self.request_limits(input, context)?;
+        let context = self.validate_admission(input)?;
+        let limits = self.request_limits_borrowed(input, context)?;
         let mut fixed = self.execution.additional_state_bytes(&limits)?;
         let mut prospective = self.execution.additional_kv_bytes(context, &limits)?;
         let sampling = input.sampling.temperature > 0. && input.sampling.top_logprobs.is_none();

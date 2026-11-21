@@ -18,6 +18,7 @@ impl Worker {
     pub(in crate::models::deepseek_v41) fn owner_requirement(
         &self,
         tokens: usize,
+        shared_tokens: usize,
         reserve: usize,
     ) -> Result<Requirement> {
         if tokens == 0 || tokens > self.capacity {
@@ -26,8 +27,18 @@ impl Worker {
         let (_, allocation) = self.fixed_owner_layout()?;
         let new_banks = usize::from(self.batch.as_ref().is_none_or(|r| r.idle_owners.is_empty()));
         let mut needed = Requirement::owners(allocation, new_banks, reserve)?;
+        let shared = shared_tokens.min(tokens);
+        const VMM_PAGE: usize = 2 << 20;
         for (name, layout) in &self.growth {
-            let bytes = get(&self.buffers, name)?.physical_extent(layout.extent(tokens)?)?;
+            let total = get(&self.buffers, name)?.physical_extent(layout.extent(tokens)?)?;
+            // Whole 2 MiB VMM pages covered by an already-resident device prefix
+            // are zero-copy shared; keep any partial tail page budgeted for COW.
+            let closed_shared = (shared / layout.tokens_per_row)
+                .checked_mul(layout.row_bytes)
+                .ok_or("Owner shared prefix budget overflow")?
+                / VMM_PAGE
+                * VMM_PAGE;
+            let bytes = total.saturating_sub(closed_shared);
             needed.device = needed
                 .device
                 .checked_add(bytes)
@@ -222,46 +233,97 @@ impl Worker {
         self.session.release_pages_many(&buffers)
     }
     pub(in crate::models::deepseek_v41) fn evict_batch_program(&mut self) -> Result<bool> {
+        self.evict_batch_program_protected(&ProtectedKeys::default())
+    }
+    pub(in crate::models::deepseek_v41) fn evict_batch_program_for_admission(
+        &mut self,
+    ) -> Result<bool> {
+        self.evict_batch_program_protected(&ProtectedKeys {
+            keep_idle_owner: true,
+            ..ProtectedKeys::default()
+        })
+    }
+    pub(in crate::models::deepseek_v41) fn evict_batch_program_protected(
+        &mut self,
+        protected: &ProtectedKeys<'_>,
+    ) -> Result<bool> {
         self.session.synchronize()?;
         let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
         let tables_released = runtime.bound_tables.take().is_some();
-        if runtime.idle_owners.pop().is_some() {
+        let min_idle = usize::from(protected.keep_idle_owner);
+        if runtime.idle_owners.len() > min_idle {
+            runtime.idle_owners.pop();
             return Ok(true);
         }
-        while let Some(key) = runtime.lru.pop_front() {
+        while let Some(pos) = runtime.lru.iter().position(|k| Some(k) != protected.mono) {
+            let key = runtime.lru.remove(pos).unwrap();
             if runtime.remove(&key) {
                 self.w4.retain(|_, w| w.strong_count() > 0);
                 self.session.synchronize()?;
                 return Ok(true);
             }
         }
-        while let Some(key) = runtime.head_lru.pop_front() {
+        while let Some(pos) = runtime
+            .head_lru
+            .iter()
+            .position(|k| Some(k) != protected.head)
+        {
+            let key = runtime.head_lru.remove(pos).unwrap();
             if runtime.remove_head(&key) {
                 self.w4.retain(|_, w| w.strong_count() > 0);
                 self.session.synchronize()?;
                 return Ok(true);
             }
         }
-        while let Some(key) = runtime.tail_lru.pop_front() {
+        while let Some(pos) = runtime
+            .tail_lru
+            .iter()
+            .position(|k| Some(k) != protected.tail)
+        {
+            let key = runtime.tail_lru.remove(pos).unwrap();
             if runtime.remove_tail(&key) {
                 self.w4.retain(|_, w| w.strong_count() > 0);
                 self.session.synchronize()?;
                 return Ok(true);
             }
         }
-        while let Some(key) = runtime.trunk_lru.pop_front() {
+        while let Some(pos) = runtime
+            .trunk_lru
+            .iter()
+            .position(|k| Some(k) != protected.trunk)
+        {
+            let key = runtime.trunk_lru.remove(pos).unwrap();
             if runtime.remove_trunk(&key) {
                 self.w4.retain(|_, w| w.strong_count() > 0);
                 self.session.synchronize()?;
                 return Ok(true);
             }
         }
-        Ok(self.shared.evict() || tables_released)
+        if self.shared.evict() {
+            return Ok(true);
+        }
+        if self
+            .vision
+            .as_mut()
+            .is_some_and(super::super::vision::Encoder::evict_frame)
+        {
+            self.session.synchronize()?;
+            return Ok(true);
+        }
+        Ok(tables_released)
     }
     pub(in crate::models::deepseek_v41) fn reserve_batch_memory(
         &mut self,
         needed: Requirement,
         stage: &str,
+    ) -> Result<()> {
+        self.reserve_batch_memory_protected(needed, stage, &ProtectedKeys::default())
+    }
+    pub(in crate::models::deepseek_v41) fn reserve_batch_memory_protected(
+        &mut self,
+        needed: Requirement,
+        stage: &str,
+        protected: &ProtectedKeys<'_>,
     ) -> Result<()> {
         let (device, session) = self.available_memory()?;
         if needed.fits(device, session) {
@@ -274,7 +336,7 @@ impl Worker {
             if needed.fits(device, session) {
                 break;
             }
-            if !self.evict_batch_program()? {
+            if !self.evict_batch_program_protected(protected)? {
                 return Err(format!(
                     "Insufficient A2 memory for {stage}: device free {}, session free {}, required {needed:?}",
                     self.session.memory_info()?.0,

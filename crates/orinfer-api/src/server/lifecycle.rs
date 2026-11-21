@@ -7,6 +7,7 @@ use std::sync::{
 pub(crate) struct Lifecycle {
     phase: AtomicU8,
     failure: Mutex<Option<orinfer_engine::error::EngineError>>,
+    failed: tokio::sync::Notify,
 }
 impl Lifecycle {
     pub fn supervise(&self, work: impl FnOnce()) -> std::thread::Result<()> {
@@ -40,6 +41,16 @@ impl Lifecycle {
             self.phase.store(3, Ordering::Release);
         } else {
             self.phase.store(3, Ordering::Release);
+        }
+        self.failed.notify_waiters();
+    }
+    pub async fn failed(&self) {
+        loop {
+            let notified = self.failed.notified();
+            if self.phase.load(Ordering::Acquire) == 3 {
+                return;
+            }
+            notified.await;
         }
     }
     pub fn is_ready(&self) -> bool {
@@ -112,5 +123,27 @@ mod tests {
             true,
         ));
         assert_eq!(state.failure().unwrap().message, "panic");
+    }
+    #[tokio::test]
+    async fn failed_notifier_wakes_waiters_and_returns_immediately_when_already_failed() {
+        let state = std::sync::Arc::new(Lifecycle::default());
+        state.ready();
+        let waiter = std::sync::Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            waiter.failed().await;
+        });
+        tokio::task::yield_now().await;
+        state.fail(orinfer_engine::error::EngineError::take(
+            "device fault".into(),
+            true,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        // Calling after failure must not block.
+        tokio::time::timeout(std::time::Duration::from_secs(1), state.failed())
+            .await
+            .unwrap();
     }
 }

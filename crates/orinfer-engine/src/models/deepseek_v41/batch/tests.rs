@@ -798,3 +798,39 @@ fn retained_mixed_work_keeps_source_padding_in_decoder_views() {
         }
     }
 }
+
+#[test]
+fn unprotected_eviction_preserves_active_keys_and_cleans_recent_family() {
+    let mut lru = VecDeque::from([1u32, 2, 3]);
+    let mut cache = BTreeMap::from([(1u32, "a"), (2u32, "b"), (3u32, "c")]);
+    let mut recent = BTreeMap::from([(0u8, (2u32, 4u8))]);
+    // Key 1 is protected even though it is at the front of the LRU queue.
+    assert!(Runtime::evict_oldest_unprotected(
+        &mut lru,
+        Some(&1),
+        |k| cache.remove(k).is_some(),
+        &mut recent,
+        |_| 0u8,
+    ));
+    assert!(cache.contains_key(&1));
+    assert!(!cache.contains_key(&2));
+    assert!(!recent.contains_key(&0));
+    assert!(Runtime::evict_oldest_unprotected(
+        &mut lru,
+        Some(&1),
+        |k| cache.remove(k).is_some(),
+        &mut recent,
+        |_| 0u8,
+    ));
+    assert!(cache.contains_key(&1));
+    assert!(!cache.contains_key(&3));
+    // Once only the protected key remains, eviction returns false cleanly.
+    assert!(!Runtime::evict_oldest_unprotected(
+        &mut lru,
+        Some(&1),
+        |k| cache.remove(k).is_some(),
+        &mut recent,
+        |_| 0u8,
+    ));
+    assert!(cache.contains_key(&1));
+}

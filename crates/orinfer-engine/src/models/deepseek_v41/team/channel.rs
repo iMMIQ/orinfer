@@ -18,6 +18,19 @@ pub(super) fn command_timeout(raw: Option<&str>) -> Result<Duration> {
         .ok_or("ORINFER_A2_COMMAND_TIMEOUT_MS must be within 1..1800000")?;
     Ok(Duration::from_millis(millis))
 }
+pub(super) fn heavy_command_timeout(raw: Option<&str>, base: Duration) -> Result<Duration> {
+    if let Some(raw) = raw {
+        let millis = raw
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (1..=1_800_000).contains(n))
+            .ok_or("ORINFER_A2_HEAVY_COMMAND_TIMEOUT_MS must be within 1..1800000")?;
+        return Ok(Duration::from_millis(millis).max(base));
+    }
+    Ok(base
+        .saturating_mul(4)
+        .clamp(Duration::from_secs(120), Duration::from_secs(1800)))
+}
 pub(super) struct Peer {
     pub send: mpsc::Sender<Command>,
     pub receive: mpsc::Receiver<Response>,
@@ -56,14 +69,28 @@ pub(super) struct Transport {
     peers: Vec<Peer>,
     failure: RefCell<Option<EngineError>>,
     timeout: Duration,
+    heavy_timeout: Duration,
 }
 impl Transport {
+    #[cfg(test)]
     pub fn new(timeout: Duration) -> Self {
+        Self::with_heavy_timeout(
+            timeout,
+            timeout
+                .saturating_mul(4)
+                .clamp(timeout, Duration::from_secs(1800)),
+        )
+    }
+    pub fn with_heavy_timeout(timeout: Duration, heavy_timeout: Duration) -> Self {
         Self {
             peers: vec![],
             failure: RefCell::new(None),
             timeout,
+            heavy_timeout: heavy_timeout.max(timeout),
         }
+    }
+    pub fn has_failed(&self) -> bool {
+        self.failure.borrow().is_some()
     }
     pub fn push(&mut self, peer: Peer) {
         self.peers.push(peer);
@@ -92,6 +119,10 @@ impl Transport {
     pub fn exchange(&self, command: Command) -> Result<Vec<Reply>> {
         self.send(command)?;
         self.receive(self.timeout)
+    }
+    pub fn exchange_heavy(&self, command: Command) -> Result<Vec<Reply>> {
+        self.send(command)?;
+        self.receive(self.heavy_timeout)
     }
     pub fn collect(&self) -> Result<Vec<Reply>> {
         self.receive(self.timeout)
@@ -149,8 +180,21 @@ mod tests {
             command_timeout(Some("60000")).unwrap(),
             Duration::from_secs(60)
         );
+        assert_eq!(
+            heavy_command_timeout(None, Duration::from_secs(30)).unwrap(),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            heavy_command_timeout(Some("15000"), Duration::from_secs(30)).unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            heavy_command_timeout(Some("240000"), Duration::from_secs(30)).unwrap(),
+            Duration::from_secs(240)
+        );
         for bad in ["0", "-1", "1800001", "x"] {
             assert!(command_timeout(Some(bad)).is_err());
+            assert!(heavy_command_timeout(Some(bad), Duration::from_secs(30)).is_err());
         }
     }
 

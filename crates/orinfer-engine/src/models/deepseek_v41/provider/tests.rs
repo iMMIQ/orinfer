@@ -494,3 +494,71 @@ fn verification_commits_only_accepted_device_reports_and_grammar_states() {
         assert_eq!(r.decoder.finished(), accepted.len() == 2);
     }
 }
+
+#[test]
+fn impossible_grammar_is_isolated_to_failing_request_in_batch() {
+    #[derive(Clone)]
+    struct Empty;
+    impl Constraint for Empty {
+        fn fork(&self) -> Box<dyn Constraint> {
+            Box::new(self.clone())
+        }
+        fn mask(&mut self) -> Result<Vec<u32>> {
+            Ok(vec![0])
+        }
+        fn consume(&mut self, _: u32) -> Result<()> {
+            unreachable!()
+        }
+        fn finished(&self) -> bool {
+            false
+        }
+    }
+    let mut bad = request(output(), Default::default());
+    bad.slot = 1;
+    bad.device_sampling = true;
+    bad.processed_sampling = true;
+    bad.prefilling = false;
+    bad.set_constraint(Box::new(Empty)).unwrap();
+
+    let mut good = request(output(), Default::default());
+    good.slot = 2;
+    good.device_sampling = true;
+    good.processed_sampling = true;
+    good.prefilling = false;
+    good.set_constraint(Box::new(Steps(0))).unwrap();
+
+    let readout = packet::target_readout(
+        &[&mut bad, &mut good],
+        false,
+        &BTreeMap::new(),
+        4,
+        &[(0, 1), (1, 1)],
+    )
+    .unwrap();
+    let params = readout.parameters.get().unwrap();
+    assert_eq!(
+        params[&bad.slot][0].error.as_deref(),
+        Some("Grammar permits no tokens")
+    );
+    assert!(params[&bad.slot][0].mask.is_none());
+    assert!(params[&good.slot][0].error.is_none());
+    assert_eq!(params[&good.slot][0].mask.as_deref(), Some(&[4u32][..]));
+
+    let bad_out = Output {
+        owner: bad.slot,
+        error: Some("Grammar permits no tokens".into()),
+        ..Default::default()
+    };
+    assert!(bad.accept_output(&bad_out).is_err());
+    assert_eq!(bad.decoder.failure(), Some("Grammar permits no tokens"));
+    assert!(bad.is_finished());
+
+    let good_out = Output {
+        owner: good.slot,
+        token: 2,
+        value: 1.0,
+        ..Default::default()
+    };
+    assert_eq!(good.accept_output(&good_out).unwrap(), 2);
+    assert!(good.decoder.failure().is_none());
+}

@@ -68,6 +68,7 @@ struct Key(Family, usize, bool, bool);
 struct Cell {
     time: crate::scheduler::Timing,
     prior: f64,
+    last: usize,
 }
 impl Cell {
     fn mean(&self) -> f64 {
@@ -82,14 +83,16 @@ impl Cell {
 struct Cold {
     build: Estimate,
     capture: Estimate,
+    last: usize,
 }
 #[derive(Default)]
 pub(super) struct Model {
     cells: BTreeMap<Key, Cell>,
-    modes: BTreeMap<(Family, usize), bool>,
+    modes: BTreeMap<(Family, usize), (bool, usize)>,
     shared_modes: std::collections::BTreeSet<(Family, usize)>,
     trace: bool,
     cold: BTreeMap<(Family, usize), Cold>,
+    tick: usize,
 }
 #[derive(Clone, Copy)]
 pub(super) struct Prediction {
@@ -170,29 +173,34 @@ impl Model {
         self.insert(point, true);
     }
     fn insert(&mut self, point: Point, online: bool) {
+        self.tick = self.tick.saturating_add(1);
+        let tick = self.tick;
         let group = family(point.stage, point.block, point.full, point.work);
         let key = Key(group, point.work.rows, point.replay, point.shared);
+        let mode_key = (group, point.work.rows);
         // Offline priors describe costs, never residency in a live Graph cache.
         if online {
-            if self.modes.len() >= 2048 && !self.modes.contains_key(&(group, point.work.rows)) {
-                self.modes.clear();
-                self.shared_modes.clear();
+            if self.modes.len() >= 2048
+                && !self.modes.contains_key(&mode_key)
+                && let Some((&victim, _)) = self.modes.iter().min_by_key(|(_, (_, last))| *last)
+            {
+                self.modes.remove(&victim);
+                self.shared_modes.remove(&victim);
             }
-            self.modes.insert((group, point.work.rows), point.replay);
+            self.modes.insert(mode_key, (point.replay, tick));
             if point.shared {
-                self.shared_modes.insert((group, point.work.rows));
+                self.shared_modes.insert(mode_key);
             } else {
-                self.shared_modes.remove(&(group, point.work.rows));
+                self.shared_modes.remove(&mode_key);
             }
         }
-        if self.cells.len() >= 2048 && !self.cells.contains_key(&key) {
-            // Retain the bounded sparse surface; unseen shapes can still use it.
-            return;
-        }
+        crate::mtp::adaptive::evict_oldest(&mut self.cells, key, 2048, |cell| cell.last);
         let cell = self.cells.entry(key).or_insert(Cell {
             time: Default::default(),
             prior: 0.,
+            last: tick,
         });
+        cell.last = tick;
         if online {
             cell.time.observe(point.seconds);
         } else {
@@ -208,15 +216,19 @@ impl Model {
         if local_setup > 0. {
             // Host readback mode does not change the captured launch geometry.
             let cold_group = family(point.stage, point.block, false, point.work);
-            if self.cold.len() < 2048 || self.cold.contains_key(&(cold_group, point.work.rows)) {
-                let cold = self.cold.entry((cold_group, point.work.rows)).or_default();
-                if point.replay {
-                    cold.capture.observe(local_setup);
-                } else {
-                    cold.build.observe(local_setup);
-                }
+            let cold_key = (cold_group, point.work.rows);
+            crate::mtp::adaptive::evict_oldest(&mut self.cold, cold_key, 2048, |c| c.last);
+            let cold = self.cold.entry(cold_key).or_default();
+            cold.last = tick;
+            if point.replay {
+                cold.capture.observe(local_setup);
+            } else {
+                cold.build.observe(local_setup);
             }
         }
+    }
+    pub fn cell_count(&self) -> usize {
+        self.cells.len()
     }
     pub fn predict(
         &self,
@@ -229,7 +241,7 @@ impl Model {
         let replay = self
             .modes
             .get(&(requested, work.rows))
-            .copied()
+            .map(|&(replay, _)| replay)
             .unwrap_or(false);
         self.predict_mode(stage, block, full, work, replay)
     }
@@ -239,8 +251,8 @@ impl Model {
             .iter()
             .any(|(Key(f, rows, _, _), cell)| *f == group && *rows == work.rows && cell.prior > 0.)
     }
-    /// Actual local observations, or None if the bounded surface cannot learn
-    /// this ordinary direct path. A missing prior must not defer capture forever.
+    /// Actual local observations; LRU eviction keeps the bounded surface able
+    /// to learn new shapes even after filling 2048 entries.
     pub(super) fn local_evidence(
         &self,
         stage: Stage,
@@ -249,13 +261,6 @@ impl Model {
         work: Work,
     ) -> Option<(usize, usize)> {
         let group = family(stage, block, full, work);
-        if self.cells.len() >= 2048
-            && !self
-                .cells
-                .contains_key(&Key(group, work.rows, false, false))
-        {
-            return None;
-        }
         Some(
             self.cells
                 .range(Key(group, work.rows, false, false)..=Key(group, work.rows, true, true))

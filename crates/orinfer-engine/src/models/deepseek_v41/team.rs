@@ -31,11 +31,11 @@ pub(super) enum Command {
         snapshot: Option<u64>,
     },
     BeginImages(Arc<Vec<crate::vision::ImageInput>>),
-    AdvanceImages(usize),
+    AdvanceImages(usize, super::vision::CapturePolicy),
     CancelImages,
     InstallImages(usize, Arc<Vec<super::vision::Span>>),
     GrowCached(Layout),
-    OwnerRequirement(usize, usize),
+    OwnerRequirement(usize, usize, usize),
     Reset(Vec<usize>),
     Release(Option<usize>),
     #[cfg(test)]
@@ -62,6 +62,7 @@ pub(super) enum Command {
         snapshot: u64,
     },
     Evict(u64),
+    EvictMany(Vec<u64>),
     Offload(u64),
     PlanOffload(u64),
     SaveHost {
@@ -76,6 +77,7 @@ pub(super) enum Command {
     },
     Budget(super::memory::Requirement),
     Reclaim,
+    ReclaimForAdmission,
     PlanSnapshot {
         owner: usize,
         snapshot: u64,
@@ -93,6 +95,7 @@ pub(super) enum Reply {
     Outputs(Vec<Output>, bool),
     Shared(Vec<super::shared::State>),
     Allocations(BTreeMap<u64, usize>),
+    SaveSkipped(String),
     SnapshotPlan {
         allocations: BTreeMap<u64, usize>,
         device_free: usize,
@@ -100,6 +103,10 @@ pub(super) enum Reply {
     },
     RoutingGroups(Vec<RoutingGroup>),
     Capacity(bool),
+    BudgetStatus {
+        fits: bool,
+        device_free: usize,
+    },
     Requirement(super::memory::Requirement),
 }
 #[derive(serde::Serialize)]
@@ -115,6 +122,7 @@ pub(super) struct Output {
     pub logits: Vec<f32>,
     pub summary: Option<crate::backend::ascend::sampling::Summary>,
     pub report: Option<crate::sampling::TokenLogprob>,
+    pub error: Option<String>,
 }
 #[derive(Clone, Default)]
 pub(super) struct Readout {
@@ -274,7 +282,7 @@ impl Readout {
 pub(super) struct Team {
     peers: Transport,
     graphs_enabled: bool,
-    handles: Vec<JoinHandle<()>>,
+    handles: Vec<(JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>)>,
     pub model: Arc<Model>,
     pub load_s: f64,
     pub rows: usize,
@@ -288,6 +296,7 @@ pub(super) struct Team {
     pub(super) host_tables: Option<Arc<SharedTables>>,
     pub(super) host_hasher: Option<Arc<orinfer_model_sdk::conditional_memory::Hasher>>,
     pub(super) host_prepare: Arc<std::sync::atomic::AtomicBool>,
+    rank_free_range: std::cell::Cell<(usize, usize)>,
 }
 
 /// Execution mode and preparation are measured separately; direct is a valid steady path.
@@ -397,6 +406,12 @@ impl Team {
                 .ok()
                 .as_deref(),
         )?;
+        let heavy_timeout = channel::heavy_command_timeout(
+            std::env::var("ORINFER_A2_HEAVY_COMMAND_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+            timeout,
+        )?;
         let work_launches = super::batch::graph_launches(&model);
         // Rank plans move to their workers; retain only target row geometry
         // needed by the host scheduler's measured cost domains.
@@ -415,7 +430,7 @@ impl Team {
         let shared = Arc::new(SharedTables::new());
         let model = Arc::new(model);
         let mut team = Self {
-            peers: Transport::new(timeout),
+            peers: Transport::with_heavy_timeout(timeout, heavy_timeout),
             graphs_enabled,
             handles: vec![],
             model: Arc::clone(&model),
@@ -432,6 +447,7 @@ impl Team {
                 orinfer_model_sdk::conditional_memory::Hasher::new(layout.clone())?,
             )),
             host_prepare: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rank_free_range: std::cell::Cell::new((0, 0)),
         };
         // One shared CPU load owns no ACL handles. Join it with rank workers
         // on every startup/teardown path, including partial rank failures.
@@ -439,16 +455,20 @@ impl Team {
         let table_dir = model_dir.to_owned();
         let table_index = model.index.file.clone();
         let table_layout = layout.clone();
-        team.handles.push(
+        let table_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let table_done_flag = Arc::clone(&table_done);
+        team.handles.push((
             std::thread::Builder::new()
                 .name("orinfer-a2-tables".into())
                 .spawn(move || {
                     table_shared.get_or_init(|| {
                         super::load::tables(&table_dir, &table_index, &table_layout)
                     });
+                    table_done_flag.store(true, std::sync::atomic::Ordering::Release);
                 })
                 .map_err(|e| e.to_string())?,
-        );
+            table_done,
+        ));
         for rank in ranks {
             let cpus = cpus.as_ref().map(|v| v[rank.rank as usize].clone());
             let root = root.clone();
@@ -460,9 +480,18 @@ impl Team {
             let (send, commands) = mpsc::channel();
             let (reply, receive) = reply_channel();
             let index = rank.rank;
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let done_flag = Arc::clone(&done);
             let handle = std::thread::Builder::new()
                 .name(format!("orinfer-a2-{index}"))
                 .spawn(move || {
+                    struct MarkDone(Arc<std::sync::atomic::AtomicBool>);
+                    impl Drop for MarkDone {
+                        fn drop(&mut self) {
+                            self.0.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    let _mark_done = MarkDone(done_flag);
                     let result = (|| {
                         if let Some(cpus) = cpus.as_deref() {
                             affinity::apply(cpus)?;
@@ -472,7 +501,7 @@ impl Team {
                             Limits {
                                 device_bytes: 58 << 30,
                                 pinned_bytes: 64 << 20,
-                                timeout_ms: timeout.as_millis() as i32,
+                                timeout_ms: heavy_timeout.as_millis() as i32,
                             },
                         )?;
                         session.set_graphs_enabled(graphs_enabled);
@@ -500,33 +529,58 @@ impl Team {
                     let mut host_pool = super::state::HostPool::default();
                     let mut journal = BTreeMap::new();
                     let mut journal_pool = BTreeMap::new();
+                    let mut idle_journals: Vec<super::Buffer> = vec![];
+                    const MAX_IDLE_JOURNALS: usize = 4;
+                    let recycle_journal =
+                        |j: super::state::Journal, pool: &mut Vec<super::Buffer>| {
+                            if pool.len() < MAX_IDLE_JOURNALS {
+                                pool.push(j.bank);
+                            }
+                        };
                     while let Ok(command) = commands.recv() {
                         let result = match command {
                             Command::Stop => break,
                             Command::BeginVerification(owners) => {
                                 journal.clear();
                                 let mut copies = vec![];
-                                owners
-                                    .into_iter()
-                                    .try_for_each(|(id, rows)| {
-                                        journal.insert(
-                                            id,
-                                            worker.save_mutable(
-                                                id,
-                                                rows,
-                                                journal_pool.remove(&id),
-                                                &mut copies,
-                                            )?,
-                                        );
-                                        Ok(())
-                                    })
-                                    .and_then(|_| {
+                                let mut oom = false;
+                                let mut outcome: Result<()> = Ok(());
+                                for (id, rows) in owners {
+                                    match worker.save_mutable(
+                                        id,
+                                        rows,
+                                        journal_pool.remove(&id),
+                                        &mut idle_journals,
+                                        &mut copies,
+                                    ) {
+                                        Ok(saved) => {
+                                            journal.insert(id, saved);
+                                        }
+                                        Err(error)
+                                            if !worker.session.is_poisoned()
+                                                && error.contains("Insufficient A2 memory") =>
+                                        {
+                                            oom = true;
+                                            break;
+                                        }
+                                        Err(error) => {
+                                            outcome = Err(error);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if oom {
+                                    journal_pool.append(&mut journal);
+                                    Ok(Reply::Capacity(false))
+                                } else {
+                                    outcome.and_then(|()| {
                                         // Compute-stream ordered before verification forward.
                                         if !copies.is_empty() {
                                             worker.session.copy_many(&copies)?;
                                         }
                                         Ok(Reply::Ready)
                                     })
+                                }
                             }
                             Command::FinishVerification(owners) => {
                                 let mut copies = vec![];
@@ -554,9 +608,29 @@ impl Team {
                                 result
                             }
                             Command::Budget(requirement) => {
-                                worker.check_budget(requirement).map(Reply::Capacity)
+                                worker.check_budget(requirement).and_then(|fits| {
+                                    let (device_free, _) = worker.available_memory()?;
+                                    Ok(Reply::BudgetStatus { fits, device_free })
+                                })
                             }
-                            Command::Reclaim => worker.evict_batch_program().map(Reply::Capacity),
+                            Command::Reclaim => {
+                                if let Some(bank) = idle_journals.pop() {
+                                    drop(bank);
+                                    Ok(Reply::Capacity(true))
+                                } else {
+                                    worker.evict_batch_program().map(Reply::Capacity)
+                                }
+                            }
+                            Command::ReclaimForAdmission => {
+                                if let Some(bank) = idle_journals.pop() {
+                                    drop(bank);
+                                    Ok(Reply::Capacity(true))
+                                } else {
+                                    worker
+                                        .evict_batch_program_for_admission()
+                                        .map(Reply::Capacity)
+                                }
+                            }
                             Command::PlanSnapshot {
                                 owner,
                                 snapshot,
@@ -600,20 +674,24 @@ impl Team {
                             } => {
                                 let parent =
                                     lineage.get(&owner).and_then(|id| host_snapshots.get(id));
-                                worker
-                                    .save_host_snapshot(
-                                        owner,
-                                        complete,
-                                        snapshot,
-                                        parent,
-                                        &mut host_pool,
-                                    )
-                                    .map(|saved| {
+                                match worker.save_host_snapshot(
+                                    owner,
+                                    complete,
+                                    snapshot,
+                                    parent,
+                                    &mut host_pool,
+                                ) {
+                                    Ok(saved) => {
                                         let allocations = saved.allocations();
                                         host_snapshots.insert(snapshot, saved);
                                         lineage.insert(owner, snapshot);
-                                        Reply::Allocations(allocations)
-                                    })
+                                        Ok(Reply::Allocations(allocations))
+                                    }
+                                    Err(error) if !worker.session.is_poisoned() => {
+                                        Ok(Reply::SaveSkipped(error))
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
                             Command::PlanOffload(id) => snapshots
                                 .get(&id)
@@ -621,21 +699,28 @@ impl Team {
                                 .map(|s: &super::state::Snapshot| {
                                     Reply::Allocations(s.host_allocations())
                                 }),
-                            Command::Offload(id) => snapshots
-                                .get(&id)
-                                .ok_or_else(|| "Missing A2 offload snapshot".into())
-                                .and_then(|saved| {
+                            Command::Offload(id) => {
+                                let saved = snapshots
+                                    .get(&id)
+                                    .ok_or_else(|| "Missing A2 offload snapshot".to_string());
+                                match saved.and_then(|saved| {
                                     super::state::HostSnapshot::offload(
                                         &worker.session,
                                         saved,
                                         &mut host_pool,
                                     )
-                                })
-                                .map(|saved| {
-                                    host_snapshots.insert(id, saved);
-                                    snapshots.remove(&id);
-                                    Reply::Ready
-                                }),
+                                }) {
+                                    Ok(saved) => {
+                                        host_snapshots.insert(id, saved);
+                                        snapshots.remove(&id);
+                                        Ok(Reply::Ready)
+                                    }
+                                    Err(error) if !worker.session.is_poisoned() => {
+                                        Ok(Reply::SaveSkipped(error))
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
                             Command::InstallImages(owner, spans) => worker
                                 .batch
                                 .as_mut()
@@ -661,12 +746,29 @@ impl Team {
                                     None => Ok(Reply::Ready),
                                 }
                             }
-                            Command::AdvanceImages(segments) => worker
-                                .vision
-                                .as_mut()
-                                .ok_or_else(|| "Missing native vision encoder".to_owned())
-                                .and_then(|encoder| encoder.advance(&worker.session, segments))
-                                .map(Reply::Image),
+                            Command::AdvanceImages(segments, capture) => {
+                                let effective_capture = if capture
+                                    != super::vision::CapturePolicy::Never
+                                    && worker.available_memory().is_ok_and(|(d, s)| {
+                                        super::memory::Requirement::workspace().fits(d, s)
+                                    }) {
+                                    capture
+                                } else {
+                                    super::vision::CapturePolicy::Never
+                                };
+                                worker
+                                    .vision
+                                    .as_mut()
+                                    .ok_or_else(|| "Missing native vision encoder".to_owned())
+                                    .and_then(|encoder| {
+                                        encoder.advance(
+                                            &worker.session,
+                                            segments,
+                                            effective_capture,
+                                        )
+                                    })
+                                    .map(Reply::Image)
+                            }
                             Command::CancelImages => {
                                 if let Some(encoder) = &mut worker.vision {
                                     encoder.cancel();
@@ -679,24 +781,25 @@ impl Team {
                                 limit,
                                 snapshot,
                             } => worker.admit(&[slot]).and_then(|()| {
-                                let step = worker.limit_owner(slot, limit).and_then(|()| {
-                                    if let Some(snapshot) = snapshot {
-                                        let restored = if let Some(saved) = snapshots.get(&snapshot)
-                                        {
-                                            worker.restore_owner(slot, saved)
-                                        } else if let Some(saved) = host_snapshots.get(&snapshot) {
-                                            worker.restore_host_snapshot(slot, saved)
-                                        } else {
-                                            Err("Missing A2 prefix snapshot".into())
-                                        };
-                                        restored.map(|()| {
-                                            lineage.insert(slot, snapshot);
-                                        })
+                                // Restore shared prefix pages before reserving future KV budget
+                                // so zero-copy device prefix hits are not double-charged.
+                                let step = if let Some(snapshot) = snapshot {
+                                    let restored = if let Some(saved) = snapshots.get(&snapshot) {
+                                        worker.restore_owner(slot, saved)
+                                    } else if let Some(saved) = host_snapshots.get(&snapshot) {
+                                        worker.restore_host_snapshot(slot, saved)
                                     } else {
-                                        Ok(())
-                                    }
-                                });
+                                        Err("Missing A2 prefix snapshot".into())
+                                    };
+                                    restored.map(|()| {
+                                        lineage.insert(slot, snapshot);
+                                    })
+                                } else {
+                                    Ok(())
+                                }
+                                .and_then(|()| worker.limit_owner(slot, limit));
                                 if step.is_err() {
+                                    lineage.remove(&slot);
                                     let _ = worker.release_owner(slot);
                                 }
                                 step.map(|()| Reply::Ready)
@@ -705,7 +808,7 @@ impl Team {
                                 .grow_batch(&layout)
                                 .and_then(|()| worker.batch_split_cached(&layout))
                                 .and_then(|states| {
-                                    let workspace_fits = if !states.any_missing() {
+                                    let workspace_fits = if states.all_graphs() {
                                         true
                                     } else {
                                         let (device, session) = worker.available_memory()?;
@@ -714,14 +817,18 @@ impl Team {
                                     };
                                     Ok(Reply::SplitCached(states, workspace_fits))
                                 }),
-                            Command::OwnerRequirement(tokens, reserve) => worker
-                                .owner_requirement(tokens, reserve)
+                            Command::OwnerRequirement(tokens, shared_tokens, reserve) => worker
+                                .owner_requirement(tokens, shared_tokens, reserve)
                                 .map(Reply::Requirement),
                             Command::Reset(ids) => ids
                                 .into_iter()
                                 .try_for_each(|id| {
-                                    journal_pool.remove(&id);
-                                    journal.remove(&id);
+                                    if let Some(j) = journal_pool.remove(&id) {
+                                        recycle_journal(j, &mut idle_journals);
+                                    }
+                                    if let Some(j) = journal.remove(&id) {
+                                        recycle_journal(j, &mut idle_journals);
+                                    }
                                     lineage.remove(&id);
                                     worker.reset_owner(id)
                                 })
@@ -729,12 +836,17 @@ impl Team {
                             Command::Release(None) => {
                                 journal_pool.clear();
                                 journal.clear();
+                                idle_journals.clear();
                                 lineage.clear();
                                 worker.release_owners().map(|_| Reply::Ready)
                             }
                             Command::Release(Some(owner)) => {
-                                journal_pool.remove(&owner);
-                                journal.remove(&owner);
+                                if let Some(j) = journal_pool.remove(&owner) {
+                                    recycle_journal(j, &mut idle_journals);
+                                }
+                                if let Some(j) = journal.remove(&owner) {
+                                    recycle_journal(j, &mut idle_journals);
+                                }
                                 lineage.remove(&owner);
                                 worker.release_owner(owner).map(|_| Reply::Ready)
                             }
@@ -772,14 +884,18 @@ impl Team {
                                 complete,
                             } => {
                                 let parent = lineage.get(&owner).and_then(|id| snapshots.get(id));
-                                worker
-                                    .save_owner(owner, complete, snapshot, parent)
-                                    .map(|saved| {
+                                match worker.save_owner(owner, complete, snapshot, parent) {
+                                    Ok(saved) => {
                                         let allocations = saved.allocations();
                                         snapshots.insert(snapshot, saved);
                                         lineage.insert(owner, snapshot);
-                                        Reply::Allocations(allocations)
-                                    })
+                                        Ok(Reply::Allocations(allocations))
+                                    }
+                                    Err(error) if !worker.session.is_poisoned() => {
+                                        Ok(Reply::SaveSkipped(error))
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
                             #[cfg(test)]
                             Command::Restore { owner, snapshot } => {
@@ -801,11 +917,26 @@ impl Team {
                                 lineage.retain(|_, id| *id != snapshot);
                                 Ok(Reply::Ready)
                             }
+                            Command::EvictMany(ids) => {
+                                let removed: BTreeSet<u64> = ids.into_iter().collect();
+                                for id in &removed {
+                                    snapshots.remove(id);
+                                    host_snapshots.remove(id);
+                                }
+                                lineage.retain(|_, id| !removed.contains(id));
+                                Ok(Reply::Ready)
+                            }
                             Command::RoutingGroups(decode) => {
                                 worker.routing_groups(decode).map(Reply::RoutingGroups)
                             }
                         };
-                        let result = result.map_err(|error| EngineError::take(error, true));
+                        let result = result.map_err(|mut error| {
+                            if let Err(hccl_err) = worker.comm.check_async_error() {
+                                eprintln!("A2 rank {index} HCCL async error: {hccl_err}");
+                                error = format!("{error}; HCCL async: {hccl_err}");
+                            }
+                            EngineError::take(error, true)
+                        });
                         let failed = result.is_err();
                         if let Err(error) = &result {
                             eprintln!("A2 rank {index}: {error}");
@@ -817,7 +948,7 @@ impl Team {
                     let _ = worker.session.synchronize();
                 })
                 .map_err(|error| error.to_string())?;
-            team.handles.push(handle);
+            team.handles.push((handle, done));
             team.peers.push(Peer { send, receive });
         }
         let ready = team.peers.receive(Duration::from_secs(1800))?;
@@ -829,6 +960,129 @@ impl Team {
     }
     pub fn exchange(&self, command: Command) -> Result<Vec<Reply>> {
         exchange(&self.peers, command)
+    }
+    pub fn exchange_heavy(&self, command: Command) -> Result<Vec<Reply>> {
+        self.peers.exchange_heavy(command)
+    }
+    pub fn rank_free_range(&self) -> (usize, usize) {
+        self.rank_free_range.get()
+    }
+    pub fn try_begin_verification(&self, journal: Vec<(usize, usize)>) -> Result<bool> {
+        let mut all_ready = true;
+        for reply in self.exchange(Command::BeginVerification(journal))? {
+            match reply {
+                Reply::Ready => {}
+                Reply::Capacity(false) => all_ready = false,
+                _ => return Err("Invalid A2 verification journal reply".into()),
+            }
+        }
+        Ok(all_ready)
+    }
+    pub fn try_offload(&self, id: u64) -> Result<bool> {
+        let mut skipped = None;
+        for reply in self.exchange_heavy(Command::Offload(id))? {
+            match reply {
+                Reply::Ready => {}
+                Reply::SaveSkipped(reason) => {
+                    skipped.get_or_insert(reason);
+                }
+                _ => return Err("Invalid A2 offload reply".into()),
+            }
+        }
+        if let Some(reason) = skipped {
+            if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+                eprintln!("A2 offload skipped for snapshot {id}: {reason}");
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    pub fn try_host_allocations(
+        &self,
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+        plan: bool,
+    ) -> Result<Option<BTreeMap<u64, usize>>> {
+        let command = if plan {
+            Command::PlanHost {
+                owner,
+                snapshot,
+                complete,
+            }
+        } else {
+            Command::SaveHost {
+                owner,
+                snapshot,
+                complete,
+            }
+        };
+        let replies = if plan {
+            self.exchange(command)?
+        } else {
+            self.exchange_heavy(command)?
+        };
+        self.try_combine_allocations(replies, snapshot)
+    }
+    pub fn try_snapshot_allocations(
+        &self,
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+    ) -> Result<Option<BTreeMap<u64, usize>>> {
+        let replies = self.exchange(Command::Save {
+            owner,
+            snapshot,
+            complete,
+        })?;
+        self.try_combine_allocations(replies, snapshot)
+    }
+    fn try_combine_allocations(
+        &self,
+        replies: Vec<Reply>,
+        snapshot: u64,
+    ) -> Result<Option<BTreeMap<u64, usize>>> {
+        if let Some(reason) = replies.iter().find_map(|reply| match reply {
+            Reply::SaveSkipped(reason) => Some(reason.as_str()),
+            _ => None,
+        }) {
+            if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+                eprintln!("A2 prefix save skipped for snapshot {snapshot}: {reason}");
+            }
+            let _ = self.exchange(Command::Evict(snapshot));
+            return Ok(None);
+        }
+        let mut result: Option<BTreeMap<u64, usize>> = None;
+        for (rank, reply) in replies.into_iter().enumerate() {
+            let Reply::Allocations(allocations) = reply else {
+                return Err("Invalid A2 snapshot allocation reply".into());
+            };
+            if let Some(combined) = &mut result {
+                if !combined.keys().eq(allocations.keys()) {
+                    let missing = combined
+                        .keys()
+                        .filter(|k| !allocations.contains_key(k))
+                        .take(8)
+                        .collect::<Vec<_>>();
+                    let extra = allocations
+                        .keys()
+                        .filter(|k| !combined.contains_key(k))
+                        .take(8)
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "TP snapshot allocation lineage differs on rank {rank}: missing {missing:?}, extra {extra:?}"
+                    ));
+                }
+                for (id, bytes) in allocations {
+                    *combined.get_mut(&id).unwrap() = combined[&id].max(bytes);
+                }
+            } else {
+                result = Some(allocations);
+            }
+        }
+        Ok(Some(
+            result.ok_or_else(|| "Empty A2 snapshot team".to_string())?,
+        ))
     }
     pub fn forward(
         &self,
@@ -895,6 +1149,7 @@ impl Team {
             }
         })
     }
+    #[cfg(test)]
     pub fn snapshot_allocations(
         &self,
         owner: usize,
@@ -938,6 +1193,7 @@ impl Team {
     ) -> Result<(BTreeMap<u64, usize>, usize, usize)> {
         let mut result: Option<BTreeMap<u64, usize>> = None;
         let mut min_device = usize::MAX;
+        let mut max_device = 0usize;
         let mut min_session = usize::MAX;
         for (rank, reply) in self
             .exchange(Command::PlanSnapshot {
@@ -957,6 +1213,9 @@ impl Team {
                 return Err("Invalid A2 snapshot plan reply".into());
             };
             min_device = min_device.min(device_free);
+            if device_free != usize::MAX {
+                max_device = max_device.max(device_free);
+            }
             min_session = min_session.min(session_free);
             if let Some(combined) = &mut result {
                 if !combined.keys().eq(allocations.keys()) {
@@ -971,6 +1230,9 @@ impl Team {
                 result = Some(allocations);
             }
         }
+        if min_device != usize::MAX {
+            self.rank_free_range.set((min_device, max_device));
+        }
         Ok((
             result.ok_or_else(|| "Empty A2 snapshot team".to_string())?,
             min_device,
@@ -978,21 +1240,33 @@ impl Team {
         ))
     }
     pub fn has_budget(&self, requirement: super::memory::Requirement) -> Result<bool> {
-        Ok(self
-            .capacities(Command::Budget(requirement))?
-            .into_iter()
-            .all(|v| v))
+        let mut all_fit = true;
+        let mut min_free = usize::MAX;
+        let mut max_free = 0usize;
+        for reply in self.exchange(Command::Budget(requirement))? {
+            let Reply::BudgetStatus { fits, device_free } = reply else {
+                return Err("Invalid A2 budget reply".into());
+            };
+            all_fit &= fits;
+            min_free = min_free.min(device_free);
+            max_free = max_free.max(device_free);
+        }
+        if min_free != usize::MAX {
+            self.rank_free_range.set((min_free, max_free));
+        }
+        Ok(all_fit)
     }
     pub fn owner_requirement(
         &self,
         tokens: usize,
+        shared_tokens: usize,
         reserve: usize,
     ) -> Result<super::memory::Requirement> {
         let mut maximum = super::memory::Requirement {
             device: 0,
             session: 0,
         };
-        for reply in self.exchange(Command::OwnerRequirement(tokens, reserve))? {
+        for reply in self.exchange(Command::OwnerRequirement(tokens, shared_tokens, reserve))? {
             let Reply::Requirement(required) = reply else {
                 return Err("Invalid A2 owner requirement reply".into());
             };
@@ -1003,6 +1277,12 @@ impl Team {
     }
     pub fn reclaim_programs(&self) -> Result<bool> {
         Ok(self.capacities(Command::Reclaim)?.into_iter().any(|v| v))
+    }
+    pub fn reclaim_programs_for_admission(&self) -> Result<bool> {
+        Ok(self
+            .capacities(Command::ReclaimForAdmission)?
+            .into_iter()
+            .any(|v| v))
     }
     fn capacities(&self, command: Command) -> Result<Vec<bool>> {
         self.exchange(command)?
@@ -1104,15 +1384,39 @@ impl Drop for Team {
             let _ = peer.send.send(Command::Stop);
         }
         let host_release = self.host_tables.take().and_then(host_release::start);
-        for handle in self.handles.drain(..) {
+        let failed = self.peers.has_failed();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut detached = 0usize;
+        for (handle, done) in self.handles.drain(..) {
+            if failed {
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if !done.load(std::sync::atomic::Ordering::Acquire) {
+                    detached += 1;
+                    continue;
+                }
+            }
             if handle.join().is_err() {
                 eprintln!("A2 worker panicked during teardown");
             }
         }
-        // CPU table reclamation owns no ACL/HCCL state and overlaps both rank
-        // teardown and the final bootstrap context. Join before releasing the
-        // model owner's GPU lock or returning from destruction.
-        drop(self._bootstrap.take());
+        if detached > 0 {
+            eprintln!(
+                "A2 teardown detached {detached} wedged rank thread(s) after failure deadline"
+            );
+            // Do not destroy the bootstrap ACL context while a wedged rank thread
+            // is still executing inside native CANN/HCCL calls.
+            std::mem::forget(self._bootstrap.take());
+        } else {
+            // CPU table reclamation owns no ACL/HCCL state and overlaps both rank
+            // teardown and the final bootstrap context. Join before releasing the
+            // model owner's GPU lock or returning from destruction.
+            drop(self._bootstrap.take());
+        }
         if let Some(handle) = host_release
             && handle.join().is_err()
         {
@@ -1341,7 +1645,7 @@ fn finish_forward(
         )?;
     }
     if !cached_prepare {
-        exchange(peers, Command::PrepareParts(layout.clone(), split_plan))?;
+        peers.exchange_heavy(Command::PrepareParts(layout.clone(), split_plan))?;
     }
     let mut shared = vec![];
     let mut shared_setup = 0.;
@@ -1365,7 +1669,7 @@ fn finish_forward(
                 maintenance();
             }
             let capture_started = Instant::now();
-            let states = read(exchange(peers, Command::CaptureShared(layout.clone(), id))?)?;
+            let states = read(peers.exchange_heavy(Command::CaptureShared(layout.clone(), id))?)?;
             shared_setup = capture_started.elapsed().as_secs_f64();
             shared = super::shared::plan(&states, -1.)?.0;
         }
@@ -1419,8 +1723,17 @@ fn finish_forward(
     if ranks.iter().any(|rank| rank.len() != outputs.len()) {
         return Err("A2 TP output count differs".into());
     }
+    let mut owner_positions = BTreeMap::<usize, usize>::new();
+    let prepared_parameters = parameters.get()?;
     for (i, output) in outputs.iter_mut().enumerate() {
         output.logits.clear();
+        output.error = None;
+        let position = owner_positions.entry(output.owner).or_default();
+        let row_error = prepared_parameters
+            .get(&output.owner)
+            .and_then(|rows| rows.get(*position))
+            .and_then(|p| p.error.clone());
+        *position += 1;
         for rank in &ranks {
             let value = rank.get(i).ok_or("A2 TP output count differs")?;
             if value.owner != output.owner {
@@ -1438,6 +1751,11 @@ fn finish_forward(
             }
             output.logits.extend_from_slice(&value.logits);
         }
+        if let Some(error) = row_error {
+            output.error = Some(error);
+            output.summary = None;
+            continue;
+        }
         let summaries = ranks
             .iter()
             .filter_map(|r| r[i].summary.as_ref())
@@ -1446,20 +1764,27 @@ fn finish_forward(
             if summaries.len() != ranks.len() {
                 return Err("TP probability summaries differ".into());
             }
-            output.report = Some(crate::backend::ascend::sampling::report(
+            match crate::backend::ascend::sampling::report(
                 &summaries,
                 output
                     .summary
                     .as_ref()
                     .ok_or("Missing chosen sampling summary")?,
                 output.token,
-            )?);
+            ) {
+                Ok(report) => output.report = Some(report),
+                Err(error) if error == "Grammar permits no tokens" => {
+                    output.error = Some(error);
+                    output.summary = None;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
         if sampled && !output.value.is_finite() {
-            return Err("Grammar permits no tokens".into());
-        }
-        if !readout_rejection_empty && output.value == f32::MIN {
-            return Err("Rejected proposal has no residual mass".into());
+            output.error = Some("Grammar permits no tokens".into());
+        } else if !readout_rejection_empty && output.value == f32::MIN {
+            output.error = Some("Rejected proposal has no residual mass".into());
         }
         output.summary = None;
     }

@@ -459,8 +459,14 @@ impl Worker {
     }
     pub fn capture_shared(&mut self, layout: &batch::Layout, id: &str) -> Result<Vec<State>> {
         let start = Instant::now();
-        let (execution, entry) = {
+        let (execution, entry, split_keys, mono_key) = {
             let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+            let split_keys = runtime.split_keys(layout)?;
+            let mono_key = if split_keys.is_none() {
+                Some(runtime.key(layout)?)
+            } else {
+                None
+            };
             let execution = runtime
                 .execution(layout, &self.packet_templates)?
                 .ok_or("Missing shared packet")?;
@@ -469,9 +475,20 @@ impl Worker {
                 .into_iter()
                 .find(|e| e.id == id)
                 .ok_or("Missing shared piece")?;
-            (execution, entry)
+            (execution, entry, split_keys, mono_key)
         };
-        self.reserve_batch_memory(memory::Requirement::workspace(), "shared graph capture")?;
+        let protected = batch::ProtectedKeys {
+            mono: mono_key.as_ref(),
+            trunk: split_keys.as_ref().map(|s| &s.trunk),
+            tail: split_keys.as_ref().and_then(|s| s.tail.as_ref()),
+            head: split_keys.as_ref().and_then(|s| s.head.as_ref()),
+            keep_idle_owner: false,
+        };
+        self.reserve_batch_memory_protected(
+            memory::Requirement::workspace(),
+            "shared graph capture",
+            &protected,
+        )?;
         let _keepalive = execution;
         self.shared.touch(Rc::clone(&entry));
         entry.active.set(false);

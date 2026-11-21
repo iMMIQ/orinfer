@@ -139,6 +139,67 @@ impl Measurements {
         ] {
             let _ = writeln!(out, "# TYPE {name} counter\n{name}{{{label}}} {value}");
         }
+        if let Some(health) = &statistics.backend_health {
+            for (name, value) in [
+                (
+                    "orinfer_device_rank_free_bytes_min",
+                    health.min_rank_free_bytes,
+                ),
+                (
+                    "orinfer_device_rank_free_bytes_max",
+                    health.max_rank_free_bytes,
+                ),
+                (
+                    "orinfer_prefix_cache_device_entries",
+                    health.device_prefix_entries,
+                ),
+                (
+                    "orinfer_prefix_cache_device_bytes",
+                    health.device_prefix_bytes,
+                ),
+                (
+                    "orinfer_prefix_cache_host_entries",
+                    health.host_prefix_entries,
+                ),
+                ("orinfer_prefix_cache_host_bytes", health.host_prefix_bytes),
+                ("orinfer_dspark_cost_cells", health.dspark_cost_cells),
+            ] {
+                let _ = writeln!(out, "# TYPE {name} gauge\n{name}{{{label}}} {value}");
+            }
+            for (name, value) in [
+                (
+                    "orinfer_prefix_cache_host_evict_max_seconds",
+                    health.host_evict_max_s,
+                ),
+                (
+                    "orinfer_dspark_budget_balance_seconds",
+                    health.dspark_budget_balance_s,
+                ),
+            ] {
+                let _ = writeln!(out, "# TYPE {name} gauge\n{name}{{{label}}} {value}");
+            }
+            for (name, value) in [
+                (
+                    "orinfer_prefix_cache_evictions_total",
+                    health.prefix_evictions,
+                ),
+                (
+                    "orinfer_prefix_cache_host_evictions_total",
+                    health.host_prefix_evictions,
+                ),
+                (
+                    "orinfer_prefix_cache_save_skips_total",
+                    health.prefix_save_skips,
+                ),
+                ("orinfer_program_reclaims_total", health.program_reclaims),
+                (
+                    "orinfer_sampling_request_failures_total",
+                    health.sampling_request_failures,
+                ),
+            ] {
+                let _ = writeln!(out, "# TYPE {name} counter\n{name}{{{label}}} {value}");
+            }
+        }
         out
     }
 }
@@ -211,5 +272,34 @@ mod tests {
             "orinfer_request_latency_seconds_bucket{model=\"test\\\"model\",le=\"+Inf\"} 2"
         ));
         assert!(text.contains("orinfer_cached_prompt_tokens_total{model=\"test\\\"model\"} 75"));
+        let stats = orinfer_engine::scheduler::Statistics {
+            backend_health: Some(orinfer_engine::scheduler::BackendHealthStatistics {
+                min_rank_free_bytes: 10 << 30,
+                max_rank_free_bytes: 12 << 30,
+                device_prefix_entries: 4,
+                device_prefix_bytes: 1 << 30,
+                host_prefix_entries: 100,
+                host_prefix_bytes: 32 << 30,
+                prefix_evictions: 7,
+                host_prefix_evictions: 11,
+                host_evict_max_s: 0.015,
+                prefix_save_skips: 2,
+                program_reclaims: 3,
+                sampling_request_failures: 1,
+                dspark_cost_cells: 512,
+                dspark_budget_balance_s: -0.25,
+            }),
+            ..Default::default()
+        };
+        let rendered = metrics.render("dsv41", 4, 2, &stats);
+        for metric in [
+            "orinfer_device_rank_free_bytes_min{model=\"dsv41\"}",
+            "orinfer_prefix_cache_host_evict_max_seconds{model=\"dsv41\"} 0.015",
+            "orinfer_prefix_cache_save_skips_total{model=\"dsv41\"} 2",
+            "orinfer_sampling_request_failures_total{model=\"dsv41\"} 1",
+            "orinfer_dspark_budget_balance_seconds{model=\"dsv41\"} -0.25",
+        ] {
+            assert!(rendered.contains(metric), "missing {metric}");
+        }
     }
 }

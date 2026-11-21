@@ -373,6 +373,40 @@ impl SharedInt8Rows {
             .checked_mul(self.store.row_bytes())
             .filter(|&n| n <= max_bytes)
             .ok_or("Host-row staging budget exceeded")?;
+        let use_lockfree_resident = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Shared host-row reader poisoned")?;
+            if let Some(planes) = state
+                .last_split
+                .as_ref()
+                .filter(|batch| batch.ids == ids)
+                .map(|batch| Arc::clone(&batch.planes))
+            {
+                state.statistics.gathers += 1;
+                state.statistics.packet_hits += 1;
+                return Ok(planes);
+            }
+            self.store.is_resident() && state.cache.is_none()
+        };
+        if use_lockfree_resident {
+            // Resident tables are immutable; release the mutex during parallel
+            // gather so forecast prefetches never block live rank gathers.
+            let (values, scales) = self.store.gather_split_resident(ids, max_bytes)?;
+            let planes = Arc::new((values, scales));
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Shared host-row reader poisoned")?;
+            state.statistics.gathers += 1;
+            state.statistics.unique_row_reads += ids.len() as u64;
+            state.last_split = Some(SplitBatch {
+                ids: ids.to_vec(),
+                planes: Arc::clone(&planes),
+            });
+            return Ok(planes);
+        }
         let mut state = self
             .state
             .lock()
@@ -387,24 +421,18 @@ impl SharedInt8Rows {
             state.statistics.packet_hits += 1;
             return Ok(planes);
         }
-        let (values, scales, hits, reads) = if self.store.is_resident() && state.cache.is_none() {
-            let (values, scales) = self.store.gather_split_resident(ids, max_bytes)?;
-            (values, scales, 0, ids.len())
-        } else {
-            let mut packed = vec![];
-            let (hits, reads) =
-                self.store
-                    .gather_cached_into(ids, &mut packed, max_bytes, state.cache.as_mut())?;
-            let (val_width, scale_width) = self.store.split_widths();
-            let row_width = self.store.row_bytes();
-            let mut values = Vec::with_capacity(ids.len() * val_width);
-            let mut scales = Vec::with_capacity(ids.len() * scale_width);
-            for record in packed.chunks_exact(row_width) {
-                values.extend_from_slice(&record[..val_width]);
-                scales.extend_from_slice(&record[val_width..]);
-            }
-            (values, scales, hits, reads)
-        };
+        let mut packed = vec![];
+        let (hits, reads) =
+            self.store
+                .gather_cached_into(ids, &mut packed, max_bytes, state.cache.as_mut())?;
+        let (val_width, scale_width) = self.store.split_widths();
+        let row_width = self.store.row_bytes();
+        let mut values = Vec::with_capacity(ids.len() * val_width);
+        let mut scales = Vec::with_capacity(ids.len() * scale_width);
+        for record in packed.chunks_exact(row_width) {
+            values.extend_from_slice(&record[..val_width]);
+            scales.extend_from_slice(&record[val_width..]);
+        }
         state.statistics.gathers += 1;
         state.statistics.unique_row_hits += hits as u64;
         state.statistics.unique_row_reads += reads as u64;
