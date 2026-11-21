@@ -63,6 +63,10 @@ pub(super) enum Command {
     },
     Evict(u64),
     EvictMany(Vec<u64>),
+    RollbackSave {
+        owner: usize,
+        snapshot: u64,
+    },
     Offload(u64),
     PlanOffload(u64),
     SaveHost {
@@ -699,17 +703,13 @@ impl Team {
                                 .map(|s: &super::state::Snapshot| {
                                     Reply::Allocations(s.host_allocations())
                                 }),
-                            Command::Offload(id) => {
-                                let saved = snapshots
-                                    .get(&id)
-                                    .ok_or_else(|| "Missing A2 offload snapshot".to_string());
-                                match saved.and_then(|saved| {
-                                    super::state::HostSnapshot::offload(
-                                        &worker.session,
-                                        saved,
-                                        &mut host_pool,
-                                    )
-                                }) {
+                            Command::Offload(id) => match snapshots.get(&id) {
+                                None => Err("Missing A2 offload snapshot".to_string()),
+                                Some(saved) => match super::state::HostSnapshot::offload(
+                                    &worker.session,
+                                    saved,
+                                    &mut host_pool,
+                                ) {
                                     Ok(saved) => {
                                         host_snapshots.insert(id, saved);
                                         snapshots.remove(&id);
@@ -719,8 +719,8 @@ impl Team {
                                         Ok(Reply::SaveSkipped(error))
                                     }
                                     Err(error) => Err(error),
-                                }
-                            }
+                                },
+                            },
                             Command::InstallImages(owner, spans) => worker
                                 .batch
                                 .as_mut()
@@ -926,6 +926,16 @@ impl Team {
                                 lineage.retain(|_, id| !removed.contains(id));
                                 Ok(Reply::Ready)
                             }
+                            Command::RollbackSave { owner, snapshot } => {
+                                snapshots.remove(&snapshot);
+                                host_snapshots.remove(&snapshot);
+                                // Clear the owner's lineage on every rank so an
+                                // asymmetric SaveSkipped cannot leave ranks with
+                                // divergent parent snapshots on future plans.
+                                lineage.remove(&owner);
+                                lineage.retain(|_, id| *id != snapshot);
+                                Ok(Reply::Ready)
+                            }
                             Command::RoutingGroups(decode) => {
                                 worker.routing_groups(decode).map(Reply::RoutingGroups)
                             }
@@ -1022,7 +1032,7 @@ impl Team {
         } else {
             self.exchange_heavy(command)?
         };
-        self.try_combine_allocations(replies, snapshot)
+        self.try_combine_allocations(replies, owner, snapshot)
     }
     pub fn try_snapshot_allocations(
         &self,
@@ -1035,54 +1045,15 @@ impl Team {
             snapshot,
             complete,
         })?;
-        self.try_combine_allocations(replies, snapshot)
+        self.try_combine_allocations(replies, owner, snapshot)
     }
     fn try_combine_allocations(
         &self,
         replies: Vec<Reply>,
+        owner: usize,
         snapshot: u64,
     ) -> Result<Option<BTreeMap<u64, usize>>> {
-        if let Some(reason) = replies.iter().find_map(|reply| match reply {
-            Reply::SaveSkipped(reason) => Some(reason.as_str()),
-            _ => None,
-        }) {
-            if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
-                eprintln!("A2 prefix save skipped for snapshot {snapshot}: {reason}");
-            }
-            let _ = self.exchange(Command::Evict(snapshot));
-            return Ok(None);
-        }
-        let mut result: Option<BTreeMap<u64, usize>> = None;
-        for (rank, reply) in replies.into_iter().enumerate() {
-            let Reply::Allocations(allocations) = reply else {
-                return Err("Invalid A2 snapshot allocation reply".into());
-            };
-            if let Some(combined) = &mut result {
-                if !combined.keys().eq(allocations.keys()) {
-                    let missing = combined
-                        .keys()
-                        .filter(|k| !allocations.contains_key(k))
-                        .take(8)
-                        .collect::<Vec<_>>();
-                    let extra = allocations
-                        .keys()
-                        .filter(|k| !combined.contains_key(k))
-                        .take(8)
-                        .collect::<Vec<_>>();
-                    return Err(format!(
-                        "TP snapshot allocation lineage differs on rank {rank}: missing {missing:?}, extra {extra:?}"
-                    ));
-                }
-                for (id, bytes) in allocations {
-                    *combined.get_mut(&id).unwrap() = combined[&id].max(bytes);
-                }
-            } else {
-                result = Some(allocations);
-            }
-        }
-        Ok(Some(
-            result.ok_or_else(|| "Empty A2 snapshot team".to_string())?,
-        ))
+        try_combine_allocations_with(&self.peers, replies, owner, snapshot)
     }
     pub fn forward(
         &self,
@@ -1408,8 +1379,9 @@ impl Drop for Team {
             eprintln!(
                 "A2 teardown detached {detached} wedged rank thread(s) after failure deadline"
             );
-            // Do not destroy the bootstrap ACL context while a wedged rank thread
-            // is still executing inside native CANN/HCCL calls.
+            // Do not destroy the bootstrap ACL context or run CANN process-exit
+            // destructors while a wedged rank thread is still inside native calls.
+            crate::backend::ascend::runtime::mark_quarantined();
             std::mem::forget(self._bootstrap.take());
         } else {
             // CPU table reclamation owns no ACL/HCCL state and overlaps both rank
@@ -1427,6 +1399,55 @@ impl Drop for Team {
 
 fn exchange(peers: &Transport, command: Command) -> Result<Vec<Reply>> {
     peers.exchange(command)
+}
+
+fn try_combine_allocations_with(
+    peers: &Transport,
+    replies: Vec<Reply>,
+    owner: usize,
+    snapshot: u64,
+) -> Result<Option<BTreeMap<u64, usize>>> {
+    if let Some(reason) = replies.iter().find_map(|reply| match reply {
+        Reply::SaveSkipped(reason) => Some(reason.as_str()),
+        _ => None,
+    }) {
+        if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+            eprintln!("A2 prefix save skipped for snapshot {snapshot}: {reason}");
+        }
+        peers.exchange(Command::RollbackSave { owner, snapshot })?;
+        return Ok(None);
+    }
+    let mut result: Option<BTreeMap<u64, usize>> = None;
+    for (rank, reply) in replies.into_iter().enumerate() {
+        let Reply::Allocations(allocations) = reply else {
+            return Err("Invalid A2 snapshot allocation reply".into());
+        };
+        if let Some(combined) = &mut result {
+            if !combined.keys().eq(allocations.keys()) {
+                let missing = combined
+                    .keys()
+                    .filter(|k| !allocations.contains_key(k))
+                    .take(8)
+                    .collect::<Vec<_>>();
+                let extra = allocations
+                    .keys()
+                    .filter(|k| !combined.contains_key(k))
+                    .take(8)
+                    .collect::<Vec<_>>();
+                return Err(format!(
+                    "TP snapshot allocation lineage differs on rank {rank}: missing {missing:?}, extra {extra:?}"
+                ));
+            }
+            for (id, bytes) in allocations {
+                *combined.get_mut(&id).unwrap() = combined[&id].max(bytes);
+            }
+        } else {
+            result = Some(allocations);
+        }
+    }
+    Ok(Some(
+        result.ok_or_else(|| "Empty A2 snapshot team".to_string())?,
+    ))
 }
 
 fn forward(

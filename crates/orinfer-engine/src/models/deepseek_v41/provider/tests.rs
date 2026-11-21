@@ -562,3 +562,85 @@ fn impossible_grammar_is_isolated_to_failing_request_in_batch() {
     assert_eq!(good.accept_output(&good_out).unwrap(), 2);
     assert!(good.decoder.failure().is_none());
 }
+
+#[test]
+fn speculative_future_grammar_dead_end_preserves_valid_prefix_when_draft_rejected() {
+    #[derive(Clone)]
+    struct DeadEndAfterOne(bool);
+    impl Constraint for DeadEndAfterOne {
+        fn fork(&self) -> Box<dyn Constraint> {
+            Box::new(self.clone())
+        }
+        fn mask(&mut self) -> Result<Vec<u32>> {
+            // Position 0 allows tokens 1 and 2; after consuming token 1,
+            // position 1 hits a grammar dead-end (empty mask).
+            Ok(vec![if self.0 { 0 } else { 0b110 }])
+        }
+        fn consume(&mut self, token: u32) -> Result<()> {
+            if token == 1 {
+                self.0 = true;
+            }
+            Ok(())
+        }
+        fn finished(&self) -> bool {
+            false
+        }
+    }
+
+    let mut req = request(output(), Default::default());
+    req.slot = 3;
+    req.device_sampling = true;
+    req.processed_sampling = true;
+    req.prefilling = false;
+    req.set_constraint(Box::new(DeadEndAfterOne(false)))
+        .unwrap();
+
+    let proposals = BTreeMap::from([(0usize, vec![1u32])]);
+    let readout = packet::target_readout(&[&mut req], false, &proposals, 4, &[(0, 2)]).unwrap();
+    let params = readout.parameters.get().unwrap();
+    assert_eq!(params[&req.slot].len(), 2);
+    assert!(params[&req.slot][0].error.is_none());
+    assert_eq!(params[&req.slot][0].mask.as_deref(), Some(&[0b110u32][..]));
+    assert_eq!(
+        params[&req.slot][1].error.as_deref(),
+        Some("Grammar permits no tokens")
+    );
+
+    // Target chooses token 2 (!= draft 1): unaccepted speculative row 1 is ignored.
+    let target_reject = [
+        Output {
+            owner: req.slot,
+            token: 2,
+            value: 1.0,
+            ..Default::default()
+        },
+        Output {
+            owner: req.slot,
+            error: Some("Grammar permits no tokens".into()),
+            ..Default::default()
+        },
+    ];
+    let refs: Vec<&Output> = target_reject.iter().collect();
+    assert_eq!(req.verify_device(&[1], &refs).unwrap(), vec![2]);
+    assert!(req.decoder.failure().is_none());
+    assert!(!req.is_finished());
+
+    // If target actually accepts draft token 1, position 1 fails cleanly for this request.
+    let target_accept = [
+        Output {
+            owner: req.slot,
+            token: 1,
+            value: 1.0,
+            ..Default::default()
+        },
+        Output {
+            owner: req.slot,
+            error: Some("Grammar permits no tokens".into()),
+            ..Default::default()
+        },
+    ];
+    let refs: Vec<&Output> = target_accept.iter().collect();
+    assert!(req.verify_device(&[1], &refs).is_err());
+    assert_eq!(req.decoder.failure(), Some("Grammar permits no tokens"));
+    assert!(req.is_finished());
+}

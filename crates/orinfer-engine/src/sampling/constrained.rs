@@ -170,7 +170,9 @@ impl Decoder {
         law
     }
     /// Consume an owned parser fork along the proposal prefix. After an illegal
-    /// proposal or termination, remaining rows are unused and need no reports.
+    /// proposal, dead-end, or termination, remaining rows are unused and need no
+    /// masks or reports; an error at a future speculative position never clobbers
+    /// earlier valid rows.
     pub(crate) fn proposed_rows(
         mut self,
         tokens: &[u32],
@@ -181,7 +183,18 @@ impl Decoder {
         let mut rows = Vec::with_capacity(tokens.len() + 1);
         for position in 0..=tokens.len() {
             let mask = if !ignored && self.constrained() {
-                self.gpu_mask()?
+                match self.gpu_mask() {
+                    Ok(mask) => mask,
+                    Err(error) => {
+                        rows.push(RowParameters {
+                            mask: None,
+                            top_logprobs: None,
+                            error: Some(error),
+                        });
+                        ignored = true;
+                        continue;
+                    }
+                }
             } else {
                 None
             };
@@ -193,7 +206,13 @@ impl Decoder {
                             .get(vocab / 32)
                             .is_some_and(|b| b & ((1u32 << tail) - 1) != 0)))
                 {
-                    return Err("Grammar permits no tokens".into());
+                    rows.push(RowParameters {
+                        mask: None,
+                        top_logprobs: None,
+                        error: Some("Grammar permits no tokens".into()),
+                    });
+                    ignored = true;
+                    continue;
                 }
             }
             let allowed = tokens.get(position).is_none_or(|&id| {
@@ -210,10 +229,9 @@ impl Decoder {
             if let Some(&token) = tokens.get(position)
                 && !ignored
             {
-                if !allowed || self.finished() {
+                if !allowed || self.finished() || self.consume(token).is_err() {
                     ignored = true;
                 } else {
-                    self.consume(token)?;
                     ignored = self.finished();
                 }
             }

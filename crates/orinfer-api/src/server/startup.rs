@@ -128,6 +128,9 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                             "WARMUP READY after {:.3}s",
                             warm_started.elapsed().as_secs_f64()
                         );
+                        if let Ok(mut statistics) = worker_activity.statistics.lock() {
+                            *statistics = loaded.model.scheduler_statistics();
+                        }
                         worker_lifecycle.ready();
                         let mtp_drafts = loaded.model.mtp_drafts();
                         let ready = (context, vision, mtp_drafts, Arc::clone(&worker_codec));

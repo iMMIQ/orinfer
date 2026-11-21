@@ -47,6 +47,10 @@ impl Lifecycle {
     pub async fn failed(&self) {
         loop {
             let notified = self.failed.notified();
+            tokio::pin!(notified);
+            // Register the waiter before loading `phase` so a concurrent
+            // `fail()` calling `notify_waiters()` cannot lose this wakeup.
+            notified.as_mut().enable();
             if self.phase.load(Ordering::Acquire) == 3 {
                 return;
             }
@@ -145,5 +149,19 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), state.failed())
             .await
             .unwrap();
+        // Polling once before `fail()` must register the waiter without losing a
+        // synchronous wakeup occurring between the first poll and the second poll.
+        let fresh = Lifecycle::default();
+        fresh.ready();
+        let fut = fresh.failed();
+        tokio::pin!(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        fresh.fail(orinfer_engine::error::EngineError::take(
+            "synchronous fault".into(),
+            true,
+        ));
+        assert!(fut.as_mut().poll(&mut cx).is_ready());
     }
 }

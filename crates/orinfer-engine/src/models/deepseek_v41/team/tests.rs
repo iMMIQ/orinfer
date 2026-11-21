@@ -398,3 +398,34 @@ fn split_packet_reuses_trunk_graph_while_building_tail_and_head_direct_without_i
         assert!(timing.shared);
     });
 }
+
+#[test]
+fn asymmetric_save_skipped_rolls_back_owner_lineage_on_all_ranks() {
+    std::thread::scope(|scope| {
+        let mut peers = Transport::new(Duration::from_secs(5));
+        for _ in 0..2 {
+            let (send, commands) = mpsc::channel();
+            let (reply, receive) = reply_channel();
+            peers.push(Peer { send, receive });
+            scope.spawn(move || {
+                assert!(matches!(
+                    commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    Command::RollbackSave {
+                        owner: 7,
+                        snapshot: 42
+                    }
+                ));
+                reply.send(Ok(Reply::Ready)).unwrap();
+            });
+        }
+        let replies = vec![
+            Reply::Allocations(BTreeMap::from([(100, 4096)])),
+            Reply::SaveSkipped("Insufficient A2 memory".into()),
+        ];
+        assert!(
+            try_combine_allocations_with(&peers, replies, 7, 42)
+                .unwrap()
+                .is_none()
+        );
+    });
+}

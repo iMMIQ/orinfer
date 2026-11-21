@@ -515,12 +515,6 @@ impl Runtime {
                     })
                 );
             }
-            if let Some(error) = target.iter().find_map(|o| o.error.as_ref()) {
-                request.decoder.fail(error.clone());
-                self.health.sampling_request_failures += 1;
-                rollback.push((request.slot, 0));
-                continue;
-            }
             let committed = if request.host_sampling()
                 && !(request.device_sample() && target.iter().all(|o| o.logits.is_empty()))
             {
@@ -576,11 +570,26 @@ impl Runtime {
                 // Target draws use only their absolute position's randomness.
                 // A deterministic guess or a draft sharing that randomness can
                 // therefore reuse the matching prefix. Earlier decisions never
-                // inspect future draws; the first mismatch is the target draw.
-                let mut tokens = crate::mtp::greedy_commit(
-                    &draft,
-                    &target.iter().map(|v| v.token).collect::<Vec<_>>(),
-                )?;
+                // inspect future draws; the first mismatch is the target draw,
+                // and errors on unaccepted speculative rows are ignored.
+                let mut tokens = Vec::with_capacity(target.len());
+                let mut row_error = None;
+                for (position, output) in target.iter().enumerate() {
+                    if let Some(error) = &output.error {
+                        row_error = Some(error.clone());
+                        break;
+                    }
+                    tokens.push(output.token);
+                    if draft.get(position) != Some(&output.token) {
+                        break;
+                    }
+                }
+                if let Some(error) = row_error {
+                    request.decoder.fail(error);
+                    self.health.sampling_request_failures += 1;
+                    rollback.push((request.slot, 0));
+                    continue;
+                }
                 let count = match request.decoder.consume_unconstrained_prefix(&tokens) {
                     Ok(count) => count,
                     Err(_) if request.decoder.failure().is_some() => {

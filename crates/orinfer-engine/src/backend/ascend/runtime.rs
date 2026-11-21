@@ -28,6 +28,13 @@ pub fn has_quarantined_resources() -> bool {
     QUARANTINED.load(Ordering::Acquire)
 }
 
+/// Mark native Ascend resources as quarantined (e.g. when a wedged TP rank
+/// thread is detached on failure teardown) so standalone runners bypass CANN
+/// process-exit destructors via `_exit`.
+pub(crate) fn mark_quarantined() {
+    QUARANTINED.store(true, Ordering::Release);
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub device_bytes: usize,
