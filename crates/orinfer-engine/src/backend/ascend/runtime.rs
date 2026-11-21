@@ -8,7 +8,7 @@ use super::{
     check,
 };
 use crate::artifact::Result;
-use orinfer_device::{Backend, DeviceOwner, MemoryRange};
+use orinfer_model_sdk::device::{Backend, DeviceOwner, MemoryRange};
 use std::{
     any::Any,
     cell::{Cell, RefCell},

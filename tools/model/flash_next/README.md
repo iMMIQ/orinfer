@@ -54,4 +54,4 @@ uv run --locked --project tools/environments/cuda python -m orinfer_build.models
 ## 4. Verification & Serving
 
 - **Serving**: `orinfer serve artifacts/models/flash-ready --model qwen-flash-next --cuda-graph decode_only --mtp-drafts auto --prefix-cache-mib 4096` (see [Serving Guide](../../../docs/serving.md)).
-- **Checks**: Operator & replay tests live in `tests/cuda/operators/` and `python/orinfer_build/models/flash_next/checks/`; BF16 reference math in `python/orinfer_build/models/flash_next/reference/`. Always validate quality (`seed=20261002`), state isolation, and complete-request TPS after rebuilding.
+- **Checks**: Operator & replay tests live in `tests/cuda/operators/`; BF16 reference math in `python/orinfer_build/models/flash_next/reference/`. Always validate quality (`seed=20261002`), state isolation, and complete-request TPS after rebuilding.

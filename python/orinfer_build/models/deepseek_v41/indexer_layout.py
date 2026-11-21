@@ -1,18 +1,16 @@
 """Group owner-private indexer queries while retaining the exact FP32 head sum."""
 
-import argparse
 from copy import deepcopy
 import hashlib
 import json
-from pathlib import Path
 
 from orinfer_build.common.files import atomic_json
-from orinfer_build.models.deepseek_v41.assembly import (
-    compact_buffers,
-    publish_package,
-    validate_rows,
-)
 from orinfer_build.models.deepseek_v41.publication import manifest_bindings
+from orinfer_build.models.deepseek_v41.transform import (
+    finalize_plan,
+    plan_parser,
+    stage_plan,
+)
 
 
 INDEXER = "private_rows.indexer_fused_causal_topk"
@@ -126,11 +124,7 @@ def group_queries(model, descriptions, query_group=4):
 def build(plan, output, workers=4, query_group=4, model_dir=None):
     from orinfer_build.models.deepseek_v41.build import rebuild_kernels
 
-    if output.exists():
-        raise ValueError("Require a new indexer grouping output directory")
-    base = output / "source"
-    publish_package(json.loads(plan.read_text()), plan.parent, base)
-    model = json.loads((base / "model.json").read_text())
+    model, base, _ = stage_plan(plan, output, workers=workers)
     paths = {binding[key] for binding, key in manifest_bindings(model)}
     descriptions = {path: json.loads((base / path).read_text()) for path in paths}
     updates, report = group_queries(model, descriptions, query_group)
@@ -140,21 +134,20 @@ def build(plan, output, workers=4, query_group=4, model_dir=None):
     atomic_json(base / "model.json", model)
     rebuild_kernels(base / "model.json", workers, operators=[INDEXER, PREPARE])
     model = json.loads((base / "model-selected.json").read_text())
-    compact_buffers(model, owner_tables=True)
-    validate_rows(model, base, model_dir=model_dir)
-    report["assets"] = publish_package(model, base, output / "package")
-    report["model"] = str(output / "package/model.json")
-    atomic_json(output / "indexer-grouping.json", report)
-    return report
+    return finalize_plan(
+        model,
+        base,
+        output,
+        owner_tables=True,
+        model_dir=model_dir,
+        report_name="indexer-grouping.json",
+        report=report,
+    )
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser = plan_parser(__doc__, default_workers=4)
     parser.add_argument("--query-group", type=int, choices=(2, 4), default=4)
-    parser.add_argument("--compile-workers", type=int, default=4)
-    parser.add_argument("--model-dir", type=Path)
     args = parser.parse_args()
     print(
         json.dumps(

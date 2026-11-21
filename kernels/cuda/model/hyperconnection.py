@@ -243,6 +243,83 @@ def hc_combine_norm(
     return hc_combine_norm
 
 
+def _prepare_hc_projection(
+    M: int,
+    N: int,
+    K: int,
+    *,
+    block_m: int,
+    dtype: str,
+    block_n: int,
+    silu: bool,
+    streams: int,
+    group_m: int,
+    dynamic_rows: bool,
+    stages: int,
+    cast_input: bool,
+    cast_silu: bool,
+    coalesced_silu: bool,
+    reduction_groups: int,
+):
+    _dtype(dtype)
+    if (
+        any(type(x) is not int or x <= 0 for x in (M, N, K))
+        or K % 64
+        or block_m not in (16, 32, 64, 128)
+    ):
+        raise ValueError("Invalid HC projection dimensions")
+    if block_n not in (16, 32, 64, 128):
+        raise ValueError("Invalid HC output tile")
+    if type(group_m) is not int or group_m not in (0, 1, 2, 4, 8):
+        raise ValueError("Invalid HC row grouping")
+    if (
+        type(reduction_groups) is not int
+        or reduction_groups not in (1, 4)
+        or K % (64 * reduction_groups)
+    ):
+        raise ValueError("Invalid HC reduction grouping")
+    threads = 64 if block_n == 16 else 128
+    M = row_count(M, dynamic_rows)
+    accumulate = mma_loop(
+        M,
+        K,
+        block_m,
+        block_n,
+        64,
+        stages=stages,
+        reduction_groups=reduction_groups,
+        cast_input=cast_input,
+    )
+
+    @T.macro
+    def project(A, W, C, by, bx):
+        acc = T.alloc_fragment((block_m, block_n), T.float32)
+        accumulate(A, W, acc, by, bx, 0)
+        if silu:
+            if coalesced_silu:
+                for i, j in T.Parallel(block_m, block_n, coalesced_width=T.int32(1)):
+                    if by * block_m + i < M and bx * block_n + j < N:
+                        rounded = T.cast(acc[i, j], dtype)
+                        v = T.cast(T.cast(T.cast(rounded, T.float32) / streams, dtype), T.float32)
+                        value = v / (1 + T.exp(-v))
+                        C[by * block_m + i, bx * block_n + j] = (
+                            T.cast(value, dtype) if cast_silu else value
+                        )
+            else:
+                for i, j in T.Parallel(block_m, block_n):
+                    if by * block_m + i < M and bx * block_n + j < N:
+                        rounded = T.cast(acc[i, j], dtype)
+                        v = T.cast(T.cast(T.cast(rounded, T.float32) / streams, dtype), T.float32)
+                        value = v / (1 + T.exp(-v))
+                        C[by * block_m + i, bx * block_n + j] = (
+                            T.cast(value, dtype) if cast_silu else value
+                        )
+        else:
+            T.copy(acc, C[by * block_m, bx * block_n])
+
+    return M, threads, project
+
+
 @orin_jit
 def hc_projection(
     M: int,
@@ -265,42 +342,23 @@ def hc_projection(
     Four reduction groups match the decode HC down partials: accumulate each
     contiguous stream in FP32, then add streams in order before FP16 rounding.
     """
-    _dtype(dtype)
-    if (
-        any(type(x) is not int or x <= 0 for x in (M, N, K))
-        or K % 64
-        or block_m not in (16, 32, 64, 128)
-    ):
-        raise ValueError("Invalid HC projection dimensions")
-    if block_n not in (16, 32, 64, 128):
-        raise ValueError("Invalid HC output tile")
-    if type(group_m) is not int or group_m not in (0, 1, 2, 4, 8):
-        raise ValueError("Invalid HC row grouping")
-    if (
-        type(reduction_groups) is not int
-        or reduction_groups not in (1, 4)
-        or K % (64 * reduction_groups)
-    ):
-        raise ValueError("Invalid HC reduction grouping")
-    threads = 64 if block_n == 16 else 128
-    M = row_count(M, dynamic_rows)
-    accumulate = mma_loop(
-        M, K, block_m, block_n, 64, stages=2, reduction_groups=reduction_groups, cast_input=True
+    M, threads, project = _prepare_hc_projection(
+        M,
+        N,
+        K,
+        block_m=block_m,
+        dtype=dtype,
+        block_n=block_n,
+        silu=silu,
+        streams=streams,
+        group_m=group_m,
+        dynamic_rows=dynamic_rows,
+        stages=2,
+        cast_input=True,
+        cast_silu=False,
+        coalesced_silu=False,
+        reduction_groups=reduction_groups,
     )
-
-    @T.macro
-    def project(A, W, C, by, bx):
-        acc = T.alloc_fragment((block_m, block_n), T.float32)
-        accumulate(A, W, acc, by, bx, 0)
-        if silu:
-            for i, j in T.Parallel(block_m, block_n):
-                if by * block_m + i < M and bx * block_n + j < N:
-                    rounded = T.cast(acc[i, j], dtype)
-                    v = T.cast(T.cast(T.cast(rounded, T.float32) / streams, dtype), T.float32)
-                    C[by * block_m + i, bx * block_n + j] = v / (1 + T.exp(-v))
-        else:
-            T.copy(acc, C[by * block_m, bx * block_n])
-
     if group_m:
         mt, nt = (M + block_m - 1) // block_m, (N + block_n - 1) // block_n
 
@@ -316,19 +374,18 @@ def hc_projection(
                 project(A, W, C, by, bx)
 
         return grouped
-    else:
 
-        @T.prim_func
-        def main(
-            A: T.Tensor((M, K), dtype), W: T.Tensor((N, K), T.bfloat16), C: T.Tensor((M, N), dtype)
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), dtype), W: T.Tensor((N, K), T.bfloat16), C: T.Tensor((M, N), dtype)
+    ):
+        with T.Kernel(T.ceildiv(M, block_m), T.ceildiv(N, block_n), threads=threads) as (
+            by,
+            bx,
         ):
-            with T.Kernel(T.ceildiv(M, block_m), T.ceildiv(N, block_n), threads=threads) as (
-                by,
-                bx,
-            ):
-                project(A, W, C, by, bx)
+            project(A, W, C, by, bx)
 
-        return main
+    return main
 
 
 @orin_jit

@@ -1,6 +1,7 @@
 //! Native model implementations built with the engine's common source workspace.
 pub use orinfer_model_sdk::{artifact, execution, model, operators};
 mod adapter;
+mod encoder;
 mod flash_next;
 mod nemotron_embed;
 mod packet;

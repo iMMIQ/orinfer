@@ -1,17 +1,14 @@
 """Upload disjoint BF16 embedding columns and fuse their gather with HC expansion."""
 
-import argparse
-from concurrent.futures import ProcessPoolExecutor
 import json
-import multiprocessing
-from pathlib import Path
 
-from orinfer_build.common.files import atomic_json
-from orinfer_build.models.deepseek_v41.assembly import (
-    check_intermediate_liveness,
-    compact_buffers,
-    publish_package,
-    validate_rows,
+from orinfer_build.models.deepseek_v41.assembly import check_intermediate_liveness
+from orinfer_build.models.deepseek_v41.transform import (
+    compile_and_replace,
+    define_buffer,
+    finalize_plan,
+    plan_parser,
+    stage_plan,
 )
 from orinfer_build.contracts.row_contract import expression
 
@@ -32,13 +29,7 @@ def transform(model, describe, kernel):
         definitions = {b["name"]: b for b in rank["buffers"]}
 
         def buffer(name, size, **kwargs):
-            definition = dict(name=name, bytes=size, **kwargs)
-            if name not in definitions:
-                rank["buffers"].append(definition)
-                definitions[name] = definition
-            elif definitions[name] != definition:
-                raise ValueError("Conflicting device embedding buffer")
-            return name
+            return define_buffer(rank, definitions, name, size, label="device embedding", **kwargs)
 
         def emit(name, arguments, ports, capacity):
             specs = [
@@ -192,25 +183,8 @@ def transform(model, describe, kernel):
 def build(plan, output, workers=4):
     from orinfer_build.models.deepseek_v41.build import compile_task
 
-    if workers < 1 or (output / "package").exists():
-        raise ValueError("Require an unpublished output and positive compiler count")
-    model = json.loads(plan.read_text())
-    output.mkdir(parents=True, exist_ok=True)
-    base = output / "source"
-    if base.exists():
-        if json.loads((base / "model.json").read_text()) != model:
-            raise ValueError("Device embedding build input changed")
-    else:
-        publish_package(model, plan.parent, base)
-    descriptions, tasks = {}, {}
-
-    def describe(step):
-        if step.get("op") != "kernel":
-            return None
-        name = step["manifest"]
-        if name not in descriptions:
-            descriptions[name] = json.loads((base / name).read_text())
-        return descriptions[name]
+    model, base, describe = stage_plan(plan, output, workers=workers, allow_resume=True)
+    tasks = {}
 
     def kernel(name, arguments, specs, capacity):
         key = json.dumps([name, arguments, specs, capacity], sort_keys=True)
@@ -227,34 +201,20 @@ def build(plan, output, workers=4):
         return tasks[key]["placeholder"]
 
     changes = transform(model, describe, kernel)
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        replacements = dict(pool.map(compile_task, [(t, str(base)) for t in tasks.values()]))
-    for rank in model["ranks"]:
-        for packet in rank["packets"]:
-            for step in packet["body"]:
-                if step.get("manifest") in replacements:
-                    step["manifest"] = replacements[step["manifest"]]
-    compact_buffers(model)
-    validate_rows(model, base)
-    atomic_json(base / "model.json", model)
-    assets = publish_package(model, base, output / "package")
-    atomic_json(
-        output / "embedding-columns.json",
-        dict(
-            packets=changes, kernels=len(tasks), columns=5120 // len(model["ranks"]), assets=assets
-        ),
+    compile_and_replace(model, tasks, base, workers, compiler=compile_task)
+    finalize_plan(
+        model,
+        base,
+        output,
+        save_base=True,
+        report_name="embedding-columns.json",
+        report=dict(packets=changes, kernels=len(tasks), columns=5120 // len(model["ranks"])),
     )
     return output / "package/model.json"
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--compile-workers", type=int, default=4)
-    args = parser.parse_args()
+    args = plan_parser(__doc__, default_workers=4, model_dir=False).parse_args()
     print(build(args.plan, args.output, args.compile_workers))
 
 

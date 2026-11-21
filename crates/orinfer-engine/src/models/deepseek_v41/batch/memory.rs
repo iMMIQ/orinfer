@@ -43,7 +43,7 @@ impl Worker {
             let buffer = get(&owner.buffers, name)?;
             let end = layout.extent(tokens)?;
             let start = owner.history.len() / layout.tokens_per_row * layout.row_bytes;
-            let cow = buffer.kv_writable_bytes(orinfer_device::MemoryRange {
+            let cow = buffer.kv_writable_bytes(orinfer_model_sdk::device::MemoryRange {
                 offset: start,
                 bytes: end.saturating_sub(start),
             })?;
@@ -135,7 +135,7 @@ impl Worker {
                 let start = owner.history.len() / layout.tokens_per_row * layout.row_bytes;
                 Ok((
                     get(&owner.buffers, name)?,
-                    orinfer_device::MemoryRange {
+                    orinfer_model_sdk::device::MemoryRange {
                         offset: start,
                         bytes: layout.extent(tokens)?.saturating_sub(start),
                     },

@@ -1,8 +1,10 @@
 //! Shared model data and execution contracts.
 pub mod architecture;
 pub mod artifact;
+pub mod audio;
 pub mod catalog;
 pub mod conditional_memory;
+pub mod device;
 pub mod embedding;
 pub mod encoder_rows;
 pub mod execution;
@@ -12,5 +14,3 @@ pub mod operators;
 pub mod packet;
 pub mod reranking;
 pub mod vision;
-
-pub mod audio;

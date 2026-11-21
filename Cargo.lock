@@ -1780,14 +1780,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "orinfer-device"
-version = "0.3.13"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "orinfer-engine"
 version = "0.3.13"
 dependencies = [
@@ -1800,7 +1792,6 @@ dependencies = [
  "libloading",
  "lzma-rust2",
  "memmap2",
- "orinfer-device",
  "orinfer-model-sdk",
  "orinfer-models",
  "rayon",
@@ -1817,7 +1808,6 @@ dependencies = [
 name = "orinfer-model-sdk"
 version = "0.3.13"
 dependencies = [
- "orinfer-device",
  "serde",
  "serde_json",
 ]

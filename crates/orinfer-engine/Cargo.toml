@@ -10,7 +10,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-orinfer-device.workspace = true
 cudarc = { version = "=0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12060"] }
 libloading = "=0.9.0"
 serde.workspace = true

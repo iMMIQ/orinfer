@@ -6,7 +6,7 @@ combines those scaled planes before the existing BF16 projection/activation.
 
 import tilelang.language as T
 
-from kernels.ascend.vector_math import quantize_bf16_row
+from kernels.ascend.quantization import COMPONENT_SOURCES, quantize_bf16_row
 
 
 @T.macro
@@ -83,7 +83,9 @@ def gather_split(rows, table_rows, width, experts):
                     flag[0] = T.if_then_else(index < -1 or index >= table_rows, 1, 0)
                     T.copy(flag[:1], errors[row : row + 1])
 
-    return main.with_attr("orinfer.explicit_cross_sync", True)
+    return main.with_attr("orinfer.explicit_cross_sync", True).with_attr(
+        "orinfer.component_sources", COMPONENT_SOURCES
+    )
 
 
 def finish(rows, width, experts, tile_n=256, slots=24):
@@ -176,4 +178,6 @@ def finish(rows, width, experts, tile_n=256, slots=24):
                         quantize_bf16_row(gated, out, scales, row, width)
                     prefix[0] = start + count
 
-    return main.with_attr("orinfer.explicit_cross_sync", True)
+    return main.with_attr("orinfer.explicit_cross_sync", True).with_attr(
+        "orinfer.component_sources", COMPONENT_SOURCES
+    )

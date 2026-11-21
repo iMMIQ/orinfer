@@ -75,7 +75,7 @@ def source_identity():
         )
     ]
     paths.extend((ROOT / "configs").glob("*.json"))
-    for crate in ("orinfer-models", "orinfer-model-sdk", "orinfer-device"):
+    for crate in ("orinfer-models", "orinfer-model-sdk"):
         base = ROOT / "crates" / crate
         paths.append(base / "Cargo.toml")
         paths.extend(

@@ -3,7 +3,7 @@
 //! CUDA executes Orin model packages. Ascend provides CANN discovery and an
 //! experimental native DSv4.1 provider through the shared request interface.
 
-pub mod architecture;
+pub use orinfer_model_sdk::architecture;
 pub mod artifact;
 pub mod backend;
 mod batch_plan;

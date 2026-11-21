@@ -417,7 +417,7 @@ impl Manifest {
             return Err("Duplicate packet operand tables".into());
         }
 
-        let target = orinfer_device::Target::from_package(&self.target)?;
+        let target = crate::device::Target::from_package(&self.target)?;
         if self.schema_version != 2 || self.model.is_empty() || self.toolchain.is_empty() {
             return Err(
                 "Expected safetensors model schema 2; prepare the AOT model directory first".into(),

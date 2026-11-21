@@ -1,7 +1,7 @@
 //! Shared KV ownership and mapping transitions. Device adapters issue native calls.
 pub(crate) mod host;
 use crate::artifact::Result;
-use orinfer_device::{DeviceOwner, MemoryRange};
+use orinfer_model_sdk::device::{DeviceOwner, MemoryRange};
 use std::{any::Any, cell::Cell, rc::Rc};
 
 thread_local! { static NEXT: Cell<u64> = const { Cell::new(0) }; }
@@ -689,7 +689,7 @@ mod tests {
     #[test]
     fn checkpoint_shares_full_allocations_and_packs_only_the_partial_suffix() {
         for grain in [64, 2 << 20] {
-            let owner = DeviceOwner::new(orinfer_device::Backend::Ascend, 0);
+            let owner = DeviceOwner::new(orinfer_model_sdk::device::Backend::Ascend, 0);
             let allocation = |bytes| {
                 Rc::new(Allocation {
                     owner,
@@ -761,7 +761,7 @@ mod tests {
     impl Fake {
         fn new() -> Self {
             Self {
-                owner: DeviceOwner::new(orinfer_device::Backend::Cuda, 0),
+                owner: DeviceOwner::new(orinfer_model_sdk::device::Backend::Cuda, 0),
                 data: Default::default(),
                 mapped: Default::default(),
                 next: Cell::new(0),
@@ -968,7 +968,7 @@ mod tests {
     fn logical_alias_and_budget_rules_are_independent_of_native_granularity() {
         for grain in [64, 256, 2 << 20] {
             let a = Allocation {
-                owner: DeviceOwner::new(orinfer_device::Backend::Ascend, 0),
+                owner: DeviceOwner::new(orinfer_model_sdk::device::Backend::Ascend, 0),
                 id: 2,
                 address: 3,
                 bytes: grain,

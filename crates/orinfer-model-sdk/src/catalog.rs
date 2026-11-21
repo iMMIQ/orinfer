@@ -98,12 +98,12 @@ impl Catalog {
         }
         Ok(())
     }
-    pub fn validate_target(&self, target: &orinfer_device::Target) -> Result<()> {
+    pub fn validate_target(&self, target: &crate::device::Target) -> Result<()> {
         self.validate()?;
         target.validate()?;
         for definition in &self.definitions {
             let backend = definition.launch.as_ref().map_or(
-                orinfer_device::Backend::Cuda,
+                crate::device::Backend::Cuda,
                 crate::artifact::Launch::backend,
             );
             if backend != target.backend {
@@ -339,11 +339,11 @@ mod binding_tests {
                 readonly_arguments: vec![],
             }],
         };
-        let target = orinfer_device::Target::from_package("ascend910b").unwrap();
+        let target = crate::device::Target::from_package("ascend910b").unwrap();
         catalog.validate_target(&target).unwrap();
         assert!(
             catalog
-                .validate_target(&orinfer_device::Target::from_package("sm_87").unwrap())
+                .validate_target(&crate::device::Target::from_package("sm_87").unwrap())
                 .is_err()
         );
         let kernel = catalog

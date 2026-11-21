@@ -2,23 +2,20 @@
 
 from importlib import import_module
 
-import argparse
-from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 import json
 import math
-import multiprocessing
-from pathlib import Path
 
-from orinfer_build.common.files import atomic_json
 from orinfer_build.models.deepseek_v41.batch import SIZES, compile_task
 from orinfer_build.models.deepseek_v41.assembly import (
     check_intermediate_liveness as check_query_liveness,
-    compact_buffers,
-    publish_package,
-    selected_packet_ranges,
     selected_target_packet,
-    validate_rows,
+)
+from orinfer_build.models.deepseek_v41.transform import (
+    compile_and_replace,
+    finalize_plan,
+    plan_parser,
+    stage_plan,
 )
 from orinfer_build.contracts.row_contract import expression
 
@@ -65,24 +62,19 @@ def build(plan, output, workers=4, minimum=512, query_tile_m=128, maximum=None, 
     from orinfer_build.compiler.ascend.build import operand
     from orinfer_build.contracts.ascend.geometry import physical_shapes
 
-    if output.exists():
-        raise ValueError("Require a new output directory")
-    model = json.loads(plan.read_text())
-    for rank in model["ranks"]:
-        rank["packets"] = selected_packet_ranges(rank["packets"], minimum, maximum)
+    model, base, describe = stage_plan(
+        plan,
+        output,
+        workers=workers,
+        minimum=minimum,
+        maximum=maximum,
+        validate_source=True,
+        model_dir=model_dir,
+    )
     peers = len(model["ranks"])
     if peers != 8 or not model.get("batch", {}).get("partitioned_tables"):
         raise ValueError("Require the TP8 owner-row indexer partitions")
-    validate_rows(model, plan.parent, model_dir=model_dir)
-    base = output / "source"
-    publish_package(model, plan.parent, base)
-    descriptions, tasks, counts = {}, {}, []
-
-    def describe(step):
-        path = step["manifest"]
-        if path not in descriptions:
-            descriptions[path] = json.loads((base / path).read_text())
-        return descriptions[path]
+    tasks, counts = {}, []
 
     def register(module, name, arguments, specs, capacity, factor=1):
         task = dict(
@@ -239,39 +231,26 @@ def build(plan, output, workers=4, minimum=512, query_tile_m=128, maximum=None, 
                 index += len(chain)
             packet["body"] = body
             counts.append(dict(rank=rank["rank"], family=packet["min_rows"], queries=changed))
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        replacements = dict(pool.map(compile_task, [(task, str(base)) for task in tasks.values()]))
-    for rank in model["ranks"]:
-        for packet in rank["packets"]:
-            for step in packet["body"]:
-                if step.get("manifest") in replacements:
-                    step["manifest"] = replacements[step["manifest"]]
-    compact_buffers(model, owner_tables=True)
-    validate_rows(model, base, model_dir=model_dir)
-    assets = publish_package(model, base, output / "package")
-    report = dict(
-        model=str(output / "package/model.json"),
-        minimum=minimum,
-        query_tile_m=query_tile_m,
-        kernels=len(tasks),
-        assets=assets,
-        families=counts,
-        additional_owner_bytes=0,
+    compile_and_replace(model, tasks, base, workers, compiler=compile_task)
+    return finalize_plan(
+        model,
+        base,
+        output,
+        owner_tables=True,
+        model_dir=model_dir,
+        report_name="local-indexer.json",
+        report=dict(
+            minimum=minimum,
+            query_tile_m=query_tile_m,
+            kernels=len(tasks),
+            families=counts,
+            additional_owner_bytes=0,
+        ),
     )
-    atomic_json(output / "local-indexer.json", report)
-    return report
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--compile-workers", type=int, default=4)
-    parser.add_argument("--min-rows", type=int, default=512)
-    parser.add_argument("--max-rows", type=int)
-    parser.add_argument("--model-dir", type=Path)
+    parser = plan_parser(__doc__, default_workers=4, min_rows=512, max_rows=True)
     parser.add_argument("--query-tile-m", type=int, default=128)
     args = parser.parse_args()
     print(

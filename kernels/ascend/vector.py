@@ -8,8 +8,8 @@ import math
 
 import tilelang.language as T
 
-from kernels.ascend.quantization import row_quantizer
-from kernels.ascend.vector_math import div_127_fp32, div_fp32_rows, div_fp32_scalar, rsqrt_fp32
+from kernels.ascend.quantization import COMPONENT_SOURCES, quantize_bf16_row, row_quantizer
+from kernels.ascend.vector_math import div_127_fp32, div_fp32_rows, rsqrt_fp32
 
 
 def mean_sections(rows, width=5120, branches=4, sections=3, section=0):
@@ -149,7 +149,7 @@ def quantize(rows, width, fp16_query_scale=False, tile_rows=1):
                 else:
                     T.copy(scale, scales[row : row + 1])
 
-    return main.with_attr("orinfer.component_sources", ["kernels/ascend/quantization.py"])
+    return main.with_attr("orinfer.component_sources", COMPONENT_SOURCES)
 
 
 def _quantize_rows(rows, width, fp16_query_scale, tile_rows):
@@ -290,21 +290,6 @@ def swiglu_quant(rows, width, limit=10.0):
             u = T.alloc_ub((1, width), "float32")
             exponential = T.alloc_ub((1, width), "float32")
             y = T.alloc_ub((1, width), "bfloat16")
-            a = T.alloc_ub((1, width), "float32")
-            absolute = T.alloc_ub((1, width), "float32")
-            maximum = T.alloc_ub((1, 1), "float32")
-            scale = T.alloc_ub((1, 1), "float32")
-            divisor = T.alloc_ub((1, 1), "float32")
-            scale_residual = T.alloc_ub((1, 1), "float32")
-            scale_negative = T.alloc_ub((1, 1), "float32")
-            scale_high = T.alloc_ub((1, 1), "float32")
-            scale_low = T.alloc_ub((1, 1), "float32")
-            scale_tile = T.alloc_ub((1, width), "float32")
-            residual = T.alloc_ub((1, width), "float32")
-            quotient_low = T.alloc_ub((1, width), "float32")
-            product = T.alloc_ub((1, width), "float32")
-            rounded = T.alloc_ub((1, width), "float16")
-            yq = T.alloc_ub((1, width), "int8")
             row = cid * 2 + vid
             if row < rows:
                 T.copy(gate[row, :], gb)
@@ -320,38 +305,9 @@ def swiglu_quant(rows, width, limit=10.0):
                 T.tile.div(g, g, exponential)
                 T.tile.mul(u, g, u)
                 T.tile.cast(y, u, "CAST_RINT", width)
-                T.tile.cast(a, y, "CAST_NONE", width)
-                T.tile.abs(absolute, a)
-                T.reduce_max(absolute, maximum, dim=1)
-                T.tile.max(maximum, maximum, 1e-12)
-                T.tile.fill(divisor, 127.0)
-                div_127_fp32(maximum, divisor, scale, scale_negative, scale_residual)
-                scale_high[0, 0] = T.reinterpret(
-                    "float32",
-                    T.bitwise_and(T.reinterpret("uint32", scale[0, 0]), T.uint32(4294963200)),
-                )
-                T.tile.sub(scale_low, scale, scale_high)
-                T.tile.broadcast(scale_tile, scale)
-                div_fp32_scalar(
-                    a,
-                    scale_tile,
-                    scale_high,
-                    scale_low,
-                    a,
-                    residual,
-                    absolute,
-                    quotient_low,
-                    product,
-                )
-                T.tile.min(a, a, 127.0)
-                T.tile.max(a, a, -127.0)
-                T.tile.round(a, a, width)
-                T.tile.cast(rounded, a, "CAST_RINT", width)
-                T.tile.cast(yq, rounded, "CAST_RINT", width)
-                T.copy(yq, out[row : row + 1, :])
-                T.copy(scale, scales[row : row + 1])
+                quantize_bf16_row(y, out, scales, row, width)
 
-    return main
+    return main.with_attr("orinfer.component_sources", COMPONENT_SOURCES)
 
 
 def mhc_split_sinkhorn(rows, iterations=20, eps=1e-6, vector_rows=True, tile_rows=1):

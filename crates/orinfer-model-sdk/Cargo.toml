@@ -10,6 +10,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-orinfer-device.workspace = true
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true

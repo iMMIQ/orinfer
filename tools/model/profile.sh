@@ -14,7 +14,7 @@ cp --parents "$model_manifest" "$(dirname -- "$model_manifest")/weights/model.sa
     crates/orinfer-engine/src/{model,artifact,weights,loader,operators}.rs crates/orinfer-cli/src/main.rs \
     "$output_dir/measurement-source/"
 cp "$request_manifest" "$output_dir/requests.json"
-cp -r --parents crates/orinfer-engine/src/{backend,runtime,architecture} crates/orinfer-device "$output_dir/measurement-source/"
+cp -r --parents crates/orinfer-engine/src/{backend,runtime} crates/orinfer-model-sdk/src/{architecture.rs,device.rs} "$output_dir/measurement-source/"
 cp target/release/orinfer "$output_dir/orinfer"
 "$output_dir/orinfer" plan-model "$model_manifest" > "$output_dir/plan.json"
 sha256sum "$model_manifest" "$request_manifest" "$output_dir/orinfer" > "$output_dir/identities.sha256"

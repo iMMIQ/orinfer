@@ -3,7 +3,7 @@ use crate::artifact::Result;
 use serde::Serialize;
 use std::{fmt, str::FromStr};
 
-pub use orinfer_device::GraphMode;
+pub use orinfer_model_sdk::device::GraphMode;
 /// Compatibility name for existing callers and serialized load options.
 pub type CudaGraphMode = GraphMode;
 
@@ -250,7 +250,7 @@ pub fn parse_cache_mib(value: &str) -> Result<usize> {
         .ok_or_else(|| "Prefix cache MiB must be a nonnegative integer within usize".into())
 }
 
-pub(crate) use orinfer_device::ExecutionPhase;
+pub(crate) use orinfer_model_sdk::device::ExecutionPhase;
 pub use orinfer_model_sdk::execution::{BufferView, Invocation};
 
 #[cfg(test)]

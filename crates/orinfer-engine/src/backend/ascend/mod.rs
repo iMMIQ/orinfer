@@ -161,7 +161,7 @@ fn inventory(runtime: &Driver) -> Result<Inventory> {
         }
     }
     Ok(Inventory {
-        backend: orinfer_device::Backend::Ascend,
+        backend: orinfer_model_sdk::device::Backend::Ascend,
         host_arch: std::env::consts::ARCH.into(),
         device_count: devices,
         soc: soc_name,

@@ -2,7 +2,7 @@
 
 import tilelang.language as T
 
-from kernels.ascend.quantization import row_quantizer
+from kernels.ascend.quantization import COMPONENT_SOURCES, row_quantizer
 
 
 def routed_layout(width, routes, ranks):
@@ -51,7 +51,7 @@ def quantize_routed(rows, width, routes=8, ranks=8):
                 T.copy(packed, out[row, :])
                 T.pipe_barrier("ALL")
 
-    return main.with_attr("orinfer.component_sources", ["kernels/ascend/quantization.py"])
+    return main.with_attr("orinfer.component_sources", COMPONENT_SOURCES)
 
 
 def unpack_routed_metadata(rows, width, routes=8, ranks=8):

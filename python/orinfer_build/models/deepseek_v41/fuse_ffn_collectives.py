@@ -1,18 +1,9 @@
 """Gather routed INT8 activations, scales and route metadata in one message."""
 
-import argparse
-from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 import json
-import multiprocessing
-from pathlib import Path
 
 from orinfer_build.common.files import atomic_json
-from orinfer_build.models.deepseek_v41.assembly import (
-    compact_buffers,
-    publish_package,
-    validate_rows,
-)
 from orinfer_build.models.deepseek_v41.batch import compile_task
 from orinfer_build.contracts.row_contract import expression, resolve
 
@@ -204,21 +195,17 @@ def strided_task(spec, stride):
 
 
 def build(plan, output, workers=2, model_dir=None):
-    if output.exists():
-        raise ValueError("Require a new output directory")
-    model = json.loads(plan.read_text())
+    from orinfer_build.models.deepseek_v41.transform import (
+        compile_and_replace,
+        finalize_plan,
+        stage_plan,
+    )
+
+    model, base, describe = stage_plan(plan, output, workers=workers)
     ranks = len(model["ranks"])
-    base = output / "source"
-    publish_package(model, plan.parent, base)
-    tasks, descriptors, counts, strided = {}, {}, [], {}
+    tasks, counts, strided = {}, [], {}
     original_selections = deepcopy(model.get("row_selections", {}))
     selections = model.setdefault("row_selections", {})
-
-    def describe(step):
-        path = step["manifest"]
-        if path not in descriptors:
-            descriptors[path] = json.loads((base / path).read_text())
-        return descriptors[path]
 
     def register(source):
         identity = json.dumps(source, sort_keys=True)
@@ -372,16 +359,9 @@ def build(plan, output, workers=2, model_dir=None):
                 )
     if not tasks:
         raise ValueError("No routed sequence collectives found")
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        replacements = dict(pool.map(compile_task, [(t, str(base)) for t in tasks.values()]))
-    for rank in model["ranks"]:
-        for packet in rank["packets"]:
-            for step in packet["body"]:
-                for field in ("manifest", "uncompacted_manifest"):
-                    if step.get(field) in replacements:
-                        step[field] = replacements[step[field]]
+    replacements = compile_and_replace(
+        model, tasks, base, workers, compiler=compile_task, include_uncompacted=True
+    )
     referenced = {
         s.get(k)
         for r in model["ranks"]
@@ -415,28 +395,25 @@ def build(plan, output, workers=2, model_dir=None):
         atomic_json(convergence, model)
         rebuild_kernels(convergence, workers, operators=mixed)
         model = json.loads(convergence.with_name("model-strided-selected.json").read_text())
-    compact_buffers(model)
-    validate_rows(model, base, model_dir=model_dir)
-    assets = publish_package(model, base, output / "package")
-    report = dict(
-        model=str(output / "package/model.json"),
-        kernels=len(tasks),
-        assets=assets,
-        families=counts,
-        activation_unpack=False,
-        quantization_fused=True,
+    return finalize_plan(
+        model,
+        base,
+        output,
+        model_dir=model_dir,
+        report_name="routed-collectives.json",
+        report=dict(
+            kernels=len(tasks),
+            families=counts,
+            activation_unpack=False,
+            quantization_fused=True,
+        ),
     )
-    atomic_json(output / "routed-collectives.json", report)
-    return report
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model-dir", type=Path)
-    parser.add_argument("--compile-workers", type=int, default=2)
-    args = parser.parse_args()
+    from orinfer_build.models.deepseek_v41.transform import plan_parser
+
+    args = plan_parser(__doc__, default_workers=2).parse_args()
     print(json.dumps(build(args.plan, args.output, args.compile_workers, args.model_dir)))
 
 

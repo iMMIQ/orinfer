@@ -49,9 +49,9 @@ impl Fixture {
         let library = self._dir.path().join("libacl-fixture.so");
         let spec = Spec {
             schema_version: 1,
-            target: orinfer_device::Target {
+            target: orinfer_model_sdk::device::Target {
                 host_arch: std::env::consts::ARCH.into(),
-                backend: orinfer_device::Backend::Ascend,
+                backend: orinfer_model_sdk::device::Backend::Ascend,
                 device_arch: "ascend910b".into(),
             },
             op: "copy_fixture".into(),

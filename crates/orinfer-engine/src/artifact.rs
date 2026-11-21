@@ -57,7 +57,7 @@ impl Manifest {
                 .checked_add(b.bytes()?)
                 .ok_or("Total buffer size overflow")?;
         }
-        let target = orinfer_device::Target::from_package(&self.target)?;
+        let target = orinfer_model_sdk::device::Target::from_package(&self.target)?;
         for k in &self.kernels {
             k.validate_launch(&target)?;
             if k.name.is_empty()

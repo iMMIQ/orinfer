@@ -6,7 +6,7 @@ use super::{
 };
 use crate::artifact::{Dtype, FileIdentity, Result, resolve_file};
 use libloading::Library;
-use orinfer_device::{Backend, Target};
+use orinfer_model_sdk::device::{Backend, Target};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},

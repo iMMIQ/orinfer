@@ -13,8 +13,7 @@ Orinfer splits cleanly into a **Rust workspace** for online execution/serving an
 | `orinfer-cli` | CLI binary (`serve`, `batch`, `package`, `validate-model`, `plan-model`, manager & diagnostic commands) |
 | `orinfer-api` | OpenAI / Ollama HTTP & SSE server, request preprocessing, JSONL batch runner, multi-model manager |
 | `orinfer-engine` | Core runtime: continuous scheduler, tiered prefix cache, adaptive MTP/DSpark, CUDA & Ascend backends, native DSv4.1 provider |
-| `orinfer-device` | Driver-free device, target ABI, graph policy, and memory interval traits |
-| `orinfer-model-sdk` | Shared Rust plan, state, packet, and Schema 2 package data contracts ([README](../crates/orinfer-model-sdk/README.md)) |
+| `orinfer-model-sdk` | Shared driver-free device/target/graph contracts and Rust plan, state, packet, and Schema 2 package data contracts ([README](../crates/orinfer-model-sdk/README.md)) |
 | `orinfer-models` | Statically linked CUDA model adapters (Qwen3.5, Qwen3-ASR, Flash Next, Nemotron Embed, Qwen Reranker) ([README](../crates/orinfer-models/README.md)) |
 
 ### Offline Python, Kernels & Tests

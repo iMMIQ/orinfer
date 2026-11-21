@@ -1,21 +1,18 @@
 """Fuse the existing three-level TopK tree with the same ordered merge helper."""
 
-import argparse
-from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 import json
-import multiprocessing
-from pathlib import Path
 
-from orinfer_build.common.files import atomic_json
 from orinfer_build.models.deepseek_v41.batch import compile_task
 from orinfer_build.models.deepseek_v41.assembly import (
     check_intermediate_liveness,
-    compact_buffers,
-    publish_package,
-    selected_packet_ranges,
     selected_target_packet,
-    validate_rows,
+)
+from orinfer_build.models.deepseek_v41.transform import (
+    compile_and_replace,
+    finalize_plan,
+    plan_parser,
+    stage_plan,
 )
 
 
@@ -79,23 +76,17 @@ def causal_lengths(producer, chain, describe, batch, definitions):
 
 
 def build(plan, output, workers=2, minimum=512, maximum=None, model_dir=None):
-    if output.exists():
-        raise ValueError("Require a new output directory")
-    model = json.loads(plan.read_text())
-    for rank in model["ranks"]:
-        rank["packets"] = selected_packet_ranges(rank["packets"], minimum, maximum)
-    if not model.get("batch"):
-        raise ValueError("Require the owner-row native A2 contract")
-    validate_rows(model, plan.parent, model_dir=model_dir)
-    base = output / "source"
-    publish_package(model, plan.parent, base)
-    descriptions, tasks, counts = {}, {}, []
-
-    def describe(step):
-        name = step["manifest"]
-        if name not in descriptions:
-            descriptions[name] = json.loads((base / name).read_text())
-        return descriptions[name]
+    model, base, describe = stage_plan(
+        plan,
+        output,
+        workers=workers,
+        minimum=minimum,
+        maximum=maximum,
+        require_batch=True,
+        validate_source=True,
+        model_dir=model_dir,
+    )
+    tasks, counts = {}, []
 
     for rank in model["ranks"]:
         definitions = {b["name"]: b for b in rank["buffers"]}
@@ -152,39 +143,25 @@ def build(plan, output, workers=2, minimum=512, maximum=None, model_dir=None):
             counts.append(dict(rank=rank["rank"], family=packet["min_rows"], trees=changed))
     if not tasks:
         raise ValueError("No eligible TopK merge trees")
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        replacements = dict(pool.map(compile_task, [(task, str(base)) for task in tasks.values()]))
-    for rank in model["ranks"]:
-        for packet in rank["packets"]:
-            for step in packet["body"]:
-                if step.get("manifest") in replacements:
-                    step["manifest"] = replacements[step["manifest"]]
-    compact_buffers(model, owner_tables=True)
-    validate_rows(model, base, model_dir=model_dir)
-    assets = publish_package(model, base, output / "package")
-    report = dict(
-        model=str(output / "package/model.json"),
-        minimum=minimum,
-        kernels=len(tasks),
-        assets=assets,
-        families=counts,
-        additional_owner_bytes=0,
+    compile_and_replace(model, tasks, base, workers, compiler=compile_task)
+    return finalize_plan(
+        model,
+        base,
+        output,
+        owner_tables=True,
+        model_dir=model_dir,
+        report_name="topk-tree.json",
+        report=dict(
+            minimum=minimum,
+            kernels=len(tasks),
+            families=counts,
+            additional_owner_bytes=0,
+        ),
     )
-    atomic_json(output / "topk-tree.json", report)
-    return report
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--compile-workers", type=int, default=2)
-    parser.add_argument("--min-rows", type=int, default=512)
-    parser.add_argument("--max-rows", type=int)
-    parser.add_argument("--model-dir", type=Path)
-    args = parser.parse_args()
+    args = plan_parser(__doc__, default_workers=2, min_rows=512, max_rows=True).parse_args()
     print(
         json.dumps(
             build(

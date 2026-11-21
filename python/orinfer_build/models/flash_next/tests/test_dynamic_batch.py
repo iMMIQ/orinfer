@@ -9,7 +9,6 @@ from kernels.cuda.model import moe, hyperconnection, flash_next, rotation_a8
 from kernels.cuda.model.int8_swiglu import int8_swiglu
 from kernels.cuda.model.int8_projection import int8_small_projection
 from kernels.cuda.model.q4_projection import q4_projection
-from kernels.cuda.model.bf16_single import bf16_single
 from kernels.cuda.model.greedy import greedy_merge
 
 TEST_ENVIRONMENT = "cuda"
@@ -230,13 +229,8 @@ class DynamicRowsTests(unittest.TestCase):
 
     def test_metadata_scalars_survive_independent_state_wrapping(self):
         from kernels.cuda.model import qsa
-        from kernels.cuda.model.hc_bf16_cache import hc_up13_mix
         from kernels.cuda.model.independent_rows import independent_rows
 
-        hc = explicit_rows(
-            hc_up13_mix.__wrapped__(1024, 2560, 320, base_exp=None, dynamic_rows=True)
-        )
-        self.assertEqual({p.name for p in hc.params if p.dtype == "int32"}, {"m", "base_exp"})
         for primitive in (qsa.radix_histogram, qsa.radix_choose):
             fn = primitive.__wrapped__(1, 262144, None)
             roles = {b.name: ("private", "Scratch") for b in fn.buffer_map.values()}
@@ -442,14 +436,6 @@ class DynamicRowsTests(unittest.TestCase):
         )
         buffers = {b.name: b for b in fn.buffer_map.values()}
         self.assertEqual(str(buffers["Out"].dtype), "float32")
-
-    def test_direct_bf16_rows_do_not_change_private_split_layout(self):
-        fn = explicit_rows(bf16_single.__wrapped__(320, 2560, 4, rows=4, dynamic_rows=True))
-        (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
-        buffers = {b.name: b for b in fn.buffer_map.values()}
-        self.assertTrue(buffers["A"].shape[0].same_as(rows))
-        self.assertTrue(buffers["Output"].shape[1].same_as(rows))
-        self.assertEqual(int(buffers["Output"].shape[0]), 4)
 
     def test_large_route_histograms_keep_live_segment_strides_and_assignment_rows(self):
         for primitive in (moe.expert_histogram_local, moe.expert_histogram_finish):

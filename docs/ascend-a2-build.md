@@ -72,27 +72,16 @@ uv run --locked python -m orinfer_build.models.deepseek_v41.service \
 For production releases, export physical safetensors (≤4 GiB shards), convert W4 banks to Ascend transposed-NZ `[E, K/64, N/16, 16, 32]`, and pack Engram rows (`i8-f32-g32-v1`) so online startup loads directly without runtime transposes:
 
 ```bash
-# 1. Export physical safetensors + separate execution cache
+# Single-pass physical safetensors export with transposed-NZ W4 banks & packed Engram host rows
 uv run --locked python -m orinfer_build.models.deepseek_v41.export_release \
   --source artifacts/models/dsv41-a2-service \
-  --output artifacts/release/nd-weights \
-  --execution-output artifacts/release/nd-exec \
-  --attribution /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
-
-# 2. Prepack GPU W4 banks to transposed-NZ (unchanged shards hardlinked)
-uv run --locked python -m orinfer_build.models.deepseek_v41.prepack_release \
-  --source artifacts/release/nd-weights \
-  --source-execution artifacts/release/nd-exec \
-  --output artifacts/release/nz-weights \
-  --execution-output artifacts/release/nz-exec
-
-# 3. Pack Engram host rows (INT8 + FP32 scale contiguous per row)
-uv run --locked python -m orinfer_build.models.deepseek_v41.pack_host_release \
-  --source artifacts/release/nz-weights \
-  --source-execution artifacts/release/nz-exec \
   --output artifacts/release/packed-weights \
-  --execution-output artifacts/release/packed-exec
+  --execution-output artifacts/release/packed-exec \
+  --attribution /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
+  --w4-layout transposed_nz --pack-host
 ```
+
+For incremental upgrades of an existing ND release (hardlinking unchanged shards), pass `--mode prepack` or `--mode pack-host` with `--source-execution`.
 
 ---
 
@@ -124,9 +113,9 @@ uv run --locked python -m orinfer_build.models.deepseek_v41.dspark_export \
 
 Vision weights live in `vision.safetensors` (matching the Ascend language preprocessing basis):
 
-- `orinfer_build.models.deepseek_v41.vision` — export `vision.safetensors`.
+- `orinfer_build.models.deepseek_v41.vision export` — export `vision.safetensors`.
 - `orinfer_build.models.deepseek_v41.vision_build` — compile dynamic-patch TileLang-Ascend vision encoder.
-- `orinfer_build.models.deepseek_v41.vision_attach` / `vision_release` — attach vision to an existing language plan and publish.
+- `orinfer_build.models.deepseek_v41.vision attach` / `publish` — attach vision to an existing language plan and publish.
 - `orinfer validate-ascend-vision` — validate encoder outputs against checkpoint reference fixtures.
 
 ---
@@ -139,7 +128,7 @@ Key offline plan transforms in `python/orinfer_build/models/deepseek_v41/`:
 | --- | --- |
 | `build --rebuild-plan PLAN --rebuild-op OP` | Selectively rebuild specific operators (optional `--rebuild-grid-limit N`, e.g., `20` for 20-Cube devices) |
 | `tune` / `tune_auxiliary` / `tune_attention` | On-device real-weight tile & pipeline tuning with changed-input Graph replay verification |
-| `fuse_attention` / `fuse_indexer` / `fuse_topk` / `fuse_hc` / `fuse_ffn_collectives` / `expert_fusion` | Offline operator & collective fusion passes preserving numeric contracts |
+| `fuse_attention` / `fuse_indexer` / `fuse_topk` / `fuse_ffn_collectives` / `expert_fusion` | Offline operator & collective fusion passes preserving numeric contracts |
 | `decoder_rows` | Bounded decoder replay (`--keep 128..512`, `--final-prompt-only`, `--source-kv-boundary`) |
 | `candidate_blocks` | Checkpoint-declared cross-layer candidate block TopK (layer 20 → layers 24/28/32/36) |
 | `floating_head` | Convert FP32 target/draft heads to 3-plane (or 2-plane) BF16 Cube partials + FP32 reduce |

@@ -8,7 +8,7 @@ pub(crate) mod report;
 pub(crate) mod snapshot;
 mod values;
 pub(crate) use cuda::executor::Executor;
-pub use orinfer_device::{Backend, DeviceInfo, GraphMode, Target};
+pub use orinfer_model_sdk::device::{Backend, DeviceInfo, GraphMode, Target};
 pub(crate) use report::LoadStats;
 pub(crate) use values::floats;
 

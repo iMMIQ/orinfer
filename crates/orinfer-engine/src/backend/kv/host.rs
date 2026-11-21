@@ -431,13 +431,13 @@ mod tests {
     #[test]
     fn cpu_capture_preserves_roles_offsets_and_weak_replica_identity() {
         for backend in [
-            orinfer_device::Backend::Cuda,
-            orinfer_device::Backend::Ascend,
+            orinfer_model_sdk::device::Backend::Cuda,
+            orinfer_model_sdk::device::Backend::Ascend,
         ] {
             capture_lifecycle(backend);
         }
     }
-    fn capture_lifecycle(backend: orinfer_device::Backend) {
+    fn capture_lifecycle(backend: orinfer_model_sdk::device::Backend) {
         let owner = DeviceOwner::new(backend, 0);
         let kv = Rc::new(Allocation {
             owner,

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from orinfer_build.models.deepseek_v41.pack_host_release import record_chunks
+from orinfer_build.models.deepseek_v41.export_release import record_chunks
 from orinfer_build.models.deepseek_v41.weight_layout import (
     restore_nd,
     transposed_nz_blocks,

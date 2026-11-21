@@ -1,7 +1,7 @@
 //! Backend-owned backing for shared prefix extents and private continuation state.
 pub(crate) use super::kv::Allocation;
 use crate::artifact::Result;
-pub(crate) use orinfer_device::MemoryRange as Range;
+pub(crate) use orinfer_model_sdk::device::MemoryRange as Range;
 use std::{collections::BTreeMap, rc::Rc};
 #[derive(Clone)]
 pub(crate) struct Piece {
@@ -12,13 +12,16 @@ pub(crate) struct Piece {
 }
 #[derive(Clone)]
 pub(crate) struct Snapshot {
-    pub(super) owner: orinfer_device::DeviceOwner,
+    pub(super) owner: orinfer_model_sdk::device::DeviceOwner,
     pub bytes: usize,
     pub(super) state: Vec<Piece>,
     pub kv: Vec<Piece>,
 }
 impl Snapshot {
-    pub(super) fn require_owner(&self, owner: orinfer_device::DeviceOwner) -> Result<()> {
+    pub(super) fn require_owner(
+        &self,
+        owner: orinfer_model_sdk::device::DeviceOwner,
+    ) -> Result<()> {
         owner.require(self.owner)?;
         for piece in self.state.iter().chain(&self.kv) {
             owner.require(piece.allocation.owner)?;
@@ -40,7 +43,7 @@ impl Workspace {
 }
 #[derive(Clone)]
 pub(crate) struct Plan {
-    pub(super) owner: orinfer_device::DeviceOwner,
+    pub(super) owner: orinfer_model_sdk::device::DeviceOwner,
     pub(super) state: BTreeMap<String, Range>,
     pub(super) shared: BTreeMap<String, Range>,
     pub(super) tails: BTreeMap<String, Range>,
@@ -143,7 +146,7 @@ pub(super) fn size(ranges: &BTreeMap<String, Range>) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orinfer_device::{Backend, DeviceOwner};
+    use orinfer_model_sdk::device::{Backend, DeviceOwner};
 
     #[test]
     fn cpu_parent_plan_reuses_only_kv_and_accounts_inherited_banks() {

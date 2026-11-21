@@ -181,9 +181,9 @@ impl Executor {
         preload: &std::collections::BTreeSet<String>,
     ) -> Result<(Self, LoadStats)> {
         let manifest = &prepared.plan;
-        let target = orinfer_device::Target::from_package(&manifest.target)?;
+        let target = orinfer_model_sdk::device::Target::from_package(&manifest.target)?;
         target.require_host(std::env::consts::ARCH)?;
-        if target.backend == orinfer_device::Backend::Ascend {
+        if target.backend == orinfer_model_sdk::device::Backend::Ascend {
             return Err("This package requires Ascend model execution; no Ascend model provider is registered yet".into());
         }
         let base = &prepared.weights_root;

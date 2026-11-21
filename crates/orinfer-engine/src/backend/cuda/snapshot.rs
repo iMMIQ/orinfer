@@ -627,7 +627,10 @@ mod tests {
     #[test]
     fn partial_valid_prefix_maps_the_same_physical_allocation() {
         let allocation = Rc::new(Allocation {
-            owner: orinfer_device::DeviceOwner::new(orinfer_device::Backend::Cuda, 0),
+            owner: orinfer_model_sdk::device::DeviceOwner::new(
+                orinfer_model_sdk::device::Backend::Cuda,
+                0,
+            ),
             id: 2,
             address: 0,
             bytes: 8192,

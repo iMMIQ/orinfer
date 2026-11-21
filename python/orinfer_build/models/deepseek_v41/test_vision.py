@@ -7,8 +7,7 @@ import struct
 import tempfile
 import unittest
 
-from orinfer_build.models.deepseek_v41.vision import export, tensor_shapes
-from orinfer_build.models.deepseek_v41.vision_attach import attach, rebind_masks
+from orinfer_build.models.deepseek_v41.vision import attach, export, rebind_masks, tensor_shapes
 from orinfer_build.models.deepseek_v41.vision_build import program
 from orinfer_build.contracts.row_contract import expression, resolve
 from orinfer_build.weights.safetensors_source import local_header

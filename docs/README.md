@@ -11,7 +11,7 @@ flowchart LR
     Client["OpenAI / Ollama / CLI Clients"] --> API["orinfer-api<br/>HTTP/SSE, Chat/Audio/Embed/Rerank, Batch, Manager"]
     API --> Engine["orinfer-engine<br/>Continuous Scheduler, Prefix Cache, Adaptive MTP/DSpark"]
     Engine --> Models["orinfer-models<br/>Static Rust Model Adapters"]
-    Engine --> Device["orinfer-device + Backends"]
+    Engine --> Device["Device Contracts + Backends"]
     Device --> CUDA["CUDA SM87 Backend<br/>Schema 2 Packages (TileLang cubins)"]
     Device --> Ascend["Ascend 910B Backend<br/>CANN 9.2 + ACLNN W4A8 + TileLang AOT + HCCL"]
 ```

@@ -5,24 +5,21 @@ query. They follow the existing owner/decoder/TP row mapping and never become
 persistent KV or prefix state. All consumers use the common INT8 score factory.
 """
 
-import argparse
-from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 import hashlib
 import inspect
 import json
 import math
-import multiprocessing
 from pathlib import Path
 
-from orinfer_build.common.files import atomic_json, file_hash
-from orinfer_build.common.shared_json import decode
-from orinfer_build.models.deepseek_v41.assembly import (
-    compact_buffers,
-    publish_package,
-    validate_rows,
-)
+from orinfer_build.common.files import file_hash
 from orinfer_build.models.deepseek_v41.batch import compile_task, DTYPES
+from orinfer_build.models.deepseek_v41.transform import (
+    compile_and_replace,
+    finalize_plan,
+    plan_parser,
+    stage_plan,
+)
 
 
 INDEX_OPS = {"private_rows.indexer_cube_causal_logits", "private_rows.indexer_fused_causal_topk"}
@@ -58,29 +55,17 @@ def build(plan, output, model_dir, workers=4, index_chunk=1024):
 
     if index_chunk not in (512, 1024, 2048, 4096):
         raise ValueError("Invalid index chunk size")
-    if output.exists():
-        raise ValueError("Require a new candidate-block output directory")
     config = json.loads((model_dir / "config.json").read_text())["text_config"]
     source = config["candidate_source_layer_id"]
     layers = config["index_source_layer_ids"]
     selected, block = config["candidate_topk_blocks"], config["candidate_block_size"]
     if source != 20 or layers != [2, 8, 14, 20, 24, 28, 32, 36] or (selected, block) != (2048, 8):
         raise ValueError("Unsupported candidate-block topology")
-    model = decode(json.loads(plan.read_text()))
+    model, base, describe = stage_plan(plan, output, workers=workers)
     contract = model["batch"]
     if any(".candidate_blocks" in c["buffer"] for c in contract["columns"]):
         raise ValueError("Candidate-block topology is already compiled")
-    base = output / "source"
-    publish_package(model, plan.parent, base)
-    descriptions, tasks, registered, registered_grids = {}, {}, {}, {}
-
-    def describe(step):
-        if step.get("op") != "kernel":
-            return None
-        path = step["manifest"]
-        if path not in descriptions:
-            descriptions[path] = json.loads((base / path).read_text())
-        return descriptions[path]
+    tasks, registered, registered_grids = {}, {}, {}
 
     def register(factory, params, writes, *, columns=None):
         signature = json.dumps(
@@ -426,40 +411,27 @@ def build(plan, output, model_dir, workers=4, index_chunk=1024):
                     step["manifest"], _ = register(
                         getattr(topk, name), params, {"out", "indices", "values"}
                     )
-    jobs = [(task, str(base)) for task in tasks.values()]
-    if workers == 1:
-        replacements = dict(compile_task(job) for job in jobs)
-    else:
-        with ProcessPoolExecutor(
-            max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-        ) as pool:
-            replacements = dict(pool.map(compile_task, jobs))
-    for rank in model["ranks"]:
-        for packet in rank["packets"]:
-            for step in packet["body"] + packet["head"]:
-                if step.get("manifest") in replacements:
-                    step["manifest"] = replacements[step["manifest"]]
-    compact_buffers(model, owner_tables=True)
-    validate_rows(model, base, model_dir=model_dir)
-    publish_package(model, base, output / "package")
-    report = dict(
-        changed_chains=changed,
-        kernels=len(tasks),
-        index_chunk_size=index_chunk,
-        source_layer=source,
-        consumer_index_layers=[v for v in layers if v > source],
-        model=str(output / "package/model.json"),
+    compile_and_replace(model, tasks, base, workers, compiler=compile_task, include_head=True)
+    return finalize_plan(
+        model,
+        base,
+        output,
+        owner_tables=True,
+        model_dir=model_dir,
+        report_name="candidate-blocks.json",
+        report=dict(
+            changed_chains=changed,
+            kernels=len(tasks),
+            index_chunk_size=index_chunk,
+            source_layer=source,
+            consumer_index_layers=[v for v in layers if v > source],
+        ),
     )
-    atomic_json(output / "candidate-blocks.json", report)
-    return report
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser = plan_parser(__doc__, default_workers=4, model_dir=False)
     parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--index-chunk", type=int, choices=(512, 1024, 2048, 4096), default=1024)
     args = parser.parse_args()
     print(

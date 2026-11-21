@@ -380,7 +380,7 @@ def build(
 
 def rebuild(source, output, operators, workers):
     from orinfer_build.models.deepseek_v41.build import compile_plan_tasks, kernel_rebuild_task
-    from orinfer_build.models.deepseek_v41.vision_attach import hardlinks
+    from orinfer_build.models.deepseek_v41.vision import hardlinks
 
     source, output = source.resolve(), output.resolve()
     if output.exists() or not operators:

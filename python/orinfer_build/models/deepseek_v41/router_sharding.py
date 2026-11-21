@@ -5,19 +5,16 @@ column spans overlap at the tail, and AllGather restores the 384 logical logits
 before the original TopK. Expert placement, weights and request state stay fixed.
 """
 
-import argparse
-from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 import json
 import math
-import multiprocessing
-from pathlib import Path
 
-from orinfer_build.common.files import atomic_json
-from orinfer_build.models.deepseek_v41.assembly import (
-    compact_buffers,
-    publish_package,
-    validate_rows,
+from orinfer_build.models.deepseek_v41.transform import (
+    compile_and_replace,
+    define_buffer,
+    finalize_plan,
+    plan_parser,
+    stage_plan,
 )
 from orinfer_build.contracts.row_contract import expression
 
@@ -36,24 +33,11 @@ def build(plan, output, workers=4):
     from orinfer_build.models.deepseek_v41.build import compile_task
     from orinfer_build.compiler.ascend.build import operand
 
-    if output.exists() or workers < 1:
-        raise ValueError("Require a new output directory and positive compiler count")
-    model = json.loads(plan.read_text())
+    model, base, describe = stage_plan(plan, output, workers=workers)
     peers = len(model["ranks"])
     if [rank["rank"] for rank in model["ranks"]] != list(range(peers)):
         raise ValueError("Router shards require ordered ranks")
-    output.mkdir(parents=True)
-    base = output / "source"
-    publish_package(model, plan.parent, base)
-    descriptions, tasks = {}, {}
-
-    def describe(step):
-        if step.get("op") != "kernel":
-            return None
-        path = step["manifest"]
-        if path not in descriptions:
-            descriptions[path] = json.loads((base / path).read_text())
-        return descriptions[path]
+    tasks = {}
 
     def kernel(op, arguments, specs, capacity):
         key = json.dumps([op, arguments, specs, capacity], sort_keys=True)
@@ -75,13 +59,7 @@ def build(plan, output, workers=4):
         definitions = {b["name"]: b for b in rank["buffers"]}
 
         def buffer(name, size, **kwargs):
-            definition = dict(name=name, bytes=size, **kwargs)
-            if name not in definitions:
-                rank["buffers"].append(definition)
-                definitions[name] = definition
-            elif definitions[name] != definition:
-                raise ValueError("Conflicting router shard buffer")
-            return name
+            return define_buffer(rank, definitions, name, size, label="router shard", **kwargs)
 
         for packet in rank["packets"]:
             if not packet.get("batch_decode"):
@@ -190,29 +168,20 @@ def build(plan, output, workers=4):
             packet["body"] = body
     if not changes:
         raise ValueError("No decode router projections found")
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        replacements = dict(pool.map(compile_task, [(t, str(base)) for t in tasks.values()]))
-    for rank in model["ranks"]:
-        for packet in rank["packets"]:
-            for step in packet["body"]:
-                if step.get("manifest") in replacements:
-                    step["manifest"] = replacements[step["manifest"]]
-    compact_buffers(model)
-    validate_rows(model, base)
-    atomic_json(base / "model.json", model)
-    assets = publish_package(model, base, output / "package")
-    atomic_json(output / "router-sharding.json", dict(projections=changes, assets=assets))
+    compile_and_replace(model, tasks, base, workers, compiler=compile_task)
+    finalize_plan(
+        model,
+        base,
+        output,
+        save_base=True,
+        report_name="router-sharding.json",
+        report=dict(projections=changes),
+    )
     return output / "package/model.json"
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--compile-workers", type=int, default=4)
-    args = parser.parse_args()
+    args = plan_parser(__doc__, default_workers=4, model_dir=False).parse_args()
     print(build(args.plan, args.output, args.compile_workers))
 
 

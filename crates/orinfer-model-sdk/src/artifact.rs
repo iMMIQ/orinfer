@@ -120,9 +120,9 @@ pub enum Launch {
     },
 }
 impl Launch {
-    pub fn backend(&self) -> orinfer_device::Backend {
+    pub fn backend(&self) -> crate::device::Backend {
         match self {
-            Self::Ascend { .. } => orinfer_device::Backend::Ascend,
+            Self::Ascend { .. } => crate::device::Backend::Ascend,
         }
     }
 }
@@ -162,12 +162,12 @@ pub(crate) fn validate_geometry(
     Ok(())
 }
 impl Kernel {
-    pub fn backend(&self) -> orinfer_device::Backend {
+    pub fn backend(&self) -> crate::device::Backend {
         self.launch
             .as_ref()
-            .map_or(orinfer_device::Backend::Cuda, Launch::backend)
+            .map_or(crate::device::Backend::Cuda, Launch::backend)
     }
-    pub fn validate_launch(&self, target: &orinfer_device::Target) -> Result<()> {
+    pub fn validate_launch(&self, target: &crate::device::Target) -> Result<()> {
         target.validate()?;
         if self.backend() != target.backend {
             return Err("Kernel backend differs from package target".into());
@@ -196,7 +196,7 @@ pub enum Argument {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orinfer_device::Target;
+    use crate::device::Target;
 
     fn kernel() -> serde_json::Value {
         let asset = serde_json::json!({"file":"kernel.bin","sha256":"0".repeat(64)});

@@ -90,7 +90,7 @@ pub(super) fn inspect() -> Result<super::Inventory> {
         compatible = [major, minor] == [8, 7];
     }
     Ok(super::Inventory {
-        backend: orinfer_device::Backend::Cuda,
+        backend: orinfer_model_sdk::device::Backend::Cuda,
         host_arch: std::env::consts::ARCH.into(),
         device_count: count.try_into().map_err(|_| "Negative CUDA device count")?,
         soc: None,
@@ -102,7 +102,7 @@ pub(super) fn inspect() -> Result<super::Inventory> {
 
 #[cfg(test)]
 use crate::backend::values::half_to_float;
-pub use orinfer_device::DeviceInfo;
+pub use orinfer_model_sdk::device::DeviceInfo;
 #[derive(Debug, Serialize)]
 pub struct RunReport {
     pub manifest_sha256: String,
@@ -125,7 +125,7 @@ pub struct RunReport {
 // Raw handles make this private owner !Send/!Sync. No CUDA context or allocation
 // is borrowed by outside code, and all resources belong to the retained context.
 pub(crate) struct Session {
-    pub(crate) owner: orinfer_device::DeviceOwner,
+    pub(crate) owner: orinfer_model_sdk::device::DeviceOwner,
     pub(crate) driver: Driver,
     pub(crate) device: i32,
     pub(crate) previous: sys::CUcontext,
@@ -151,7 +151,10 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn new(driver: Driver) -> Self {
         Self {
-            owner: orinfer_device::DeviceOwner::new(orinfer_device::Backend::Cuda, 0),
+            owner: orinfer_model_sdk::device::DeviceOwner::new(
+                orinfer_model_sdk::device::Backend::Cuda,
+                0,
+            ),
             driver,
             device: 0,
             previous: ptr::null_mut(),

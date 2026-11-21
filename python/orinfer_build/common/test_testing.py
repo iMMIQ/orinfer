@@ -27,4 +27,4 @@ class DiscoveryTests(unittest.TestCase):
     def test_previously_unregistered_suites_are_selected(self):
         selected = test_modules()
         self.assertIn("orinfer_build.models.deepseek_v41.test_fuse_ffn_collectives", selected)
-        self.assertIn("orinfer_build.models.flash_next.tests.test_hc_bf16", selected)
+        self.assertIn("orinfer_build.models.flash_next.tests.test_speculation", selected)

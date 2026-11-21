@@ -2,22 +2,21 @@
 
 from importlib import import_module
 
-import argparse
-from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 import hashlib
 import inspect
 import json
-import multiprocessing
 from pathlib import Path
 
-from orinfer_build.common.files import atomic_json, file_hash
+from orinfer_build.common.files import file_hash
 from orinfer_build.models.deepseek_v41.batch import compile_task
 from orinfer_build.models.deepseek_v41.decoder_boundary import live_rows, source_boundary
-from orinfer_build.models.deepseek_v41.assembly import (
-    compact_buffers,
-    publish_package,
-    validate_rows,
+from orinfer_build.models.deepseek_v41.assembly import compact_buffers
+from orinfer_build.models.deepseek_v41.transform import (
+    compile_and_replace,
+    finalize_plan,
+    plan_parser,
+    stage_plan,
 )
 from orinfer_build.contracts.row_contract import expression
 
@@ -27,24 +26,17 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False, source_kv_
     from kernels.ascend.private_rows import indirect
     from kernels.shared.rows import row_count
 
-    if output.exists() or not 128 <= keep <= 512:
+    if not 128 <= keep <= 512:
         raise ValueError("Require a new output directory and 128..512 retained rows")
-    model = json.loads(plan.read_text())
-    contract = model.get("batch")
+    model, base, describe = stage_plan(
+        plan, output, workers=workers, require_batch=True, validate_source=True
+    )
+    contract = model["batch"]
     peers = len(model["ranks"])
-    if not contract or peers != 8 or contract.get("decoder_replay"):
+    if peers != 8 or contract.get("decoder_replay"):
         raise ValueError("Require a complete TP8 owner-row plan")
-    validate_rows(model, plan.parent)
-    base = output / "source"
-    publish_package(model, plan.parent, base)
-    descriptions, tasks = {}, {}
+    tasks = {}
     decoder_columns, decoder_tables, maps = {}, set(), {}
-
-    def describe(step):
-        path = step["manifest"]
-        if path not in descriptions:
-            descriptions[path] = json.loads((base / path).read_text())
-        return descriptions[path]
 
     def register(task):
         identity = json.dumps(task, sort_keys=True)
@@ -470,47 +462,37 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False, source_kv_
             s for s in contract["state"] if s["buffer"] in decoder_state
         ]
         contract["state"] = [s for s in contract["state"] if s["buffer"] not in decoder_state]
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        replacements = dict(pool.map(compile_task, [(v, str(base)) for v in tasks.values()]))
-    for rank in model["ranks"]:
-        for packet in rank["packets"]:
-            for step in packet["body"] + packet["head"]:
-                if step.get("manifest") in replacements:
-                    step["manifest"] = replacements[step["manifest"]]
+    compile_and_replace(model, tasks, base, workers, compiler=compile_task, include_head=True)
     compact_buffers(model, owner_tables=True)
     live_tables = set(contract["pointers"]) | set(contract["work"])
     contract["decoder_replay"]["tables"] = sorted(
         set(contract["decoder_replay"]["tables"]) & live_tables
     )
-    validate_rows(model, base)
-    assets = publish_package(model, base, output / "package")
-    report = dict(
-        model=str(output / "package/model.json"),
-        keep=keep,
-        final_prompt_only=final_prompt_only,
-        source_kv_boundary=source_kv_boundary,
-        kernels=len(tasks),
-        assets=assets,
-        families=counts,
-        additional_owner_bytes=0,
+    return finalize_plan(
+        model,
+        base,
+        output,
+        owner_tables=True,
+        report_name="decoder-replay.json",
+        report=dict(
+            keep=keep,
+            final_prompt_only=final_prompt_only,
+            source_kv_boundary=source_kv_boundary,
+            kernels=len(tasks),
+            families=counts,
+            additional_owner_bytes=0,
+        ),
     )
-    atomic_json(output / "decoder-replay.json", report)
-    return report
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser = plan_parser(__doc__, default_workers=4, model_dir=False)
     parser.add_argument(
         "--keep",
         type=int,
         default=128,
         help="Retained decoder rows per owner (128..512 for owner-row plans)",
     )
-    parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument(
         "--final-prompt-only",
         action="store_true",

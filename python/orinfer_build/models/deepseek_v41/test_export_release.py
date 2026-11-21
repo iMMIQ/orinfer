@@ -9,8 +9,11 @@ import unittest
 
 import numpy as np
 
-from orinfer_build.models.deepseek_v41.export_release import Export, verify_release
-from orinfer_build.models.deepseek_v41.pack_host_release import HostRecordRelease
+from orinfer_build.models.deepseek_v41.export_release import (
+    Export,
+    HostRecordRelease,
+    verify_release,
+)
 from orinfer_build.weights.safetensors_source import local_header
 from orinfer_build.common.files import file_hash
 from orinfer_build.common.elf import runtime_sections
@@ -374,6 +377,24 @@ class ReleaseExportTests(unittest.TestCase):
             self.assertFalse(any(packed.rglob("*.so")))
             self.assertEqual(
                 (packed / "SOURCE-README.md").read_text(), "original model attribution"
+            )
+            single_pass = root / "single-pass-packed"
+            single_pass_exec = root / "single-pass-exec"
+            Export(
+                source,
+                single_pass,
+                execution_output=single_pass_exec,
+                source_execution=source_execution,
+                pack_host=True,
+            ).plan().export(2)
+            sp_index = json.loads((single_pass / "model.safetensors.index.json").read_text())
+            self.assertFalse(sp_index["row_shards"])
+            sp_parts = sp_index["row_records"]["layers.1.engram.embed"]["parts"]
+            self.assertEqual(
+                b"".join(read_tensor(single_pass, sp_index, n) for n in sp_parts), expected
+            )
+            self.assertEqual(
+                verify_release(single_pass, 2, single_pass_exec)["prepared_bindings"], 6
             )
 
 

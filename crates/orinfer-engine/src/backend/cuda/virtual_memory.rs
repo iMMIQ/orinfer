@@ -170,7 +170,7 @@ impl Reservation {
     }
     pub(crate) fn preview(
         &self,
-        owner: orinfer_device::DeviceOwner,
+        owner: orinfer_model_sdk::device::DeviceOwner,
         range: crate::backend::snapshot::Range,
     ) -> Result<
         Vec<(
@@ -475,7 +475,10 @@ mod tests {
             id: crate::backend::kv::allocation_id().unwrap(),
             used: 8192,
             native: None,
-            owner: orinfer_device::DeviceOwner::new(orinfer_device::Backend::Cuda, 0),
+            owner: orinfer_model_sdk::device::DeviceOwner::new(
+                orinfer_model_sdk::device::Backend::Cuda,
+                0,
+            ),
             address: 0,
             bytes: 8192,
             handle: Some(7),

@@ -20,6 +20,7 @@ import numpy as np
 
 from orinfer_build.common.files import atomic_json, file_hash
 from orinfer_build.common.shared_json import decode
+from orinfer_build.models.deepseek_v41.weight_layout import transposed_nz_file_chunks
 from orinfer_build.weights.safetensors_source import local_header, SIZES
 
 CHUNK = 8 << 20
@@ -90,10 +91,77 @@ def physical_contract(rank, package, specs=None):
     return physical
 
 
+def record_chunks(weight, scale, rows, width, block_rows=16384):
+    """Two sequential input ranges produce unchanged value/scale bytes in row order."""
+    if rows < 1 or width < 1 or width % 32 or block_rows < 1:
+        raise ValueError("Host records require positive group-32 INT8 rows")
+    scale_bytes = width // 32 * 4
+    with Path(weight[0]).open("rb", buffering=8 << 20) as w:
+        with Path(scale[0]).open("rb", buffering=8 << 20) as s:
+            w.seek(weight[1])
+            s.seek(scale[1])
+            for first in range(0, rows, block_rows):
+                count = min(block_rows, rows - first)
+                values = w.read(count * width)
+                scales = s.read(count * scale_bytes)
+                if len(values) != count * width or len(scales) != count * scale_bytes:
+                    raise EOFError("Truncated host INT8 value/scale range")
+                out = np.empty((count, width + scale_bytes), dtype=np.uint8)
+                out[:, :width] = np.frombuffer(values, dtype=np.uint8).reshape(count, width)
+                out[:, width:] = np.frombuffer(scales, dtype=np.uint8).reshape(count, scale_bytes)
+                yield memoryview(out).cast("B")
+
+
+def _plan_w4_nz_transforms(model, key_for_buffer):
+    """Rewrite ND W4 steps in place to transposed-NZ and return {key: [E, K, N]}."""
+    transforms = {}
+    for rank in model["ranks"]:
+        definitions = {b["name"]: b for b in rank["buffers"]}
+        workspace_sizes = {}
+        for packet in rank["packets"]:
+            for step in packet["body"] + packet["head"]:
+                if step["op"] != "w4":
+                    continue
+                if step.get("weight_layout", "nd") != "nd":
+                    raise ValueError("Prepacking requires the original ND representation")
+                if step.get("expected_expert_rows") != 16:
+                    raise ValueError("NZ capacity/workspace selection was measured with hint16")
+                e, k, n = step["experts"], step["input"], step["output"]
+                if e != 48 or (k, n) not in [(5120, 4608), (2304, 5120)]:
+                    raise ValueError("Unmeasured W4 NZ geometry")
+                target = definitions[step["buffers"][1]]
+                key = key_for_buffer(target)
+                geometry = [e, k, n]
+                if key in transforms and transforms[key] != geometry:
+                    raise ValueError("Conflicting W4 physical shapes")
+                transforms[key] = geometry
+                if "prepared_tensor" in target:
+                    target["prepared_tensor"]["shape"] = [e, k // 64, n // 16, 16, 32]
+                step["weight_layout"] = "transposed_nz"
+                workspace = step["workspace"]
+                required = 32 << 20 if step["rows"] <= 192 else 320 << 20
+                workspace_sizes[workspace] = max(workspace_sizes.get(workspace, 0), required)
+        for name, size in workspace_sizes.items():
+            definitions[name]["bytes"] = size
+    return transforms
+
+
 class Export:
     def __init__(
-        self, source, output, attribution=None, execution_output=None, source_execution=None
+        self,
+        source,
+        output,
+        attribution=None,
+        execution_output=None,
+        source_execution=None,
+        *,
+        w4_layout="nd",
+        pack_host=False,
     ):
+        if w4_layout not in ("nd", "transposed_nz"):
+            raise ValueError(f"Unsupported W4 layout: {w4_layout}")
+        self.w4_layout = w4_layout
+        self.pack_host = pack_host
         self.source, self.output = Path(source).resolve(), Path(output).resolve()
         self.execution_output = Path(execution_output).resolve() if execution_output else None
         if self.execution_output and (
@@ -137,6 +205,11 @@ class Export:
 
     def plan(self):
         specs = {}
+        nz_banks = {}
+        if self.w4_layout == "transposed_nz":
+            nz_banks = _plan_w4_nz_transforms(self.model, lambda b: b["prepared_weight"])
+            self.index["metadata"]["w4_layout"] = "transposed_nz"
+            self.manifest["w4_layout"] = "transposed_nz"
         for rank in self.model["ranks"]:
             physical = physical_contract(rank, self.package, specs)
             for b in rank["buffers"]:
@@ -145,7 +218,14 @@ class Export:
                     if b["name"] not in physical:
                         raise ValueError(f"Missing physical contract: {b['name']}")
                     dtype, shape = physical[b["name"]]
-                    source = dict(file=str(self.package / b["prepared_weight"]), offset=0)
+                    if b["prepared_weight"] in nz_banks:
+                        source = dict(
+                            nz_source=str(self.package / b["prepared_weight"]),
+                            offset=0,
+                            geometry=nz_banks[b["prepared_weight"]],
+                        )
+                    else:
+                        source = dict(file=str(self.package / b["prepared_weight"]), offset=0)
                 elif "weight" in b:
                     w = b["weight"]
                     key = "transform:" + json.dumps(w, sort_keys=True)
@@ -206,40 +286,93 @@ class Export:
             ),
         )
         layout = json.loads((self.package / self.model["engram"]["file"]).read_text())
+        if self.pack_host:
+            self.index["metadata"]["host_row_layout"] = "i8-f32-g32-v1"
+            self.index["row_records"] = {}
+            self.manifest["host_row_layout"] = "i8-f32-g32-v1"
         for layer in layout["layers"]:
-            weight = f"layers.{layer['layer']}.engram.embed.weight"
-            scale = f"layers.{layer['layer']}.engram.embed.scale"
+            prefix = f"layers.{layer['layer']}.engram.embed"
+            weight = f"{prefix}.weight"
+            scale = f"{prefix}.scale"
             sources = {name: self.tensor(name) for name in [weight, scale]}
             self.manifest["logical_shapes"].update(
                 {name: source["shape"] for name, source in sources.items()}
             )
             first = 0
-            for name in sources:
-                self.index["row_shards"][name] = []
-            for head, rows in enumerate(layer["primes"]):
-                half = (rows + 1) // 2
-                for part, begin in enumerate(range(0, rows, half)):
-                    count = min(half, rows - begin)
-                    group = f"weights/host/layer-{layer['layer']:02}/head-{head:02}-part-{part:02}.safetensors"
-                    for logical, source in sources.items():
-                        dtype, width = source["dtype"], source["shape"][1]
-                        name = f"{logical}.head_{head:02}.part_{part:02}"
-                        self.index["row_shards"][logical].append(name)
+            if self.pack_host:
+                w_src, s_src = sources[weight], sources[scale]
+                width = w_src["shape"][1]
+                if (
+                    w_src["dtype"] != "I8"
+                    or s_src["dtype"] != "F32"
+                    or s_src["shape"] != [w_src["shape"][0], width // 32]
+                    or width % 32
+                ):
+                    raise ValueError("Host value/scale dtype or geometry differs")
+                scale_width = width // 32
+                parts = []
+                part_index = 0
+                for head, rows in enumerate(layer["primes"]):
+                    half = (rows + 1) // 2
+                    for part, begin in enumerate(range(0, rows, half)):
+                        count = min(half, rows - begin)
+                        group = f"weights/host/layer-{layer['layer']:02}/head-{head:02}-part-{part:02}.safetensors"
+                        name = f"{prefix}.records.part{part_index:04}"
+                        part_index += 1
+                        parts.append(name)
+                        row_bytes = width + scale_width * 4
                         self.add(
                             group,
                             name,
                             dict(
-                                dtype=dtype,
-                                shape=[count, width],
-                                bytes=count * width * SIZES[dtype],
+                                dtype="U8",
+                                shape=[count, row_bytes],
+                                bytes=count * row_bytes,
                                 source=dict(
-                                    file=source["file"],
-                                    offset=source["offset"]
-                                    + (first + begin) * width * SIZES[dtype],
+                                    row_record=dict(
+                                        weight=[
+                                            w_src["file"],
+                                            w_src["offset"] + (first + begin) * width,
+                                        ],
+                                        scale=[
+                                            s_src["file"],
+                                            s_src["offset"] + (first + begin) * scale_width * 4,
+                                        ],
+                                        rows=count,
+                                        width=width,
+                                    )
                                 ),
                             ),
                         )
-                first += rows
+                    first += rows
+                self.index["row_records"][prefix] = dict(format="i8-f32-g32-v1", parts=parts)
+            else:
+                for name in sources:
+                    self.index["row_shards"][name] = []
+                for head, rows in enumerate(layer["primes"]):
+                    half = (rows + 1) // 2
+                    for part, begin in enumerate(range(0, rows, half)):
+                        count = min(half, rows - begin)
+                        group = f"weights/host/layer-{layer['layer']:02}/head-{head:02}-part-{part:02}.safetensors"
+                        for logical, source in sources.items():
+                            dtype, width = source["dtype"], source["shape"][1]
+                            name = f"{logical}.head_{head:02}.part_{part:02}"
+                            self.index["row_shards"][logical].append(name)
+                            self.add(
+                                group,
+                                name,
+                                dict(
+                                    dtype=dtype,
+                                    shape=[count, width],
+                                    bytes=count * width * SIZES[dtype],
+                                    source=dict(
+                                        file=source["file"],
+                                        offset=source["offset"]
+                                        + (first + begin) * width * SIZES[dtype],
+                                    ),
+                                ),
+                            )
+                    first += rows
             if first != layer["rows"]:
                 raise ValueError("Hash-head partitions do not cover the original table")
         for group, entries in self.groups.items():
@@ -266,6 +399,14 @@ class Export:
 
     def chunks(self, entry):
         source = entry["source"]
+        if "nz_source" in source:
+            yield from transposed_nz_file_chunks(
+                source["nz_source"], source["offset"], *source["geometry"]
+            )
+            return
+        if "row_record" in source:
+            yield from record_chunks(**source["row_record"])
+            return
         if "file" in source:
             with open(source["file"], "rb") as f:
                 f.seek(source["offset"])
@@ -666,9 +807,163 @@ def verify_release(output, workers=4, execution_output=None):
     return proof
 
 
+class _IncrementalRelease(Export):
+    def write_shard(self, group):
+        if group in self.rewrite_groups:
+            return super().write_shard(group)
+        target = self.output / group
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.hardlink_to(self.source / group)
+        return group, deepcopy(self.old_records[group])
+
+
+class PrepackRelease(_IncrementalRelease):
+    """Prepare transposed-NZ W4 shards from an existing ND release, hardlinking unchanged shards."""
+
+    def plan(self):
+        self.index = deepcopy(self.old_index)
+        self.index["metadata"]["w4_layout"] = "transposed_nz"
+        old_manifest = json.loads((self.source / "release-manifest.json").read_text())
+        self.old_records = old_manifest["files"]
+        self.manifest["logical_shapes"] = old_manifest["logical_shapes"]
+        self.manifest["w4_layout"] = "transposed_nz"
+        self.rewrite_groups = set()
+        transforms = _plan_w4_nz_transforms(self.model, lambda b: b["prepared_tensor"]["name"])
+        for group, record in self.old_records.items():
+            path = self.source / group
+            if path not in self.headers:
+                self.headers[path] = local_header(path)
+            start, header = self.headers[path]
+            names = sorted(record["tensors"], key=lambda n: header[n]["data_offsets"][0])
+            for name in names:
+                spec = header[name]
+                offset = start + spec["data_offsets"][0]
+                source = dict(file=str(path), offset=offset)
+                shape = spec["shape"]
+                if name in transforms:
+                    e, k, n = transforms[name]
+                    if spec["dtype"] != "I8" or shape != [e, k, n // 2]:
+                        raise ValueError("Original packed W4 tensor contract differs")
+                    source = dict(nz_source=str(path), offset=offset, geometry=[e, k, n])
+                    shape = [e, k // 64, n // 16, 16, 32]
+                    self.rewrite_groups.add(group)
+                self.groups[group].append(
+                    (
+                        name,
+                        dict(
+                            dtype=spec["dtype"],
+                            shape=shape,
+                            bytes=spec["data_offsets"][1] - spec["data_offsets"][0],
+                            source=source,
+                        ),
+                    )
+                )
+        if len(transforms) != 640 or len(self.rewrite_groups) != 80:
+            raise ValueError("Expected complete 40-layer TP8 up/down W4 banks in 80 GPU shards")
+        return self
+
+
+class HostRecordRelease(_IncrementalRelease):
+    """Interleave split host INT8/FP32 shards into packed row records, hardlinking GPU shards."""
+
+    def plan(self):
+        self.index = deepcopy(self.old_index)
+        self.index["metadata"]["host_row_layout"] = "i8-f32-g32-v1"
+        if self.index.get("row_records"):
+            raise ValueError("Host records are already packed")
+        self.index["row_records"] = {}
+        old = json.loads((self.source / "release-manifest.json").read_text())
+        self.manifest.update({k: v for k, v in old.items() if k != "files"})
+        self.manifest["source_package"] = json.loads(
+            (self.source / "cache/model.json").read_text()
+        )["execution_package"]
+        self.manifest["host_row_layout"] = "i8-f32-g32-v1"
+        self.old_records = old["files"]
+        self.rewrite_groups = set()
+        replacements = {}
+        removed = set()
+        for logical, values in list(self.index["row_shards"].items()):
+            if not logical.endswith(".weight"):
+                continue
+            prefix = logical.removesuffix(".weight")
+            scales = self.index["row_shards"].get(prefix + ".scale")
+            if not scales or len(values) != len(scales):
+                raise ValueError("Host value/scale shard inventory differs")
+            parts = []
+            for i, (value, scale) in enumerate(zip(values, scales, strict=True)):
+                group = self.index["weight_map"][value]
+                if group != self.index["weight_map"][scale]:
+                    raise ValueError("Host value/scale pair must share one semantic shard")
+                path = self.source / group
+                if path not in self.headers:
+                    self.headers[path] = local_header(path)
+                start, header = self.headers[path]
+                w, s = header[value], header[scale]
+                rows, width = w["shape"]
+                if (
+                    w["dtype"] != "I8"
+                    or s["dtype"] != "F32"
+                    or s["shape"] != [rows, width // 32]
+                    or width % 32
+                ):
+                    raise ValueError("Host value/scale dtype or geometry differs")
+                name = prefix + f".records.part{i:04}"
+                entry = dict(
+                    dtype="U8",
+                    shape=[rows, width + width // 32 * 4],
+                    bytes=rows * (width + width // 32 * 4),
+                    source=dict(
+                        row_record=dict(
+                            weight=[str(path), start + w["data_offsets"][0]],
+                            scale=[str(path), start + s["data_offsets"][0]],
+                            rows=rows,
+                            width=width,
+                        )
+                    ),
+                )
+                replacements[value] = (name, entry)
+                removed.add(scale)
+                self.index["weight_map"].pop(value)
+                self.index["weight_map"].pop(scale)
+                self.index["weight_map"][name] = group
+                self.rewrite_groups.add(group)
+                parts.append(name)
+            self.index["row_records"][prefix] = dict(format="i8-f32-g32-v1", parts=parts)
+            self.index["row_shards"].pop(logical)
+            self.index["row_shards"].pop(prefix + ".scale")
+        if not replacements:
+            raise ValueError("Missing split host row tables")
+        for group, record in self.old_records.items():
+            path = self.source / group
+            if path not in self.headers:
+                self.headers[path] = local_header(path)
+            start, header = self.headers[path]
+            for name in sorted(record["tensors"], key=lambda n: header[n]["data_offsets"][0]):
+                if name in removed:
+                    continue
+                if name in replacements:
+                    self.groups[group].append(replacements[name])
+                else:
+                    spec = header[name]
+                    self.groups[group].append(
+                        (
+                            name,
+                            dict(
+                                dtype=spec["dtype"],
+                                shape=spec["shape"],
+                                bytes=spec["data_offsets"][1] - spec["data_offsets"][0],
+                                source=dict(file=str(path), offset=start + spec["data_offsets"][0]),
+                            ),
+                        )
+                    )
+        return self
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("export", "prepack", "pack-host"), default="export")
     parser.add_argument("--source", type=Path)
+    parser.add_argument("--source-execution", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument(
@@ -677,6 +972,8 @@ def main():
     parser.add_argument(
         "--attribution", type=Path, help="Original checkpoint license and documentation"
     )
+    parser.add_argument("--w4-layout", choices=("nd", "transposed_nz"), default="nd")
+    parser.add_argument("--pack-host", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
@@ -687,7 +984,38 @@ def main():
         return
     if args.source is None:
         parser.error("Export requires --source")
-    exporter = Export(args.source, args.output, args.attribution, args.execution_output).plan()
+    if args.mode in ("prepack", "pack-host"):
+        if args.source_execution is None or args.execution_output is None:
+            parser.error(f"Mode {args.mode} requires --source-execution and --execution-output")
+        cls = PrepackRelease if args.mode == "prepack" else HostRecordRelease
+        job = cls(
+            args.source,
+            args.output,
+            execution_output=args.execution_output,
+            source_execution=args.source_execution,
+        ).plan()
+        print(
+            json.dumps(
+                dict(
+                    shards=len(job.groups),
+                    rewritten_shards=len(job.rewrite_groups),
+                    reused_shards=len(job.groups) - len(job.rewrite_groups),
+                )
+            ),
+            flush=True,
+        )
+        if not args.plan_only:
+            job.export(args.workers)
+        return
+    exporter = Export(
+        args.source,
+        args.output,
+        args.attribution,
+        args.execution_output,
+        args.source_execution,
+        w4_layout=args.w4_layout,
+        pack_host=args.pack_host,
+    ).plan()
     print(
         json.dumps(
             dict(

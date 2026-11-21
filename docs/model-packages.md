@@ -64,7 +64,7 @@ orinfer validate-model /path/to/prepared-model
 
 ## 3. Device Backend Boundary
 
-`orinfer-device` defines backend-agnostic device, target ABI, graph policy, logical memory interval, and session ownership traits. Concrete backends live in `crates/orinfer-engine/src/backend/{cuda,ascend}/`.
+`orinfer_model_sdk::device` defines backend-agnostic device, target ABI, graph policy, logical memory interval, and session ownership traits. Concrete backends live in `crates/orinfer-engine/src/backend/{cuda,ascend}/`.
 
 - **Targets**: `sm_87` (`aarch64` CUDA), `ascend910b` (`aarch64` Ascend), `ascend910b-x86_64` (`x86_64` Ascend).
 - **Tiered Prefix State**: Logical radix indexing, physical bank deduplication, copy-on-write, and device↔CPU eviction are shared across CUDA and Ascend. Snapshots tag backend, device, and session generation to prevent cross-session pointer reuse.

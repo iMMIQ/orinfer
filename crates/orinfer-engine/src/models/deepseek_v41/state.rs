@@ -201,7 +201,7 @@ impl<B> CapturePlan<B> {
 }
 pub(super) trait StateBytes: Clone {
     fn bytes(&self) -> usize;
-    fn view(&self, range: orinfer_device::MemoryRange) -> Result<Self>;
+    fn view(&self, range: orinfer_model_sdk::device::MemoryRange) -> Result<Self>;
     fn paged(&self) -> bool {
         false
     }
@@ -213,7 +213,7 @@ impl StateBytes for Buffer {
     fn bytes(&self) -> usize {
         self.bytes()
     }
-    fn view(&self, range: orinfer_device::MemoryRange) -> Result<Self> {
+    fn view(&self, range: orinfer_model_sdk::device::MemoryRange) -> Result<Self> {
         self.slice(range.offset, range.bytes)
     }
 }
@@ -300,17 +300,19 @@ impl<B: StateBytes> Snapshot<B> {
                         .collect::<Vec<_>>();
                     let reuse = kv::reuse_tail(
                         tail,
-                        candidates.iter().map(|p| orinfer_device::MemoryRange {
-                            offset: p.offset,
-                            bytes: p.buffer.bytes(),
-                        }),
+                        candidates
+                            .iter()
+                            .map(|p| orinfer_model_sdk::device::MemoryRange {
+                                offset: p.offset,
+                                bytes: p.buffer.bytes(),
+                            }),
                     )?;
                     for part in reuse.parts {
                         let p = candidates[part.index];
                         plan.pieces.push(Piece {
                             name: p.name.clone(),
                             offset: part.range.offset,
-                            buffer: p.buffer.view(orinfer_device::MemoryRange {
+                            buffer: p.buffer.view(orinfer_model_sdk::device::MemoryRange {
                                 offset: part.source_offset,
                                 bytes: part.range.bytes,
                             })?,
@@ -404,7 +406,7 @@ impl StateBytes for DeviceBuffer {
     fn bytes(&self) -> usize {
         self.bytes
     }
-    fn view(&self, range: orinfer_device::MemoryRange) -> Result<Self> {
+    fn view(&self, range: orinfer_model_sdk::device::MemoryRange) -> Result<Self> {
         range.within(self.bytes)?;
         Ok(Self {
             allocation: self.allocation.clone(),

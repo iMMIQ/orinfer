@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub mod dynamic;
+pub use orinfer_model_sdk::operators::dynamic;
 pub mod generated;
 pub mod install;
 pub(crate) mod shared_json;
@@ -83,7 +83,7 @@ impl ExecutionPackage {
     }
 
     fn validate_metadata(&self) -> Result<()> {
-        let target = orinfer_device::Target::from_package(&self.target)?;
+        let target = orinfer_model_sdk::device::Target::from_package(&self.target)?;
         if self.schema_version != 2
             || self.architecture.is_empty()
             || self.compute_policy.is_empty()
