@@ -1,10 +1,12 @@
 """Release cooling period boundaries and stale lock-file proof rejection."""
 
 from copy import deepcopy
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import unittest
 
 from tools.dev.dependencies import MINIMUM_AGE, timestamp, verify
+
+UTC = timezone.utc
 
 
 class DependencyAgeTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 # DSv4.1 Ascend 910B Production Deployment
 
-This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 910B (TP8)** with Orinfer **v0.3.13**.
+This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 910B (TP8)** with Orinfer **v0.4.0**.
 
 ---
 
@@ -9,7 +9,7 @@ This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 91
 - **OS & Runtime**: Linux `aarch64`, `glibc >= 2.34`, **CANN 9.2**, 8 dedicated Ascend 910B NPUs (TP8).
 - **Recommended Host**: ≥96 CPU cores and ≥1 TB host RAM when keeping Engram tables resident (~207 GiB) alongside 256 GiB CPU prefix cache offload.
 - **Supported Features**: OpenAI HTTP/SSE, continuous batching, DSpark speculative decoding (auto up to 5 drafts by default), device + CPU tiered prefix cache, DSML tool calling, thinking history, and single/multi-image vision (when paired with `vision.safetensors` and a vision-enabled execution package).
-- **Package Digest (v0.3.13)**: `7b50e69aab2cbd3e50c5658e9b6c31bb7c1880bcb753ecb62209c92d1c041a71`.
+- **Package Digest (A2 W4A8)**: `ce7a1cec548914645bf31ae9e695da038ec1506c895138ecbe61906688ac3687` (carried forward from the validated v0.3.14 A2 package).
 
 ---
 
@@ -18,28 +18,28 @@ This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 91
 ### Install Engine & Execution Package
 
 ```bash
-tar -xf orinfer-v0.3.13-linux-aarch64.tar.xz
+tar -xf orinfer-v0.4.0-linux-aarch64.tar.xz
 bin/orinfer --version
 
 bin/orinfer package install \
-  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.3.13.tar.xz \
+  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.4.0.tar.xz \
   --cache /srv/orinfer/execution-cache
 ```
 
 ### Update Model Frontend Metadata (Existing Deployments)
 
-Weights from v0.3.1+ remain unchanged. Create a new model directory (using hardlinks on the same filesystem so the previous directory stays intact for rollback) and pull the matching v0.3.13 metadata:
+Weights from v0.3.1+ remain unchanged. Create a new model directory (using hardlinks on the same filesystem so the previous directory stays intact for rollback) and pull the matching v0.4.0 metadata:
 
 ```bash
 uv run --locked python -m orinfer_build.models.deepseek_v41.service --frontend-only \
-  --model-dir /data/model/current --output /data/model/dsv41-v0.3.13
+  --model-dir /data/model/current --output /data/model/dsv41-v0.4.0
 
 hf download immiq/DeepSeek-V4.1-Flash-1017-Orinfer-A2-W4A8 \
   cache/model.json README.md publication.json SHA256SUMS \
-  --revision v0.3.13 --local-dir /data/model/dsv41-v0.3.13
+  --revision v0.4.0 --local-dir /data/model/dsv41-v0.4.0
 ```
 
-Run `bin/orinfer validate-model /data/model/dsv41-v0.3.13` to verify frontend, execution package, and weight integrity.
+Run `bin/orinfer validate-model /data/model/dsv41-v0.4.0` to verify frontend, execution package, and weight integrity.
 
 ---
 
@@ -57,7 +57,7 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_NPU_SOCKET_PORT_RANGE=auto
 export HCCL_EXEC_TIMEOUT=120
 
-bin/orinfer serve /data/model/dsv41-v0.3.13 \
+bin/orinfer serve /data/model/dsv41-v0.4.0 \
   --model deepseek-v4.1 \
   --listen 127.0.0.1:8088 \
   --mtp-drafts auto \

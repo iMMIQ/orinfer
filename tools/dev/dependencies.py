@@ -2,7 +2,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import cache
 import hashlib
 import json
@@ -10,7 +10,6 @@ from pathlib import Path
 import re
 import tempfile
 import time
-import tomllib
 from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
 
@@ -18,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 RECORD = Path("configs/dependency-releases.json")
 LOCKS = ("Cargo.lock", "uv.lock", "tools/environments/cuda/uv.lock")
 MINIMUM_AGE = timedelta(days=7)
+UTC = timezone.utc
 
 
 def timestamp(value):
@@ -134,6 +134,8 @@ def github_asset(registry, url, checksum):
 
 
 def refresh(root=ROOT):
+    import tomllib
+
     registry = Registry(root / "artifacts/cache/dependency-metadata")
     cargo = tomllib.loads((root / "Cargo.lock").read_text())["package"]
     python = {lock: tomllib.loads((root / lock).read_text())["package"] for lock in LOCKS[1:]}

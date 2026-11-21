@@ -8,19 +8,19 @@ This page records current end-to-end performance baselines on **Jetson AGX Orin 
 
 - **Hardware & Runtime**: Jetson AGX Orin 64GB (R36.4.3, CUDA SM87), Schema 2 execution packages, `decode_only`, `--mtp-drafts auto`, `--prompt-lookup`, `--prefix-cache-mib 4096`, `--max-active-requests 4`.
 - **Workload**: 512 synthetic multi-turn agent trajectories (`tools.bench.mini_weka_synthetic --profile compact`, cold first turns 2/3/4/6 Ki tokens, concurrency 4, 240 s wall limit, `temperature=1.0`, `ignore_eos=true`).
-- **Progression**: `Baseline (58ab647)` → `P1–P5 (Rust scheduler/cache)` → `P6 (Batched GPU sampling packages)`.
+- **Progression**: `Baseline (58ab647)` → `P1–P5 (Rust scheduler/cache)` → `P6 / Flash-Next opt (Batched GPU sampling & CPU/layered-prefill opt)`.
 
-| Model (Latency Policy) | Completed Reqs | Full Trajectories | Output TPS | `batch_commit_s` | TTFT P50 / P95 (s, P5) |
+| Model (Latency Policy) | Completed Reqs | Full Trajectories | Output TPS | `batch_commit_s` | TTFT P50 / P95 (s, latest) |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | **Index-Translate-2B** | 288 → 358 → **356** | 39 → 50 → **48** | 124.0 → 156.2 → **155.6** | 29.3 → 45.0 → **43.2** | 0.24 / 0.80 |
 | **Qwen3.5-4B** | 133 → 168 → **198** | 17 → 24 → **28** | 57.6 → 73.6 → **86.6** | 24.3 → 36.3 → **8.0** | 0.52 / 1.95 |
 | **Index-Translate-9B** | 90 → 125 → **128** | 12 → 16 → **16** | 39.3 → 53.8 → **55.5** | 16.1 → 23.2 → **14.2** | 0.76 / 2.98 |
 | **Qwen3.8-27B** | 26 → 34 → **34** | 4 → 4 → **4** | 13.5 → 15.8 → **15.8** | 4.0 → 1.9 → **0.6** | 3.86 / 26.43 |
 | **Index-Translate-35B-A3B** | 68 → 124 → **133** | 8 → 16 → **17** | 28.4 → 52.8 → **59.7** | 94.0 → 33.4 → **16.9** | 0.72 / 2.29 |
-| **Qwen3.8-Flash-Next** *(P5)* | 72 → **86** | 8 → **12** | 32.3 → **39.8** | 1.6 → **1.1** | 1.53 / 6.70 |
-| **Qwen3.8-Flash-Next** *(throughput, P5)* | 92 → **93** | 12 → **12** | 41.5 → **41.8** | 2.1 → **1.6** | 0.99 / 3.93 |
+| **Qwen3.8-Flash-Next** | 72 → 86 → **93** | 8 → 12 → **12** | 32.3 → 39.8 → **41.6** | 1.6 → 1.1 → **1.1** | 1.26 / 7.51 |
+| **Qwen3.8-Flash-Next** *(throughput)* | 92 → 93 → **100** | 12 → 12 → **12** | 41.5 → 41.8 → **44.9** | 2.1 → 1.6 → **1.4** | 0.92 / 3.61 |
 
-- **Notes**: Prefix cache hit rates reached **77.9%–79.7%** across all six models under P5/P6. Output TPS includes queuing, prefill, generation, and HTTP/SSE over the profiling window (total wall minus warmup). Zero CUDA/runtime errors, panics, or OOMs across all runs.
+- **Notes**: Prefix cache hit rates reached **77.9%–79.7%** across all six models under P5/P6 and `b4bb35f`. Output TPS includes queuing, prefill, generation, and HTTP/SSE over the profiling window (total wall minus warmup). Zero CUDA/runtime errors, panics, or OOMs across all runs.
 
 ### Reproduce
 
