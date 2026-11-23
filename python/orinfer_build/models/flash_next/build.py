@@ -147,6 +147,8 @@ def rebuild(args):
         or args.qsa_attention_only
         or args.gdn_prefill_only
         or args.q4_prefill_only
+        or args.decode_rows_only
+        or args.q4_out_proj_only
     ):
         from orinfer_build.compiler.cuda.common import configure
         from orinfer_build.packaging.compact import compact_package
@@ -155,7 +157,13 @@ def rebuild(args):
             from functools import partial
             from orinfer_build.models.flash_next.gdn_prefill import publish as publish_gdn
 
-            publish = partial(publish_gdn, scopes=data["buffer_scopes"])
+            publish = partial(publish_gdn, data)
+        elif args.decode_rows_only:
+            from orinfer_build.models.flash_next.decode_rows import publish
+        elif args.q4_out_proj_only:
+            from orinfer_build.models.flash_next.q4_out_proj import publish as publish_q4_out_proj
+
+            publish = None
         elif args.qsa_attention_only:
             from functools import partial
             from orinfer_build.models.flash_next.qsa_prefill import publish as publish_qsa
@@ -186,7 +194,12 @@ def rebuild(args):
         with atomic_model(args.model_output) as staging:
             root = clone_model(args.model, staging, origin)
             compiler = Compiler(origin, root, args.output, buffers)
-            bindings = publish(package, manifest, compiler)
+            if args.q4_out_proj_only:
+                bindings = publish_q4_out_proj(
+                    data, package, manifest, compiler, weights_dir=staging / "cache/weights"
+                )
+            else:
+                bindings = publish(package, manifest, compiler)
             digest = compact_package(root, package, staging / "cache/packages")
             shutil.rmtree(root)
             data["execution_package"] = digest
@@ -511,6 +524,16 @@ def main():
         action="store_true",
         help="Publish the measured temporary INT8 expansion for native Flash prefill",
     )
+    auxiliary.add_argument(
+        "--decode-rows-only",
+        action="store_true",
+        help="Publish measured small-batch flash_decode row specializations",
+    )
+    auxiliary.add_argument(
+        "--q4-out-proj-only",
+        action="store_true",
+        help="Convert ssm_out (36L) and attn_output (12L) from W8 to single-resident row-Q4",
+    )
     p.add_argument(
         "--prefill-only",
         action="store_true",
@@ -546,6 +569,8 @@ def main():
         or args.qsa_attention_only
         or args.gdn_prefill_only
         or args.q4_prefill_only
+        or args.decode_rows_only
+        or args.q4_out_proj_only
     ) and (
         args.plan_only
         or args.prefill_only

@@ -54,7 +54,10 @@ def dense_selection(local, merge, compiler, rows, context):
 
 def publish(data, package, manifest, compiler):
     from kernels.cuda.model.qsa import sparse_merge
-    from kernels.cuda.model.qsa_attention import expand_prefill_kv
+    from kernels.cuda.model.qsa_attention import (
+        dense_causal_qsa_attention,
+        expand_prefill_kv,
+    )
     from orinfer_build.tuning.auxiliary_tuning import (
         _QSA_ATTENTION,
         _QSA_PREFILL_PASSES,
@@ -64,6 +67,7 @@ def publish(data, package, manifest, compiler):
 
     context = manifest["max_context"]
     limit = min(context, 8192)
+    dense_limit = min(limit, 2048)
     first = 256
     expanded = {}
     for role in ("K", "V"):
@@ -139,27 +143,61 @@ def publish(data, package, manifest, compiler):
             ):
                 raise ValueError(f"Unexpected native QSA merge contract: {merge['name']}")
             stage = {role: operands[role] for role in _QSA_STATE} | expanded
+            dense_bindings = {
+                role: operands[role] for role in ("Query", "Position", "Max", "Den", "Out")
+            } | expanded
             # The merge and attention choices use the same row interval.
-            # The merge reads only partitions the attention CTA populated.
+            # Queries at Position + row < dense_limit run GQA-12 dense causal
+            # attention into split 0; queries at >= dense_limit run paired sparse.
             for kernel, i, role, bindings, build in (
                 (old, 0, "expand", stage, partial(expand_prefill_kv, rows, context, limit)),
                 (
                     old,
                     1,
-                    "attention-paired",
+                    "dense-causal",
+                    dense_bindings,
+                    partial(
+                        dense_causal_qsa_attention,
+                        rows,
+                        context,
+                        expanded_capacity=limit,
+                        dense_limit=dense_limit,
+                        block_q=4,
+                        block_k=32,
+                        threads=128,
+                        dynamic_rows=True,
+                    ),
+                ),
+                (
+                    old,
+                    2,
+                    "attention-paired-sparse",
                     operands | expanded,
-                    partial(_packed_qsa, rows, context, limit, skip_empty=True),
+                    partial(
+                        _packed_qsa,
+                        rows,
+                        context,
+                        limit,
+                        skip_empty=True,
+                        min_position=dense_limit,
+                    ),
                 ),
                 (
                     merge,
                     0,
-                    "merge",
+                    "merge-dense",
                     merge_args | {"Position": position},
-                    partial(sparse_merge.__wrapped__, rows, dynamic_rows=True, split_size=256),
+                    partial(
+                        sparse_merge.__wrapped__,
+                        rows,
+                        dynamic_rows=True,
+                        split_size=256,
+                        dense_limit=dense_limit,
+                    ),
                 ),
             ):
                 choice = f"{kernel['name']}/choice/{first}-{rows}/1/k{i}"
-                key = f"flash-qsa-live-{role}-{context}-{limit}-{rows}"
+                key = f"flash-qsa-live-{role}-{context}-{limit}-{dense_limit}-{rows}"
                 added[choice], launches[choice] = compiler.emit(
                     kernel,
                     choice,

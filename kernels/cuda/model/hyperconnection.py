@@ -28,24 +28,45 @@ def _dtype(value):
 def combine_fragment(H, streams, dtype):
     """Residual injection and its FP32 norm reduction, retaining stream rounding."""
     width = 1 << (H - 1).bit_length()
+    vec_fp16 = dtype == "float16"
 
     @T.macro
     def combine(Block, Residual, Inject, Output, values, square, total, row, branch):
         raw = T.cast(T.cast(T.cast(Inject[row, branch], T.float32) / streams, dtype), T.float32)
-        gate = T.cast(2.0 * T.cast(stream_sigmoid(raw, dtype), T.float32), dtype)
-        for j in T.Parallel(width, coalesced_width=T.int32(1)):
-            values[j] = 0.0
-            if j < H:
-                injection = T.cast(
-                    T.cast(Block[row, j], T.float32) * T.cast(gate, T.float32), dtype
-                )
-                rounded = T.cast(
-                    T.cast(Residual[row, branch, j], T.float32) + T.cast(injection, T.float32),
-                    dtype,
-                )
-                values[j] = T.cast(rounded, T.float32)
-                Output[row, branch, j] = rounded
-            square[j] = values[j] * values[j]
+        gate_val = T.alloc_local((1,), T.float32)
+        gate_val[0] = T.cast(
+            T.cast(2.0 * T.cast(stream_sigmoid(raw, dtype), T.float32), dtype), T.float32
+        )
+        if vec_fp16:
+            for j in T.Parallel(width):
+                values[j] = 0.0
+                if j < H:
+                    injection = T.cast(T.cast(Block[row, j], T.float32) * gate_val[0], dtype)
+                    values[j] = T.cast(
+                        T.cast(
+                            T.cast(Residual[row, branch, j], T.float32)
+                            + T.cast(injection, T.float32),
+                            dtype,
+                        ),
+                        T.float32,
+                    )
+                    Output[row, branch, j] = T.cast(values[j], dtype)
+                square[j] = values[j] * values[j]
+        else:
+            for j in T.Parallel(width, coalesced_width=T.int32(1)):
+                values[j] = 0.0
+                if j < H:
+                    injection = T.cast(T.cast(Block[row, j], T.float32) * gate_val[0], dtype)
+                    values[j] = T.cast(
+                        T.cast(
+                            T.cast(Residual[row, branch, j], T.float32)
+                            + T.cast(injection, T.float32),
+                            dtype,
+                        ),
+                        T.float32,
+                    )
+                    Output[row, branch, j] = T.cast(values[j], dtype)
+                square[j] = values[j] * values[j]
         T.reduce_sum(square, total, dim=0)
 
     return combine
@@ -207,6 +228,7 @@ def hc_combine_norm(
     streams: int = 4,
     eps: float = 1e-6,
     dtype: str = "bfloat16",
+    dynamic_rows: bool = False,
 ):
     """Combine residuals and normalize, retaining the rounded residual output.
 
@@ -218,7 +240,40 @@ def hc_combine_norm(
     if any(type(x) is not int or x <= 0 for x in (M, H, streams)) or not 0 < eps < 1:
         raise ValueError("Invalid HC combination/normalization dimensions")
     width = 1 << (H - 1).bit_length()
+    M = row_count(M, dynamic_rows)
     combine = combine_fragment(H, streams, dtype)
+    vec_fp16 = dtype == "float16"
+
+    @T.macro
+    def body(Block, Residual, Inject, Weight, Output, Normed):
+        with T.Kernel(M, streams, threads=min(256, width)) as (row, branch):
+            T.import_source(HALF_MATH)
+            values = T.alloc_fragment((width,), T.float32)
+            square = T.alloc_fragment((width,), T.float32)
+            total = T.alloc_fragment((1,), T.float32)
+            combine(Block, Residual, Inject, Output, values, square, total, row, branch)
+            inverse = T.rsqrt(total[0] / H + eps)
+            if vec_fp16:
+                for j in T.Parallel(H):
+                    Normed[row, branch, j] = values[j] * inverse * (1.0 + Weight[branch, j])
+            else:
+                for j in T.Parallel(H, coalesced_width=T.int32(1)):
+                    Normed[row, branch, j] = values[j] * inverse * (1.0 + Weight[branch, j])
+
+    if dynamic_rows:
+
+        @T.prim_func
+        def hc_combine_norm_rows(
+            Block: T.Tensor((M, H), dtype),
+            Residual: T.Tensor((M, streams, H), dtype),
+            Inject: T.Tensor((M, streams), dtype),
+            Weight: T.Tensor((streams, H), T.float32),
+            Output: T.Tensor((M, streams, H), dtype),
+            Normed: T.Tensor((M, streams, H), dtype),
+        ):
+            body(Block, Residual, Inject, Weight, Output, Normed)
+
+        return hc_combine_norm_rows
 
     @T.prim_func
     def hc_combine_norm(
@@ -229,16 +284,7 @@ def hc_combine_norm(
         Output: T.Tensor((M, streams, H), dtype),
         Normed: T.Tensor((M, streams, H), dtype),
     ):
-        with T.Kernel(M, streams, threads=min(256, width)) as (row, branch):
-            T.import_source(HALF_MATH)
-            values = T.alloc_fragment((width,), T.float32)
-            square = T.alloc_fragment((width,), T.float32)
-            total = T.alloc_fragment((1,), T.float32)
-            combine(Block, Residual, Inject, Output, values, square, total, row, branch)
-            for j in T.Parallel(H, coalesced_width=T.int32(1)):
-                Normed[row, branch, j] = (
-                    values[j] * T.rsqrt(total[0] / H + eps) * (1.0 + Weight[branch, j])
-                )
+        body(Block, Residual, Inject, Weight, Output, Normed)
 
     return hc_combine_norm
 
@@ -570,3 +616,157 @@ def hc_down_finish(M: int, N: int, splits: int = 4, streams: int = 4, dynamic_ro
                     Out[index // N, index % N] = value / (1 + T.exp(-value))
 
     return main
+
+
+@orin_jit
+def bf16_projection_small(
+    M: int,
+    N: int,
+    K: int,
+    *,
+    splits: int = 1,
+    block_m: int = 8,
+    block_n: int = 16,
+    block_k: int = 128,
+    stages: int = 2,
+    threads: int = 64,
+    dynamic_rows: bool = False,
+):
+    """Weight-left BF16 Tensor Core projection for small decode/lookup batches.
+
+    Preserves the exact m16n8k16 K-traversal and 4-stream split layout of
+    bf16_rows_kernel_kernel while raising SM occupancy on small M (3..15).
+    """
+    if (
+        any(
+            type(x) is not int or x <= 0
+            for x in (M, N, K, splits, block_m, block_n, block_k, stages, threads)
+        )
+        or splits not in (1, 4)
+        or block_m not in (8, 16)
+        or block_n not in (16, 32, 64)
+        or block_k not in (64, 128)
+        or N % block_n
+        or K % (block_k * splits)
+        or threads not in (32, 64, 128)
+    ):
+        raise ValueError("Invalid small BF16 projection tile")
+    sub_k = K // splits
+    M = row_count(M, dynamic_rows)
+
+    if splits == 1:
+
+        @T.prim_func
+        def bf16_small_router(
+            A: T.Tensor((M, K), T.float16),
+            Weight: T.Tensor((N, K), T.bfloat16),
+            Output: T.Tensor((M, N), T.float32),
+        ):
+            with T.Kernel(T.ceildiv(M, block_m), N // block_n, 1, threads=threads) as (by, bx, _):
+                w = T.alloc_shared((block_n, block_k), T.bfloat16)
+                a = T.alloc_shared((block_m, block_k), T.bfloat16)
+                acc = T.alloc_fragment((block_n, block_m), T.float32)
+                T.clear(acc)
+                for kg in T.Pipelined(sub_k // block_k, num_stages=stages):
+                    T.copy(Weight[bx * block_n, kg * block_k], w)
+                    for i, j in T.Parallel(block_m, block_k, coalesced_width=T.int32(1)):
+                        a[i, j] = 0
+                        if by * block_m + i < M:
+                            a[i, j] = A[by * block_m + i, kg * block_k + j]
+                    T.gemm(w, a, acc, transpose_B=True)
+                for n, m_idx in T.Parallel(block_n, block_m, coalesced_width=T.int32(1)):
+                    if by * block_m + m_idx < M:
+                        Output[by * block_m + m_idx, bx * block_n + n] = acc[n, m_idx]
+
+        return bf16_small_router
+
+    @T.prim_func
+    def bf16_small_split(
+        A: T.Tensor((M, K), T.float16),
+        Weight: T.Tensor((N, K), T.bfloat16),
+        Output: T.Tensor((splits, M, N), T.float32),
+    ):
+        with T.Kernel(T.ceildiv(M, block_m), N // block_n, splits, threads=threads) as (
+            by,
+            bx,
+            part,
+        ):
+            w = T.alloc_shared((block_n, block_k), T.bfloat16)
+            a = T.alloc_shared((block_m, block_k), T.bfloat16)
+            acc = T.alloc_fragment((block_n, block_m), T.float32)
+            T.clear(acc)
+            for kg in T.Pipelined(sub_k // block_k, num_stages=stages):
+                offset = part * sub_k + kg * block_k
+                T.copy(Weight[bx * block_n, offset], w)
+                for i, j in T.Parallel(block_m, block_k, coalesced_width=T.int32(1)):
+                    a[i, j] = 0
+                    if by * block_m + i < M:
+                        a[i, j] = A[by * block_m + i, offset + j]
+                T.gemm(w, a, acc, transpose_B=True)
+            for n, m_idx in T.Parallel(block_n, block_m, coalesced_width=T.int32(1)):
+                if by * block_m + m_idx < M:
+                    Output[part, by * block_m + m_idx, bx * block_n + n] = acc[n, m_idx]
+
+    return bf16_small_split
+
+
+_HC_INJECT_DOT8 = r"""
+#include <cuda_fp16.h>
+__device__ __forceinline__ float hc_dot8_f16_bf16(const void* a_ptr, const void* w_ptr) {
+    uint4 av = *reinterpret_cast<const uint4*>(a_ptr);
+    uint4 wv = *reinterpret_cast<const uint4*>(w_ptr);
+    const __half* ah = reinterpret_cast<const __half*>(&av);
+    const unsigned short* wh = reinterpret_cast<const unsigned short*>(&wv);
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float fa = __half2float(ah[i]);
+        unsigned short ab;
+        asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(ab) : "f"(fa));
+        float af = __uint_as_float(static_cast<unsigned>(ab) << 16);
+        float wf = __uint_as_float(static_cast<unsigned>(wh[i]) << 16);
+        sum = fmaf(af, wf, sum);
+    }
+    return sum;
+}
+"""
+
+
+@orin_jit
+def hc_injection_fast(
+    M: int,
+    K: int = 10240,
+    outputs: int = 4,
+    dynamic_rows: bool = False,
+):
+    """Full-SM 128-bit vectorized HC injection dot product with BF16 input rounding."""
+    if any(type(x) is not int or x <= 0 for x in (M, K, outputs)) or K % 1024:
+        raise ValueError("Invalid fast HC injection geometry")
+    M = row_count(M, dynamic_rows)
+    chunks = K // 1024  # 128 threads * 8 elements = 1024 elements per step
+
+    @T.prim_func
+    def hc_inject_vec(
+        A: T.Tensor((M, K), T.float16),
+        Weight: T.Tensor((outputs, K), T.bfloat16),
+        Output: T.Tensor((M, outputs), T.float16),
+    ):
+        with T.Kernel(M, outputs, threads=128) as (row, col):
+            T.import_source(_HC_INJECT_DOT8)
+            partial = T.alloc_fragment((128,), T.float32)
+            total = T.alloc_fragment((1,), T.float32)
+            T.clear(partial)
+            for step in T.unroll(chunks):
+                for t in T.Parallel(128):
+                    offset = step * 1024 + t * 8
+                    partial[t] += T.call_pure_extern(
+                        "float32",
+                        "hc_dot8_f16_bf16",
+                        T.access_ptr(A[row, offset], "r", 8),
+                        T.access_ptr(Weight[col, offset], "r", 8),
+                    )
+            T.reduce_sum(partial, total, dim=0)
+            if T.get_thread_binding() == 0:
+                Output[row, col] = T.cast(total[0], T.float16)
+
+    return hc_inject_vec

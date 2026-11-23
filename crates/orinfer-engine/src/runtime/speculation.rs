@@ -7,7 +7,7 @@ pub(super) struct PrefillWarm {
 }
 
 impl ModelRuntime {
-    pub(super) fn mtp_capture(
+    pub(super) fn submit_mtp_capture(
         &self,
         spec: &crate::mtp::Spec,
         tokens: usize,
@@ -48,7 +48,17 @@ impl ModelRuntime {
                     .min_by_key(|p| p.tokens)
             })
             .ok_or("Missing MTP hidden capture shape")?;
-        self.launch_rows(&plan.program, tokens, phase)
+        self.execution
+            .submit_program_rows(&plan.program, tokens, phase)
+    }
+    pub(super) fn mtp_capture(
+        &self,
+        spec: &crate::mtp::Spec,
+        tokens: usize,
+        phase: ExecutionPhase,
+    ) -> Result<()> {
+        self.submit_mtp_capture(spec, tokens, phase)?;
+        self.execution.sync()
     }
     pub(super) fn mtp_warm(
         &mut self,

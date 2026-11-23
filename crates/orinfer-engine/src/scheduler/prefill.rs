@@ -494,6 +494,11 @@ impl Profiles {
         }
     }
 
+    pub fn has_stage(&self, chunk: usize, context: usize, warm: bool) -> bool {
+        self.stages
+            .contains_key(&(bucket(chunk), bucket(context), warm))
+    }
+
     pub fn stage_upper(&self, chunk: usize, context: usize, count: usize, warm: bool) -> f64 {
         self.stages
             .get(&(bucket(chunk), bucket(context), warm))

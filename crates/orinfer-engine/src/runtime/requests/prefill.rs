@@ -130,33 +130,69 @@ impl ModelRuntime {
         if let Some(workspace) = &frame.workspace {
             frame.regular_s += self.execution.resume_workspace(workspace)?;
         }
+        if frame.next < frame.plan.stages.len() {
+            self.upload_segment_controls(chunk)?;
+        }
         // OOM while saving a continuation falls back to completing the same
         // forward pass, never to recomputing already-mutated recurrent layers.
         loop {
             let began = Instant::now();
             let before = self.execution.batch_statistics();
             let stage = frame.next;
-            self.scheduler_statistics.layered_prefill_iterations += 1;
+            let mut executed_stages = 1usize;
             if stage < frame.plan.stages.len() {
-                self.upload_segment_controls(chunk)?;
-                self.launch_rows(&frame.plan.stages[stage], chunk, ExecutionPhase::Prefill)?;
-                frame.next += 1;
-                frame.regular_s += began.elapsed().as_secs_f64()
-                    - (self.execution.batch_statistics().initialization_s()
-                        - before.initialization_s());
+                let rem_stages = frame.plan.stages.len() - stage;
+                let batch = if budget_s <= 0. {
+                    1
+                } else {
+                    let stage_est = self.prefill_costs.stage_upper(
+                        chunk,
+                        req.offset + chunk,
+                        frame.plan.stages.len(),
+                        false,
+                    );
+                    let rem_s = (budget_s - at.elapsed().as_secs_f64()).max(0.);
+                    let mut fit = ((rem_s * 0.90) / stage_est.max(0.0005)).floor() as usize;
+                    if !self
+                        .prefill_costs
+                        .has_stage(chunk, req.offset + chunk, false)
+                    {
+                        fit = fit.min(4);
+                    }
+                    fit.clamp(1, rem_stages)
+                };
+                executed_stages = batch;
+                self.scheduler_statistics.layered_prefill_iterations += batch;
+                for s in stage..stage + batch {
+                    self.execution.submit_program_rows(
+                        &frame.plan.stages[s],
+                        chunk,
+                        ExecutionPhase::Prefill,
+                    )?;
+                }
+                frame.next += batch;
                 if frame.next == frame.plan.stages.len() {
                     if let Some(spec) = &self.manifest.mtp {
-                        self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
+                        self.submit_mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
                     }
                     if req.offset + chunk == req.input.len()
                         || req.checkpoints.contains(&(req.offset + chunk))
                     {
-                        self.launch_rows(&frame.plan.head_program, chunk, ExecutionPhase::Prefill)?;
+                        self.execution.submit_program_rows(
+                            &frame.plan.head_program,
+                            chunk,
+                            ExecutionPhase::Prefill,
+                        )?;
                     }
                 }
+                self.execution.sync()?;
+                frame.regular_s += began.elapsed().as_secs_f64()
+                    - (self.execution.batch_statistics().initialization_s()
+                        - before.initialization_s());
             } else if !req.mtp_blocked
                 && let Some(spec) = self.manifest.mtp.clone()
             {
+                self.scheduler_statistics.layered_prefill_iterations += 1;
                 let end = req.offset + chunk;
                 let warm_end =
                     end + usize::from(end < req.input.len() && !req.checkpoints.contains(&end));
@@ -174,19 +210,27 @@ impl ModelRuntime {
                     req.warm.tokens += tokens;
                     req.warm.seconds += began.elapsed().as_secs_f64();
                 }
+            } else {
+                self.scheduler_statistics.layered_prefill_iterations += 1;
             }
             if bounded {
-                self.scheduler_statistics.bounded_prefill_iterations += 1;
+                self.scheduler_statistics.bounded_prefill_iterations += executed_stages;
             }
             let after = self.execution.batch_statistics();
             let cold = after.initialization_s() - before.initialization_s()
                 + after.sequence_capture_s
                 - before.sequence_capture_s;
+            let stage_s = (began.elapsed().as_secs_f64() - cold).max(0.000001);
+            let observed = if executed_stages > 1 {
+                (stage_s / executed_stages as f64) * 1.15
+            } else {
+                stage_s
+            };
             self.prefill_costs.observe_stage(
                 chunk,
                 req.offset + chunk,
                 stage == frame.plan.stages.len(),
-                (began.elapsed().as_secs_f64() - cold).max(0.000001),
+                observed,
             );
             if frame.next < frame.plan.stages.len() {
                 // Short layers share one latency window. The token tile and

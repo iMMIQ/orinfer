@@ -14,6 +14,15 @@ from kernels.shared.rows import row_count
 from kernels.cuda.model.half_math import SOURCE as HALF_MATH, stream_sigmoid
 
 
+_BF16_STORE_SOURCE = r"""
+__device__ __forceinline__ void hc_store_bf16_from_f32(void* dst, float fv) {
+    unsigned short hb;
+    asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(hb) : "f"(fv));
+    *reinterpret_cast<unsigned short*>(dst) = hb;
+}
+"""
+
+
 @orin_jit
 def hc_norm_prefill(
     M: int,
@@ -40,18 +49,24 @@ def hc_norm_prefill(
         InvRms: T.Tensor((M, streams), T.float32),
     ):
         with T.Kernel(M, streams, threads=min(256, width)) as (row, branch):
+            T.import_source(_BF16_STORE_SOURCE)
             values = T.alloc_fragment((width,), T.float32)
             square = T.alloc_fragment((width,), T.float32)
             total = T.alloc_fragment((1,), T.float32)
-            for j in T.Parallel(width, coalesced_width=T.int32(1)):
+            for j in T.Parallel(width):
                 values[j] = T.if_then_else(j < H, T.cast(Residual[row, branch, j], T.float32), 0.0)
                 square[j] = values[j] * values[j]
             T.reduce_sum(square, total, dim=0)
             inverse = T.rsqrt(total[0] / H + eps)
             InvRms[row, branch] = inverse
-            for j in T.Parallel(H, coalesced_width=T.int32(1)):
+            for j in T.Parallel(H):
                 rounded_norm = T.cast((values[j] * inverse * (1.0 + Weight[branch, j])), dtype)
-                NormedBF[row, branch, j] = T.cast(rounded_norm, T.bfloat16)
+                T.call_extern(
+                    "void",
+                    "hc_store_bf16_from_f32",
+                    T.address_of(NormedBF[row, branch, j]),
+                    T.cast(rounded_norm, T.float32),
+                )
 
     return hc_prefill_norm
 
@@ -91,16 +106,21 @@ def hc_combine_norm_prefill(
         InvRms: T.Tensor((M, streams), T.float32),
     ):
         with T.Kernel(M, streams, threads=min(256, width)) as (row, branch):
-            T.import_source(HALF_MATH)
+            T.import_source(HALF_MATH + _BF16_STORE_SOURCE)
             values = T.alloc_fragment((width,), T.float32)
             square = T.alloc_fragment((width,), T.float32)
             total = T.alloc_fragment((1,), T.float32)
             combine(Block, Residual, Inject, Output, values, square, total, row, branch)
             inverse = T.rsqrt(total[0] / H + eps)
             InvRms[row, branch] = inverse
-            for j in T.Parallel(H, coalesced_width=T.int32(1)):
+            for j in T.Parallel(H):
                 rounded_norm = T.cast((values[j] * inverse * (1.0 + Weight[branch, j])), dtype)
-                NormedBF[row, branch, j] = T.cast(rounded_norm, T.bfloat16)
+                T.call_extern(
+                    "void",
+                    "hc_store_bf16_from_f32",
+                    T.address_of(NormedBF[row, branch, j]),
+                    T.cast(rounded_norm, T.float32),
+                )
 
     return hc_prefill_combine_norm
 
@@ -230,6 +250,7 @@ def hc_up_mix_prefill(
             acc = T.alloc_fragment((BM, 4 * BN), T.float32)
             rounded = T.alloc_shared((BM, 4 * BN), T.float16)
             inv = T.alloc_shared((BM, 4), T.float32)
+            weight_s = T.alloc_shared((4, BN), T.float32)
             total = T.alloc_fragment((BM, BN), T.float32)
             T.annotate_layout(
                 {
@@ -243,19 +264,21 @@ def hc_up_mix_prefill(
             T.clear(acc)
             for kg in T.Pipelined(rank // 64, num_stages=stages):
                 T.copy(A[by * BM, kg * 64], a)
-                for n, j in T.Parallel(4 * BN, 64):
-                    w[n, j] = W[(n // BN) * H + bx * BN + n % BN, kg * 64 + j]
+                for b in T.unroll(4):
+                    T.copy(W[b * H + bx * BN, kg * 64], w[b * BN : (b + 1) * BN, :])
                 T.gemm(a, w, acc, transpose_B=True)
             T.copy(acc, rounded)
             T.copy(InvRms[by * BM, 0], inv)
+            for b in T.unroll(4):
+                T.copy(Weight[b, bx * BN : bx * BN + BN], weight_s[b, :])
             T.clear(total)
             for branch in T.serial(4):
-                for i, j in T.Parallel(BM, BN, coalesced_width=T.int32(1)):
+                for i, j in T.Parallel(BM, BN):
                     if aligned_rows or padded_inputs or by * BM + i < M:
                         normed = T.cast(
                             T.cast(Residual[by * BM + i, branch, bx * BN + j], T.float32)
                             * inv[i, branch]
-                            * (1.0 + Weight[branch, bx * BN + j]),
+                            * (1.0 + weight_s[branch, j]),
                             T.float16,
                         )
                         gate = stream_sigmoid(
@@ -305,17 +328,17 @@ def hc_up_mix_packet(M: int, H: int, rank: int, dynamic_rows: bool = False):
             )
             T.clear(acc)
             for kg in T.Pipelined(rank // 64, num_stages=2):
-                for i, j in T.Parallel(BM, 64):
+                for i, j in T.Parallel(BM, 64, coalesced_width=T.int32(1)):
                     a[i, j] = T.if_then_else(
                         by * BM + i < M, A[by * BM + i, kg * 64 + j], T.float16(0)
                     )
-                for n, j in T.Parallel(4 * BN, 64):
-                    w[n, j] = W[(n // BN) * H + bx * BN + n % BN, kg * 64 + j]
+                for b in T.unroll(4):
+                    T.copy(W[b * H + bx * BN, kg * 64], w[b * BN : (b + 1) * BN, :])
                 T.gemm(a, w, acc, transpose_B=True)
             T.copy(acc, rounded)
             T.clear(total)
             for branch in T.serial(4):
-                for i, j in T.Parallel(BM, BN, coalesced_width=T.int32(1)):
+                for i, j in T.Parallel(BM, BN):
                     if by * BM + i < M:
                         normed = Normed[by * BM + i, branch, bx * BN + j]
                         gate = stream_sigmoid(

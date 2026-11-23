@@ -1096,18 +1096,21 @@ impl ModelRuntime {
             self.prefetch_next_prefill(req, plan, chunk);
         }
         self.upload_segment_controls(chunk)?;
-        self.launch_rows(&program, chunk, ExecutionPhase::Prefill)?;
+        self.execution
+            .submit_program_rows(&program, chunk, ExecutionPhase::Prefill)?;
         if let Some(spec) = &self.manifest.mtp {
-            self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
+            self.submit_mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
         }
+        let needs_head = (req.offset + chunk == req.input.len()
+            || req.checkpoints.contains(&(req.offset + chunk)))
+            && head.is_some();
+        if needs_head && let Some(head) = head {
+            self.execution
+                .submit_program_rows(&head, chunk, ExecutionPhase::Prefill)?;
+        }
+        self.execution.sync()?;
         let regular_s = at.elapsed().as_secs_f64()
             - (self.execution.batch_statistics().initialization_s() - load_before);
-        if (req.offset + chunk == req.input.len()
-            || req.checkpoints.contains(&(req.offset + chunk)))
-            && let Some(head) = head
-        {
-            self.launch_rows(&head, chunk, ExecutionPhase::Prefill)?;
-        }
         let tokens = self.after_prefill(req, chunk)?;
         let seconds = at.elapsed().as_secs_f64();
         // Head/checkpoint/MTP warm-up is terminal work, and module loading is
@@ -1713,11 +1716,6 @@ impl ModelRuntime {
             requests[i].last_prefill.elapsed().as_secs_f64()
                 >= (options.target_tpot_ms / 1000. * 4.).max(2.)
         });
-        let turn = std::mem::take(&mut self.decode_turn);
-        let decode_round = prefill.is_none() || (!throughput && !decode.is_empty() && turn);
-        if decode_round && prefill.is_some() {
-            self.scheduler_statistics.decode_burst_iterations += 1;
-        }
         let slack = if throughput {
             f64::INFINITY
         } else {
@@ -1726,6 +1724,38 @@ impl ModelRuntime {
                 .filter_map(|&i| requests[i].decode_slack_s(options.target_tpot_ms))
                 .fold(f64::INFINITY, f64::min)
         };
+        let turn = std::mem::take(&mut self.decode_turn);
+        let prefill_ceiling_ms = (options.prefill_budget_ms * 1.6)
+            .min(options.target_tpot_ms)
+            .max(options.prefill_budget_ms);
+        let mut continued_prefill_window = None;
+        if turn
+            && !throughput
+            && !decode.is_empty()
+            && let Some(next_prefill) = prefill
+            && requests[next_prefill].prefill_frame.is_none()
+            && slack.is_finite()
+        {
+            // After finishing a short prompt slice, continue to the next pending
+            // prefill if it fits cleanly inside the remaining TPOT budget
+            // (reserving margin for ordinary or sampled-lookup decode).
+            let decode_s = self.predict_iteration(requests, &target);
+            let reserve_s = (decode_s * 1.5).max(decode_s + 0.055);
+            let remaining = scheduler::prefill_window(slack, reserve_s, prefill_ceiling_ms);
+            if remaining > 0.
+                && let Some(chunk) =
+                    self.native_prefill_chunk(requests, next_prefill, remaining, false)
+                && chunk > 1
+                && self.prefill_stage_cost(requests[next_prefill], chunk) <= remaining
+            {
+                continued_prefill_window = Some(remaining);
+            }
+        }
+        let decode_round = prefill.is_none()
+            || (!throughput && !decode.is_empty() && turn && continued_prefill_window.is_none());
+        if decode_round && prefill.is_some() {
+            self.scheduler_statistics.decode_burst_iterations += 1;
+        }
         // Prompt lookup remains an explicitly enabled proposal source. Its
         // timing/acceptance never trains the model-draft controller.
         if decode_round && decode.len() == 1 && self.prompt_lookup {
@@ -1857,7 +1887,9 @@ impl ModelRuntime {
             return Ok(Work::Batch(selected));
         }
         let decode_s = self.predict_iteration(requests, &selected);
-        let window_s = scheduler::prefill_window(slack, decode_s, options.prefill_budget_ms);
+        let reserve_s = (decode_s * 1.5).max(decode_s + 0.055);
+        let window_s = continued_prefill_window
+            .unwrap_or_else(|| scheduler::prefill_window(slack, reserve_s, prefill_ceiling_ms));
         let native = prefill.and_then(|i| {
             self.native_prefill_chunk(requests, i, window_s, progress_due)
                 .map(|n| (i, n))
@@ -1869,7 +1901,10 @@ impl ModelRuntime {
                 &prefills,
                 &mut joint,
                 cap,
-                (decode_s + window_s).min(slack).max(0.) * 1000.,
+                (decode_s + window_s.min(options.prefill_budget_ms / 1000.))
+                    .min(slack)
+                    .max(0.)
+                    * 1000.,
             )?;
             // A short prompt that fits alongside decode can start streaming
             // in this packet, without paying for a second target pass.

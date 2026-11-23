@@ -241,15 +241,15 @@ impl Executor {
                     &direct.row_kernels,
                     rows,
                 )?);
-                while cache.len() >= 128
+                while cache.len() >= 2048
                     || cache.iter().map(|(_, _, ops)| ops.len()).sum::<usize>() + operations.len()
-                        > 65536
+                        > 262144
                 {
                     if cache.pop_front().is_none() {
                         break;
                     }
                 }
-                if operations.len() <= 65536 {
+                if operations.len() <= 262144 {
                     cache.push_back((name.into(), rows, operations.clone()));
                 }
                 operations

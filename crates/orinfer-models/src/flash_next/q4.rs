@@ -10,27 +10,49 @@ use std::collections::{BTreeMap, BTreeSet};
 /// precision variants from roles, never from package kernel enumeration.
 pub(super) fn validate(manifest: &Manifest) -> Result<()> {
     let storage = Storage::new(&manifest.buffers);
-    let mut matrices = vec![("Q4_output".to_owned(), 248320, true)];
+    let mut matrices: Vec<(String, usize, usize, bool)> =
+        vec![("Q4_output".to_owned(), 248320, 2560, true)];
     for layer in 0..48 {
         if layer % 4 == 3 {
-            matrices.push((format!("Q4_blk.{layer}.attn_q"), 12288, true));
+            matrices.push((format!("Q4_blk.{layer}.attn_q"), 12288, 2560, true));
         } else {
-            matrices.push((format!("Q4_blk.{layer}.attn_gate"), 6144, true));
+            matrices.push((format!("Q4_blk.{layer}.attn_gate"), 6144, 2560, true));
             // QKV and Z deliberately share the Z sign vector.
-            matrices.push((format!("Q4_blk.{layer}.attn_qkv"), 10240, false));
+            matrices.push((format!("Q4_blk.{layer}.attn_qkv"), 10240, 2560, false));
+        }
+    }
+    let has_q4_out_proj = storage.names().any(|n| {
+        n.starts_with("Q4_blk.")
+            && (n.ends_with(".ssm_out_packed") || n.ends_with(".attn_output_packed"))
+    });
+    if has_q4_out_proj {
+        for layer in 0..48 {
+            let role = if layer % 4 == 3 {
+                "attn_output"
+            } else {
+                "ssm_out"
+            };
+            let w8_weight = format!("W_blk.{layer}.{role}.weight_weight");
+            let w8_scale = format!("W_blk.{layer}.{role}.weight_scale");
+            if storage.names().any(|n| n == w8_weight || n == w8_scale) {
+                return Err(format!(
+                    "Duplicate resident W8 and Q4 banks for blk.{layer}.{role}"
+                ));
+            }
+            matrices.push((format!("Q4_blk.{layer}.{role}"), 2560, 6144, true));
         }
     }
     let selected: BTreeSet<_> = matrices
         .iter()
-        .map(|(prefix, _, _)| format!("{prefix}_packed"))
+        .map(|(prefix, _, _, _)| format!("{prefix}_packed"))
         .collect();
-    for (prefix, outputs, signs) in matrices {
+    for (prefix, outputs, inputs, signs) in matrices {
         for (suffix, dtype, shape) in [
-            ("packed", Dtype::U16, vec![outputs, 640]),
+            ("packed", Dtype::U16, vec![outputs, inputs / 4]),
             ("scale", Dtype::F16, vec![outputs]),
         ]
         .into_iter()
-        .chain(signs.then_some(("signs", Dtype::I8, vec![2560])))
+        .chain(signs.then_some(("signs", Dtype::I8, vec![inputs])))
         {
             storage.check(&format!("{prefix}_{suffix}"), dtype, true, |b| {
                 Ok(b.shape == shape)
@@ -328,5 +350,114 @@ mod tests {
             "weight_parameters":0,"weight_scope":"test"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn optional_q4_out_proj_enforces_single_resident_bank() {
+        use crate::artifact::{Access, Buffer};
+        use crate::model::TensorIdentity;
+        let weight_buf = |name: String, dtype: Dtype, shape: Vec<usize>| Buffer {
+            name: name.clone(),
+            dtype,
+            shape,
+            layout: "native_contiguous".into(),
+            alignment: 256,
+            access: Access::Read,
+            data: Some(TensorIdentity {
+                tensor: name,
+                sha256: "0".repeat(64),
+            }),
+        };
+        let mut m = manifest(0);
+        m.buffers.push(weight_buf(
+            "Q4_output_packed".into(),
+            Dtype::U16,
+            vec![248320, 640],
+        ));
+        m.buffers.push(weight_buf(
+            "Q4_output_scale".into(),
+            Dtype::F16,
+            vec![248320],
+        ));
+        m.buffers
+            .push(weight_buf("Q4_output_signs".into(), Dtype::I8, vec![2560]));
+        for layer in 0..48 {
+            if layer % 4 == 3 {
+                m.buffers.push(weight_buf(
+                    format!("Q4_blk.{layer}.attn_q_packed"),
+                    Dtype::U16,
+                    vec![12288, 640],
+                ));
+                m.buffers.push(weight_buf(
+                    format!("Q4_blk.{layer}.attn_q_scale"),
+                    Dtype::F16,
+                    vec![12288],
+                ));
+                m.buffers.push(weight_buf(
+                    format!("Q4_blk.{layer}.attn_q_signs"),
+                    Dtype::I8,
+                    vec![2560],
+                ));
+            } else {
+                m.buffers.push(weight_buf(
+                    format!("Q4_blk.{layer}.attn_gate_packed"),
+                    Dtype::U16,
+                    vec![6144, 640],
+                ));
+                m.buffers.push(weight_buf(
+                    format!("Q4_blk.{layer}.attn_gate_scale"),
+                    Dtype::F16,
+                    vec![6144],
+                ));
+                m.buffers.push(weight_buf(
+                    format!("Q4_blk.{layer}.attn_gate_signs"),
+                    Dtype::I8,
+                    vec![2560],
+                ));
+                m.buffers.push(weight_buf(
+                    format!("Q4_blk.{layer}.attn_qkv_packed"),
+                    Dtype::U16,
+                    vec![10240, 640],
+                ));
+                m.buffers.push(weight_buf(
+                    format!("Q4_blk.{layer}.attn_qkv_scale"),
+                    Dtype::F16,
+                    vec![10240],
+                ));
+            }
+        }
+        // Baseline without Q4 ssm_out/attn_output passes.
+        validate(&m).unwrap();
+        // Adding all 48 Q4 ssm_out/attn_output banks passes.
+        for layer in 0..48 {
+            let role = if layer % 4 == 3 {
+                "attn_output"
+            } else {
+                "ssm_out"
+            };
+            m.buffers.push(weight_buf(
+                format!("Q4_blk.{layer}.{role}_packed"),
+                Dtype::U16,
+                vec![2560, 1536],
+            ));
+            m.buffers.push(weight_buf(
+                format!("Q4_blk.{layer}.{role}_scale"),
+                Dtype::F16,
+                vec![2560],
+            ));
+            m.buffers.push(weight_buf(
+                format!("Q4_blk.{layer}.{role}_signs"),
+                Dtype::I8,
+                vec![6144],
+            ));
+        }
+        validate(&m).unwrap();
+        // Retaining a duplicate W8 bank must be rejected.
+        m.buffers.push(weight_buf(
+            "W_blk.0.ssm_out.weight_weight".into(),
+            Dtype::I8,
+            vec![2560, 6144],
+        ));
+        assert!(validate(&m).unwrap_err().contains("Duplicate resident"));
     }
 }

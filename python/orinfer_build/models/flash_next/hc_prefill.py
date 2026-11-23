@@ -69,7 +69,7 @@ def _publish_packet_up_mix(kernels, launches, compiler, scopes):
             bindings,
             capacity,
             build=partial(hc_up_mix_packet.__wrapped__, capacity, hidden, rank, dynamic_rows=True),
-            key="flash-hc-packet-up-bf16-64",
+            key="flash-hc-packet-up-bf16-64-v2",
         )
     for name in obsolete - additions.keys():
         del kernels[name]
@@ -79,7 +79,11 @@ def _publish_packet_up_mix(kernels, launches, compiler, scopes):
 
 
 def publish(package, manifest, compiler, *, scopes):
-    from kernels.cuda.model.hc_prefill import hc_up_mix_prefill
+    from kernels.cuda.model.hc_prefill import (
+        hc_combine_norm_prefill,
+        hc_norm_prefill,
+        hc_up_mix_prefill,
+    )
 
     capacity, hidden, rank, tile = 4096, 2560, 320, 128
     plan = next(p for p in manifest["prefill_plans"] if p["chunk_tokens"] == capacity)
@@ -97,7 +101,67 @@ def publish(package, manifest, compiler, *, scopes):
     replacements, small = {}, {}
     for old in package["kernels"]:
         name = old["name"]
-        if name not in program or old["symbol"] != "hc_prefill_up_mix_kernel":
+        if name not in program:
+            continue
+        if old["symbol"] == "hc_prefill_norm_kernel":
+            pointers = compiler.pointers(old)
+            if set(pointers) != {"Residual", "Weight", "NormedBF", "InvRms"}:
+                raise ValueError(f"Unexpected HC prefill norm arguments: {name}")
+            if launches[name]["capacity"] != capacity:
+                raise ValueError(f"Incompatible HC prefill norm capacity: {name}")
+            rebuilt, launch = compiler.emit(
+                old,
+                name,
+                pointers,
+                capacity,
+                build=partial(
+                    hc_norm_prefill.__wrapped__,
+                    capacity,
+                    hidden,
+                    streams=4,
+                    dtype="float16",
+                    dynamic_rows=True,
+                ),
+                key="flash-hc-prefill-norm-vec",
+            )
+            if rebuilt["args"] != old["args"] or launch != launches[name]:
+                raise ValueError(f"Changed HC prefill norm contract: {name}")
+            replacements[name] = rebuilt
+            continue
+        if old["symbol"] == "hc_prefill_combine_norm_kernel":
+            pointers = compiler.pointers(old)
+            if set(pointers) != {
+                "Block",
+                "Residual",
+                "Inject",
+                "Weight",
+                "Output",
+                "NormedBF",
+                "InvRms",
+            }:
+                raise ValueError(f"Unexpected HC prefill combine-norm arguments: {name}")
+            if launches[name]["capacity"] != capacity:
+                raise ValueError(f"Incompatible HC prefill combine-norm capacity: {name}")
+            rebuilt, launch = compiler.emit(
+                old,
+                name,
+                pointers,
+                capacity,
+                build=partial(
+                    hc_combine_norm_prefill.__wrapped__,
+                    capacity,
+                    hidden,
+                    streams=4,
+                    dtype="float16",
+                    dynamic_rows=True,
+                ),
+                key="flash-hc-prefill-combine-norm-vec-v2",
+            )
+            if rebuilt["args"] != old["args"] or launch != launches[name]:
+                raise ValueError(f"Changed HC prefill combine-norm contract: {name}")
+            replacements[name] = rebuilt
+            continue
+        if old["symbol"] != "hc_prefill_up_mix_kernel":
             continue
         pointers = compiler.pointers(old)
         if set(pointers) != set(shapes) | {"W", "Weight"}:
@@ -134,10 +198,35 @@ def publish(package, manifest, compiler, *, scopes):
                 dynamic_rows=True,
                 padded_inputs=True,
             ),
-            key="flash-hc-prefill-up-padded",
+            key="flash-hc-prefill-up-padded-v2",
         )
         if rebuilt["args"] != old["args"] or launch != launches[name]:
             raise ValueError(f"Changed HC prefill operand or launch contract: {name}")
+        aligned = f"{name}/choice/{tile}-{capacity}/{tile}/k0"
+        if aligned in kernels:
+            aligned_old = kernels[aligned]
+            rebuilt_aligned, launch_aligned = compiler.emit(
+                aligned_old,
+                aligned,
+                compiler.pointers(aligned_old),
+                capacity,
+                build=partial(
+                    hc_up_mix_prefill.__wrapped__,
+                    capacity,
+                    hidden,
+                    rank,
+                    block_m=tile,
+                    dynamic_rows=True,
+                    aligned_rows=True,
+                ),
+                key="flash-hc-prefill-up-aligned-v2",
+            )
+            if (
+                rebuilt_aligned["args"] != aligned_old["args"]
+                or launch_aligned != launches[aligned]
+            ):
+                raise ValueError(f"Changed aligned HC prefill contract: {aligned}")
+            replacements[aligned] = rebuilt_aligned
         # Keep the original path for very short tails where the padding
         # costs more than the masked operands. The aligned choice starts at 128.
         short = f"{name}/choice/1-15/1/k0"

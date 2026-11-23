@@ -1050,10 +1050,13 @@ impl Executor {
         }
         self.ensure_kv(name)?;
         if let Some(operations) = self.direct.as_ref().and_then(|d| d.programs.get(name)) {
-            for operation in operations {
-                if let crate::model::Operation::Copy { source, bytes, .. } = operation {
-                    self.ensure_workspace(source, *bytes)?;
+            self.ensure_workspaces(operations.iter().filter_map(|operation| match operation {
+                crate::model::Operation::Copy { source, bytes, .. } => {
+                    Some((source.as_str(), *bytes))
                 }
+                _ => None,
+            }))?;
+            for operation in operations {
                 match operation {
                     crate::model::Operation::Copy {
                         destination, bytes, ..
@@ -1169,11 +1172,14 @@ impl Executor {
             .get_mut(name)
             .ok_or_else(|| format!("Unknown kernel {name}"))?;
         if !kernel.workspaces_ready {
-            for argument in &kernel.spec.args {
-                if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } = argument {
-                    self.ensure_workspace(name, self.sizes[name])?;
-                }
-            }
+            self.ensure_workspaces(kernel.spec.args.iter().filter_map(
+                |argument| match argument {
+                    Argument::Buffer { name } | Argument::BufferSlice { name, .. } => {
+                        Some((name.as_str(), self.sizes[name]))
+                    }
+                    _ => None,
+                },
+            ))?;
             // Shared mappings are retained for this executor's lifetime.
             // Track readiness separately from module preload: a preloaded
             // function can still reference an untouched workspace reservation.
@@ -1193,13 +1199,41 @@ impl Executor {
         Ok(())
     }
     pub(super) fn ensure_program_kernels(&self, name: &str) -> Result<()> {
-        let operations = self
-            .direct
-            .as_ref()
-            .ok_or("Missing direct bindings")?
+        let direct = self.direct.as_ref().ok_or("Missing direct bindings")?;
+        let operations = direct
             .programs
             .get(name)
             .ok_or_else(|| format!("Unknown program {name}"))?;
+        {
+            let mut bindings = direct.kernels.borrow_mut();
+            let mut pending = vec![];
+            for operation in operations {
+                if let crate::model::Operation::Kernel { name } = operation {
+                    let kernel = bindings
+                        .get(name)
+                        .ok_or_else(|| format!("Unknown kernel {name}"))?;
+                    if !kernel.workspaces_ready {
+                        for argument in &kernel.spec.args {
+                            if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } =
+                                argument
+                            {
+                                pending.push((name.as_str(), self.sizes[name]));
+                            }
+                        }
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                self.ensure_workspaces(pending)?;
+                for operation in operations {
+                    if let crate::model::Operation::Kernel { name } = operation
+                        && let Some(kernel) = bindings.get_mut(name)
+                    {
+                        kernel.workspaces_ready = true;
+                    }
+                }
+            }
+        }
         for operation in operations {
             if let crate::model::Operation::Kernel { name } = operation {
                 self.ensure_kernel(name)?;
@@ -1211,29 +1245,60 @@ impl Executor {
         &self,
         operations: &[crate::execution::Invocation],
     ) -> Result<()> {
-        for invocation in operations {
-            for view in invocation.views.values() {
-                self.ensure_workspace(&view.buffer, self.sizes[&view.buffer])?;
+        let direct = self.direct.as_ref().ok_or("Missing direct bindings")?;
+        {
+            let mut bindings = direct.kernels.borrow_mut();
+            let mut pending = vec![];
+            for invocation in operations {
+                for view in invocation.views.values() {
+                    pending.push((view.buffer.as_str(), self.sizes[&view.buffer]));
+                }
+                if let crate::model::Operation::Kernel { name } = &invocation.operation {
+                    let kernel = bindings
+                        .get(name)
+                        .ok_or_else(|| format!("Unknown kernel {name}"))?;
+                    if !kernel.workspaces_ready {
+                        for argument in &kernel.spec.args {
+                            if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } =
+                                argument
+                            {
+                                pending.push((name.as_str(), self.sizes[name]));
+                            }
+                        }
+                    }
+                } else {
+                    let names: Vec<&str> = match &invocation.operation {
+                        crate::model::Operation::Copy {
+                            source,
+                            destination,
+                            ..
+                        } => vec![source, destination],
+                        crate::model::Operation::Zero { destination, .. } => vec![destination],
+                        _ => vec![],
+                    };
+                    for name in names {
+                        let name = invocation
+                            .views
+                            .get(name)
+                            .map_or(name, |v| v.buffer.as_str());
+                        pending.push((name, self.sizes[name]));
+                    }
+                }
             }
+            if !pending.is_empty() {
+                self.ensure_workspaces(pending)?;
+                for invocation in operations {
+                    if let crate::model::Operation::Kernel { name } = &invocation.operation
+                        && let Some(kernel) = bindings.get_mut(name)
+                    {
+                        kernel.workspaces_ready = true;
+                    }
+                }
+            }
+        }
+        for invocation in operations {
             if let crate::model::Operation::Kernel { name } = &invocation.operation {
                 self.ensure_kernel(name)?;
-            } else {
-                let names: Vec<&str> = match &invocation.operation {
-                    crate::model::Operation::Copy {
-                        source,
-                        destination,
-                        ..
-                    } => vec![source, destination],
-                    crate::model::Operation::Zero { destination, .. } => vec![destination],
-                    _ => vec![],
-                };
-                for name in names {
-                    let name = invocation
-                        .views
-                        .get(name)
-                        .map_or(name, |v| v.buffer.as_str());
-                    self.ensure_workspace(name, self.sizes[name])?;
-                }
             }
         }
         Ok(())
@@ -1378,6 +1443,53 @@ impl Executor {
             stats.workspace_mapping_s += at.elapsed().as_secs_f64();
             self.batch_statistics.set(stats);
         }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_workspaces<'a>(
+        &self,
+        items: impl IntoIterator<Item = (&'a str, usize)>,
+    ) -> Result<()> {
+        let mut pending: BTreeMap<&'a str, usize> = BTreeMap::new();
+        {
+            let buffers = self.session.workspace_buffers.borrow();
+            for (name, bytes) in items {
+                if bytes > self.sizes.get(name).copied().unwrap_or(0) {
+                    return Err("Workspace mapping exceeds buffer".into());
+                }
+                if let Some(buffer) = buffers.get(name)
+                    && bytes > buffer.mapped
+                {
+                    pending
+                        .entry(name)
+                        .and_modify(|prev| *prev = (*prev).max(bytes))
+                        .or_insert(bytes);
+                }
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let at = Instant::now();
+        self.sync()?;
+        let mut buffers = self.session.workspace_buffers.borrow_mut();
+        let mut mappings = 0usize;
+        let mut mapped_bytes = 0usize;
+        for (name, bytes) in pending {
+            if let Some(buffer) = buffers.get_mut(name)
+                && bytes > buffer.mapped
+            {
+                let before = buffer.physical_bytes();
+                buffer.grow_bytes(&self.session, bytes)?;
+                mappings += 1;
+                mapped_bytes += buffer.physical_bytes() - before;
+            }
+        }
+        let mut stats = self.batch_statistics.get();
+        stats.workspace_mappings += mappings;
+        stats.workspace_mapped_bytes += mapped_bytes;
+        stats.workspace_mapping_s += at.elapsed().as_secs_f64();
+        self.batch_statistics.set(stats);
         Ok(())
     }
 

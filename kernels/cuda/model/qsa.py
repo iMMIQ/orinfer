@@ -654,6 +654,7 @@ def sparse_merge(
     splits: int = 8,
     dynamic_rows: bool = False,
     split_size: int | None = None,
+    dense_limit: int = 0,
 ):
 
     m = count = row_count(m, dynamic_rows)
@@ -674,9 +675,17 @@ def sparse_merge(
         with T.Kernel(m, 24, threads=128) as (row, head):
             if row < count:
                 active = (
-                    T.min(splits, T.ceildiv(T.min(position[0] + row + 1, 2051), split_size))
-                    if split_size is not None
-                    else splits
+                    T.if_then_else(
+                        position[0] + row < dense_limit,
+                        1,
+                        T.min(splits, T.ceildiv(T.min(position[0] + row + 1, 2051), split_size)),
+                    )
+                    if split_size is not None and dense_limit > 0
+                    else (
+                        T.min(splits, T.ceildiv(T.min(position[0] + row + 1, 2051), split_size))
+                        if split_size is not None
+                        else splits
+                    )
                 )
                 maximum = T.alloc_local((1,), T.float32)
                 den = T.alloc_local((1,), T.float32)

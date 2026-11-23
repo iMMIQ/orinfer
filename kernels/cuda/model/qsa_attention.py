@@ -73,6 +73,7 @@ def sparse_attention(
     explicit_barriers: bool = False,
     expanded_capacity: int = 0,
     partitions_per_cta: int = 1,
+    min_position: int = 0,
 ):
     geometry(m, capacity)
 
@@ -116,15 +117,19 @@ def sparse_attention(
     if type(partitions_per_cta) is not int or partitions_per_cta not in (1, 2):
         raise ValueError("Invalid QSA partitions per CTA")
     if partitions_per_cta == 2 and not (
-        expanded_capacity
+        explicit_barriers
         and skip_empty
         and split_size == 256
         and block_size == 32
         and threads == 128
     ):
         raise ValueError("Paired QSA partitions require the bounded native prefill schedule")
+    if type(min_position) is not int or min_position < 0:
+        raise ValueError("Invalid QSA min_position")
     block = block_size
-    shared_softmax = bool(expanded_capacity and block == 32 and threads == 128)
+    shared_softmax = bool(
+        (expanded_capacity or partitions_per_cta == 2) and block == 32 and threads == 128
+    )
     kv_width = 64 if packed else 256
     kv_dtype = T.uint32 if packed else T.int8
 
@@ -434,7 +439,7 @@ def sparse_attention(
                         T.gemm(q, k, scores, transpose_B=True, clear_accum=True)
                         for i in T.Parallel(16):
                             previous[i] = maximum[i]
-                        if expanded_capacity:
+                        if shared_softmax:
                             # Prefill uses the same softmax recurrence for complete and
                             # partial tiles. Only the final partial tile needs a mask.
                             # Padded query heads are independent and never written back.
@@ -448,10 +453,7 @@ def sparse_attention(
                                         scores[i, j] * 0.0625,
                                         -3.402823466e38,
                                     )
-                            if shared_softmax:
-                                reduce_tile(scores, pairs, maximum_scratch, partial, maximum, True)
-                            else:
-                                T.reduce_max(scores, maximum, dim=1, clear=False)
+                            reduce_tile(scores, pairs, maximum_scratch, partial, maximum, True)
                             if start + (tile + 1) * block <= end:
                                 for i, j in T.Parallel(16, block):
                                     scores[i, j] = T.exp(scores[i, j] - maximum[i])
@@ -572,13 +574,19 @@ def sparse_attention(
 
         def wrap(node):
             if isinstance(node, tir.SBlock) and node.name_hint == "tilelang_root":
+                cond = axes["blockIdx.z"] * (split_size * partitions_per_cta) < length
+                if min_position > 0:
+                    cond = tir.And(
+                        tir.BufferLoad(position, [0]) + axes["blockIdx.x"] >= min_position,
+                        cond,
+                    )
                 return tir.SBlock(
                     node.iter_vars,
                     node.reads,
                     node.writes,
                     node.name_hint,
                     tir.IfThenElse(
-                        axes["blockIdx.z"] * (split_size * partitions_per_cta) < length,
+                        cond,
                         node.body,
                         None,
                     ),
@@ -600,7 +608,7 @@ def sparse_attention(
 
 
 def expand_prefill_kv(m, capacity, limit):
-    """Dequantize the live prefill context into two reusable FP16 workspaces."""
+    """Dequantize the live prefill context prefix into two reusable FP16 workspaces."""
     if not 0 < limit <= capacity:
         raise ValueError("Invalid QSA expansion capacity")
     m = row_count(m, True)
@@ -617,8 +625,9 @@ def expand_prefill_kv(m, capacity, limit):
     ):
         with T.Kernel(T.ceildiv(limit, 4), 2, threads=128) as (group, h):
             T.import_source(PACKED_SOURCE)
-            end = Position[0] + m
-            if end <= limit:
+            pos = Position[0]
+            end = T.min(pos + m, limit)
+            if pos < limit and group * 4 < end:
                 for row, lane in T.Parallel(4, 32, coalesced_width=T.int32(1)):
                     token = group * 4 + row
                     if token < end:
@@ -640,3 +649,151 @@ def expand_prefill_kv(m, capacity, limit):
                         )
 
     return main
+
+
+def dense_causal_qsa_attention(
+    m: int,
+    capacity: int,
+    expanded_capacity: int = 8192,
+    dense_limit: int = 2048,
+    splits: int = 8,
+    block_q: int = 4,
+    block_k: int = 32,
+    threads: int = 128,
+    dynamic_rows: bool = True,
+):
+    """GQA-12 dense causal FlashAttention for QSA queries at Position + row < dense_limit.
+
+    Each CTA processes block_q consecutive queries x 12 GQA query heads (q_rows = block_q * 12),
+    sharing each ExpandedK/ExpandedV tile across q_rows queries via cp.async with overlapped
+    ExpandedV loading during QK + softmax, writing exact split-0 (Max, Den, Out) for sparse_merge.
+    """
+    geometry(m, capacity)
+    if (
+        not 0 < dense_limit <= expanded_capacity <= capacity
+        or dense_limit > 2048
+        or block_q not in (4, 8)
+        or block_k not in (32, 64)
+        or threads not in (128, 256)
+    ):
+        raise ValueError("Invalid dense causal QSA geometry")
+    m = row_count(m, dynamic_rows)
+    q_rows = block_q * 12
+
+    @T.prim_func
+    def dense_causal_qsa(
+        Query: T.Tensor((m, 24, 256), T.float16),
+        ExpandedK: T.Tensor((expanded_capacity, 2, 256), T.float16),
+        ExpandedV: T.Tensor((expanded_capacity, 2, 256), T.float16),
+        Position: T.Tensor((1,), T.int32),
+        Max: T.Tensor((m, 24, splits), T.float32),
+        Den: T.Tensor((m, 24, splits), T.float32),
+        Out: T.Tensor((m, 24, splits, 256), T.float32),
+    ):
+        with T.Kernel(T.ceildiv(m, block_q), 2, threads=threads) as (by, kh):
+            pos0 = Position[0]
+            q_start = by * block_q
+            abs_start = pos0 + q_start
+            if abs_start < dense_limit:
+                q = T.alloc_shared((q_rows, 256), T.float16)
+                k = T.alloc_shared((block_k, 256), T.float16)
+                v = T.alloc_shared((block_k, 256), T.float16)
+                p = T.alloc_shared((q_rows, block_k), T.float16)
+                scores = T.alloc_fragment((q_rows, block_k), T.float32)
+                acc = T.alloc_fragment((q_rows, 256), T.float32)
+                maximum = T.alloc_fragment((q_rows,), T.float32)
+                denom = T.alloc_fragment((q_rows,), T.float32)
+                previous = T.alloc_fragment((q_rows,), T.float32)
+                correction = T.alloc_fragment((q_rows,), T.float32)
+                rowsum = T.alloc_fragment((q_rows,), T.float32)
+                for r, group in T.Parallel(q_rows, 32, coalesced_width=T.int32(1)):
+                    qi = r // 12
+                    hi = r % 12
+                    live = q_start + qi < m and abs_start + qi < dense_limit
+                    T.ptx_cp_async(
+                        T.access_ptr(q[r, group * 8], "w", 8),
+                        T.access_ptr(
+                            Query[T.min(q_start + qi, m - 1), kh * 12 + hi, group * 8], "r", 8
+                        ),
+                        8,
+                        predicate=live,
+                    )
+                T.ptx_commit_group()
+                T.ptx_wait_group(0)
+                T.sync_threads()
+                T.clear(acc)
+                T.clear(denom)
+                T.fill(maximum, -3.402823466e38)
+                max_k = T.min(T.min(pos0 + m, dense_limit), abs_start + block_q)
+                for tile in T.serial(T.ceildiv(max_k, block_k)):
+                    k_base = tile * block_k
+                    T.sync_threads()
+                    for j, group in T.Parallel(block_k, 32, coalesced_width=T.int32(1)):
+                        live_k = k_base + j < max_k
+                        safe_k = T.min(k_base + j, expanded_capacity - 1)
+                        T.ptx_cp_async(
+                            T.access_ptr(k[j, group * 8], "w", 8),
+                            T.access_ptr(ExpandedK[safe_k, kh, group * 8], "r", 8),
+                            8,
+                            predicate=live_k,
+                        )
+                    T.ptx_commit_group()
+                    for j, group in T.Parallel(block_k, 32, coalesced_width=T.int32(1)):
+                        live_k = k_base + j < max_k
+                        safe_k = T.min(k_base + j, expanded_capacity - 1)
+                        T.ptx_cp_async(
+                            T.access_ptr(v[j, group * 8], "w", 8),
+                            T.access_ptr(ExpandedV[safe_k, kh, group * 8], "r", 8),
+                            8,
+                            predicate=live_k,
+                        )
+                    T.ptx_commit_group()
+                    T.ptx_wait_group(1)
+                    T.sync_threads()
+                    T.gemm(q, k, scores, transpose_B=True, clear_accum=True)
+                    for r in T.Parallel(q_rows):
+                        previous[r] = maximum[r]
+                    if k_base + block_k <= abs_start:
+                        for r, j in T.Parallel(q_rows, block_k):
+                            scores[r, j] *= 0.0625
+                        T.reduce_max(scores, maximum, dim=1, clear=False)
+                        for r, j in T.Parallel(q_rows, block_k):
+                            scores[r, j] = T.exp(scores[r, j] - maximum[r])
+                            p[r, j] = scores[r, j]
+                    else:
+                        for r, j in T.Parallel(q_rows, block_k):
+                            scores[r, j] = T.if_then_else(
+                                k_base + j <= abs_start + (r // 12) and k_base + j < max_k,
+                                scores[r, j] * 0.0625,
+                                -3.402823466e38,
+                            )
+                        T.reduce_max(scores, maximum, dim=1, clear=False)
+                        for r, j in T.Parallel(q_rows, block_k):
+                            scores[r, j] = T.if_then_else(
+                                k_base + j <= abs_start + (r // 12) and k_base + j < max_k,
+                                T.exp(scores[r, j] - maximum[r]),
+                                T.float32(0),
+                            )
+                            p[r, j] = scores[r, j]
+                    T.reduce_sum(scores, rowsum, dim=1)
+                    for r in T.Parallel(q_rows):
+                        correction[r] = T.exp(previous[r] - maximum[r])
+                        denom[r] = denom[r] * correction[r] + rowsum[r]
+                    for r, d in T.Parallel(q_rows, 256):
+                        acc[r, d] *= correction[r]
+                    T.ptx_wait_group(0)
+                    T.sync_threads()
+                    T.gemm(p, v, acc)
+                for r, d in T.Parallel(q_rows, 256):
+                    qi = r // 12
+                    hi = r % 12
+                    if q_start + qi < m and abs_start + qi < dense_limit:
+                        Out[q_start + qi, kh * 12 + hi, 0, d] = acc[r, d]
+                for r in T.Parallel(q_rows):
+                    qi = r // 12
+                    hi = r % 12
+                    if q_start + qi < m and abs_start + qi < dense_limit:
+                        Max[q_start + qi, kh * 12 + hi, 0] = maximum[r]
+                        Den[q_start + qi, kh * 12 + hi, 0] = denom[r]
+
+    return dense_causal_qsa

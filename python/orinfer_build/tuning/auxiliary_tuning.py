@@ -212,7 +212,7 @@ _QSA_STATE = {"K", "V", "KS", "VS", "Position"}
 _QSA_ATTENTION = _QSA_STATE | {"Query", "Selected", "Max", "Den", "Out"}
 
 
-def _packed_qsa(rows, context, expanded_capacity=0, *, skip_empty=False):
+def _packed_qsa(rows, context, expanded_capacity=0, *, skip_empty=False, min_position=0):
     from kernels.cuda.model.qsa_attention import sparse_attention
 
     return sparse_attention.__wrapped__(
@@ -227,6 +227,7 @@ def _packed_qsa(rows, context, expanded_capacity=0, *, skip_empty=False):
         expanded_capacity=expanded_capacity,
         skip_empty=skip_empty,
         partitions_per_cta=2 if expanded_capacity and skip_empty else 1,
+        min_position=min_position,
     )
 
 
@@ -551,14 +552,12 @@ def publish_q4_prefill(data, package, manifest, compiler):
                 raise ValueError("Unexpected dense Q4 projection ABI")
             weights = compiler.buffers[args["W"]["name"]]
             outputs, packed_width = weights["shape"]
-            if (
-                weights["dtype"] != "u16"
-                or packed_width * 4 != width
-                or outputs not in (6144, 10240, 12288)
-            ):
-                raise ValueError("Unexpected dense Q4 prefill geometry")
+            if weights["dtype"] != "u16":
+                raise ValueError("Unexpected dense Q4 prefill dtype")
+            if packed_width * 4 != width or outputs not in (6144, 10240, 12288):
+                continue
             expanded = workspaces["GdnGate" if outputs == 6144 else "Attention"]
-            for start in (1200, 2048):
+            for start in (769, 1200, 2048):
                 old_choice = f"{old['name']}/choice/{start}-{rows - 1}/1"
                 retired.update((f"{old_choice}/k0", f"{old_choice}/k1"))
             # Expansion wins from the seventh 128-row tile. A full block
