@@ -56,10 +56,10 @@ Ensure the Git working tree is clean, workspace versions are updated, and an ann
 
 ```bash
 uv run --locked python -m tools.release.package \
-  --version v0.4.1 \
+  --version v0.4.2 \
   --operators /path/to/qwen35-execution.tar.xz \
   --operators /path/to/flash-next-execution.tar.xz \
-  --output artifacts/releases/v0.4.1
+  --output artifacts/releases/v0.4.2
 ```
 
 - Verifies `aarch64` ELF target, binary `--version`, clean Git revision, and every execution package's ABI/digest/architecture contract (`configs/architecture-contract.json`).
