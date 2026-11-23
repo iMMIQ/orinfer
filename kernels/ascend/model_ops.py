@@ -229,6 +229,7 @@ def _partial_rope_heads(rows, heads, dimension, inverse):
     rotary, half = 64, 32
     count = heads * rotary
     sign = -1.0 if inverse else 1.0
+    slots = 20
 
     @T.prim_func
     def main(
@@ -237,7 +238,7 @@ def _partial_rope_heads(rows, heads, dimension, inverse):
         sine: T.Tensor((rows, half), "float32"),
         out: T.Tensor((rows * heads, dimension), "bfloat16"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(T.min(slots, T.ceildiv(rows, 2)), is_npu=True) as (cid, vid):
             source = T.alloc_ub((heads, dimension), "bfloat16")
             xb = T.alloc_ub((heads, rotary), "bfloat16")
             a = T.alloc_ub((heads, rotary), "float32")
@@ -255,9 +256,23 @@ def _partial_rope_heads(rows, heads, dimension, inverse):
             floor_index = T.alloc_ub((count,), "int32")
             parity = T.alloc_ub((count,), "float32")
             y = T.alloc_ub((heads, rotary), "bfloat16")
-            row = cid * 2 + vid
-            first = row * heads
-            if row < rows:
+            active_lanes = T.min(slots, T.ceildiv(rows, 2)) * 2
+            lane_id = cid * 2 + vid
+            # Hoist rotary interleave gather offsets once per persistent AIV.
+            T.tile.createvecindex(lane, 0.0)
+            T.tile.mul(half_index, lane, 0.5)
+            T.tile.cast(floor_index, half_index, "CAST_FLOOR", count)
+            T.tile.cast(half_index, floor_index, "CAST_NONE", count)
+            T.tile.mul(parity, half_index, 2.0)
+            T.tile.sub(lane, lane, parity)
+            T.tile.mul(lane, lane, float(heads * half))
+            T.tile.add(lane, lane, half_index)
+            T.tile.mul(lane, lane, 4.0)
+            T.tile.cast(floor_index, lane, "CAST_RINT", count)
+            T.reinterpretcast(offsets, floor_index, "uint32_t")
+            for step in T.serial(T.ceildiv(T.max(0, rows - lane_id), active_lanes)):
+                row = lane_id + step * active_lanes
+                first = row * heads
                 T.copy(x[first : first + heads, :], source)
                 T.copy(source[:, dimension - rotary :], xb)
                 T.copy(cosine[row : row + 1, :], co_row)
@@ -274,23 +289,14 @@ def _partial_rope_heads(rows, heads, dimension, inverse):
                 T.tile.mul(result[1, :, :], odd, co)
                 T.tile.mul(product, even, si)
                 T.tile.add(result[1, :, :], result[1, :, :], product)
-                T.tile.createvecindex(lane, 0.0)
-                T.tile.mul(half_index, lane, 0.5)
-                T.tile.cast(floor_index, half_index, "CAST_FLOOR", count)
-                T.tile.cast(half_index, floor_index, "CAST_NONE", count)
-                T.tile.mul(parity, half_index, 2.0)
-                T.tile.sub(lane, lane, parity)
-                T.tile.mul(lane, lane, float(heads * half))
-                T.tile.add(lane, lane, half_index)
-                T.tile.mul(lane, lane, 4.0)
-                T.tile.cast(floor_index, lane, "CAST_RINT", count)
-                T.reinterpretcast(offsets, floor_index, "uint32_t")
                 T.tile.gather(a, result, offsets, 0)
                 T.tile.cast(y, a, "CAST_RINT", count)
                 # The pinned UB->GM copy assumes a compact UB source. Store
                 # the complete head before replacing its rotary suffix.
                 T.copy(source, out[first : first + heads, :])
                 T.copy(y, out[first : first + heads, dimension - rotary :])
+                T.set_flag("MTE3", "V", 7)
+                T.wait_flag("MTE3", "V", 7)
 
     return main
 

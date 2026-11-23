@@ -48,6 +48,7 @@ pub(crate) struct Prediction {
     pub upper_s: f64,
     pub path: Path,
     pub samples: usize,
+    pub extrapolated: bool,
 }
 #[derive(Default)]
 struct Curves {
@@ -130,6 +131,7 @@ impl Costs {
                 upper_s: 0.,
                 path,
                 samples: 0,
+                extrapolated: false,
             };
         }
         let local = self.measured(work, path);
@@ -163,6 +165,7 @@ impl Costs {
                     upper_s: p.upper_s * 1.25,
                     path,
                     samples: 0,
+                    extrapolated: p.extrapolated,
                 };
             }
         }
@@ -197,6 +200,7 @@ impl Costs {
                 upper_s: prompt.upper_s + decode.1,
                 path,
                 samples: 0,
+                extrapolated: true,
             };
         }
         let seconds = (work.tokens + work.decode_rows) as f64 * self.cold_token_s;
@@ -205,6 +209,7 @@ impl Costs {
             upper_s: seconds,
             path,
             samples: 0,
+            extrapolated: true,
         }
     }
     fn measured(&self, work: Work, path: Path) -> Option<Prediction> {
@@ -296,14 +301,18 @@ impl Costs {
                     interpolate(points, work.tokens, |s| s.time.upper()),
                 )
             };
+            let extrapolated = !(points.iter().any(|(n, _)| n.abs_diff(work.tokens) <= 128)
+                || (points.len() >= 2
+                    && points.first().unwrap().0 <= work.tokens
+                    && work.tokens <= points.last().unwrap().0));
             let samples = points
                 .iter()
                 .map(|(_, s)| s.time.samples())
                 .min()
                 .unwrap_or(0);
-            (mean, upper.max(mean), samples)
+            (mean, upper.max(mean), samples, extrapolated)
         };
-        let (seconds, upper_s, samples) = match (lower, upper) {
+        let (seconds, upper_s, samples, extrapolated) = match (lower, upper) {
             (Some(a), Some(b)) if a.0 < b.0 => {
                 let fraction = ((work.context as f64 - a.0) / (b.0 - a.0)).clamp(0., 1.);
                 let x = price(&a.1);
@@ -312,6 +321,7 @@ impl Costs {
                     x.0 + (y.0 - x.0) * fraction,
                     x.1 + (y.1 - x.1) * fraction,
                     x.2.min(y.2),
+                    x.3 || y.3,
                 )
             }
             (Some(a), _) | (_, Some(a)) => price(&a.1),
@@ -322,6 +332,7 @@ impl Costs {
             upper_s,
             samples,
             path,
+            extrapolated,
         })
     }
     pub fn observe_restore(&mut self, host: bool, tokens: usize, seconds: f64) {

@@ -182,7 +182,7 @@ fn embedding_tensor() -> String {
     "embed.weight".into()
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Instruction {
     Fork,
@@ -480,6 +480,7 @@ struct SubProgram {
 }
 struct Execution {
     packet: Rc<Packet>,
+    tail_packet: Option<Rc<Packet>>,
     trunk: Rc<SubProgram>,
     tail: Option<Rc<SubProgram>>,
     head: Option<Rc<SubProgram>>,
@@ -488,6 +489,7 @@ impl Execution {
     fn monolithic(packet: Rc<Packet>, body: Vec<Step>, head: Vec<Step>, captured: bool) -> Self {
         Self {
             packet,
+            tail_packet: None,
             trunk: Rc::new(SubProgram {
                 steps: body,
                 captured,

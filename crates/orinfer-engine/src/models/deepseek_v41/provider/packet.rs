@@ -132,12 +132,7 @@ impl Selection {
             keep,
             estimator.capacity,
             ceiling_s,
-            |selected| {
-                estimator
-                    .costs
-                    .estimate(estimator.work(selected, requests, self.full, false))
-                    .upper_s
-            },
+            |selected| estimator.mixed_price(estimator.work(selected, requests, self.full, false)),
         )
         .min(self.budget)
     }
@@ -371,7 +366,148 @@ pub(super) fn forecast(
     work(&selected, requests, prefill_rows)
 }
 
+/// Canonical verification row buckets (max gap 15 <= DRAFTS + 1 = 17 so device
+/// coordinates remain active and all buckets <= 127 stay inside non-SP P[2]).
+const VERIFY_BUCKETS: &[usize] = &[16, 32, 48, 64, 80, 96, 112, 127];
+
+/// Canonical Mixed decoder-row buckets (max gap 33 <= 64 <= keep = 128; buckets
+/// <= 127 trigger cross-family Tail downgrade from SP P[3] to non-SP P[2]).
+const MIXED_DECODER_BUCKETS: &[usize] = &[32, 64, 96, 127, 160, 192, 224, 256];
+
+pub(super) fn bucket_verify_rows(rows: usize) -> usize {
+    VERIFY_BUCKETS
+        .iter()
+        .copied()
+        .find(|&b| b >= rows)
+        .unwrap_or(rows)
+}
+
+pub(super) fn bucket_mixed_decoder_rows(rows: usize) -> usize {
+    MIXED_DECODER_BUCKETS
+        .iter()
+        .copied()
+        .find(|&b| b >= rows)
+        .unwrap_or(rows)
+}
+
 impl Runtime {
+    /// Snap variable verification and mixed Tail/Head dimensions to a small
+    /// canonical bucket ladder via a reusable scratch pad owner so ACL Graphs
+    /// stay resident across changing batch compositions.
+    pub(super) fn bucket_selection(
+        &mut self,
+        selection: &mut Selection,
+        _requests: &[&mut Request],
+    ) -> Result<()> {
+        if selection.layout.decode
+            || selection.layout.role != super::super::PacketRole::Target
+            || selection.layout.pad_slot.is_some()
+        {
+            return Ok(());
+        }
+        let Some(contract) = self.team.model.batch.as_ref() else {
+            return Ok(());
+        };
+        let owners = contract.owners;
+        let output_capacity = contract.output_capacity();
+        if owners < 2 || selection.layout.segments.len() >= owners {
+            return Ok(());
+        }
+        let capacity = self.team.rows;
+        if selection.prefill_rows == 0 {
+            let actual = selection.layout.rows.total;
+            if actual == 0 || actual > 127 {
+                return Ok(());
+            }
+            let target = bucket_verify_rows(actual).min(capacity);
+            let pad_len = target.saturating_sub(actual);
+            selection.layout.enable_bucketing();
+            if pad_len > 0
+                && selection.layout.outputs.len() + pad_len <= output_capacity
+                && let Some(slot) = self.ensure_pad_slot()?
+            {
+                selection
+                    .layout
+                    .append_pad(slot, pad_len, pad_len, None, capacity, owners)?;
+                selection.tokens.push(vec![0u32; pad_len]);
+            }
+            return Ok(());
+        }
+        let keep = self.final_decoder_window();
+        if keep == 0 {
+            return Ok(());
+        }
+        let decoder_rows: usize = selection
+            .layout
+            .segments
+            .iter()
+            .zip(&selection.layout.decoder_roles)
+            .map(|(s, role)| {
+                if *role == super::super::replay::Role::Producer {
+                    0
+                } else {
+                    s.tokens.min(keep)
+                }
+            })
+            .sum();
+        if decoder_rows == 0 {
+            if selection.layout.rows.total == capacity || selection.layout.rows.total == 1024 {
+                selection.layout.enable_bucketing();
+            }
+            return Ok(());
+        }
+        if decoder_rows > 256 {
+            return Ok(());
+        }
+        let target_dec = bucket_mixed_decoder_rows(decoder_rows);
+        let pad_len = target_dec.saturating_sub(decoder_rows);
+        let cur_out = selection.layout.outputs.len();
+        let target_out = bucket_verify_rows(cur_out)
+            .min(target_dec)
+            .min(output_capacity);
+        let pad_out = target_out.saturating_sub(cur_out);
+        selection.layout.enable_bucketing();
+        if pad_len == 0 || pad_len > 64 {
+            return Ok(());
+        }
+        let at_budget = selection.layout.rows.total == selection.budget
+            || selection.layout.rows.total + pad_len > capacity;
+        let shrink_producer = if at_budget {
+            selection
+                .layout
+                .segments
+                .iter()
+                .zip(&selection.layout.decoder_roles)
+                .enumerate()
+                .rev()
+                .find_map(|(lane, (seg, role))| {
+                    (*role == super::super::replay::Role::Producer && seg.tokens > pad_len)
+                        .then_some(lane)
+                })
+        } else {
+            None
+        };
+        if shrink_producer.is_none() && selection.layout.rows.total + pad_len > capacity {
+            return Ok(());
+        }
+        if let Some(slot) = self.ensure_pad_slot()? {
+            if let Some(p_lane) = shrink_producer {
+                selection.selected[p_lane].1 -= pad_len;
+                selection.tokens[p_lane].truncate(selection.selected[p_lane].1);
+                selection.prefill_rows -= pad_len;
+            }
+            selection.layout.append_pad(
+                slot,
+                pad_len,
+                pad_out,
+                shrink_producer,
+                capacity,
+                owners,
+            )?;
+            selection.tokens.push(vec![0u32; pad_len]);
+        }
+        Ok(())
+    }
     pub(super) fn prepare_host_inputs(
         &mut self,
         layout: &Layout,
@@ -519,7 +655,7 @@ impl Runtime {
                     |selected| {
                         let full = self.packet_full(selected, requests);
                         let work = self.prefill_work(selected, requests, full, false);
-                        self.prefill_costs.estimate(work).upper_s
+                        self.prefill_estimator().mixed_price(work)
                     },
                 )
             } else {
@@ -837,5 +973,24 @@ mod tests {
         assert_eq!((partial.rows, partial.prefill_rows), (1927, 1921));
         let expanded = forecast(&requests, &order, &[6, 0], 4, 128, 2048);
         assert_eq!((expanded.rows, expanded.prefill_rows), (6, 0));
+    }
+    #[test]
+    fn bucket_ladders_bound_padding_gaps_and_stay_below_sp_threshold() {
+        for r in 1..=127 {
+            let b = bucket_verify_rows(r);
+            assert!(b >= r && b <= 127);
+            assert!(b - r <= 16, "verify gap {b}-{r} exceeds device coord limit");
+        }
+        for r in 1..=256 {
+            let b = bucket_mixed_decoder_rows(r);
+            assert!(b >= r && b <= 256);
+            assert!(b - r <= 64, "mixed gap {b}-{r} exceeds pad token budget");
+            if r <= 127 {
+                assert!(
+                    b <= 127,
+                    "mixed decoder_rows {r} spilled into SP bucket {b}"
+                );
+            }
+        }
     }
 }

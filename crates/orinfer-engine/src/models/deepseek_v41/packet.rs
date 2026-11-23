@@ -17,7 +17,7 @@ pub(super) struct Inputs<'a> {
     pub next: Option<&'a super::host_inputs::Window>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Coordinates {
     #[serde(default)]

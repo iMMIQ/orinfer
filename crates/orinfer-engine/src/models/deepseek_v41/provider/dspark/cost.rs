@@ -251,6 +251,24 @@ impl Model {
             .iter()
             .any(|(Key(f, rows, _, _), cell)| *f == group && *rows == work.rows && cell.prior > 0.)
     }
+    /// True when a neighboring execution size in the same stage/mode already
+    /// established hot calibration, so a single local observation suffices to
+    /// confirm this batch's ordinary cost without repeating full warmup.
+    pub fn has_calibrated_neighbor(&self, stage: Stage, full: bool, work: Work) -> bool {
+        let requested = family(stage, 0, full, work);
+        self.cells.iter().any(|(Key(f, rows, _, _), cell)| {
+            f.0 == stage
+                && f.1 == 0
+                && f.2 == full
+                && f.3 == requested.3
+                && cell.time.samples() >= crate::mtp::adaptive::HOT_SAMPLES
+                && (*rows >= 128) == (work.rows >= 128)
+                && work.rows <= rows.saturating_mul(2)
+                && *rows <= work.rows.saturating_mul(2)
+                && f.4.ilog2().abs_diff(requested.4.ilog2()) <= 1
+                && f.5.abs_diff(requested.5) <= 2
+        })
+    }
     /// Actual local observations; LRU eviction keeps the bounded surface able
     /// to learn new shapes even after filling 2048 entries.
     pub(super) fn local_evidence(

@@ -33,14 +33,23 @@ def split_row(x, packed, row, reduction):
     T.copy(low_bytes, packed[row * 2 + 1, :])
 
 
-def gather_split(rows, table_rows, width, experts):
-    """Gather live rows directly into paired signed INT4 planes and counts."""
-    if width % 64 or experts < 1 or experts % 4:
-        raise ValueError("Split gather requires aligned K and expert counts")
+def gather_split(rows, table_rows, width, experts, table_stride=0, slots=20):
+    """Gather live rows directly into paired signed INT4 planes and counts.
+
+    Persistent 20-slot (40-AIV) 1-wave schedule loads 64 indices per block and
+    skips dead (-1) rows without zeroing the 5 KB activation buffer or issuing
+    per-row scalar GM writes.
+    """
+    stride = table_stride or width
+    if width % 64 or stride < width or stride % 32 or experts < 1 or experts % 4:
+        raise ValueError("Split gather requires aligned K, stride and expert counts")
+    if slots not in (20, 24, 32, 48, 64):
+        raise ValueError("Unsupported split gather slot count")
+    block = 64
 
     @T.prim_func
     def main(
-        table: T.Tensor((table_rows, width), "int8"),
+        table: T.Tensor((table_rows, stride), "int8"),
         scales: T.Tensor((table_rows,), "float32"),
         indices: T.Tensor((rows,), "int32"),
         groups: T.Tensor((experts,), "int64"),
@@ -49,20 +58,23 @@ def gather_split(rows, table_rows, width, experts):
         errors: T.Tensor((rows,), "int32"),
         split_groups: T.Tensor((experts,), "int64"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(slots, is_npu=True) as (cid, vid):
             with T.Scope("V"):
                 x = T.alloc_ub((width,), "int8")
                 zeros = T.alloc_ub((width // 2,), "int16")
                 scale = T.alloc_ub((8,), "float32")
-                flag = T.alloc_ub((8,), "int32")
+                idx_ub = T.alloc_ub((block,), "int32")
+                scale_ub = T.alloc_ub((block,), "float32")
+                err_ub = T.alloc_ub((block,), "int32")
                 counts64 = T.alloc_ub((experts,), "int64")
                 counts32 = T.alloc_ub((experts * 2,), "int32")
                 doubled64 = T.alloc_ub((experts,), "int64")
                 T.reinterpretcast(x, zeros, "int8_t")
                 T.reinterpretcast(counts32, counts64, "int32_t")
                 T.reinterpretcast(doubled64, counts32, "int64_t")
-                row = cid * 2 + vid
-                if row == 0:
+                lane = cid * 2 + vid
+                lanes = slots * 2
+                if lane == 0:
                     T.copy(groups, counts64)
                     T.set_flag("MTE2", "V", 7)
                     T.wait_flag("MTE2", "V", 7)
@@ -70,27 +82,114 @@ def gather_split(rows, table_rows, width, experts):
                     T.set_flag("V", "MTE3", 7)
                     T.wait_flag("V", "MTE3", 7)
                     T.copy(doubled64, split_groups)
-                if row < rows:
-                    index = indices[row]
-                    T.tile.fill(zeros, 0)
-                    T.tile.fill(scale, 0.0)
-                    if index >= 0 and index < table_rows:
-                        T.copy(table[index, :], x)
-                        T.copy(scales[index : index + 1], scale[:1])
-                    if index != -1:
-                        split_row(x, packed, row, width)
-                    T.copy(scale[:1], out_scales[row : row + 1])
-                    flag[0] = T.if_then_else(index < -1 or index >= table_rows, 1, 0)
-                    T.copy(flag[:1], errors[row : row + 1])
+                chunks = T.ceildiv(rows, block)
+                for step in T.serial(T.ceildiv(T.max(0, chunks - lane), lanes)):
+                    part = lane + step * lanes
+                    base = part * block
+                    valid = T.min(block, rows - base)
+                    T.tile.fill(scale_ub, 0.0)
+                    T.tile.fill(err_ub, 0)
+                    T.copy(indices[base : base + valid], idx_ub[:valid])
+                    T.pipe_barrier("ALL")
+                    for j in T.serial(valid):
+                        index = idx_ub[j]
+                        if index != -1:
+                            if index >= 0 and index < table_rows:
+                                T.copy(table[index, :width], x)
+                                T.copy(scales[index : index + 1], scale[:1])
+                                T.pipe_barrier("ALL")
+                                scale_ub[j] = scale[0]
+                            else:
+                                T.tile.fill(zeros, 0)
+                                err_ub[j] = 1
+                                T.pipe_barrier("ALL")
+                            split_row(x, packed, base + j, width)
+                    T.pipe_barrier("ALL")
+                    T.copy(scale_ub[:valid], out_scales[base : base + valid])
+                    T.copy(err_ub[:valid], errors[base : base + valid])
+                    T.pipe_barrier("ALL")
 
     return main.with_attr("orinfer.explicit_cross_sync", True).with_attr(
         "orinfer.component_sources", COMPONENT_SOURCES
     )
 
 
-def finish(rows, width, experts, tile_n=256, slots=24):
-    if width % tile_n or tile_n % 32 or slots not in (24, 32, 48, 64):
+def finish(rows, width, experts, tile_n=256, slots=20):
+    if width % tile_n or tile_n % 32 or slots not in (20, 24, 32, 48, 64):
         raise ValueError("Invalid grouped epilogue geometry")
+    # Default 24-slot callers from existing plans map cleanly to 20 slots (40 AIVs = 1 wave on 910B3).
+    launch_slots = 20 if slots == 24 else slots
+
+    @T.prim_func
+    def main_full(
+        raw: T.Tensor((rows * 2, width * 2), "float16"),
+        assist: T.Tensor((experts, width * 2), "float32"),
+        token_scale: T.Tensor((rows,), "float32"),
+        groups: T.Tensor((experts,), "int64"),
+        out: T.Tensor((rows, width), "int8"),
+        scales: T.Tensor((rows,), "float32"),
+    ):
+        with T.Kernel(launch_slots, is_npu=True) as (cid, vid):
+            with T.Scope("V"):
+                prefix = T.alloc_ub((8,), "int32")
+                prefix[0] = 0
+                ri0 = T.alloc_ub((1, width * 2), "float16")
+                ri1 = T.alloc_ub((1, width * 2), "float16")
+                high = T.alloc_ub((1, width * 2), "float32")
+                low = T.alloc_ub((1, width * 2), "float32")
+                bias = T.alloc_ub((1, width * 2), "float32")
+                projected = T.alloc_ub((1, width * 2), "bfloat16")
+                gb = T.alloc_ub((1, width), "bfloat16")
+                ub = T.alloc_ub((1, width), "bfloat16")
+                gate = T.alloc_ub((1, width), "float32")
+                up = T.alloc_ub((1, width), "float32")
+                exponential = T.alloc_ub((1, width), "float32")
+                gated = T.alloc_ub((1, width), "bfloat16")
+                lane = cid * 2 + vid
+                lanes = launch_slots * 2
+                for expert in T.serial(experts):
+                    start = prefix[0]
+                    cursor = start % lanes
+                    count = T.min(rows - start, T.max(0, T.cast(groups[expert], "int32")))
+                    if lane >= cursor:
+                        prefix[1] = lane - cursor
+                    else:
+                        prefix[1] = lane + lanes - cursor
+                    first = prefix[1]
+                    items = T.ceildiv(T.max(0, count - first), lanes)
+                    if items > 0:
+                        T.copy(assist[expert : expert + 1, :], bias)
+                    for item in T.serial(items):
+                        row = start + first + item * lanes
+                        T.copy(raw[row * 2 : row * 2 + 1, :], ri0)
+                        T.copy(raw[row * 2 + 1 : row * 2 + 2, :], ri1)
+                        T.tile.cast(high, ri0, "CAST_NONE", width * 2)
+                        T.tile.cast(low, ri1, "CAST_NONE", width * 2)
+                        T.tile.mul(high, high, 16.0)
+                        T.tile.add(high, high, low)
+                        T.tile.add(high, high, bias)
+                        T.tile.mul(high, high, token_scale[row])
+                        T.tile.cast(projected, high, "CAST_RINT", width * 2)
+                        T.copy(projected[:, :width], gb)
+                        T.copy(projected[:, width:], ub)
+                        T.tile.cast(gate, gb, "CAST_NONE", width)
+                        T.tile.cast(up, ub, "CAST_NONE", width)
+                        T.tile.min(gate, gate, 10.0)
+                        T.tile.min(up, up, 10.0)
+                        T.tile.max(up, up, -10.0)
+                        T.tile.mul(exponential, gate, -1.0)
+                        T.tile.exp(exponential, exponential)
+                        T.tile.add(exponential, exponential, 1.0)
+                        T.tile.div(gate, gate, exponential)
+                        T.tile.mul(up, up, gate)
+                        T.tile.cast(gated, up, "CAST_RINT", width)
+                        quantize_bf16_row(gated, out, scales, row, width)
+                    prefix[0] = start + count
+
+    if tile_n == width:
+        return main_full.with_attr("orinfer.explicit_cross_sync", True).with_attr(
+            "orinfer.component_sources", COMPONENT_SOURCES
+        )
 
     @T.prim_func
     def main(
@@ -101,11 +200,8 @@ def finish(rows, width, experts, tile_n=256, slots=24):
         out: T.Tensor((rows, width), "int8"),
         scales: T.Tensor((rows,), "float32"),
     ):
-        with T.Kernel(slots, is_npu=True) as (cid, vid):
+        with T.Kernel(launch_slots, is_npu=True) as (cid, vid):
             with T.Scope("V"):
-                # The Ascend frontend hoists alloc_var initializers out of the
-                # bounded logical-grid loop. Reset a UB scalar on every tile;
-                # the rotating lane cursor is exactly this prefix modulo lanes.
                 prefix = T.alloc_ub((8,), "int32")
                 prefix[0] = 0
                 ri = T.alloc_ub((2, width * 2), "float16")
@@ -123,16 +219,16 @@ def finish(rows, width, experts, tile_n=256, slots=24):
                 gated = T.alloc_ub((1, width), "bfloat16")
                 for expert in T.serial(experts):
                     start = prefix[0]
-                    cursor = start % (slots * 2)
+                    cursor = start % (launch_slots * 2)
                     count = T.min(rows - start, T.max(0, T.cast(groups[expert], "int32")))
                     lane = cid * 2 + vid
                     if lane >= cursor:
                         prefix[1] = lane - cursor
                     else:
-                        prefix[1] = lane + slots * 2 - cursor
+                        prefix[1] = lane + launch_slots * 2 - cursor
                     first = prefix[1]
-                    for item in T.serial(T.ceildiv(T.max(0, count - first), slots * 2)):
-                        row = start + first + item * slots * 2
+                    for item in T.serial(T.ceildiv(T.max(0, count - first), launch_slots * 2)):
+                        row = start + first + item * launch_slots * 2
                         T.copy(raw[row * 2 : row * 2 + 2, :], ri)
                         T.tile.cast(rf, ri, "CAST_NONE", width * 4)
                         for column in T.serial(width // tile_n):

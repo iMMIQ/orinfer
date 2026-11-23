@@ -2,7 +2,9 @@
 use crate::artifact::Result;
 
 const ENV: &str = "ORINFER_A2_WORKER_CPUS";
+const HOST_ENV: &str = "ORINFER_A2_HOST_CPUS";
 const CPU_LIMIT: usize = 1024;
+const MAX_HOST_RAYON_THREADS: usize = 16;
 
 pub(super) fn from_env(ranks: usize) -> Result<Option<Vec<Vec<usize>>>> {
     let value = match std::env::var(ENV) {
@@ -13,11 +15,67 @@ pub(super) fn from_env(ranks: usize) -> Result<Option<Vec<Vec<usize>>>> {
     parse(&value, ranks, &current()?).map(Some)
 }
 
+pub(super) fn host_cpus(worker_cpus: Option<&[Vec<usize>]>) -> Result<Option<Vec<usize>>> {
+    let allowed = current()?;
+    match std::env::var(HOST_ENV) {
+        Ok(value) => {
+            let mut groups = parse_groups(&value, 1, &allowed, HOST_ENV)?;
+            return Ok(Some(groups.pop().unwrap()));
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(format!("{HOST_ENV}: {error}")),
+    }
+    let Some(groups) = worker_cpus else {
+        return Ok(None);
+    };
+    let reserved: std::collections::BTreeSet<usize> = groups.iter().flatten().copied().collect();
+    let remaining: Vec<usize> = allowed
+        .into_iter()
+        .filter(|cpu| !reserved.contains(cpu))
+        .collect();
+    Ok((!remaining.is_empty()).then_some(remaining))
+}
+
+/// Bound Rayon's global pool before host-table loading initializes it across all
+/// logical CPUs (e.g. 192 cores across NPU-attached NUMA nodes).
+pub(super) fn configure_host_pool(host_cpus: Option<&[usize]>) {
+    let env_threads = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    let default_threads = host_cpus
+        .map_or_else(
+            || std::thread::available_parallelism().map_or(4, usize::from),
+            <[usize]>::len,
+        )
+        .clamp(2, MAX_HOST_RAYON_THREADS);
+    let threads = env_threads.unwrap_or(default_threads);
+    let pinned = host_cpus.map(<[usize]>::to_vec);
+    let mut builder = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("orinfer-cpu-{i}"));
+    if let Some(cpus) = pinned {
+        builder = builder.start_handler(move |_| {
+            let _ = apply(&cpus);
+        });
+    }
+    let _ = builder.build_global();
+}
+
 fn parse(value: &str, ranks: usize, allowed: &[usize]) -> Result<Vec<Vec<usize>>> {
+    parse_groups(value, ranks, allowed, ENV)
+}
+
+fn parse_groups(
+    value: &str,
+    ranks: usize,
+    allowed: &[usize],
+    env_name: &str,
+) -> Result<Vec<Vec<usize>>> {
     let groups: Vec<_> = value.split(';').collect();
     if groups.len() != ranks {
         return Err(format!(
-            "{ENV} requires {ranks} semicolon-separated CPU lists"
+            "{env_name} requires {ranks} semicolon-separated CPU lists"
         ));
     }
     groups
@@ -29,7 +87,7 @@ fn parse(value: &str, ranks: usize, allowed: &[usize]) -> Result<Vec<Vec<usize>>
                 let number = |s: &str| {
                     s.trim()
                         .parse::<usize>()
-                        .map_err(|_| format!("{ENV}: invalid CPU in rank {rank}"))
+                        .map_err(|_| format!("{env_name}: invalid CPU in rank {rank}"))
                 };
                 let (first, last) = match item.trim().split_once('-') {
                     Some((first, last)) => (number(first)?, number(last)?),
@@ -39,11 +97,13 @@ fn parse(value: &str, ranks: usize, allowed: &[usize]) -> Result<Vec<Vec<usize>>
                     }
                 };
                 if first > last || last >= CPU_LIMIT {
-                    return Err(format!("{ENV}: invalid CPU range in rank {rank}"));
+                    return Err(format!("{env_name}: invalid CPU range in rank {rank}"));
                 }
                 for cpu in first..=last {
                     if !allowed.contains(&cpu) {
-                        return Err(format!("{ENV}: CPU {cpu} is outside the current affinity"));
+                        return Err(format!(
+                            "{env_name}: CPU {cpu} is outside the current affinity"
+                        ));
                     }
                     cpus.push(cpu);
                 }
@@ -114,6 +174,10 @@ mod tests {
         assert_eq!(
             parse("0,2-3,2;4-5", 2, &[0, 2, 3, 4, 5]).unwrap(),
             vec![vec![0, 2, 3], vec![4, 5]],
+        );
+        assert_eq!(
+            parse_groups("24-27,72", 1, &[0, 1, 24, 25, 26, 27, 72], HOST_ENV).unwrap(),
+            vec![vec![24, 25, 26, 27, 72]],
         );
     }
 

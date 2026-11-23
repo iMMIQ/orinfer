@@ -91,6 +91,35 @@ impl Runtime {
             .max(started.elapsed().as_secs_f64());
         Ok(true)
     }
+    /// Reclaim a batch of stale device prefixes directly on device without
+    /// synchronous PCIe host offload, for latency-critical HBM pressure paths.
+    pub(super) fn evict_fast_except(
+        &mut self,
+        protected: Option<u64>,
+        max_batch: usize,
+    ) -> Result<bool> {
+        let mut victims = Vec::with_capacity(max_batch.max(1));
+        for _ in 0..max_batch.max(1) {
+            let Some(key) = self.cache.device.victim_except(protected) else {
+                break;
+            };
+            let entry = self
+                .cache
+                .device
+                .remove(key)
+                .ok_or("Missing device prefix")?;
+            victims.push(entry.snapshot.id);
+        }
+        if victims.is_empty() {
+            return Ok(false);
+        }
+        let count = victims.len();
+        self.team.exchange(Command::EvictMany(victims))?;
+        self.cache_reclamation.device += count;
+        self.cache
+            .update_statistics(self.team.ranks(), &mut self.prefix);
+        Ok(true)
+    }
     pub(super) fn evict(&mut self) -> Result<bool> {
         self.evict_except(None)
     }
@@ -100,8 +129,21 @@ impl Runtime {
         };
         let entry = &self.cache.device.entries[&key];
         let id = entry.snapshot.id;
+        let freed_device = self.cache.device.unique_bytes(key);
+        let new_host_bytes: usize = entry
+            .snapshot
+            .banks
+            .iter()
+            .filter(|(bank_id, _)| !self.cache.host.contains_bank(**bank_id))
+            .map(|(_, bytes)| *bytes)
+            .sum();
+        // During active serving, skip synchronous PCIe offload when a COW leaf
+        // would copy far more shared ancestor bytes than it frees on device (or
+        // exceed a bounded per-rank transfer), avoiding multi-second stalls.
+        let allow_offload = self.active.is_empty()
+            || (new_host_bytes <= (32 << 20) && new_host_bytes <= freed_device.saturating_mul(4));
         let mut host_snapshot = None;
-        if self.cache.host.budget > 0 {
+        if self.cache.host.budget > 0 && allow_offload {
             let banks = self.team.offload_allocations(id)?;
             let snapshot = Snapshot {
                 id,

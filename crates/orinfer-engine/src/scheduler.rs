@@ -171,8 +171,11 @@ pub(crate) fn waiting_order(a: &Waiting, b: &Waiting) -> std::cmp::Ordering {
         if old_a {
             b.age_s.total_cmp(&a.age_s)
         } else {
-            (a.cost_s() / (1. + a.age_s / 2.))
-                .total_cmp(&(b.cost_s() / (1. + b.age_s / 2.)))
+            // Smooth aging over the 30s horizon avoids round-robin thrashing
+            // among similar-cost prompts while still prioritizing short work
+            // and honoring the 30s hard starvation promotion above.
+            (a.cost_s() / (1. + a.age_s / 30.))
+                .total_cmp(&(b.cost_s() / (1. + b.age_s / 30.)))
                 .then(b.age_s.total_cmp(&a.age_s))
         }
     })

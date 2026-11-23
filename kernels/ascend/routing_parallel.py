@@ -38,11 +38,34 @@ def clear(rows, experts=384, selected=6):
     return main
 
 
+def _compact_routes(destination, positions, masks, width, selected, live):
+    from tilelang import tvm
+
+    return tvm.tir.call_intrin(
+        "handle",
+        tvm.ir.Op.get("tl.ascend_mma"),
+        f"orinfer_compact_routes<{width}, {selected}>",
+        destination.access_ptr("rw"),
+        positions.access_ptr("r"),
+        masks.access_ptr("rw"),
+        False,
+        live,
+    )
+
+
 def local(rows, base=0, experts=48, selected=6, chunk=32):
+    """Compact per-chunk expert routes via hardware GatherMask.
+
+    Groups 8 experts per AIV task to cut redundant `indices` GM reads and block
+    launches 8x, and writes only the 32-byte-aligned live route prefix (skipping
+    positions GM writes completely on empty count==0 pairs).
+    """
     if not 1 <= selected <= 8 or chunk != 32:
         raise ValueError("Parallel regroup requires 1–8 routes and 32-token chunks")
     chunks = T.ceildiv(rows, chunk)
     width = chunk * 8
+    group_size = 8
+    expert_groups = (experts + group_size - 1) // group_size
 
     @T.prim_func
     def main(
@@ -50,62 +73,61 @@ def local(rows, base=0, experts=48, selected=6, chunk=32):
         positions: T.Tensor((experts, chunks, width), "int32"),
         counts: T.Tensor((experts, chunks), "int32"),
     ):
-        with T.Kernel(T.ceildiv(experts * chunks, 2), is_npu=True) as (cid, vid):
-            ids = T.alloc_ub((width,), "int32")
-            values = T.alloc_ub((width,), "float32")
-            lanes = T.alloc_ub((width,), "float32")
-            floor_i = T.alloc_ub((width,), "int32")
-            floor_f = T.alloc_ub((width,), "float32")
-            mask = T.alloc_ub((width // 8,), "uint8")
-            score = T.alloc_ub((width,), "float32")
-            pairs = T.alloc_ub((width * 2,), "float32")
-            ordered = T.alloc_ub((width,), "int32")
-            valid = T.alloc_ub((1, width), "float32")
-            total = T.alloc_ub((1, 1), "float32")
-            count = T.alloc_ub((8,), "int32")
-            task = cid * 2 + vid
-            expert, part = task // chunks, task % chunks
-            if expert < experts:
-                available = T.min(chunk, rows - part * chunk)
-                T.tile.fill(ids, -1)
-                T.copy(
-                    indices[part * chunk * 8 : (part * chunk + available) * 8], ids[: available * 8]
-                )
-                T.tile.cast(values, ids, "CAST_NONE", width)
-                T.tile.createvecindex(lanes, 0.0)
-                T.tile.mul(score, lanes, -1.0)
-                T.tile.compare(mask, values, T.cast(base + expert, "float32"), "EQ")
-                T.tile.select(score, mask, score, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
-                # Ignore padded route lanes even if their indices look valid.
-                T.tile.mul(floor_f, lanes, 0.125)
-                T.tile.cast(floor_i, floor_f, "CAST_FLOOR", width)
-                T.tile.cast(floor_f, floor_i, "CAST_NONE", width)
-                T.tile.mul(floor_f, floor_f, 8.0)
-                T.tile.sub(values, lanes, floor_f)
-                T.tile.compare(mask, values, float(selected), "LT")
-                T.tile.select(score, mask, score, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
-                # GM->UB copies zero-pad their physical destination. Explicitly
-                # exclude the final partial token chunk so padded zero IDs do
-                # not become real routes to expert zero on rank 0.
-                T.tile.compare(mask, lanes, T.cast(available * 8, "float32"), "LT")
-                T.tile.select(score, mask, score, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
-                T.tile.topk(pairs, score, width, width)
-                T.tile.gather_mask(values, pairs, "P0101")
-                T.tile.compare(mask, values, -T.infinity("float32"), "GT")
-                T.tile.fill(valid, 1.0)
-                T.tile.select(valid, mask, valid, 0.0, "VSEL_TENSOR_SCALAR_MODE")
-                T.reduce_sum(valid, total, dim=1)
-                T.tile.cast(count[:1], total, "CAST_RINT", 1)
-                T.copy(count[:1], counts[expert, part : part + 1])
-                T.tile.mul(values, values, -1.0)
-                T.tile.add(values, values, T.cast(part * chunk * 8, "float32"))
-                T.tile.select(values, mask, values, -1.0, "VSEL_TENSOR_SCALAR_MODE")
-                T.tile.cast(ordered, values, "CAST_RINT", width)
-                T.copy(ordered, positions[expert, part, :])
-                T.set_flag("MTE3", "V", 7)
-                T.wait_flag("MTE3", "V", 7)
+        with T.Kernel(T.ceildiv(expert_groups * chunks, 2), is_npu=True) as (cid, vid):
+            with T.Scope("V"):
+                ids = T.alloc_ub((width,), "int32")
+                values = T.alloc_ub((width,), "float32")
+                lanes = T.alloc_ub((width,), "int32")
+                masks = T.alloc_ub((width // 4,), "uint8")
+                ordered = T.alloc_ub((width + 8,), "int32")
+                T.reads(indices[0 : rows * 8])
+                T.writes(positions[0:experts, 0:chunks, 0:width], counts[0:experts, 0:chunks])
+                task = cid * 2 + vid
+                group, part = task // chunks, task % chunks
+                if group < expert_groups:
+                    available = T.min(chunk, rows - part * chunk)
+                    T.tile.fill(ids, -1)
+                    T.pipe_barrier("V")
+                    T.set_flag("V", "MTE2", 6)
+                    T.wait_flag("V", "MTE2", 6)
+                    T.copy(
+                        indices[part * width : part * width + available * 8], ids[: available * 8]
+                    )
+                    T.set_flag("MTE2", "V", 6)
+                    T.wait_flag("MTE2", "V", 6)
+                    T.tile.cast(values, ids, "CAST_NONE", width)
+                    T.tile.createvecindex(lanes, T.cast(part * width, "int32"))
+                    T.pipe_barrier("V")
+                    for offset in T.serial(group_size):
+                        expert = group * group_size + offset
+                        if expert < experts:
+                            T.tile.compare(
+                                masks[: width // 8],
+                                values,
+                                T.cast(base + expert, "float32"),
+                                "EQ",
+                            )
+                            T.pipe_barrier("V")
+                            T.evaluate(
+                                _compact_routes(
+                                    ordered, lanes, masks, width, selected, available * 8
+                                )
+                            )
+                            T.set_flag("V", "MTE3", 6)
+                            T.wait_flag("V", "MTE3", 6)
+                            T.set_flag("S", "MTE3", 6)
+                            T.wait_flag("S", "MTE3", 6)
+                            T.copy(ordered[width : width + 1], counts[expert, part : part + 1])
+                            cnt = ordered[width]
+                            if cnt > 0:
+                                aligned = T.min(width, T.ceildiv(cnt, 8) * 8)
+                                T.copy(ordered[:aligned], positions[expert, part, :aligned])
+                            T.set_flag("MTE3", "V", 7)
+                            T.wait_flag("MTE3", "V", 7)
 
-    return main
+    return main.with_attr(
+        "orinfer.component_sources", ["kernels/ascend/include/route_mask.h"]
+    ).with_attr("orinfer.explicit_sync", True)
 
 
 def prefix(rows, experts=48, selected=6, chunk=32, pad_last=False, scan_rows=0):
@@ -137,6 +159,15 @@ def prefix(rows, experts=48, selected=6, chunk=32, pad_last=False, scan_rows=0):
     return main
 
 
+@T.macro
+def _scan_shift_add(values, shifted, width, distance, n):
+    if distance < width:
+        if distance < n:
+            T.tile.fill(shifted, 0.0)
+            T.copy(values[0, 0 : width - distance], shifted[0, distance:width])
+            T.tile.add(values, values, shifted)
+
+
 def _vector_prefix(rows, experts, selected, chunk, pad_last, scan_rows):
     """Exact bounded scan over the model's local experts and selected routes."""
     if (
@@ -148,7 +179,6 @@ def _vector_prefix(rows, experts, selected, chunk, pad_last, scan_rows):
         raise ValueError("Vector regroup scan requires E1–128/top1–8/chunk32 and at most 4096 rows")
     chunks = T.ceildiv(rows, chunk)
     width = ((experts * ((scan_rows + chunk - 1) // chunk) + 63) // 64) * 64
-    steps = (width - 1).bit_length()
 
     @T.prim_func
     def main(
@@ -159,7 +189,9 @@ def _vector_prefix(rows, experts, selected, chunk, pad_last, scan_rows):
     ):
         with T.Kernel(1, is_npu=True) as (cid, vid):
             values = T.alloc_ub((1, width), "float32")
+            orig = T.alloc_ub((1, width), "float32")
             shifted = T.alloc_ub((1, width), "float32")
+            base_lanes = T.alloc_ub((1, width), "float32")
             lanes = T.alloc_ub((1, width), "float32")
             work = T.alloc_ub((width,), "int32")
             addresses = T.alloc_ub((width,), "uint32")
@@ -169,27 +201,42 @@ def _vector_prefix(rows, experts, selected, chunk, pad_last, scan_rows):
             total = T.alloc_ub((8,), "int32")
             maximum = T.alloc_ub((1, 1), "float32")
             if vid == 0:
+                n = experts * chunks
                 T.tile.fill(work, 0)
-                T.copy(counts[: experts * chunks], work[: experts * chunks])
+                T.copy(counts[:n], work[:n])
                 T.tile.cast(values, work, "CAST_NONE", width)
+                T.copy(values, orig)
+                T.tile.createvecindex(base_lanes, 0.0)
                 # All intermediate sums are integers <= 6*4096, exactly
                 # representable in FP32. Zero padding cannot create routes.
-                for step in T.serial(steps):
+                # Unrolled compile-time distances skip dead steps on small
+                # batches and replace >=8-element gathers with aligned UB copies.
+                for step in T.serial(3):
                     distance = T.shift_left(1, step)
-                    T.tile.createvecindex(lanes, 0.0)
-                    T.tile.add(lanes, lanes, -T.cast(distance, "float32"))
-                    T.tile.max(lanes, lanes, 0.0)
-                    T.tile.mul(lanes, lanes, 4.0)
-                    T.tile.cast(work, lanes, "CAST_RINT", width)
-                    T.reinterpretcast(addresses, work, "uint32_t")
-                    T.tile.gather(shifted, values, addresses, 0)
-                    T.tile.createvecindex(lanes, 0.0)
-                    T.tile.compare(mask, lanes, T.cast(distance, "float32"), "GE")
-                    T.tile.select(shifted, mask, shifted, 0.0, "VSEL_TENSOR_SCALAR_MODE")
-                    T.tile.add(values, values, shifted)
+                    if distance < n:
+                        T.tile.add(lanes, base_lanes, -T.cast(distance, "float32"))
+                        T.tile.max(lanes, lanes, 0.0)
+                        T.tile.mul(lanes, lanes, 4.0)
+                        T.tile.cast(work, lanes, "CAST_RINT", width)
+                        T.reinterpretcast(addresses, work, "uint32_t")
+                        T.tile.gather(shifted, values, addresses, 0)
+                        T.tile.compare(mask, base_lanes, T.cast(distance, "float32"), "GE")
+                        T.tile.select(shifted, mask, shifted, 0.0, "VSEL_TENSOR_SCALAR_MODE")
+                        T.tile.add(values, values, shifted)
+                _scan_shift_add(values, shifted, width, 8, n)
+                _scan_shift_add(values, shifted, width, 16, n)
+                _scan_shift_add(values, shifted, width, 32, n)
+                _scan_shift_add(values, shifted, width, 64, n)
+                _scan_shift_add(values, shifted, width, 128, n)
+                _scan_shift_add(values, shifted, width, 256, n)
+                _scan_shift_add(values, shifted, width, 512, n)
+                _scan_shift_add(values, shifted, width, 1024, n)
+                _scan_shift_add(values, shifted, width, 2048, n)
+                _scan_shift_add(values, shifted, width, 4096, n)
+                _scan_shift_add(values, shifted, width, 8192, n)
                 T.set_flag("V", "S", 6)
                 T.wait_flag("V", "S", 6)
-                total[0] = T.cast(values[0, experts * chunks - 1], "int32")
+                total[0] = T.cast(values[0, n - 1], "int32")
                 for expert in T.serial(experts):
                     group_values[expert] = T.cast(values[0, (expert + 1) * chunks - 1], "int64")
                     if expert > 0:
@@ -204,11 +251,9 @@ def _vector_prefix(rows, experts, selected, chunk, pad_last, scan_rows):
                 T.wait_flag("S", "MTE3", 6)
                 T.copy(group_values, groups)
                 T.copy(total[:1], errors[rows : rows + 1])
-                T.copy(counts[: experts * chunks], work[: experts * chunks])
-                T.tile.cast(lanes, work, "CAST_NONE", width)
-                T.tile.sub(values, values, lanes)
+                T.tile.sub(values, values, orig)
                 T.tile.cast(work, values, "CAST_RINT", width)
-                T.copy(work[: experts * chunks], offsets[: experts * chunks])
+                T.copy(work[:n], offsets[:n])
                 T.set_flag("MTE3", "V", 7)
                 T.wait_flag("MTE3", "V", 7)
                 T.tile.fill(work, 0)
@@ -236,6 +281,8 @@ def _vector_prefix(rows, experts, selected, chunk, pad_last, scan_rows):
 def pack(rows, experts=48, selected=6, chunk=32):
     chunks = T.ceildiv(rows, chunk)
     width = chunk * 8
+    group_size = 8
+    expert_groups = (experts + group_size - 1) // group_size
 
     @T.prim_func
     def main(
@@ -244,30 +291,42 @@ def pack(rows, experts=48, selected=6, chunk=32):
         offsets: T.Tensor((experts, chunks), "int32"),
         gather: T.Tensor((rows * selected,), "int32"),
     ):
-        with T.Kernel(T.ceildiv(experts * chunks, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(T.ceildiv(expert_groups * chunks, 2), is_npu=True) as (cid, vid):
             ids = T.alloc_ub((width,), "int32")
             original = T.alloc_ub((width,), "float32")
             row_f = T.alloc_ub((width,), "float32")
             row_i = T.alloc_ub((width,), "int32")
             task = cid * 2 + vid
-            expert, part = task // chunks, task % chunks
-            if expert < experts:
-                count, start = counts[expert, part], offsets[expert, part]
-                if count > 0:
-                    T.copy(positions[expert, part, :], ids)
-                    T.tile.cast(original, ids, "CAST_NONE", width)
-                    T.tile.mul(row_f, original, 0.125)
-                    T.tile.cast(row_i, row_f, "CAST_FLOOR", width)
-                    T.copy(row_i[:count], gather[start : start + count])
-                    T.set_flag("MTE3", "V", 7)
-                    T.wait_flag("MTE3", "V", 7)
+            group, part = task // chunks, task % chunks
+            if group < expert_groups:
+                T.tile.fill(ids, 0)
+                for offset in T.serial(group_size):
+                    expert = group * group_size + offset
+                    if expert < experts:
+                        count, start = counts[expert, part], offsets[expert, part]
+                        if count > 0:
+                            aligned = T.min(width, T.ceildiv(count, 8) * 8)
+                            T.copy(positions[expert, part, :aligned], ids[:aligned])
+                            T.tile.cast(original, ids, "CAST_NONE", width)
+                            T.tile.mul(row_f, original, 0.125)
+                            T.tile.cast(row_i, row_f, "CAST_FLOOR", width)
+                            T.copy(row_i[:count], gather[start : start + count])
+                            T.set_flag("MTE3", "V", 7)
+                            T.wait_flag("MTE3", "V", 7)
 
     return main
 
 
-def restore(rows, base=0, experts=48, selected=6, chunk=32):
+def restore(rows, base=0, experts=48, selected=6, chunk=32, scan_rows=2048):
+    """Chunk-level scalar cursor scan replacing 32x redundant per-row GM loads."""
+    from kernels.ascend.kv_int8 import _contiguous_view
+
+    if not 1 <= selected <= 8 or chunk != 32 or scan_rows < chunk:
+        raise ValueError("Restore scan requires 1–8 routes and 32-token chunks")
     chunks = T.ceildiv(rows, chunk)
+    capacity = (scan_rows + chunk - 1) // chunk
     width = chunk * 8
+    expert_capacity = (experts + 7) // 8 * 8
 
     @T.prim_func
     def main(
@@ -275,56 +334,47 @@ def restore(rows, base=0, experts=48, selected=6, chunk=32):
         offsets: T.Tensor((experts, chunks), "int32"),
         restore: T.Tensor((rows, 8), "int32"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
-            ids = T.alloc_ub((width,), "int32")
-            values = T.alloc_ub((width,), "float32")
-            lanes = T.alloc_ub((width,), "float32")
-            floor_i = T.alloc_ub((width,), "int32")
-            lane_mod = T.alloc_ub((width,), "float32")
-            valid = T.alloc_ub((1, width), "float32")
-            matching = T.alloc_ub((1, width), "float32")
-            total = T.alloc_ub((1, 1), "float32")
-            mask = T.alloc_ub((width // 8,), "uint8")
-            result = T.alloc_ub((8,), "int32")
-            row = cid * 2 + vid
-            if row < rows:
-                part = row // chunk
-                available = T.min(chunk, rows - part * chunk)
-                T.tile.fill(ids, -1)
-                T.copy(
-                    indices[part * chunk * 8 : (part * chunk + available) * 8], ids[: available * 8]
-                )
-                T.tile.cast(values, ids, "CAST_NONE", width)
-                T.tile.createvecindex(lanes, 0.0)
-                T.tile.mul(lane_mod, lanes, 0.125)
-                T.tile.cast(floor_i, lane_mod, "CAST_FLOOR", width)
-                T.tile.cast(lane_mod, floor_i, "CAST_NONE", width)
-                T.tile.mul(lane_mod, lane_mod, 8.0)
-                T.tile.sub(lane_mod, lanes, lane_mod)
-                T.tile.compare(mask, lane_mod, float(selected), "LT")
-                T.tile.fill(valid, 1.0)
-                T.tile.select(valid, mask, valid, 0.0, "VSEL_TENSOR_SCALAR_MODE")
-                for lane in T.serial(8):
-                    result[lane] = -1
-                for lane in T.serial(selected):
-                    expert = indices[row * 8 + lane] - base
-                    if expert >= 0 and expert < experts:
-                        T.tile.compare(mask, values, T.cast(expert + base, "float32"), "EQ")
-                        T.tile.select(matching, mask, valid, 0.0, "VSEL_TENSOR_SCALAR_MODE")
-                        T.tile.compare(
-                            mask, lanes, T.cast((row % chunk) * 8 + lane + 1, "float32"), "LT"
-                        )
-                        T.tile.select(matching, mask, matching, 0.0, "VSEL_TENSOR_SCALAR_MODE")
-                        T.reduce_sum(matching, total, dim=1)
-                        T.set_flag("V", "S", 6)
-                        T.wait_flag("V", "S", 6)
-                        result[lane] = offsets[expert, part] + T.cast(total[0, 0], "int32") - 1
-                        T.set_flag("S", "V", 6)
-                        T.wait_flag("S", "V", 6)
-                T.set_flag("S", "MTE3", 6)
-                T.wait_flag("S", "MTE3", 6)
-                T.copy(result, restore[row, :])
-                T.set_flag("MTE3", "S", 7)
-                T.wait_flag("MTE3", "S", 7)
+        flat_offsets = _contiguous_view(offsets, (experts * chunks,))
+        with T.Kernel(T.ceildiv(chunks, 2), is_npu=True) as (cid, vid):
+            T.reads(indices[0 : rows * 8], offsets[0:experts, 0:chunks])
+            T.writes(restore[0:rows, 0:8])
+            with T.Scope("V"):
+                ids = T.alloc_ub((width,), "int32")
+                starts = T.alloc_ub((experts * capacity,), "int32")
+                cursor = T.alloc_ub((expert_capacity,), "int32")
+                result = T.alloc_ub((chunk, 8), "int32")
+                part = cid * 2 + vid
+                if part < chunks:
+                    available = T.min(chunk, rows - part * chunk)
+                    T.copy(
+                        indices[part * width : part * width + available * 8], ids[: available * 8]
+                    )
+                    if chunks <= capacity:
+                        T.copy(flat_offsets[:], starts[: experts * chunks])
+                    T.tile.fill(result, -1)
+                    T.pipe_barrier("V")
+                    T.set_flag("MTE2", "S", 5)
+                    T.wait_flag("MTE2", "S", 5)
+                    T.set_flag("V", "S", 5)
+                    T.wait_flag("V", "S", 5)
+                    if chunks <= capacity:
+                        for expert in T.serial(experts):
+                            cursor[expert] = starts[expert * chunks + part]
+                    else:
+                        for expert in T.serial(experts):
+                            cursor[expert] = offsets[expert, part]
+                    for row in T.serial(available):
+                        for lane in T.serial(selected):
+                            expert = ids[row * 8 + lane] - base
+                            if 0 <= expert and expert < experts:
+                                result[row, lane] = cursor[expert]
+                                cursor[expert] = cursor[expert] + 1
+                    T.set_flag("S", "MTE3", 5)
+                    T.wait_flag("S", "MTE3", 5)
+                    T.copy(
+                        result[:available, :], restore[part * chunk : part * chunk + available, :]
+                    )
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
-    return main
+    return main.with_attr("orinfer.explicit_sync", True)

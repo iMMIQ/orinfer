@@ -50,6 +50,34 @@ impl Estimator<'_> {
         w.domain = self.cost_domain(w.tokens + w.decode_rows, decode);
         w
     }
+    /// Price a mixed packet for scheduling window selection. Once hot samples
+    /// exist, return the measured upper bound directly. Before the mixed cell
+    /// is observed, avoid double-counting the shared Trunk weight pass on
+    /// split Trunk + downgraded P[2] Tail packets (decoder_rows <= 127).
+    pub(super) fn mixed_price(&self, work: Work) -> f64 {
+        let p = self.costs.estimate(work);
+        if work.tokens < 512 || work.decode_rows == 0 || work.decode_rows > 127 {
+            return p.upper_s;
+        }
+        if p.samples > 0 && !p.extrapolated {
+            // Do not let a ~205ms un-captured Direct warmup pass permanently
+            // lock out a 2048-row mixed tile before it reaches Graph replay.
+            if p.path == Path::Direct && work.tokens >= 1024 {
+                return p.seconds * 0.90;
+            }
+            return p.upper_s;
+        }
+        let prompt = self.costs.estimate(Work {
+            decode_rows: 0,
+            decode_context: 0,
+            ..work
+        });
+        if prompt.samples > 0 {
+            let extra = (p.upper_s - prompt.upper_s).max(0.);
+            return prompt.upper_s + extra * 0.30;
+        }
+        p.upper_s
+    }
     fn prompt_decoder_rows(&self, rows: usize, final_chunk: bool) -> usize {
         self.model
             .batch
@@ -135,7 +163,7 @@ impl Estimator<'_> {
     }
 }
 impl Runtime {
-    fn prefill_estimator(&self) -> Estimator<'_> {
+    pub(super) fn prefill_estimator(&self) -> Estimator<'_> {
         Estimator {
             model: &self.team.model,
             domains: &self.team.target_domains,

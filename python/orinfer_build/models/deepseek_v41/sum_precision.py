@@ -122,6 +122,167 @@ def promote(model, kernel):
     return model, changes
 
 
+def demote(model, specs, combine_replacements=None, zero_row_tail_manifest=None):
+    """Demote FP32 collective sums (and optionally MoE combines) back to native BF16."""
+    model = deepcopy(model)
+    combine_replacements = combine_replacements or {}
+    attn_demoted = 0
+    moe_demoted = 0
+    shrunk_local = set()
+
+    def is_convert(step, src_dtype, dst_dtype):
+        if step["op"] != "kernel":
+            return False
+        spec = specs.get(step["manifest"])
+        if spec is None or spec["op"] != "model_ops.convert":
+            return False
+        params = spec["parameters"]
+        return (
+            params.get("source_dtype") == src_dtype and params.get("destination_dtype") == dst_dtype
+        )
+
+    for rank in model["ranks"]:
+        for packet in rank["packets"]:
+            for section in ("body", "head"):
+                old_steps = packet[section]
+                new_steps = []
+                i = 0
+                n = len(old_steps)
+                while i < n:
+                    step = old_steps[i]
+                    if (
+                        i + 2 < n
+                        and is_convert(step, "bfloat16", "float32")
+                        and old_steps[i + 1]["op"] == "reduce"
+                        and old_steps[i + 1].get("fp32", False)
+                        and old_steps[i + 1]["source"] == step["buffers"][1]
+                        and is_convert(old_steps[i + 2], "float32", "bfloat16")
+                        and old_steps[i + 2]["buffers"][0] == old_steps[i + 1]["destination"]
+                    ):
+                        reduced = deepcopy(old_steps[i + 1])
+                        reduced["source"] = step["buffers"][0]
+                        reduced["destination"] = old_steps[i + 2]["buffers"][1]
+                        reduced["fp32"] = False
+                        new_steps.append(reduced)
+                        attn_demoted += 1
+                        i += 3
+                        continue
+                    if (
+                        combine_replacements
+                        and step["op"] == "kernel"
+                        and step["manifest"] in combine_replacements
+                    ):
+                        comb = deepcopy(step)
+                        comb["manifest"] = combine_replacements[step["manifest"]]
+                        local_buf = comb["buffers"][4]
+                        shrunk_local.add(local_buf)
+                        new_steps.append(comb)
+                        j = i + 1
+                        if (
+                            j < n
+                            and old_steps[j]["op"] == "kernel"
+                            and specs.get(old_steps[j]["manifest"], {}).get("op")
+                            == "memory.zero_row_tail"
+                            and old_steps[j]["buffers"][1] == local_buf
+                        ):
+                            if zero_row_tail_manifest is None:
+                                raise ValueError(
+                                    "Missing BF16 zero_row_tail manifest for MoE demotion"
+                                )
+                            zrt = deepcopy(old_steps[j])
+                            zrt["manifest"] = zero_row_tail_manifest
+                            new_steps.append(zrt)
+                            j += 1
+                        if not (
+                            j + 1 < n
+                            and old_steps[j]["op"] == "reduce"
+                            and old_steps[j].get("fp32", False)
+                            and old_steps[j]["source"] == local_buf
+                            and is_convert(old_steps[j + 1], "float32", "bfloat16")
+                            and old_steps[j + 1]["buffers"][0] == old_steps[j]["destination"]
+                        ):
+                            raise ValueError(f"Unexpected FP32 MoE reduce sequence at step {i}")
+                        reduced = deepcopy(old_steps[j])
+                        reduced["destination"] = old_steps[j + 1]["buffers"][1]
+                        reduced["fp32"] = False
+                        new_steps.append(reduced)
+                        moe_demoted += 1
+                        i = j + 2
+                        continue
+                    new_steps.append(step)
+                    i += 1
+                packet[section] = new_steps
+
+        used = set()
+        for packet in rank["packets"]:
+            for section in ("body", "head"):
+                for step in packet[section]:
+                    if "buffers" in step:
+                        used.update(step["buffers"])
+                    for key in ("source", "destination", "counts", "offsets", "groups"):
+                        if isinstance(step.get(key), str):
+                            used.add(step[key])
+        for item in model.get("batch", {}).get("state", []):
+            if "buffer" in item:
+                used.add(item["buffer"])
+        kept = []
+        for buf in rank["buffers"]:
+            name = buf["name"]
+            if name.startswith("collective.fp32_sum.") and name not in used:
+                continue
+            if combine_replacements and name.endswith(".expert.reduced") and name not in used:
+                continue
+            if name in shrunk_local:
+                buf = deepcopy(buf)
+                if buf["bytes"] % 4:
+                    raise ValueError(f"Expected FP32 local buffer extent for {name}")
+                buf["bytes"] //= 2
+            kept.append(buf)
+        rank["buffers"] = kept
+
+    return model, dict(attn_demoted=attn_demoted, moe_demoted=moe_demoted)
+
+
+def compile_demoted(model, base, workers, full=True):
+    from orinfer_build.models.deepseek_v41.build import compile_plan_tasks, kernel_rebuild_task
+
+    specs = {
+        str(p.relative_to(base)): json.loads(p.read_text())
+        for p in base.glob("cache/*/kernel.json")
+    }
+    bf16_zrt = None
+    combine_replacements = {}
+    if full:
+        for rel, spec in specs.items():
+            params = spec["parameters"]
+            if (
+                spec["op"] == "memory.zero_row_tail"
+                and params.get("dtype") == "bfloat16"
+                and params.get("rows") == 2048
+                and params.get("capacity") == 2048
+                and params.get("width") == 5120
+                and params.get("partitions") == 8
+            ):
+                bf16_zrt = rel
+                break
+        tasks = {}
+        for rel, spec in specs.items():
+            if spec["op"] == "moe.combine" and spec["parameters"].get("output_dtype") == "float32":
+                rebuilt = deepcopy(spec)
+                rebuilt["parameters"]["output_dtype"] = "bfloat16"
+                for arg in rebuilt["operands"]:
+                    if arg["name"] == "out":
+                        arg["dtype"] = "bf16"
+                tasks[rel] = kernel_rebuild_task(rebuilt, rel)
+        if tasks:
+            combine_replacements = compile_plan_tasks(
+                tasks.values(), base, workers, progress="bf16-combine"
+            )
+            for new_rel in combine_replacements.values():
+                specs[new_rel] = json.loads((base / new_rel).read_text())
+    return demote(model, specs, combine_replacements, bf16_zrt)
+
+
 def compile_promoted(model, base, workers):
     from orinfer_build.models.deepseek_v41.build import compile_task, kernel_rebuild_task
     from orinfer_build.compiler.ascend.build import operand
@@ -211,7 +372,7 @@ def compile_promoted(model, base, workers):
     )
 
 
-def build(plan, output, workers=4, model_dir=None):
+def build(plan, output, workers=4, model_dir=None, mode="promote"):
     from orinfer_build.models.deepseek_v41.assembly import (
         compact_buffers,
         publish_package,
@@ -223,7 +384,14 @@ def build(plan, output, workers=4, model_dir=None):
     model = json.loads(plan.read_text())
     base = output / "source"
     publish_package(model, plan.parent, base)
-    model, report = compile_promoted(model, base, workers)
+    if mode == "promote":
+        model, report = compile_promoted(model, base, workers)
+    elif mode == "demote":
+        model, report = compile_demoted(model, base, workers, full=True)
+    elif mode == "demote-attention":
+        model, report = compile_demoted(model, base, workers, full=False)
+    else:
+        raise ValueError(f"Unknown sum precision mode: {mode}")
     compact_buffers(model)
     validate_rows(model, base, model_dir=model_dir)
     atomic_json(base / "model.json", model)
@@ -238,8 +406,13 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-workers", type=int, default=4)
     parser.add_argument("--model-dir", type=Path)
+    parser.add_argument(
+        "--mode",
+        choices=("promote", "demote", "demote-attention"),
+        default="promote",
+    )
     args = parser.parse_args()
-    print(build(args.plan, args.output, args.compile_workers, args.model_dir))
+    print(build(args.plan, args.output, args.compile_workers, args.model_dir, args.mode))
 
 
 if __name__ == "__main__":

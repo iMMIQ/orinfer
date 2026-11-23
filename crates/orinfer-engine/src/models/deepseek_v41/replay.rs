@@ -58,8 +58,8 @@ pub(super) struct RowMap {
 pub(super) struct Boundary {
     pub index: usize,
     pub keep: usize,
-    prepare: usize,
-    select: usize,
+    pub prepare: usize,
+    pub select: usize,
 }
 impl Boundary {
     pub fn find(program: &[Instruction]) -> Result<Option<Self>> {

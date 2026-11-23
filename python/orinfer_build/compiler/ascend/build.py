@@ -232,6 +232,15 @@ def compile_kernel(
             source = lower_aliases(source, parameters["_owner_aliases"])
         if function.attrs and function.attrs.get("orinfer.gather_pipeline", False):
             source = lower_gather_pipeline(source, required=True)
+        components = function.attrs.get("orinfer.component_sources", []) if function.attrs else []
+        headers = [ROOT / str(path) for path in components if Path(str(path)).suffix == ".h"]
+        if headers:
+            include = '#include "tl_templates/ascend/common.h"'
+            if include not in source:
+                raise ValueError("Device helpers require the Ascend template include")
+            source = source.replace(
+                include, include + "\n" + "\n".join(path.read_text() for path in headers), 1
+            )
         source = lower_scalar_cache(source)
         prototype = re.search(r'extern "C" void call\(([^)]*)\)', source)
         if prototype is None:

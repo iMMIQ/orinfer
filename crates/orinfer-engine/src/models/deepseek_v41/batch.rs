@@ -88,7 +88,7 @@ impl Contract {
         name: &str,
         rank: usize,
     ) -> Result<Vec<[i32; 2]>> {
-        let padded = padded_work(layout);
+        let padded = work_pad(layout);
         let decoder = self
             .decoder_replay
             .as_ref()
@@ -252,6 +252,7 @@ pub(super) struct TrunkKey {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct TailKey {
     family: (super::PacketRole, bool, usize),
+    trunk_family: (super::PacketRole, bool, usize),
     rows: usize,
     decoder_rows: usize,
     clipped: bool,
@@ -279,15 +280,22 @@ pub(super) struct WorkLaunch {
     partition: usize,
     decoder: bool,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkPad {
+    Exact,
+    Padded,
+    Bucketed,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TableKey {
     family: (super::PacketRole, bool, usize),
+    tail_min_rows: Option<usize>,
     segments: Vec<(usize, usize)>,
     outputs: Vec<usize>,
     output_positions: Vec<usize>,
     decoder_roles: Vec<super::replay::Role>,
     work_shape: Option<Vec<usize>>,
-    work_padding: bool,
+    work_padding: WorkPad,
 }
 pub(super) struct BoundTables {
     key: TableKey,
@@ -328,10 +336,20 @@ struct TableUse {
     draft_block: Option<usize>,
     draft_stride: Option<usize>,
     decoder_split: Option<usize>,
+    decoder_boundary: Option<usize>,
+    decoder_prepare: usize,
+    head_independent: bool,
     trunk_uses_clipped: bool,
+    tail_downgrade_targets: BTreeSet<(super::PacketRole, bool, usize)>,
     pointers: BTreeSet<String>,
     work: BTreeSet<String>,
     columns: Vec<bool>,
+    trunk_pointers: BTreeSet<String>,
+    trunk_work: BTreeSet<String>,
+    trunk_columns: Vec<bool>,
+    tail_pointers: BTreeSet<String>,
+    tail_work: BTreeSet<String>,
+    tail_columns: Vec<bool>,
 }
 impl Runtime {
     pub(super) fn touch_shared_packet(&mut self, key: Key) {
@@ -434,35 +452,30 @@ impl Runtime {
         }
         removed
     }
-    /// Cap the combined population across monolithic and split caches so
-    /// 4x64 independent maps cannot exhaust 910B hardware stream/event/model quotas.
+    /// Cap captured heavy graphs across monolithic, trunk, and tail caches so
+    /// 910B hardware stream/event/model quotas stay bounded. Uncaptured direct
+    /// entries hold no ACL Graph resources, and tiny 1-kernel heads stay
+    /// bounded independently by `self.capacity` so they are never thrash-evicted.
     fn trim_total_programs(&mut self, protected: &ProtectedKeys<'_>) {
-        let total_cap = self.capacity.saturating_add(self.capacity / 2).max(1);
+        let graph_cap = self.capacity.saturating_add(self.capacity / 2).max(1);
         loop {
-            let total = self.cache.len()
-                + self.trunk_cache.len()
-                + self.tail_cache.len()
-                + self.head_cache.len();
-            if total <= total_cap {
+            let captured = self.cache.values().filter(|e| e.all_captured()).count()
+                + self.trunk_cache.values().filter(|e| e.captured).count()
+                + self.tail_cache.values().filter(|e| e.captured).count();
+            if captured <= graph_cap {
                 break;
             }
             let evicted = Self::evict_oldest_unprotected(
-                &mut self.head_lru,
-                protected.head,
-                |k| self.head_cache.remove(k).is_some(),
-                &mut self.recent_head,
+                &mut self.lru,
+                protected.mono,
+                |k| self.cache.remove(k).is_some(),
+                &mut self.recent,
                 |k| k.family,
             ) || Self::evict_oldest_unprotected(
                 &mut self.tail_lru,
                 protected.tail,
                 |k| self.tail_cache.remove(k).is_some(),
                 &mut self.recent_tail,
-                |k| k.family,
-            ) || Self::evict_oldest_unprotected(
-                &mut self.lru,
-                protected.mono,
-                |k| self.cache.remove(k).is_some(),
-                &mut self.recent,
                 |k| k.family,
             ) || Self::evict_oldest_unprotected(
                 &mut self.trunk_lru,
@@ -522,31 +535,87 @@ impl Runtime {
         let family = self.resolve_family(layout)?;
         shape_key(&self.contract, layout, family, &self.launches)
     }
+    fn resolve_tail_family(
+        &self,
+        trunk_family: (super::PacketRole, bool, usize),
+        decoder_rows: usize,
+        clipped: bool,
+    ) -> (super::PacketRole, bool, usize) {
+        if !clipped || decoder_rows == 0 {
+            return trunk_family;
+        }
+        let trunk_used = &self.tables[&trunk_family];
+        if trunk_used.tail_downgrade_targets.is_empty() {
+            return trunk_family;
+        }
+        self.families
+            .iter()
+            .find_map(|family| {
+                let used = &self.tables[family];
+                (trunk_used.tail_downgrade_targets.contains(family)
+                    && family.2 <= decoder_rows
+                    && decoder_rows <= used.max_rows)
+                    .then_some(*family)
+            })
+            .unwrap_or(trunk_family)
+    }
     pub(super) fn split_keys(&self, layout: &Layout) -> Result<Option<SplitKeys>> {
         let family = self.resolve_family(layout)?;
         let used = &self.tables[&family];
         if used.decoder_split.is_none() {
             return Ok(None);
         }
-        let (decoder_rows, trunk_work, decoder_work) =
-            split_work_rows(&self.contract, layout, family, &self.launches)?;
+        let decoder_rows = self
+            .contract
+            .decoder_replay
+            .as_ref()
+            .filter(|_| layout.role == super::PacketRole::Target && !layout.decode)
+            .map(|r| layout.decoder(r.keep, r.final_prompt_only))
+            .transpose()?
+            .map(|d| d.rows.total);
         let clipped = decoder_rows.is_some_and(|d| d < layout.rows.total);
+        let tail_family = decoder_rows
+            .filter(|&d| d > 0)
+            .map(|d| self.resolve_tail_family(family, d, clipped));
+        let (_, trunk_work, decoder_work) = split_work_rows(
+            &self.contract,
+            layout,
+            family,
+            tail_family.unwrap_or(family),
+            &self.launches,
+        )?;
         let trunk = TrunkKey {
             family,
             rows: layout.rows.total,
             clipped: used.trunk_uses_clipped && clipped,
             work_rows: trunk_work,
         };
-        let tail = decoder_rows.filter(|&d| d > 0).map(|d| TailKey {
-            family,
-            rows: layout.rows.total,
-            decoder_rows: d,
-            clipped,
-            work_rows: decoder_work,
+        let tail = decoder_rows.filter(|&d| d > 0).map(|d| {
+            let tf = tail_family.unwrap_or(family);
+            TailKey {
+                family: tf,
+                trunk_family: family,
+                rows: if used.decoder_prepare > 0 {
+                    layout.rows.total
+                } else {
+                    0
+                },
+                decoder_rows: d,
+                clipped,
+                work_rows: decoder_work,
+            }
         });
         let head = (!layout.outputs.is_empty()).then_some(HeadKey {
-            family,
-            rows: layout.rows.total,
+            family: if used.head_independent {
+                tail_family.unwrap_or(family)
+            } else {
+                family
+            },
+            rows: if used.head_independent {
+                0
+            } else {
+                layout.rows.total
+            },
             decoder_rows,
             outputs: layout.outputs.len(),
         });
@@ -589,8 +658,25 @@ impl Runtime {
                 })
                 .cloned()
                 .ok_or("Missing batch family")?;
+            let tail_packet = split
+                .tail
+                .as_ref()
+                .filter(|k| k.family != split.family)
+                .map(|k| {
+                    templates
+                        .iter()
+                        .find(|p| {
+                            p.role == k.family.0
+                                && p.batch_decode == k.family.1
+                                && p.min_rows == k.family.2
+                        })
+                        .cloned()
+                        .ok_or_else(|| "Missing tail batch family".to_string())
+                })
+                .transpose()?;
             return Ok(Some(Rc::new(Execution {
                 packet,
+                tail_packet,
                 trunk,
                 tail,
                 head,
@@ -606,11 +692,12 @@ impl Runtime {
         launches: &BTreeSet<WorkLaunch>,
     ) -> Self {
         let mut tables = BTreeMap::new();
+        let mut boundaries = BTreeMap::new();
         for packet in packets {
-            let split = super::replay::Boundary::find(&packet.body)
+            let boundary = super::replay::Boundary::find(&packet.body)
                 .ok()
                 .flatten()
-                .and_then(|b| {
+                .filter(|b| {
                     // Only split when no Fork/Switch/Join crosses the boundary
                     // and no instruction in body uses owner-output counts.
                     let split_idx = b.split_index();
@@ -628,8 +715,9 @@ impl Runtime {
                         }
                         _ => false,
                     });
-                    (depth == 0 && !body_uses_owners).then_some(split_idx)
+                    depth == 0 && !body_uses_owners
                 });
+            let split = boundary.as_ref().map(super::replay::Boundary::split_index);
             let trunk_uses_clipped = split.is_some_and(|split_idx| {
                 packet.body[..split_idx].iter().any(|s| {
                     matches!(
@@ -641,31 +729,155 @@ impl Runtime {
                     )
                 })
             });
+            let head_independent = matches!(
+                packet.head.first(),
+                Some(Instruction::DecoderRows {
+                    prepare: 0,
+                    select: 0,
+                    ..
+                })
+            ) && !packet.head.iter().any(|s| {
+                matches!(
+                    s,
+                    Instruction::Kernel {
+                        uncompacted_manifest: Some(_),
+                        ..
+                    }
+                )
+            });
             let mut used = TableUse {
                 max_rows: packet.dispatch_max(),
                 draft_block: packet.coordinates.draft_block,
                 draft_stride: packet.draft_stride,
                 decoder_split: split,
+                decoder_boundary: boundary.as_ref().map(|b| b.index),
+                decoder_prepare: boundary.as_ref().map_or(0, |b| b.prepare),
+                head_independent,
                 trunk_uses_clipped,
+                tail_downgrade_targets: BTreeSet::new(),
                 pointers: BTreeSet::new(),
                 work: BTreeSet::new(),
                 columns: vec![false; contract.columns.len()],
+                trunk_pointers: BTreeSet::new(),
+                trunk_work: BTreeSet::new(),
+                trunk_columns: vec![false; contract.columns.len()],
+                tail_pointers: BTreeSet::new(),
+                tail_work: BTreeSet::new(),
+                tail_columns: vec![false; contract.columns.len()],
             };
-            for step in packet.body.iter().chain(&packet.head) {
+            let record_step = |step: &Instruction,
+                               work: &mut BTreeSet<String>,
+                               pointers: &mut BTreeSet<String>,
+                               columns: &mut [bool]| {
                 if let Instruction::Kernel {
                     owner_work: Some(_),
                     buffers,
                     ..
                 } = step
                 {
-                    used.work.insert(buffers[0].clone());
-                    used.pointers.insert(buffers[1].clone());
+                    work.insert(buffers[0].clone());
+                    pointers.insert(buffers[1].clone());
                     for &column in &contract.pointers[&buffers[1]] {
-                        used.columns[column] = true;
+                        columns[column] = true;
                     }
                 }
+            };
+            let split_at = split.unwrap_or(packet.body.len());
+            for step in &packet.body[..split_at] {
+                record_step(step, &mut used.work, &mut used.pointers, &mut used.columns);
+                record_step(
+                    step,
+                    &mut used.trunk_work,
+                    &mut used.trunk_pointers,
+                    &mut used.trunk_columns,
+                );
             }
-            tables.insert((packet.role, packet.batch_decode, packet.min_rows), used);
+            for step in packet.body[split_at..].iter().chain(&packet.head) {
+                record_step(step, &mut used.work, &mut used.pointers, &mut used.columns);
+                record_step(
+                    step,
+                    &mut used.tail_work,
+                    &mut used.tail_pointers,
+                    &mut used.tail_columns,
+                );
+            }
+            let key = (packet.role, packet.batch_decode, packet.min_rows);
+            if let Some(b) = boundary {
+                boundaries.insert(key, b);
+            }
+            tables.insert(key, used);
+        }
+        // Pre-validate cross-family tail downgrade: an SP trunk (prepare > 0)
+        // that gathers all sequence-partitioned live rows into global buffers
+        // can hand off directly to a smaller non-SP family's Tail + Head.
+        for trunk in packets {
+            let tk = (trunk.role, trunk.batch_decode, trunk.min_rows);
+            let Some(tb) = boundaries.get(&tk) else {
+                continue;
+            };
+            if trunk.role != super::PacketRole::Target || trunk.batch_decode || tb.prepare == 0 {
+                continue;
+            }
+            let mut trunk_global = BTreeSet::new();
+            for step in &trunk.body[..tb.index] {
+                match step {
+                    Instruction::Gather { destination, .. } => {
+                        trunk_global.insert(destination.as_str());
+                    }
+                    Instruction::Kernel { buffers, .. } => {
+                        for b in buffers {
+                            trunk_global.insert(b.as_str());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for cand in packets {
+                let ck = (cand.role, cand.batch_decode, cand.min_rows);
+                if ck == tk
+                    || cand.role != super::PacketRole::Target
+                    || cand.batch_decode
+                    || cand.min_rows >= trunk.min_rows
+                    || cand.rows != trunk.rows
+                    || cand.decoder_coordinates != trunk.decoder_coordinates
+                    || cand.head != trunk.head
+                    || cand.logits != trunk.logits
+                    || cand.best_value != trunk.best_value
+                    || cand.best_index != trunk.best_index
+                    || cand.confidence != trunk.confidence
+                    || cand.vocab_first != trunk.vocab_first
+                    || cand.replicated_output != trunk.replicated_output
+                {
+                    continue;
+                }
+                let Some(cb) = boundaries.get(&ck) else {
+                    continue;
+                };
+                if cb.prepare != 0 || cb.keep != tb.keep || cb.select == 0 {
+                    continue;
+                }
+                // Every non-scratch source buffer read by the candidate's
+                // decoder selection must already be populated in global order
+                // by the trunk + its prepare gathers.
+                let select_sources_ready = cand.body[cb.index + 1..=cb.index + cb.select]
+                    .iter()
+                    .all(|step| match step {
+                        Instruction::Kernel { buffers, .. } => {
+                            let src = buffers.first().map(String::as_str).unwrap_or("");
+                            src.starts_with("batch.decoder.scratch.")
+                                || src.ends_with(".residual.b")
+                                || trunk_global.contains(src)
+                        }
+                        _ => false,
+                    });
+                if select_sources_ready {
+                    tables
+                        .get_mut(&tk)
+                        .unwrap()
+                        .tail_downgrade_targets
+                        .insert(ck);
+                }
+            }
         }
         Self {
             contract,
@@ -703,6 +915,8 @@ pub(super) struct Layout {
     pub output_positions: Vec<usize>,
     pub decode: bool,
     pub decoder_roles: Vec<super::replay::Role>,
+    pub pad_slot: Option<usize>,
+    pub bucketed: bool,
     work_shape: Option<Vec<usize>>,
     work_padding: bool,
 }
@@ -741,9 +955,60 @@ impl Layout {
             outputs,
             decode,
             decoder_roles,
+            pad_slot: None,
+            bucketed: false,
             work_shape: None,
             work_padding,
         })
+    }
+    pub(super) fn enable_bucketing(&mut self) {
+        self.bucketed = true;
+        if !self.decode {
+            self.work_padding = true;
+        }
+    }
+    /// Append a scratch padding segment (and optional dummy outputs) while
+    /// preserving all real owner slices, roles, and retained work shapes.
+    pub(super) fn append_pad(
+        &mut self,
+        slot: usize,
+        pad_tokens: usize,
+        pad_outputs: usize,
+        shrink_producer: Option<usize>,
+        capacity: usize,
+        owners: usize,
+    ) -> Result<()> {
+        if pad_tokens == 0 || self.decode || self.pad_slot.is_some() {
+            return Err("Invalid padding layout request".into());
+        }
+        if let Some(lane) = shrink_producer {
+            if self.decoder_roles.get(lane) != Some(&super::replay::Role::Producer)
+                || self.segments[lane].tokens <= pad_tokens
+            {
+                return Err("Invalid producer shrink for padding".into());
+            }
+            self.segments[lane].tokens -= pad_tokens;
+            if let Some(shape) = &mut self.work_shape {
+                shape[lane] = shape[lane].saturating_sub(pad_tokens);
+            }
+        }
+        let pad_lane = self.segments.len();
+        self.segments.push(BatchSegment {
+            slot,
+            tokens: pad_tokens,
+        });
+        self.decoder_roles.push(super::replay::Role::Continue);
+        if let Some(shape) = &mut self.work_shape {
+            shape.push(pad_tokens);
+        }
+        for pos in 0..pad_outputs {
+            self.outputs.push(pad_lane);
+            self.output_positions.push(pos % pad_tokens);
+        }
+        self.rows = Rows::packet(&self.segments, owners, capacity)?;
+        self.pad_slot = Some(slot);
+        self.enable_bucketing();
+        Ok(())
     }
     /// Retain a proven launch envelope while row/address tables carry real lengths.
     /// Only short decoder lengths may change. Prompt membership and lengths
@@ -764,7 +1029,7 @@ impl Layout {
             || self.outputs.len() != reference.outputs.len()
             || self.segments.len() != reference.segments.len()
             || self.decoder_roles != reference.decoder_roles
-            || padded_work(self) != padded_work(reference)
+            || work_pad(self) != work_pad(reference)
             || self
                 .segments
                 .iter()
@@ -965,15 +1230,20 @@ impl Layout {
         result.resize(width, -1);
         Ok(result)
     }
+    #[cfg(test)]
     fn table_key(&self, min_rows: usize) -> TableKey {
+        self.table_key_for(min_rows, None)
+    }
+    fn table_key_for(&self, min_rows: usize, tail_min_rows: Option<usize>) -> TableKey {
         TableKey {
             family: (self.role, self.decode, min_rows),
+            tail_min_rows,
             segments: self.segments.iter().map(|s| (s.slot, s.tokens)).collect(),
             outputs: self.outputs.clone(),
             output_positions: self.output_positions.clone(),
             decoder_roles: self.decoder_roles.clone(),
             work_shape: self.work_shape.clone(),
-            work_padding: padded_work(self),
+            work_padding: work_pad(self),
         }
     }
 }
@@ -1039,6 +1309,7 @@ fn split_work_rows(
     contract: &Contract,
     layout: &Layout,
     family: (super::PacketRole, bool, usize),
+    tail_family: (super::PacketRole, bool, usize),
     launches: &BTreeSet<WorkLaunch>,
 ) -> Result<(Option<usize>, Vec<usize>, Vec<usize>)> {
     if layout.outputs.len() > contract.output_capacity() {
@@ -1051,7 +1322,7 @@ fn split_work_rows(
     } else {
         layout
     };
-    let padded = padded_work(layout);
+    let padded = work_pad(layout);
     let decoder = contract
         .decoder_replay
         .as_ref()
@@ -1065,8 +1336,10 @@ fn split_work_rows(
         let applicable = launch.family.0 == layout.decode
             && if layout.role == super::PacketRole::Draft {
                 launch.family.1 == family.2
+            } else if launch.decoder {
+                launch.family.1 == tail_family.2
             } else {
-                (launch.family.1..=launch.family.2).contains(&layout.rows.total)
+                launch.family.1 == family.2
             };
         if launch.role != layout.role || !applicable {
             continue;
@@ -1136,7 +1409,7 @@ fn shape_key_with_scope(
     } else {
         layout
     };
-    let padded = padded_work(layout);
+    let padded = work_pad(layout);
     let decoder = contract
         .decoder_replay
         .as_ref()
@@ -1200,19 +1473,32 @@ fn shape_key_with_scope(
     })
 }
 /// Owner tables carry real work; unused lanes already use the inactive sentinel.
-/// Retain a small launch envelope across nearby owner-work counts so changing
+/// Retain a launch envelope across nearby owner-work counts so changing
 /// prompt splits need not rebuild an otherwise identical model packet.
-fn padded_work(layout: &Layout) -> bool {
+fn work_pad(layout: &Layout) -> WorkPad {
     // Decoder/suffix views inherit their source packet's launch envelope.
     // Recomputing it from their shorter row count would disagree with the
     // retained-work check and with the uploaded owner-work table.
-    layout.role == super::PacketRole::Target && !layout.decode && layout.work_padding
-}
-fn work_capacity(count: usize, padded: bool) -> usize {
-    if padded {
-        count.max(2).next_power_of_two()
+    if layout.role == super::PacketRole::Target && !layout.decode {
+        if layout.bucketed {
+            WorkPad::Bucketed
+        } else if layout.work_padding {
+            WorkPad::Padded
+        } else {
+            WorkPad::Exact
+        }
     } else {
-        count.max(1).div_ceil(2) * 2
+        WorkPad::Exact
+    }
+}
+fn work_capacity(count: usize, mode: WorkPad) -> usize {
+    match mode {
+        WorkPad::Exact => count.max(1).div_ceil(2) * 2,
+        WorkPad::Padded => count.max(2).next_power_of_two().min(8192),
+        // Bucketed packets use a 256-item (128-pair) floor so 1..=4 active
+        // owners per rank partition share one canonical Trunk/Tail ACL Graph;
+        // unused lanes hold the [-1, 0] sentinel and return immediately.
+        WorkPad::Bucketed => count.max(256).next_power_of_two().min(8192),
     }
 }
 fn work_blocks(tokens: usize, grid: &RowExpression, range: Option<&WorkRange>) -> Result<usize> {
@@ -1475,7 +1761,7 @@ impl Worker {
                     &0i32.to_le_bytes(),
                 )?;
                 let tables_started = std::time::Instant::now();
-                self.update_batch_tables(layout, &packet)?;
+                self.update_batch_tables(layout, &packet, None)?;
                 tables_s = tables_started.elapsed().as_secs_f64();
             }
             let guard_s = guard_started.elapsed().as_secs_f64() - tables_s;
@@ -1623,6 +1909,22 @@ impl Worker {
                 })
                 .cloned()
                 .ok_or("Missing batch family")?;
+            let tail_packet = split
+                .tail
+                .as_ref()
+                .filter(|k| k.family != split.family)
+                .map(|k| {
+                    self.packet_templates
+                        .iter()
+                        .find(|p| {
+                            p.role == k.family.0
+                                && p.batch_decode == k.family.1
+                                && p.min_rows == k.family.2
+                        })
+                        .cloned()
+                        .ok_or_else(|| "Missing tail batch family".to_string())
+                })
+                .transpose()?;
             if layout.rows.total > packet.rows {
                 return Err("Batch exceeds its family row capacity".into());
             }
@@ -1632,11 +1934,15 @@ impl Worker {
                     &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
                     &0i32.to_le_bytes(),
                 )?;
-                self.update_batch_tables(layout, &packet)?;
+                self.update_batch_tables(layout, &packet, tail_packet.as_deref())?;
             }
-            let split_idx = self.batch.as_ref().unwrap().tables[&split.family]
+            let trunk_used = &self.batch.as_ref().unwrap().tables[&split.family];
+            let split_idx = trunk_used
                 .decoder_split
                 .ok_or("Missing decoder split index")?;
+            let trunk_boundary = trunk_used
+                .decoder_boundary
+                .ok_or("Missing decoder boundary index")?;
             let base = self.package.clone();
             if let Some(capture) = need_trunk {
                 let prev = self
@@ -1677,6 +1983,28 @@ impl Worker {
                     .cloned();
                 let steps = if let Some(prev) = prev {
                     self.capture_steps(&prev.steps)?
+                } else if let Some(tp) = &tail_packet {
+                    let tail_boundary = self.batch.as_ref().unwrap().tables[&tail_key.family]
+                        .decoder_boundary
+                        .ok_or("Missing tail decoder boundary index")?;
+                    let prepare_len = trunk_boundary - split_idx;
+                    let mut spliced =
+                        Vec::with_capacity(prepare_len + (tp.body.len() - tail_boundary));
+                    spliced.extend_from_slice(&packet.body[split_idx..trunk_boundary]);
+                    let mut dr = tp.body[tail_boundary].clone();
+                    if let Instruction::DecoderRows { prepare, .. } = &mut dr {
+                        *prepare = prepare_len;
+                    }
+                    spliced.push(dr);
+                    spliced.extend_from_slice(&tp.body[tail_boundary + 1..]);
+                    self.compile_bound(
+                        &spliced,
+                        &base,
+                        self.snapshots,
+                        (packet.rows, layout.rows.total),
+                        Some(layout),
+                        capture,
+                    )?
                 } else {
                     self.compile_bound(
                         &packet.body[split_idx..],
@@ -1731,6 +2059,7 @@ impl Worker {
                     serde_json::json!({
                         "rows": layout.rows.total,
                         "decoder_rows": split.tail.as_ref().map(|k| k.decoder_rows),
+                        "tail_family": split.tail.as_ref().map(|k| k.family.2),
                         "outputs": layout.outputs.len(),
                         "trunk": need_trunk, "tail": need_tail, "head": need_head,
                         "wall_s": started.elapsed().as_secs_f64(),
@@ -1779,9 +2108,11 @@ impl Worker {
         &mut self,
         layout: &Layout,
         packet: &super::Packet,
+        tail_packet: Option<&super::Packet>,
     ) -> Result<Vec<Buffer>> {
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
-        let key = layout.table_key(packet.min_rows);
+        let tail_override = tail_packet.filter(|tp| tp.min_rows != packet.min_rows);
+        let key = layout.table_key_for(packet.min_rows, tail_override.map(|tp| tp.min_rows));
         if let Some(bound) = &runtime.bound_tables
             && bound.key == key
         {
@@ -1792,6 +2123,21 @@ impl Worker {
             .tables
             .get(&(packet.role, packet.batch_decode, packet.min_rows))
             .ok_or("Missing packet table usage")?;
+        let tail_used = tail_override
+            .map(|tp| {
+                runtime
+                    .tables
+                    .get(&(tp.role, tp.batch_decode, tp.min_rows))
+                    .ok_or("Missing tail packet table usage")
+            })
+            .transpose()?;
+        let col_active = |index: usize| {
+            if let Some(tu) = tail_used {
+                used.trunk_columns[index] || tu.tail_columns[index]
+            } else {
+                used.columns[index]
+            }
+        };
         let decoder = runtime
             .contract
             .decoder_replay
@@ -1805,7 +2151,7 @@ impl Worker {
             aligned.insert((true, 1, 1), l.rows.partition(1, 0)?);
         }
         for (index, column) in runtime.contract.columns.iter().enumerate() {
-            if used.columns[index] && column.row_bytes.is_some() {
+            if col_active(index) && column.row_bytes.is_some() {
                 let stride = column.row_partition.unwrap_or(1);
                 let alignment = column.row_alignment;
                 if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -1836,7 +2182,7 @@ impl Worker {
                 .ok_or("Owner must be admitted before capture")?;
             values.extend_from_slice(&(segment.tokens as u64).to_le_bytes());
             for (index, column) in runtime.contract.columns.iter().enumerate() {
-                let buffer = if !used.columns[index] {
+                let buffer = if !col_active(index) {
                     None
                 } else if let Some(stride) = column.row_bytes {
                     let view = &aligned[&(
@@ -1871,7 +2217,13 @@ impl Worker {
         let width = runtime.contract.columns.len() + 1;
         let addresses = values.as_chunks::<8>().0;
         let mut inputs = vec![];
-        for name in &used.pointers {
+        let mut pointer_names: Vec<&String> = if let Some(tu) = tail_used {
+            used.trunk_pointers.union(&tu.tail_pointers).collect()
+        } else {
+            used.pointers.iter().collect()
+        };
+        pointer_names.sort_unstable();
+        for name in pointer_names {
             let mapping = &runtime.contract.pointers[name];
             let is_decoder = runtime
                 .contract
@@ -1900,7 +2252,13 @@ impl Worker {
             }
             inputs.push((get(&self.buffers, name)?.slice(0, data.len())?, data));
         }
-        for name in &used.work {
+        let mut work_names: Vec<&String> = if let Some(tu) = tail_used {
+            used.trunk_work.union(&tu.tail_work).collect()
+        } else {
+            used.work.iter().collect()
+        };
+        work_names.sort_unstable();
+        for name in work_names {
             let grid = &runtime.contract.work[name];
             let data = runtime
                 .contract
@@ -2023,7 +2381,8 @@ impl Worker {
                 }
             }
         }
-        let retained = self.update_batch_tables(layout, &execution.packet)?;
+        let retained =
+            self.update_batch_tables(layout, &execution.packet, execution.tail_packet.as_deref())?;
         let device_input = if std::env::var_os("ORINFER_A2_BATCH_TRACE").is_none() {
             if let Some(mut runtime) = self.device_inputs.take() {
                 let result = runtime.prepare(self, &execution.packet, layout, tokens, readout);
@@ -2460,12 +2819,9 @@ impl Worker {
                 });
             }
         }
-        for (segment, input) in layout
-            .segments
-            .iter()
-            .zip(tokens)
-            .filter(|_| layout.role == super::PacketRole::Target)
-        {
+        for (segment, input) in layout.segments.iter().zip(tokens).filter(|(s, _)| {
+            layout.role == super::PacketRole::Target && layout.pad_slot != Some(s.slot)
+        }) {
             self.batch
                 .as_mut()
                 .unwrap()

@@ -202,14 +202,18 @@ impl Runtime {
                         decode_rows[i] = depth + 1;
                     }
                 }
-                Ok(Some(packet::forecast(
+                let mut predicted = packet::forecast(
                     requests,
                     &baseline.order,
                     &decode_rows,
                     verification_budget(&decode_rows),
                     keep,
                     capacity,
-                )))
+                );
+                if predicted.prefill_rows == 0 && predicted.rows > 0 && predicted.rows <= 127 {
+                    predicted.rows = packet::bucket_verify_rows(predicted.rows);
+                }
+                Ok(Some(predicted))
             },
         )?;
         let depths = allocation.depths;
@@ -368,16 +372,7 @@ impl Runtime {
             .filter(|(_, n)| *n > 0)
             .map(|&(i, count)| (requests[i].slot, count + 1))
             .collect::<Vec<_>>();
-        let packet::Selection {
-            mut layout,
-            tokens: inputs,
-            selected: packet_requests,
-            full: packet_full,
-            batch: packet_batch,
-            prefill_rows,
-            prefill_requests,
-            ..
-        } = self
+        let mut verification = self
             .packet_for_budget(
                 requests,
                 Some(&inputs),
@@ -387,7 +382,7 @@ impl Runtime {
             )?
             .ok_or("Missing DSpark verification packet")?;
         if let Some(reference) = retained_work
-            && !layout.bound_work(
+            && !verification.layout.bound_work(
                 &reference,
                 self.team.model.batch.as_ref().unwrap(),
                 &self.team.work_launches,
@@ -395,25 +390,39 @@ impl Runtime {
         {
             return Err("Verification packet changed its retained launch envelope".into());
         }
-        let verify_prepared = self
-            .begin_forward_with_workspace(&layout, "Insufficient DSpark verification workspace")?;
-        let verified_work = packet::work(&packet_requests, requests, prefill_rows);
+        self.bucket_selection(&mut verification, requests)?;
+        let packet::Selection {
+            layout,
+            tokens: inputs,
+            selected: packet_requests,
+            full: packet_full,
+            batch: packet_batch,
+            prefill_rows,
+            prefill_requests,
+            ..
+        } = verification;
+        let started = Instant::now();
+        let Some(verify_prepared) = self.begin_verification_forward_with_workspace(
+            &layout,
+            journal,
+            "Insufficient DSpark verification workspace",
+        )?
+        else {
+            // Journal memory could not be reserved even after prefix/program
+            // reclamation; fall back cleanly to ordinary target decode.
+            return self.advance_selection(baseline, requests, options, false, || {});
+        };
+        let save_s = started.elapsed().as_secs_f64();
+        let mut verified_work = packet::work(&packet_requests, requests, prefill_rows);
+        if prefill_rows == 0 && layout.rows.total > verified_work.rows {
+            verified_work.rows = layout.rows.total;
+        }
         let prefill_work = self.prefill_work(
             &packet_requests,
             requests,
             full || packet_full,
             layout.decode,
         );
-        let started = Instant::now();
-        if !self.team.try_begin_verification(journal.clone())?
-            && (!memory::ensure_budget(self, memory::Requirement::workspace())?
-                || !self.team.try_begin_verification(journal)?)
-        {
-            // Journal memory could not be reserved even after prefix/program
-            // reclamation; fall back cleanly to ordinary target decode.
-            return self.advance_selection(baseline, requests, options, false, || {});
-        }
-        let save_s = started.elapsed().as_secs_f64();
         let (uses, slack) =
             self.capture_context(&packet_requests, requests, Some(&depths), block, options);
         let capture = self.speculation_policy.target_budget(

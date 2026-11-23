@@ -35,6 +35,7 @@ pub(super) enum Command {
     CancelImages,
     InstallImages(usize, Arc<Vec<super::vision::Span>>),
     GrowCached(Layout),
+    GrowCachedAndBeginVerification(Layout, Vec<(usize, usize)>),
     OwnerRequirement(usize, usize, usize),
     Reset(Vec<usize>),
     Release(Option<usize>),
@@ -87,6 +88,12 @@ pub(super) enum Command {
         snapshot: u64,
         complete: bool,
     },
+    PlanAndSave {
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+        max_incoming_bytes: usize,
+    },
     RoutingGroups(bool),
     Stop,
 }
@@ -96,6 +103,7 @@ pub(super) enum Reply {
     #[cfg(test)]
     Cached(CacheState),
     SplitCached(SplitStates, bool),
+    SplitCachedAndVerification(SplitStates, bool, bool),
     Outputs(Vec<Output>, bool),
     Shared(Vec<super::shared::State>),
     Allocations(BTreeMap<u64, usize>),
@@ -428,6 +436,8 @@ impl Team {
         let ranks = std::mem::take(&mut model.ranks);
         let snapshots = std::env::var_os("ORINFER_A2_BATCH_TRACE").is_some();
         let cpus = affinity::from_env(ranks.len())?;
+        let host_cpus = affinity::host_cpus(cpus.as_deref())?;
+        affinity::configure_host_pool(host_cpus.as_deref());
         let started = Instant::now();
         let bootstrap = Session::new(0, Limits::default())?;
         let root = RootInfo::new(&bootstrap, ranks.len() as u32)?;
@@ -660,6 +670,61 @@ impl Team {
                                         })
                                     })
                             }
+                            Command::PlanAndSave {
+                                owner,
+                                snapshot,
+                                complete,
+                                max_incoming_bytes,
+                            } => {
+                                let planned = {
+                                    let parent =
+                                        lineage.get(&owner).and_then(|id| snapshots.get(id));
+                                    worker.plan_owner_snapshot(owner, complete, snapshot, parent)
+                                };
+                                match planned {
+                                    Err(error) => Err(error),
+                                    Ok(allocations) => (|| {
+                                        let incoming = allocations
+                                            .get(&crate::backend::kv::checkpoint_id(snapshot)?)
+                                            .copied()
+                                            .unwrap_or(0);
+                                        let (device_free, session_free) = if incoming != 0 {
+                                            worker.available_memory()?
+                                        } else {
+                                            (usize::MAX, usize::MAX)
+                                        };
+                                        let fits = incoming <= max_incoming_bytes
+                                            && (incoming == 0
+                                                || super::memory::Requirement::snapshot(incoming)?
+                                                    .fits(device_free, session_free));
+                                        if !fits {
+                                            return Ok(Reply::SnapshotPlan {
+                                                allocations,
+                                                device_free,
+                                                session_free,
+                                            });
+                                        }
+                                        let saved = {
+                                            let parent = lineage
+                                                .get(&owner)
+                                                .and_then(|id| snapshots.get(id));
+                                            worker.save_owner(owner, complete, snapshot, parent)
+                                        };
+                                        match saved {
+                                            Ok(saved) => {
+                                                let saved_allocs = saved.allocations();
+                                                snapshots.insert(snapshot, saved);
+                                                lineage.insert(owner, snapshot);
+                                                Ok(Reply::Allocations(saved_allocs))
+                                            }
+                                            Err(error) if !worker.session.is_poisoned() => {
+                                                Ok(Reply::SaveSkipped(error))
+                                            }
+                                            Err(error) => Err(error),
+                                        }
+                                    })(),
+                                }
+                            }
                             Command::PlanHost {
                                 owner,
                                 snapshot,
@@ -816,6 +881,65 @@ impl Team {
                                             .fits(device, session)
                                     };
                                     Ok(Reply::SplitCached(states, workspace_fits))
+                                }),
+                            Command::GrowCachedAndBeginVerification(layout, owners) => worker
+                                .grow_batch(&layout)
+                                .and_then(|()| worker.batch_split_cached(&layout))
+                                .and_then(|states| {
+                                    let workspace_fits = if states.all_graphs() {
+                                        true
+                                    } else {
+                                        let (device, session) = worker.available_memory()?;
+                                        super::memory::Requirement::workspace()
+                                            .fits(device, session)
+                                    };
+                                    journal.clear();
+                                    let mut copies = vec![];
+                                    let mut oom = false;
+                                    let mut outcome: Result<()> = Ok(());
+                                    for (id, rows) in owners {
+                                        match worker.save_mutable(
+                                            id,
+                                            rows,
+                                            journal_pool.remove(&id),
+                                            &mut idle_journals,
+                                            &mut copies,
+                                        ) {
+                                            Ok(saved) => {
+                                                journal.insert(id, saved);
+                                            }
+                                            Err(error)
+                                                if !worker.session.is_poisoned()
+                                                    && error.contains("Insufficient A2 memory") =>
+                                            {
+                                                oom = true;
+                                                break;
+                                            }
+                                            Err(error) => {
+                                                outcome = Err(error);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if oom {
+                                        journal_pool.append(&mut journal);
+                                        Ok(Reply::SplitCachedAndVerification(
+                                            states,
+                                            workspace_fits,
+                                            false,
+                                        ))
+                                    } else {
+                                        outcome.and_then(|()| {
+                                            if !copies.is_empty() {
+                                                worker.session.copy_many(&copies)?;
+                                            }
+                                            Ok(Reply::SplitCachedAndVerification(
+                                                states,
+                                                workspace_fits,
+                                                true,
+                                            ))
+                                        })
+                                    }
                                 }),
                             Command::OwnerRequirement(tokens, shared_tokens, reserve) => worker
                                 .owner_requirement(tokens, shared_tokens, reserve)
@@ -977,17 +1101,6 @@ impl Team {
     pub fn rank_free_range(&self) -> (usize, usize) {
         self.rank_free_range.get()
     }
-    pub fn try_begin_verification(&self, journal: Vec<(usize, usize)>) -> Result<bool> {
-        let mut all_ready = true;
-        for reply in self.exchange(Command::BeginVerification(journal))? {
-            match reply {
-                Reply::Ready => {}
-                Reply::Capacity(false) => all_ready = false,
-                _ => return Err("Invalid A2 verification journal reply".into()),
-            }
-        }
-        Ok(all_ready)
-    }
     pub fn try_offload(&self, id: u64) -> Result<bool> {
         let mut skipped = None;
         for reply in self.exchange_heavy(Command::Offload(id))? {
@@ -1135,6 +1248,78 @@ impl Team {
     }
     pub fn begin_forward(&self, layout: &Layout) -> Result<PreparedForward> {
         begin_forward(&self.peers, layout)
+    }
+    pub fn begin_verification_forward(
+        &self,
+        layout: &Layout,
+        journal: Vec<(usize, usize)>,
+    ) -> Result<(PreparedForward, bool)> {
+        let started = Instant::now();
+        let replies = self.exchange(Command::GrowCachedAndBeginVerification(
+            layout.clone(),
+            journal,
+        ))?;
+        let mut states = Vec::with_capacity(replies.len());
+        let mut workspace_fits = true;
+        let mut journal_ready = true;
+        for reply in replies {
+            let Reply::SplitCachedAndVerification(state, fits, ready) = reply else {
+                return Err("Invalid A2 verification cache state reply".to_string());
+            };
+            states.push(state);
+            workspace_fits &= fits;
+            journal_ready &= ready;
+        }
+        Ok((
+            PreparedForward {
+                started,
+                states,
+                workspace_fits,
+            },
+            journal_ready,
+        ))
+    }
+    pub fn try_plan_and_save(
+        &self,
+        owner: usize,
+        snapshot: u64,
+        complete: bool,
+        max_incoming_bytes: usize,
+    ) -> Result<Option<BTreeMap<u64, usize>>> {
+        let replies = self.exchange(Command::PlanAndSave {
+            owner,
+            snapshot,
+            complete,
+            max_incoming_bytes,
+        })?;
+        let mut any_not_saved = false;
+        let mut any_saved = false;
+        let mut min_device = usize::MAX;
+        let mut max_device = 0usize;
+        for reply in &replies {
+            match reply {
+                Reply::Allocations(_) => any_saved = true,
+                Reply::SnapshotPlan { device_free, .. } => {
+                    any_not_saved = true;
+                    if *device_free != usize::MAX {
+                        min_device = min_device.min(*device_free);
+                        max_device = max_device.max(*device_free);
+                    }
+                }
+                Reply::SaveSkipped(_) => any_not_saved = true,
+                _ => return Err("Invalid A2 plan-and-save reply".into()),
+            }
+        }
+        if min_device != usize::MAX {
+            self.rank_free_range.set((min_device, max_device));
+        }
+        if any_not_saved {
+            if any_saved {
+                self.exchange(Command::RollbackSave { owner, snapshot })?;
+            }
+            return Ok(None);
+        }
+        self.try_combine_allocations(replies, owner, snapshot)
     }
     pub fn finish_forward(
         &self,
@@ -1553,6 +1738,7 @@ fn finish_forward(
         started, states, ..
     } = prepared;
     let repeated = layout.decode
+        || layout.bucketed
         || layout.role == super::PacketRole::Draft
         || layout.outputs.len() > layout.segments.len()
             && layout
@@ -1591,30 +1777,68 @@ fn finish_forward(
         }
         Ok::<_, String>(plan)
     };
-    // Reuse compiled Trunk Graphs across large mixed cohorts (>=512 rows), but
-    // avoid spending capture time on cohort-specific Tail/Head slices there.
-    let allow_tail_head_capture = !(has_tail && !layout.decode && layout.rows.total >= 512);
-    let trunk_plan = plan_part(&trunk_states, repeated, budget, true)?;
+    let bucket_budget = |base: Option<CaptureBudget>, capture_scale: f64| {
+        base.map(|mut b| {
+            if layout.bucketed {
+                if b.max_uses.is_none() {
+                    b.uses = b.uses.max(24.);
+                }
+                if let Some(c) = &mut b.capture_s {
+                    *c *= capture_scale;
+                }
+            }
+            b
+        })
+    };
+    // Reuse compiled Trunk Graphs across large mixed cohorts (>=512 rows).
+    // Bucketed canonical shapes also capture bounded Tail and Head slices;
+    // unbucketed large cohorts keep cohort-specific Tail/Head slices direct.
+    let allow_tail_head_capture =
+        layout.bucketed || !(has_tail && !layout.decode && layout.rows.total >= 512);
+    let trunk_plan = plan_part(
+        &trunk_states,
+        repeated,
+        bucket_budget(budget, if has_tail { 0.55 } else { 1.0 }),
+        true,
+    )?;
+    let stagger_tail = layout.bucketed
+        && trunk_plan.mode == preparation::Mode::CaptureReplay
+        && budget.is_some_and(|b| b.slack_s.is_finite());
     let tail_plan = if has_tail {
         let tail_states: Vec<CacheState> = states.iter().map(|s| s.tail.unwrap()).collect();
+        let tail_scale = if trunk_plan.mode == preparation::Mode::Replay {
+            0.45
+        } else {
+            1.0
+        };
         Some(plan_part(
             &tail_states,
             repeated,
-            budget,
-            allow_tail_head_capture && trunk_plan.capture(),
+            bucket_budget(budget, tail_scale),
+            allow_tail_head_capture && trunk_plan.capture() && !stagger_tail,
         )?)
     } else {
         None
     };
     let head_plan = if has_head {
         let head_states: Vec<CacheState> = states.iter().map(|s| s.head.unwrap()).collect();
+        let head_scale = if trunk_plan.mode == preparation::Mode::Replay
+            && tail_plan
+                .as_ref()
+                .is_none_or(|p| p.mode == preparation::Mode::Replay)
+        {
+            0.10
+        } else {
+            1.0
+        };
         let allow_head_capture = allow_tail_head_capture
+            && !stagger_tail
             && trunk_plan.capture()
             && tail_plan.as_ref().is_none_or(preparation::Plan::capture);
         Some(plan_part(
             &head_states,
             repeated,
-            budget,
+            bucket_budget(budget, head_scale),
             allow_head_capture,
         )?)
     } else {

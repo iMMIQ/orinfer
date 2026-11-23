@@ -15,7 +15,7 @@ impl memory::Pressure for Runtime {
         self.team.has_budget(requirement)
     }
     fn evict_prefix(&mut self) -> Result<bool> {
-        self.evict()
+        self.evict_fast_except(None, 16)
     }
     fn evict_program(&mut self) -> Result<bool> {
         let reclaimed = self.team.reclaim_programs()?;
@@ -37,7 +37,7 @@ impl memory::Pressure for AdmissionPressure<'_> {
         self.runtime.team.has_budget(requirement)
     }
     fn evict_prefix(&mut self) -> Result<bool> {
-        self.runtime.evict_except(self.protected)
+        self.runtime.evict_fast_except(self.protected, 16)
     }
     fn evict_program(&mut self) -> Result<bool> {
         let reclaimed = self.runtime.team.reclaim_programs_for_admission()?;
@@ -142,6 +142,7 @@ pub(crate) struct Runtime {
     statistics: scheduler::Statistics,
     active: BTreeSet<usize>,
     resident: BTreeSet<usize>,
+    pad_slot: Option<usize>,
     abandoned: Arc<Mutex<Vec<usize>>>,
     owner: u64,
     next_snapshot: u64,
@@ -401,6 +402,7 @@ impl Runtime {
             statistics: Default::default(),
             active: Default::default(),
             resident: Default::default(),
+            pad_slot: None,
             abandoned: Default::default(),
             owner: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             next_snapshot: 0,
@@ -612,6 +614,36 @@ impl Runtime {
         }
         Ok(())
     }
+    pub(super) fn ensure_pad_slot(&mut self) -> Result<Option<usize>> {
+        const MAX_PAD_TOKENS: usize = 64;
+        if let Some(slot) = self.pad_slot {
+            if !self.active.contains(&slot) {
+                return Ok(Some(slot));
+            }
+            self.pad_slot = None;
+        }
+        let owners = self.team.model.batch.as_ref().map_or(0, |b| b.owners);
+        if owners < 2 || self.active.contains(&0) {
+            return Ok(None);
+        }
+        let needed = self.team.owner_requirement(MAX_PAD_TOKENS, 0, 0)?;
+        if !self.team.has_budget(needed)? {
+            return Ok(None);
+        }
+        self.team.exchange(Command::StartOwner {
+            slot: 0,
+            limit: MAX_PAD_TOKENS,
+            snapshot: None,
+        })?;
+        self.pad_slot = Some(0);
+        Ok(Some(0))
+    }
+    fn release_pad_slot(&mut self) -> Result<()> {
+        if let Some(slot) = self.pad_slot.take() {
+            self.team.exchange(Command::Release(Some(slot)))?;
+        }
+        Ok(())
+    }
     fn head_only(&self, input: &GenerationInput) -> bool {
         input.max_new_tokens == 1
             && Media::images(&input.input_tokens, &input.images, self.vision())
@@ -696,6 +728,22 @@ impl Runtime {
         }
         let cached = matched.map_or(0, |hit| self.entry(hit).tokens.len());
         if input.input_tokens.len().saturating_sub(cached) > capacity {
+            // Reclaim stale device prefixes directly on device (without
+            // synchronous PCIe offload) so cold prompts do not stall behind
+            // full device caches or trigger prolonged memory_guard drains.
+            if self.cache.device.bytes > 0 {
+                let spill_start = Instant::now();
+                for _ in 0..16 {
+                    if spill_start.elapsed().as_secs_f64() >= 0.02
+                        || !self.evict_fast_except(protected, 16)?
+                    {
+                        break;
+                    }
+                    if self.team.has_budget(needed)? {
+                        return Ok(true);
+                    }
+                }
+            }
             // Let live owners progress while the scheduler waits for memory
             // to admit a cold prompt. Its aged memory guard prevents starvation.
             return Ok(false);
@@ -745,6 +793,9 @@ impl Runtime {
         } else {
             return Err("A2 owner capacity exhausted".into());
         };
+        if self.pad_slot == Some(slot) {
+            self.release_pad_slot()?;
+        }
         let resident = !self.head_only(&input);
         let setup_s = started.elapsed().as_secs_f64() - reap_s;
         let mut prefix = crate::prefix::Statistics::default();
@@ -883,106 +934,153 @@ impl Runtime {
             .ok_or("A2 snapshot identity overflow")?;
         let id = self.next_snapshot;
         let head = output.cloned().map(Arc::new);
+        let head_bytes = output.map_or(0, |o| o.logits.len() * 4 + std::mem::size_of::<Output>());
         let mut host = self.cache.device.budget == 0;
-        let (snapshot, bytes) = loop {
-            // Eviction can remove the owner's parent lineage. Re-plan after
-            // every reclamation, before allocating or committing any new bank.
-            let (banks, min_device_free, min_session_free) = if host {
-                (
-                    self.team
-                        .host_allocations(request.slot, id, output.is_some(), true)?,
-                    usize::MAX,
-                    usize::MAX,
-                )
-            } else {
+        // Fast path: when device cache has headroom, plan + budget check + save
+        // in one 8-rank IPC instead of two round-trips.
+        let fast = if !host && self.cache.device.budget > self.cache.device.bytes + head_bytes {
+            let max_incoming = self
+                .cache
+                .device
+                .budget
+                .saturating_sub(self.cache.device.bytes)
+                .saturating_sub(head_bytes);
+            if let Some(banks) =
                 self.team
-                    .plan_snapshot_with_budget(request.slot, id, output.is_some())?
-            };
-            let incoming = banks
-                .get(&crate::backend::kv::checkpoint_id(id)?)
-                .copied()
-                .unwrap_or(0);
-            let device_bytes = banks.values().try_fold(0usize, |sum, bytes| {
-                sum.checked_add(*bytes)
-                    .ok_or("Snapshot accounting overflow")
-            })?;
-            let host_overhead = if host {
-                self.host_overhead(count, banks.len())?
-            } else {
-                0
-            };
-            let bytes = device_bytes
-                .checked_add(host_overhead)
-                .ok_or("Host snapshot accounting overflow")?
-                .checked_add(
-                    output.map_or(0, |o| o.logits.len() * 4 + std::mem::size_of::<Output>()),
-                )
-                .ok_or("Snapshot size overflow")?;
-            let budget = if host {
-                self.cache.host.budget
-            } else {
-                self.cache.device.budget
-            };
-            if bytes > budget {
-                if !host && self.cache.host.budget > 0 {
-                    host = true;
-                    continue;
-                }
-                return Ok(());
-            }
-            let snapshot = Snapshot {
-                id,
-                banks,
-                output: head.clone(),
-                host_overhead,
-            };
-            let cache = if host {
-                &self.cache.host
-            } else {
-                &self.cache.device
-            };
-            if cache.admission(&snapshot, 0) != Admission::Ready {
-                if !(if host {
-                    self.evict_host_for(&snapshot)?
-                } else {
-                    self.evict()?
-                }) {
-                    return Ok(());
-                }
-                continue;
-            }
-            if !host
-                && incoming != 0
-                && !memory::Requirement::snapshot(incoming)?.fits(min_device_free, min_session_free)
+                    .try_plan_and_save(request.slot, id, output.is_some(), max_incoming)?
             {
-                if !memory::reclaim_one(self)? {
-                    if self.cache.host.budget > 0 {
+                let device_bytes = banks.values().try_fold(0usize, |sum, bytes| {
+                    sum.checked_add(*bytes)
+                        .ok_or("Snapshot accounting overflow")
+                })?;
+                let bytes = device_bytes
+                    .checked_add(head_bytes)
+                    .ok_or("Snapshot size overflow")?;
+                let snapshot = Snapshot {
+                    id,
+                    banks,
+                    output: head.clone(),
+                    host_overhead: 0,
+                };
+                if bytes <= self.cache.device.budget
+                    && self.cache.device.admission(&snapshot, 0) == Admission::Ready
+                {
+                    Some((snapshot, bytes))
+                } else {
+                    self.team.exchange(Command::RollbackSave {
+                        owner: request.slot,
+                        snapshot: id,
+                    })?;
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (snapshot, bytes) = if let Some(saved) = fast {
+            saved
+        } else {
+            loop {
+                // Eviction can remove the owner's parent lineage. Re-plan after
+                // every reclamation, before allocating or committing any new bank.
+                let (banks, min_device_free, min_session_free) = if host {
+                    (
+                        self.team
+                            .host_allocations(request.slot, id, output.is_some(), true)?,
+                        usize::MAX,
+                        usize::MAX,
+                    )
+                } else {
+                    self.team
+                        .plan_snapshot_with_budget(request.slot, id, output.is_some())?
+                };
+                let incoming = banks
+                    .get(&crate::backend::kv::checkpoint_id(id)?)
+                    .copied()
+                    .unwrap_or(0);
+                let device_bytes = banks.values().try_fold(0usize, |sum, bytes| {
+                    sum.checked_add(*bytes)
+                        .ok_or("Snapshot accounting overflow")
+                })?;
+                let host_overhead = if host {
+                    self.host_overhead(count, banks.len())?
+                } else {
+                    0
+                };
+                let bytes = device_bytes
+                    .checked_add(host_overhead)
+                    .ok_or("Host snapshot accounting overflow")?
+                    .checked_add(head_bytes)
+                    .ok_or("Snapshot size overflow")?;
+                let budget = if host {
+                    self.cache.host.budget
+                } else {
+                    self.cache.device.budget
+                };
+                if bytes > budget {
+                    if !host && self.cache.host.budget > 0 {
                         host = true;
                         continue;
                     }
                     return Ok(());
                 }
-                continue;
-            }
-            let actual = if host {
-                self.team
-                    .try_host_allocations(request.slot, id, output.is_some(), false)?
-            } else {
-                self.team
-                    .try_snapshot_allocations(request.slot, id, output.is_some())?
-            };
-            let Some(actual) = actual else {
-                self.health.prefix_save_skips += 1;
-                if !host && self.cache.host.budget > 0 {
-                    host = true;
+                let snapshot = Snapshot {
+                    id,
+                    banks,
+                    output: head.clone(),
+                    host_overhead,
+                };
+                let cache = if host {
+                    &self.cache.host
+                } else {
+                    &self.cache.device
+                };
+                if cache.admission(&snapshot, 0) != Admission::Ready {
+                    if !(if host {
+                        self.evict_host_for(&snapshot)?
+                    } else {
+                        self.evict()?
+                    }) {
+                        return Ok(());
+                    }
                     continue;
                 }
-                return Ok(());
-            };
-            if actual != snapshot.banks {
-                return Err("A2 snapshot allocation differs from its reserved plan".into());
+                if !host
+                    && incoming != 0
+                    && !memory::Requirement::snapshot(incoming)?
+                        .fits(min_device_free, min_session_free)
+                {
+                    if !memory::reclaim_one(self)? {
+                        if self.cache.host.budget > 0 {
+                            host = true;
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                    continue;
+                }
+                let actual = if host {
+                    self.team
+                        .try_host_allocations(request.slot, id, output.is_some(), false)?
+                } else {
+                    self.team
+                        .try_snapshot_allocations(request.slot, id, output.is_some())?
+                };
+                let Some(actual) = actual else {
+                    self.health.prefix_save_skips += 1;
+                    if !host && self.cache.host.budget > 0 {
+                        host = true;
+                        continue;
+                    }
+                    return Ok(());
+                };
+                if actual != snapshot.banks {
+                    return Err("A2 snapshot allocation differs from its reserved plan".into());
+                }
+                break (snapshot, bytes);
             }
-            break (snapshot, bytes);
         };
         // Upgrade endpoints across both tiers after the new snapshot is complete.
         let mut obsolete_ids = Vec::new();
@@ -1097,14 +1195,30 @@ impl Runtime {
         let started = Instant::now();
         let before_prefill = self.statistics.prefill_tokens;
         let before_iterations = self.statistics.iterations;
+        let before_mixed = self.statistics.mixed_iterations;
         let burst = options.policy == scheduler::Policy::Latency
             && self.decode_burst.allows(started, decoding.len());
         let result = self.advance_packet(requests, options, maintenance);
         if result.is_ok() && self.statistics.iterations > before_iterations {
             let seconds = started.elapsed().as_secs_f64();
             if self.statistics.prefill_tokens > before_prefill {
-                self.decode_burst
-                    .after_prefill(Instant::now(), seconds, decoding.len(), options);
+                // Keep DecodeBurst active for healthy decoder cohorts (>= 4) or
+                // when decoders were held back by a pure-prefill step or an
+                // over-budget mixed step, while avoiding wasteful decode-only
+                // weight passes for tiny 1..3 decoder tails.
+                if self.statistics.mixed_iterations == before_mixed
+                    || decoding.len() >= 3
+                    || seconds > options.target_tpot_ms / 1000.
+                {
+                    self.decode_burst.after_prefill(
+                        Instant::now(),
+                        seconds,
+                        decoding.len(),
+                        options,
+                    );
+                } else {
+                    self.decode_burst.clear();
+                }
             } else {
                 self.decode_burst.observe_decode(
                     seconds,
@@ -1187,14 +1301,40 @@ impl Runtime {
         }
         Ok(prepared)
     }
+    pub(super) fn begin_verification_forward_with_workspace(
+        &mut self,
+        layout: &Layout,
+        journal: Vec<(usize, usize)>,
+        error: &str,
+    ) -> Result<Option<super::team::PreparedForward>> {
+        let (prepared, journal_ready) = self
+            .team
+            .begin_verification_forward(layout, journal.clone())?;
+        let need_workspace = !prepared.all_graphs() && !prepared.workspace_fits;
+        if !need_workspace && journal_ready {
+            return Ok(Some(prepared));
+        }
+        if !memory::ensure_budget(self, memory::Requirement::workspace())? {
+            if need_workspace {
+                return Err(error.into());
+            }
+            return Ok(None);
+        }
+        let (prepared, journal_ready) = self.team.begin_verification_forward(layout, journal)?;
+        if !prepared.all_graphs() && !prepared.workspace_fits {
+            return Err(error.into());
+        }
+        Ok(journal_ready.then_some(prepared))
+    }
     fn advance_selection(
         &mut self,
-        selection: packet::Selection,
+        mut selection: packet::Selection,
         requests: &mut [&mut Request],
         options: &scheduler::Options,
         speculative_baseline: bool,
         maintenance: impl FnOnce(),
     ) -> Result<Vec<StepOutput>> {
+        self.bucket_selection(&mut selection, requests)?;
         let packet::Selection {
             layout,
             tokens,

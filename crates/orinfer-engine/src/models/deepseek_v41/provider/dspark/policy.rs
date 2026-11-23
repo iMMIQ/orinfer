@@ -465,7 +465,12 @@ impl Policy {
             normal_s: self
                 .costs
                 .predict(stage, 0, full, work)
-                .filter(|p| p.samples >= adaptive::HOT_SAMPLES)
+                .filter(|p| {
+                    p.samples >= adaptive::HOT_SAMPLES
+                        || (p.observations >= 1
+                            && (self.costs.has_calibrated_neighbor(stage, full, work)
+                                || self.costs.profiled(stage, 0, full, work)))
+                })
                 .map_or(0., |p| p.seconds),
         });
     }
@@ -734,7 +739,14 @@ impl Policy {
         };
         // Establish a hot ordinary baseline before pricing savings. The first
         // direct call may be far slower than the eventual Graph replay.
-        if limit <= batch || normal.samples < adaptive::HOT_SAMPLES {
+        // Once a nearby cohort in the same stage is already hot-calibrated (or
+        // an offline prior matches this work), a single local observation
+        // confirms this batch's baseline without repeating 4 direct rounds.
+        let baseline_ready = normal.samples >= adaptive::HOT_SAMPLES
+            || (normal.observations >= 1
+                && (self.costs.has_calibrated_neighbor(stage, full, work)
+                    || self.costs.profiled(stage, 0, full, work)));
+        if limit <= batch || !baseline_ready {
             return Ok(ordinary.into());
         }
         if blocks.is_empty()

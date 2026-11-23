@@ -360,6 +360,18 @@ impl<T: Resident> Cache<T> {
             .sum();
         self.bytes + added
     }
+    pub fn unique_bytes(&self, id: u64) -> usize {
+        self.entry_banks.get(&id).map_or(0, |banks| {
+            banks
+                .iter()
+                .filter(|(bank_id, _)| self.bank_refs.get(bank_id).is_some_and(|r| r.1 == 1))
+                .map(|(_, bytes)| *bytes)
+                .sum()
+        })
+    }
+    pub fn contains_bank(&self, bank_id: u64) -> bool {
+        self.bank_refs.contains_key(&bank_id)
+    }
     pub fn update_statistics(&self, statistics: &mut Statistics) {
         statistics.resident_bytes = self.bytes;
         statistics.logical_bytes = self.logical_bytes;
@@ -449,13 +461,7 @@ impl<T: Resident> Cache<T> {
                 continue;
             }
             let parent = self.ancestor_depth(entry);
-            let freed: usize = self.entry_banks.get(&id).map_or(0, |banks| {
-                banks
-                    .iter()
-                    .filter(|(bank_id, _)| self.bank_refs.get(bank_id).is_some_and(|r| r.1 == 1))
-                    .map(|(_, bytes)| *bytes)
-                    .sum()
-            });
+            let freed = self.unique_bytes(id);
             let util = (entry.tokens.len() - parent).max(1) as f64 * (1.0 + entry.hits as f64)
                 / (freed.max(1) as f64 * (self.clock - entry.used + 1) as f64);
             let is_better = match best {

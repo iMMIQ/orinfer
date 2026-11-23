@@ -650,7 +650,12 @@ pub(super) fn worker(
                 order.reverse();
                 order
             };
-            untried.retain(|&i| memory_guard.as_ref().is_none_or(|id| id == &waiting[i].id));
+            untried.retain(|&i| {
+                memory_guard.as_ref().is_none_or(|id| {
+                    id == &waiting[i].id
+                        || (latency && costs[i].remaining_tokens <= cold_prompt_capacity)
+                })
+            });
             while !untried.is_empty() {
                 let i = if latency {
                     let relative = scheduler::select_waiting(
@@ -672,38 +677,55 @@ pub(super) fn worker(
                     cold_deferrals += 1;
                     continue;
                 }
-                if costs[i].age_s < 30. && costs[i].remaining_tokens > 0 {
-                    // Large cold prompts need bounded residency. Small prompts
-                    // must still form a cohort to amortize a model weight pass.
-                    if latency
-                        && costs[i].remaining_tokens > cold_prompt_capacity
-                        && active
-                            .iter()
-                            .filter(|a| a.request.is_prefilling())
-                            .filter(|a| a.request.remaining_prefill_tokens() > cold_prompt_capacity)
-                            .count()
-                            >= 2
-                    {
+                // Large cold prompts need bounded residency so giant prompts do
+                // not exhaust HBM with future_bytes reservations or head-of-line
+                // block short continuations. Short prompts (<= 4x packet capacity)
+                // always admit immediately; among large prompts, strictly shorter
+                // prompts may preempt up to 4 active large prefills.
+                let large_prompt_threshold = cold_prompt_capacity.saturating_mul(4);
+                if latency && costs[i].remaining_tokens > large_prompt_threshold {
+                    let mut active_large = 0usize;
+                    let mut min_active_large = usize::MAX;
+                    for a in &active {
+                        if a.request.is_prefilling() {
+                            let rem = a.request.remaining_prefill_tokens();
+                            if rem > large_prompt_threshold {
+                                active_large += 1;
+                                min_active_large = min_active_large.min(rem);
+                            }
+                        }
+                    }
+                    let allow = if costs[i].age_s >= 42. {
+                        true
+                    } else if costs[i].age_s >= 30. {
+                        active_large < 4
+                    } else {
+                        active_large < 2
+                            || (active_large < 4 && costs[i].remaining_tokens < min_active_large)
+                    };
+                    if !allow {
                         cold_deferrals += 1;
                         continue;
                     }
-                    if model.prefix_cache_enabled()
-                        && let Some(hint) = &waiting[i].hint
-                    {
-                        let mut shared = false;
-                        for a in &mut active {
-                            if model
-                                .share_prefill_checkpoint(&mut a.request, hint)
-                                .unwrap_or(false)
-                            {
-                                shared = true;
-                                break;
-                            }
+                }
+                if costs[i].age_s < 30.
+                    && costs[i].remaining_tokens > 0
+                    && model.prefix_cache_enabled()
+                    && let Some(hint) = &waiting[i].hint
+                {
+                    let mut shared = false;
+                    for a in &mut active {
+                        if model
+                            .share_prefill_checkpoint(&mut a.request, hint)
+                            .unwrap_or(false)
+                        {
+                            shared = true;
+                            break;
                         }
-                        if shared {
-                            prefix_waits += 1;
-                            continue;
-                        }
+                    }
+                    if shared {
+                        prefix_waits += 1;
+                        continue;
                     }
                 }
                 if latency && has_decoders && costs[i].age_s < 30. {
@@ -836,7 +858,12 @@ pub(super) fn worker(
                             break;
                         }
                         if costs[i].age_s >= 30. {
-                            memory_guard = Some(waiting[i].id.clone());
+                            memory_guard.get_or_insert_with(|| waiting[i].id.clone());
+                            if latency {
+                                untried
+                                    .retain(|&j| costs[j].remaining_tokens <= cold_prompt_capacity);
+                                continue;
+                            }
                             break;
                         }
                     }
