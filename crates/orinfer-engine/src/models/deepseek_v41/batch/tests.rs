@@ -801,11 +801,11 @@ fn retained_mixed_work_keeps_source_padding_in_decoder_views() {
 
 #[test]
 fn bucketed_work_capacity_collapses_owner_count_variations() {
-    assert_eq!(work_capacity(2, WorkPad::Bucketed), 256);
-    assert_eq!(work_capacity(64, WorkPad::Bucketed), 256);
-    assert_eq!(work_capacity(192, WorkPad::Bucketed), 256);
-    assert_eq!(work_capacity(256, WorkPad::Bucketed), 256);
-    assert_eq!(work_capacity(257, WorkPad::Bucketed), 512);
+    assert_eq!(work_capacity(2, WorkPad::Bucketed), 512);
+    assert_eq!(work_capacity(64, WorkPad::Bucketed), 512);
+    assert_eq!(work_capacity(192, WorkPad::Bucketed), 512);
+    assert_eq!(work_capacity(512, WorkPad::Bucketed), 512);
+    assert_eq!(work_capacity(513, WorkPad::Bucketed), 1024);
     assert_eq!(work_capacity(1, WorkPad::Exact), 2);
     assert_eq!(work_capacity(5, WorkPad::Padded), 8);
 }

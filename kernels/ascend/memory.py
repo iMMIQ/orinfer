@@ -61,7 +61,9 @@ def partition_rows(
     if dynamic_count:
         count = T.ceildiv(rows, stride)
     total = count * (stride if all_partitions else 1)
-    block = math.gcd(width, tile_columns)
+    elem_bytes = {"int8": 1, "bfloat16": 2, "float16": 2, "int32": 4, "float32": 4}.get(dtype, 4)
+    max_cols = max(tile_columns, 16384 // elem_bytes)
+    block = width if width <= max_cols else math.gcd(width, max_cols)
     blocks = width // block
 
     @T.prim_func
@@ -69,33 +71,42 @@ def partition_rows(
         source: T.Tensor((rows, width), dtype),
         out: T.Tensor((total, width), dtype),
     ):
-        with T.Kernel(T.ceildiv(total, 2) * blocks, is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             data = T.alloc_ub((block,), dtype)
+            zero_buf = T.alloc_ub((block,), dtype)
             zeros = T.alloc_ub((max(1, block // 2),), "int16")
-            row = (cid // blocks) * 2 + vid
-            column = (cid % blocks) * block
-            index = (
-                row // count + (row % count) * stride if all_partitions else first + row * stride
-            )
-            if row < total:
-                if repeat_last:
-                    index = T.min(index, rows - 1)
-                    T.copy(source[index, column : column + block], data)
-                else:
-                    if dtype == "int8":
-                        T.reinterpretcast(data, zeros, "int8_t")
+            aiv = cid * 2 + vid
+            items = total * blocks
+            if aiv < items:
+                if not repeat_last:
+                    if dtype == "int8" and block >= 8:
+                        T.reinterpretcast(zero_buf, zeros, "int8_t")
                         T.tile.fill(zeros, 0)
                     elif block < 8:
                         for lane in T.serial(block):
-                            data[lane] = 0
+                            zero_buf[lane] = 0
                     else:
-                        T.tile.fill(data, 0)
-                    if index < rows:
-                        T.copy(source[index, column : column + block], data)
-                T.copy(data, out[row, column : column + block])
-                # The INT8 view aliases the INT16 zero-fill buffer. Preserve
-                # its lifetime across the bounded grid's next loop iteration.
-                T.pipe_barrier("ALL")
+                        T.tile.fill(zero_buf, 0)
+                    T.pipe_barrier("ALL")
+                for step in T.serial(T.ceildiv(items - aiv, 40)):
+                    flat = aiv + step * 40
+                    row = flat // blocks
+                    column = (flat % blocks) * block
+                    index = (
+                        row // count + (row % count) * stride
+                        if all_partitions
+                        else first + row * stride
+                    )
+                    if repeat_last:
+                        src_row = T.min(index, rows - 1)
+                        T.copy(source[src_row, column : column + block], data)
+                        T.copy(data, out[row, column : column + block])
+                    else:
+                        if index < rows:
+                            T.copy(source[index, column : column + block], data)
+                            T.copy(data, out[row, column : column + block])
+                        else:
+                            T.copy(zero_buf, out[row, column : column + block])
 
     return main
 
@@ -110,7 +121,9 @@ def interleave_rows(
         raise ValueError("Movement column tile must be a power of two in 1..8192")
     if dynamic_count:
         count = T.ceildiv(rows, ranks)
-    block = math.gcd(width, tile_columns)
+    elem_bytes = {"int8": 1, "bfloat16": 2, "float16": 2, "int32": 4, "float32": 4}.get(dtype, 4)
+    max_cols = max(tile_columns, 16384 // elem_bytes)
+    block = width if width <= max_cols else math.gcd(width, max_cols)
     blocks = width // block
 
     @T.prim_func
@@ -118,14 +131,18 @@ def interleave_rows(
         source: T.Tensor((ranks * count, width), dtype),
         out: T.Tensor((rows, width), dtype),
     ):
-        with T.Kernel(T.ceildiv(rows, 2) * blocks, is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             data = T.alloc_ub((block,), dtype)
-            row = cid // blocks * 2 + vid
-            column = cid % blocks * block
-            if row < rows:
-                index = row % ranks * count + row // ranks
-                T.copy(source[index, column : column + block], data)
-                T.copy(data, out[row, column : column + block])
+            aiv = cid * 2 + vid
+            items = rows * blocks
+            if aiv < items:
+                for step in T.serial(T.ceildiv(items - aiv, 40)):
+                    flat = aiv + step * 40
+                    row = flat // blocks
+                    column = (flat % blocks) * block
+                    index = row % ranks * count + row // ranks
+                    T.copy(source[index, column : column + block], data)
+                    T.copy(data, out[row, column : column + block])
 
     return main
 
@@ -139,7 +156,9 @@ def zero_row_tail(rows, capacity, width, dtype="bfloat16", partitions=0, first=N
             raise ValueError("Invalid interleaved tail partition")
     elif partitions and (partitions < 1 or capacity % partitions):
         raise ValueError("Collective partition must divide its capacity")
-    block = math.gcd(width, 256)
+    elem_bytes = 2 if dtype == "bfloat16" else 4
+    max_cols = 16384 // elem_bytes
+    block = width if width <= max_cols else math.gcd(width, max_cols)
     blocks = width // block
     start = T.ceildiv(rows - first, partitions) if first is not None else rows
     end = (
@@ -155,17 +174,23 @@ def zero_row_tail(rows, capacity, width, dtype="bfloat16", partitions=0, first=N
         positions: T.Tensor((rows,), "int32"),
         out: T.Tensor((capacity, width), dtype),
     ):
-        with T.Kernel(T.max(1, T.ceildiv((end - start) * blocks, 2)), is_npu=True) as (
-            cid,
-            vid,
-        ):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             zeros = T.alloc_ub((block,), dtype)
-            index = cid * 2 + vid
-            row = start + index // blocks
-            column = index % blocks * block
-            if row < end:
-                T.tile.fill(zeros, 0)
-                T.copy(zeros, out[row, column : column + block])
+            aiv = cid * 2 + vid
+            if start < end:
+                items = (end - start) * blocks
+                if aiv < items:
+                    if block < 8:
+                        for lane in T.serial(block):
+                            zeros[lane] = 0
+                    else:
+                        T.tile.fill(zeros, 0)
+                    T.pipe_barrier("ALL")
+                    for step in T.serial(T.ceildiv(items - aiv, 40)):
+                        index = aiv + step * 40
+                        row = start + index // blocks
+                        column = (index % blocks) * block
+                        T.copy(zeros, out[row, column : column + block])
 
     return main
 
@@ -257,18 +282,21 @@ def gather_columns(rows, width, ranks=8, dtype="bfloat16", output_width=0, paths
         gathered: T.Tensor((ranks, rows, local), dtype),
         out: T.Tensor(output_shape, dtype),
     ):
-        with T.Kernel(T.ceildiv(rows * ranks, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             data = T.alloc_ub((logical,), dtype)
-            index = cid * 2 + vid
-            row, rank = index // ranks, index % ranks
-            if row < rows:
-                first = T.max(0, rank * logical + local - output)
-                T.copy(gathered[rank, row, first : first + logical], data)
-                if paths == 1:
-                    T.copy(data, out[row, rank * logical : (rank + 1) * logical])
-                else:
-                    for path in T.serial(paths):
-                        T.copy(data, out[row, path, rank * logical : (rank + 1) * logical])
+            aiv = cid * 2 + vid
+            items = rows * ranks
+            if aiv < items:
+                for step in T.serial(T.ceildiv(items - aiv, 40)):
+                    index = aiv + step * 40
+                    row, rank = index // ranks, index % ranks
+                    first = T.max(0, rank * logical + local - output)
+                    T.copy(gathered[rank, row, first : first + logical], data)
+                    if paths == 1:
+                        T.copy(data, out[row, rank * logical : (rank + 1) * logical])
+                    else:
+                        for path in T.serial(paths):
+                            T.copy(data, out[row, path, rank * logical : (rank + 1) * logical])
 
     return main
 
@@ -276,7 +304,9 @@ def gather_columns(rows, width, ranks=8, dtype="bfloat16", output_width=0, paths
 def gather_rows(rows, table_rows, width, dtype="bfloat16", index_dtype="int64"):
     if isinstance(table_rows, int) and table_rows > 2147483647:
         raise ValueError("A2 row table exceeds signed 32-bit addressing")
-    block = math.gcd(width, 256)
+    elem_bytes = {"int8": 1, "bfloat16": 2, "float16": 2, "int32": 4, "float32": 4}.get(dtype, 4)
+    max_cols = 16384 // elem_bytes
+    block = width if width <= max_cols else math.gcd(width, max_cols)
     blocks = width // block
 
     @T.prim_func
@@ -286,25 +316,38 @@ def gather_rows(rows, table_rows, width, dtype="bfloat16", index_dtype="int64"):
         out: T.Tensor((rows, width), dtype),
         errors: T.Tensor((rows,), "int32"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2) * blocks, is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             a = T.alloc_ub((block,), dtype)
+            zero_buf = T.alloc_ub((block,), dtype)
             zeros = T.alloc_ub((max(1, block // 2),), "int16")
             flag = T.alloc_ub((8,), "int32")
-            row = cid // blocks * 2 + vid
-            column = cid % blocks * block
-            if row < rows:
-                index = indices[row]
-                if dtype == "int8":
-                    T.reinterpretcast(a, zeros, "int8_t")
+            aiv = cid * 2 + vid
+            items = rows * blocks
+            if aiv < items:
+                if dtype == "int8" and block >= 8:
+                    T.reinterpretcast(zero_buf, zeros, "int8_t")
                     T.tile.fill(zeros, 0)
+                elif block < 8:
+                    for lane in T.serial(block):
+                        zero_buf[lane] = 0
                 else:
-                    T.tile.fill(a, 0.0)
-                if index >= 0 and index < table_rows:
-                    T.copy(table[T.cast(index, "int32"), column : column + block], a)
-                T.copy(a, out[row, column : column + block])
-                if column == 0:
-                    flag[0] = T.if_then_else(index < -1 or index >= table_rows, 1, 0)
-                    T.copy(flag[:1], errors[row : row + 1])
+                    T.tile.fill(zero_buf, 0)
+                T.pipe_barrier("ALL")
+                for step in T.serial(T.ceildiv(items - aiv, 40)):
+                    flat = aiv + step * 40
+                    row = flat // blocks
+                    column = (flat % blocks) * block
+                    index = indices[row]
+                    if index >= 0 and index < table_rows:
+                        T.copy(table[T.cast(index, "int32"), column : column + block], a)
+                        T.copy(a, out[row, column : column + block])
+                    else:
+                        T.copy(zero_buf, out[row, column : column + block])
+                    if column == 0:
+                        flag[0] = T.if_then_else(index < -1 or index >= table_rows, 1, 0)
+                        T.copy(flag[:1], errors[row : row + 1])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main
 
@@ -341,30 +384,48 @@ def scatter_rows(rows, table_rows, width, dtype="bfloat16", index_dtype="int64")
 
 
 def dequant_rows(rows, width, group=32):
+    groups = width // group
+    tile_rows = 8 if width <= 512 and groups * 4 % 32 == 0 else 1
+
     @T.prim_func
     def main(
         values: T.Tensor((rows, width), "int8"),
-        scales: T.Tensor((rows, width // group), "float32"),
+        scales: T.Tensor((rows, groups), "float32"),
         out: T.Tensor((rows, width), "bfloat16"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
-            q = T.alloc_ub((width,), "int8")
-            half_values = T.alloc_ub((width,), "float16")
-            a = T.alloc_ub((width,), "float32")
-            scale = T.alloc_ub((width // group,), "float32")
-            y = T.alloc_ub((width,), "bfloat16")
-            row = cid * 2 + vid
-            if row < rows:
-                T.copy(values[row, :], q)
-                T.copy(scales[row, :], scale)
-                T.tile.cast(half_values, q, "CAST_NONE", width)
-                T.tile.cast(a, half_values, "CAST_NONE", width)
-                for g in T.serial(width // group):
-                    T.tile.mul(
-                        a[g * group : (g + 1) * group], a[g * group : (g + 1) * group], scale[g]
-                    )
-                T.tile.cast(y, a, "CAST_RINT", width)
-                T.copy(y, out[row, :])
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            q = T.alloc_ub((tile_rows, width), "int8")
+            half_values = T.alloc_ub((tile_rows * width,), "float16")
+            a = T.alloc_ub((tile_rows * width,), "float32")
+            q_flat = T.alloc_ub((tile_rows * width,), "int8")
+            scale = T.alloc_ub((tile_rows, groups), "float32")
+            s_flat = T.alloc_ub((tile_rows * groups,), "float32")
+            y = T.alloc_ub((tile_rows, width), "bfloat16")
+            y_flat = T.alloc_ub((tile_rows * width,), "bfloat16")
+            T.reinterpretcast(q_flat, q, "int8_t")
+            T.reinterpretcast(s_flat, scale, "float")
+            T.reinterpretcast(y_flat, y, "bfloat16_t")
+            aiv = cid * 2 + vid
+            tiles = T.ceildiv(rows, tile_rows)
+            if aiv < tiles:
+                for step in T.serial(T.ceildiv(tiles - aiv, 40)):
+                    first = (aiv + step * 40) * tile_rows
+                    valid = T.min(tile_rows, rows - first)
+                    T.copy(values[first : first + valid, :], q[:valid, :])
+                    T.copy(scales[first : first + valid, :], scale[:valid, :])
+                    T.pipe_barrier("ALL")
+                    T.tile.cast(half_values, q_flat, "CAST_NONE", tile_rows * width)
+                    T.tile.cast(a, half_values, "CAST_NONE", tile_rows * width)
+                    for idx in T.serial(valid * groups):
+                        T.tile.mul(
+                            a[idx * group : (idx + 1) * group],
+                            a[idx * group : (idx + 1) * group],
+                            s_flat[idx],
+                        )
+                    T.tile.cast(y_flat, a, "CAST_RINT", tile_rows * width)
+                    T.copy(y[:valid, :], out[first : first + valid, :])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main
 

@@ -148,7 +148,7 @@ pub(crate) struct Runtime {
     next_snapshot: u64,
     hints: Vec<usize>,
     prefill_costs: scheduler::prefill::Costs,
-    input_window: Option<Arc<super::host_inputs::Window>>,
+    input_windows: Vec<Arc<super::host_inputs::Window>>,
     decode_burst: scheduler::DecodeBurst,
     capture_credit_s: f64,
     draft_limit: usize,
@@ -409,7 +409,7 @@ impl Runtime {
             hints: vec![],
             // Bootstrap only; actual packet and restore observations replace it.
             prefill_costs: scheduler::prefill::Costs::new(4000.),
-            input_window: None,
+            input_windows: vec![],
             decode_burst: Default::default(),
             capture_credit_s: 0.,
             draft_limit,
@@ -1345,10 +1345,6 @@ impl Runtime {
             prefill_requests,
             ..
         } = selection;
-        let prepared = self.begin_forward_with_workspace(
-            &layout,
-            "Insufficient A2 workspace after reclaiming cached state",
-        )?;
         let shared = packet::mark_shared(&selected, requests);
         let work = packet::work(&selected, requests, prefill_rows);
         let prefill_work = self.prefill_work(&selected, requests, full, layout.decode);
@@ -1363,31 +1359,43 @@ impl Runtime {
             shared,
             1,
         );
-        let (uses, slack) = self.capture_context(
-            &selected,
-            requests,
-            None,
-            self.team.draft_blocks.first().copied().unwrap_or(0),
-            options,
-        );
-        let capture = if speculative_baseline {
-            self.speculation_policy
-                .baseline_budget(full, layout.decode, work, uses, slack)
+        let (values, timing) = if self.team.is_resident(&layout) {
+            let mut readout =
+                packet::target_readout(requests, full, &BTreeMap::new(), self.vocab(), &selected)?;
+            self.prepare_host_inputs(&layout, &selected, requests, &mut readout);
+            self.team
+                .fast_forward(layout, tokens, readout, maintenance)?
         } else {
-            self.speculation_policy
-                .target_budget(full, layout.decode, work, uses, slack)
+            let prepared = self.begin_forward_with_workspace(
+                &layout,
+                "Insufficient A2 workspace after reclaiming cached state",
+            )?;
+            let (uses, slack) = self.capture_context(
+                &selected,
+                requests,
+                None,
+                self.team.draft_blocks.first().copied().unwrap_or(0),
+                options,
+            );
+            let capture = if speculative_baseline {
+                self.speculation_policy
+                    .baseline_budget(full, layout.decode, work, uses, slack)
+            } else {
+                self.speculation_policy
+                    .target_budget(full, layout.decode, work, uses, slack)
+            };
+            let mut readout =
+                packet::target_readout(requests, full, &BTreeMap::new(), self.vocab(), &selected)?;
+            self.prepare_host_inputs(&layout, &selected, requests, &mut readout);
+            self.team.finish_forward(
+                prepared,
+                layout,
+                tokens,
+                readout,
+                Some(capture),
+                maintenance,
+            )?
         };
-        let mut readout =
-            packet::target_readout(requests, full, &BTreeMap::new(), self.vocab(), &selected)?;
-        self.prepare_host_inputs(&layout, &selected, requests, &mut readout);
-        let (values, timing) = self.team.finish_forward(
-            prepared,
-            layout,
-            tokens,
-            readout,
-            Some(capture),
-            maintenance,
-        )?;
         timing.record(&mut self.statistics.batch_execution);
         self.observe_prefill(prefill_work, &timing);
         let seconds = timing.seconds;
@@ -1459,7 +1467,8 @@ impl Runtime {
             }
             if request.prefilling
                 && request.cache_prompt
-                && (request.offset.is_multiple_of(4096)
+                && (request.offset == 4096
+                    || request.offset.is_multiple_of(16384)
                     || keep > 0 && request.input.len() - request.offset == keep)
             {
                 self.store(request, None)?;
@@ -1479,13 +1488,7 @@ impl Runtime {
         }
         self.release_resident(request.slot)?;
         self.active.remove(&request.slot);
-        if self
-            .input_window
-            .as_ref()
-            .is_some_and(|w| w.owner == request.slot)
-        {
-            self.input_window = None;
-        }
+        self.input_windows.retain(|w| w.owner != request.slot);
         if self.active.is_empty() {
             self.capture_credit_s = 0.;
             self.decode_burst.clear();

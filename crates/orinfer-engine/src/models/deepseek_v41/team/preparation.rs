@@ -78,10 +78,20 @@ impl Plan {
     }
 }
 
+#[cfg(test)]
 pub(super) fn plan(
     states: &[CacheState],
     repeated: bool,
     budget: Option<CaptureBudget>,
+) -> Result<Plan> {
+    plan_with_warmup(states, repeated, budget, if repeated { 2 } else { 8 })
+}
+
+pub(super) fn plan_with_warmup(
+    states: &[CacheState],
+    repeated: bool,
+    budget: Option<CaptureBudget>,
+    min_warmup: u8,
 ) -> Result<Plan> {
     if states.is_empty() {
         return Err("Missing A2 TP cache states".into());
@@ -97,9 +107,11 @@ pub(super) fn plan(
         });
     }
     let invalidate = (!all_missing && missing) || graphs > 0;
-    let ready = !missing && (graphs > 0 || states.iter().all(|s| {
-        matches!(s, CacheState::Direct { uses, .. } if *uses >= if repeated { 2 } else { 8 })
-    }));
+    let ready = !missing
+        && (graphs > 0
+            || states
+                .iter()
+                .all(|s| matches!(s, CacheState::Direct { uses, .. } if *uses >= min_warmup)));
     let budget = budget.map(|mut budget| {
         // Short tails and final prompt windows have little request-local reuse.
         // Actual hits of the same retained packet also establish reuse across

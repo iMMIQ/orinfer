@@ -370,9 +370,9 @@ pub(super) fn forecast(
 /// coordinates remain active and all buckets <= 127 stay inside non-SP P[2]).
 const VERIFY_BUCKETS: &[usize] = &[16, 32, 48, 64, 80, 96, 112, 127];
 
-/// Canonical Mixed decoder-row buckets (max gap 33 <= 64 <= keep = 128; buckets
+/// Canonical Mixed decoder-row buckets (max gap 64 <= keep = 128; buckets
 /// <= 127 trigger cross-family Tail downgrade from SP P[3] to non-SP P[2]).
-const MIXED_DECODER_BUCKETS: &[usize] = &[32, 64, 96, 127, 160, 192, 224, 256];
+const MIXED_DECODER_BUCKETS: &[usize] = &[32, 64, 127, 192, 256];
 
 pub(super) fn bucket_verify_rows(rows: usize) -> usize {
     VERIFY_BUCKETS
@@ -462,7 +462,7 @@ impl Runtime {
         let target_dec = bucket_mixed_decoder_rows(decoder_rows);
         let pad_len = target_dec.saturating_sub(decoder_rows);
         let cur_out = selection.layout.outputs.len();
-        let target_out = bucket_verify_rows(cur_out)
+        let target_out = bucket_mixed_decoder_rows(cur_out)
             .min(target_dec)
             .min(output_capacity);
         let pad_out = target_out.saturating_sub(cur_out);
@@ -516,25 +516,33 @@ impl Runtime {
         readout: &mut super::super::team::Readout,
     ) {
         let has_prefill = selected.iter().any(|&(i, _)| requests[i].prefilling);
-        let hint = if has_prefill && layout.rows.total >= 128 {
-            let previous = self.input_window.take();
-            previous.as_ref().and_then(|window| {
-                selected.iter().enumerate().find_map(|(lane, &(i, rows))| {
+        let hints = if has_prefill && layout.rows.total >= 128 {
+            let previous = std::mem::take(&mut self.input_windows);
+            selected
+                .iter()
+                .enumerate()
+                .filter_map(|(lane, &(i, rows))| {
                     let r = &requests[i];
-                    let start = r.offset.checked_sub(window.offset)?;
-                    (r.prefilling && r.slot == window.owner && start + rows <= window.rows).then(
-                        || super::super::host_inputs::Hint {
-                            window: Arc::clone(window),
-                            destination: layout.rows.starts[lane]..layout.rows.starts[lane] + rows,
-                            source: start..start + rows,
-                        },
-                    )
+                    if !r.prefilling {
+                        return None;
+                    }
+                    previous.iter().find_map(|window| {
+                        let start = r.offset.checked_sub(window.offset)?;
+                        (r.slot == window.owner && start + rows <= window.rows).then(|| {
+                            super::super::host_inputs::Hint {
+                                window: Arc::clone(window),
+                                destination: layout.rows.starts[lane]
+                                    ..layout.rows.starts[lane] + rows,
+                                source: start..start + rows,
+                            }
+                        })
+                    })
                 })
-            })
+                .collect()
         } else {
-            None
+            vec![]
         };
-        readout.first_input = self.team.first_input(hint);
+        readout.first_input = self.team.first_input(hints);
         if !has_prefill || layout.rows.total < 256 {
             return;
         }
@@ -567,12 +575,22 @@ impl Runtime {
                 remaining_tokens: r.input.len() - offset,
             })
         });
-        if let Some(&i) = order.first() {
-            self.input_window =
+        let mut windows = Vec::with_capacity(2);
+        let mut covered = 0usize;
+        for &i in order.iter().take(2) {
+            if let Some(window) =
                 self.team
-                    .forecast_input(requests[i].slot, offsets[i], &requests[i].input);
-            readout.next_input = self.input_window.clone();
+                    .forecast_input(requests[i].slot, offsets[i], &requests[i].input)
+            {
+                covered += window.rows;
+                windows.push(window);
+                if covered >= self.team.rows {
+                    break;
+                }
+            }
         }
+        readout.next_inputs = windows.clone();
+        self.input_windows = windows;
     }
     pub(super) fn capture_context(
         &self,

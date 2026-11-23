@@ -60,23 +60,35 @@ impl Estimator<'_> {
             return p.upper_s;
         }
         if p.samples > 0 && !p.extrapolated {
-            // Do not let a ~205ms un-captured Direct warmup pass permanently
-            // lock out a 2048-row mixed tile before it reaches Graph replay.
-            if p.path == Path::Direct && work.tokens >= 1024 {
-                return p.seconds * 0.90;
+            // Do not let an un-captured Direct/Shared Tail warmup (~210-225ms)
+            // permanently lock out a 2048-row mixed tile before Graph replay
+            // (~175-182ms) is captured.
+            if p.path != Path::Replay && work.tokens >= 1024 {
+                return p.seconds * 0.85;
             }
-            return p.upper_s;
+            // Use the measured mean on downgraded non-SP mixed packets so
+            // transient jitter near the 200ms budget does not halve throughput
+            // from 2048 to 1024 rows.
+            return p.seconds;
         }
+        // Anchor unmeasured or extrapolated mixed shapes to the pure producer
+        // curve (clearing final_rows/full so final-window mixed chunks still
+        // match the hot pure-prefill baseline).
         let prompt = self.costs.estimate(Work {
             decode_rows: 0,
             decode_context: 0,
+            final_rows: 0,
+            full: false,
             ..work
         });
         if prompt.samples > 0 {
-            let extra = (p.upper_s - prompt.upper_s).max(0.);
-            return prompt.upper_s + extra * 0.30;
+            let extra = (p.seconds - prompt.seconds).max(0.);
+            return prompt.seconds + extra * 0.25;
         }
-        p.upper_s
+        if p.path != Path::Replay && work.tokens >= 1024 {
+            return p.seconds * 0.85;
+        }
+        p.seconds
     }
     fn prompt_decoder_rows(&self, rows: usize, final_chunk: bool) -> usize {
         self.model

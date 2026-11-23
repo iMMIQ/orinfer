@@ -5,7 +5,7 @@ use crate::{
 };
 use safetensors::Dtype;
 use serde::Deserialize;
-use std::{fs, path::Path, rc::Rc, time::Instant};
+use std::{fs, path::Path, rc::Rc, sync::Arc, time::Instant};
 
 pub(super) struct Inputs<'a> {
     pub tokens: &'a [u32],
@@ -14,7 +14,7 @@ pub(super) struct Inputs<'a> {
     pub visual_rows: &'a [super::vision::Overlay],
     pub device: Option<super::device_inputs::Prepared>,
     pub first: Option<&'a super::host_inputs::First>,
-    pub next: Option<&'a super::host_inputs::Window>,
+    pub next: &'a [Arc<super::host_inputs::Window>],
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
@@ -424,7 +424,7 @@ impl Worker {
                 visual_rows: &[],
                 device: None,
                 first: None,
-                next: None,
+                next: &[],
             },
             logits,
             vec![],
@@ -483,7 +483,24 @@ impl Worker {
             .body_steps()
             .filter(|step| matches!(step, Step::Lookup { .. }))
             .count();
-        let mut next_window = next;
+        // Start gathering later Engram layers (e.g. layer 14) asynchronously before
+        // layer 0 launches so their host RAM reads overlap with layers 0..13 on NPU.
+        if let Some(first) = first {
+            for step in execution.body_steps() {
+                if let Step::Lookup { layer, .. } = step
+                    && *layer != first.layer
+                    && first.handles_layer(*layer)
+                {
+                    first.prefetch_extra(
+                        *layer,
+                        Arc::clone(&self.tables),
+                        || self.lookup_ids(*layer, tokens.len(), hashes, valid),
+                        valid,
+                    );
+                }
+            }
+        }
+        let mut next_windows = (!next.is_empty()).then_some(next);
         let mut embeddings = embeddings.into_iter();
         let mut device_embeddings = device_embeddings.iter();
         let mut lookup_cursor = 0usize;
@@ -577,9 +594,9 @@ impl Worker {
                                 )?;
                                 lookup_cursor += 1;
                                 if lookup_cursor == total_lookups
-                                    && let Some(next) = next_window.take()
+                                    && let Some(windows) = next_windows.take()
                                 {
-                                    next.start();
+                                    super::host_inputs::Window::start_all(windows);
                                 }
                             }
                             Step::Snapshot { .. } => {}

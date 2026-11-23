@@ -50,6 +50,7 @@ pub(super) enum Command {
     Shared(Layout),
     CaptureShared(Layout, String),
     Forward(Layout, Vec<Vec<u32>>, Readout, Vec<String>),
+    FastForward(Layout, Vec<Vec<u32>>, Readout),
     BeginVerification(Vec<(usize, usize)>),
     FinishVerification(Vec<(usize, usize)>),
     Save {
@@ -155,7 +156,7 @@ pub(super) struct Readout {
         >,
     >,
     pub first_input: Option<Arc<super::host_inputs::First>>,
-    pub next_input: Option<Arc<super::host_inputs::Window>>,
+    pub next_inputs: Vec<Arc<super::host_inputs::Window>>,
 }
 impl From<bool> for Readout {
     fn from(full: bool) -> Self {
@@ -291,6 +292,18 @@ impl Readout {
             .collect()
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ResidentKey {
+    role: super::PacketRole,
+    decode: bool,
+    bucketed: bool,
+    total_rows: usize,
+    outputs: usize,
+    decoder_rows: usize,
+    pad_slot: bool,
+    segments: Vec<(usize, super::replay::Role)>,
+}
+
 pub(super) struct Team {
     peers: Transport,
     graphs_enabled: bool,
@@ -309,6 +322,7 @@ pub(super) struct Team {
     pub(super) host_hasher: Option<Arc<orinfer_model_sdk::conditional_memory::Hasher>>,
     pub(super) host_prepare: Arc<std::sync::atomic::AtomicBool>,
     rank_free_range: std::cell::Cell<(usize, usize)>,
+    resident_graphs: std::cell::RefCell<BTreeSet<ResidentKey>>,
 }
 
 /// Execution mode and preparation are measured separately; direct is a valid steady path.
@@ -462,6 +476,7 @@ impl Team {
             )),
             host_prepare: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rank_free_range: std::cell::Cell::new((0, 0)),
+            resident_graphs: std::cell::RefCell::new(BTreeSet::new()),
         };
         // One shared CPU load owns no ACL handles. Join it with rank workers
         // on every startup/teardown path, including partial rank failures.
@@ -1002,6 +1017,10 @@ impl Team {
                                 .select_shared(&layout, &shared)
                                 .and_then(|()| worker.forward_batch(&layout, &tokens, &readout))
                                 .map(|values| Reply::Outputs(values, !shared.is_empty())),
+                            Command::FastForward(layout, tokens, readout) => worker
+                                .grow_batch(&layout)
+                                .and_then(|()| worker.forward_batch(&layout, &tokens, &readout))
+                                .map(|values| Reply::Outputs(values, false)),
                             Command::Save {
                                 owner,
                                 snapshot,
@@ -1093,6 +1112,10 @@ impl Team {
         Ok(team)
     }
     pub fn exchange(&self, command: Command) -> Result<Vec<Reply>> {
+        #[cfg(test)]
+        if matches!(command, Command::Prepare(_, _) | Command::Invalidate(_)) {
+            self.resident_graphs.borrow_mut().clear();
+        }
         exchange(&self.peers, command)
     }
     pub fn exchange_heavy(&self, command: Command) -> Result<Vec<Reply>> {
@@ -1246,19 +1269,123 @@ impl Team {
             complete,
         })
     }
-    pub fn begin_forward(&self, layout: &Layout) -> Result<PreparedForward> {
-        begin_forward(&self.peers, layout)
+    fn resident_key(&self, layout: &Layout) -> Option<ResidentKey> {
+        if !self.graphs_enabled || layout.has_work_shape() {
+            return None;
+        }
+        let replay = self
+            .model
+            .batch
+            .as_ref()
+            .and_then(|c| c.decoder_replay.as_ref());
+        let final_only = replay.is_some_and(|r| r.final_prompt_only);
+        let keep = replay.filter(|r| r.final_prompt_only).map_or(0, |r| r.keep);
+        let decoder_rows = if keep > 0 && layout.role == super::PacketRole::Target && !layout.decode
+        {
+            layout
+                .segments
+                .iter()
+                .zip(&layout.decoder_roles)
+                .map(|(s, role)| {
+                    if *role == super::replay::Role::Producer {
+                        0
+                    } else {
+                        s.tokens.min(keep)
+                    }
+                })
+                .sum()
+        } else {
+            0
+        };
+        let use_bucket_key = layout.bucketed && (final_only || replay.is_none());
+        let segments = if use_bucket_key {
+            vec![]
+        } else {
+            layout
+                .segments
+                .iter()
+                .zip(&layout.decoder_roles)
+                .map(|(s, &r)| (s.tokens, r))
+                .collect()
+        };
+        Some(ResidentKey {
+            role: layout.role,
+            decode: layout.decode,
+            bucketed: use_bucket_key,
+            total_rows: layout.rows.total,
+            outputs: layout.outputs.len(),
+            decoder_rows,
+            pad_slot: layout.pad_slot.is_some(),
+            segments,
+        })
     }
-    pub fn begin_verification_forward(
+    pub fn is_resident(&self, layout: &Layout) -> bool {
+        self.resident_key(layout)
+            .is_some_and(|key| self.resident_graphs.borrow().contains(&key))
+    }
+    pub fn fast_forward(
+        &self,
+        layout: Layout,
+        tokens: Vec<Vec<u32>>,
+        readout: impl Into<Readout>,
+        maintenance: impl FnOnce(),
+    ) -> Result<(Vec<Output>, Timing)> {
+        let started = Instant::now();
+        let readout = readout.into();
+        let replicated = layout.role == super::PacketRole::Draft;
+        let sampled = !readout.draws.is_empty();
+        let readout_rejection_empty = readout.rejection.is_empty();
+        let parameters = Arc::clone(&readout.parameters);
+        let first_input = readout.first_input.clone();
+        self.peers
+            .send(Command::FastForward(layout, tokens, readout))?;
+        maintenance();
+        let results = self.peers.collect()?;
+        collect_forward_outputs(
+            results,
+            replicated,
+            false,
+            sampled,
+            readout_rejection_empty,
+            parameters,
+            first_input,
+            started,
+            0.,
+            true,
+            false,
+            false,
+            false,
+            0.,
+            0.,
+        )
+    }
+    pub fn begin_forward(&self, layout: &Layout) -> Result<PreparedForward> {
+        let prepared = begin_forward(&self.peers, layout)?;
+        if prepared.all_graphs()
+            && let Some(key) = self.resident_key(layout)
+        {
+            self.resident_graphs.borrow_mut().insert(key);
+        }
+        Ok(prepared)
+    }
+    pub fn send_verification_forward(
         &self,
         layout: &Layout,
         journal: Vec<(usize, usize)>,
-    ) -> Result<(PreparedForward, bool)> {
+    ) -> Result<Instant> {
         let started = Instant::now();
-        let replies = self.exchange(Command::GrowCachedAndBeginVerification(
+        self.peers.send(Command::GrowCachedAndBeginVerification(
             layout.clone(),
             journal,
         ))?;
+        Ok(started)
+    }
+    pub fn collect_verification_forward(
+        &self,
+        layout: &Layout,
+        started: Instant,
+    ) -> Result<(PreparedForward, bool)> {
+        let replies = self.peers.collect()?;
         let mut states = Vec::with_capacity(replies.len());
         let mut workspace_fits = true;
         let mut journal_ready = true;
@@ -1270,14 +1397,25 @@ impl Team {
             workspace_fits &= fits;
             journal_ready &= ready;
         }
-        Ok((
-            PreparedForward {
-                started,
-                states,
-                workspace_fits,
-            },
-            journal_ready,
-        ))
+        let prepared = PreparedForward {
+            started,
+            states,
+            workspace_fits,
+        };
+        if prepared.all_graphs()
+            && let Some(key) = self.resident_key(layout)
+        {
+            self.resident_graphs.borrow_mut().insert(key);
+        }
+        Ok((prepared, journal_ready))
+    }
+    pub fn begin_verification_forward(
+        &self,
+        layout: &Layout,
+        journal: Vec<(usize, usize)>,
+    ) -> Result<(PreparedForward, bool)> {
+        let started = self.send_verification_forward(layout, journal)?;
+        self.collect_verification_forward(layout, started)
     }
     pub fn try_plan_and_save(
         &self,
@@ -1330,7 +1468,8 @@ impl Team {
         budget: Option<CaptureBudget>,
         maintenance: impl FnOnce(),
     ) -> Result<(Vec<Output>, Timing)> {
-        finish_forward(
+        let key = self.resident_key(&layout);
+        let (outputs, timing) = finish_forward(
             &self.peers,
             prepared,
             layout,
@@ -1339,7 +1478,21 @@ impl Team {
             budget,
             maintenance,
             self.graphs_enabled,
-        )
+        )?;
+        if timing.invalidated || timing.captured || (!timing.replay && timing.setup > 0.) {
+            let mut resident = self.resident_graphs.borrow_mut();
+            resident.clear();
+            if timing.replay
+                && let Some(key) = key
+            {
+                resident.insert(key);
+            }
+        } else if timing.replay
+            && let Some(key) = key
+        {
+            self.resident_graphs.borrow_mut().insert(key);
+        }
+        Ok((outputs, timing))
     }
     pub fn plan_snapshot_with_budget(
         &self,
@@ -1432,9 +1585,11 @@ impl Team {
         Ok(maximum)
     }
     pub fn reclaim_programs(&self) -> Result<bool> {
+        self.resident_graphs.borrow_mut().clear();
         Ok(self.capacities(Command::Reclaim)?.into_iter().any(|v| v))
     }
     pub fn reclaim_programs_for_admission(&self) -> Result<bool> {
+        self.resident_graphs.borrow_mut().clear();
         Ok(self
             .capacities(Command::ReclaimForAdmission)?
             .into_iter()
@@ -1758,12 +1913,19 @@ fn finish_forward(
         return Err("TP split packet shapes disagree across ranks".into());
     }
     let split_packet = has_tail || has_head;
+    let min_warmup = if layout.bucketed || layout.role == super::PacketRole::Draft {
+        1
+    } else if repeated {
+        2
+    } else {
+        8
+    };
     let plan_part = |part_states: &[CacheState],
                      part_repeated: bool,
                      part_budget: Option<CaptureBudget>,
                      allow_new_capture: bool| {
         let mut plan = if graphs_enabled {
-            preparation::plan(part_states, part_repeated, part_budget)?
+            preparation::plan_with_warmup(part_states, part_repeated, part_budget, min_warmup)?
         } else {
             preparation::direct_plan(part_states)?
         };
@@ -1779,9 +1941,19 @@ fn finish_forward(
     };
     let bucket_budget = |base: Option<CaptureBudget>, capture_scale: f64| {
         base.map(|mut b| {
-            if layout.bucketed {
+            if layout.bucketed || layout.role == super::PacketRole::Draft {
                 if b.max_uses.is_none() {
                     b.uses = b.uses.max(24.);
+                    // Context variance across mixed cohorts can occasionally record a
+                    // low-context Direct observation below a high-context Replay mean.
+                    // Do not strand a canonical reusable bucket in Direct forever;
+                    // fall back to the bounded replay-trial rule (still honoring slack_s).
+                    if b.direct_s
+                        .zip(b.replay_s)
+                        .is_some_and(|(direct, replay)| direct <= replay * 1.02)
+                    {
+                        b.replay_s = None;
+                    }
                 }
                 if let Some(c) = &mut b.capture_s {
                     *c *= capture_scale;
@@ -1803,7 +1975,11 @@ fn finish_forward(
     )?;
     let stagger_tail = layout.bucketed
         && trunk_plan.mode == preparation::Mode::CaptureReplay
-        && budget.is_some_and(|b| b.slack_s.is_finite());
+        && budget.is_some_and(|b| {
+            b.slack_s.is_finite()
+                && b.capture_s.unwrap_or(0.) * 1.5 + b.replay_s.or(b.direct_s).unwrap_or(0.)
+                    > b.slack_s
+        });
     let tail_plan = if has_tail {
         let tail_states: Vec<CacheState> = states.iter().map(|s| s.tail.unwrap()).collect();
         let tail_scale = if trunk_plan.mode == preparation::Mode::Replay {
@@ -1943,6 +2119,51 @@ fn finish_forward(
         maintenance();
     }
     let results = peers.collect()?;
+    collect_forward_outputs(
+        results,
+        replicated,
+        shared_mode,
+        sampled,
+        readout_rejection_empty,
+        parameters,
+        first_input,
+        started,
+        prepare_s,
+        capture,
+        any_captured,
+        invalidate,
+        partial_trunk_graph,
+        shared_setup,
+        if cached_prepare {
+            shared_setup
+        } else {
+            prepare_s
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_forward_outputs(
+    results: Vec<Reply>,
+    replicated: bool,
+    shared_mode: bool,
+    sampled: bool,
+    readout_rejection_empty: bool,
+    parameters: Arc<
+        crate::sampling::Prepared<
+            BTreeMap<usize, Vec<crate::backend::ascend::sampling::Parameters>>,
+        >,
+    >,
+    first_input: Option<Arc<super::host_inputs::First>>,
+    started: Instant,
+    prepare_s: f64,
+    capture: bool,
+    any_captured: bool,
+    invalidate: bool,
+    partial_trunk_graph: bool,
+    shared_setup: f64,
+    setup: f64,
+) -> Result<(Vec<Output>, Timing)> {
     if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some()
         && let Some(first) = first_input
         && first.prepared.seconds() > 0.
@@ -2060,11 +2281,7 @@ fn finish_forward(
             } else {
                 shared_setup
             },
-            setup: if cached_prepare {
-                shared_setup
-            } else {
-                prepare_s
-            },
+            setup,
         },
     ))
 }

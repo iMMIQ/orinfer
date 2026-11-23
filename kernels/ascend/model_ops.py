@@ -52,7 +52,7 @@ def norm(rows, width, eps=1e-20):
         out: T.Tensor((rows, width), "bfloat16"),
         precise: T.Tensor((rows, width), "float32"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             xb = T.alloc_ub((1, width), "bfloat16")
             a = T.alloc_ub((1, width), "float32")
             w = T.alloc_ub((1, width), "float32")
@@ -61,21 +61,25 @@ def norm(rows, width, eps=1e-20):
             inverse = T.alloc_ub((1, 1), "float32")
             correction = T.alloc_ub((1, 1), "float32")
             y = T.alloc_ub((1, width), "bfloat16")
-            row = cid * 2 + vid
-            if row < rows:
-                T.copy(x[row, :], xb)
+            aiv = cid * 2 + vid
+            if aiv < rows:
                 T.copy(weight[:], w)
-                T.tile.cast(a, xb, "CAST_NONE", width)
-                T.tile.mul(squared, a, a)
-                T.reduce_sum(squared, variance, dim=1)
-                T.tile.mul(variance, variance, 1.0 / width)
-                T.tile.add(variance, variance, eps)
-                rsqrt_fp32(variance, inverse, correction)
-                T.tile.mul(a, a, inverse[0, 0])
-                T.tile.mul(a, a, w)
-                T.copy(a, precise[row, :])
-                T.tile.cast(y, a, "CAST_RINT", width)
-                T.copy(y, out[row, :])
+                for step in T.serial(T.ceildiv(rows - aiv, 40)):
+                    row = aiv + step * 40
+                    T.copy(x[row, :], xb)
+                    T.tile.cast(a, xb, "CAST_NONE", width)
+                    T.tile.mul(squared, a, a)
+                    T.reduce_sum(squared, variance, dim=1)
+                    T.tile.mul(variance, variance, 1.0 / width)
+                    T.tile.add(variance, variance, eps)
+                    rsqrt_fp32(variance, inverse, correction)
+                    T.tile.mul(a, a, inverse[0, 0])
+                    T.tile.mul(a, a, w)
+                    T.copy(a, precise[row, :])
+                    T.tile.cast(y, a, "CAST_RINT", width)
+                    T.copy(y, out[row, :])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main
 
@@ -95,29 +99,33 @@ def norm_quant(rows, width, eps=1e-20):
         out: T.Tensor((rows, width), "int8"),
         scales: T.Tensor((rows,), "float32"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             xb = T.alloc_ub((1, width), "bfloat16")
-            a = T.alloc_ub((1, width), "float32")
+            norm_a = T.alloc_ub((1, width), "float32")
             w = T.alloc_ub((1, width), "float32")
             squared = T.alloc_ub((1, width), "float32")
             variance = T.alloc_ub((1, 1), "float32")
             inverse = T.alloc_ub((1, 1), "float32")
             correction = T.alloc_ub((1, 1), "float32")
             y = T.alloc_ub((1, width), "bfloat16")
-            row = cid * 2 + vid
-            if row < rows:
-                T.copy(x[row, :], xb)
+            aiv = cid * 2 + vid
+            if aiv < rows:
                 T.copy(weight[:], w)
-                T.tile.cast(a, xb, "CAST_NONE", width)
-                T.tile.mul(squared, a, a)
-                T.reduce_sum(squared, variance, dim=1)
-                T.tile.mul(variance, variance, 1.0 / width)
-                T.tile.add(variance, variance, eps)
-                rsqrt_fp32(variance, inverse, correction)
-                T.tile.mul(a, a, inverse[0, 0])
-                T.tile.mul(a, a, w)
-                T.tile.cast(y, a, "CAST_RINT", width)
-                quantize_bf16_row(y, out, scales, row, width)
+                for step in T.serial(T.ceildiv(rows - aiv, 40)):
+                    row = aiv + step * 40
+                    T.copy(x[row, :], xb)
+                    T.tile.cast(norm_a, xb, "CAST_NONE", width)
+                    T.tile.mul(squared, norm_a, norm_a)
+                    T.reduce_sum(squared, variance, dim=1)
+                    T.tile.mul(variance, variance, 1.0 / width)
+                    T.tile.add(variance, variance, eps)
+                    rsqrt_fp32(variance, inverse, correction)
+                    T.tile.mul(norm_a, norm_a, inverse[0, 0])
+                    T.tile.mul(norm_a, norm_a, w)
+                    T.tile.cast(y, norm_a, "CAST_RINT", width)
+                    quantize_bf16_row(y, out, scales, row, width)
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main.with_attr("orinfer.component_sources", COMPONENT_SOURCES)
 
@@ -380,15 +388,7 @@ def swiglu_packed(rows, width, limit=10.0):
     return main
 
 
-def swiglu_packed_quant(rows, width, limit=10.0):
-    """Fused packed SiLU-and-up gate with per-row INT8 quantization.
-
-    Bit-exact with the separate swiglu_packed -> quantize pair: the gated FP32
-    row rounds through BF16 exactly as the standalone kernels do. The gated
-    row moves into the quantization layout through an in-UB copy, never
-    touching global memory.
-    """
-
+def _swiglu_packed_quant_grid(rows, width, limit=10.0):
     @T.prim_func
     def main(
         packed: T.Tensor((rows, 2 * width), "bfloat16"),
@@ -424,6 +424,51 @@ def swiglu_packed_quant(rows, width, limit=10.0):
     return main.with_attr("orinfer.component_sources", COMPONENT_SOURCES)
 
 
+def swiglu_packed_quant(rows, width, limit=10.0):
+    """Fused packed SiLU-and-up gate with per-row INT8 quantization.
+
+    Bit-exact with the separate swiglu_packed -> quantize pair: the gated FP32
+    row rounds through BF16 exactly as the standalone kernels do. Uses a 20-slot
+    (40-AIV) 1-wave persistent loop to avoid per-row wave launch overhead.
+    """
+
+    @T.prim_func
+    def main(
+        packed: T.Tensor((rows, 2 * width), "bfloat16"),
+        out: T.Tensor((rows, width), "int8"),
+        scales: T.Tensor((rows,), "float32"),
+    ):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            gb = T.alloc_ub((1, width), "bfloat16")
+            ub = T.alloc_ub((1, width), "bfloat16")
+            g = T.alloc_ub((1, width), "float32")
+            u = T.alloc_ub((1, width), "float32")
+            exp = T.alloc_ub((1, width), "float32")
+            yb = T.alloc_ub((1, width), "bfloat16")
+            aiv = cid * 2 + vid
+            if aiv < rows:
+                for step in T.serial(T.ceildiv(rows - aiv, 40)):
+                    row = aiv + step * 40
+                    T.copy(packed[row : row + 1, :width], gb)
+                    T.copy(packed[row : row + 1, width:], ub)
+                    T.tile.cast(g, gb, "CAST_NONE", width)
+                    T.tile.cast(u, ub, "CAST_NONE", width)
+                    T.tile.min(g, g, limit)
+                    T.tile.min(u, u, limit)
+                    T.tile.max(u, u, -limit)
+                    T.tile.mul(exp, g, -1.0)
+                    T.tile.exp(exp, exp)
+                    T.tile.add(exp, exp, 1.0)
+                    T.tile.div(g, g, exp)
+                    T.tile.mul(u, u, g)
+                    T.tile.cast(yb, u, "CAST_RINT", width)
+                    quantize_bf16_row(yb, out, scales, row, width)
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
+
+    return main.with_attr("orinfer.component_sources", COMPONENT_SOURCES)
+
+
 def swiglu_packed_quant_active(rows, width, limit=10.0, selected=6):
     """Apply the shared arithmetic to the routed prefix, with a GPU-owned bound.
 
@@ -433,7 +478,7 @@ def swiglu_packed_quant_active(rows, width, limit=10.0, selected=6):
     from tilelang import tvm
 
     tir = tvm.tir
-    function = swiglu_packed_quant(rows, width, limit)
+    function = _swiglu_packed_quant_grid(rows, width, limit)
     handle = tir.Var("active_counts_handle", "handle")
     counts = tir.decl_buffer((rows // selected + 1,), "int32", name="active_counts")
     active = tir.Max(0, tir.Min(rows, tir.BufferLoad(counts, [rows // selected])))

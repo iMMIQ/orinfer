@@ -7,7 +7,8 @@ import tilelang.language as T
 def split(rows, width, tile=256):
     if tile < 16 or tile > 8192 or tile % 16:
         raise ValueError("FP32 decomposition tile must be 16-aligned and at most 8192")
-    block = math.gcd(width, tile)
+    max_cols = max(tile, 1024)
+    block = math.gcd(width, max_cols)
     tiles = width // block
 
     @T.prim_func
@@ -15,21 +16,31 @@ def split(rows, width, tile=256):
         source: T.Tensor((rows, width), "float32"),
         out: T.Tensor((3, rows, width), "bfloat16"),
     ):
-        with T.Kernel(T.ceildiv(rows * tiles, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             x = T.alloc_ub((block,), "float32")
             restored = T.alloc_ub((block,), "float32")
-            part = T.alloc_ub((block,), "bfloat16")
-            index = cid * 2 + vid
-            row, column = index // tiles, index % tiles * block
-            if row < rows:
-                T.copy(source[row, column : column + block], x)
-                for plane in T.serial(3):
-                    T.tile.cast(part, x, "CAST_RINT", block)
-                    T.copy(part, out[plane, row, column : column + block])
+            part0 = T.alloc_ub((block,), "bfloat16")
+            part1 = T.alloc_ub((block,), "bfloat16")
+            part2 = T.alloc_ub((block,), "bfloat16")
+            aiv = cid * 2 + vid
+            items = rows * tiles
+            if aiv < items:
+                for step in T.serial(T.ceildiv(items - aiv, 40)):
+                    index = aiv + step * 40
+                    row, column = index // tiles, (index % tiles) * block
+                    T.copy(source[row, column : column + block], x)
+                    T.tile.cast(part0, x, "CAST_RINT", block)
+                    T.copy(part0, out[0, row, column : column + block])
+                    T.tile.cast(restored, part0, "CAST_NONE", block)
+                    T.tile.sub(x, x, restored)
+                    T.tile.cast(part1, x, "CAST_RINT", block)
+                    T.copy(part1, out[1, row, column : column + block])
+                    T.tile.cast(restored, part1, "CAST_NONE", block)
+                    T.tile.sub(x, x, restored)
+                    T.tile.cast(part2, x, "CAST_RINT", block)
+                    T.copy(part2, out[2, row, column : column + block])
                     T.set_flag("MTE3", "V", 7)
                     T.wait_flag("MTE3", "V", 7)
-                    T.tile.cast(restored, part, "CAST_NONE", block)
-                    T.tile.sub(x, x, restored)
 
     return main
 
@@ -238,22 +249,27 @@ def reduce_partials(rows, output, tile_n=32, splits=8):
     """Restore the common 32-column/eight-split reduction from wide Cube tiles."""
     if tile_n not in (32, 64, 128) or output % 32 or splits != 8:
         raise ValueError("Invalid floating partial layout")
-    tiles, groups = output // 32, tile_n // 32
+    blocks = (output + tile_n - 1) // tile_n
 
     @T.prim_func
     def main(
-        partials: T.Tensor((rows, (output + tile_n - 1) // tile_n, splits, tile_n), "float32"),
+        partials: T.Tensor((rows, blocks, splits, tile_n), "float32"),
         out: T.Tensor((rows, output), "float32"),
     ):
-        with T.Kernel(T.ceildiv(rows * tiles, 2), is_npu=True) as (cid, vid):
-            p = T.alloc_ub((splits, 32), "float32")
-            total = T.alloc_ub((1, 32), "float32")
-            index = cid * 2 + vid
-            tile, row = index % tiles, index // tiles
-            if row < rows:
-                column = tile % groups * 32
-                T.copy(partials[row, tile // groups, :, column : column + 32], p)
-                T.reduce_sum(p, total, dim=0)
-                T.copy(total[0, :], out[row, tile * 32 : (tile + 1) * 32])
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            p = T.alloc_ub((splits, tile_n), "float32")
+            total = T.alloc_ub((1, tile_n), "float32")
+            aiv = cid * 2 + vid
+            items = rows * blocks
+            if aiv < items:
+                for step in T.serial(T.ceildiv(items - aiv, 40)):
+                    index = aiv + step * 40
+                    block, row = index % blocks, index // blocks
+                    valid = T.min(tile_n, output - block * tile_n)
+                    T.copy(partials[row, block, :, :], p)
+                    T.reduce_sum(p, total, dim=0)
+                    T.copy(total[0, :valid], out[row, block * tile_n : block * tile_n + valid])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main

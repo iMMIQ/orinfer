@@ -1010,6 +1010,9 @@ impl Layout {
         self.enable_bucketing();
         Ok(())
     }
+    pub(super) fn has_work_shape(&self) -> bool {
+        self.work_shape.is_some()
+    }
     /// Retain a proven launch envelope while row/address tables carry real lengths.
     /// Only short decoder lengths may change. Prompt membership and lengths
     /// remain fixed, including their final-window decoder replay roles.
@@ -1495,10 +1498,10 @@ fn work_capacity(count: usize, mode: WorkPad) -> usize {
     match mode {
         WorkPad::Exact => count.max(1).div_ceil(2) * 2,
         WorkPad::Padded => count.max(2).next_power_of_two().min(8192),
-        // Bucketed packets use a 256-item (128-pair) floor so 1..=4 active
+        // Bucketed packets use a 512-item (256-pair) floor so 1..=8 active
         // owners per rank partition share one canonical Trunk/Tail ACL Graph;
         // unused lanes hold the [-1, 0] sentinel and return immediately.
-        WorkPad::Bucketed => count.max(256).next_power_of_two().min(8192),
+        WorkPad::Bucketed => count.max(512).next_power_of_two().min(8192),
     }
 }
 fn work_blocks(tokens: usize, grid: &RowExpression, range: Option<&WorkRange>) -> Result<usize> {
@@ -2643,7 +2646,7 @@ impl Worker {
                     visual_rows: &visual_rows,
                     device: device_input,
                     first: readout.first_input.as_deref(),
-                    next: readout.next_input.as_deref(),
+                    next: &readout.next_inputs,
                 },
                 !layout.outputs.is_empty(),
                 retained,

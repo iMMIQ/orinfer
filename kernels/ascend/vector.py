@@ -133,21 +133,25 @@ def quantize(rows, width, fp16_query_scale=False, tile_rows=1):
         out: T.Tensor((rows, width), "int8"),
         scales: T.Tensor((rows,), scale_dtype),
     ):
-        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             xb = T.alloc_ub((1, width), "bfloat16")
             scale = T.alloc_ub((1, 1), "float32")
             half_scale = T.alloc_ub((1, 1), "float16")
             y = T.alloc_ub((1, width), "int8")
-            row = cid * 2 + vid
-            if row < rows:
-                T.copy(x[row : row + 1, :], xb)
-                quantize_row(xb, y, scale, half_scale)
-                T.copy(y, out[row : row + 1, :])
-                if fp16_query_scale:
-                    T.tile.cast(half_scale, scale, "CAST_RINT", 1)
-                    T.copy(half_scale, scales[row : row + 1])
-                else:
-                    T.copy(scale, scales[row : row + 1])
+            aiv = cid * 2 + vid
+            if aiv < rows:
+                for step in T.serial(T.ceildiv(rows - aiv, 40)):
+                    row = aiv + step * 40
+                    T.copy(x[row : row + 1, :], xb)
+                    quantize_row(xb, y, scale, half_scale)
+                    T.copy(y, out[row : row + 1, :])
+                    if fp16_query_scale:
+                        T.tile.cast(half_scale, scale, "CAST_RINT", 1)
+                        T.copy(half_scale, scales[row : row + 1])
+                    else:
+                        T.copy(scale, scales[row : row + 1])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main.with_attr("orinfer.component_sources", COMPONENT_SOURCES)
 
@@ -702,7 +706,7 @@ def mhc_post_pre(rows, width, tile=256, reuse_residual=False):
         mix: T.Tensor((rows, 8), "float32"),
         collapsed: T.Tensor((rows, width), "bfloat16"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2) * blocks, is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             xb = T.alloc_ub((4, block), "bfloat16")
             lb = T.alloc_ub((16 if reuse_residual else block,), "bfloat16")
             x = T.alloc_ub((4, block), "float32")
@@ -715,54 +719,60 @@ def mhc_post_pre(rows, width, tile=256, reuse_residual=False):
             y = T.alloc_ub((block,), "bfloat16")
             weights = T.alloc_ub((8,), "float32")
             weighted = T.alloc_ub((1, 8) if reuse_residual else (4, block), "float32")
-            row, column = cid // blocks * 2 + vid, cid % blocks * block
-            if row < rows:
-                T.copy(residual[row, :, column : column + block], xb)
-                if reuse_residual:
-                    T.copy(layer[row, column : column + block], y)
-                else:
-                    T.copy(layer[row, column : column + block], lb)
-                T.copy(post[row, :], p)
-                T.copy(mix[row, :], weights)
-                T.copy(combination[row, :], c)
-                T.tile.cast(x, xb, "CAST_NONE", 4 * block)
-                if reuse_residual:
-                    T.tile.cast(l, y, "CAST_NONE", block)
-                else:
-                    T.tile.cast(l, lb, "CAST_NONE", block)
-                for path in T.serial(4):
-                    T.tile.mul(a, x[0, :], c[path])
-                    for source in T.serial(1, 4):
-                        T.tile.mul(temporary, x[source, :], c[source * 4 + path])
-                        T.tile.add(a, a, temporary)
+            aiv = cid * 2 + vid
+            items = rows * blocks
+            if aiv < items:
+                for step in T.serial(T.ceildiv(items - aiv, 40)):
+                    index = aiv + step * 40
+                    row, column = index // blocks, (index % blocks) * block
+                    T.copy(residual[row, :, column : column + block], xb)
                     if reuse_residual:
-                        T.tile.mul(temporary, l, p[path])
-                        T.tile.add(a, temporary, a)
-                        # The input residual is already held in x. Reuse its
-                        # BF16 copy for the rounded post-mix, then reuse x once
-                        # all four paths have consumed the original values.
-                        T.tile.cast(xb[path, :], a, "CAST_RINT", block)
-                        T.copy(xb[path, :], out[row, path, column : column + block])
+                        T.copy(layer[row, column : column + block], y)
                     else:
-                        T.tile.mul(term, l, p[path])
-                        T.tile.add(a, term, a)
-                        T.tile.cast(y, a, "CAST_RINT", block)
-                        T.copy(y, out[row, path, column : column + block])
-                        T.tile.cast(weighted[path, :], y, "CAST_NONE", block)
-                        T.tile.mul(weighted[path, :], weighted[path, :], weights[path])
-                if reuse_residual:
+                        T.copy(layer[row, column : column + block], lb)
+                    T.copy(post[row, :], p)
+                    T.copy(mix[row, :], weights)
+                    T.copy(combination[row, :], c)
                     T.tile.cast(x, xb, "CAST_NONE", 4 * block)
+                    if reuse_residual:
+                        T.tile.cast(l, y, "CAST_NONE", block)
+                    else:
+                        T.tile.cast(l, lb, "CAST_NONE", block)
                     for path in T.serial(4):
-                        T.tile.mul(x[path, :], x[path, :], weights[path])
-                    T.tile.add(a, x[0, :], x[1, :])
-                    T.tile.add(a, a, x[2, :])
-                    T.tile.add(a, a, x[3, :])
-                else:
-                    T.tile.add(a, weighted[0, :], weighted[1, :])
-                    T.tile.add(a, a, weighted[2, :])
-                    T.tile.add(a, a, weighted[3, :])
-                T.tile.cast(y, a, "CAST_RINT", block)
-                T.copy(y, collapsed[row, column : column + block])
+                        T.tile.mul(a, x[0, :], c[path])
+                        for source in T.serial(1, 4):
+                            T.tile.mul(temporary, x[source, :], c[source * 4 + path])
+                            T.tile.add(a, a, temporary)
+                        if reuse_residual:
+                            T.tile.mul(temporary, l, p[path])
+                            T.tile.add(a, temporary, a)
+                            # The input residual is already held in x. Reuse its
+                            # BF16 copy for the rounded post-mix, then reuse x once
+                            # all four paths have consumed the original values.
+                            T.tile.cast(xb[path, :], a, "CAST_RINT", block)
+                            T.copy(xb[path, :], out[row, path, column : column + block])
+                        else:
+                            T.tile.mul(term, l, p[path])
+                            T.tile.add(a, term, a)
+                            T.tile.cast(y, a, "CAST_RINT", block)
+                            T.copy(y, out[row, path, column : column + block])
+                            T.tile.cast(weighted[path, :], y, "CAST_NONE", block)
+                            T.tile.mul(weighted[path, :], weighted[path, :], weights[path])
+                    if reuse_residual:
+                        T.tile.cast(x, xb, "CAST_NONE", 4 * block)
+                        for path in T.serial(4):
+                            T.tile.mul(x[path, :], x[path, :], weights[path])
+                        T.tile.add(a, x[0, :], x[1, :])
+                        T.tile.add(a, a, x[2, :])
+                        T.tile.add(a, a, x[3, :])
+                    else:
+                        T.tile.add(a, weighted[0, :], weighted[1, :])
+                        T.tile.add(a, a, weighted[2, :])
+                        T.tile.add(a, a, weighted[3, :])
+                    T.tile.cast(y, a, "CAST_RINT", block)
+                    T.copy(y, collapsed[row, column : column + block])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main
 

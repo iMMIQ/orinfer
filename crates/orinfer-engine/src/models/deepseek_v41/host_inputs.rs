@@ -120,11 +120,42 @@ impl Window {
     pub fn start(&self) {
         self.prepared.start(&self.active);
     }
+    pub fn start_all(windows: &[Arc<Self>]) {
+        let Some(first) = windows.first() else {
+            return;
+        };
+        if windows.len() == 1 {
+            first.start();
+            return;
+        }
+        if rayon::current_num_threads() < 2
+            || first
+                .active
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return;
+        }
+        let batch = windows.to_vec();
+        let active = Arc::clone(&first.active);
+        rayon::spawn(move || {
+            for window in batch {
+                let _ = window.prepared.get();
+            }
+            active.store(false, std::sync::atomic::Ordering::Release);
+        });
+    }
     #[cfg(test)]
     pub fn is_ready(&self) -> bool {
         self.prepared.is_ready()
     }
 }
+#[derive(Clone)]
 pub(super) struct Hint {
     pub window: Arc<Window>,
     pub destination: Range<usize>,
@@ -132,27 +163,72 @@ pub(super) struct Hint {
 }
 pub(super) struct First {
     pub layer: usize,
-    hint: Option<Hint>,
+    hints: Arc<Vec<Hint>>,
     pub prepared: Prepared<Rows>,
-    extras: BTreeMap<usize, Prepared<Rows>>,
+    extras: BTreeMap<usize, (Arc<Prepared<Rows>>, AtomicBool)>,
 }
 impl First {
-    pub fn new(layers: &[usize], hint: Option<Hint>) -> Arc<Self> {
+    pub fn new(layers: &[usize], hints: Vec<Hint>) -> Arc<Self> {
         let primary = layers.first().copied().unwrap_or(0);
         let extras = layers
             .iter()
             .skip(1)
-            .map(|&layer| (layer, Prepared::deferred()))
+            .map(|&layer| {
+                (
+                    layer,
+                    (Arc::new(Prepared::deferred()), AtomicBool::new(false)),
+                )
+            })
             .collect();
         Arc::new(Self {
             layer: primary,
-            hint,
+            hints: Arc::new(hints),
             prepared: Prepared::deferred(),
             extras,
         })
     }
     pub fn handles_layer(&self, layer: usize) -> bool {
         layer == self.layer || self.extras.contains_key(&layer)
+    }
+    /// Launch background gather for a later Engram layer (e.g. layer 14) once per
+    /// forward so it overlaps with layers 0..13 running on the NPU.
+    pub fn prefetch_extra(
+        &self,
+        layer: usize,
+        tables: Arc<BTreeMap<usize, SharedInt8Rows>>,
+        ids: impl FnOnce() -> Result<Vec<u64>>,
+        valid: &[bool],
+    ) {
+        if rayon::current_num_threads() < 2 {
+            return;
+        }
+        let Some((slot, started)) = self.extras.get(&layer) else {
+            return;
+        };
+        if slot.is_ready()
+            || started
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return;
+        }
+        let Ok(ids) = ids() else {
+            return;
+        };
+        let slot = Arc::clone(slot);
+        let hints = Arc::clone(&self.hints);
+        let valid = valid.to_vec();
+        rayon::spawn(move || {
+            let _ = slot.get_or(|| {
+                let store = tables.get(&layer).ok_or("Engram table missing")?;
+                assemble(layer, store, &ids, &valid, &hints)
+            });
+        });
     }
     pub fn get(
         &self,
@@ -161,14 +237,15 @@ impl First {
         ids: impl FnOnce() -> Result<Vec<u64>>,
         valid: &[bool],
     ) -> Result<&Rows> {
-        let slot = if layer == self.layer {
+        let slot: &Prepared<Rows> = if layer == self.layer {
             &self.prepared
         } else {
             self.extras
                 .get(&layer)
+                .map(|(p, _)| p.as_ref())
                 .ok_or("Engram layer not prepared in host inputs")?
         };
-        slot.get_or(|| assemble(layer, store, &ids()?, valid, self.hint.as_ref()))
+        slot.get_or(|| assemble(layer, store, &ids()?, valid, &self.hints))
     }
 }
 fn layer_ids_for(hasher: &Hasher, layer_index: usize, hashes: &[i64], valid: &[bool]) -> Vec<u64> {
@@ -193,15 +270,20 @@ fn assemble(
     store: &SharedInt8Rows,
     ids: &[u64],
     valid: &[bool],
-    hint: Option<&Hint>,
+    hints: &[Hint],
 ) -> Result<Rows> {
-    let mut reused = None;
+    let mut matched: Vec<(Range<usize>, Range<usize>, Arc<Payload>)> = vec![];
     let mut wait_s = 0.;
-    if let Some(hint) = hint {
+    let mut candidates: Vec<&Hint> = hints.iter().collect();
+    candidates.sort_by_key(|h| h.destination.start);
+    let mut cursor = 0usize;
+    for hint in candidates {
         let d = hint.destination.clone();
         let s = hint.source.clone();
-        // Reject changed row identities or media before waiting on a forecast.
-        if d.len() == s.len()
+        // Reject overlapping, out-of-range, or changed row identities/media before waiting.
+        if d.start >= cursor
+            && d.len() == s.len()
+            && !d.is_empty()
             && d.end <= valid.len()
             && s.end <= hint.window.rows
             && hint.window.layer_ids.get(&layer).is_some_and(|w_ids| {
@@ -213,47 +295,59 @@ fn assemble(
             if let Ok(data) = hint.window.prepared.get()
                 && let Some(payload) = data.get(&layer)
             {
-                reused = Some((d, s, Arc::clone(payload)));
+                cursor = d.end;
+                matched.push((d, s, Arc::clone(payload)));
             }
-            wait_s = started.elapsed().as_secs_f64();
+            wait_s += started.elapsed().as_secs_f64();
         }
     }
     let mut parts = vec![];
-    let reused_rows = reused.as_ref().map_or(0, |(d, _, _)| d.len());
-    if let Some((d, s, data)) = reused {
-        let mut needed = Vec::with_capacity(ids.len() - d.len() * LANES);
-        needed.extend_from_slice(&ids[..d.start * LANES]);
-        needed.extend_from_slice(&ids[d.end * LANES..]);
-        if !needed.is_empty() {
-            let mut masks = valid[..d.start].to_vec();
-            masks.extend_from_slice(&valid[d.end..]);
-            let fallback = read(store, &needed, &masks)?;
-            if d.start > 0 {
-                parts.push(Part {
-                    destination: 0,
-                    source: 0..d.start,
-                    data: Arc::clone(&fallback),
-                });
-            }
-            if d.end < valid.len() {
-                parts.push(Part {
-                    destination: d.end,
-                    source: d.start..masks.len(),
-                    data: fallback,
-                });
-            }
-        }
-        parts.push(Part {
-            destination: d.start,
-            source: s,
-            data,
-        });
-    } else {
+    let reused_rows: usize = matched.iter().map(|(d, _, _)| d.len()).sum();
+    if matched.is_empty() {
         parts.push(Part {
             destination: 0,
             source: 0..valid.len(),
             data: read(store, ids, valid)?,
         });
+    } else {
+        let mut gaps: Vec<Range<usize>> = vec![];
+        let mut pos = 0usize;
+        for (d, _, _) in &matched {
+            if pos < d.start {
+                gaps.push(pos..d.start);
+            }
+            pos = d.end;
+        }
+        if pos < valid.len() {
+            gaps.push(pos..valid.len());
+        }
+        let gap_rows: usize = gaps.iter().map(|g| g.len()).sum();
+        if gap_rows > 0 {
+            let mut needed = Vec::with_capacity(gap_rows * LANES);
+            let mut masks = Vec::with_capacity(gap_rows);
+            for g in &gaps {
+                needed.extend_from_slice(&ids[g.start * LANES..g.end * LANES]);
+                masks.extend_from_slice(&valid[g.clone()]);
+            }
+            let fallback = read(store, &needed, &masks)?;
+            let mut src_pos = 0usize;
+            for g in gaps {
+                let len = g.len();
+                parts.push(Part {
+                    destination: g.start,
+                    source: src_pos..src_pos + len,
+                    data: Arc::clone(&fallback),
+                });
+                src_pos += len;
+            }
+        }
+        for (d, s, data) in matched {
+            parts.push(Part {
+                destination: d.start,
+                source: s,
+                data,
+            });
+        }
     }
     Ok(Rows {
         parts,
@@ -263,10 +357,10 @@ fn assemble(
     })
 }
 impl Team {
-    pub fn first_input(&self, hint: Option<Hint>) -> Option<Arc<First>> {
+    pub fn first_input(&self, hints: Vec<Hint>) -> Option<Arc<First>> {
         self.host_hasher.as_ref().map(|hasher| {
             let layers: Vec<usize> = hasher.layout().layers.iter().map(|l| l.layer).collect();
-            First::new(&layers, hint)
+            First::new(&layers, hints)
         })
     }
     pub fn forecast_input(
@@ -426,11 +520,11 @@ mod tests {
         ids14.extend(query(&hasher, 1, &[10, 11], &[7]).0);
         let first = First::new(
             &[1, 14],
-            Some(Hint {
+            vec![Hint {
                 window,
                 destination: 1..3,
                 source: 1..3,
-            }),
+            }],
         );
         let calls = AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -484,11 +578,11 @@ mod tests {
             }
             let first = First::new(
                 &[1, 14],
-                Some(Hint {
+                vec![Hint {
                     window: window.clone(),
                     destination: 0..2,
                     source: 0..2,
-                }),
+                }],
             );
             let rows = first.get(1, store, || Ok(ids.clone()), &valid).unwrap();
             check(rows, &ids, &valid);
@@ -515,16 +609,16 @@ mod tests {
         let (ids, valid) = query(&hasher, 0, &[], &[4]);
         let first = First::new(
             &[1, 14],
-            Some(Hint {
+            vec![Hint {
                 window,
                 destination: 0..1,
                 source: 0..1,
-            }),
+            }],
         );
         let rows = first.get(1, store, || Ok(ids.clone()), &valid).unwrap();
         check(rows, &ids, &valid);
         assert_eq!(rows.reused_rows, 0);
-        let bad = First::new(&[1, 14], None);
+        let bad = First::new(&[1, 14], vec![]);
         assert!(bad.get(1, store, || Ok(vec![49; LANES]), &[true]).is_err());
         assert!(
             bad.get(

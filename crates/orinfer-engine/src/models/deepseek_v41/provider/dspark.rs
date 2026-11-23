@@ -128,9 +128,20 @@ impl Runtime {
             capacity,
         };
         let ceiling_s = options.prefill_budget_ms / 1000.;
-        let mut budgets = BTreeMap::<Vec<usize>, usize>::new();
+        let mut budgets = BTreeMap::<(usize, u64), usize>::new();
+        let mut retained_cache = BTreeMap::<Vec<usize>, Layout>::new();
         let mut verification_budget = |rows: &[usize]| {
-            *budgets.entry(rows.to_vec()).or_insert_with(|| {
+            let mut sum = 0usize;
+            let mut mask = 0u64;
+            for (idx, &n) in rows.iter().enumerate() {
+                if n > 0 {
+                    sum += n;
+                    if idx < 64 {
+                        mask |= 1u64 << idx;
+                    }
+                }
+            }
+            *budgets.entry((sum, mask)).or_insert_with(|| {
                 baseline.verification_budget(requests, rows, keep, &prefill_estimator, ceiling_s)
             })
         };
@@ -180,19 +191,24 @@ impl Runtime {
                         capacity,
                         owners,
                     )?;
-                    for (&i, &depth) in indices.iter().zip(reference) {
-                        decode_rows[i] = depth + 1;
-                    }
-                    let retained = baseline.forecast_layout(
-                        requests,
-                        &decode_rows,
-                        verification_budget(&decode_rows),
-                        keep,
-                        capacity,
-                        owners,
-                    )?;
+                    let retained = if let Some(cached) = retained_cache.get(reference) {
+                        cached
+                    } else {
+                        for (&i, &depth) in indices.iter().zip(reference) {
+                            decode_rows[i] = depth + 1;
+                        }
+                        let built = baseline.forecast_layout(
+                            requests,
+                            &decode_rows,
+                            verification_budget(&decode_rows),
+                            keep,
+                            capacity,
+                            owners,
+                        )?;
+                        retained_cache.entry(reference.to_vec()).or_insert(built)
+                    };
                     if !target.bound_work(
-                        &retained,
+                        retained,
                         self.team.model.batch.as_ref().unwrap(),
                         &self.team.work_launches,
                     )? {
@@ -302,24 +318,7 @@ impl Runtime {
             Layout::verification(segments, owners * block, owners)?
         };
         draft.role = super::super::PacketRole::Draft;
-        let draft_prepared =
-            self.begin_forward_with_workspace(&draft, "Insufficient DSpark graph workspace")?;
         let depths = selected.iter().copied().collect::<BTreeMap<_, _>>();
-        // Only these owners execute the draft graph. A final prefill window
-        // or a non-speculating tail cannot shorten its reuse forecast.
-        let draft_owners = selected
-            .iter()
-            .copied()
-            .filter(|&(_, depth)| depth > 0)
-            .collect::<Vec<_>>();
-        let (uses, _) =
-            self.capture_context(&draft_owners, requests, Some(&depths), block, options);
-        // Draft preparation still delays every decoder in the packet.
-        let (_, slack) =
-            self.capture_context(&baseline.selected, requests, Some(&depths), block, options);
-        let capture = self
-            .speculation_policy
-            .draft_budget(block, draft_owners.len(), uses, slack);
         let mut readout = if self
             .team
             .model
@@ -338,14 +337,36 @@ impl Runtime {
                 draw.seed ^= crate::mtp::DRAFT_STREAM;
             }
         }
-        let (proposals, draft_timing) = self.team.finish_forward(
-            draft_prepared,
-            draft,
-            inputs,
-            readout,
-            Some(capture),
-            maintenance,
-        )?;
+        let (proposals, draft_timing) = if self.team.is_resident(&draft) {
+            self.team
+                .fast_forward(draft, inputs, readout, maintenance)?
+        } else {
+            let draft_prepared =
+                self.begin_forward_with_workspace(&draft, "Insufficient DSpark graph workspace")?;
+            // Only these owners execute the draft graph. A final prefill window
+            // or a non-speculating tail cannot shorten its reuse forecast.
+            let draft_owners = selected
+                .iter()
+                .copied()
+                .filter(|&(_, depth)| depth > 0)
+                .collect::<Vec<_>>();
+            let (uses, _) =
+                self.capture_context(&draft_owners, requests, Some(&depths), block, options);
+            // Draft preparation still delays every decoder in the packet.
+            let (_, slack) =
+                self.capture_context(&baseline.selected, requests, Some(&depths), block, options);
+            let capture =
+                self.speculation_policy
+                    .draft_budget(block, draft_owners.len(), uses, slack);
+            self.team.finish_forward(
+                draft_prepared,
+                draft,
+                inputs,
+                readout,
+                Some(capture),
+                maintenance,
+            )?
+        };
         draft_timing.record(&mut self.statistics.batch_execution);
         let draft_s = draft_timing.seconds;
         let draft_prepare = draft_timing.preparation;
@@ -401,18 +422,11 @@ impl Runtime {
             prefill_requests,
             ..
         } = verification;
-        let started = Instant::now();
-        let Some(verify_prepared) = self.begin_verification_forward_with_workspace(
-            &layout,
-            journal,
-            "Insufficient DSpark verification workspace",
-        )?
-        else {
-            // Journal memory could not be reserved even after prefix/program
-            // reclamation; fall back cleanly to ordinary target decode.
-            return self.advance_selection(baseline, requests, options, false, || {});
-        };
-        let save_s = started.elapsed().as_secs_f64();
+        // Dispatch GrowCachedAndBeginVerification to all 8 ranks first so CPU
+        // readout/rejection/Engram-forecast preparation overlaps the 8-rank IPC.
+        let started = self
+            .team
+            .send_verification_forward(&layout, journal.clone())?;
         let mut verified_work = packet::work(&packet_requests, requests, prefill_rows);
         if prefill_rows == 0 && layout.rows.total > verified_work.rows {
             verified_work.rows = layout.rows.total;
@@ -437,52 +451,75 @@ impl Runtime {
             .zip(&draft_tokens)
             .map(|(&(i, _), tokens)| (i, tokens.clone()))
             .collect();
-        let mut readout = packet::target_readout(
+        let readout_result = packet::target_readout(
             requests,
             full || packet_full,
             &proposal_map,
             self.vocab(),
             &packet_requests,
-        )?;
-        if rejection {
-            readout.sampling_steps(&rejection_steps);
-            let stride = self
-                .team
-                .model
-                .sampling
-                .as_ref()
-                .unwrap()
-                .rejection
-                .as_ref()
-                .unwrap()
-                .stride;
-            for (&(i, count), tokens) in selected.iter().zip(&draft_tokens) {
-                if count == 0 {
-                    continue;
+        );
+        let readout_result = readout_result.map(|mut readout| {
+            if rejection {
+                readout.sampling_steps(&rejection_steps);
+                let stride = self
+                    .team
+                    .model
+                    .sampling
+                    .as_ref()
+                    .unwrap()
+                    .rejection
+                    .as_ref()
+                    .unwrap()
+                    .stride;
+                for (&(i, count), tokens) in selected.iter().zip(&draft_tokens) {
+                    if count == 0 {
+                        continue;
+                    }
+                    let request = &requests[i];
+                    readout.rejection.insert(
+                        request.slot,
+                        tokens
+                            .iter()
+                            .enumerate()
+                            .map(|(position, &token)| {
+                                crate::backend::ascend::sampling::RejectionProposal {
+                                    row: request.slot * stride + position,
+                                    token,
+                                    log_uniform: crate::sampling::counter_uniform(
+                                        request.sampling.seed,
+                                        crate::mtp::ACCEPT_STREAM,
+                                        (rejection_steps[&request.slot] + position) as u64,
+                                    )
+                                    .ln() as f32,
+                                }
+                            })
+                            .collect(),
+                    );
                 }
-                let request = &requests[i];
-                readout.rejection.insert(
-                    request.slot,
-                    tokens
-                        .iter()
-                        .enumerate()
-                        .map(|(position, &token)| {
-                            crate::backend::ascend::sampling::RejectionProposal {
-                                row: request.slot * stride + position,
-                                token,
-                                log_uniform: crate::sampling::counter_uniform(
-                                    request.sampling.seed,
-                                    crate::mtp::ACCEPT_STREAM,
-                                    (rejection_steps[&request.slot] + position) as u64,
-                                )
-                                .ln() as f32,
-                            }
-                        })
-                        .collect(),
-                );
             }
-        }
-        self.prepare_host_inputs(&layout, &packet_requests, requests, &mut readout);
+            self.prepare_host_inputs(&layout, &packet_requests, requests, &mut readout);
+            readout
+        });
+        let (first_prepared, first_journal_ready) =
+            self.team.collect_verification_forward(&layout, started)?;
+        let readout = readout_result?;
+        let need_workspace = !first_prepared.all_graphs() && !first_prepared.workspace_fits;
+        let verify_prepared = if !need_workspace && first_journal_ready {
+            first_prepared
+        } else {
+            let Some(retried) = self.begin_verification_forward_with_workspace(
+                &layout,
+                journal,
+                "Insufficient DSpark verification workspace",
+            )?
+            else {
+                // Journal memory could not be reserved even after prefix/program
+                // reclamation; fall back cleanly to ordinary target decode.
+                return self.advance_selection(baseline, requests, options, false, || {});
+            };
+            retried
+        };
+        let save_s = started.elapsed().as_secs_f64();
         let (verified, verify_timing) = self.team.finish_forward(
             verify_prepared,
             layout,

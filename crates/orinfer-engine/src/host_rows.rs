@@ -543,60 +543,190 @@ impl Int8Rows {
     /// INT8 values and FP32 scales, bypassing HashMap dedup and intermediate staging.
     fn gather_split_resident(&self, ids: &[u64], max_bytes: usize) -> Result<(Vec<u8>, Vec<u8>)> {
         use rayon::prelude::*;
+        use std::mem::MaybeUninit;
         ids.len()
             .checked_mul(self.row_bytes)
             .filter(|&n| n <= max_bytes)
             .ok_or("Host-row staging budget exceeded")?;
+        let (val_width, scale_width) = self.split_widths();
+        let val_bytes = ids.len() * val_width;
+        let scale_bytes = ids.len() * scale_width;
+        if ids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
         for &row in ids {
             self.shard.local(row)?;
         }
-        let (val_width, scale_width) = self.split_widths();
-        let mut values = vec![0u8; ids.len() * val_width];
-        let mut scales = vec![0u8; ids.len() * scale_width];
-        if ids.is_empty() {
-            return Ok((values, scales));
+        #[cfg(target_arch = "aarch64")]
+        #[inline(always)]
+        unsafe fn prefetch_read(ptr: *const u8) {
+            // SAFETY: PRFM is a non-faulting architectural prefetch hint.
+            unsafe {
+                core::arch::asm!(
+                    "prfm pldl1keep, [{ptr}]",
+                    ptr = in(reg) ptr,
+                    options(readonly, nostack, preserves_flags),
+                );
+            }
         }
-        let fill_chunk =
-            |chunk_ids: &[u64], val_out: &mut [u8], scale_out: &mut [u8]| -> Result<()> {
-                match &self.storage {
-                    RowStorage::Records(records) => {
-                        for ((&row, v_dst), s_dst) in chunk_ids
-                            .iter()
-                            .zip(val_out.chunks_exact_mut(val_width))
-                            .zip(scale_out.chunks_exact_mut(scale_width))
+        #[cfg(not(target_arch = "aarch64"))]
+        #[inline(always)]
+        unsafe fn prefetch_read(_ptr: *const u8) {}
+
+        let mut values = Vec::<u8>::with_capacity(val_bytes);
+        let mut scales = Vec::<u8>::with_capacity(scale_bytes);
+        let val_spare = &mut values.spare_capacity_mut()[..val_bytes];
+        let scale_spare = &mut scales.spare_capacity_mut()[..scale_bytes];
+        const PREFETCH_DIST: usize = 8;
+
+        let fill_chunk = |chunk_ids: &[u64],
+                          val_out: &mut [MaybeUninit<u8>],
+                          scale_out: &mut [MaybeUninit<u8>]|
+         -> Result<()> {
+            match &self.storage {
+                RowStorage::Records(records) => {
+                    let (first, data) = records
+                        .resident
+                        .as_ref()
+                        .ok_or("Host-row plane is not resident")?;
+                    let row_bytes = records.row_bytes;
+                    let base_ptr = data.as_ptr();
+                    let data_len = data.len();
+                    for (idx, ((&row, v_dst), s_dst)) in chunk_ids
+                        .iter()
+                        .zip(val_out.chunks_exact_mut(val_width))
+                        .zip(scale_out.chunks_exact_mut(scale_width))
+                        .enumerate()
+                    {
+                        if let Some(&next_row) = chunk_ids.get(idx + PREFETCH_DIST)
+                            && let Ok(nr) = usize::try_from(next_row)
+                            && let Some(nb) = nr
+                                .checked_sub(*first)
+                                .and_then(|v| v.checked_mul(row_bytes))
+                            && nb + row_bytes <= data_len
                         {
-                            let src = records.resident_slice(
-                                usize::try_from(row).map_err(|_| "Host row offset overflow")?,
-                            )?;
-                            v_dst.copy_from_slice(&src[..val_width]);
-                            s_dst.copy_from_slice(&src[val_width..]);
+                            // SAFETY: nb + row_bytes <= data_len bounds the prefetch addresses.
+                            unsafe {
+                                let p = base_ptr.add(nb);
+                                prefetch_read(p);
+                                if row_bytes > 64 {
+                                    prefetch_read(p.add(64));
+                                }
+                                if row_bytes > 128 {
+                                    prefetch_read(p.add(128));
+                                }
+                                if row_bytes > 192 {
+                                    prefetch_read(p.add(192));
+                                }
+                                if row_bytes > 256 {
+                                    prefetch_read(p.add(256));
+                                }
+                            }
                         }
-                    }
-                    RowStorage::Split(weight, scale) => {
-                        for ((&row, v_dst), s_dst) in chunk_ids
-                            .iter()
-                            .zip(val_out.chunks_exact_mut(val_width))
-                            .zip(scale_out.chunks_exact_mut(scale_width))
-                        {
-                            let idx =
-                                usize::try_from(row).map_err(|_| "Host row offset overflow")?;
-                            v_dst.copy_from_slice(weight.resident_slice(idx)?);
-                            s_dst.copy_from_slice(scale.resident_slice(idx)?);
+                        let src = records.resident_slice(
+                            usize::try_from(row).map_err(|_| "Host row offset overflow")?,
+                        )?;
+                        // SAFETY: src has length val_width + scale_width; destinations are exact chunks.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                src.as_ptr(),
+                                v_dst.as_mut_ptr().cast::<u8>(),
+                                val_width,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                src.as_ptr().add(val_width),
+                                s_dst.as_mut_ptr().cast::<u8>(),
+                                scale_width,
+                            );
                         }
                     }
                 }
-                Ok(())
-            };
-        if ids.len() < 1024 {
-            fill_chunk(ids, &mut values, &mut scales)?;
+                RowStorage::Split(weight, scale) => {
+                    let (w_first, w_data) = weight
+                        .resident
+                        .as_ref()
+                        .ok_or("Host-row plane is not resident")?;
+                    let (s_first, s_data) = scale
+                        .resident
+                        .as_ref()
+                        .ok_or("Host-row plane is not resident")?;
+                    for (idx, ((&row, v_dst), s_dst)) in chunk_ids
+                        .iter()
+                        .zip(val_out.chunks_exact_mut(val_width))
+                        .zip(scale_out.chunks_exact_mut(scale_width))
+                        .enumerate()
+                    {
+                        if let Some(&next_row) = chunk_ids.get(idx + PREFETCH_DIST)
+                            && let Ok(nr) = usize::try_from(next_row)
+                        {
+                            if let Some(wb) = nr
+                                .checked_sub(*w_first)
+                                .and_then(|v| v.checked_mul(val_width))
+                                && wb + val_width <= w_data.len()
+                            {
+                                // SAFETY: wb + val_width <= w_data.len().
+                                unsafe {
+                                    let p = w_data.as_ptr().add(wb);
+                                    prefetch_read(p);
+                                    if val_width > 64 {
+                                        prefetch_read(p.add(64));
+                                    }
+                                    if val_width > 128 {
+                                        prefetch_read(p.add(128));
+                                    }
+                                    if val_width > 192 {
+                                        prefetch_read(p.add(192));
+                                    }
+                                }
+                            }
+                            if let Some(sb) = nr
+                                .checked_sub(*s_first)
+                                .and_then(|v| v.checked_mul(scale_width))
+                                && sb + scale_width <= s_data.len()
+                            {
+                                // SAFETY: sb + scale_width <= s_data.len().
+                                unsafe {
+                                    prefetch_read(s_data.as_ptr().add(sb));
+                                }
+                            }
+                        }
+                        let r = usize::try_from(row).map_err(|_| "Host row offset overflow")?;
+                        let w_src = weight.resident_slice(r)?;
+                        let s_src = scale.resident_slice(r)?;
+                        // SAFETY: w_src/s_src lengths match val_width/scale_width.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                w_src.as_ptr(),
+                                v_dst.as_mut_ptr().cast::<u8>(),
+                                val_width,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                s_src.as_ptr(),
+                                s_dst.as_mut_ptr().cast::<u8>(),
+                                scale_width,
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
+        if ids.len() < 384 {
+            fill_chunk(ids, val_spare, scale_spare)?;
         } else {
             // Bound parallelism to <=16 contiguous stripes to avoid waking all
             // host cores across NUMA nodes on a few megabytes of RAM copies.
-            let stripe = (ids.len() / 16).max(256);
+            let stripe = (ids.len() / 8).clamp(128, 2048);
             ids.par_chunks(stripe)
-                .zip(values.par_chunks_mut(stripe * val_width))
-                .zip(scales.par_chunks_mut(stripe * scale_width))
+                .zip(val_spare.par_chunks_mut(stripe * val_width))
+                .zip(scale_spare.par_chunks_mut(stripe * scale_width))
                 .try_for_each(|((chunk_ids, v_out), s_out)| fill_chunk(chunk_ids, v_out, s_out))?;
+        }
+        // SAFETY: Every byte of val_spare[..val_bytes] and scale_spare[..scale_bytes]
+        // was initialized by copy_nonoverlapping above without error.
+        unsafe {
+            values.set_len(val_bytes);
+            scales.set_len(scale_bytes);
         }
         Ok((values, scales))
     }
