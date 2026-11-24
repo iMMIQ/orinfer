@@ -12,7 +12,7 @@ mod prepared;
 mod reporting;
 pub use constrained::{Constraint, Decoder, TokenLogprob, verify};
 pub(crate) use constrained::{RowParameters, verify_validated};
-pub(crate) use prepared::Prepared;
+pub(crate) use prepared::{BackgroundLane, Prepared, prepare_lane};
 
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);

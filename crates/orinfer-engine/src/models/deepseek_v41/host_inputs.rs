@@ -1,13 +1,35 @@
 //! Immutable multi-layer Engram inputs shared by one packet and one bounded forecast.
 use super::{SharedTables, team::Team};
-use crate::{artifact::Result, host_rows::SharedInt8Rows, sampling::Prepared};
+use crate::{
+    artifact::Result,
+    host_rows::SharedInt8Rows,
+    sampling::{BackgroundLane, Prepared, prepare_lane},
+};
 use orinfer_model_sdk::conditional_memory::Hasher;
 use std::{
     collections::BTreeMap,
     ops::Range,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
+
+static EXTRA_PREFETCH_LANE: OnceLock<Option<BackgroundLane>> = OnceLock::new();
+
+fn extra_prefetch_lane() -> Option<&'static BackgroundLane> {
+    EXTRA_PREFETCH_LANE
+        .get_or_init(|| BackgroundLane::spawn("orinfer-engram-prefetch", 16).ok())
+        .as_ref()
+}
+
+struct ResetActive(Arc<AtomicBool>);
+impl Drop for ResetActive {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 const LANES: usize = 24;
 const VALUES: usize = 256;
@@ -141,14 +163,20 @@ impl Window {
         {
             return;
         }
+        let Some(lane) = prepare_lane() else {
+            first.active.store(false, Ordering::Release);
+            return;
+        };
         let batch = windows.to_vec();
         let active = Arc::clone(&first.active);
-        rayon::spawn(move || {
+        if !lane.try_submit(move || {
+            let _reset = ResetActive(active);
             for window in batch {
                 let _ = window.prepared.get();
             }
-            active.store(false, std::sync::atomic::Ordering::Release);
-        });
+        }) {
+            first.active.store(false, Ordering::Release);
+        }
     }
     #[cfg(test)]
     pub fn is_ready(&self) -> bool {
@@ -220,10 +248,13 @@ impl First {
         let Ok(ids) = ids() else {
             return;
         };
+        let Some(lane) = extra_prefetch_lane() else {
+            return;
+        };
         let slot = Arc::clone(slot);
         let hints = Arc::clone(&self.hints);
         let valid = valid.to_vec();
-        rayon::spawn(move || {
+        let _ = lane.try_submit(move || {
             let _ = slot.get_or(|| {
                 let store = tables.get(&layer).ok_or("Engram table missing")?;
                 assemble(layer, store, &ids, &valid, &hints)
@@ -395,12 +426,12 @@ mod tests {
     use crate::host_rows::{Int8Rows, Shard};
     use orinfer_model_sdk::conditional_memory::{HashLayer, HashLayout};
     use safetensors::tensor::{TensorView, serialize};
-    use std::{
-        collections::BTreeMap,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
+    use std::{collections::BTreeMap, sync::atomic::AtomicUsize};
 
     fn assets() -> (Arc<Hasher>, Arc<SharedTables>) {
+        assets_with_residency(false)
+    }
+    fn assets_with_residency(resident: bool) -> (Arc<Hasher>, Arc<SharedTables>) {
         let layout = HashLayout {
             schema_version: 1,
             config_sha256: "0".repeat(64),
@@ -443,8 +474,14 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let store1 = Int8Rows::open(&path, "w", &path, "s", Shard { first: 0, rows: 48 }).unwrap();
-        let store14 = Int8Rows::open(&path, "w", &path, "s", Shard { first: 0, rows: 48 }).unwrap();
+        let mut store1 =
+            Int8Rows::open(&path, "w", &path, "s", Shard { first: 0, rows: 48 }).unwrap();
+        let mut store14 =
+            Int8Rows::open(&path, "w", &path, "s", Shard { first: 0, rows: 48 }).unwrap();
+        if resident {
+            store1 = store1.into_resident(1 << 20).unwrap();
+            store14 = store14.into_resident(1 << 20).unwrap();
+        }
         let tables = Arc::new(SharedTables::new());
         tables
             .set(Ok(Arc::new(BTreeMap::from([
@@ -629,5 +666,76 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn concurrent_window_and_extra_prefetch_never_self_deadlock() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (resident, rounds, tokens_len) in [(true, 128usize, 256usize), (false, 32, 128)] {
+                let (hasher, tables) = assets_with_residency(resident);
+                let map = Arc::clone(tables.get().unwrap().as_ref().unwrap());
+                let store1 = &map[&1];
+                let store14 = &map[&14];
+                let history = vec![1, 2, 3];
+                let tokens: Vec<u32> = (0..tokens_len).map(|i| (i % 14 + 1) as u32).collect();
+                let (ids1, valid) = query(&hasher, 0, &history, &tokens);
+                let (ids14, _) = query(&hasher, 1, &history, &tokens);
+                let active = Arc::new(AtomicBool::new(false));
+                for round in 0..rounds {
+                    let window = Window::new(
+                        Arc::clone(&hasher),
+                        Arc::clone(&tables),
+                        round % 4,
+                        0,
+                        history.clone(),
+                        tokens.clone(),
+                        Arc::clone(&active),
+                    )
+                    .unwrap();
+                    let extra = Window::new(
+                        Arc::clone(&hasher),
+                        Arc::clone(&tables),
+                        (round + 1) % 4,
+                        0,
+                        history.clone(),
+                        tokens.clone(),
+                        Arc::clone(&active),
+                    )
+                    .unwrap();
+                    let first = First::new(
+                        &[1, 14],
+                        vec![Hint {
+                            window: Arc::clone(&window),
+                            destination: 0..tokens_len,
+                            source: 0..tokens_len,
+                        }],
+                    );
+                    if round % 2 == 0 {
+                        window.start();
+                    } else {
+                        Window::start_all(&[Arc::clone(&window), extra]);
+                    }
+                    first.prefetch_extra(14, Arc::clone(&map), || Ok(ids14.clone()), &valid);
+                    std::thread::scope(|scope| {
+                        for _ in 0..4 {
+                            let (first, ids1, ids14, valid) = (&first, &ids1, &ids14, &valid);
+                            scope.spawn(move || {
+                                let r1 = first.get(1, store1, || Ok(ids1.clone()), valid).unwrap();
+                                assert_eq!(r1.reused_rows, tokens_len);
+                                let r14 =
+                                    first.get(14, store14, || Ok(ids14.clone()), valid).unwrap();
+                                assert_eq!(r14.reused_rows, tokens_len);
+                            });
+                        }
+                    });
+                    // Ensure background batch clears active before next round if start_all ran.
+                    let _ = window.prepared.get().unwrap();
+                }
+            }
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("concurrent Window::start/start_all + First::prefetch_extra deadlocked");
     }
 }

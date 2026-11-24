@@ -2,11 +2,53 @@
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::time::Instant;
 
 type Result<T> = std::result::Result<T, String>;
 type Work<T> = Box<dyn FnOnce() -> Result<T> + Send>;
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Dedicated non-Rayon worker lane for asynchronous preparation tasks.
+/// Running outer `OnceLock`/`Mutex` initializers off Rayon prevents work-stealing
+/// inside nested `par_iter`/`par_chunks` from re-entering the same lock on the
+/// same worker thread.
+pub(crate) struct BackgroundLane {
+    sender: mpsc::SyncSender<Job>,
+}
+impl BackgroundLane {
+    pub fn spawn(name: &'static str, capacity: usize) -> Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<Job>(capacity);
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    job();
+                }
+            })
+            .map_err(|e| format!("Failed to spawn {name}: {e}"))?;
+        Ok(Self { sender })
+    }
+    pub fn try_submit(&self, job: impl FnOnce() + Send + 'static) -> bool {
+        self.sender.try_send(Box::new(job)).is_ok()
+    }
+}
+
+static PREPARE_LANE: OnceLock<Option<BackgroundLane>> = OnceLock::new();
+
+pub(crate) fn prepare_lane() -> Option<&'static BackgroundLane> {
+    PREPARE_LANE
+        .get_or_init(|| BackgroundLane::spawn("orinfer-prepare", 16).ok())
+        .as_ref()
+}
+
+struct ResetActive(Arc<AtomicBool>);
+impl Drop for ResetActive {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 pub(crate) struct Prepared<T> {
     value: OnceLock<Result<(T, f64)>>,
     work: Mutex<Option<Work<T>>>,
@@ -77,12 +119,21 @@ impl<T> Prepared<T> {
             active.store(false, Ordering::Release);
             return false;
         }
-        let prepared = Arc::clone(self);
-        let active = Arc::clone(active);
-        rayon::spawn(move || {
-            let _ = prepared.get();
+        let Some(lane) = prepare_lane() else {
+            self.started.store(false, Ordering::Release);
             active.store(false, Ordering::Release);
-        });
+            return false;
+        };
+        let prepared = Arc::clone(self);
+        let active_flag = Arc::clone(active);
+        if !lane.try_submit(move || {
+            let _reset = ResetActive(active_flag);
+            let _ = prepared.get();
+        }) {
+            self.started.store(false, Ordering::Release);
+            active.store(false, Ordering::Release);
+            return false;
+        }
         true
     }
     pub fn seconds(&self) -> f64 {
@@ -164,5 +215,18 @@ mod tests {
             });
             assert_eq!(count.load(Ordering::Relaxed), 1);
         }
+    }
+    #[test]
+    fn eager_start_runs_off_rayon_workers() {
+        let off_rayon = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&off_rayon);
+        let value = Arc::new(Prepared::new(move || {
+            flag.store(rayon::current_thread_index().is_none(), Ordering::Relaxed);
+            Ok(42usize)
+        }));
+        let active = Arc::new(AtomicBool::new(false));
+        assert!(value.start(&active));
+        assert_eq!(*value.get().unwrap(), 42);
+        assert!(off_rayon.load(Ordering::Relaxed));
     }
 }
