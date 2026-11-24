@@ -52,6 +52,7 @@ def candidates(query_heads, kv_heads, reference):
 
 def select(tuner, context, reference):
     import torch
+    from orinfer_build.compiler.cuda.target import cuda_target
     import tilelang
     from kernels.cuda.model.independent_rows import independent_rows
     from orinfer_build.models.qwen35.parallel import factory
@@ -90,7 +91,7 @@ def select(tuner, context, reference):
                         fn,
                         out_idx=[],
                         execution_backend="nvrtc",
-                        target={"kind": "cuda", "arch": "sm_87"},
+                        target=cuda_target(),
                     ),
                     names,
                 )

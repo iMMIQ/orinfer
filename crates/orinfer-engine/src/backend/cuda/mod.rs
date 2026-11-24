@@ -64,7 +64,7 @@ pub(super) fn inspect() -> Result<super::Inventory> {
         check(sys::cuDeviceGetCount(&mut count), "CUDA device count")?;
     }
     let mut compatible = false;
-    if count > 0 && std::env::consts::ARCH == "aarch64" {
+    if count > 0 && matches!(std::env::consts::ARCH, "aarch64" | "x86_64") {
         let (mut device, mut major, mut minor) = (0, 0, 0);
         // SAFETY: Device zero is the current model provider's selected device.
         // These calls only query attributes into live scalar outputs.
@@ -87,7 +87,9 @@ pub(super) fn inspect() -> Result<super::Inventory> {
                 "CUDA discovery SM minor",
             )?;
         }
-        compatible = [major, minor] == [8, 7];
+        let arch = format!("sm_{major}{minor}");
+        compatible = orinfer_model_sdk::device::parse_cuda_sm(&arch).is_some()
+            && (arch != "sm_87" || std::env::consts::ARCH == "aarch64");
     }
     Ok(super::Inventory {
         backend: orinfer_model_sdk::device::Backend::Cuda,
@@ -358,6 +360,11 @@ fn errors(output: &[f32], reference: &[f32]) -> Result<(f64, f64)> {
 
 pub(crate) fn run(x: Loaded) -> Result<RunReport> {
     let started = Instant::now();
+    let target = orinfer_model_sdk::device::Target::from_package(&x.manifest.target)?;
+    target.require_host(std::env::consts::ARCH)?;
+    let expected_sm = target
+        .cuda_sm()
+        .ok_or_else(|| format!("Fixture target {} is not a CUDA target", x.manifest.target))?;
     let mut s = Session::new(Driver::load()?);
     let (mut major, mut minor, mut total) = (0, 0, 0usize);
     let mut name = [0u8; 256];
@@ -386,8 +393,11 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
             ),
             "SM minor",
         )?;
-        if [major, minor] != [8, 7] {
-            return Err(format!("Expected SM87, got {major}.{minor}"));
+        if [major, minor] != expected_sm {
+            return Err(format!(
+                "Fixture target {} requires SM{}.{}, got {major}.{minor}",
+                target.device_arch, expected_sm[0], expected_sm[1]
+            ));
         }
         check(
             sys::cuDeviceGetName(name.as_mut_ptr().cast(), 256, s.device),

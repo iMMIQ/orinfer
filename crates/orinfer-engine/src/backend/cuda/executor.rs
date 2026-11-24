@@ -308,9 +308,12 @@ impl Executor {
         let mut pointers = BTreeMap::new();
         let mut sizes = BTreeMap::new();
         let mut weight_buffers = BTreeSet::new();
-        let (mut major, mut minor) = (0, 0);
+        let (mut major, mut minor, mut integrated) = (0, 0, 0);
         let mut name = [0u8; 256];
         let mut total = 0usize;
+        let expected_sm = target
+            .cuda_sm()
+            .ok_or_else(|| format!("Model target {} is not a CUDA target", manifest.target))?;
         // SAFETY: This owner initializes and retains the context on this thread.
         // The synchronous upload borrows live host storage until the driver returns.
         // Async memset touches separate session-owned allocations on our stream.
@@ -333,9 +336,20 @@ impl Executor {
                 ),
                 "SM minor",
             )?;
-            if [major, minor] != [8, 7] {
-                return Err("Model requires SM87".into());
+            if [major, minor] != expected_sm {
+                return Err(format!(
+                    "Model package target {} requires SM{}.{}, got SM{major}.{minor}",
+                    target.device_arch, expected_sm[0], expected_sm[1]
+                ));
             }
+            check(
+                sys::cuDeviceGetAttribute(
+                    &mut integrated,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED,
+                    s.device,
+                ),
+                "integrated device check",
+            )?;
             check(
                 sys::cuDeviceGetName(name.as_mut_ptr().cast(), 256, s.device),
                 "device name",
@@ -363,10 +377,15 @@ impl Executor {
                     "Model needs {buffer_bytes} bytes, device total {memtotal}"
                 ));
             }
-            // On Tegra the instantaneous free estimate excludes memory the OS
-            // can reclaim (CUDA for Tegra, memory management). Let checked
-            // allocations decide availability; Session rolls back on failure.
+            // On unified-memory Tegra devices, CUDA's instantaneous free estimate
+            // excludes reclaimable OS page cache; let checked allocations decide.
+            // On discrete-VRAM GPUs, free VRAM is authoritative.
             if buffer_bytes > free {
+                if integrated == 0 {
+                    return Err(format!(
+                        "Model needs {buffer_bytes} bytes, discrete GPU reports {free} free of {memtotal} total"
+                    ));
+                }
                 eprintln!(
                     "Model needs {buffer_bytes} bytes, CUDA free estimate {free}; checking allocations"
                 );

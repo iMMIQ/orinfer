@@ -107,9 +107,12 @@ class Projections:
             if (self.args.source / name).is_file():
                 shutil.copyfile(self.args.source / name, self.root / name)
         prepare_tokenizer(self.args.source, self.root / "tokenizer.json")
+        from orinfer_build.compiler.cuda.target import package_target
+
+        pkg_target = package_target()
         metadata = dict(
             schema_version=2,
-            target="sm_87",
+            target=pkg_target,
             model=model_name,
             chunk_tokens=self.capacity,
             max_context=self.capacity,
@@ -128,7 +131,7 @@ class Projections:
             **{spec_key: spec},
         )
         package = dict(
-            target="sm_87",
+            target=pkg_target,
             architecture=architecture,
             compute_policy="int8_quality",
             config_signature=config_signature,

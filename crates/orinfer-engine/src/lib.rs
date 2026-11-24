@@ -1,7 +1,8 @@
 //! Shared model runtime with device-owned execution backends.
 //!
-//! CUDA executes Orin model packages. Ascend provides CANN discovery and an
-//! experimental native DSv4.1 provider through the shared request interface.
+//! CUDA executes Jetson Orin (`sm_87`) and generic discrete-GPU (`sm_80`–`sm_120`)
+//! Schema 2 packages. Ascend provides CANN discovery and an experimental native
+//! DSv4.1 provider through the shared request interface.
 
 pub use orinfer_model_sdk::architecture;
 pub mod artifact;

@@ -20,7 +20,7 @@ Orinfer splits cleanly into a **Rust workspace** for online execution/serving an
 
 | Directory | Responsibility |
 | --- | --- |
-| `kernels/cuda` | Production CUDA SM87 TileLang kernels (`operators`, `model`, `audio`, `vision`) |
+| `kernels/cuda` | Production CUDA SM87 TileLang kernels (`operators`, `model`, `audio`, `vision`) and portable non-Orin discrete-GPU kernels (`generic`) |
 | `kernels/ascend` | Production Ascend 910B TileLang kernels + third-party licenses |
 | `kernels/shared` | Shared dynamic-row contracts used by both backends |
 | `python/orinfer_build/contracts` | Geometry, layout, host ABI, and binding contracts |

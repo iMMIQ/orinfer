@@ -139,12 +139,14 @@ class Compiler:
                     passes = EXACT_PASSES
                 passes = {**passes, **(pass_configs or {})}
                 if artifact is None and kernel is None:
+                    from orinfer_build.compiler.cuda.target import cuda_target
+
                     fn = explicit_rows(build()) if symbolic else build()
                     kernel = tilelang.compile(
                         fn,
                         out_idx=[],
                         execution_backend="nvrtc",
-                        target={"kind": "cuda", "arch": "sm_87"},
+                        target=cuda_target(),
                         pass_configs=passes,
                     )
                 folder = artifact or self.output / "aot" / key

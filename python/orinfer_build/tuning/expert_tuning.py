@@ -5,9 +5,10 @@ use the same factory, so tile capacity, codec, tail policy and compiler passes
 cannot diverge between measurement and the emitted execution package.
 """
 
+from orinfer_build.compiler.compile import primitive
+from orinfer_build.compiler.cuda.target import is_orin_arch
 from orinfer_build.tuning.row_tuning import RowTuner, launch
 from orinfer_build.tuning.tuning import lowest_total_latency
-from orinfer_build.compiler.compile import primitive
 
 
 EXACT_EXPERT_PASSES = {
@@ -28,8 +29,16 @@ def cold_expert_config():
     return dict(block_m=32, expand=False, folded=True, minimum_blocks=4, sparse_rows=True)
 
 
-def expert_configs(codec, *, block_m=None, direct=False):
+def expert_configs(codec, *, block_m=None, direct=False, arch=None):
     if codec == "e8p_q2":
+        if not is_orin_arch(arch):
+            tiles = (16, 32, 64) if block_m is None else (block_m,)
+            return [
+                dict(block_m=m, block_n=n, num_stages=s, portable=True)
+                for m in tiles
+                for n in (64, 128)
+                for s in (1, 2)
+            ]
         tiles = (8, 16) if block_m is None else (block_m,)
         return [dict(block_m=m, stages=s) for m in tiles for s in (2, 4)]
     if codec != "e8p_q4" or block_m is not None:
@@ -84,18 +93,39 @@ def expert_configs(codec, *, block_m=None, direct=False):
     return configs
 
 
-def expert_passes(codec, config):
-    if codec == "e8p_q2" or config.get("folded"):
+def expert_passes(codec, config, *, arch=None):
+    if codec == "e8p_q2":
+        if config.get("portable") or not is_orin_arch(arch):
+            return {}
+        return EXACT_EXPERT_PASSES
+    if config.get("folded"):
         return EXACT_EXPERT_PASSES
     return {"tl.enable_aggressive_shared_memory_merge": True} if config.get("reuse_shared") else {}
 
 
-def expert_projection(rows, outputs, inputs, experts, top_k, *, codec, config, dynamic_rows=False):
+def expert_projection(
+    rows, outputs, inputs, experts, top_k, *, codec, config, dynamic_rows=False, arch=None
+):
     import inspect
 
     tile = config["block_m"]
     tiles = tile_capacity(rows, experts, top_k, tile)
     if codec == "e8p_q2":
+        if config.get("portable") or not is_orin_arch(arch):
+            from kernels.cuda.generic.e8p_gemm import e8p_grouped_gemm
+
+            return inspect.unwrap(e8p_grouped_gemm)(
+                rows * top_k,
+                experts,
+                tiles,
+                outputs,
+                inputs,
+                block_m=tile,
+                block_n=config.get("block_n", 64),
+                num_stages=config.get("num_stages", 2),
+                dynamic_rows=dynamic_rows,
+                packed_k=config.get("packed_k", 128),
+            )
         from kernels.cuda.model.e8p_exact import e8p_exact_grouped
 
         return inspect.unwrap(e8p_exact_grouped)(

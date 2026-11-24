@@ -131,6 +131,8 @@ def main():
                 assert bool(torch.all(output[rows:] == 91))
             records.append(dict(context=length, rows=rows, exact=True, changed_input_replay=True))
 
+    from orinfer_build.compiler.cuda.target import cuda_target
+
     wrapped = []
     for role in ("attention", "attention_merge"):
         fn = factory(role, 16384, CONFIG | dict(independent_queries=True))
@@ -147,7 +149,7 @@ def main():
                     fn,
                     out_idx=[],
                     execution_backend="nvrtc",
-                    target={"kind": "cuda", "arch": "sm_87"},
+                    target=cuda_target(),
                 ),
                 names,
             )

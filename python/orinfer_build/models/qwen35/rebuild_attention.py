@@ -112,8 +112,10 @@ def rebuild(args):
         )
         if geometry["head_group"] != qh // kvh:
             raise ValueError("Expected the measured complete GQA head group")
+        from orinfer_build.compiler.cuda.target import cuda_arch
+
         compiler_identity = dict(
-            tilelang=tilelang.__version__, cuda=torch.version.cuda, target="sm_87"
+            tilelang=tilelang.__version__, cuda=torch.version.cuda, target=cuda_arch()
         )
         identity = hashlib.sha256(
             json.dumps(

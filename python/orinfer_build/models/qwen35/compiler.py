@@ -35,11 +35,13 @@ class Aot:
         import torch
         import tilelang
 
+        from orinfer_build.compiler.cuda.target import cuda_arch
+
         self.identity = dict(
             source=source_hash(ROOT, sources),
             tilelang=tilelang.__version__,
             cuda=torch.version.cuda,
-            target="sm_87",
+            target=cuda_arch(),
         )
 
     def emit(

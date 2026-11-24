@@ -28,6 +28,7 @@ from orinfer_build.contracts.projection_policy import (
     swiglu_configs,
     candidate_scores,
 )
+from orinfer_build.compiler.cuda.target import cuda_target
 from orinfer_build.tuning.expert_tuning import (
     EXACT_EXPERT_PASSES as EXACT_PASSES,
     expert_configs,
@@ -35,7 +36,7 @@ from orinfer_build.tuning.expert_tuning import (
 )
 
 
-TARGET = {"kind": "cuda", "arch": "sm_87"}
+TARGET = cuda_target()
 
 
 def profile_rows(capacity):
@@ -304,7 +305,7 @@ class ProjectionTuner:
                 make_prim(spec, config),
                 out_idx=[],
                 execution_backend="nvrtc",
-                target=TARGET,
+                target=cuda_target(),
                 pass_configs=passes,
             )
 
@@ -375,7 +376,7 @@ class ProjectionTuner:
             supply, reference, check = self._inputs(spec, sample, weights)
             tuner = AutoTuner.from_kernel(factory(dict(spec, tuning_identity=key)), configs)
             tuner.set_compile_args(
-                out_idx=[], target=TARGET, execution_backend="nvrtc", pass_configs=passes
+                out_idx=[], target=cuda_target(), execution_backend="nvrtc", pass_configs=passes
             )
             tuner.set_profile_args(
                 supply_prog=supply,
@@ -447,7 +448,7 @@ class ProjectionTuner:
                     make_prim(spec, config),
                     out_idx=[],
                     execution_backend="nvrtc",
-                    target=TARGET,
+                    target=cuda_target(),
                 )
                 for live in record["checked_rows"]:
                     self._validate(kernel, spec, config, live, kwargs.get("weights"))

@@ -1,44 +1,98 @@
-"""Offline SM87 operator helpers; runtime kernels remain independent of Torch."""
+"""Offline CUDA operator helpers for Orin (`sm_87`) and generic discrete GPUs (`sm_80`+).
 
-from orinfer_build.common.paths import ROOT
+Runtime kernels remain independent of Torch. On Jetson AGX Orin (`sm_87`),
+behavior is unchanged; on non-Orin SM80+ GPUs (`sm_80`, `sm_86`, `sm_89`,
+`sm_90`, `sm_100`, `sm_120`), compilation automatically targets the live GPU or
+`ORINFER_CUDA_ARCH`.
+"""
 
-
+from functools import partial, wraps
 import os
+from pathlib import Path
 import shutil
 import statistics
 import time
-from functools import partial, wraps
-from pathlib import Path
-from orinfer_build.common.files import file_hash, write_json as write_json
 
-import torch
 import tilelang
+import torch
 
+from orinfer_build.common.files import file_hash, write_json as write_json
+from orinfer_build.common.paths import ROOT
+from orinfer_build.compiler.cuda.target import (
+    DEFAULT_CUDA_ARCH,
+    SUPPORTED_CUDA_ARCHES,
+    cuda_arch,
+    cuda_target,
+    host_arch,
+    is_generic_cuda_arch,
+    is_orin_arch,
+    package_target,
+    parse_cuda_sm,
+    validate_cuda_arch,
+)
+
+__all__ = [
+    "DEFAULT_CUDA_ARCH",
+    "SEED",
+    "SUPPORTED_CUDA_ARCHES",
+    "benchmark",
+    "configure",
+    "cuda_arch",
+    "cuda_jit",
+    "cuda_target",
+    "environment",
+    "error",
+    "export_kernel",
+    "host_arch",
+    "identity",
+    "is_generic_cuda_arch",
+    "is_orin_arch",
+    "orin_jit",
+    "package_target",
+    "parse_cuda_sm",
+    "validate_cuda_arch",
+    "write_json",
+]
 
 SEED = 20261002
 
 
-def configure():
+def configure(*, require_sm87: bool | None = None):
     torch.set_num_threads(2)
     torch.manual_seed(SEED)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    assert torch.cuda.get_device_capability() == (8, 7)
+    cap = torch.cuda.get_device_capability()
+    strict_orin = (
+        require_sm87 if require_sm87 is not None else os.environ.get("ORINFER_REQUIRE_SM87") == "1"
+    )
+    if strict_orin:
+        assert cap == (8, 7), f"Expected SM87, got {cap}"
+    else:
+        arch = f"sm_{cap[0]}{cap[1]}"
+        if parse_cuda_sm(arch) is None:
+            raise AssertionError(
+                f"Unsupported CUDA capability {cap}; expected one of {SUPPORTED_CUDA_ARCHES}"
+            )
 
 
-def orin_jit(function=None, *, pass_configs=None):
+def cuda_jit(function=None, *, pass_configs=None, arch=None, out_idx=()):
+    """Compile a TileLang kernel for the active CUDA target (`sm_87` on Orin, live SM otherwise)."""
     if function is None:
-        return partial(orin_jit, pass_configs=pass_configs)
-    compiled = tilelang.jit(
-        out_idx=[],
-        execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
-        pass_configs=pass_configs,
-    )(function)
+        return partial(cuda_jit, pass_configs=pass_configs, arch=arch, out_idx=out_idx)
+    compiled_by_arch = {}
 
     @wraps(function)
     def build(*args, **kwargs):
-        kernel = compiled(*args, **kwargs)
+        resolved_arch = cuda_arch(arch)
+        if resolved_arch not in compiled_by_arch:
+            compiled_by_arch[resolved_arch] = tilelang.jit(
+                out_idx=list(out_idx),
+                execution_backend="nvrtc",
+                target={"kind": "cuda", "arch": resolved_arch},
+                pass_configs=pass_configs,
+            )(function)
+        kernel = compiled_by_arch[resolved_arch](*args, **kwargs)
         kernel.adapter.kernels = dict(kernel.adapter.kernels)
 
         def launch(*inputs, stream=None):
@@ -50,6 +104,11 @@ def orin_jit(function=None, *, pass_configs=None):
         return kernel
 
     return build
+
+
+def orin_jit(function=None, *, pass_configs=None):
+    """Backward-compatible JIT decorator resolving the active CUDA target dynamically."""
+    return cuda_jit(function, pass_configs=pass_configs)
 
 
 def identity(path):
@@ -115,12 +174,15 @@ def benchmark(run, repetitions=20, warmup=3, calls_per_replay=1):
 
 
 def environment():
+    cap = torch.cuda.get_device_capability()
     return {
         "torch": torch.__version__,
         "tilelang": tilelang.__version__,
         "cuda": torch.version.cuda,
         "device": str(torch.cuda.get_device_properties(0)),
-        "sm": list(torch.cuda.get_device_capability()),
+        "sm": list(cap),
+        "target": package_target(),
+        "generic_cuda": is_generic_cuda_arch(),
         "seed": SEED,
         "python_dependencies_sha256": file_hash(ROOT / "tools/environments/cuda/uv.lock"),
         "output_root": os.environ.get("ORINFER_OPERATOR_OUTPUT"),

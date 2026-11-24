@@ -38,8 +38,12 @@ pub struct Validation {
 
 impl Manifest {
     pub fn validate(&self) -> Result<usize> {
-        if self.schema_version != 1 || self.target != "sm_87" {
-            return Err("Expected fixture schema 1 and sm_87".into());
+        if self.schema_version != 1 {
+            return Err("Expected fixture schema 1".into());
+        }
+        let target = orinfer_model_sdk::device::Target::from_package(&self.target)?;
+        if target.backend != orinfer_model_sdk::device::Backend::Cuda {
+            return Err("Expected fixture schema 1 and a supported CUDA target".into());
         }
         if self.toolchain.is_empty() || self.buffers.is_empty() || self.kernels.is_empty() {
             return Err("Missing toolchain/buffers/kernels".into());
@@ -57,7 +61,6 @@ impl Manifest {
                 .checked_add(b.bytes()?)
                 .ok_or("Total buffer size overflow")?;
         }
-        let target = orinfer_model_sdk::device::Target::from_package(&self.target)?;
         for k in &self.kernels {
             k.validate_launch(&target)?;
             if k.name.is_empty()
@@ -315,6 +318,26 @@ mod tests {
         x.kernels[0].cooperative = false;
         x.kernels[0].grid[0] = 0;
         assert!(x.validate().is_err());
+    }
+    #[test]
+    fn validates_generic_cuda_fixture_targets_and_rejects_invalid_ones() {
+        for target in [
+            "sm_80",
+            "sm_86",
+            "sm_89",
+            "sm_90",
+            "sm_90-aarch64",
+            "sm_120",
+        ] {
+            let mut x = sample();
+            x.target = target.into();
+            assert_eq!(x.validate().unwrap(), 16);
+        }
+        for bad in ["ascend910b", "sm_75", "unknown"] {
+            let mut x = sample();
+            x.target = bad.into();
+            assert!(x.validate().is_err());
+        }
     }
     #[test]
     fn rejects_abi_and_extent_errors() {

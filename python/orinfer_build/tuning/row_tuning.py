@@ -723,11 +723,13 @@ class RowTuner:
                 for b in fn.buffer_map.values()
             }
             fn, names = independent_rows(fn, 128, roles, {"State": 0}, dynamic=True)
+            from orinfer_build.compiler.cuda.target import cuda_target
+
             kernel = tilelang.compile(
                 fn,
                 out_idx=[],
                 execution_backend="nvrtc",
-                target={"kind": "cuda", "arch": "sm_87"},
+                target=cuda_target(),
                 pass_configs={
                     "tl.disable_thread_storage_sync": True,
                     "tl.disable_shared_memory_reuse": True,

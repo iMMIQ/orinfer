@@ -8,15 +8,13 @@ from kernels.cuda.model.greedy import greedy_merge
 from kernels.shared.rows import explicit_rows
 from kernels.cuda.operators.op02_residual_norm import residual_norm
 from orinfer_build.contracts.abi import parse_host, validate_parameter_count
-from orinfer_build.compiler.cuda.common import configure, export_kernel, write_json
+from orinfer_build.compiler.cuda.common import configure, cuda_target, export_kernel, write_json
 
 
 def dynamic_greedy(output):
     """One cubin must honor actual rows, affine shapes, tails and graph inputs."""
     fn = explicit_rows(greedy_merge.__wrapped__(2049, rows=8, dynamic_rows=True))
-    kernel = tilelang.compile(
-        fn, out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"}
-    )
+    kernel = tilelang.compile(fn, out_idx=[], execution_backend="nvrtc", target=cuda_target())
     export_kernel(kernel, output)
     (host,) = parse_host((output / "host.txt").read_text())
     validate_parameter_count((output / "kernel.cu").read_text(), host)

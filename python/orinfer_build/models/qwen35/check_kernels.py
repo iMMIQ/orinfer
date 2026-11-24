@@ -34,11 +34,13 @@ def run():
             config = dict(algorithm=algorithm, block_m=bm, block_n=bn, block_k=128, stages=2)
             if kind == "w8":
                 config.pop("stages")
+            from orinfer_build.compiler.cuda.target import cuda_target
+
             kernel = tilelang.compile(
                 make_prim(spec, config),
                 out_idx=[],
                 execution_backend="nvrtc",
-                target={"kind": "cuda", "arch": "sm_87"},
+                target=cuda_target(),
             )
             for live in [1, 5, 17]:
                 ProjectionTuner._validate(kernel, spec, config, live)

@@ -287,7 +287,8 @@ def rebuild(args):
     certificates = []
     # Validate both legal expert tiles at actual N/K/E, without independently
     # changing the certified coupled route + up + down selection table.
-    from orinfer_build.tuning.projection_tuning import make_prim, EXACT_PASSES, TARGET
+    from orinfer_build.compiler.cuda.target import cuda_target
+    from orinfer_build.tuning.projection_tuning import make_prim, EXACT_PASSES
     import tilelang
 
     for (count, n, k), operands in sorted(experts.items()):
@@ -319,7 +320,7 @@ def rebuild(args):
                     make_prim(spec, config),
                     out_idx=[],
                     execution_backend="nvrtc",
-                    target=TARGET,
+                    target=cuda_target(),
                     pass_configs=EXACT_PASSES,
                 )
                 for live in (1, 17, 512, 4096):

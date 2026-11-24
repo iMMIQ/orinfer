@@ -192,7 +192,7 @@ fn failed_validation_never_publishes() {
                     "schema" => m["schema_version"] = json!(1),
                     "binding_path" => m["bindings"]["file"] = json!("../bindings.json"),
                     "catalog" => m["catalog"]["definitions"][0]["module"] = json!(99),
-                    "target" => m["target"] = json!("sm_90"),
+                    "target" => m["target"] = json!("sm_75"),
                     "tensor" => m["catalog"]["assets"][1]["tensor"] = json!("missing"),
                     "conflicting_hash" => {
                         let mut other = m["catalog"]["assets"][0].clone();

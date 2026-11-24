@@ -180,10 +180,10 @@ mod tests {
                     "-std=c++17",
                     "-shared",
                     "-fPIC",
+                    "-fsemantic-interposition",
                     "-O2",
                     "-D_GLIBCXX_USE_CXX11_ABI=0",
                     "-static-libstdc++",
-                    "-shared-libgcc",
                     "-Wl,--exclude-libs,ALL",
                     "-I",
                 ])

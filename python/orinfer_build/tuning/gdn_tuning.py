@@ -38,11 +38,13 @@ def select(tuner, dense):
             if prefetch
             else {}
         )
+        from orinfer_build.compiler.cuda.target import cuda_target
+
         kernel = tilelang.compile(
             fn,
             out_idx=[],
             execution_backend="nvrtc",
-            target={"kind": "cuda", "arch": "sm_87"},
+            target=cuda_target(),
             pass_configs=passes,
         )
         return kernel, inputs, columns

@@ -1132,10 +1132,13 @@ class Builder:
             if (self.source / name).is_file():
                 shutil.copyfile(self.source / name, self.root / name)
         prepare_tokenizer(self.source, self.root / "tokenizer.json")
+        from orinfer_build.compiler.cuda.target import package_target
+
+        pkg_target = package_target()
         prepare_generation_config(self.source, self.root / "generation_config.json")
         metadata = dict(
             schema_version=2,
-            target="sm_87",
+            target=pkg_target,
             model=f"{self.config.get('quantization_config', {}).get('source', 'Qwen3.5')}-e8p_q4-A8",
             chunk_tokens=CAPACITY,
             max_context=self.context,
@@ -1168,7 +1171,7 @@ class Builder:
             ),
         )
         package = dict(
-            target="sm_87",
+            target=pkg_target,
             architecture=self.architecture,
             compute_policy="int8_quality",
             config_signature=config_signature(self.config),

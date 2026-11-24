@@ -14,11 +14,13 @@ from orinfer_build.compiler.cuda.common import benchmark, configure, export_kern
 
 
 def compile_kernel(fn):
+    from orinfer_build.compiler.cuda.target import cuda_target
+
     return tilelang.compile(
         explicit_rows(fn),
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        target=cuda_target(),
     )
 
 

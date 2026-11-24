@@ -9,12 +9,14 @@ def instantiate(function, *args, **kwargs):
 
 def compile_function(function, **options):
     import tilelang
+    from orinfer_build.compiler.cuda.target import cuda_target
 
+    target = options.pop("target", None) or cuda_target()
     return tilelang.compile(
         function,
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        target=target,
         **options,
     )
 

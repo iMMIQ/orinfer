@@ -81,7 +81,7 @@ pub(crate) enum Command {
     Plan,
     /// Check AOT fixture and file hashes without CUDA.
     ValidateArtifact { manifest: PathBuf },
-    /// Execute an SM87 AOT fixture and validate graph replay.
+    /// Execute a CUDA AOT fixture and validate graph replay.
     RunArtifact { manifest: PathBuf },
     /// Inspect the native model package plan without CUDA.
     PlanModel {

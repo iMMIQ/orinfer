@@ -34,6 +34,7 @@ flowchart LR
 
 ### 3. Packages, Quantization & Offline Build
 - **[Model Execution Packages & Device Backends](model-packages.md)** — CUDA Schema 2 & Ascend Schema 1 package contracts, installation, validation, compaction, and backend boundaries.
+- **[Generic Non-Orin CUDA Hardware Support](generic-cuda.md)** — Portable TileLang kernels (`kernels/cuda/generic/`) and discrete-GPU target contracts (`sm_80`–`sm_120`).
 - **[Ascend 910B (DSv4.1) Offline Build Pipeline](ascend-a2-build.md)** — Building, prepacking, tuning, DSpark/vision packaging, and compact RoPE/shared-JSON release for A2.
 - **[E8P Quantization Technical Note](quantization.md)** — E8P Q2 lattice codebook, U16 bit layout, INT4 bit-plane decomposition, Q2_K comparison, and two-stage `[4,1]` Q4 extension.
 - **[Offline Model Builders](../tools/model/README.md)** — [Qwen3.5 Dense](../tools/model/qwen35/README.md) · [Flash Next](../tools/model/flash_next/README.md) · [Quantization Tools](../tools/quantization/README.md) · [Vision Tools](../tools/vision/README.md).
