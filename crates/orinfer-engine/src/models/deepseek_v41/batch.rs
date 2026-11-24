@@ -1022,6 +1022,23 @@ impl Layout {
         contract: &Contract,
         launches: &BTreeSet<WorkLaunch>,
     ) -> Result<bool> {
+        self.bound_work_cached(reference, None, contract, launches)
+    }
+    pub(super) fn bound_work_key(
+        &self,
+        contract: &Contract,
+        launches: &BTreeSet<WorkLaunch>,
+    ) -> Result<Key> {
+        let family = (self.role, false, 1);
+        shape_key_with_scope(contract, self, family, launches, false)
+    }
+    pub(super) fn bound_work_cached(
+        &mut self,
+        reference: &Self,
+        retained_key: Option<&Key>,
+        contract: &Contract,
+        launches: &BTreeSet<WorkLaunch>,
+    ) -> Result<bool> {
         if self.work_shape.is_some()
             || reference.work_shape.is_some()
             || self.role != super::PacketRole::Target
@@ -1051,7 +1068,15 @@ impl Layout {
         }
         let family = (self.role, false, 1);
         let actual = shape_key_with_scope(contract, self, family, launches, false)?;
-        let retained = shape_key_with_scope(contract, reference, family, launches, false)?;
+        let owned_retained;
+        let retained = match retained_key {
+            Some(key) => key,
+            None => {
+                owned_retained =
+                    shape_key_with_scope(contract, reference, family, launches, false)?;
+                &owned_retained
+            }
+        };
         if actual.decoder_rows != retained.decoder_rows
             || actual
                 .work_rows
@@ -1807,7 +1832,7 @@ impl Worker {
                 Rc::new(Execution::monolithic(packet, body, head, capture)),
             );
             if self.rank == 0 && std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
-                eprintln!(
+                super::log_async(format!(
                     "A2 packet prepare {}",
                     serde_json::json!({
                         "rows": key.rows, "decode": layout.decode, "capture": capture,
@@ -1833,7 +1858,7 @@ impl Worker {
                         "template_paths_s": self.phases.template_paths_s-before.9,
                         "kernel_geometry_s": self.phases.kernel_geometry_s-before.10,
                     })
-                );
+                ));
             }
         }
         let runtime = self.batch.as_mut().unwrap();
@@ -2057,7 +2082,7 @@ impl Worker {
                 );
             }
             if self.rank == 0 && std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
-                eprintln!(
+                super::log_async(format!(
                     "A2 split prepare {}",
                     serde_json::json!({
                         "rows": layout.rows.total,
@@ -2067,7 +2092,7 @@ impl Worker {
                         "trunk": need_trunk, "tail": need_tail, "head": need_head,
                         "wall_s": started.elapsed().as_secs_f64(),
                     })
-                );
+                ));
             }
         }
         let runtime = self.batch.as_mut().unwrap();

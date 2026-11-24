@@ -375,6 +375,9 @@ impl Runtime {
             }
         }
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        if options.cuda_graph != crate::execution::CudaGraphMode::Off {
+            team.prewarm_graphs()?;
+        }
         eprintln!(
             "A2 MODEL READY after {:.3}s; owners={}, context={}, rows={}",
             team.load_s,
@@ -857,7 +860,7 @@ impl Runtime {
         self.statistics.prefix_restore_s += prefix.restore_s;
         self.statistics.peak_active = self.statistics.peak_active.max(self.active.len());
         if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
-            eprintln!(
+            super::log_async(format!(
                 "A2 request start {}",
                 serde_json::json!({
                     "owner": slot, "tokens": input.input_tokens.len(),
@@ -866,10 +869,27 @@ impl Runtime {
                     "setup_s": setup_s, "admit_s": admit_s, "limit_s": 0.0,
                     "lookup_s": lookup_s, "restore_s": prefix.restore_s,
                 })
-            );
+            ));
         }
         let pending_images =
             self.pending_images(&input.input_tokens, input.images, offset, &media)?;
+        // Kick off background Engram gather on admission for text prompts with
+        // uncached prefill tokens so short continuations hit prepared rows on
+        // their very first mixed packet.
+        if resident
+            && offset < input.input_tokens.len()
+            && pending_images
+                .front()
+                .is_none_or(|image| image.start > offset)
+            && let Some(window) = self.team.forecast_input(slot, offset, &input.input_tokens)
+        {
+            window.start();
+            self.input_windows.retain(|w| w.owner != slot);
+            if self.input_windows.len() >= 8 {
+                self.input_windows.remove(0);
+            }
+            self.input_windows.push(window);
+        }
         Ok(Request {
             core: RequestCore::new(
                 self.owner,

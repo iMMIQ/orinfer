@@ -516,41 +516,56 @@ impl Runtime {
         readout: &mut super::super::team::Readout,
     ) {
         let has_prefill = selected.iter().any(|&(i, _)| requests[i].prefilling);
-        let hints = if has_prefill && layout.rows.total >= 128 {
-            let previous = std::mem::take(&mut self.input_windows);
-            selected
-                .iter()
-                .enumerate()
-                .filter_map(|(lane, &(i, rows))| {
-                    let r = &requests[i];
-                    if !r.prefilling {
-                        return None;
-                    }
-                    previous.iter().find_map(|window| {
+        let previous = std::mem::take(&mut self.input_windows);
+        let mut hints = vec![];
+        let mut consumed = vec![false; previous.len()];
+        if has_prefill {
+            for (lane, &(i, rows)) in selected.iter().enumerate() {
+                let r = &requests[i];
+                if !r.prefilling {
+                    continue;
+                }
+                if let Some((idx, window, start)) =
+                    previous.iter().enumerate().find_map(|(idx, window)| {
                         let start = r.offset.checked_sub(window.offset)?;
-                        (r.slot == window.owner && start + rows <= window.rows).then(|| {
-                            super::super::host_inputs::Hint {
-                                window: Arc::clone(window),
-                                destination: layout.rows.starts[lane]
-                                    ..layout.rows.starts[lane] + rows,
-                                source: start..start + rows,
-                            }
-                        })
+                        (r.slot == window.owner && start + rows <= window.rows)
+                            .then_some((idx, window, start))
                     })
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-        readout.first_input = self.team.first_input(hints);
-        if !has_prefill || layout.rows.total < 256 {
-            return;
+                {
+                    consumed[idx] = true;
+                    hints.push(super::super::host_inputs::Hint {
+                        window: Arc::clone(window),
+                        destination: layout.rows.starts[lane]..layout.rows.starts[lane] + rows,
+                        source: start..start + rows,
+                    });
+                }
+            }
         }
+        readout.first_input = self.team.first_input(hints);
         let mut offsets = requests.iter().map(|r| r.offset).collect::<Vec<_>>();
         for &(i, n) in selected {
             if requests[i].prefilling {
                 offsets[i] += n;
             }
+        }
+        // Keep still-valid prefetched windows (e.g. from newly admitted requests
+        // waiting for the next mixed packet) so admission gathers are never wasted.
+        let mut retained = Vec::with_capacity(8);
+        for (idx, window) in previous.into_iter().enumerate() {
+            let still_relevant = requests.iter().enumerate().any(|(i, r)| {
+                r.slot == window.owner
+                    && r.prefilling
+                    && offsets[i] < r.input.len()
+                    && offsets[i] >= window.offset
+                    && offsets[i] < window.offset + window.rows
+            });
+            if still_relevant && (!consumed[idx] || retained.len() < 8) {
+                retained.push(window);
+            }
+        }
+        if !has_prefill || layout.rows.total < 128 {
+            self.input_windows = retained;
+            return;
         }
         let now = Instant::now();
         let order = order_snapshot(requests, false, |i, r| {
@@ -575,22 +590,35 @@ impl Runtime {
                 remaining_tokens: r.input.len() - offset,
             })
         });
-        let mut windows = Vec::with_capacity(2);
+        let mut new_windows = Vec::with_capacity(4);
         let mut covered = 0usize;
-        for &i in order.iter().take(2) {
-            if let Some(window) =
-                self.team
-                    .forecast_input(requests[i].slot, offsets[i], &requests[i].input)
+        for &i in order.iter().take(4) {
+            let slot = requests[i].slot;
+            let off = offsets[i];
+            if let Some(existing) = retained
+                .iter()
+                .find(|w| w.owner == slot && off >= w.offset && off < w.offset + w.rows)
             {
+                covered += (existing.offset + existing.rows).saturating_sub(off);
+                if covered >= self.team.rows {
+                    break;
+                }
+                continue;
+            }
+            if let Some(window) = self.team.forecast_input(slot, off, &requests[i].input) {
                 covered += window.rows;
-                windows.push(window);
+                new_windows.push(window);
                 if covered >= self.team.rows {
                     break;
                 }
             }
         }
-        readout.next_inputs = windows.clone();
-        self.input_windows = windows;
+        readout.next_inputs = new_windows.clone();
+        retained.extend(new_windows);
+        if retained.len() > 8 {
+            retained.drain(0..retained.len() - 8);
+        }
+        self.input_windows = retained;
     }
     pub(super) fn capture_context(
         &self,

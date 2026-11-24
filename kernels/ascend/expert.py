@@ -82,11 +82,12 @@ def gather_split(rows, table_rows, width, experts, table_stride=0, slots=20):
                     T.set_flag("V", "MTE3", 7)
                     T.wait_flag("V", "MTE3", 7)
                     T.copy(doubled64, split_groups)
-                chunks = T.ceildiv(rows, block)
+                step_size = T.min(block, T.max(8, T.ceildiv(rows, lanes)))
+                chunks = T.ceildiv(rows, step_size)
                 for step in T.serial(T.ceildiv(T.max(0, chunks - lane), lanes)):
                     part = lane + step * lanes
-                    base = part * block
-                    valid = T.min(block, rows - base)
+                    base = part * step_size
+                    valid = T.min(step_size, rows - base)
                     T.tile.fill(scale_ub, 0.0)
                     T.tile.fill(err_ub, 0)
                     T.copy(indices[base : base + valid], idx_ub[:valid])

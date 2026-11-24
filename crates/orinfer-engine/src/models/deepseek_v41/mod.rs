@@ -51,6 +51,24 @@ use load::upload;
 use plan::validate_dispatch;
 use plan::{bounded_rows, gather_element, load_spec, validate_row_ranges, w4_plan_rows};
 
+/// Non-blocking bounded stderr logger for hot-path A2 diagnostic telemetry.
+/// Keeps profiling logs off the NPU/sampling critical path.
+pub(in crate::models::deepseek_v41) fn log_async(line: String) {
+    static LOGGER: OnceLock<std::sync::mpsc::SyncSender<String>> = OnceLock::new();
+    let tx = LOGGER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(8192);
+        let _ = std::thread::Builder::new()
+            .name("orinfer-a2-log".into())
+            .spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    eprintln!("{msg}");
+                }
+            });
+        tx
+    });
+    let _ = tx.try_send(line);
+}
+
 pub use batch_benchmark::run as run_batch;
 pub use benchmark::{Report, run};
 

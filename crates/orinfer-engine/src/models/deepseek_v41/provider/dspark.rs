@@ -129,7 +129,7 @@ impl Runtime {
         };
         let ceiling_s = options.prefill_budget_ms / 1000.;
         let mut budgets = BTreeMap::<(usize, u64), usize>::new();
-        let mut retained_cache = BTreeMap::<Vec<usize>, Layout>::new();
+        let mut retained_cache = BTreeMap::<Vec<usize>, (Layout, super::super::batch::Key)>::new();
         let mut verification_budget = |rows: &[usize]| {
             let mut sum = 0usize;
             let mut mask = 0u64;
@@ -191,25 +191,31 @@ impl Runtime {
                         capacity,
                         owners,
                     )?;
-                    let retained = if let Some(cached) = retained_cache.get(reference) {
-                        cached
-                    } else {
-                        for (&i, &depth) in indices.iter().zip(reference) {
-                            decode_rows[i] = depth + 1;
-                        }
-                        let built = baseline.forecast_layout(
-                            requests,
-                            &decode_rows,
-                            verification_budget(&decode_rows),
-                            keep,
-                            capacity,
-                            owners,
-                        )?;
-                        retained_cache.entry(reference.to_vec()).or_insert(built)
-                    };
-                    if !target.bound_work(
+                    let contract = self.team.model.batch.as_ref().unwrap();
+                    let (retained, retained_key) =
+                        if let Some(cached) = retained_cache.get(reference) {
+                            cached
+                        } else {
+                            for (&i, &depth) in indices.iter().zip(reference) {
+                                decode_rows[i] = depth + 1;
+                            }
+                            let built = baseline.forecast_layout(
+                                requests,
+                                &decode_rows,
+                                verification_budget(&decode_rows),
+                                keep,
+                                capacity,
+                                owners,
+                            )?;
+                            let key = built.bound_work_key(contract, &self.team.work_launches)?;
+                            retained_cache
+                                .entry(reference.to_vec())
+                                .or_insert((built, key))
+                        };
+                    if !target.bound_work_cached(
                         retained,
-                        self.team.model.batch.as_ref().unwrap(),
+                        Some(retained_key),
+                        contract,
                         &self.team.work_launches,
                     )? {
                         return Ok(None);
@@ -239,24 +245,28 @@ impl Runtime {
         let packet_budget = verification_budget(&decode_rows);
         let retained_work = if let Some(reference) = allocation.reference {
             if std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some() {
-                eprintln!(
+                super::super::log_async(format!(
                     "DSPARK_ALLOCATION {}",
                     serde_json::json!({
                         "before":reference,"after":depths,"mixed":mixed,
                     })
-                );
+                ));
             }
-            for (&i, &depth) in indices.iter().zip(&reference) {
-                decode_rows[i] = depth + 1;
+            if let Some((cached, _)) = retained_cache.remove(&reference) {
+                Some(cached)
+            } else {
+                for (&i, &depth) in indices.iter().zip(&reference) {
+                    decode_rows[i] = depth + 1;
+                }
+                Some(baseline.forecast_layout(
+                    requests,
+                    &decode_rows,
+                    verification_budget(&decode_rows),
+                    keep,
+                    capacity,
+                    owners,
+                )?)
             }
-            Some(baseline.forecast_layout(
-                requests,
-                &decode_rows,
-                verification_budget(&decode_rows),
-                keep,
-                capacity,
-                owners,
-            )?)
         } else {
             None
         };

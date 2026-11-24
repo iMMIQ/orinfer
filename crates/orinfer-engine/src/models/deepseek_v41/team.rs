@@ -1323,6 +1323,257 @@ impl Team {
         self.resident_key(layout)
             .is_some_and(|key| self.resident_graphs.borrow().contains(&key))
     }
+    /// Pre-capture the canonical serving ACL Graphs (pure prefill Trunk, mixed
+    /// Trunk/Tail/Head, decode-only verification buckets, and Draft block
+    /// shapes) before `/health` reports ready, removing cold ACLNN/TileLang
+    /// initialization and on-path capture pauses from the serving window.
+    pub fn prewarm_graphs(&self) -> Result<()> {
+        if !self.graphs_enabled || std::env::var_os("ORINFER_A2_NO_PREWARM").is_some() {
+            return Ok(());
+        }
+        let Some(contract) = self.model.batch.as_ref() else {
+            return Ok(());
+        };
+        let owners = contract.owners;
+        let capacity = self.rows;
+        if owners < 2 || capacity < 512 {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let draft_block = self.draft_blocks.first().copied();
+        let draft_owners = if draft_block.is_some() {
+            owners.min(14)
+        } else {
+            2
+        };
+        let mut started_slots = Vec::with_capacity(draft_owners);
+        for slot in 0..draft_owners {
+            let limit = if slot < 2 { capacity } else { 64 };
+            self.exchange(Command::StartOwner {
+                slot,
+                limit,
+                snapshot: None,
+            })?;
+            started_slots.push(slot);
+        }
+        let capture_one = |layout: Layout| -> Result<bool> {
+            let prepared = self.begin_forward(&layout)?;
+            if !prepared.workspace_fits {
+                return Ok(false);
+            }
+            if prepared.all_graphs() {
+                return Ok(true);
+            }
+            let has_tail = prepared.states.first().is_some_and(|s| s.tail.is_some());
+            let has_head = prepared.states.first().is_some_and(|s| s.head.is_some());
+            let need = |states: Vec<CacheState>| super::batch::PartAction {
+                invalidate: false,
+                prepare: if states.iter().all(|s| *s == CacheState::Graph) {
+                    None
+                } else {
+                    Some(true)
+                },
+            };
+            let plan = SplitPlan {
+                trunk: need(prepared.states.iter().map(|s| s.trunk).collect()),
+                tail: has_tail
+                    .then(|| need(prepared.states.iter().map(|s| s.tail.unwrap()).collect())),
+                head: has_head
+                    .then(|| need(prepared.states.iter().map(|s| s.head.unwrap()).collect())),
+            };
+            if plan.any_prepare() {
+                self.peers
+                    .exchange_heavy(Command::PrepareParts(layout.clone(), plan))?;
+            }
+            Ok(true)
+        };
+        let mut captured = 0usize;
+        // 1. Pure prefill 2048- and 1024-row Trunks (also pays one-time ACLNN/TileLang load).
+        for pure_rows in [capacity, 1024usize] {
+            if pure_rows > capacity {
+                continue;
+            }
+            let pure = Layout::new(
+                vec![orinfer_model_sdk::architecture::BatchSegment {
+                    slot: 0,
+                    tokens: pure_rows,
+                }],
+                vec![],
+                false,
+                capacity,
+                owners,
+            );
+            if let Ok(mut pure) = pure {
+                pure.enable_bucketing();
+                if capture_one(pure).unwrap_or(false) {
+                    captured += 1;
+                }
+            }
+        }
+        // 2. Decode-only canonical verification buckets (16, 32, 48, 64, 80, 96).
+        let output_cap = contract.output_capacity();
+        for rows in [16usize, 32, 48, 64, 80, 96] {
+            if rows > capacity || rows > output_cap {
+                continue;
+            }
+            if let Ok(mut dec) = Layout::verification(
+                vec![orinfer_model_sdk::architecture::BatchSegment {
+                    slot: 0,
+                    tokens: rows,
+                }],
+                capacity,
+                owners,
+            ) {
+                dec.enable_bucketing();
+                if capture_one(dec).unwrap_or(false) {
+                    captured += 1;
+                }
+            }
+        }
+        // 3. Mixed 2048/1024 Trunks + canonical Tail/Head buckets (both <=8 and >8 owners).
+        if let Some(replay) = contract.decoder_replay.as_ref() {
+            for dec_rows in [32usize, 64, 127] {
+                if dec_rows >= capacity || dec_rows > output_cap {
+                    continue;
+                }
+                if let Ok(mut mixed) = Layout::new(
+                    vec![orinfer_model_sdk::architecture::BatchSegment {
+                        slot: 0,
+                        tokens: capacity - dec_rows,
+                    }],
+                    vec![],
+                    false,
+                    capacity,
+                    owners,
+                ) && mixed
+                    .append_pad(1, dec_rows, dec_rows, None, capacity, owners)
+                    .is_ok()
+                    && capture_one(mixed).unwrap_or(false)
+                {
+                    captured += 1;
+                }
+            }
+            // 9-owner mixed 2048 shapes capture the WorkPad::Bucketed=1024 Trunk and
+            // Tail graphs used when >8 owners are active concurrently.
+            if draft_owners >= 9 {
+                for dec_rows in [64usize, 127usize] {
+                    if dec_rows >= capacity || dec_rows > output_cap {
+                        continue;
+                    }
+                    let per = (dec_rows / 8).max(1);
+                    let rem = dec_rows - per * 7;
+                    let mut segs = Vec::with_capacity(8);
+                    segs.push(orinfer_model_sdk::architecture::BatchSegment {
+                        slot: 0,
+                        tokens: capacity - dec_rows,
+                    });
+                    for slot in 1..8 {
+                        segs.push(orinfer_model_sdk::architecture::BatchSegment {
+                            slot,
+                            tokens: per,
+                        });
+                    }
+                    if let Ok(mut mixed9) = Layout::new(segs, vec![], false, capacity, owners) {
+                        for lane in 1..8 {
+                            mixed9.decoder_roles[lane] = super::replay::Role::Continue;
+                            for pos in 0..per {
+                                mixed9.outputs.push(lane);
+                                mixed9.output_positions.push(pos);
+                            }
+                        }
+                        if mixed9
+                            .append_pad(8, rem, rem, None, capacity, owners)
+                            .is_ok()
+                            && capture_one(mixed9).unwrap_or(false)
+                        {
+                            captured += 1;
+                        }
+                    }
+                }
+            }
+            // Final-window mixed buckets (1 Final prefill keeping `keep` decoder rows + decode/pad).
+            let keep = replay.keep;
+            if replay.final_prompt_only && keep > 0 && keep < capacity {
+                for (total_rows, target_dec, target_out) in [
+                    (capacity, 192usize, 32usize),
+                    (capacity, 192usize, 64usize),
+                    (capacity, 256usize, 127usize),
+                    (1024usize, 192usize, 32usize),
+                ] {
+                    if total_rows > capacity || target_out > output_cap || target_dec <= keep {
+                        continue;
+                    }
+                    let extra_dec = target_dec - keep;
+                    let dec_toks = target_out.saturating_sub(1).min(extra_dec);
+                    let pad_len = extra_dec - dec_toks;
+                    let pad_out = target_out.saturating_sub(1 + dec_toks);
+                    let prefill_toks = total_rows.saturating_sub(dec_toks + pad_len);
+                    if prefill_toks < keep {
+                        continue;
+                    }
+                    let mut segs = vec![orinfer_model_sdk::architecture::BatchSegment {
+                        slot: 0,
+                        tokens: prefill_toks,
+                    }];
+                    if dec_toks > 0 {
+                        segs.push(orinfer_model_sdk::architecture::BatchSegment {
+                            slot: 1,
+                            tokens: dec_toks,
+                        });
+                    }
+                    if let Ok(mut fin) = Layout::new(segs, vec![0], false, capacity, owners) {
+                        if dec_toks > 0 {
+                            fin.decoder_roles[1] = super::replay::Role::Continue;
+                            for pos in 0..dec_toks {
+                                fin.outputs.push(1);
+                                fin.output_positions.push(pos);
+                            }
+                        }
+                        let ready = if pad_len > 0 {
+                            fin.append_pad(2, pad_len, pad_out, None, capacity, owners)
+                                .is_ok()
+                        } else {
+                            fin.enable_bucketing();
+                            true
+                        };
+                        if ready && capture_one(fin).unwrap_or(false) {
+                            captured += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // 4. DSpark Draft block buckets (1..=14 owners).
+        if let Some(block) = draft_block {
+            for n in 1..=draft_owners {
+                let segments = (0..n)
+                    .map(|slot| orinfer_model_sdk::architecture::BatchSegment {
+                        slot,
+                        tokens: block,
+                    })
+                    .collect::<Vec<_>>();
+                let built = if self.strided_draft {
+                    Layout::new(segments, (0..n).collect(), false, owners * block, owners)
+                } else {
+                    Layout::verification(segments, owners * block, owners)
+                };
+                if let Ok(mut draft) = built {
+                    draft.role = super::PacketRole::Draft;
+                    if capture_one(draft).unwrap_or(false) {
+                        captured += 1;
+                    }
+                }
+            }
+        }
+        if !started_slots.is_empty() {
+            self.exchange(Command::Release(None))?;
+        }
+        eprintln!(
+            "A2 PREWARM READY after {:.3}s; graphs={captured}",
+            started.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
     pub fn fast_forward(
         &self,
         layout: Layout,
@@ -2038,7 +2289,7 @@ fn finish_forward(
             .is_some_and(|p| p.mode == preparation::Mode::CaptureReplay);
     let cached_prepare = !invalidate && !split_plan.any_prepare();
     if budget.is_some_and(|b| b.trace) {
-        eprintln!(
+        super::log_async(format!(
             "A2_EXECUTION_PLAN {}",
             serde_json::json!({
                 "role":format!("{:?}",layout.role), "rows":layout.rows.total,
@@ -2047,7 +2298,7 @@ fn finish_forward(
                 "head_mode":head_plan.as_ref().map(|p| p.mode),
                 "budget":budget,
             })
-        );
+        ));
     }
     // A deferred response must not wait behind a new graph's warmup/capture.
     // Stable shapes run this callback after submission, below.
@@ -2104,10 +2355,10 @@ fn finish_forward(
         && (budget.is_some_and(|b| b.trace)
             || std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some())
     {
-        eprintln!(
+        super::log_async(format!(
             "A2_SHARED_PLAN {}",
             serde_json::json!({"rows":layout.rows.total,"pieces":shared.len(),"setup_s":shared_setup})
-        );
+        ));
     }
     let sampled = !readout.draws.is_empty();
     let readout_rejection_empty = readout.rejection.is_empty();
@@ -2169,14 +2420,14 @@ fn collect_forward_outputs(
         && first.prepared.seconds() > 0.
         && let Ok(data) = first.prepared.get()
     {
-        eprintln!(
+        super::log_async(format!(
             "A2_HOST_INPUT {}",
             serde_json::json!({
                 "rows": data.rows, "reused_rows": data.reused_rows,
                 "forecast_wait_s": data.wait_s,
                 "prepare_s": first.prepared.seconds(),
             })
-        );
+        ));
     }
     let ranks = results
         .into_iter()

@@ -221,7 +221,7 @@ impl Runtime {
         );
         if let Some(before) = before {
             let estimate = self.prefill_costs.estimate(work);
-            eprintln!(
+            super::super::log_async(format!(
                 "A2_PREFILL_COST {}",
                 serde_json::json!({
                     "tokens":work.tokens,"context":work.context,"decode_rows":work.decode_rows,
@@ -233,7 +233,7 @@ impl Runtime {
                     "estimate_s":estimate.seconds,
                     "upper_s":estimate.upper_s,"samples":estimate.samples,
                 })
-            );
+            ));
         }
     }
 }

@@ -19,16 +19,16 @@ def weighted_head_sum(
     heads,
     query_rows=1,
     tmp=None,
+    qsw_premultiplied=False,
 ):
     T.tile.fill(total, 0.0)
     if vector_scales:
         T.tile.max(dots, dots, 0.0)
         T.tile.broadcast(expanded, qs, tmp=tmp)
         T.tile.mul(dots, dots, expanded)
-        T.tile.broadcast(expanded, ks, tmp=tmp)
-        T.tile.mul(dots, dots, expanded)
-        T.tile.broadcast(expanded, w, tmp=tmp)
-        T.tile.mul(dots, dots, expanded)
+        if not qsw_premultiplied:
+            T.tile.broadcast(expanded, w, tmp=tmp)
+            T.tile.mul(dots, dots, expanded)
     for head in T.serial(heads):
         if query_rows > 1:
             T.tile.add(total, total, dots[head * query_rows : (head + 1) * query_rows, :])
@@ -42,6 +42,12 @@ def weighted_head_sum(
                 T.tile.mul(partial, partial, ks)
                 T.tile.mul(partial, partial, w[head, 0])
             T.tile.add(total, total, partial)
+    if vector_scales:
+        if query_rows > 1:
+            T.tile.broadcast(expanded[:query_rows, :], ks, tmp=tmp)
+            T.tile.mul(total, total, expanded[:query_rows, :])
+        else:
+            T.tile.mul(total, total, ks)
 
 
 def causal_logits(
@@ -238,6 +244,8 @@ def causal_logits(
                                     T.tile.mul(w, w, factor)
                                     T.tile.cast(w_half, w, "CAST_RINT", heads)
                                     T.tile.cast(w, w_half, "CAST_NONE", heads)
+                                    if vector_scales:
+                                        T.tile.mul(qs, qs, w)
                                     if candidate_blocks != 0:
                                         load_scales(
                                             key_scale,
@@ -266,6 +274,7 @@ def causal_logits(
                                         vector_scales,
                                         direct_sum,
                                         heads,
+                                        qsw_premultiplied=vector_scales,
                                     )
                                     if candidate_blocks != 0:
                                         mask_scores(

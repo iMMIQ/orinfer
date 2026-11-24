@@ -431,13 +431,16 @@ def _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows, normalization_wid
     """Batch independent 4x4 matrices with the original row/column reductions."""
     if tile_rows not in (2, 4, 8, 16, 32):
         raise ValueError("mHC Sinkhorn row tile must be 1, 2, 4, 8, 16 or 32")
-    width = tile_rows * 32
+    # Persistent 20-slot (40-AIV) schedule with 4-row sub-tiles saturates all 40 AIVs
+    # across both 32/64-row Decode and 256-row SP Trunk while hoisting constant indices.
+    sub_tile = min(tile_rows, 4)
+    width = sub_tile * 32
     normalized_input = normalization_width is not None
     input_rows = rows * 8 if normalized_input else rows
     if normalized_input:
         from kernels.ascend.hc_prefill import normalization
 
-        normalize = normalization(tile_rows, normalization_width)
+        normalize = normalization(sub_tile, normalization_width)
 
     @T.prim_func
     def main(
@@ -448,142 +451,155 @@ def _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows, normalization_wid
         post: T.Tensor((rows, 8), "float32"),
         combination: T.Tensor((rows, 16), "float32"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2 * tile_rows), is_npu=True) as (cid, vid):
-            m = T.alloc_ub((tile_rows, 32), "float32")
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            m = T.alloc_ub((sub_tile, 32), "float32")
             flat_m = T.alloc_ub((width,), "float32")
             s = T.alloc_ub((8,), "float32")
             b = T.alloc_ub((1, 32), "float32")
             scale_row = T.alloc_ub((1, 32), "float32")
-            expanded = T.alloc_ub((tile_rows, 32), "float32")
-            p = T.alloc_ub((tile_rows, 8), "float32")
-            q = T.alloc_ub((tile_rows, 8), "float32")
+            expanded = T.alloc_ub((sub_tile, 32), "float32")
+            p = T.alloc_ub((sub_tile, 8), "float32")
+            q = T.alloc_ub((sub_tile, 8), "float32")
             # Path-major storage lets RA reduce exactly four HC paths for
             # each token/column, while AR sees independent padded 8-lane rows.
-            a = T.alloc_ub((4 * tile_rows, 8), "float32")
-            column_a = T.alloc_ub((4, tile_rows * 8), "float32")
-            r = T.alloc_ub((4 * tile_rows,), "float32")
-            c = T.alloc_ub((1, tile_rows * 8), "float32")
-            row_divisor = T.alloc_ub((4 * tile_rows, 8), "float32")
-            column_divisor = T.alloc_ub((4, tile_rows * 8), "float32")
-            row_column_divisor = T.alloc_ub((4 * tile_rows, 8), "float32")
-            packed = T.alloc_ub((tile_rows, 16), "float32")
+            a = T.alloc_ub((4 * sub_tile, 8), "float32")
+            column_a = T.alloc_ub((4, sub_tile * 8), "float32")
+            r = T.alloc_ub((4 * sub_tile,), "float32")
+            c = T.alloc_ub((1, sub_tile * 8), "float32")
+            row_divisor = T.alloc_ub((4 * sub_tile, 8), "float32")
+            column_divisor = T.alloc_ub((4, sub_tile * 8), "float32")
+            row_column_divisor = T.alloc_ub((4 * sub_tile, 8), "float32")
+            packed = T.alloc_ub((sub_tile, 16), "float32")
             lanes = T.alloc_ub((width,), "float32")
             row_f = T.alloc_ub((width,), "float32")
             path_f = T.alloc_ub((width,), "float32")
             indices = T.alloc_ub((width,), "float32")
-            integers = T.alloc_ub((width,), "int32")
-            offsets = T.alloc_ub((width,), "uint32")
-            row_integers = T.alloc_ub((width,), "int32")
+            int_p = T.alloc_ub((width,), "int32")
+            int_q = T.alloc_ub((width,), "int32")
+            int_a = T.alloc_ub((width,), "int32")
+            int_out = T.alloc_ub((width,), "int32")
+            int_row = T.alloc_ub((width,), "int32")
+            offsets_p = T.alloc_ub((width,), "uint32")
+            offsets_q = T.alloc_ub((width,), "uint32")
+            offsets_a = T.alloc_ub((width,), "uint32")
+            offsets_out = T.alloc_ub((width,), "uint32")
             row_offsets = T.alloc_ub((width,), "uint32")
             mask = T.alloc_ub((width // 8,), "uint8")
-            first = (cid * 2 + vid) * tile_rows
-            if first < rows:
-                valid = T.min(tile_rows, rows - first)
-                T.tile.fill(m, 0.0)
-                if normalized_input:
-                    normalize(mixes, m, first, valid)
-                else:
-                    T.copy(mixes[first : first + valid, :], m[:valid, :])
-                T.copy(scale, s)
-                T.copy(base, b[0, :])
-                T.tile.fill(scale_row, 0.0)
-                for i in T.serial(4):
-                    scale_row[0, i] = s[0]
-                    scale_row[0, 4 + i] = s[1]
-                for i in T.serial(16):
-                    scale_row[0, 8 + i] = s[2]
-                T.tile.broadcast(expanded, scale_row)
-                T.tile.mul(m, m, expanded)
-                T.tile.broadcast(expanded, b)
-                T.tile.add(m, m, expanded)
-                T.reinterpretcast(flat_m, m, "float")
-                T.reinterpretcast(column_a, a, "float")
-                T.reinterpretcast(row_column_divisor, column_divisor, "float")
-                T.tile.createvecindex(lanes, 0.0)
-                T.tile.mul(row_f, lanes, 0.125)
-                T.tile.cast(row_integers, row_f, "CAST_FLOOR", width)
-                T.tile.cast(row_f, row_integers, "CAST_NONE", width)
-                T.tile.mul(indices, row_f, 4.0)
-                T.tile.cast(row_integers, indices, "CAST_RINT", width)
-                T.reinterpretcast(row_offsets, row_integers, "uint32_t")
-                # Pre/post gather: source column = token*32 + lane%8.
-                T.tile.mul(indices, row_f, 24.0)
-                T.tile.add(indices, indices, lanes)
-                T.tile.mul(indices, indices, 4.0)
-                T.tile.cast(integers, indices, "CAST_RINT", width)
-                T.reinterpretcast(offsets, integers, "uint32_t")
-                T.pipe_barrier("V")
-                T.tile.gather(p, flat_m, offsets[: tile_rows * 8], 0)
-                T.tile.add(indices, indices, 16.0)
-                T.tile.cast(integers, indices, "CAST_RINT", width)
-                T.pipe_barrier("V")
-                T.tile.gather(q, flat_m, offsets[: tile_rows * 8], 0)
-                T.tile.sigmoid(p, p)
-                T.tile.sigmoid(q, q)
-                T.tile.add(p, p, eps)
-                T.tile.mul(q, q, 2.0)
-                T.tile.mul(indices, row_f, 8.0)
-                T.tile.sub(indices, lanes, indices)
-                T.tile.compare(mask, indices, 4.0, "LT")
-                T.tile.select(p, mask, p, 0.0, "VSEL_TENSOR_SCALAR_MODE")
-                T.tile.select(q, mask, q, 0.0, "VSEL_TENSOR_SCALAR_MODE")
-                # Matrix gather: (path, token, padded column) from token-major mixes.
-                T.tile.mul(path_f, lanes, 1.0 / (tile_rows * 8))
-                T.tile.cast(integers, path_f, "CAST_FLOOR", width)
-                T.tile.cast(path_f, integers, "CAST_NONE", width)
-                T.tile.mul(indices, row_f, 24.0)
-                T.tile.add(indices, indices, lanes)
-                T.tile.mul(path_f, path_f, float(4 - 32 * tile_rows))
-                T.tile.add(indices, indices, path_f)
-                T.tile.add(indices, indices, 8.0)
-                T.tile.mul(indices, indices, 4.0)
-                T.tile.cast(integers, indices, "CAST_RINT", width)
-                T.pipe_barrier("V")
-                T.tile.gather(a, flat_m, offsets, 0)
-                T.tile.select(a, mask, a, 0.0, "VSEL_TENSOR_SCALAR_MODE")
-                T.reduce_max(a, r, dim=1, real_shape=[4 * tile_rows, 4])
-                T.tile.gather(row_divisor, r, row_offsets, 0)
-                T.tile.sub(a, a, row_divisor)
-                T.tile.exp(a, a)
-                T.reduce_sum(a, r, dim=1, real_shape=[4 * tile_rows, 4])
-                T.tile.gather(row_divisor, r, row_offsets, 0)
-                T.tile.div(a, a, row_divisor)
-                T.tile.add(a, a, eps)
-                T.pipe_barrier("V")
-                T.reduce_sum(column_a, c, dim=0)
-                T.tile.add(c, c, eps)
-                T.tile.broadcast(column_divisor, c)
-                T.pipe_barrier("V")
-                T.tile.div(a, a, row_column_divisor)
-                for _ in T.serial(iterations - 1):
-                    T.reduce_sum(a, r, dim=1, real_shape=[4 * tile_rows, 4])
-                    T.tile.add(r, r, eps)
+
+            # Hoist invariant scale/base loads and permutation offsets once per AIV.
+            T.copy(scale, s)
+            T.copy(base, b[0, :])
+            T.tile.fill(scale_row, 0.0)
+            for i in T.serial(4):
+                scale_row[0, i] = s[0]
+                scale_row[0, 4 + i] = s[1]
+            for i in T.serial(16):
+                scale_row[0, 8 + i] = s[2]
+            T.reinterpretcast(flat_m, m, "float")
+            T.reinterpretcast(column_a, a, "float")
+            T.reinterpretcast(row_column_divisor, column_divisor, "float")
+            T.tile.createvecindex(lanes, 0.0)
+            T.tile.mul(row_f, lanes, 0.125)
+            T.tile.cast(int_row, row_f, "CAST_FLOOR", width)
+            T.tile.cast(row_f, int_row, "CAST_NONE", width)
+            T.tile.mul(indices, row_f, 4.0)
+            T.tile.cast(int_row, indices, "CAST_RINT", width)
+            T.reinterpretcast(row_offsets, int_row, "uint32_t")
+            T.tile.mul(indices, row_f, 24.0)
+            T.tile.add(indices, indices, lanes)
+            T.tile.mul(indices, indices, 4.0)
+            T.tile.cast(int_p, indices, "CAST_RINT", width)
+            T.reinterpretcast(offsets_p, int_p, "uint32_t")
+            T.tile.add(indices, indices, 16.0)
+            T.tile.cast(int_q, indices, "CAST_RINT", width)
+            T.reinterpretcast(offsets_q, int_q, "uint32_t")
+            T.tile.mul(indices, row_f, 8.0)
+            T.tile.sub(indices, lanes, indices)
+            T.tile.compare(mask, indices, 4.0, "LT")
+            T.tile.mul(path_f, lanes, 1.0 / (sub_tile * 8))
+            T.tile.cast(int_a, path_f, "CAST_FLOOR", width)
+            T.tile.cast(path_f, int_a, "CAST_NONE", width)
+            T.tile.mul(indices, row_f, 24.0)
+            T.tile.add(indices, indices, lanes)
+            T.tile.mul(path_f, path_f, float(4 - 32 * sub_tile))
+            T.tile.add(indices, indices, path_f)
+            T.tile.add(indices, indices, 8.0)
+            T.tile.mul(indices, indices, 4.0)
+            T.tile.cast(int_a, indices, "CAST_RINT", width)
+            T.reinterpretcast(offsets_a, int_a, "uint32_t")
+            T.tile.mul(indices, lanes, 0.25)
+            T.tile.cast(int_out, indices, "CAST_FLOOR", width)
+            T.tile.cast(indices, int_out, "CAST_NONE", width)
+            T.tile.mul(indices, indices, float(sub_tile * 8 - 4))
+            T.tile.mul(path_f, lanes, 0.0625)
+            T.tile.cast(int_out, path_f, "CAST_FLOOR", width)
+            T.tile.cast(path_f, int_out, "CAST_NONE", width)
+            T.tile.mul(path_f, path_f, float(8 - sub_tile * 32))
+            T.tile.add(indices, indices, path_f)
+            T.tile.add(indices, indices, lanes)
+            T.tile.mul(indices, indices, 4.0)
+            T.tile.cast(int_out, indices, "CAST_RINT", width)
+            T.reinterpretcast(offsets_out, int_out, "uint32_t")
+            T.pipe_barrier("V")
+
+            aiv = cid * 2 + vid
+            chunks = T.ceildiv(rows, sub_tile)
+            if aiv < chunks:
+                for step in T.serial(T.ceildiv(chunks - aiv, 40)):
+                    first = (aiv + step * 40) * sub_tile
+                    valid = T.min(sub_tile, rows - first)
+                    T.tile.fill(m, 0.0)
+                    if normalized_input:
+                        normalize(mixes, m, first, valid)
+                    else:
+                        T.copy(mixes[first : first + valid, :], m[:valid, :])
+                    T.tile.broadcast(expanded, scale_row)
+                    T.tile.mul(m, m, expanded)
+                    T.tile.broadcast(expanded, b)
+                    T.tile.add(m, m, expanded)
+                    T.pipe_barrier("V")
+                    T.tile.gather(p, flat_m, offsets_p[: sub_tile * 8], 0)
+                    T.tile.gather(q, flat_m, offsets_q[: sub_tile * 8], 0)
+                    T.tile.sigmoid(p, p)
+                    T.tile.sigmoid(q, q)
+                    T.tile.add(p, p, eps)
+                    T.tile.mul(q, q, 2.0)
+                    T.tile.select(p, mask, p, 0.0, "VSEL_TENSOR_SCALAR_MODE")
+                    T.tile.select(q, mask, q, 0.0, "VSEL_TENSOR_SCALAR_MODE")
+                    T.tile.gather(a, flat_m, offsets_a, 0)
+                    T.tile.select(a, mask, a, 0.0, "VSEL_TENSOR_SCALAR_MODE")
+                    T.reduce_max(a, r, dim=1, real_shape=[4 * sub_tile, 4])
+                    T.tile.gather(row_divisor, r, row_offsets, 0)
+                    T.tile.sub(a, a, row_divisor)
+                    T.tile.exp(a, a)
+                    T.reduce_sum(a, r, dim=1, real_shape=[4 * sub_tile, 4])
                     T.tile.gather(row_divisor, r, row_offsets, 0)
                     T.tile.div(a, a, row_divisor)
+                    T.tile.add(a, a, eps)
                     T.pipe_barrier("V")
                     T.reduce_sum(column_a, c, dim=0)
                     T.tile.add(c, c, eps)
                     T.tile.broadcast(column_divisor, c)
                     T.pipe_barrier("V")
                     T.tile.div(a, a, row_column_divisor)
-                # Return only the original four columns in token-major order.
-                T.tile.mul(indices, lanes, 0.25)
-                T.tile.cast(integers, indices, "CAST_FLOOR", width)
-                T.tile.cast(indices, integers, "CAST_NONE", width)
-                T.tile.mul(indices, indices, float(tile_rows * 8 - 4))
-                T.tile.mul(path_f, lanes, 0.0625)
-                T.tile.cast(integers, path_f, "CAST_FLOOR", width)
-                T.tile.cast(path_f, integers, "CAST_NONE", width)
-                T.tile.mul(path_f, path_f, float(8 - tile_rows * 32))
-                T.tile.add(indices, indices, path_f)
-                T.tile.add(indices, indices, lanes)
-                T.tile.mul(indices, indices, 4.0)
-                T.tile.cast(integers, indices, "CAST_RINT", width)
-                T.pipe_barrier("V")
-                T.tile.gather(packed, a, offsets[: tile_rows * 16], 0)
-                T.copy(p[:valid, :], pre[first : first + valid, :])
-                T.copy(q[:valid, :], post[first : first + valid, :])
-                T.copy(packed[:valid, :], combination[first : first + valid, :])
+                    for _ in T.serial(iterations - 1):
+                        T.reduce_sum(a, r, dim=1, real_shape=[4 * sub_tile, 4])
+                        T.tile.add(r, r, eps)
+                        T.tile.gather(row_divisor, r, row_offsets, 0)
+                        T.tile.div(a, a, row_divisor)
+                        T.pipe_barrier("V")
+                        T.reduce_sum(column_a, c, dim=0)
+                        T.tile.add(c, c, eps)
+                        T.tile.broadcast(column_divisor, c)
+                        T.pipe_barrier("V")
+                        T.tile.div(a, a, row_column_divisor)
+                    T.pipe_barrier("V")
+                    T.tile.gather(packed, a, offsets_out[: sub_tile * 16], 0)
+                    T.copy(p[:valid, :], pre[first : first + valid, :])
+                    T.copy(q[:valid, :], post[first : first + valid, :])
+                    T.copy(packed[:valid, :], combination[first : first + valid, :])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     if normalized_input:
         main = main.with_attr("orinfer.component_sources", ["kernels/ascend/hc_prefill.py"])
@@ -778,7 +794,7 @@ def mhc_post_pre(rows, width, tile=256, reuse_residual=False):
 
 
 def mhc_prenorm_partials(rows, width, splits=8, lanes=32):
-    """FP32 fn arithmetic, split over K; no BF16 approximation of HC weights.
+    """FP32 fn arithmetic, split over K with persistent 8-row weight reuse.
 
     The padded fn has 24 valid rows. Output lane 24 stores sum(x*x), lanes
     25..31 are reserved zeros. Splitting output lanes distributes the same
@@ -793,6 +809,7 @@ def mhc_prenorm_partials(rows, width, splits=8, lanes=32):
     if lanes not in (8, 16, 32):
         raise ValueError("mHC output lane tile must be 8, 16 or 32")
     groups = 32 // lanes
+    row_tile = 8
 
     @T.prim_func
     def main(
@@ -800,41 +817,57 @@ def mhc_prenorm_partials(rows, width, splits=8, lanes=32):
         fn: T.Tensor((32, reduction), "float32"),
         out: T.Tensor((rows, splits, 32), "float32"),
     ):
-        with T.Kernel(T.ceildiv(rows * splits * groups, 2), is_npu=True) as (cid, vid):
-            xb = T.alloc_ub((1, chunk), "bfloat16")
-            x = T.alloc_ub((1, chunk), "float32")
-            square = T.alloc_ub((1, chunk), "float32")
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            xb = T.alloc_ub((row_tile, chunk), "bfloat16")
+            x = T.alloc_ub((row_tile, chunk), "float32")
+            square = T.alloc_ub((row_tile, chunk), "float32")
             sq = T.alloc_ub((1, 1), "float32")
-            sq_acc = T.alloc_ub((1, 1), "float32")
+            sq_acc = T.alloc_ub((row_tile, 1), "float32")
             broadcast = T.alloc_ub((lanes, chunk), "float32")
             w = T.alloc_ub((lanes, chunk), "float32")
             product = T.alloc_ub((lanes, chunk), "float32")
             partial = T.alloc_ub((lanes, 1), "float32")
-            total = T.alloc_ub((lanes, 1), "float32")
-            index = cid * 2 + vid
-            row = index // (splits * groups)
-            split = index // groups % splits
-            group = index % groups
-            if row < rows:
-                T.tile.fill(total, 0.0)
-                T.tile.fill(sq_acc, 0.0)
-                for k in T.serial(loops):
-                    offset = (split * loops + k) * chunk
-                    T.copy(residual[row : row + 1, offset : offset + chunk], xb)
-                    T.copy(fn[group * lanes : (group + 1) * lanes, offset : offset + chunk], w)
-                    T.tile.cast(x, xb, "CAST_NONE", chunk)
-                    T.tile.mul(square, x, x)
-                    T.reduce_sum(square, sq, dim=1)
-                    T.tile.add(sq_acc, sq_acc, sq)
-                    T.tile.broadcast(broadcast, x)
-                    T.tile.mul(product, w, broadcast)
-                    T.reduce_sum(product, partial, dim=1)
-                    T.tile.add(total, total, partial)
-                if group == 24 // lanes:
-                    total[24 % lanes, 0] = sq_acc[0, 0]
-                    for i in T.Parallel(7):
-                        total[24 % lanes + 1 + i, 0] = 0.0
-                T.copy(total, out[row, split, group * lanes : (group + 1) * lanes])
+            total = T.alloc_ub((row_tile, lanes), "float32")
+            aiv = cid * 2 + vid
+            row_blocks = T.ceildiv(rows, row_tile)
+            tasks = row_blocks * splits * groups
+            if aiv < tasks:
+                for step in T.serial(T.ceildiv(tasks - aiv, 40)):
+                    index = aiv + step * 40
+                    rb = index // (splits * groups)
+                    split = index // groups % splits
+                    group = index % groups
+                    first = rb * row_tile
+                    valid = T.min(row_tile, rows - first)
+                    T.tile.fill(total, 0.0)
+                    T.tile.fill(sq_acc, 0.0)
+                    for k in T.serial(loops):
+                        offset = (split * loops + k) * chunk
+                        T.copy(fn[group * lanes : (group + 1) * lanes, offset : offset + chunk], w)
+                        T.copy(
+                            residual[first : first + valid, offset : offset + chunk], xb[:valid, :]
+                        )
+                        T.tile.cast(x, xb, "CAST_NONE", row_tile * chunk)
+                        T.tile.mul(square, x, x)
+                        for r in T.serial(valid):
+                            T.reduce_sum(square[r : r + 1, :], sq, dim=1)
+                            sq_acc[r, 0] = sq_acc[r, 0] + sq[0, 0]
+                            T.tile.broadcast(broadcast, x[r : r + 1, :])
+                            T.tile.mul(product, w, broadcast)
+                            T.reduce_sum(product, partial, dim=1)
+                            T.tile.add(total[r : r + 1, :], total[r : r + 1, :], partial[:, 0])
+                    if group == 24 // lanes:
+                        for r in T.serial(valid):
+                            total[r, 24 % lanes] = sq_acc[r, 0]
+                            for i in T.serial(7):
+                                total[r, 24 % lanes + 1 + i] = 0.0
+                    for r in T.serial(valid):
+                        T.copy(
+                            total[r : r + 1, :],
+                            out[first + r, split, group * lanes : (group + 1) * lanes],
+                        )
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main
 

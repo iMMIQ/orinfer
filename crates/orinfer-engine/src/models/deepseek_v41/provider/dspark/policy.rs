@@ -400,7 +400,7 @@ impl Policy {
         if self.trace {
             let errors = &feedback.blocks[&block].errors[..block];
             let compared = errors.iter().filter(|e| e.observed).count();
-            eprintln!(
+            crate::models::deepseek_v41::log_async(format!(
                 "DSPARK_FEEDBACK {}",
                 serde_json::json!({
                     "owner":owner,"block":block,"proposed":counts.0,"accepted":counts.1,
@@ -409,7 +409,7 @@ impl Policy {
                     "forecast_brier":errors.iter().filter(|e| e.observed).map(|e| e.head).sum::<f64>() / compared.max(1) as f64,
                     "history_brier":errors.iter().filter(|e| e.observed).map(|e| e.history).sum::<f64>() / compared.max(1) as f64,
                 })
-            );
+            ));
         }
     }
     pub fn prepare_feedback(
@@ -509,10 +509,10 @@ impl Policy {
             receipt.calibrating,
         );
         if self.trace {
-            eprintln!(
+            crate::models::deepseek_v41::log_async(format!(
                 "DSPARK_SETTLE {}",
                 serde_json::json!({"family":receipt.family,"width":receipt.width,"seconds":seconds,"committed":tokens,"normal_s":receipt.normal_s,"balance":self.ledger.balance,"startup_spent":self.ledger.startup_spent})
-            );
+            ));
         }
     }
     pub fn preparation_s(&self) -> f64 {
@@ -592,13 +592,13 @@ impl Policy {
             r.preparation_s += timing.setup;
         }
         if self.trace {
-            eprintln!(
+            crate::models::deepseek_v41::log_async(format!(
                 "DSPARK_BASELINE {}",
                 serde_json::json!({
                     "batch": batch, "full": full, "mixed": work.prefill_rows > 0,
                     "seconds": timing.seconds, "replay": timing.replay,
                 })
-            );
+            ));
         }
         let point = Point {
             stage: if batch > 0 && work.prefill_rows == 0 {
@@ -1092,7 +1092,7 @@ fn trace_selection(
     reason: &str,
 ) {
     let (full, mixed) = mode;
-    eprintln!(
+    crate::models::deepseek_v41::log_async(format!(
         "DSPARK_POLICY {}",
         serde_json::json!({
             "batch": maxima.len(), "full": full, "mixed": mixed, "limit": limit,
@@ -1105,7 +1105,7 @@ fn trace_selection(
                 "acceptance":(0..block).map(|i|c.acceptance.rate(i,0.7)).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         })
-    );
+    ));
 }
 
 #[cfg(test)]

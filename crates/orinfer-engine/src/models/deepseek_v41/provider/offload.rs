@@ -191,8 +191,11 @@ fn matched_tier(
     reserve: usize,
 ) -> Option<Hit> {
     let score = |entry: &Entry<Snapshot>| {
-        (entry.tokens.len() <= input.len().saturating_sub(reserve)
-            || entry.tokens.len() == input.len() && entry.snapshot.output.is_some())
+        // Restoring a 1-token BOS-only snapshot on a multi-token prompt costs
+        // ~18 ms of 8-rank IPC/DMA to save 1 token (~0.07 ms of prefill).
+        ((entry.tokens.len() > 1 || entry.tokens.len() == input.len())
+            && (entry.tokens.len() <= input.len().saturating_sub(reserve)
+                || entry.tokens.len() == input.len() && entry.snapshot.output.is_some()))
         .then_some(-(entry.tokens.len() as f64))
     };
     cache.matched(input, media, score, score)
