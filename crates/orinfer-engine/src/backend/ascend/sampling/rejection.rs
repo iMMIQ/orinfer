@@ -121,11 +121,12 @@ impl Contract {
     }
 }
 
-pub(crate) fn requested() -> Result<bool> {
+pub(crate) fn requested(supported: bool) -> Result<bool> {
     match std::env::var("ORINFER_A2_DSPARK_SAMPLING").as_deref() {
         Ok("rejection") => Ok(true),
-        Ok("coupled") | Err(std::env::VarError::NotPresent) => Ok(false),
-        _ => Err("ORINFER_A2_DSPARK_SAMPLING must be coupled or rejection".into()),
+        Ok("coupled") => Ok(false),
+        Ok("auto") | Err(std::env::VarError::NotPresent) => Ok(supported),
+        _ => Err("ORINFER_A2_DSPARK_SAMPLING must be auto, coupled or rejection".into()),
     }
 }
 

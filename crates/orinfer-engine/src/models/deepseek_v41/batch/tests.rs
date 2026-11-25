@@ -808,6 +808,44 @@ fn bucketed_work_capacity_collapses_owner_count_variations() {
     assert_eq!(work_capacity(513, WorkPad::Bucketed), 1024);
     assert_eq!(work_capacity(1, WorkPad::Exact), 2);
     assert_eq!(work_capacity(5, WorkPad::Padded), 8);
+
+    // Bounded bucketed capacity tightens small row-proportional work tables while
+    // keeping owner-count-independent Graph keys across all valid splits.
+    let rows_grid = RowExpression::Rows;
+    assert_eq!(
+        work_capacity_bounded(16, WorkPad::Bucketed, 16, &rows_grid, None).unwrap(),
+        16
+    );
+    assert_eq!(
+        work_capacity_bounded(32, WorkPad::Bucketed, 32, &rows_grid, None).unwrap(),
+        32
+    );
+    assert_eq!(
+        work_capacity_bounded(20, WorkPad::Bucketed, 32, &rows_grid, None).unwrap(),
+        32
+    );
+    assert_eq!(
+        work_capacity_bounded(127, WorkPad::Bucketed, 127, &rows_grid, None).unwrap(),
+        128
+    );
+    assert_eq!(
+        work_capacity_bounded(256, WorkPad::Bucketed, 256, &rows_grid, None).unwrap(),
+        256
+    );
+    // Constant-64 indexer tables still collapse 1..=8 owners into 512 and 9..=16 into 1024.
+    let const_grid = RowExpression::Constant { value: 64 };
+    assert_eq!(
+        work_capacity_bounded(64, WorkPad::Bucketed, 32, &const_grid, None).unwrap(),
+        512
+    );
+    assert_eq!(
+        work_capacity_bounded(512, WorkPad::Bucketed, 32, &const_grid, None).unwrap(),
+        512
+    );
+    assert_eq!(
+        work_capacity_bounded(576, WorkPad::Bucketed, 32, &const_grid, None).unwrap(),
+        1024
+    );
 }
 
 #[test]

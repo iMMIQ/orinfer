@@ -23,7 +23,7 @@ fn fixed_history_sampling_cost() {
     ))
     .unwrap();
     let output = std::path::PathBuf::from(std::env::var_os("ORINFER_A2_DSPARK_REPORT").unwrap());
-    assert!(crate::backend::ascend::sampling::rejection_requested().unwrap());
+    assert!(crate::backend::ascend::sampling::rejection_requested(true).unwrap());
     let mut runtime = Runtime::load(
         &model,
         crate::execution::LoadOptions {

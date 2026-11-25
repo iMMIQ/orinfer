@@ -365,6 +365,7 @@ def selected_int8(
     async_gather=False,
     dma_scales=False,
     direct_bf16=False,
+    overlap_qk=False,
 ):
     """One paired-core selected-KV gather/QK/softmax/PV invocation per query.
 
@@ -398,6 +399,10 @@ def selected_int8(
     if softmax_heads not in (1, 4, 8) or half_heads % softmax_heads:
         raise ValueError("Softmax head tile must divide each Vector's head group")
     produced = 128 if reuse_long else selected
+    chunk_overlap = (
+        overlap_qk and (not reuse_long) and (tile_k % (2 * tile_slots) == 0) and (selected > tile_k)
+    )
+    reuse_overlap = overlap_qk and reuse_long and (selected > tile_k)
 
     @T.macro
     def run(
@@ -452,15 +457,67 @@ def selected_int8(
                     score_acc = T.alloc_L0C((padded_heads, tile_k), "float32")
                     output_acc = T.alloc_L0C((padded_heads, tile_d), "float32")
                     T.copy(query[row, :, :], query_l1[:heads, :])
-                    T.wait_cross_flag(0)
-                    for slot in T.serial(selected // tile_k):
-                        T.copy(kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :], key_l1)
+                    if chunk_overlap:
+                        for slot in T.serial(selected // tile_k):
+                            T.wait_cross_flag(0)
+                            T.copy(
+                                kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :], key_l1
+                            )
+                            T.gemm_v0(
+                                query_l1,
+                                key_l1,
+                                score_acc,
+                                transpose_B=True,
+                                init=True,
+                                kL0Size=128,
+                            )
+                            T.copy(
+                                score_acc,
+                                score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k],
+                            )
+                    elif reuse_overlap:
+                        # Long KV slots [1..N) are already resident in kv_workspace; compute
+                        # their QK tiles on Cube concurrently while Vector decodes SWA slot 0.
+                        for slot in T.serial(1, selected // tile_k):
+                            T.copy(
+                                kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :], key_l1
+                            )
+                            T.gemm_v0(
+                                query_l1,
+                                key_l1,
+                                score_acc,
+                                transpose_B=True,
+                                init=True,
+                                kL0Size=128,
+                            )
+                            T.copy(
+                                score_acc,
+                                score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k],
+                            )
+                        T.wait_cross_flag(0)
+                        T.copy(kv_workspace[row, 0:tile_k, :], key_l1)
                         T.gemm_v0(
                             query_l1, key_l1, score_acc, transpose_B=True, init=True, kL0Size=128
                         )
-                        T.copy(
-                            score_acc, score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k]
-                        )
+                        T.copy(score_acc, score_workspace[row, :, 0:tile_k])
+                    else:
+                        T.wait_cross_flag(0)
+                        for slot in T.serial(selected // tile_k):
+                            T.copy(
+                                kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :], key_l1
+                            )
+                            T.gemm_v0(
+                                query_l1,
+                                key_l1,
+                                score_acc,
+                                transpose_B=True,
+                                init=True,
+                                kL0Size=128,
+                            )
+                            T.copy(
+                                score_acc,
+                                score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k],
+                            )
                     T.set_cross_flag("FIX", 1)
                     T.wait_cross_flag(2)
                     T.copy(probability_workspace[row, :heads, :], probability_l1[:heads, :])
@@ -498,42 +555,82 @@ def selected_int8(
                     sink_value = T.alloc_ub((softmax_heads, 1), "float32")
                     probability = T.alloc_ub((softmax_heads, selected), "bfloat16")
                     expanded = T.alloc_ub((softmax_heads, selected), "float32")
-                    for part in T.serial(produced // (2 * tile_slots)):
-                        first = vid * (produced // 2) + part * tile_slots
-                        gather_tile(
-                            swa,
-                            swa_scales,
-                            long_kv,
-                            long_scales,
-                            swa_indices,
-                            long_indices,
-                            kv_workspace,
-                            mask_workspace,
-                            q,
-                            zeros,
-                            half_values,
-                            values,
-                            half_scales,
-                            scale,
-                            broadcast,
-                            decoded,
-                            flag,
-                            row,
-                            first,
-                            capacity,
-                            compressed_capacity,
-                            compressed,
-                            storage,
-                            tile_slots,
-                            True,
-                            decode_groups,
-                            staged_swa_cache,
-                            staged_swa,
-                            staged_rows,
-                            async_gather,
-                            dma_scales,
-                        )
-                    T.set_cross_flag("MTE3", 0)
+                    if chunk_overlap:
+                        parts_per_slot = tile_k // (2 * tile_slots)
+                        for slot in T.serial(selected // tile_k):
+                            for part in T.serial(parts_per_slot):
+                                first = slot * tile_k + vid * (tile_k // 2) + part * tile_slots
+                                gather_tile(
+                                    swa,
+                                    swa_scales,
+                                    long_kv,
+                                    long_scales,
+                                    swa_indices,
+                                    long_indices,
+                                    kv_workspace,
+                                    mask_workspace,
+                                    q,
+                                    zeros,
+                                    half_values,
+                                    values,
+                                    half_scales,
+                                    scale,
+                                    broadcast,
+                                    decoded,
+                                    flag,
+                                    row,
+                                    first,
+                                    capacity,
+                                    compressed_capacity,
+                                    compressed,
+                                    storage,
+                                    tile_slots,
+                                    True,
+                                    decode_groups,
+                                    staged_swa_cache,
+                                    staged_swa,
+                                    staged_rows,
+                                    async_gather,
+                                    dma_scales,
+                                )
+                            T.set_cross_flag("MTE3", 0)
+                    else:
+                        for part in T.serial(produced // (2 * tile_slots)):
+                            first = vid * (produced // 2) + part * tile_slots
+                            gather_tile(
+                                swa,
+                                swa_scales,
+                                long_kv,
+                                long_scales,
+                                swa_indices,
+                                long_indices,
+                                kv_workspace,
+                                mask_workspace,
+                                q,
+                                zeros,
+                                half_values,
+                                values,
+                                half_scales,
+                                scale,
+                                broadcast,
+                                decoded,
+                                flag,
+                                row,
+                                first,
+                                capacity,
+                                compressed_capacity,
+                                compressed,
+                                storage,
+                                tile_slots,
+                                True,
+                                decode_groups,
+                                staged_swa_cache,
+                                staged_swa,
+                                staged_rows,
+                                async_gather,
+                                dma_scales,
+                            )
+                        T.set_cross_flag("MTE3", 0)
                     T.wait_cross_flag(1)
                     if softmax_heads > 1:
                         T.copy(mask_workspace[row, :], ids)

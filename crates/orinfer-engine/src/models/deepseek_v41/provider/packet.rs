@@ -158,6 +158,7 @@ impl Selection {
             &selected,
             true,
             self.prefill_rows > 0,
+            false,
             capacity,
             owners,
         )
@@ -366,13 +367,15 @@ pub(super) fn forecast(
     work(&selected, requests, prefill_rows)
 }
 
-/// Canonical verification row buckets (max gap 15 <= DRAFTS + 1 = 17 so device
+/// Canonical verification row buckets (max gap 16 <= DRAFTS + 1 = 17 so device
 /// coordinates remain active and all buckets <= 127 stay inside non-SP P[2]).
-const VERIFY_BUCKETS: &[usize] = &[16, 32, 48, 64, 80, 96, 112, 127];
+/// Includes 24 so 3..4 active decoders (18..24 rows) do not pad up to 32 rows.
+const VERIFY_BUCKETS: &[usize] = &[16, 24, 32, 48, 64, 80, 96, 112, 127];
 
-/// Canonical Mixed decoder-row buckets (max gap 64 <= keep = 128; buckets
-/// <= 127 trigger cross-family Tail downgrade from SP P[3] to non-SP P[2]).
-const MIXED_DECODER_BUCKETS: &[usize] = &[32, 64, 127, 192, 256];
+/// Canonical Mixed decoder-row buckets (max gap 64 <= keep = 128 for <=256,
+/// and 128 <= keep for 257..384 when two final prefills share a mixed packet;
+/// buckets <= 127 trigger cross-family Tail downgrade from SP P[3] to non-SP P[2]).
+const MIXED_DECODER_BUCKETS: &[usize] = &[32, 64, 127, 192, 256, 384];
 
 pub(super) fn bucket_verify_rows(rows: usize) -> usize {
     VERIFY_BUCKETS
@@ -456,7 +459,7 @@ impl Runtime {
             }
             return Ok(());
         }
-        if decoder_rows > 256 {
+        if decoder_rows > 384 {
             return Ok(());
         }
         let target_dec = bucket_mixed_decoder_rows(decoder_rows);
@@ -467,7 +470,8 @@ impl Runtime {
             .min(output_capacity);
         let pad_out = target_out.saturating_sub(cur_out);
         selection.layout.enable_bucketing();
-        if pad_len == 0 || pad_len > 64 {
+        let max_pad = if target_dec > 256 { 128 } else { 64 };
+        if pad_len == 0 || pad_len > max_pad {
             return Ok(());
         }
         let at_budget = selection.layout.rows.total == selection.budget
@@ -776,6 +780,7 @@ impl Runtime {
             &selected,
             decode_inputs.is_some(),
             has_prefill,
+            self.team.has_fused_small_target(),
             self.team.rows,
             self.team.model.batch.as_ref().unwrap().owners,
         )?;
@@ -814,6 +819,7 @@ fn packet_layout(
     selected: &[(usize, usize)],
     verification: bool,
     has_prefill: bool,
+    fused_small_target: bool,
     capacity: usize,
     owners: usize,
 ) -> Result<Layout> {
@@ -832,15 +838,12 @@ fn packet_layout(
             (!r.prefilling || r.offset + count == r.input.len()).then_some(lane)
         })
         .collect();
+    let decode = !has_prefill && !verification && !fused_small_target;
     let mut layout = Layout::new(
         segments,
         outputs,
-        !has_prefill && !verification,
-        if has_prefill || verification {
-            capacity
-        } else {
-            owners
-        },
+        decode,
+        if decode { owners } else { capacity },
         owners,
     )?;
     for (lane, &(i, _)) in selected.iter().enumerate() {

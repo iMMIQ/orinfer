@@ -360,7 +360,13 @@ impl Runtime {
             },
             &package_root,
         )?;
-        let rejection_sampling = crate::backend::ascend::sampling::rejection_requested()?;
+        let rejection_supported = team
+            .model
+            .sampling
+            .as_ref()
+            .is_some_and(|s| s.rejection.is_some());
+        let rejection_sampling =
+            crate::backend::ascend::sampling::rejection_requested(rejection_supported)?;
         if rejection_sampling {
             let contract = team
                 .model
@@ -618,7 +624,7 @@ impl Runtime {
         Ok(())
     }
     pub(super) fn ensure_pad_slot(&mut self) -> Result<Option<usize>> {
-        const MAX_PAD_TOKENS: usize = 64;
+        const MAX_PAD_TOKENS: usize = 128;
         if let Some(slot) = self.pad_slot {
             if !self.active.contains(&slot) {
                 return Ok(Some(slot));
@@ -1222,12 +1228,12 @@ impl Runtime {
         if result.is_ok() && self.statistics.iterations > before_iterations {
             let seconds = started.elapsed().as_secs_f64();
             if self.statistics.prefill_tokens > before_prefill {
-                // Keep DecodeBurst active for healthy decoder cohorts (>= 4) or
+                // Keep DecodeBurst active for healthy decoder cohorts (>= 5) or
                 // when decoders were held back by a pure-prefill step or an
-                // over-budget mixed step, while avoiding wasteful decode-only
-                // weight passes for tiny 1..3 decoder tails.
+                // over-budget mixed step, while prioritizing prefill completion
+                // for tiny 1..4 decoder tails so new requests join decode sooner.
                 if self.statistics.mixed_iterations == before_mixed
-                    || decoding.len() >= 3
+                    || decoding.len() >= 5
                     || seconds > options.target_tpot_ms / 1000.
                 {
                     self.decode_burst.after_prefill(

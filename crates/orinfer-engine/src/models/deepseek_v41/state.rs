@@ -775,11 +775,17 @@ impl Worker {
             }
         }
         let bytes = bytes.checked_add(255).ok_or("Journal size overflow")?;
+        // Include worst-case 256-byte wrap alignment per circular buffer so a
+        // pooled slab allocated for `rows` always fits any wrapped offset with
+        // <= `rows`, guaranteeing zero-allocation reuse in FastVerifyForward.
+        let worst_case = bytes
+            .checked_add(circular.len().saturating_mul(256))
+            .ok_or("Journal size overflow")?;
         // Round journal buffers to power-of-two slabs (min 64 KiB) and recycle
         // across released owners so varying draft widths avoid HBM fragmentation.
-        let slab = bytes
+        let slab = worst_case
             .checked_next_power_of_two()
-            .unwrap_or(bytes)
+            .unwrap_or(worst_case)
             .max(64 << 10);
         let bank = if let Some(saved) = previous.filter(|saved| saved.bank.bytes() >= bytes) {
             saved.bank

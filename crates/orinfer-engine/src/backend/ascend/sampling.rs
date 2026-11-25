@@ -250,7 +250,7 @@ impl Categorical {
                 processed::Processed::load(session, base, contract, &logits, &controls, &active)
             })
             .transpose()?;
-        let rejection = if rejection_requested()? {
+        let rejection = if rejection_requested(contract.rejection.is_some())? {
             Some(rejection::Rejection::load(
                 session,
                 base,

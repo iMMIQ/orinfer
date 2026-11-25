@@ -685,6 +685,7 @@ pub(super) fn worker(
                 let large_prompt_threshold = cold_prompt_capacity.saturating_mul(4);
                 if latency && costs[i].remaining_tokens > large_prompt_threshold {
                     let mut active_large = 0usize;
+                    let mut active_decoders = 0usize;
                     let mut min_active_large = usize::MAX;
                     for a in &active {
                         if a.request.is_prefilling() {
@@ -693,15 +694,24 @@ pub(super) fn worker(
                                 active_large += 1;
                                 min_active_large = min_active_large.min(rem);
                             }
+                        } else {
+                            active_decoders += 1;
                         }
                     }
-                    let allow = if costs[i].age_s >= 42. {
+                    // When the active decode cohort is under-populated, allow
+                    // more concurrent large prefills (still strictly bounded by
+                    // HBM admission checks below) so decode concurrency does
+                    // not collapse while requests wait in the queue.
+                    let base_large_cap = if active_decoders < 10 { 5 } else { 3 };
+                    let preempt_large_cap = if active_decoders < 10 { 7 } else { 5 };
+                    let allow = if costs[i].age_s >= 30. {
                         true
-                    } else if costs[i].age_s >= 30. {
-                        active_large < 4
+                    } else if costs[i].age_s >= 12. {
+                        active_large < preempt_large_cap
                     } else {
-                        active_large < 2
-                            || (active_large < 4 && costs[i].remaining_tokens < min_active_large)
+                        active_large < base_large_cap
+                            || (active_large < preempt_large_cap
+                                && costs[i].remaining_tokens < min_active_large)
                     };
                     if !allow {
                         cold_deferrals += 1;

@@ -189,10 +189,14 @@ pub(super) struct Hint {
     pub destination: Range<usize>,
     pub source: Range<usize>,
 }
+type PrimaryPrefetch = (Vec<u64>, Vec<bool>, Rows);
+
 pub(super) struct First {
     pub layer: usize,
     hints: Arc<Vec<Hint>>,
-    pub prepared: Prepared<Rows>,
+    pub prepared: Arc<Prepared<Rows>>,
+    primary_prefetch: Arc<Prepared<PrimaryPrefetch>>,
+    primary_started: AtomicBool,
     extras: BTreeMap<usize, (Arc<Prepared<Rows>>, AtomicBool)>,
 }
 impl First {
@@ -211,12 +215,51 @@ impl First {
         Arc::new(Self {
             layer: primary,
             hints: Arc::new(hints),
-            prepared: Prepared::deferred(),
+            prepared: Arc::new(Prepared::deferred()),
+            primary_prefetch: Arc::new(Prepared::deferred()),
+            primary_started: AtomicBool::new(false),
             extras,
         })
     }
     pub fn handles_layer(&self, layer: usize) -> bool {
         layer == self.layer || self.extras.contains_key(&layer)
+    }
+    /// Launch background gather for the primary Engram layer (e.g. layer 1) so
+    /// decode verification RAM reads overlap with verification IPC and layer 0.
+    /// `get()` validates exact `(ids, valid)` identity before reusing it.
+    pub fn prefetch_primary(
+        &self,
+        tables: Arc<BTreeMap<usize, SharedInt8Rows>>,
+        ids: Vec<u64>,
+        valid: Vec<bool>,
+    ) {
+        if rayon::current_num_threads() < 2
+            || self.prepared.is_ready()
+            || self
+                .primary_started
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return;
+        }
+        let Some(lane) = extra_prefetch_lane() else {
+            return;
+        };
+        let layer = self.layer;
+        let slot = Arc::clone(&self.primary_prefetch);
+        let hints = Arc::clone(&self.hints);
+        let _ = lane.try_submit(move || {
+            let _ = slot.get_or(|| {
+                let store = tables.get(&layer).ok_or("Engram table missing")?;
+                let rows = assemble(layer, store, &ids, &valid, &hints)?;
+                Ok((ids, valid, rows))
+            });
+        });
     }
     /// Launch background gather for a later Engram layer (e.g. layer 14) once per
     /// forward so it overlaps with layers 0..13 running on the NPU.
@@ -268,14 +311,27 @@ impl First {
         ids: impl FnOnce() -> Result<Vec<u64>>,
         valid: &[bool],
     ) -> Result<&Rows> {
-        let slot: &Prepared<Rows> = if layer == self.layer {
-            &self.prepared
-        } else {
-            self.extras
-                .get(&layer)
-                .map(|(p, _)| p.as_ref())
-                .ok_or("Engram layer not prepared in host inputs")?
-        };
+        if layer == self.layer {
+            if self.primary_started.load(Ordering::Acquire)
+                && let Ok((cached_ids, cached_valid, cached_rows)) = self.primary_prefetch.get()
+            {
+                let live_ids = ids()?;
+                if *cached_ids == live_ids && cached_valid.as_slice() == valid {
+                    return Ok(cached_rows);
+                }
+                return self
+                    .prepared
+                    .get_or(|| assemble(layer, store, &live_ids, valid, &self.hints));
+            }
+            return self
+                .prepared
+                .get_or(|| assemble(layer, store, &ids()?, valid, &self.hints));
+        }
+        let slot = self
+            .extras
+            .get(&layer)
+            .map(|(p, _)| p.as_ref())
+            .ok_or("Engram layer not prepared in host inputs")?;
         slot.get_or(|| assemble(layer, store, &ids()?, valid, &self.hints))
     }
 }
@@ -393,6 +449,45 @@ impl Team {
             let layers: Vec<usize> = hasher.layout().layers.iter().map(|l| l.layer).collect();
             First::new(&layers, hints)
         })
+    }
+    /// Pre-hash and start background Engram gather for the primary layer (layer 1)
+    /// on small decode/verification packets before NPU submission starts.
+    pub fn prefetch_first_primary(&self, first: &First, segments: &[(&[u32], &[u32])]) {
+        let Some(hasher) = self.host_hasher.as_ref() else {
+            return;
+        };
+        let Some(tables) = self
+            .host_tables
+            .as_ref()
+            .and_then(|shared| shared.get())
+            .and_then(|res| res.as_ref().ok())
+            .cloned()
+        else {
+            return;
+        };
+        let mut hashes = Vec::new();
+        let mut valid = Vec::new();
+        for &(history, tokens) in segments {
+            let mut h = Vec::new();
+            let mut v = Vec::new();
+            if hasher.hash_into(history, tokens, &mut h, &mut v).is_err() {
+                return;
+            }
+            hashes.extend(h);
+            valid.extend(v);
+        }
+        if valid.is_empty() {
+            return;
+        }
+        if let Some(layer_index) = hasher
+            .layout()
+            .layers
+            .iter()
+            .position(|l| l.layer == first.layer)
+        {
+            let ids = layer_ids_for(hasher, layer_index, &hashes, &valid);
+            first.prefetch_primary(tables, ids, valid);
+        }
     }
     pub fn forecast_input(
         &self,

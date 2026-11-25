@@ -101,16 +101,23 @@ impl Contract {
             .transpose()?;
         let layout = decoder.as_ref().unwrap_or(layout);
         let range = self.work_ranges.get(name);
-        let mut items = if let Some(&stride) = self.partitioned_tables.get(name) {
-            let view = layout.rows.partition(stride, rank % stride)?;
+        let partition = self.partitioned_tables.get(name).copied().unwrap_or(1);
+        let max_rows = layout.rows.total.div_ceil(partition);
+        let mut items = if partition > 1 {
+            let view = layout.rows.partition(partition, rank % partition)?;
             work_lengths(view.lengths, grid, range)?
         } else {
             work_items(layout, grid, range)?
         };
         if layout.work_shape.is_some() {
             let reference = layout.work_layout()?;
-            let capacity =
-                work_capacity(self.work_items(&reference, grid, name, rank)?.len(), padded);
+            let capacity = work_capacity_bounded(
+                self.work_items(&reference, grid, name, rank)?.len(),
+                padded,
+                max_rows,
+                grid,
+                range,
+            )?;
             if items.len() > capacity {
                 return Err(format!(
                     "Owner work table {name} needs {} items but its retained Graph holds {capacity}",
@@ -119,7 +126,26 @@ impl Contract {
             }
             items.resize(capacity, [-1, 0]);
         }
-        items.resize(work_capacity(items.len(), padded), [-1, 0]);
+        let uniform_count = if padded == WorkPad::Bucketed && partition > 1 {
+            let mut worst = items.len();
+            for r in 0..partition {
+                let view = layout.rows.partition(partition, r)?;
+                let c = view
+                    .lengths
+                    .iter()
+                    .copied()
+                    .try_fold(0usize, |sum, tokens| {
+                        sum.checked_add(work_blocks(tokens, grid, range)?)
+                            .ok_or_else(|| "Owner work extent overflow".to_string())
+                    })?;
+                worst = worst.max(c);
+            }
+            worst
+        } else {
+            items.len()
+        };
+        let target = work_capacity_bounded(uniform_count, padded, max_rows, grid, range)?;
+        items.resize(target, [-1, 0]);
         Ok(items)
     }
     pub(super) fn preferred_span(&self) -> usize {
@@ -1380,6 +1406,11 @@ fn split_work_rows(
         } else {
             layout
         };
+        let range = launch
+            .range
+            .map(|(min_rows, max_rows)| WorkRange { min_rows, max_rows });
+        let max_rows = selected.rows.total.div_ceil(launch.partition);
+        let mut counts = Vec::with_capacity(launch.partition);
         for rank in 0..launch.partition {
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 partitions.entry((launch.decoder, launch.partition, rank))
@@ -1395,9 +1426,6 @@ fn split_work_rows(
                 });
             }
             let lengths = &partitions[&(launch.decoder, launch.partition, rank)];
-            let range = launch
-                .range
-                .map(|(min_rows, max_rows)| WorkRange { min_rows, max_rows });
             let count = lengths.iter().copied().try_fold(0usize, |sum, tokens| {
                 sum.checked_add(work_blocks(tokens, &launch.grid, range.as_ref())?)
                     .ok_or_else(|| "Owner work extent overflow".to_string())
@@ -1405,7 +1433,14 @@ fn split_work_rows(
             if count > 8192 {
                 return Err("Owner work table exceeds its capacity".into());
             }
-            let rows = work_capacity(count, padded) / 2;
+            counts.push(count);
+        }
+        let uniform_worst = (padded == WorkPad::Bucketed && launch.partition > 1)
+            .then(|| counts.iter().copied().max().unwrap_or(0));
+        for count in counts {
+            let eff = uniform_worst.unwrap_or(count);
+            let rows =
+                work_capacity_bounded(eff, padded, max_rows, &launch.grid, range.as_ref())? / 2;
             if launch.decoder {
                 decoder_work.push(rows);
             } else {
@@ -1464,6 +1499,11 @@ fn shape_key_with_scope(
         } else {
             layout
         };
+        let range = launch
+            .range
+            .map(|(min_rows, max_rows)| WorkRange { min_rows, max_rows });
+        let max_rows = selected.rows.total.div_ceil(launch.partition);
+        let mut counts = Vec::with_capacity(launch.partition);
         for rank in 0..launch.partition {
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 partitions.entry((launch.decoder, launch.partition, rank))
@@ -1479,9 +1519,6 @@ fn shape_key_with_scope(
                 });
             }
             let lengths = &partitions[&(launch.decoder, launch.partition, rank)];
-            let range = launch
-                .range
-                .map(|(min_rows, max_rows)| WorkRange { min_rows, max_rows });
             let count = lengths.iter().copied().try_fold(0usize, |sum, tokens| {
                 sum.checked_add(work_blocks(tokens, &launch.grid, range.as_ref())?)
                     .ok_or_else(|| "Owner work extent overflow".to_string())
@@ -1489,7 +1526,15 @@ fn shape_key_with_scope(
             if count > 8192 {
                 return Err("Owner work table exceeds its capacity".into());
             }
-            work_rows.push(work_capacity(count, padded) / 2);
+            counts.push(count);
+        }
+        let uniform_worst = (padded == WorkPad::Bucketed && launch.partition > 1)
+            .then(|| counts.iter().copied().max().unwrap_or(0));
+        for count in counts {
+            let eff = uniform_worst.unwrap_or(count);
+            work_rows.push(
+                work_capacity_bounded(eff, padded, max_rows, &launch.grid, range.as_ref())? / 2,
+            );
         }
     }
     Ok(Key {
@@ -1499,6 +1544,21 @@ fn shape_key_with_scope(
         outputs: layout.outputs.len(),
         work_rows,
     })
+}
+pub(super) fn resident_work_rows(
+    contract: &Contract,
+    layout: &Layout,
+    launches: &BTreeSet<WorkLaunch>,
+) -> Result<(bool, Vec<usize>)> {
+    let key = shape_key_with_scope(
+        contract,
+        layout,
+        (layout.role, layout.decode, 0),
+        launches,
+        false,
+    )?;
+    let clipped = key.decoder_rows.is_some_and(|d| d < layout.rows.total);
+    Ok((clipped, key.work_rows))
 }
 /// Owner tables carry real work; unused lanes already use the inactive sentinel.
 /// Retain a launch envelope across nearby owner-work counts so changing
@@ -1519,13 +1579,69 @@ fn work_pad(layout: &Layout) -> WorkPad {
         WorkPad::Exact
     }
 }
+fn max_work_items(
+    max_rows: usize,
+    grid: &RowExpression,
+    range: Option<&WorkRange>,
+) -> Result<usize> {
+    if max_rows == 0 {
+        return Ok(0);
+    }
+    let lo = range.map_or(1, |r| r.min_rows.max(1));
+    let hi = range.map_or(max_rows, |r| r.max_rows.min(max_rows));
+    if lo > hi {
+        return Ok(0);
+    }
+    // Every owner with t tokens contributes f(t) = work_blocks(t) <= 64 items.
+    // Therefore sum_i f(t_i) <= max_{t in [lo, hi]} (f(t) / t) * max_rows.
+    // Since f(t) <= 64, for all t > 64 we have f(t) / t <= 64 / (upper_t + 1).
+    let mut bound = 0usize;
+    let upper_t = hi.min(lo.max(64));
+    for t in lo..=upper_t {
+        let blocks = work_blocks(t, grid, range)?;
+        if blocks > 0 {
+            let candidate = max_rows.saturating_mul(blocks).div_ceil(t).min(8192);
+            bound = bound.max(candidate);
+            if bound >= 512 {
+                return Ok(bound);
+            }
+        }
+    }
+    if hi > upper_t {
+        let t = upper_t + 1;
+        let candidate = max_rows.saturating_mul(64).div_ceil(t).min(8192);
+        bound = bound.max(candidate);
+    }
+    Ok(bound.min(8192))
+}
+fn work_capacity_bounded(
+    count: usize,
+    mode: WorkPad,
+    max_rows: usize,
+    grid: &RowExpression,
+    range: Option<&WorkRange>,
+) -> Result<usize> {
+    Ok(match mode {
+        // Bound the bucketed floor by the table's row-domain maximum so small
+        // decode/tail buckets (e.g. rows=16..127) and partitioned 256-row
+        // attention tables do not launch 512 sentinel blocks while still
+        // sharing one canonical ACL Graph across all owner splits.
+        WorkPad::Bucketed => {
+            let upper = max_work_items(max_rows, grid, range)?;
+            let floor = upper.clamp(2, 512).div_ceil(2) * 2;
+            if count <= floor {
+                floor
+            } else {
+                count.next_power_of_two().min(8192)
+            }
+        }
+        _ => work_capacity(count, mode),
+    })
+}
 fn work_capacity(count: usize, mode: WorkPad) -> usize {
     match mode {
         WorkPad::Exact => count.max(1).div_ceil(2) * 2,
         WorkPad::Padded => count.max(2).next_power_of_two().min(8192),
-        // Bucketed packets use a 512-item (256-pair) floor so 1..=8 active
-        // owners per rank partition share one canonical Trunk/Tail ACL Graph;
-        // unused lanes hold the [-1, 0] sentinel and return immediately.
         WorkPad::Bucketed => count.max(512).next_power_of_two().min(8192),
     }
 }
@@ -2676,6 +2792,39 @@ impl Worker {
                 !layout.outputs.is_empty(),
                 retained,
             )?;
+            // Enqueue the D2D draft-logit copy on the compute stream before
+            // sampling readback so it executes back-to-back on device with no
+            // post-wait host stall.
+            if readout.store_draft_distributions {
+                if layout.role != super::PacketRole::Draft {
+                    return Err("Only a draft packet can populate proposal distributions".into());
+                }
+                let source = get(
+                    &self.buffers,
+                    execution
+                        .packet
+                        .logits
+                        .as_ref()
+                        .ok_or("Missing draft logits")?,
+                )?;
+                let owners = layout
+                    .segments
+                    .iter()
+                    .map(|s| (s.slot, s.tokens))
+                    .collect::<Vec<_>>();
+                self.sampling
+                    .as_mut()
+                    .ok_or("Missing device sampler")?
+                    .store_proposals(
+                        &self.session,
+                        &source,
+                        execution
+                            .packet
+                            .draft_stride
+                            .ok_or("Missing draft stride")?,
+                        &owners,
+                    )?;
+            }
             let sampled = readout.parameters.get().and_then(|_| {
                 // Model, sampling and readback are ordered on the same stream.
                 self.sample_batch(&execution, layout, readout)
@@ -2694,36 +2843,6 @@ impl Worker {
         };
         if !execution.all_captured() {
             execution.record_shared_use();
-        }
-        if readout.store_draft_distributions {
-            if layout.role != super::PacketRole::Draft {
-                return Err("Only a draft packet can populate proposal distributions".into());
-            }
-            let source = get(
-                &self.buffers,
-                execution
-                    .packet
-                    .logits
-                    .as_ref()
-                    .ok_or("Missing draft logits")?,
-            )?;
-            let owners = layout
-                .segments
-                .iter()
-                .map(|s| (s.slot, s.tokens))
-                .collect::<Vec<_>>();
-            self.sampling
-                .as_mut()
-                .ok_or("Missing device sampler")?
-                .store_proposals(
-                    &self.session,
-                    &source,
-                    execution
-                        .packet
-                        .draft_stride
-                        .ok_or("Missing draft stride")?,
-                    &owners,
-                )?;
         }
         let mut output = vec![];
         if !layout.outputs.is_empty() {

@@ -378,3 +378,98 @@ def restore(rows, base=0, experts=48, selected=6, chunk=32, scan_rows=2048):
                     T.wait_flag("MTE3", "V", 7)
 
     return main.with_attr("orinfer.explicit_sync", True)
+
+
+def small_regroup(
+    rows,
+    base=0,
+    experts=48,
+    selected=6,
+    total_experts=384,
+    pad_last=False,
+    max_rows=128,
+):
+    """Single-kernel bit-exact MoE regrouping for small decode/tail batches (rows <= 128).
+
+    Replaces the 5-kernel clear/local/prefix/pack/restore chain with one UB pass
+    eliminating 4 inter-kernel launches/barriers and intermediate GM traffic per layer.
+    """
+    if not 1 <= selected <= 8 or not 1 <= max_rows <= 256 or not 1 <= experts <= 128:
+        raise ValueError("Small regroup requires top1-8, E1-128 and max_rows <= 256")
+    lanes = (selected + 7) // 8 * 8
+    exp_ub = (experts + 7) // 8 * 8
+
+    @T.prim_func
+    def main(
+        indices: T.Tensor((rows, lanes), "int32"),
+        gather: T.Tensor((rows * selected,), "int32"),
+        restore: T.Tensor((rows, lanes), "int32"),
+        groups: T.Tensor((experts,), "int64"),
+        errors: T.Tensor((rows + 1,), "int32"),
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, vid):
+            T.reads(indices[0:rows, 0:lanes])
+            T.writes(
+                gather[0 : rows * selected],
+                restore[0:rows, 0:lanes],
+                groups[0:experts],
+                errors[0 : rows + 1],
+            )
+            with T.Scope("V"):
+                ids = T.alloc_ub((max_rows, lanes), "int32")
+                gather_ub = T.alloc_ub((max_rows * selected,), "int32")
+                restore_ub = T.alloc_ub((max_rows, lanes), "int32")
+                counts = T.alloc_ub((exp_ub,), "int32")
+                cursor = T.alloc_ub((exp_ub,), "int32")
+                grp_ub = T.alloc_ub((exp_ub,), "int64")
+                err_ub = T.alloc_ub((max_rows + 8,), "int32")
+                state = T.alloc_ub((8,), "int32")
+                if vid == 0:
+                    T.copy(indices[:rows, :], ids[:rows, :])
+                    T.tile.fill(gather_ub, -1)
+                    T.tile.fill(restore_ub, -1)
+                    T.tile.fill(counts, 0)
+                    T.tile.fill(err_ub, 0)
+                    T.tile.fill(state, 0)
+                    T.pipe_barrier("V")
+                    T.set_flag("MTE2", "S", 5)
+                    T.wait_flag("MTE2", "S", 5)
+                    T.set_flag("V", "S", 5)
+                    T.wait_flag("V", "S", 5)
+                    for r in T.serial(rows):
+                        for l in T.serial(selected):
+                            raw = ids[r, l]
+                            if raw < 0 or raw >= total_experts:
+                                state[0] = 1
+                            e = raw - base
+                            if 0 <= e and e < experts:
+                                counts[e] = counts[e] + 1
+                    for e in T.serial(experts):
+                        c = counts[e]
+                        cursor[e] = state[1]
+                        grp_ub[e] = T.cast(c, "int64")
+                        state[1] = state[1] + c
+                    if pad_last:
+                        grp_ub[experts - 1] = grp_ub[experts - 1] + T.cast(
+                            rows * selected - state[1], "int64"
+                        )
+                    for r in T.serial(rows):
+                        for l in T.serial(selected):
+                            e = ids[r, l] - base
+                            if 0 <= e and e < experts:
+                                pos = cursor[e]
+                                cursor[e] = pos + 1
+                                gather_ub[pos] = r
+                                restore_ub[r, l] = pos
+                    err_ub[0] = state[0]
+                    err_ub[rows] = state[1]
+                    T.set_flag("S", "MTE3", 5)
+                    T.wait_flag("S", "MTE3", 5)
+                    T.copy(gather_ub[: rows * selected], gather[: rows * selected])
+                    T.copy(restore_ub[:rows, :], restore[:rows, :])
+                    T.copy(grp_ub[:experts], groups[:experts])
+                    T.copy(err_ub[: rows + 1], errors[: rows + 1])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
+
+    return main.with_attr("orinfer.explicit_sync", True)

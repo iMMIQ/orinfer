@@ -238,38 +238,86 @@ impl Runtime {
                 Ok(Some(predicted))
             },
         )?;
-        let depths = allocation.depths;
+        let mut depths = allocation.depths;
+        let mut expanded_bucket = false;
+        // Fill unused verification bucket slack (pad_slot rows) with extra verified
+        // drafts from the already-computed parallel draft block at zero extra NPU cost.
+        if baseline.prefill_rows == 0 && depths.iter().any(|&d| d > 0) {
+            let max_depth = *depths.iter().max().unwrap();
+            if let Some(block) = self
+                .team
+                .draft_blocks
+                .iter()
+                .copied()
+                .find(|&b| b >= max_depth)
+            {
+                let mut total: usize = depths.iter().map(|&d| d + 1).sum();
+                let output_cap = self
+                    .team
+                    .model
+                    .batch
+                    .as_ref()
+                    .map_or(capacity, |c| c.output_capacity());
+                let target = packet::bucket_verify_rows(total)
+                    .min(capacity)
+                    .min(output_cap);
+                if total <= 127 && target > total {
+                    let owner_rates: Vec<Vec<f64>> = feedback
+                        .iter()
+                        .map(|f| f.rates(block, &[], block))
+                        .collect();
+                    while total < target {
+                        let best = (0..depths.len())
+                            .filter(|&p| depths[p] > 0 && depths[p] < maxima[p].min(block))
+                            .max_by(|&a, &b| {
+                                let ra = owner_rates[a].get(depths[a]).copied().unwrap_or(0.0);
+                                let rb = owner_rates[b].get(depths[b]).copied().unwrap_or(0.0);
+                                ra.total_cmp(&rb)
+                                    .then_with(|| depths[b].cmp(&depths[a]))
+                                    .then_with(|| b.cmp(&a))
+                            });
+                        let Some(pos) = best else {
+                            break;
+                        };
+                        depths[pos] += 1;
+                        total += 1;
+                        expanded_bucket = true;
+                    }
+                }
+            }
+        }
         for (&i, &depth) in indices.iter().zip(&depths) {
             decode_rows[i] = depth + 1;
         }
         let packet_budget = verification_budget(&decode_rows);
-        let retained_work = if let Some(reference) = allocation.reference {
-            if std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some() {
-                super::super::log_async(format!(
-                    "DSPARK_ALLOCATION {}",
-                    serde_json::json!({
-                        "before":reference,"after":depths,"mixed":mixed,
-                    })
-                ));
-            }
-            if let Some((cached, _)) = retained_cache.remove(&reference) {
-                Some(cached)
-            } else {
-                for (&i, &depth) in indices.iter().zip(&reference) {
-                    decode_rows[i] = depth + 1;
+        let retained_work =
+            if let Some(reference) = allocation.reference.filter(|_| !expanded_bucket) {
+                if std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some() {
+                    super::super::log_async(format!(
+                        "DSPARK_ALLOCATION {}",
+                        serde_json::json!({
+                            "before":reference,"after":depths,"mixed":mixed,
+                        })
+                    ));
                 }
-                Some(baseline.forecast_layout(
-                    requests,
-                    &decode_rows,
-                    verification_budget(&decode_rows),
-                    keep,
-                    capacity,
-                    owners,
-                )?)
-            }
-        } else {
-            None
-        };
+                if let Some((cached, _)) = retained_cache.remove(&reference) {
+                    Some(cached)
+                } else {
+                    for (&i, &depth) in indices.iter().zip(&reference) {
+                        decode_rows[i] = depth + 1;
+                    }
+                    Some(baseline.forecast_layout(
+                        requests,
+                        &decode_rows,
+                        verification_budget(&decode_rows),
+                        keep,
+                        capacity,
+                        owners,
+                    )?)
+                }
+            } else {
+                None
+            };
         self.statistics.mtp_budget_calls += 1;
         self.statistics.mtp_budget_s += budget_started.elapsed().as_secs_f64();
         let selected = indices.into_iter().zip(depths).collect::<Vec<_>>();
@@ -432,11 +480,17 @@ impl Runtime {
             prefill_requests,
             ..
         } = verification;
-        // Dispatch GrowCachedAndBeginVerification to all 8 ranks first so CPU
-        // readout/rejection/Engram-forecast preparation overlaps the 8-rank IPC.
-        let started = self
-            .team
-            .send_verification_forward(&layout, journal.clone())?;
+        let fast_verify = self.team.can_fast_verify(&layout, &journal);
+        // On the slow path, dispatch GrowCachedAndBeginVerification to all 8 ranks
+        // first so CPU readout/rejection/Engram preparation overlaps the 8-rank IPC.
+        let slow_started = if fast_verify {
+            None
+        } else {
+            Some(
+                self.team
+                    .send_verification_forward(&layout, journal.clone())?,
+            )
+        };
         let mut verified_work = packet::work(&packet_requests, requests, prefill_rows);
         if prefill_rows == 0 && layout.rows.total > verified_work.rows {
             verified_work.rows = layout.rows.total;
@@ -508,36 +562,65 @@ impl Runtime {
                 }
             }
             self.prepare_host_inputs(&layout, &packet_requests, requests, &mut readout);
+            // Overlap Layer 1 Engram random host-RAM gather on verification batches
+            // (both pure decode and mixed) with verification IPC, journal copy, and layer 0.
+            if let Some(first) = readout.first_input.as_deref() {
+                let mut pairs: Vec<(&[u32], &[u32])> = Vec::with_capacity(inputs.len());
+                for (lane, tok) in inputs.iter().enumerate() {
+                    if let Some(&(req_idx, _)) = packet_requests.get(lane) {
+                        let req = &requests[req_idx];
+                        let worker_hist = if req.prefilling {
+                            &req.input[..req.offset.min(req.input.len())]
+                        } else {
+                            // Worker owner.history precedes the anchor token at tok[0].
+                            &req.history[..req.history.len().saturating_sub(1)]
+                        };
+                        pairs.push((worker_hist, tok.as_slice()));
+                    } else {
+                        pairs.push((&[], tok.as_slice()));
+                    }
+                }
+                self.team.prefetch_first_primary(first, &pairs);
+            }
             readout
         });
-        let (first_prepared, first_journal_ready) =
-            self.team.collect_verification_forward(&layout, started)?;
-        let readout = readout_result?;
-        let need_workspace = !first_prepared.all_graphs() && !first_prepared.workspace_fits;
-        let verify_prepared = if !need_workspace && first_journal_ready {
-            first_prepared
-        } else {
-            let Some(retried) = self.begin_verification_forward_with_workspace(
-                &layout,
-                journal,
-                "Insufficient DSpark verification workspace",
-            )?
-            else {
-                // Journal memory could not be reserved even after prefix/program
-                // reclamation; fall back cleanly to ordinary target decode.
-                return self.advance_selection(baseline, requests, options, false, || {});
+        let (verified, verify_timing, save_s) = if let Some(started) = slow_started {
+            let (first_prepared, first_journal_ready) =
+                self.team.collect_verification_forward(&layout, started)?;
+            let readout = readout_result?;
+            let need_workspace = !first_prepared.all_graphs() && !first_prepared.workspace_fits;
+            let verify_prepared = if !need_workspace && first_journal_ready {
+                first_prepared
+            } else {
+                let Some(retried) = self.begin_verification_forward_with_workspace(
+                    &layout,
+                    journal.clone(),
+                    "Insufficient DSpark verification workspace",
+                )?
+                else {
+                    // Journal memory could not be reserved even after prefix/program
+                    // reclamation; fall back cleanly to ordinary target decode.
+                    return self.advance_selection(baseline, requests, options, false, || {});
+                };
+                retried
             };
-            retried
+            let save_s = started.elapsed().as_secs_f64();
+            let (verified, verify_timing) = self.team.finish_forward(
+                verify_prepared,
+                layout,
+                inputs,
+                readout,
+                Some(capture),
+                || {},
+            )?;
+            (verified, verify_timing, save_s)
+        } else {
+            let readout = readout_result?;
+            let (verified, verify_timing) =
+                self.team
+                    .fast_verify_forward(layout, journal.clone(), inputs, readout)?;
+            (verified, verify_timing, 0.)
         };
-        let save_s = started.elapsed().as_secs_f64();
-        let (verified, verify_timing) = self.team.finish_forward(
-            verify_prepared,
-            layout,
-            inputs,
-            readout,
-            Some(capture),
-            || {},
-        )?;
         verify_timing.record(&mut self.statistics.batch_execution);
         self.observe_prefill(prefill_work, &verify_timing);
         let verify_s = verify_timing.seconds;
@@ -706,7 +789,7 @@ impl Runtime {
         let sampling_s = started.elapsed().as_secs_f64();
         self.speculation.sampling_s += sampling_s;
         let started = Instant::now();
-        self.team.exchange(Command::FinishVerification(rollback))?;
+        self.team.finish_verification(rollback, &journal)?;
         let restore_s = started.elapsed().as_secs_f64() + save_s;
         self.speculation_policy.observe(
             selected.len(),

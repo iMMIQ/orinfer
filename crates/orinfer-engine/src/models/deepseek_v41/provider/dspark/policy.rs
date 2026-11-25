@@ -47,7 +47,7 @@ impl Feedback {
             .or_default()
             .observe(confidence, proposed, accepted);
     }
-    fn rates(&self, maximum: usize, prior: &[f64], block: usize) -> Vec<f64> {
+    pub(super) fn rates(&self, maximum: usize, prior: &[f64], block: usize) -> Vec<f64> {
         self.blocks
             .get(&block)
             .unwrap_or(&History::default())

@@ -51,6 +51,7 @@ pub(super) enum Command {
     CaptureShared(Layout, String),
     Forward(Layout, Vec<Vec<u32>>, Readout, Vec<String>),
     FastForward(Layout, Vec<Vec<u32>>, Readout),
+    FastVerifyForward(Layout, Vec<(usize, usize)>, Vec<Vec<u32>>, Readout),
     BeginVerification(Vec<(usize, usize)>),
     FinishVerification(Vec<(usize, usize)>),
     Save {
@@ -300,7 +301,9 @@ struct ResidentKey {
     total_rows: usize,
     outputs: usize,
     decoder_rows: usize,
+    clipped: bool,
     pad_slot: bool,
+    work_rows: Vec<usize>,
     segments: Vec<(usize, super::replay::Role)>,
 }
 
@@ -323,6 +326,8 @@ pub(super) struct Team {
     pub(super) host_prepare: Arc<std::sync::atomic::AtomicBool>,
     rank_free_range: std::cell::Cell<(usize, usize)>,
     resident_graphs: std::cell::RefCell<BTreeSet<ResidentKey>>,
+    /// Per-owner maximum verification rows already backed by a pooled journal slab.
+    verified_journal_rows: std::cell::RefCell<BTreeMap<usize, usize>>,
 }
 
 /// Execution mode and preparation are measured separately; direct is a valid steady path.
@@ -477,6 +482,7 @@ impl Team {
             host_prepare: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rank_free_range: std::cell::Cell::new((0, 0)),
             resident_graphs: std::cell::RefCell::new(BTreeSet::new()),
+            verified_journal_rows: std::cell::RefCell::new(BTreeMap::new()),
         };
         // One shared CPU load owns no ACL handles. Join it with rank workers
         // on every startup/teardown path, including partial rank failures.
@@ -1021,6 +1027,27 @@ impl Team {
                                 .grow_batch(&layout)
                                 .and_then(|()| worker.forward_batch(&layout, &tokens, &readout))
                                 .map(|values| Reply::Outputs(values, false)),
+                            Command::FastVerifyForward(layout, owners, tokens, readout) => worker
+                                .grow_batch(&layout)
+                                .and_then(|()| {
+                                    journal.clear();
+                                    let mut copies = vec![];
+                                    for (id, rows) in owners {
+                                        let saved = worker.save_mutable(
+                                            id,
+                                            rows,
+                                            journal_pool.remove(&id),
+                                            &mut idle_journals,
+                                            &mut copies,
+                                        )?;
+                                        journal.insert(id, saved);
+                                    }
+                                    if !copies.is_empty() {
+                                        worker.session.copy_many(&copies)?;
+                                    }
+                                    worker.forward_batch(&layout, &tokens, &readout)
+                                })
+                                .map(|values| Reply::Outputs(values, false)),
                             Command::Save {
                                 owner,
                                 snapshot,
@@ -1116,7 +1143,49 @@ impl Team {
         if matches!(command, Command::Prepare(_, _) | Command::Invalidate(_)) {
             self.resident_graphs.borrow_mut().clear();
         }
+        match &command {
+            Command::Release(None) => self.verified_journal_rows.borrow_mut().clear(),
+            Command::Release(Some(slot)) => {
+                self.verified_journal_rows.borrow_mut().remove(slot);
+            }
+            Command::Reset(ids) => {
+                let mut rows = self.verified_journal_rows.borrow_mut();
+                for id in ids {
+                    rows.remove(id);
+                }
+            }
+            _ => {}
+        }
         exchange(&self.peers, command)
+    }
+    pub fn has_fused_small_target(&self) -> bool {
+        self.target_domains
+            .iter()
+            .any(|&(decode, min_rows, max_rows)| !decode && min_rows <= 1 && max_rows >= 32)
+    }
+    pub fn can_fast_verify(&self, layout: &Layout, journal: &[(usize, usize)]) -> bool {
+        if !self.is_resident(layout) {
+            return false;
+        }
+        let pooled = self.verified_journal_rows.borrow();
+        journal
+            .iter()
+            .all(|&(slot, rows)| pooled.get(&slot).is_some_and(|&cap| cap >= rows))
+    }
+    pub fn finish_verification(
+        &self,
+        rollback: Vec<(usize, usize)>,
+        verified: &[(usize, usize)],
+    ) -> Result<()> {
+        self.exchange(Command::FinishVerification(rollback))?;
+        let mut pooled = self.verified_journal_rows.borrow_mut();
+        for &(slot, rows) in verified {
+            pooled
+                .entry(slot)
+                .and_modify(|cap| *cap = (*cap).max(rows))
+                .or_insert(rows);
+        }
+        Ok(())
     }
     pub fn exchange_heavy(&self, command: Command) -> Result<Vec<Reply>> {
         self.peers.exchange_heavy(command)
@@ -1273,11 +1342,10 @@ impl Team {
         if !self.graphs_enabled || layout.has_work_shape() {
             return None;
         }
-        let replay = self
-            .model
-            .batch
-            .as_ref()
-            .and_then(|c| c.decoder_replay.as_ref());
+        let contract = self.model.batch.as_ref()?;
+        let (clipped, work_rows) =
+            super::batch::resident_work_rows(contract, layout, &self.work_launches).ok()?;
+        let replay = contract.decoder_replay.as_ref();
         let final_only = replay.is_some_and(|r| r.final_prompt_only);
         let keep = replay.filter(|r| r.final_prompt_only).map_or(0, |r| r.keep);
         let decoder_rows = if keep > 0 && layout.role == super::PacketRole::Target && !layout.decode
@@ -1315,7 +1383,9 @@ impl Team {
             total_rows: layout.rows.total,
             outputs: layout.outputs.len(),
             decoder_rows,
+            clipped,
             pad_slot: layout.pad_slot.is_some(),
+            work_rows,
             segments,
         })
     }
@@ -1348,7 +1418,7 @@ impl Team {
         };
         let mut started_slots = Vec::with_capacity(draft_owners);
         for slot in 0..draft_owners {
-            let limit = if slot < 2 { capacity } else { 64 };
+            let limit = if slot < 3 { capacity } else { 128 };
             self.exchange(Command::StartOwner {
                 slot,
                 limit,
@@ -1410,9 +1480,10 @@ impl Team {
                 }
             }
         }
-        // 2. Decode-only canonical verification buckets (16, 32, 48, 64, 80, 96).
+        // 2. Decode-only canonical verification buckets (16, 24, 32, 48, 64, 80, 96),
+        // plus 9-owner (WorkPad::Bucketed=1024) decode verification buckets (64, 80, 96).
         let output_cap = contract.output_capacity();
-        for rows in [16usize, 32, 48, 64, 80, 96] {
+        for rows in [16usize, 24, 32, 48, 64, 80, 96] {
             if rows > capacity || rows > output_cap {
                 continue;
             }
@@ -1430,16 +1501,43 @@ impl Team {
                 }
             }
         }
+        if draft_owners >= 9 {
+            for rows in [64usize, 80, 96] {
+                if rows > capacity || rows > output_cap {
+                    continue;
+                }
+                let per = (rows / 9).max(1);
+                let rem = rows.saturating_sub(per * 8);
+                if rem == 0 {
+                    continue;
+                }
+                let segs = (0..8)
+                    .map(|slot| orinfer_model_sdk::architecture::BatchSegment { slot, tokens: per })
+                    .collect();
+                if let Ok(mut dec9) = Layout::verification(segs, capacity, owners)
+                    && dec9.append_pad(8, rem, rem, None, capacity, owners).is_ok()
+                    && capture_one(dec9).unwrap_or(false)
+                {
+                    captured += 1;
+                }
+            }
+        }
         // 3. Mixed 2048/1024 Trunks + canonical Tail/Head buckets (both <=8 and >8 owners).
         if let Some(replay) = contract.decoder_replay.as_ref() {
-            for dec_rows in [32usize, 64, 127] {
-                if dec_rows >= capacity || dec_rows > output_cap {
+            for (total_rows, dec_rows) in [
+                (capacity, 32usize),
+                (capacity, 64usize),
+                (capacity, 127usize),
+                (1024usize, 32usize),
+                (1024usize, 64usize),
+            ] {
+                if total_rows > capacity || dec_rows >= total_rows || dec_rows > output_cap {
                     continue;
                 }
                 if let Ok(mut mixed) = Layout::new(
                     vec![orinfer_model_sdk::architecture::BatchSegment {
                         slot: 0,
-                        tokens: capacity - dec_rows,
+                        tokens: total_rows - dec_rows,
                     }],
                     vec![],
                     false,
@@ -1453,40 +1551,51 @@ impl Team {
                     captured += 1;
                 }
             }
-            // 9-owner mixed 2048 shapes capture the WorkPad::Bucketed=1024 Trunk and
-            // Tail graphs used when >8 owners are active concurrently.
+            // 9- and 10-owner mixed 2048 shapes capture WorkPad::Bucketed=1024 Trunk
+            // (with both <=8 and >8 decoder Tail graphs) when >8 owners are active.
             if draft_owners >= 9 {
                 for dec_rows in [64usize, 127usize] {
                     if dec_rows >= capacity || dec_rows > output_cap {
                         continue;
                     }
-                    let per = (dec_rows / 8).max(1);
-                    let rem = dec_rows - per * 7;
-                    let mut segs = Vec::with_capacity(8);
-                    segs.push(orinfer_model_sdk::architecture::BatchSegment {
-                        slot: 0,
-                        tokens: capacity - dec_rows,
-                    });
-                    for slot in 1..8 {
-                        segs.push(orinfer_model_sdk::architecture::BatchSegment {
-                            slot,
-                            tokens: per,
-                        });
-                    }
-                    if let Ok(mut mixed9) = Layout::new(segs, vec![], false, capacity, owners) {
-                        for lane in 1..8 {
-                            mixed9.decoder_roles[lane] = super::replay::Role::Continue;
-                            for pos in 0..per {
-                                mixed9.outputs.push(lane);
-                                mixed9.output_positions.push(pos);
-                            }
+                    for total_owners in [9usize, 10usize] {
+                        if total_owners > draft_owners {
+                            continue;
                         }
-                        if mixed9
-                            .append_pad(8, rem, rem, None, capacity, owners)
-                            .is_ok()
-                            && capture_one(mixed9).unwrap_or(false)
+                        let dec_owners = total_owners - 1;
+                        let real_dec = dec_owners - 1;
+                        let per = (dec_rows / dec_owners).max(1);
+                        let rem = dec_rows.saturating_sub(per * real_dec);
+                        if rem == 0 {
+                            continue;
+                        }
+                        let mut segs = Vec::with_capacity(real_dec + 1);
+                        segs.push(orinfer_model_sdk::architecture::BatchSegment {
+                            slot: 0,
+                            tokens: capacity - dec_rows,
+                        });
+                        for slot in 1..=real_dec {
+                            segs.push(orinfer_model_sdk::architecture::BatchSegment {
+                                slot,
+                                tokens: per,
+                            });
+                        }
+                        if let Ok(mut mixed_n) = Layout::new(segs, vec![], false, capacity, owners)
                         {
-                            captured += 1;
+                            for lane in 1..=real_dec {
+                                mixed_n.decoder_roles[lane] = super::replay::Role::Continue;
+                                for pos in 0..per {
+                                    mixed_n.outputs.push(lane);
+                                    mixed_n.output_positions.push(pos);
+                                }
+                            }
+                            if mixed_n
+                                .append_pad(real_dec + 1, rem, rem, None, capacity, owners)
+                                .is_ok()
+                                && capture_one(mixed_n).unwrap_or(false)
+                            {
+                                captured += 1;
+                            }
                         }
                     }
                 }
@@ -1537,6 +1646,91 @@ impl Team {
                             true
                         };
                         if ready && capture_one(fin).unwrap_or(false) {
+                            captured += 1;
+                        }
+                    }
+                }
+                // 9-owner Final-window mixed buckets capture the WorkPad::Bucketed=1024
+                // graphs used when >8 owners are active alongside a final prefill window.
+                if draft_owners >= 9 {
+                    for (target_dec, target_out) in [(192usize, 64usize), (256usize, 127usize)] {
+                        if target_out > output_cap || target_dec <= keep {
+                            continue;
+                        }
+                        let extra_dec = target_dec - keep;
+                        let dec_total = target_out.saturating_sub(1).min(extra_dec);
+                        let per = (dec_total / 8).max(1);
+                        let rem = extra_dec.saturating_sub(per * 7);
+                        let pad_out = target_out.saturating_sub(1 + per * 7);
+                        let prefill_toks = capacity.saturating_sub(per * 7 + rem);
+                        if rem == 0 || prefill_toks < keep || pad_out > rem {
+                            continue;
+                        }
+                        let mut segs = Vec::with_capacity(8);
+                        segs.push(orinfer_model_sdk::architecture::BatchSegment {
+                            slot: 0,
+                            tokens: prefill_toks,
+                        });
+                        for slot in 1..8 {
+                            segs.push(orinfer_model_sdk::architecture::BatchSegment {
+                                slot,
+                                tokens: per,
+                            });
+                        }
+                        if let Ok(mut fin9) = Layout::new(segs, vec![0], false, capacity, owners) {
+                            for lane in 1..8 {
+                                fin9.decoder_roles[lane] = super::replay::Role::Continue;
+                                for pos in 0..per {
+                                    fin9.outputs.push(lane);
+                                    fin9.output_positions.push(pos);
+                                }
+                            }
+                            if fin9
+                                .append_pad(8, rem, pad_out, None, capacity, owners)
+                                .is_ok()
+                                && capture_one(fin9).unwrap_or(false)
+                            {
+                                captured += 1;
+                            }
+                        }
+                    }
+                }
+                // Two-final-window mixed bucket (384 decoder rows = 2x128 Final + 128 decode/pad,
+                // 64 outputs) removes Direct fallbacks when two short final prefills pack together.
+                // Place the large producer chunk on slot 0 (which has full `capacity` token budget).
+                if capacity >= 2048 && keep * 3 <= capacity && 64 <= output_cap {
+                    let dec_toks = 62usize;
+                    let pad_len = keep.saturating_sub(dec_toks);
+                    let prod_toks = capacity - keep * 2 - dec_toks - pad_len;
+                    let segs = vec![
+                        orinfer_model_sdk::architecture::BatchSegment {
+                            slot: 0,
+                            tokens: prod_toks,
+                        },
+                        orinfer_model_sdk::architecture::BatchSegment {
+                            slot: 1,
+                            tokens: keep,
+                        },
+                        orinfer_model_sdk::architecture::BatchSegment {
+                            slot: 2,
+                            tokens: keep,
+                        },
+                        orinfer_model_sdk::architecture::BatchSegment {
+                            slot: 3,
+                            tokens: dec_toks,
+                        },
+                    ];
+                    if let Ok(mut fin2) = Layout::new(segs, vec![1, 2], false, capacity, owners) {
+                        fin2.decoder_roles[3] = super::replay::Role::Continue;
+                        for pos in 0..dec_toks {
+                            fin2.outputs.push(3);
+                            fin2.output_positions.push(pos);
+                        }
+                        if fin2
+                            .append_pad(4, pad_len, 0, None, capacity, owners)
+                            .is_ok()
+                            && capture_one(fin2).unwrap_or(false)
+                        {
                             captured += 1;
                         }
                     }
@@ -1595,6 +1789,40 @@ impl Team {
         collect_forward_outputs(
             results,
             replicated,
+            false,
+            sampled,
+            readout_rejection_empty,
+            parameters,
+            first_input,
+            started,
+            0.,
+            true,
+            false,
+            false,
+            false,
+            0.,
+            0.,
+        )
+    }
+    pub fn fast_verify_forward(
+        &self,
+        layout: Layout,
+        journal: Vec<(usize, usize)>,
+        tokens: Vec<Vec<u32>>,
+        readout: impl Into<Readout>,
+    ) -> Result<(Vec<Output>, Timing)> {
+        let started = Instant::now();
+        let readout = readout.into();
+        let sampled = !readout.draws.is_empty();
+        let readout_rejection_empty = readout.rejection.is_empty();
+        let parameters = Arc::clone(&readout.parameters);
+        let first_input = readout.first_input.clone();
+        self.peers
+            .send(Command::FastVerifyForward(layout, journal, tokens, readout))?;
+        let results = self.peers.collect()?;
+        collect_forward_outputs(
+            results,
+            false,
             false,
             sampled,
             readout_rejection_empty,
