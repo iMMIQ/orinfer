@@ -1,6 +1,6 @@
 # DSv4.1 Ascend 910B Production Deployment
 
-This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 910B (TP8)** with Orinfer **v0.4.2**.
+This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 910B (TP8)** with Orinfer **v0.4.3**.
 
 ---
 
@@ -9,7 +9,7 @@ This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 91
 - **OS & Runtime**: Linux `aarch64`, `glibc >= 2.34`, **CANN 9.2**, 8 dedicated Ascend 910B NPUs (TP8).
 - **Recommended Host**: ≥96 CPU cores and ≥1 TB host RAM when keeping Engram tables resident (~207 GiB) alongside 256 GiB CPU prefix cache offload.
 - **Supported Features**: OpenAI HTTP/SSE, continuous batching, DSpark speculative decoding (auto up to 5 drafts by default), device + CPU tiered prefix cache, DSML tool calling, thinking history, and single/multi-image vision (when paired with `vision.safetensors` and a vision-enabled execution package).
-- **Package Digest (A2 W4A8)**: `8f58245c8b699be8e66141cc85943794fa93e95fa58b3601df80254ef726278d` (compact `shared-json-v1` + `rope_f32_v1` A2 package shipped with v0.4.2).
+- **Package Digest (A2 W4A8)**: `67099303312023c50d4dd48323b257bfc52700d1385de182242f87045dbdf522` (compact `shared-json-v1` + `rope_f32_v1` A2 package shipped with v0.4.3).
 
 ---
 
@@ -18,28 +18,28 @@ This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 91
 ### Install Engine & Execution Package
 
 ```bash
-tar -xf orinfer-v0.4.2-linux-aarch64.tar.xz
+tar -xf orinfer-v0.4.3-linux-aarch64.tar.xz
 bin/orinfer --version
 
 bin/orinfer package install \
-  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.4.2.tar.xz \
+  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.4.3.tar.xz \
   --cache /srv/orinfer/execution-cache
 ```
 
 ### Update Model Frontend Metadata (Existing Deployments)
 
-Weights from v0.3.1+ remain unchanged. Create a new model directory (using hardlinks on the same filesystem so the previous directory stays intact for rollback) and pull the matching v0.4.2 metadata:
+Weights from v0.3.1+ remain unchanged. Create a new model directory (using hardlinks on the same filesystem so the previous directory stays intact for rollback) and pull the matching v0.4.3 metadata:
 
 ```bash
 uv run --locked python -m orinfer_build.models.deepseek_v41.service --frontend-only \
-  --model-dir /data/model/current --output /data/model/dsv41-v0.4.2
+  --model-dir /data/model/current --output /data/model/dsv41-v0.4.3
 
 hf download immiq/DeepSeek-V4.1-Flash-1017-Orinfer-A2-W4A8 \
   cache/model.json README.md publication.json SHA256SUMS \
-  --revision v0.4.2 --local-dir /data/model/dsv41-v0.4.2
+  --revision v0.4.3 --local-dir /data/model/dsv41-v0.4.3
 ```
 
-Run `bin/orinfer validate-model /data/model/dsv41-v0.4.2` to verify frontend, execution package, and weight integrity.
+Run `bin/orinfer validate-model /data/model/dsv41-v0.4.3` to verify frontend, execution package, and weight integrity.
 
 ---
 
@@ -57,7 +57,7 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_NPU_SOCKET_PORT_RANGE=auto
 export HCCL_EXEC_TIMEOUT=120
 
-bin/orinfer serve /data/model/dsv41-v0.4.2 \
+bin/orinfer serve /data/model/dsv41-v0.4.3 \
   --model deepseek-v4.1 \
   --listen 127.0.0.1:8088 \
   --mtp-drafts auto \
