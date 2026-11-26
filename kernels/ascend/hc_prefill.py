@@ -6,8 +6,8 @@ from kernels.ascend.vector_math import rsqrt_fp32
 
 def normalization(tile_rows, width, splits=8, eps=1e-20):
     """Inline the same normalization into standalone and Sinkhorn producers."""
-    if splits != 8:
-        raise ValueError("mHC normalization requires eight splits")
+    if splits not in (8, 10, 16, 20):
+        raise ValueError("mHC normalization requires 8, 10, 16 or 20 splits")
     count = tile_rows * 32
 
     @T.macro

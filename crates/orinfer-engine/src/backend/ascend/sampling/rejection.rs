@@ -145,7 +145,7 @@ pub(super) struct Rejection {
     gathered: Buffer,
     first: Program,
     second: Program,
-    graphs: Option<(Graph, Graph)>,
+    graph: Option<Graph>,
     ready: Vec<usize>,
 }
 impl Rejection {
@@ -230,7 +230,7 @@ impl Rejection {
             gathered,
             first,
             second,
-            graphs: None,
+            graph: None,
             ready,
         })
     }
@@ -266,11 +266,13 @@ impl Rejection {
         self.ready = ready;
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn sample(
         &mut self,
         session: &Session,
         comm: &Communicator,
         c: &super::Contract,
+        controls: (Buffer, Vec<u8>),
         proposals: &[Option<Proposal>],
         active: &Buffer,
         capture: bool,
@@ -300,32 +302,64 @@ impl Rejection {
             };
             packed.extend(fields.into_iter().flat_map(i32::to_le_bytes));
         }
-        if capture && self.graphs.is_none() {
+        let gather_count = (c.capacity * 8) as u64;
+        if capture && self.graph.is_none() {
             session.upload_inputs(&[(active.clone(), 0i32.to_le_bytes().to_vec())])?;
-            self.graphs = Some((self.first.capture(session)?, self.second.capture(session)?));
+            // Warm up HCCL AllGather and kernels once on this stream before graph capture.
+            self.first.enqueue(session)?;
+            comm.all_gather(
+                session,
+                &self.local,
+                &self.gathered,
+                gather_count,
+                Element::Float32,
+            )?;
+            self.second.enqueue(session)?.wait()?;
+            let first_keep = self.first.clone_keepalive();
+            let second_keep = self.second.clone_keepalive();
+            let keep = Box::new((
+                first_keep,
+                second_keep,
+                comm.clone(),
+                self.local.clone(),
+                self.gathered.clone(),
+            ));
+            // SAFETY: All kernels, communicator, and device buffers have stable
+            // addresses and are retained inside `keep` through graph teardown.
+            let captured = unsafe {
+                Graph::capture(session, keep, |stream| {
+                    self.first.launch_on_stream(stream)?;
+                    comm.gather_on_stream(
+                        stream,
+                        &self.local,
+                        &self.gathered,
+                        gather_count,
+                        Element::Float32,
+                    )?;
+                    self.second.launch_on_stream(stream)
+                })
+            }?;
+            self.graph = Some(captured);
         }
         session.upload_inputs(&[
+            controls,
             (self.proposals.slice(0, packed.len())?, packed),
             (
                 active.clone(),
                 (proposals.len() as i32).to_le_bytes().to_vec(),
             ),
         ])?;
-        if let Some((first, _)) = self.graphs.as_ref().filter(|_| capture) {
-            first.enqueue(session)?;
+        if let Some(graph) = self.graph.as_ref().filter(|_| capture) {
+            graph.enqueue(session)?;
         } else {
             self.first.enqueue(session)?;
-        }
-        comm.all_gather(
-            session,
-            &self.local,
-            &self.gathered,
-            (c.capacity * 8) as u64,
-            Element::Float32,
-        )?;
-        if let Some((_, second)) = self.graphs.as_ref().filter(|_| capture) {
-            second.enqueue(session)?;
-        } else {
+            comm.all_gather(
+                session,
+                &self.local,
+                &self.gathered,
+                gather_count,
+                Element::Float32,
+            )?;
             self.second.enqueue(session)?;
         }
         Ok(())

@@ -45,6 +45,9 @@ pub(super) fn load_spec(path: &Path, model_dir: &Path) -> Result<(Model, PathBuf
 /// Reject incomplete or mismatched packages before allocating resident weights.
 pub(super) fn preflight(model: &Model, base: &Path) -> Result<()> {
     batch::validate(model)?;
+    if let Some(copy_spans) = model.batch.as_ref().and_then(|b| b.copy_spans.as_deref()) {
+        state::SpanCopier::preflight(base, copy_spans)?;
+    }
     if let Some(c) = &model.device_inputs {
         c.preflight(model, base)?;
     }

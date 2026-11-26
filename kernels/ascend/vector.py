@@ -422,12 +422,14 @@ def mhc_split_sinkhorn(rows, iterations=20, eps=1e-6, vector_rows=True, tile_row
     return main
 
 
-def mhc_normalized_sinkhorn(rows, width=5120, iterations=20, eps=1e-6, tile_rows=32):
+def mhc_normalized_sinkhorn(rows, width=5120, iterations=20, eps=1e-6, tile_rows=32, splits=8):
     """Normalize and emit mHC gates in one pass with identical FP32 boundaries."""
-    return _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows, normalization_width=width)
+    return _mhc_split_sinkhorn_rows(
+        rows, iterations, eps, tile_rows, normalization_width=width, splits=splits
+    )
 
 
-def _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows, normalization_width=None):
+def _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows, normalization_width=None, splits=8):
     """Batch independent 4x4 matrices with the original row/column reductions."""
     if tile_rows not in (2, 4, 8, 16, 32):
         raise ValueError("mHC Sinkhorn row tile must be 1, 2, 4, 8, 16 or 32")
@@ -436,11 +438,11 @@ def _mhc_split_sinkhorn_rows(rows, iterations, eps, tile_rows, normalization_wid
     sub_tile = min(tile_rows, 4)
     width = sub_tile * 32
     normalized_input = normalization_width is not None
-    input_rows = rows * 8 if normalized_input else rows
+    input_rows = rows * splits if normalized_input else rows
     if normalized_input:
         from kernels.ascend.hc_prefill import normalization
 
-        normalize = normalization(sub_tile, normalization_width)
+        normalize = normalization(sub_tile, normalization_width, splits=splits)
 
     @T.prim_func
     def main(

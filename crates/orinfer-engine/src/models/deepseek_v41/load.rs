@@ -319,8 +319,15 @@ impl Worker {
             buffers: vec![],
             packets: rank.packets.clone(),
         });
+        let span_copier = model
+            .batch
+            .as_ref()
+            .and_then(|b| b.copy_spans.as_deref())
+            .map(|path| state::SpanCopier::load(&session, package, path))
+            .transpose()?;
         let mut worker = Self {
             device_inputs: None,
+            span_copier,
             sampling: model
                 .sampling
                 .as_ref()

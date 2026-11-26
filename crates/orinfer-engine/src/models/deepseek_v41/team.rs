@@ -611,7 +611,7 @@ impl Team {
                                     outcome.and_then(|()| {
                                         // Compute-stream ordered before verification forward.
                                         if !copies.is_empty() {
-                                            worker.session.copy_many(&copies)?;
+                                            worker.copy_many(&copies)?;
                                         }
                                         Ok(Reply::Ready)
                                     })
@@ -635,7 +635,7 @@ impl Team {
                                         // Compute-stream ordered before subsequent draft/verify;
                                         // copy_many retains journal buffers through completion.
                                         if !copies.is_empty() {
-                                            worker.session.copy_many(&copies)?;
+                                            worker.copy_many(&copies)?;
                                         }
                                         Ok(Reply::Ready)
                                     });
@@ -952,7 +952,7 @@ impl Team {
                                     } else {
                                         outcome.and_then(|()| {
                                             if !copies.is_empty() {
-                                                worker.session.copy_many(&copies)?;
+                                                worker.copy_many(&copies)?;
                                             }
                                             Ok(Reply::SplitCachedAndVerification(
                                                 states,
@@ -1043,7 +1043,7 @@ impl Team {
                                         journal.insert(id, saved);
                                     }
                                     if !copies.is_empty() {
-                                        worker.session.copy_many(&copies)?;
+                                        worker.copy_many(&copies)?;
                                     }
                                     worker.forward_batch(&layout, &tokens, &readout)
                                 })
@@ -1161,7 +1161,7 @@ impl Team {
     pub fn has_fused_small_target(&self) -> bool {
         self.target_domains
             .iter()
-            .any(|&(decode, min_rows, max_rows)| !decode && min_rows <= 1 && max_rows >= 32)
+            .any(|&(decode, min_rows, max_rows)| !decode && min_rows <= 1 && max_rows != 31)
     }
     pub fn can_fast_verify(&self, layout: &Layout, journal: &[(usize, usize)]) -> bool {
         if !self.is_resident(layout) {
@@ -1480,10 +1480,10 @@ impl Team {
                 }
             }
         }
-        // 2. Decode-only canonical verification buckets (16, 24, 32, 48, 64, 80, 96),
+        // 2. Decode-only canonical verification buckets (1, 6, 8, 9, 12, 16, 20, 24, 32, 48, 64, 80, 96),
         // plus 9-owner (WorkPad::Bucketed=1024) decode verification buckets (64, 80, 96).
         let output_cap = contract.output_capacity();
-        for rows in [16usize, 24, 32, 48, 64, 80, 96] {
+        for rows in [1usize, 6, 8, 9, 12, 16, 20, 24, 32, 48, 64, 80, 96] {
             if rows > capacity || rows > output_cap {
                 continue;
             }
@@ -1525,9 +1525,13 @@ impl Team {
         // 3. Mixed 2048/1024 Trunks + canonical Tail/Head buckets (both <=8 and >8 owners).
         if let Some(replay) = contract.decoder_replay.as_ref() {
             for (total_rows, dec_rows) in [
+                (capacity, 12usize),
+                (capacity, 20usize),
+                (capacity, 24usize),
                 (capacity, 32usize),
                 (capacity, 64usize),
                 (capacity, 127usize),
+                (1024usize, 24usize),
                 (1024usize, 32usize),
                 (1024usize, 64usize),
             ] {

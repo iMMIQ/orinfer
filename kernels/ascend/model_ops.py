@@ -130,6 +130,148 @@ def norm_quant(rows, width, eps=1e-20):
     return main.with_attr("orinfer.component_sources", COMPONENT_SOURCES)
 
 
+def norm_quant_split(rows, width, eps=1e-20):
+    """Fused zero-centered RMSNorm + per-row INT8 quantization + 3-plane BF16 FP32 split.
+
+    Bit-exact with norm -> (floating.split on precise FP32, vector.quantize on BF16).
+    """
+
+    @T.prim_func
+    def main(
+        x: T.Tensor((rows, width), "bfloat16"),
+        weight: T.Tensor((width,), "float32"),
+        out: T.Tensor((rows, width), "int8"),
+        scales: T.Tensor((rows,), "float32"),
+        parts: T.Tensor((3, rows, width), "bfloat16"),
+    ):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            xb = T.alloc_ub((1, width), "bfloat16")
+            norm_a = T.alloc_ub((1, width), "float32")
+            w = T.alloc_ub((1, width), "float32")
+            sq = T.alloc_ub((1, width), "float32")
+            var = T.alloc_ub((1, 1), "float32")
+            inv = T.alloc_ub((1, 1), "float32")
+            corr = T.alloc_ub((1, 1), "float32")
+            y = T.alloc_ub((1, width), "bfloat16")
+            p1 = T.alloc_ub((1, width), "bfloat16")
+            p2 = T.alloc_ub((1, width), "bfloat16")
+            aiv = cid * 2 + vid
+            if aiv < rows:
+                T.copy(weight[:], w[0, :])
+                for step in T.serial(T.ceildiv(rows - aiv, 40)):
+                    row = aiv + step * 40
+                    T.copy(x[row : row + 1, :], xb)
+                    T.tile.cast(norm_a, xb, "CAST_NONE", width)
+                    T.tile.mul(sq, norm_a, norm_a)
+                    T.reduce_sum(sq, var, dim=1)
+                    T.tile.mul(var, var, 1.0 / width)
+                    T.tile.add(var, var, eps)
+                    rsqrt_fp32(var, inv, corr)
+                    T.tile.mul(norm_a, norm_a, inv[0, 0])
+                    T.tile.mul(norm_a, norm_a, w)
+                    T.tile.cast(y, norm_a, "CAST_RINT", width)
+                    T.copy(y, parts[0, row : row + 1, :])
+                    T.tile.cast(sq, y, "CAST_NONE", width)
+                    T.tile.sub(norm_a, norm_a, sq)
+                    T.tile.cast(p1, norm_a, "CAST_RINT", width)
+                    T.copy(p1, parts[1, row : row + 1, :])
+                    T.tile.cast(sq, p1, "CAST_NONE", width)
+                    T.tile.sub(norm_a, norm_a, sq)
+                    T.tile.cast(p2, norm_a, "CAST_RINT", width)
+                    T.copy(p2, parts[2, row : row + 1, :])
+                    quantize_bf16_row(y, out, scales, row, width)
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
+
+    return main.with_attr("orinfer.component_sources", COMPONENT_SOURCES)
+
+
+def norm_partial_rope(rows, dimension=512, eps=1e-20):
+    """Fused single-head RMSNorm and trailing-64 partial RoPE (KV cache boundary).
+
+    Bit-exact with model_ops.norm(dimension) -> model_ops.partial_rope(heads=1, dimension).
+    """
+    rotary, half = 64, 32
+
+    @T.prim_func
+    def main(
+        x: T.Tensor((rows, dimension), "bfloat16"),
+        weight: T.Tensor((dimension,), "float32"),
+        cosine: T.Tensor((rows, half), "float32"),
+        sine: T.Tensor((rows, half), "float32"),
+        out: T.Tensor((rows, dimension), "bfloat16"),
+    ):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            xb = T.alloc_ub((1, dimension), "bfloat16")
+            a = T.alloc_ub((1, dimension), "float32")
+            w = T.alloc_ub((1, dimension), "float32")
+            sq = T.alloc_ub((1, dimension), "float32")
+            var = T.alloc_ub((1, 1), "float32")
+            inv = T.alloc_ub((1, 1), "float32")
+            corr = T.alloc_ub((1, 1), "float32")
+            normed = T.alloc_ub((dimension,), "bfloat16")
+            rot_bf = T.alloc_ub((rotary,), "bfloat16")
+            rot_f = T.alloc_ub((rotary,), "float32")
+            even = T.alloc_ub((half,), "float32")
+            odd = T.alloc_ub((half,), "float32")
+            co = T.alloc_ub((half,), "float32")
+            si = T.alloc_ub((half,), "float32")
+            prod = T.alloc_ub((half,), "float32")
+            res = T.alloc_ub((2, half), "float32")
+            offsets = T.alloc_ub((rotary,), "uint32")
+            lane = T.alloc_ub((rotary,), "float32")
+            half_idx = T.alloc_ub((rotary,), "float32")
+            floor_idx = T.alloc_ub((rotary,), "int32")
+            parity = T.alloc_ub((rotary,), "float32")
+            y = T.alloc_ub((rotary,), "bfloat16")
+            aiv = cid * 2 + vid
+            if aiv < rows:
+                T.copy(weight[:], w[0, :])
+                T.tile.createvecindex(lane, 0.0)
+                T.tile.mul(half_idx, lane, 0.5)
+                T.tile.cast(floor_idx, half_idx, "CAST_FLOOR", rotary)
+                T.tile.cast(half_idx, floor_idx, "CAST_NONE", rotary)
+                T.tile.mul(parity, half_idx, 2.0)
+                T.tile.sub(lane, lane, parity)
+                T.tile.mul(lane, lane, float(half))
+                T.tile.add(lane, lane, half_idx)
+                T.tile.mul(lane, lane, 4.0)
+                T.tile.cast(floor_idx, lane, "CAST_RINT", rotary)
+                T.reinterpretcast(offsets, floor_idx, "uint32_t")
+                for step in T.serial(T.ceildiv(rows - aiv, 40)):
+                    row = aiv + step * 40
+                    T.copy(x[row : row + 1, :], xb)
+                    T.tile.cast(a, xb, "CAST_NONE", dimension)
+                    T.tile.mul(sq, a, a)
+                    T.reduce_sum(sq, var, dim=1)
+                    T.tile.mul(var, var, 1.0 / dimension)
+                    T.tile.add(var, var, eps)
+                    rsqrt_fp32(var, inv, corr)
+                    T.tile.mul(a, a, inv[0, 0])
+                    T.tile.mul(a, a, w)
+                    T.tile.cast(normed, a[0, :], "CAST_RINT", dimension)
+                    T.copy(normed[dimension - rotary :], rot_bf)
+                    T.copy(cosine[row, :], co)
+                    T.copy(sine[row, :], si)
+                    T.tile.cast(rot_f, rot_bf, "CAST_NONE", rotary)
+                    T.tile.gather_mask(even, rot_f, "P0101")
+                    T.tile.gather_mask(odd, rot_f, "P1010")
+                    T.tile.mul(res[0, :], even, co)
+                    T.tile.mul(prod, odd, si)
+                    T.tile.sub(res[0, :], res[0, :], prod)
+                    T.tile.mul(res[1, :], odd, co)
+                    T.tile.mul(prod, even, si)
+                    T.tile.add(res[1, :], res[1, :], prod)
+                    T.tile.gather(rot_f, res, offsets, 0)
+                    T.tile.cast(y, rot_f, "CAST_RINT", rotary)
+                    T.copy(normed[: dimension - rotary], out[row, : dimension - rotary])
+                    T.copy(y, out[row, dimension - rotary :])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
+
+    return main
+
+
 def convert(rows, width, source_dtype, destination_dtype, scale=1.0, tile=256):
     if tile < 16 or tile > 8192 or tile % 16:
         raise ValueError("Conversion tile must be 16-aligned and at most 8192")
@@ -522,6 +664,48 @@ def swiglu_packed_quant_active(rows, width, limit=10.0, selected=6):
         dict(function.buffer_map) | {handle: counts},
         function.attrs,
     )
+
+
+def swiglu_packed_quant_active_p20(rows, width, limit=10.0, selected=6):
+    """20-AIC (40-AIV) persistent active-bounded SwiGLU + INT8 quantization."""
+
+    @T.prim_func
+    def main(
+        packed: T.Tensor((rows, 2 * width), "bfloat16"),
+        out: T.Tensor((rows, width), "int8"),
+        scales: T.Tensor((rows,), "float32"),
+        active_counts: T.Tensor((rows // selected + 1,), "int32"),
+    ):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            gb = T.alloc_ub((1, width), "bfloat16")
+            ub = T.alloc_ub((1, width), "bfloat16")
+            g = T.alloc_ub((1, width), "float32")
+            u = T.alloc_ub((1, width), "float32")
+            exp = T.alloc_ub((1, width), "float32")
+            yb = T.alloc_ub((1, width), "bfloat16")
+            aiv = cid * 2 + vid
+            active = T.max(0, T.min(rows, active_counts[rows // selected]))
+            if aiv < active:
+                for step in T.serial(T.ceildiv(active - aiv, 40)):
+                    row = aiv + step * 40
+                    T.copy(packed[row : row + 1, :width], gb)
+                    T.copy(packed[row : row + 1, width:], ub)
+                    T.tile.cast(g, gb, "CAST_NONE", width)
+                    T.tile.cast(u, ub, "CAST_NONE", width)
+                    T.tile.min(g, g, limit)
+                    T.tile.min(u, u, limit)
+                    T.tile.max(u, u, -limit)
+                    T.tile.mul(exp, g, -1.0)
+                    T.tile.exp(exp, exp)
+                    T.tile.add(exp, exp, 1.0)
+                    T.tile.div(g, g, exp)
+                    T.tile.mul(u, u, g)
+                    T.tile.cast(yb, u, "CAST_RINT", width)
+                    quantize_bf16_row(yb, out, scales, row, width)
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
+
+    return main.with_attr("orinfer.component_sources", COMPONENT_SOURCES)
 
 
 def add_shared(rows, width):

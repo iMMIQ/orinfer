@@ -268,6 +268,15 @@ impl Program {
             kernels: Rc::new(kernels.iter().map(|k| Rc::clone(&k.bound)).collect()),
         })
     }
+    pub(crate) fn launch_on_stream(&self, stream: Handle) -> Result<()> {
+        for kernel in self.kernels.iter() {
+            kernel.launch(stream)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn clone_keepalive(&self) -> Box<dyn std::any::Any> {
+        Box::new(Rc::clone(&self.kernels))
+    }
     pub fn enqueue(&self, session: &Session) -> Result<Ticket> {
         session.same_context(&self.context)?;
         let kernels = Rc::clone(&self.kernels);
@@ -399,16 +408,25 @@ impl Kernel {
         self.bound.launch(stream)
     }
     pub fn enqueue(&self, session: &Session) -> Result<Ticket> {
+        self.enqueue_retaining(session, Vec::new())
+    }
+    pub(crate) fn enqueue_retaining(
+        &self,
+        session: &Session,
+        mut retained: Vec<Buffer>,
+    ) -> Result<Ticket> {
         session.same_context(&self.bound.context)?;
+        for buffer in &retained {
+            session.require(buffer)?;
+        }
+        retained.extend(self.bound.buffers.iter().cloned());
         let bound = Rc::clone(&self.bound);
-        // SAFETY: Bound retains all stable operands and code. Every launch uses
-        // this session's ordered compute stream; no shared executor is mutated.
+        // SAFETY: Bound retains all stable operands and code, and `retained` keeps
+        // any indirect pointees alive through this ordered compute fence.
         unsafe {
-            session.submit_compute(
-                bound.buffers.clone(),
-                Box::new(Rc::clone(&bound)),
-                |stream| bound.launch(stream),
-            )
+            session.submit_compute(retained, Box::new(Rc::clone(&bound)), |stream| {
+                bound.launch(stream)
+            })
         }
     }
     pub fn capture(&self, session: &Session) -> Result<super::graph::Graph> {

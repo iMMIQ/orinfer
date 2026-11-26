@@ -278,3 +278,145 @@ def finish(rows, width, experts, tile_n=256, slots=20):
     return main.with_attr("orinfer.explicit_cross_sync", True).with_attr(
         "orinfer.component_sources", COMPONENT_SOURCES
     )
+
+
+def finish_split(rows, width, experts, slots=20):
+    """Fused up_proj W4A4 epilogue + SwiGLU + A8 quantization directly into paired INT4 planes."""
+    from kernels.ascend.vector_math import div_127_fp32, div_fp32_scalar
+
+    if width % 64 or slots not in (20, 24, 32, 48, 64):
+        raise ValueError("Invalid split grouped epilogue geometry")
+    launch_slots = 20 if slots == 24 else slots
+
+    @T.prim_func
+    def main(
+        raw: T.Tensor((rows * 2, width * 2), "float16"),
+        assist: T.Tensor((experts, width * 2), "float32"),
+        token_scale: T.Tensor((rows,), "float32"),
+        groups: T.Tensor((experts,), "int64"),
+        packed: T.Tensor((rows * 2, width // 2), "int8"),
+        scales: T.Tensor((rows,), "float32"),
+    ):
+        with T.Kernel(launch_slots, is_npu=True) as (cid, vid):
+            with T.Scope("V"):
+                prefix = T.alloc_ub((8,), "int32")
+                prefix[0] = 0
+                ri0 = T.alloc_ub((1, width * 2), "float16")
+                ri1 = T.alloc_ub((1, width * 2), "float16")
+                high = T.alloc_ub((1, width * 2), "float32")
+                low = T.alloc_ub((1, width * 2), "float32")
+                bias = T.alloc_ub((1, width * 2), "float32")
+                projected = T.alloc_ub((1, width * 2), "bfloat16")
+                gb = T.alloc_ub((1, width), "bfloat16")
+                ub = T.alloc_ub((1, width), "bfloat16")
+                gate = T.alloc_ub((1, width), "float32")
+                up = T.alloc_ub((1, width), "float32")
+                exponential = T.alloc_ub((1, width), "float32")
+                gated = T.alloc_ub((1, width), "bfloat16")
+                a = T.alloc_ub((1, width), "float32")
+                absolute = T.alloc_ub((1, width), "float32")
+                maximum = T.alloc_ub((1, 1), "float32")
+                divisor = T.alloc_ub((1, 1), "float32")
+                scale_residual = T.alloc_ub((1, 1), "float32")
+                scale_negative = T.alloc_ub((1, 1), "float32")
+                scale_high = T.alloc_ub((1, 1), "float32")
+                scale_low = T.alloc_ub((1, 1), "float32")
+                scale = T.alloc_ub((1, 1), "float32")
+                scale_tile = T.alloc_ub((1, width), "float32")
+                residual = T.alloc_ub((1, width), "float32")
+                quotient_low = T.alloc_ub((1, width), "float32")
+                product = T.alloc_ub((1, width), "float32")
+                rounded = T.alloc_ub((width,), "float16")
+                hi_f = T.alloc_ub((width,), "float16")
+                hi4 = T.alloc_ub((width,), "int4")
+                lo4 = T.alloc_ub((width,), "int4")
+                hi_b = T.alloc_ub((width // 2,), "int8")
+                lo_b = T.alloc_ub((width // 2,), "int8")
+                lane = cid * 2 + vid
+                lanes = launch_slots * 2
+                for expert_idx in T.serial(experts):
+                    start = prefix[0]
+                    cursor = start % lanes
+                    count = T.min(rows - start, T.max(0, T.cast(groups[expert_idx], "int32")))
+                    if lane >= cursor:
+                        prefix[1] = lane - cursor
+                    else:
+                        prefix[1] = lane + lanes - cursor
+                    first = prefix[1]
+                    items = T.ceildiv(T.max(0, count - first), lanes)
+                    if items > 0:
+                        T.copy(assist[expert_idx : expert_idx + 1, :], bias)
+                    for item in T.serial(items):
+                        row = start + first + item * lanes
+                        T.copy(raw[row * 2 : row * 2 + 1, :], ri0)
+                        T.copy(raw[row * 2 + 1 : row * 2 + 2, :], ri1)
+                        T.tile.cast(high, ri0, "CAST_NONE", width * 2)
+                        T.tile.cast(low, ri1, "CAST_NONE", width * 2)
+                        T.tile.mul(high, high, 16.0)
+                        T.tile.add(high, high, low)
+                        T.tile.add(high, high, bias)
+                        T.tile.mul(high, high, token_scale[row])
+                        T.tile.cast(projected, high, "CAST_RINT", width * 2)
+                        T.copy(projected[:, :width], gb)
+                        T.copy(projected[:, width:], ub)
+                        T.tile.cast(gate, gb, "CAST_NONE", width)
+                        T.tile.cast(up, ub, "CAST_NONE", width)
+                        T.tile.min(gate, gate, 10.0)
+                        T.tile.min(up, up, 10.0)
+                        T.tile.max(up, up, -10.0)
+                        T.tile.mul(exponential, gate, -1.0)
+                        T.tile.exp(exponential, exponential)
+                        T.tile.add(exponential, exponential, 1.0)
+                        T.tile.div(gate, gate, exponential)
+                        T.tile.mul(up, up, gate)
+                        T.tile.cast(gated, up, "CAST_RINT", width)
+                        T.tile.cast(a, gated, "CAST_NONE", width)
+                        T.tile.abs(absolute, a)
+                        T.reduce_max(absolute, maximum, dim=1)
+                        T.tile.max(maximum, maximum, 1e-12)
+                        T.tile.fill(divisor, 127.0)
+                        div_127_fp32(maximum, divisor, scale, scale_negative, scale_residual)
+                        scale_high[0, 0] = T.reinterpret(
+                            "float32",
+                            T.bitwise_and(
+                                T.reinterpret("uint32", scale[0, 0]), T.uint32(4294963200)
+                            ),
+                        )
+                        T.tile.sub(scale_low, scale, scale_high)
+                        T.tile.broadcast(scale_tile, scale)
+                        div_fp32_scalar(
+                            a,
+                            scale_tile,
+                            scale_high,
+                            scale_low,
+                            a,
+                            residual,
+                            absolute,
+                            quotient_low,
+                            product,
+                        )
+                        T.tile.min(a, a, 127.0)
+                        T.tile.max(a, a, -127.0)
+                        T.tile.round(a, a, width)
+                        T.tile.cast(rounded, a[0, :], "CAST_RINT", width)
+                        T.copy(scale, scales[row : row + 1])
+                        T.tile.mul(hi_f, rounded, 0.0625)
+                        T.tile.cast(hi4, hi_f, "CAST_FLOOR", width)
+                        T.tile.cast(hi_f, hi4, "CAST_NONE", width)
+                        T.tile.mul(hi_f, hi_f, 16.0)
+                        T.tile.sub(rounded, rounded, hi_f)
+                        T.tile.add(rounded, rounded, -8.0)
+                        T.tile.cast(lo4, rounded, "CAST_NONE", width)
+                        T.set_flag("V", "MTE3", 7)
+                        T.wait_flag("V", "MTE3", 7)
+                        T.reinterpretcast(hi_b, hi4, "int8_t")
+                        T.reinterpretcast(lo_b, lo4, "int8_t")
+                        T.copy(hi_b, packed[row * 2, :])
+                        T.copy(lo_b, packed[row * 2 + 1, :])
+                        T.set_flag("MTE3", "V", 6)
+                        T.wait_flag("MTE3", "V", 6)
+                    prefix[0] = start + count
+
+    return main.with_attr("orinfer.explicit_cross_sync", True).with_attr(
+        "orinfer.component_sources", COMPONENT_SOURCES
+    )

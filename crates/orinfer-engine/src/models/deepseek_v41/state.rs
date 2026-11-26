@@ -1,13 +1,163 @@
 //! Exact persistent-state snapshots; compute workspaces remain request-local.
-use super::{Buffer, Worker, batch::Owner, get};
-use crate::artifact::Result;
-use crate::backend::ascend::runtime::Session;
+use super::{Buffer, Kernel, Template, Worker, batch::Owner, get};
+use crate::artifact::{Dtype, Result, resolve_file};
+use crate::backend::ascend::{
+    kernels::{Access, Spec},
+    runtime::{Session, Ticket},
+};
 use crate::backend::{
     kv,
     snapshot::{Allocation as SharedAllocation, Piece as SharedPiece},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ops::Range, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, ops::Range, path::Path, rc::Rc};
+
+/// Batched 20-AIC pointer-table D2D copy engine replacing per-span aclrtMemcpyAsync.
+pub(super) struct SpanCopier {
+    template: Rc<Template>,
+    capacity: usize,
+    chunk_bytes: usize,
+    work: Buffer,
+    pointers: Buffer,
+    active: Buffer,
+    bindings: RefCell<BTreeMap<usize, Kernel>>,
+}
+
+impl SpanCopier {
+    pub(super) fn preflight(base: &Path, manifest: &str) -> Result<(usize, usize)> {
+        let spec: Spec = crate::model::read(&resolve_file(base, manifest)?)?;
+        spec.validate()?;
+        let capacity = spec
+            .row_capacity()?
+            .ok_or("copy_spans kernel requires a dynamic row capacity")?;
+        let chunk = spec
+            .parameters
+            .get("chunk")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .filter(|&c| c >= 32 && c % 16 == 0)
+            .ok_or("copy_spans kernel requires an aligned word chunk size")?;
+        let expected = [
+            (Dtype::I32, vec![capacity * 2, 2]),
+            (Dtype::U64, vec![capacity, 3]),
+            (Dtype::I32, vec![1]),
+        ];
+        if spec.op != "private_rows.copy_words"
+            || spec.operands.len() != expected.len()
+            || spec
+                .operands
+                .iter()
+                .zip(expected)
+                .any(|(o, (dt, sh))| o.dtype != dt || o.shape != sh || o.access == Access::Scratch)
+        {
+            return Err("copy_spans kernel ABI differs from contract".into());
+        }
+        Ok((capacity, chunk * 4))
+    }
+
+    pub(super) fn load(session: &Session, base: &Path, manifest: &str) -> Result<Self> {
+        let (capacity, chunk_bytes) = Self::preflight(base, manifest)?;
+        let template = Template::load(session, &resolve_file(base, manifest)?)?;
+        let work = session.allocate(capacity * 2 * 8)?;
+        let pointers = session.allocate(capacity * 3 * 8)?;
+        let active = session.allocate(4)?;
+        let mut work_bytes = Vec::with_capacity(capacity * 2 * 8);
+        for i in 0..capacity {
+            work_bytes.extend_from_slice(&(i as i32).to_le_bytes());
+            work_bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        for _ in capacity..capacity * 2 {
+            work_bytes.extend_from_slice(&(-1i32).to_le_bytes());
+            work_bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        session
+            .upload_inputs(&[
+                (work.clone(), work_bytes),
+                (active.clone(), 1i32.to_le_bytes().to_vec()),
+            ])?
+            .wait()?;
+        Ok(Self {
+            template,
+            capacity,
+            chunk_bytes,
+            work,
+            pointers,
+            active,
+            bindings: RefCell::new(BTreeMap::new()),
+        })
+    }
+
+    pub(super) fn copy_many(
+        &self,
+        session: &Session,
+        copies: &[(Buffer, usize, Buffer, usize, usize)],
+    ) -> Result<Ticket> {
+        if copies.len() < 64 {
+            return session.copy_many(copies);
+        }
+        let (spans, buffers) = session.prepare_copy_many(copies)?;
+        if spans.iter().any(|&(src, dst, bytes)| {
+            !bytes.is_multiple_of(16)
+                || !(src as usize).is_multiple_of(16)
+                || !(dst as usize).is_multiple_of(16)
+        }) {
+            return session.copy_many(copies);
+        }
+        let mut chunks = Vec::with_capacity(spans.len());
+        for &(src, dst, bytes) in &spans {
+            let mut offset = 0usize;
+            while offset < bytes {
+                let n = self.chunk_bytes.min(bytes - offset);
+                chunks.push((
+                    (n / 4) as u64,
+                    (src as usize + offset) as u64,
+                    (dst as usize + offset) as u64,
+                ));
+                offset += n;
+            }
+        }
+        let mut last = None;
+        for batch in chunks.chunks(self.capacity) {
+            let m = batch.len().div_ceil(2);
+            let mut table = Vec::with_capacity(m * 2 * 24);
+            for &(words, src, dst) in batch {
+                table.extend_from_slice(&words.to_le_bytes());
+                table.extend_from_slice(&src.to_le_bytes());
+                table.extend_from_slice(&dst.to_le_bytes());
+            }
+            if batch.len() % 2 != 0 {
+                let (_, src0, dst0) = batch[0];
+                table.extend_from_slice(&0u64.to_le_bytes());
+                table.extend_from_slice(&src0.to_le_bytes());
+                table.extend_from_slice(&dst0.to_le_bytes());
+            }
+            session.upload_inputs(&[(self.pointers.slice(0, table.len())?, table)])?;
+            let kernel = {
+                let mut cache = self.bindings.borrow_mut();
+                if let Some(existing) = cache.get(&m) {
+                    existing.clone()
+                } else {
+                    let bound = Kernel::bind_rows(
+                        session,
+                        &self.template,
+                        &[
+                            self.work.clone(),
+                            self.pointers.clone(),
+                            self.active.clone(),
+                        ],
+                        m,
+                    )?;
+                    if cache.len() < 256 {
+                        cache.insert(m, bound.clone());
+                    }
+                    bound
+                }
+            };
+            last = Some(kernel.enqueue_retaining(session, buffers.clone())?);
+        }
+        last.ok_or_else(|| "ACL device copy batch is empty".into())
+    }
+}
 mod host;
 pub(super) use crate::backend::kv::host::{HostBuffer, HostPool};
 pub(super) type HostSnapshot = Snapshot<HostBuffer>;
@@ -464,8 +614,20 @@ impl Snapshot {
         }));
         Ok(plan)
     }
+    #[cfg(test)]
     fn capture<'a>(
         session: &Session,
+        layouts: impl Iterator<Item = &'a StateLayout>,
+        buffers: &BTreeMap<String, Buffer>,
+        history: &[u32],
+        bank_id: u64,
+        parent: Option<&Snapshot>,
+    ) -> Result<Self> {
+        Self::capture_with(session, None, layouts, buffers, history, bank_id, parent)
+    }
+    fn capture_with<'a>(
+        session: &Session,
+        copier: Option<&SpanCopier>,
         layouts: impl Iterator<Item = &'a StateLayout>,
         buffers: &BTreeMap<String, Buffer>,
         history: &[u32],
@@ -506,7 +668,11 @@ impl Snapshot {
                     },
                 });
             }
-            session.copy_many(&copies)?.wait()?;
+            if let Some(copier) = copier {
+                copier.copy_many(session, &copies)?.wait()?;
+            } else {
+                session.copy_many(&copies)?.wait()?;
+            }
         }
         pieces.extend(publish_shared(session, buffers, &shared)?);
         Ok(Self {
@@ -548,7 +714,7 @@ impl Snapshot {
     fn restore_into(&self, session: &Session, buffers: &BTreeMap<String, Buffer>) -> Result<()> {
         self.restore_kv(session, buffers)?;
         self.grow_restored(session, buffers)?;
-        self.restore_mutable_into(session, buffers)
+        self.restore_mutable_into(session, None, buffers)
     }
     #[cfg(test)]
     fn grow_restored(&self, session: &Session, buffers: &BTreeMap<String, Buffer>) -> Result<()> {
@@ -563,6 +729,7 @@ impl Snapshot {
     fn restore_mutable_into(
         &self,
         session: &Session,
+        copier: Option<&SpanCopier>,
         buffers: &BTreeMap<String, Buffer>,
     ) -> Result<()> {
         let copies = self
@@ -581,7 +748,11 @@ impl Snapshot {
             .collect::<Result<Vec<_>>>()?;
         if !copies.is_empty() {
             // Compute-stream ordered; completion retains source and target buffers.
-            session.copy_many(&copies)?;
+            if let Some(copier) = copier {
+                copier.copy_many(session, &copies)?;
+            } else {
+                session.copy_many(&copies)?;
+            }
         }
         Ok(())
     }
@@ -675,6 +846,16 @@ impl Worker {
         Snapshot::plan_device(layouts.into_iter(), &owner.buffers, &owner.history, parent)?
             .allocations(bank_id)
     }
+    pub(super) fn copy_many(
+        &self,
+        copies: &[(Buffer, usize, Buffer, usize, usize)],
+    ) -> Result<Ticket> {
+        if let Some(copier) = &self.span_copier {
+            copier.copy_many(&self.session, copies)
+        } else {
+            self.session.copy_many(copies)
+        }
+    }
     pub(super) fn save_owner(
         &self,
         id: usize,
@@ -688,8 +869,9 @@ impl Worker {
             },
             layouts,
         ) = self.snapshot_state(id, complete)?;
-        Snapshot::capture(
+        Snapshot::capture_with(
             &self.session,
+            self.span_copier.as_ref(),
             layouts.into_iter(),
             buffers,
             history,
@@ -720,7 +902,7 @@ impl Worker {
         self.grow_owner_readonly(id, snapshot.history.len())?;
         let runtime = self.batch.as_mut().ok_or("Missing A2 batch runtime")?;
         let owner = runtime.owners.get_mut(&id).ok_or("Unknown A2 owner")?;
-        snapshot.restore_mutable_into(&self.session, &owner.buffers)?;
+        snapshot.restore_mutable_into(&self.session, self.span_copier.as_ref(), &owner.buffers)?;
         owner.history.clone_from(&snapshot.history);
         owner.clean = false;
         runtime.bound_tables = None;

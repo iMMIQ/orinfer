@@ -253,6 +253,51 @@ def gather_quantized_rows(rows, table_rows, width, table_stride=0):
     return main
 
 
+def gather_quantized_active(rows, table_rows, width, selected=6):
+    """20-AIC persistent active-bounded INT8 gather for direct W4 MoE routing.
+
+    Reads only the active routed prefix indicated by active_counts[rows // selected]
+    and zeroes error flags across the remaining row span.
+    """
+    if width % 32 or (isinstance(table_rows, int) and not 0 < table_rows <= 2147483647):
+        raise ValueError("Active quantized gather requires aligned width and positive table rows")
+
+    @T.prim_func
+    def main(
+        table: T.Tensor((table_rows, width), "int8"),
+        scales: T.Tensor((table_rows,), "float32"),
+        indices: T.Tensor((rows,), "int32"),
+        active_counts: T.Tensor((rows // selected + 1,), "int32"),
+        out: T.Tensor((rows, width), "int8"),
+        out_scales: T.Tensor((rows,), "float32"),
+        errors: T.Tensor((rows,), "int32"),
+    ):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            x = T.alloc_ub((width,), "int8")
+            sc = T.alloc_ub((8,), "float32")
+            flag = T.alloc_ub((8,), "int32")
+            aiv = cid * 2 + vid
+            active = T.max(0, T.min(rows, active_counts[rows // selected]))
+            if aiv < rows:
+                for step in T.serial(T.ceildiv(rows - aiv, 40)):
+                    row = aiv + step * 40
+                    flag[0] = 0
+                    if row < active:
+                        idx = indices[row]
+                        if idx >= 0 and idx < table_rows:
+                            T.copy(table[idx, :width], x)
+                            T.copy(scales[idx : idx + 1], sc[:1])
+                            T.copy(x, out[row, :])
+                            T.copy(sc[:1], out_scales[row : row + 1])
+                        else:
+                            flag[0] = T.if_then_else(idx == -1, 0, 1)
+                    T.copy(flag[:1], errors[row : row + 1])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
+
+    return main
+
+
 def gather_columns(rows, width, ranks=8, dtype="bfloat16", output_width=0, paths=1):
     """Restore row-major columns, including overlapping aligned projection tails.
 
@@ -473,5 +518,27 @@ def rope(rows, heads, rotary=64):
                 T.tile.gather(a, result, offsets, 0)
                 T.tile.cast(y, a, "CAST_RINT", rotary)
                 T.copy(y, out[row, head, :])
+
+    return main
+
+
+def copy_words(rows, chunk=2048):
+    """Copy `rows` int32 words in `chunk`-word blocks (for batched pointer-table D2D spans)."""
+    if chunk % 16 or chunk < 32:
+        raise ValueError("Word copy chunk must be a 16-word multiple >= 32")
+    half = chunk // 2
+
+    @T.prim_func
+    def main(
+        src: T.Tensor((rows,), "int32"),
+        dst: T.Tensor((rows,), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(rows, chunk), is_npu=True) as (cid, vid):
+            buf = T.alloc_ub((half,), "int32")
+            first = cid * chunk + vid * half
+            n = T.min(half, rows - first)
+            if n > 0:
+                T.copy(src[first : first + n], buf[:n])
+                T.copy(buf[:n], dst[first : first + n])
 
     return main

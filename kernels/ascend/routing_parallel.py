@@ -5,6 +5,7 @@ import tilelang.language as T
 
 def clear(rows, experts=384, selected=6):
     lanes = (selected + 7) // 8 * 8
+    chunk = 64
 
     @T.prim_func
     def main(
@@ -13,25 +14,36 @@ def clear(rows, experts=384, selected=6):
         restore: T.Tensor((rows, lanes), "int32"),
         errors: T.Tensor((rows + 1,), "int32"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
-            ids = T.alloc_ub((lanes,), "int32")
-            minus = T.alloc_ub((lanes,), "int32")
-            flag = T.alloc_ub((8,), "int32")
-            row = cid * 2 + vid
-            if row < rows:
-                T.copy(indices[row, :], ids)
-                T.tile.fill(minus, -1)
-                T.copy(minus, restore[row, :])
-                T.copy(minus[:selected], gather[row * selected : (row + 1) * selected])
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            ids = T.alloc_ub((chunk, lanes), "int32")
+            minus_r = T.alloc_ub((chunk, lanes), "int32")
+            minus_g = T.alloc_ub((chunk * selected,), "int32")
+            errs = T.alloc_ub((chunk,), "int32")
+            T.tile.fill(minus_r, -1)
+            T.tile.fill(minus_g, -1)
+            aiv = cid * 2 + vid
+            chunks = T.ceildiv(rows, chunk)
+            for s in T.serial(T.ceildiv(T.max(0, chunks - aiv), 40)):
+                part = aiv + s * 40
+                base = part * chunk
+                valid = T.min(chunk, rows - base)
+                T.copy(indices[base : base + valid, :], ids[:valid, :])
+                T.copy(minus_r[:valid, :], restore[base : base + valid, :])
+                T.copy(
+                    minus_g[: valid * selected],
+                    gather[base * selected : (base + valid) * selected],
+                )
                 T.set_flag("MTE2", "S", 6)
                 T.wait_flag("MTE2", "S", 6)
-                flag[0] = 0
-                for lane in T.serial(selected):
-                    if ids[lane] < 0 or ids[lane] >= experts:
-                        flag[0] = 1
+                for j in T.serial(valid):
+                    errs[j] = 0
+                    for lane in T.serial(selected):
+                        value = ids[j, lane]
+                        if value < 0 or value >= experts:
+                            errs[j] = 1
                 T.set_flag("S", "MTE3", 6)
                 T.wait_flag("S", "MTE3", 6)
-                T.copy(flag[:1], errors[row : row + 1])
+                T.copy(errs[:valid], errors[base : base + valid])
                 T.set_flag("MTE3", "V", 7)
                 T.wait_flag("MTE3", "V", 7)
 

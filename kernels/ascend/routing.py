@@ -113,6 +113,139 @@ def route(rows, experts=384, selected=6, routed_scale=1.5, vision_bias=False):
     return main
 
 
+def reduce_route(
+    rows,
+    experts=384,
+    tile_n=128,
+    splits=5,
+    selected=6,
+    routed_scale=1.5,
+    vision_bias=False,
+):
+    """Fused split-K partial reduction and DSv4.1 sqrt-softplus routing (20-AIC persistent)."""
+    if experts % tile_n or tile_n not in (32, 64, 128) or splits not in (5, 8, 10):
+        raise ValueError("Invalid fused router partial layout")
+    blocks = experts // tile_n
+    output_stride = (selected + 7) // 8 * 8
+
+    @T.macro
+    def _reduce_and_route(partials, b, indices, weights, row, lanes, padding, zero):
+        p = T.alloc_ub((splits, tile_n), "float32")
+        red = T.alloc_ub((1, tile_n), "float32")
+        x = T.alloc_ub((experts,), "float32")
+        score = T.alloc_ub((experts,), "float32")
+        exponential = T.alloc_ub((experts,), "float32")
+        tail = T.alloc_ub((experts,), "float32")
+        correction = T.alloc_ub((experts,), "float32")
+        root = T.alloc_ub((experts,), "float32")
+        mask = T.alloc_ub((((experts + 255) // 256) * 32,), "uint8")
+        corrected = T.alloc_ub((experts,), "float32")
+        top = T.alloc_ub((2 * output_stride,), "float32")
+        idx = T.alloc_ub((output_stride,), "float32")
+        offsets = T.alloc_ub((output_stride,), "int32")
+        unsigned_offsets = T.alloc_ub((output_stride,), "uint32")
+        oi = T.alloc_ub((output_stride,), "int32")
+        ow = T.alloc_ub((1, output_stride), "float32")
+        denominator = T.alloc_ub((1, 1), "float32")
+        for blk in T.serial(blocks):
+            T.copy(partials[row, blk, :, :], p)
+            T.reduce_sum(p, red, dim=0)
+            T.copy(red[0, :], x[blk * tile_n : (blk + 1) * tile_n])
+        T.tile.abs(exponential, x)
+        T.tile.mul(exponential, exponential, -1.0)
+        T.tile.exp(exponential, exponential)
+        T.tile.add(tail, exponential, 1.0)
+        T.tile.sub(correction, tail, 1.0)
+        T.tile.sub(correction, exponential, correction)
+        T.tile.div(correction, correction, tail)
+        T.tile.ln(exponential, tail)
+        T.tile.add(exponential, exponential, correction)
+        T.tile.max(score, x, 0.0)
+        T.tile.add(score, score, exponential)
+        T.tile.max(score, score, 1e-30)
+        rsqrt_fp32(score, root, correction)
+        T.tile.mul(score, score, root)
+        T.tile.mul(tail, x, 0.5)
+        T.tile.exp(tail, tail)
+        T.tile.compare(mask, x, -20.0, "LT")
+        T.tile.select(score, mask, tail, score, "VSEL_TENSOR_TENSOR_MODE")
+        T.tile.add(corrected, score, b)
+        T.tile.topk(top, corrected, selected, experts)
+        T.tile.gather_mask(idx, top, "P1010")
+        for i in T.Parallel(output_stride - selected):
+            idx[selected + i] = 0.0
+        T.tile.mul(idx, idx, 4.0)
+        T.tile.cast(offsets, idx, "CAST_RINT", output_stride)
+        T.reinterpretcast(unsigned_offsets, offsets, "uint32_t")
+        T.tile.gather(ow, score, unsigned_offsets, 0)
+        T.tile.select(ow, padding, ow, zero, "VSEL_TENSOR_TENSOR_MODE")
+        T.reduce_sum(ow, denominator, dim=1)
+        T.tile.div(ow, ow, denominator[0, 0])
+        T.tile.mul(ow, ow, routed_scale)
+        T.tile.div(idx, idx, 4.0)
+        T.tile.cast(oi, idx, "CAST_RINT", output_stride)
+        for i in T.Parallel(output_stride - selected):
+            oi[selected + i] = -1
+        T.copy(oi, indices[row, :])
+        T.copy(ow[0, :], weights[row, :])
+        T.set_flag("MTE3", "V", 7)
+        T.wait_flag("MTE3", "V", 7)
+
+    if vision_bias:
+
+        @T.prim_func
+        def main(
+            partials: T.Tensor((rows, blocks, splits, tile_n), "float32"),
+            bias: T.Tensor((experts,), "float32"),
+            indices: T.Tensor((rows, output_stride), "int32"),
+            weights: T.Tensor((rows, output_stride), "float32"),
+            image_bias: T.Tensor((experts,), "float32"),
+            image_rows: T.Tensor((rows,), "int32"),
+        ):
+            with T.Kernel(20, is_npu=True) as (cid, vid):
+                b = T.alloc_ub((experts,), "float32")
+                lanes = T.alloc_ub((64,), "float32")
+                padding = T.alloc_ub((32,), "uint8")
+                zero = T.alloc_ub((1, output_stride), "float32")
+                aiv = cid * 2 + vid
+                if aiv < rows:
+                    T.tile.createvecindex(lanes, 0.0)
+                    T.tile.fill(zero, 0.0)
+                    T.tile.compare(padding, lanes, float(selected), "LT")
+                    for step in T.serial(T.ceildiv(rows - aiv, 40)):
+                        row = aiv + step * 40
+                        if image_rows[row] != 0:
+                            T.copy(image_bias, b)
+                        else:
+                            T.copy(bias, b)
+                        _reduce_and_route(partials, b, indices, weights, row, lanes, padding, zero)
+    else:
+
+        @T.prim_func
+        def main(
+            partials: T.Tensor((rows, blocks, splits, tile_n), "float32"),
+            bias: T.Tensor((experts,), "float32"),
+            indices: T.Tensor((rows, output_stride), "int32"),
+            weights: T.Tensor((rows, output_stride), "float32"),
+        ):
+            with T.Kernel(20, is_npu=True) as (cid, vid):
+                b = T.alloc_ub((experts,), "float32")
+                lanes = T.alloc_ub((64,), "float32")
+                padding = T.alloc_ub((32,), "uint8")
+                zero = T.alloc_ub((1, output_stride), "float32")
+                aiv = cid * 2 + vid
+                if aiv < rows:
+                    T.copy(bias, b)
+                    T.tile.createvecindex(lanes, 0.0)
+                    T.tile.fill(zero, 0.0)
+                    T.tile.compare(padding, lanes, float(selected), "LT")
+                    for step in T.serial(T.ceildiv(rows - aiv, 40)):
+                        row = aiv + step * 40
+                        _reduce_and_route(partials, b, indices, weights, row, lanes, padding, zero)
+
+    return main
+
+
 def regroup(rows, experts=384, local=48, selected=6, base=0, pad_last=True):
     """Regroup router indices into expert-major rows for this rank.
 

@@ -109,6 +109,9 @@ fn verify_assets(model: &Model, base: &Path) -> Result<()> {
     if let Some(inputs) = &model.device_inputs {
         names.extend(inputs.manifests().map(str::to_owned));
     }
+    if let Some(copy_spans) = model.batch.as_ref().and_then(|b| b.copy_spans.as_deref()) {
+        names.insert(copy_spans.to_owned());
+    }
     let mut seen = BTreeMap::new();
     let mut reader = AssetReader::default();
     let mut verify = |root: &Path, id: &FileIdentity| -> Result<()> {

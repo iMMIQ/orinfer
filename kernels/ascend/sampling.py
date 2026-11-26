@@ -143,60 +143,72 @@ def categorical(rows, vocab, tile=1024):
         active: T.Tensor((1,), "int32"),
         partial: T.Tensor((rows, parts, 2), "float32"),
     ):
-        with T.Kernel(T.ceildiv(rows * parts, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             x = T.alloc_ub((1, tile), "float32")
             y = T.alloc_ub((1, tile), "float32")
+            base_idx = T.alloc_ub((1, tile), "float32")
             indices = T.alloc_ub((1, tile), "float32")
             mask = T.alloc_ub((tile // 8,), "uint8")
             maximum = T.alloc_ub((1, 1), "float32")
             minimum = T.alloc_ub((1, 1), "float32")
             pair = T.alloc_ub((1, 8), "float32")
-            index = cid * 2 + vid
-            row, part = index // parts, index % parts
-            begin = part * tile
-            live = T.min(tile, vocab - begin)
-            if row < T.min(rows, active[0]):
-                T.tile.fill(x, 0.0)
-                T.copy(logits[row : row + 1, begin : begin + live], x[:, :live])
-                # Detect invalid real logits before masking the padded tail.
-                T.tile.compare(mask, x, x, "EQ")
-                T.tile.fill(y, 1.0)
-                T.tile.select(y, mask, y, 0.0, "VSEL_TENSOR_SCALAR_MODE")
-                T.reduce_min(y, minimum, dim=1)
-                T.tile.abs(y, x)
-                T.reduce_max(y, maximum, dim=1)
-                pair[0, 2] = T.if_then_else(
-                    minimum[0, 0] == 0.0 or maximum[0, 0] == T.infinity("float32"),
-                    1.0,
-                    0.0,
-                )
-                inverse_temperature = T.reinterpret("float32", controls[row, 3])
-                if inverse_temperature > 0.0:
-                    uniform(
-                        y,
-                        controls[row, 2] + begin,
-                        T.reinterpret("uint32", controls[row, 0]),
-                        T.reinterpret("uint32", controls[row, 1]),
+            aiv = cid * 2 + vid
+            live_rows = T.min(rows, active[0])
+            tasks = live_rows * parts
+            if aiv < tasks:
+                T.tile.createvecindex(base_idx, T.float32(0.0))
+                for step in T.serial(T.ceildiv(tasks - aiv, 40)):
+                    index = aiv + step * 40
+                    row, part = index // parts, index % parts
+                    begin = part * tile
+                    live = T.min(tile, vocab - begin)
+                    T.tile.fill(x, 0.0)
+                    T.copy(logits[row : row + 1, begin : begin + live], x[:, :live])
+                    # Detect invalid real logits before masking the padded tail.
+                    T.tile.compare(mask, x, x, "EQ")
+                    T.tile.fill(y, 1.0)
+                    T.tile.select(y, mask, y, 0.0, "VSEL_TENSOR_SCALAR_MODE")
+                    T.reduce_min(y, minimum, dim=1)
+                    T.tile.abs(y, x)
+                    T.reduce_max(y, maximum, dim=1)
+                    pair[0, 2] = T.if_then_else(
+                        minimum[0, 0] == 0.0 or maximum[0, 0] == T.infinity("float32"),
+                        1.0,
+                        0.0,
                     )
-                    T.tile.ln(y, y)
-                    T.tile.mul(y, y, -1.0)
-                    T.tile.ln(y, y)
-                    T.tile.mul(x, x, inverse_temperature)
-                    T.tile.sub(x, x, y)
-                T.tile.createvecindex(indices, T.float32(0.0))
-                T.tile.compare(mask, indices, T.cast(live, "float32"), "LT")
-                T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
-                T.reduce_max(x, maximum, dim=1)
-                T.tile.add(indices, indices, T.cast(begin, "float32"))
-                T.tile.compare(mask, x, maximum[0, 0], "EQ")
-                T.tile.select(
-                    indices, mask, indices, T.cast(vocab, "float32"), "VSEL_TENSOR_SCALAR_MODE"
-                )
-                T.reduce_min(indices, minimum, dim=1)
-                pair[0, 0] = T.if_then_else(pair[0, 2] > 0.0, T.infinity("float32"), maximum[0, 0])
-                pair[0, 1] = minimum[0, 0]
-                T.copy(pair[:, :2], partial[row, part : part + 1, :])
-                T.pipe_barrier("ALL")
+                    inverse_temperature = T.reinterpret("float32", controls[row, 3])
+                    if inverse_temperature > 0.0:
+                        uniform(
+                            y,
+                            controls[row, 2] + begin,
+                            T.reinterpret("uint32", controls[row, 0]),
+                            T.reinterpret("uint32", controls[row, 1]),
+                        )
+                        T.tile.ln(y, y)
+                        T.tile.mul(y, y, -1.0)
+                        T.tile.ln(y, y)
+                        T.tile.mul(x, x, inverse_temperature)
+                        T.tile.sub(x, x, y)
+                    T.tile.compare(mask, base_idx, T.cast(live, "float32"), "LT")
+                    T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
+                    T.reduce_max(x, maximum, dim=1)
+                    T.tile.add(indices, base_idx, T.cast(begin, "float32"))
+                    T.tile.compare(mask, x, maximum[0, 0], "EQ")
+                    T.tile.select(
+                        indices,
+                        mask,
+                        indices,
+                        T.cast(vocab, "float32"),
+                        "VSEL_TENSOR_SCALAR_MODE",
+                    )
+                    T.reduce_min(indices, minimum, dim=1)
+                    pair[0, 0] = T.if_then_else(
+                        pair[0, 2] > 0.0, T.infinity("float32"), maximum[0, 0]
+                    )
+                    pair[0, 1] = minimum[0, 0]
+                    T.copy(pair[:, :2], partial[row, part : part + 1, :])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main
 
@@ -208,24 +220,29 @@ def merge(rows, parts):
         active: T.Tensor((1,), "int32"),
         output: T.Tensor((rows, 2), "float32"),
     ):
-        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
             pairs = T.alloc_ub((parts, 8), "float32")
             selected = T.alloc_ub((8,), "int32")
             pair = T.alloc_ub((1, 8), "float32")
-            row = cid * 2 + vid
-            if row < T.min(rows, active[0]):
-                for part in T.serial(parts):
-                    T.copy(partial[row, part : part + 1, :], pairs[part : part + 1, :2])
-                selected[0] = 0
-                for part in T.serial(1, parts):
-                    if pairs[part, 0] > pairs[selected[0], 0] or (
-                        pairs[part, 0] == pairs[selected[0], 0]
-                        and pairs[part, 1] < pairs[selected[0], 1]
-                    ):
-                        selected[0] = part
-                pair[0, 0] = pairs[selected[0], 0]
-                pair[0, 1] = pairs[selected[0], 1]
-                T.copy(pair[:, :2], output[row : row + 1, :])
+            aiv = cid * 2 + vid
+            live_rows = T.min(rows, active[0])
+            if aiv < live_rows:
+                for step in T.serial(T.ceildiv(live_rows - aiv, 40)):
+                    row = aiv + step * 40
+                    for part in T.serial(parts):
+                        T.copy(partial[row, part : part + 1, :], pairs[part : part + 1, :2])
+                    selected[0] = 0
+                    for part in T.serial(1, parts):
+                        if pairs[part, 0] > pairs[selected[0], 0] or (
+                            pairs[part, 0] == pairs[selected[0], 0]
+                            and pairs[part, 1] < pairs[selected[0], 1]
+                        ):
+                            selected[0] = part
+                    pair[0, 0] = pairs[selected[0], 0]
+                    pair[0, 1] = pairs[selected[0], 1]
+                    T.copy(pair[:, :2], output[row : row + 1, :])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main
 

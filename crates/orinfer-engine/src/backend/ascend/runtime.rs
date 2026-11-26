@@ -1168,12 +1168,12 @@ impl Session {
             bytes,
         )])
     }
-    /// Validate every span before submission and retain the whole ordered copy
-    /// batch through one completion. Cross-stream producers need a dependency.
-    pub(crate) fn copy_many(
+    /// Validate every span, enforce non-overlap, and mark KV pages writable.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn prepare_copy_many(
         &self,
         copies: &[(Buffer, usize, Buffer, usize, usize)],
-    ) -> Result<Ticket> {
+    ) -> Result<(Vec<(Handle, Handle, usize)>, Vec<Buffer>)> {
         if copies.is_empty() {
             return Err("ACL device copy batch is empty".into());
         }
@@ -1209,6 +1209,15 @@ impl Session {
             })
             .collect::<Vec<_>>();
         self.make_kv_writable(&writes)?;
+        Ok((spans, buffers))
+    }
+    /// Validate every span before submission and retain the whole ordered copy
+    /// batch through one completion. Cross-stream producers need a dependency.
+    pub(crate) fn copy_many(
+        &self,
+        copies: &[(Buffer, usize, Buffer, usize, usize)],
+    ) -> Result<Ticket> {
+        let (spans, buffers) = self.prepare_copy_many(copies)?;
         self.submit(
             self.context.compute,
             Retained {

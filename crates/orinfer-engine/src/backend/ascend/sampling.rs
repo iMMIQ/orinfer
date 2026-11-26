@@ -371,13 +371,6 @@ impl Categorical {
             .flat_map(|r| [r[0], r[1], origin as i32, r[2]])
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
-        session.upload_inputs(&[
-            (self.controls.slice(0, controls.len())?, controls),
-            (
-                self.active.clone(),
-                (rows.len() as i32).to_le_bytes().to_vec(),
-            ),
-        ])?;
         session.copy(
             source,
             0,
@@ -392,6 +385,7 @@ impl Categorical {
                 session,
                 comm,
                 &self.contract,
+                (self.controls.slice(0, controls.len())?, controls),
                 proposals,
                 &self.active,
                 capture,

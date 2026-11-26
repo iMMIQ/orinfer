@@ -366,12 +366,17 @@ def selected_int8(
     dma_scales=False,
     direct_bf16=False,
     overlap_qk=False,
+    rows_per_cta=1,
+    cross_row_pipe=False,
 ):
     """One paired-core selected-KV gather/QK/softmax/PV invocation per query.
 
     The producer and consumer of each query run within one kernel. Workspace
     spills bridge AIV/AIC storage and retain the original FP32 scores, full-row
-    normalization and normalized BF16 probability boundary.
+    normalization and normalized BF16 probability boundary. When ``rows_per_cta > 1``
+    and ``cross_row_pipe=True`` (with ``direct_bf16=True``), each CTA loops over a
+    contiguous block of queries and pipelines Cube QK(s)/PV(s-1) with Vector
+    Gather(s)/Softmax(s-1) bit-identically across disjoint row workspaces.
     """
     from kernels.ascend.attention_cube import softmax_row, softmax_head_tile
     from kernels.ascend.kv_int8 import gather_tile, _contiguous_view
@@ -384,6 +389,8 @@ def selected_int8(
         raise ValueError("Invalid selected attention cache/reuse geometry")
     if long_selected not in (128, 512):
         raise ValueError("Selected long KV must contain128or512slots")
+    if rows_per_cta < 1 or (cross_row_pipe and (rows_per_cta < 2 or not direct_bf16)):
+        raise ValueError("Cross-row attention pipeline requires rows_per_cta >= 2 and direct_bf16")
     padded_heads = (heads + 15) // 16 * 16
     dimension, tile_k = 512, 128
     if tile_d not in (128, 256) or pv_l0_k not in (64, 128):
@@ -403,6 +410,8 @@ def selected_int8(
         overlap_qk and (not reuse_long) and (tile_k % (2 * tile_slots) == 0) and (selected > tile_k)
     )
     reuse_overlap = overlap_qk and reuse_long and (selected > tile_k)
+    grouped = rows_per_cta > 1
+    grid_extent = T.ceildiv(rows, rows_per_cta) if grouped else rows
 
     @T.macro
     def run(
@@ -422,7 +431,7 @@ def selected_int8(
         output_workspace,
         staged_swa_cache,
     ):
-        with T.Kernel(rows, is_npu=True) as (cid, vid):
+        with T.Kernel(grid_extent, is_npu=True) as (cid, vid):
             T.reads(
                 query[0:rows, :, :],
                 swa[:, :, :],
@@ -447,22 +456,329 @@ def selected_int8(
                 probability_workspace[0:rows, :, :],
                 output_workspace[0:rows, :, :],
             )
-            row = cid
-            if row < rows:
-                with T.Scope("C"):
-                    query_l1 = T.alloc_L1((padded_heads, dimension), "bfloat16")
-                    key_l1 = T.alloc_L1((tile_k, dimension), "bfloat16")
-                    probability_l1 = T.alloc_L1((padded_heads, selected), "bfloat16")
-                    value_l1 = T.alloc_L1((selected, tile_d), "bfloat16")
-                    score_acc = T.alloc_L0C((padded_heads, tile_k), "float32")
-                    output_acc = T.alloc_L0C((padded_heads, tile_d), "float32")
-                    T.copy(query[row, :, :], query_l1[:heads, :])
-                    if chunk_overlap:
-                        for slot in T.serial(selected // tile_k):
+            if grouped:
+                base_row = cid * rows_per_cta
+                cnt = T.min(rows_per_cta, T.max(0, rows - base_row))
+                if cnt > 0:
+                    steps = (cnt + 1) if cross_row_pipe else cnt
+                    with T.Scope("C"):
+                        query_l1 = T.alloc_L1((padded_heads, dimension), "bfloat16")
+                        key_l1 = T.alloc_L1((tile_k, dimension), "bfloat16")
+                        probability_l1 = T.alloc_L1((padded_heads, selected), "bfloat16")
+                        value_l1 = T.alloc_L1((selected, tile_d), "bfloat16")
+                        score_acc = T.alloc_L0C((padded_heads, tile_k), "float32")
+                        output_acc = T.alloc_L0C((padded_heads, tile_d), "float32")
+                        for s in T.serial(steps):
+                            if (not cross_row_pipe) or s < cnt:
+                                r_qk = base_row + s
+                                T.copy(query[r_qk, :, :], query_l1[:heads, :])
+                                if chunk_overlap:
+                                    for slot in T.serial(selected // tile_k):
+                                        T.wait_cross_flag(0)
+                                        T.copy(
+                                            kv_workspace[
+                                                r_qk, slot * tile_k : (slot + 1) * tile_k, :
+                                            ],
+                                            key_l1,
+                                        )
+                                        T.gemm_v0(
+                                            query_l1,
+                                            key_l1,
+                                            score_acc,
+                                            transpose_B=True,
+                                            init=True,
+                                            kL0Size=128,
+                                        )
+                                        T.copy(
+                                            score_acc,
+                                            score_workspace[
+                                                r_qk, :, slot * tile_k : (slot + 1) * tile_k
+                                            ],
+                                        )
+                                elif reuse_overlap:
+                                    for slot in T.serial(1, selected // tile_k):
+                                        T.copy(
+                                            kv_workspace[
+                                                r_qk, slot * tile_k : (slot + 1) * tile_k, :
+                                            ],
+                                            key_l1,
+                                        )
+                                        T.gemm_v0(
+                                            query_l1,
+                                            key_l1,
+                                            score_acc,
+                                            transpose_B=True,
+                                            init=True,
+                                            kL0Size=128,
+                                        )
+                                        T.copy(
+                                            score_acc,
+                                            score_workspace[
+                                                r_qk, :, slot * tile_k : (slot + 1) * tile_k
+                                            ],
+                                        )
+                                    T.wait_cross_flag(0)
+                                    T.copy(kv_workspace[r_qk, 0:tile_k, :], key_l1)
+                                    T.gemm_v0(
+                                        query_l1,
+                                        key_l1,
+                                        score_acc,
+                                        transpose_B=True,
+                                        init=True,
+                                        kL0Size=128,
+                                    )
+                                    T.copy(score_acc, score_workspace[r_qk, :, 0:tile_k])
+                                else:
+                                    T.wait_cross_flag(0)
+                                    for slot in T.serial(selected // tile_k):
+                                        T.copy(
+                                            kv_workspace[
+                                                r_qk, slot * tile_k : (slot + 1) * tile_k, :
+                                            ],
+                                            key_l1,
+                                        )
+                                        T.gemm_v0(
+                                            query_l1,
+                                            key_l1,
+                                            score_acc,
+                                            transpose_B=True,
+                                            init=True,
+                                            kL0Size=128,
+                                        )
+                                        T.copy(
+                                            score_acc,
+                                            score_workspace[
+                                                r_qk, :, slot * tile_k : (slot + 1) * tile_k
+                                            ],
+                                        )
+                                T.set_cross_flag("FIX", 1)
+                            if (not cross_row_pipe) or s > 0:
+                                r_pv = base_row + (s - 1 if cross_row_pipe else s)
+                                T.wait_cross_flag(2)
+                                T.copy(
+                                    probability_workspace[r_pv, :heads, :],
+                                    probability_l1[:heads, :],
+                                )
+                                for d in T.serial(dimension // tile_d):
+                                    T.copy(
+                                        kv_workspace[r_pv, :, d * tile_d : (d + 1) * tile_d],
+                                        value_l1,
+                                    )
+                                    T.gemm_v0(
+                                        probability_l1,
+                                        value_l1,
+                                        output_acc,
+                                        init=True,
+                                        kL0Size=pv_l0_k,
+                                    )
+                                    T.copy(
+                                        output_acc,
+                                        output[r_pv, :heads, d * tile_d : (d + 1) * tile_d],
+                                    )
+                    with T.Scope("V"):
+                        q = T.alloc_ub((decode_groups, 64), "int8")
+                        zeros = T.alloc_ub((decode_groups, 16), "int32")
+                        half_values = T.alloc_ub((min(decode_groups, 128), 64), "float16")
+                        values = T.alloc_ub((min(decode_groups, 128), 64), "float32")
+                        half_scales = T.alloc_ub((decode_groups, 1), "float16")
+                        scale = T.alloc_ub((min(decode_groups, 128), 1), "float32")
+                        broadcast = T.alloc_ub((min(decode_groups, 128), 64), "float32")
+                        decoded = T.alloc_ub((tile_slots, dimension), "bfloat16")
+                        staged_rows = _contiguous_view(decoded, (decode_groups, 64))
+                        flag = T.alloc_ub((max(8, tile_slots),), "int32")
+                        x = T.alloc_ub((softmax_heads, selected), "float32")
+                        ids = T.alloc_ub((1, selected), "int32")
+                        valid = T.alloc_ub((1, selected), "float32")
+                        mask = T.alloc_ub((softmax_heads * selected // 8,), "uint8")
+                        maximum = T.alloc_ub((softmax_heads, 1), "float32")
+                        denominator = T.alloc_ub((softmax_heads, 1), "float32")
+                        sink_value = T.alloc_ub((softmax_heads, 1), "float32")
+                        probability = T.alloc_ub((softmax_heads, selected), "bfloat16")
+                        expanded = T.alloc_ub((softmax_heads, selected), "float32")
+                        for s in T.serial(steps):
+                            if (not cross_row_pipe) or s < cnt:
+                                r_g = base_row + s
+                                if chunk_overlap:
+                                    parts_per_slot = tile_k // (2 * tile_slots)
+                                    for slot in T.serial(selected // tile_k):
+                                        for part in T.serial(parts_per_slot):
+                                            first = (
+                                                slot * tile_k
+                                                + vid * (tile_k // 2)
+                                                + part * tile_slots
+                                            )
+                                            gather_tile(
+                                                swa,
+                                                swa_scales,
+                                                long_kv,
+                                                long_scales,
+                                                swa_indices,
+                                                long_indices,
+                                                kv_workspace,
+                                                mask_workspace,
+                                                q,
+                                                zeros,
+                                                half_values,
+                                                values,
+                                                half_scales,
+                                                scale,
+                                                broadcast,
+                                                decoded,
+                                                flag,
+                                                r_g,
+                                                first,
+                                                capacity,
+                                                compressed_capacity,
+                                                compressed,
+                                                storage,
+                                                tile_slots,
+                                                True,
+                                                decode_groups,
+                                                staged_swa_cache,
+                                                staged_swa,
+                                                staged_rows,
+                                                async_gather,
+                                                dma_scales,
+                                            )
+                                        T.set_cross_flag("MTE3", 0)
+                                else:
+                                    for part in T.serial(produced // (2 * tile_slots)):
+                                        first = vid * (produced // 2) + part * tile_slots
+                                        gather_tile(
+                                            swa,
+                                            swa_scales,
+                                            long_kv,
+                                            long_scales,
+                                            swa_indices,
+                                            long_indices,
+                                            kv_workspace,
+                                            mask_workspace,
+                                            q,
+                                            zeros,
+                                            half_values,
+                                            values,
+                                            half_scales,
+                                            scale,
+                                            broadcast,
+                                            decoded,
+                                            flag,
+                                            r_g,
+                                            first,
+                                            capacity,
+                                            compressed_capacity,
+                                            compressed,
+                                            storage,
+                                            tile_slots,
+                                            True,
+                                            decode_groups,
+                                            staged_swa_cache,
+                                            staged_swa,
+                                            staged_rows,
+                                            async_gather,
+                                            dma_scales,
+                                        )
+                                    T.set_cross_flag("MTE3", 0)
+                            if (not cross_row_pipe) or s > 0:
+                                r_sm = base_row + (s - 1 if cross_row_pipe else s)
+                                T.wait_cross_flag(1)
+                                if softmax_heads > 1:
+                                    T.copy(mask_workspace[r_sm, :], ids)
+                                    T.tile.cast(valid, ids, "CAST_NONE", selected)
+                                    T.tile.broadcast(expanded, valid)
+                                    T.tile.compare(mask, expanded, -1.0, "GT")
+                                for lane in T.serial(half_heads // softmax_heads):
+                                    head = vid * half_heads + lane * softmax_heads
+                                    if softmax_heads > 1:
+                                        softmax_head_tile(
+                                            score_workspace,
+                                            sink,
+                                            probability_workspace,
+                                            r_sm,
+                                            head,
+                                            x,
+                                            mask,
+                                            maximum,
+                                            denominator,
+                                            sink_value,
+                                            probability,
+                                            expanded,
+                                            selected,
+                                            dimension,
+                                            softmax_heads,
+                                        )
+                                    else:
+                                        softmax_row(
+                                            score_workspace,
+                                            mask_workspace,
+                                            sink,
+                                            probability_workspace,
+                                            r_sm,
+                                            head,
+                                            x,
+                                            ids,
+                                            valid,
+                                            mask,
+                                            maximum,
+                                            denominator,
+                                            sink_value,
+                                            probability,
+                                            selected,
+                                            dimension,
+                                            lane == 0,
+                                        )
+                                T.set_cross_flag("MTE3", 2)
+            else:
+                row = cid
+                if row < rows:
+                    with T.Scope("C"):
+                        query_l1 = T.alloc_L1((padded_heads, dimension), "bfloat16")
+                        key_l1 = T.alloc_L1((tile_k, dimension), "bfloat16")
+                        probability_l1 = T.alloc_L1((padded_heads, selected), "bfloat16")
+                        value_l1 = T.alloc_L1((selected, tile_d), "bfloat16")
+                        score_acc = T.alloc_L0C((padded_heads, tile_k), "float32")
+                        output_acc = T.alloc_L0C((padded_heads, tile_d), "float32")
+                        T.copy(query[row, :, :], query_l1[:heads, :])
+                        if chunk_overlap:
+                            for slot in T.serial(selected // tile_k):
+                                T.wait_cross_flag(0)
+                                T.copy(
+                                    kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :],
+                                    key_l1,
+                                )
+                                T.gemm_v0(
+                                    query_l1,
+                                    key_l1,
+                                    score_acc,
+                                    transpose_B=True,
+                                    init=True,
+                                    kL0Size=128,
+                                )
+                                T.copy(
+                                    score_acc,
+                                    score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k],
+                                )
+                        elif reuse_overlap:
+                            # Long KV slots [1..N) are already resident in kv_workspace; compute
+                            # their QK tiles on Cube concurrently while Vector decodes SWA slot 0.
+                            for slot in T.serial(1, selected // tile_k):
+                                T.copy(
+                                    kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :],
+                                    key_l1,
+                                )
+                                T.gemm_v0(
+                                    query_l1,
+                                    key_l1,
+                                    score_acc,
+                                    transpose_B=True,
+                                    init=True,
+                                    kL0Size=128,
+                                )
+                                T.copy(
+                                    score_acc,
+                                    score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k],
+                                )
                             T.wait_cross_flag(0)
-                            T.copy(
-                                kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :], key_l1
-                            )
+                            T.copy(kv_workspace[row, 0:tile_k, :], key_l1)
                             T.gemm_v0(
                                 query_l1,
                                 key_l1,
@@ -471,95 +787,108 @@ def selected_int8(
                                 init=True,
                                 kL0Size=128,
                             )
-                            T.copy(
-                                score_acc,
-                                score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k],
-                            )
-                    elif reuse_overlap:
-                        # Long KV slots [1..N) are already resident in kv_workspace; compute
-                        # their QK tiles on Cube concurrently while Vector decodes SWA slot 0.
-                        for slot in T.serial(1, selected // tile_k):
-                            T.copy(
-                                kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :], key_l1
-                            )
-                            T.gemm_v0(
-                                query_l1,
-                                key_l1,
-                                score_acc,
-                                transpose_B=True,
-                                init=True,
-                                kL0Size=128,
-                            )
-                            T.copy(
-                                score_acc,
-                                score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k],
-                            )
-                        T.wait_cross_flag(0)
-                        T.copy(kv_workspace[row, 0:tile_k, :], key_l1)
-                        T.gemm_v0(
-                            query_l1, key_l1, score_acc, transpose_B=True, init=True, kL0Size=128
-                        )
-                        T.copy(score_acc, score_workspace[row, :, 0:tile_k])
-                    else:
-                        T.wait_cross_flag(0)
-                        for slot in T.serial(selected // tile_k):
-                            T.copy(
-                                kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :], key_l1
-                            )
-                            T.gemm_v0(
-                                query_l1,
-                                key_l1,
-                                score_acc,
-                                transpose_B=True,
-                                init=True,
-                                kL0Size=128,
-                            )
-                            T.copy(
-                                score_acc,
-                                score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k],
-                            )
-                    T.set_cross_flag("FIX", 1)
-                    T.wait_cross_flag(2)
-                    T.copy(probability_workspace[row, :heads, :], probability_l1[:heads, :])
-                    for d in T.serial(dimension // tile_d):
-                        T.copy(kv_workspace[row, :, d * tile_d : (d + 1) * tile_d], value_l1)
-                        T.gemm_v0(probability_l1, value_l1, output_acc, init=True, kL0Size=pv_l0_k)
-                        if direct_bf16:
-                            T.copy(
-                                output_acc,
-                                output[row, :heads, d * tile_d : (d + 1) * tile_d],
-                            )
+                            T.copy(score_acc, score_workspace[row, :, 0:tile_k])
                         else:
-                            T.copy(
-                                output_acc, output_workspace[row, :, d * tile_d : (d + 1) * tile_d]
+                            T.wait_cross_flag(0)
+                            for slot in T.serial(selected // tile_k):
+                                T.copy(
+                                    kv_workspace[row, slot * tile_k : (slot + 1) * tile_k, :],
+                                    key_l1,
+                                )
+                                T.gemm_v0(
+                                    query_l1,
+                                    key_l1,
+                                    score_acc,
+                                    transpose_B=True,
+                                    init=True,
+                                    kL0Size=128,
+                                )
+                                T.copy(
+                                    score_acc,
+                                    score_workspace[row, :, slot * tile_k : (slot + 1) * tile_k],
+                                )
+                        T.set_cross_flag("FIX", 1)
+                        T.wait_cross_flag(2)
+                        T.copy(probability_workspace[row, :heads, :], probability_l1[:heads, :])
+                        for d in T.serial(dimension // tile_d):
+                            T.copy(kv_workspace[row, :, d * tile_d : (d + 1) * tile_d], value_l1)
+                            T.gemm_v0(
+                                probability_l1, value_l1, output_acc, init=True, kL0Size=pv_l0_k
                             )
-                    T.set_cross_flag("FIX", 3)
-                    T.wait_cross_flag(4)
-                with T.Scope("V"):
-                    q = T.alloc_ub((decode_groups, 64), "int8")
-                    zeros = T.alloc_ub((decode_groups, 16), "int32")
-                    half_values = T.alloc_ub((min(decode_groups, 128), 64), "float16")
-                    values = T.alloc_ub((min(decode_groups, 128), 64), "float32")
-                    half_scales = T.alloc_ub((decode_groups, 1), "float16")
-                    scale = T.alloc_ub((min(decode_groups, 128), 1), "float32")
-                    broadcast = T.alloc_ub((min(decode_groups, 128), 64), "float32")
-                    decoded = T.alloc_ub((tile_slots, dimension), "bfloat16")
-                    staged_rows = _contiguous_view(decoded, (decode_groups, 64))
-                    flag = T.alloc_ub((max(8, tile_slots),), "int32")
-                    x = T.alloc_ub((softmax_heads, selected), "float32")
-                    ids = T.alloc_ub((1, selected), "int32")
-                    valid = T.alloc_ub((1, selected), "float32")
-                    mask = T.alloc_ub((softmax_heads * selected // 8,), "uint8")
-                    maximum = T.alloc_ub((softmax_heads, 1), "float32")
-                    denominator = T.alloc_ub((softmax_heads, 1), "float32")
-                    sink_value = T.alloc_ub((softmax_heads, 1), "float32")
-                    probability = T.alloc_ub((softmax_heads, selected), "bfloat16")
-                    expanded = T.alloc_ub((softmax_heads, selected), "float32")
-                    if chunk_overlap:
-                        parts_per_slot = tile_k // (2 * tile_slots)
-                        for slot in T.serial(selected // tile_k):
-                            for part in T.serial(parts_per_slot):
-                                first = slot * tile_k + vid * (tile_k // 2) + part * tile_slots
+                            if direct_bf16:
+                                T.copy(
+                                    output_acc,
+                                    output[row, :heads, d * tile_d : (d + 1) * tile_d],
+                                )
+                            else:
+                                T.copy(
+                                    output_acc,
+                                    output_workspace[row, :, d * tile_d : (d + 1) * tile_d],
+                                )
+                        T.set_cross_flag("FIX", 3)
+                        T.wait_cross_flag(4)
+                    with T.Scope("V"):
+                        q = T.alloc_ub((decode_groups, 64), "int8")
+                        zeros = T.alloc_ub((decode_groups, 16), "int32")
+                        half_values = T.alloc_ub((min(decode_groups, 128), 64), "float16")
+                        values = T.alloc_ub((min(decode_groups, 128), 64), "float32")
+                        half_scales = T.alloc_ub((decode_groups, 1), "float16")
+                        scale = T.alloc_ub((min(decode_groups, 128), 1), "float32")
+                        broadcast = T.alloc_ub((min(decode_groups, 128), 64), "float32")
+                        decoded = T.alloc_ub((tile_slots, dimension), "bfloat16")
+                        staged_rows = _contiguous_view(decoded, (decode_groups, 64))
+                        flag = T.alloc_ub((max(8, tile_slots),), "int32")
+                        x = T.alloc_ub((softmax_heads, selected), "float32")
+                        ids = T.alloc_ub((1, selected), "int32")
+                        valid = T.alloc_ub((1, selected), "float32")
+                        mask = T.alloc_ub((softmax_heads * selected // 8,), "uint8")
+                        maximum = T.alloc_ub((softmax_heads, 1), "float32")
+                        denominator = T.alloc_ub((softmax_heads, 1), "float32")
+                        sink_value = T.alloc_ub((softmax_heads, 1), "float32")
+                        probability = T.alloc_ub((softmax_heads, selected), "bfloat16")
+                        expanded = T.alloc_ub((softmax_heads, selected), "float32")
+                        if chunk_overlap:
+                            parts_per_slot = tile_k // (2 * tile_slots)
+                            for slot in T.serial(selected // tile_k):
+                                for part in T.serial(parts_per_slot):
+                                    first = slot * tile_k + vid * (tile_k // 2) + part * tile_slots
+                                    gather_tile(
+                                        swa,
+                                        swa_scales,
+                                        long_kv,
+                                        long_scales,
+                                        swa_indices,
+                                        long_indices,
+                                        kv_workspace,
+                                        mask_workspace,
+                                        q,
+                                        zeros,
+                                        half_values,
+                                        values,
+                                        half_scales,
+                                        scale,
+                                        broadcast,
+                                        decoded,
+                                        flag,
+                                        row,
+                                        first,
+                                        capacity,
+                                        compressed_capacity,
+                                        compressed,
+                                        storage,
+                                        tile_slots,
+                                        True,
+                                        decode_groups,
+                                        staged_swa_cache,
+                                        staged_swa,
+                                        staged_rows,
+                                        async_gather,
+                                        dma_scales,
+                                    )
+                                T.set_cross_flag("MTE3", 0)
+                        else:
+                            for part in T.serial(produced // (2 * tile_slots)):
+                                first = vid * (produced // 2) + part * tile_slots
                                 gather_tile(
                                     swa,
                                     swa_scales,
@@ -594,115 +923,78 @@ def selected_int8(
                                     dma_scales,
                                 )
                             T.set_cross_flag("MTE3", 0)
-                    else:
-                        for part in T.serial(produced // (2 * tile_slots)):
-                            first = vid * (produced // 2) + part * tile_slots
-                            gather_tile(
-                                swa,
-                                swa_scales,
-                                long_kv,
-                                long_scales,
-                                swa_indices,
-                                long_indices,
-                                kv_workspace,
-                                mask_workspace,
-                                q,
-                                zeros,
-                                half_values,
-                                values,
-                                half_scales,
-                                scale,
-                                broadcast,
-                                decoded,
-                                flag,
-                                row,
-                                first,
-                                capacity,
-                                compressed_capacity,
-                                compressed,
-                                storage,
-                                tile_slots,
-                                True,
-                                decode_groups,
-                                staged_swa_cache,
-                                staged_swa,
-                                staged_rows,
-                                async_gather,
-                                dma_scales,
-                            )
-                        T.set_cross_flag("MTE3", 0)
-                    T.wait_cross_flag(1)
-                    if softmax_heads > 1:
-                        T.copy(mask_workspace[row, :], ids)
-                        T.tile.cast(valid, ids, "CAST_NONE", selected)
-                        T.tile.broadcast(expanded, valid)
-                        T.tile.compare(mask, expanded, -1.0, "GT")
-                    for lane in T.serial(half_heads // softmax_heads):
-                        head = vid * half_heads + lane * softmax_heads
+                        T.wait_cross_flag(1)
                         if softmax_heads > 1:
-                            softmax_head_tile(
-                                score_workspace,
-                                sink,
-                                probability_workspace,
-                                row,
-                                head,
-                                x,
-                                mask,
-                                maximum,
-                                denominator,
-                                sink_value,
-                                probability,
-                                expanded,
-                                selected,
-                                dimension,
-                                softmax_heads,
-                            )
-                        else:
-                            softmax_row(
-                                score_workspace,
-                                mask_workspace,
-                                sink,
-                                probability_workspace,
-                                row,
-                                head,
-                                x,
-                                ids,
-                                valid,
-                                mask,
-                                maximum,
-                                denominator,
-                                sink_value,
-                                probability,
-                                selected,
-                                dimension,
-                                lane == 0,
-                            )
-                    T.set_cross_flag("MTE3", 2)
-                    T.wait_cross_flag(3)
-                    if not direct_bf16:
-                        partial = T.alloc_ub((half_heads, tile_d), "float32")
-                        result = T.alloc_ub((half_heads, tile_d), "bfloat16")
-                        for d in T.serial(dimension // tile_d):
-                            first_head = vid * half_heads
-                            T.copy(
-                                output_workspace[
+                            T.copy(mask_workspace[row, :], ids)
+                            T.tile.cast(valid, ids, "CAST_NONE", selected)
+                            T.tile.broadcast(expanded, valid)
+                            T.tile.compare(mask, expanded, -1.0, "GT")
+                        for lane in T.serial(half_heads // softmax_heads):
+                            head = vid * half_heads + lane * softmax_heads
+                            if softmax_heads > 1:
+                                softmax_head_tile(
+                                    score_workspace,
+                                    sink,
+                                    probability_workspace,
                                     row,
-                                    first_head : first_head + half_heads,
-                                    d * tile_d : (d + 1) * tile_d,
-                                ],
-                                partial,
-                            )
-                            T.tile.cast(result, partial, "CAST_RINT", half_heads * tile_d)
-                            T.copy(
-                                result,
-                                output[
+                                    head,
+                                    x,
+                                    mask,
+                                    maximum,
+                                    denominator,
+                                    sink_value,
+                                    probability,
+                                    expanded,
+                                    selected,
+                                    dimension,
+                                    softmax_heads,
+                                )
+                            else:
+                                softmax_row(
+                                    score_workspace,
+                                    mask_workspace,
+                                    sink,
+                                    probability_workspace,
                                     row,
-                                    first_head : first_head + half_heads,
-                                    d * tile_d : (d + 1) * tile_d,
-                                ],
-                            )
-                    T.set_cross_flag("MTE3", 4)
-                    T.pipe_barrier("ALL")
+                                    head,
+                                    x,
+                                    ids,
+                                    valid,
+                                    mask,
+                                    maximum,
+                                    denominator,
+                                    sink_value,
+                                    probability,
+                                    selected,
+                                    dimension,
+                                    lane == 0,
+                                )
+                        T.set_cross_flag("MTE3", 2)
+                        T.wait_cross_flag(3)
+                        if not direct_bf16:
+                            partial = T.alloc_ub((half_heads, tile_d), "float32")
+                            result = T.alloc_ub((half_heads, tile_d), "bfloat16")
+                            for d in T.serial(dimension // tile_d):
+                                first_head = vid * half_heads
+                                T.copy(
+                                    output_workspace[
+                                        row,
+                                        first_head : first_head + half_heads,
+                                        d * tile_d : (d + 1) * tile_d,
+                                    ],
+                                    partial,
+                                )
+                                T.tile.cast(result, partial, "CAST_RINT", half_heads * tile_d)
+                                T.copy(
+                                    result,
+                                    output[
+                                        row,
+                                        first_head : first_head + half_heads,
+                                        d * tile_d : (d + 1) * tile_d,
+                                    ],
+                                )
+                        T.set_cross_flag("MTE3", 4)
+                        T.pipe_barrier("ALL")
 
     if staged_swa:
 

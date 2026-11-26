@@ -246,8 +246,8 @@ def partials(
 
 
 def reduce_partials(rows, output, tile_n=32, splits=8):
-    """Restore the common 32-column/eight-split reduction from wide Cube tiles."""
-    if tile_n not in (32, 64, 128) or output % 32 or splits != 8:
+    """Restore the common 32-column reduction from wide Cube tiles."""
+    if tile_n not in (32, 64, 128) or output % 32 or splits not in (5, 8, 10):
         raise ValueError("Invalid floating partial layout")
     blocks = (output + tile_n - 1) // tile_n
 
@@ -271,5 +271,62 @@ def reduce_partials(rows, output, tile_n=32, splits=8):
                     T.copy(total[0, :valid], out[row, block * tile_n : block * tile_n + valid])
                     T.set_flag("MTE3", "V", 7)
                     T.wait_flag("MTE3", "V", 7)
+
+    return main
+
+
+def direct_bf16(rows, output, reduction, tile_m=16, tile_n=128, block_k=256, pipeline_stages=0):
+    """Single-kernel BF16xBF16 -> FP32 projection (no split-K partial reduction)."""
+    if output % 32 or reduction % block_k:
+        raise ValueError("Direct BF16 projection requires aligned output and K tile")
+    if tile_m not in (16, 32, 64) or tile_n not in (64, 128, 256):
+        raise ValueError("Unsupported direct BF16 tile geometry")
+    if tile_m * tile_n * 4 > 131072:
+        raise ValueError("Direct BF16 accumulator exceeds A2 L0C allocation")
+    blocks = (output + tile_n - 1) // tile_n
+    loops = reduction // block_k
+    if pipeline_stages not in (0, 2, 3) or (pipeline_stages and loops < pipeline_stages):
+        raise ValueError("Direct BF16 pipeline requires enough K iterations")
+
+    @T.prim_func
+    def main(
+        activation: T.Tensor((rows, reduction), "bfloat16"),
+        weight: T.Tensor((1, output, reduction), "bfloat16"),
+        out: T.Tensor((rows, output), "float32"),
+    ):
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            m_blocks = T.ceildiv(rows, tile_m)
+            total_blocks = m_blocks * blocks
+            iters = T.ceildiv(T.max(0, total_blocks - cid), 20)
+            with T.Scope("C"):
+                a = T.alloc_L1((tile_m, block_k), "bfloat16")
+                b = T.alloc_L1((tile_n, block_k), "bfloat16")
+                c = T.alloc_L0C((tile_m, tile_n), "float32")
+                for step in T.serial(iters):
+                    blk = cid + step * 20
+                    bm = blk // blocks
+                    bn = blk % blocks
+                    first = bm * tile_m
+                    valid = T.min(tile_m, rows - first)
+                    valid_cols = T.min(tile_n, output - bn * tile_n)
+                    for k in T.Pipelined(loops, num_stages=pipeline_stages):
+                        T.copy(
+                            activation[first : first + valid, k * block_k : (k + 1) * block_k],
+                            a[:valid, :],
+                        )
+                        T.copy(
+                            weight[
+                                0,
+                                bn * tile_n : bn * tile_n + valid_cols,
+                                k * block_k : (k + 1) * block_k,
+                            ],
+                            b[:valid_cols, :],
+                        )
+                        T.gemm_v0(a, b, c, transpose_B=True, init=(k == 0))
+                    T.copy(
+                        c[:valid, :valid_cols],
+                        out[first : first + valid, bn * tile_n : bn * tile_n + valid_cols],
+                    )
+                    T.pipe_barrier("FIX")
 
     return main

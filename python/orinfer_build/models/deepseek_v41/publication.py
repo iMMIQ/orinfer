@@ -28,6 +28,9 @@ def manifest_bindings(model):
                 yield choice["kernels"], index
     for op in model.get("vision", {}).get("body", []):
         yield op, "manifest"
+    batch = model.get("batch")
+    if batch and batch.get("copy_spans"):
+        yield batch, "copy_spans"
     sampling = model.get("sampling", {})
     for key in ("local", "merge", "processed_local", "processed_merge"):
         if sampling.get(key):

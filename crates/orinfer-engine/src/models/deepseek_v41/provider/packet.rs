@@ -369,13 +369,16 @@ pub(super) fn forecast(
 
 /// Canonical verification row buckets (max gap 16 <= DRAFTS + 1 = 17 so device
 /// coordinates remain active and all buckets <= 127 stay inside non-SP P[2]).
-/// Includes 24 so 3..4 active decoders (18..24 rows) do not pad up to 32 rows.
-const VERIFY_BUCKETS: &[usize] = &[16, 24, 32, 48, 64, 80, 96, 112, 127];
+/// Fine low-load steps (1, 6, 8, 9, 12, 16, 20) avoid padding single-/small-batch
+/// decode into larger tiles or across the 20-AIC 1-wave attention cliff.
+const VERIFY_BUCKETS: &[usize] = &[1, 6, 8, 9, 12, 16, 20, 24, 32, 48, 64, 80, 96, 112, 127];
 
 /// Canonical Mixed decoder-row buckets (max gap 64 <= keep = 128 for <=256,
 /// and 128 <= keep for 257..384 when two final prefills share a mixed packet;
 /// buckets <= 127 trigger cross-family Tail downgrade from SP P[3] to non-SP P[2]).
-const MIXED_DECODER_BUCKETS: &[usize] = &[32, 64, 127, 192, 256, 384];
+/// Includes 12, 20 and 24 so low-load Mixed Tail+Head steps downgrade to P_low/P1
+/// instead of padding up to 32 rows.
+const MIXED_DECODER_BUCKETS: &[usize] = &[12, 20, 24, 32, 64, 127, 192, 256, 384];
 
 pub(super) fn bucket_verify_rows(rows: usize) -> usize {
     VERIFY_BUCKETS

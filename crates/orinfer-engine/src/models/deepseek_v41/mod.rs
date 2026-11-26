@@ -557,6 +557,7 @@ type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
 
 struct Worker {
     device_inputs: Option<device_inputs::Runtime>,
+    span_copier: Option<state::SpanCopier>,
     sampling: Option<crate::backend::ascend::sampling::Categorical>,
     growth: BTreeMap<String, crate::backend::growth::TokenLayout>,
     session: Session,

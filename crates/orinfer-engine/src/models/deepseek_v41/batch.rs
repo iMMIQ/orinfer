@@ -53,6 +53,8 @@ pub(super) struct Contract {
     pub verification_windows: BTreeMap<String, super::state::AppendWindow>,
     #[serde(default)]
     pub decoder_replay: Option<super::replay::Contract>,
+    #[serde(default)]
+    pub copy_spans: Option<String>,
 }
 impl Contract {
     pub(super) fn verification_rows(&self, legacy: usize, capacity: usize) -> Result<usize> {
