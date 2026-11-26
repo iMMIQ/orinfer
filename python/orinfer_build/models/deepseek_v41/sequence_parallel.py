@@ -298,7 +298,7 @@ def build(
                 continue
             manifest = descriptor(step)
             kind, buffers = manifest["op"], step["buffers"]
-            if kind == "engram.hadamard32":
+            if kind == "engram.cast_fp32":
                 body.append(gather(buffers[0], "bf16", 20480))
             is_local = (
                 kind.startswith("vector.mhc_")

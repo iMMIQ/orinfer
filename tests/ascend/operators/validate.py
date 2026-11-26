@@ -3,6 +3,7 @@
 import argparse
 import ctypes
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -207,12 +208,9 @@ def reference(kind, inputs, parameters):
             (x.long() @ w.long().T).float() if kind == "w8_projection" else x.float() @ w.float().T
         )
         return [(raw * sa[:, None] * sw[None, :]).bfloat16()]
-    if kind == "rotate_blocks":
-        hidden, rotation = inputs
-        shape = hidden.shape
-        return [
-            (hidden.float().view(*shape[:-1], -1, parameters["block"]) @ rotation.T).reshape(shape)
-        ]
+    if kind == "engram_cast_fp32":
+        (hidden,) = inputs
+        return [hidden.float()]
     if kind == "engram_gate":
         hidden, original, key, value, channel_weight, token_mask = inputs
         k = key.float()
@@ -582,17 +580,16 @@ def cases(rows, width, index_length=8192, attention_selected=32, select_k=512):
             ],
             [x, w, sa, sw],
         )
-    rotation, _ = torch.linalg.qr(torch.randn(128, 128))
+    cast_tile = math.gcd(4 * width, 2048)
     yield (
-        "rotate_blocks",
-        engram.rotate_blocks(rows, width),
-        {"rows": rows, "width": width, "block": 128},
+        "engram_cast_fp32",
+        engram.cast_fp32(rows, width, tile=cast_tile),
+        {"rows": rows, "width": width, "tile": cast_tile},
         [
-            operand("hidden", "bf16", (rows, 4, width)),
-            operand("rotation", "f32", (128, 128)),
-            operand("out", "f32", (rows, 4, width), "write"),
+            operand("hidden", "bf16", (rows * 4 * width,)),
+            operand("out", "f32", (rows * 4 * width,), "write"),
         ],
-        [torch.randn(rows, 4, width).bfloat16(), rotation],
+        [torch.randn(rows * 4 * width).bfloat16()],
     )
     mask = torch.ones(rows, dtype=torch.int8)
     if rows > 1:
@@ -958,7 +955,7 @@ def main():
             "regroup",
             "w8_projection",
             "bf16_projection",
-            "rotate_blocks",
+            "engram_cast_fp32",
             "engram_gate",
             "sparse_attention",
             "fp32_partials",

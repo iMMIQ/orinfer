@@ -35,7 +35,7 @@ def main():
             if d["op"] not in [
                 "memory.gather_columns",
                 "model_ops.split",
-                "engram.hadamard32",
+                "engram.cast_fp32",
                 "engram.gate",
             ]:
                 continue
@@ -78,13 +78,6 @@ def main():
     mask = torch.ones(cap, dtype=torch.int8, device="npu")
     mask[::7] = 0
     channel = torch.randn(4, width, device="npu") * 0.1
-    rotation = torch.tensor(
-        [
-            [(-1.0 if (i & j).bit_count() % 2 else 1.0) / (32**0.5) for j in range(32)]
-            for i in range(32)
-        ],
-        device="npu",
-    ).flatten()
 
     def allocate(rows):
         return dict(
@@ -103,7 +96,7 @@ def main():
     def pipeline(entries, buf, h, m, n):
         call(entries, "memory.gather_columns", [buf["received"], buf["projected"]], n)
         call(entries, "model_ops.split", [buf["projected"], buf["key"], buf["value"]], n)
-        call(entries, "engram.hadamard32", [h, rotation, buf["original"]], n)
+        call(entries, "engram.cast_fp32", [h, buf["original"]], n)
         call(
             entries,
             "engram.gate",

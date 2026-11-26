@@ -70,7 +70,6 @@ class PrefillOptions:
     parallel_regroup: bool = False
     packed_attention: bool = False
     batched_hc: bool = False
-    fast_engram: bool = False
     compact_attention: bool = False
     batched_rope: bool = False
     active_expert_rows: bool = False
@@ -712,21 +711,13 @@ class Builder:
         original = self.temp("engram.original", (rows, 4, 5120), "f32")
         self.kernel(
             engram,
-            "hadamard32" if self.dynamic and self.prefill.fast_engram else "rotate_blocks",
-            dict(
-                rows=rows,
-                width=5120,
-                **(
-                    {"tile_groups": 64}
-                    if self.dynamic and self.prefill.fast_engram
-                    else {"block": 32}
-                ),
-            ),
+            "cast_fp32",
+            dict(rows=rows, width=5120, tile=2048),
             [
-                ("hidden", hidden, "bf16", (rows, 4, 5120), "read"),
-                ("rotation", "rotation", "f32", (32, 32), "read"),
-                ("out", original, "f32", (rows, 4, 5120), "write"),
+                ("hidden", hidden, "bf16", (rows * 4 * 5120,), "read"),
+                ("out", original, "f32", (rows * 4 * 5120,), "write"),
             ],
+            grid_limit=20,
         )
         channel = self.buffer(
             "w." + prefix + ".channel",
@@ -1779,7 +1770,6 @@ def main():
     parser.add_argument("--prefill-capacity", type=int, default=16)
     parser.add_argument("--packed-attention", action="store_true")
     parser.add_argument("--batched-hc", action="store_true")
-    parser.add_argument("--fast-engram", action="store_true")
     parser.add_argument("--compact-attention", action="store_true")
     parser.add_argument("--vector-prefix", action="store_true")
     parser.add_argument(
@@ -1848,19 +1838,6 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "data").mkdir(exist_ok=True)
     shutil.copyfile(args.engram_metadata, args.output / "data/engram.json")
-    from safetensors import safe_open
-
-    with safe_open(
-        args.model_dir / "optional/quarot.safetensors", framework="pt", device="cpu"
-    ) as archive:
-        rotation = archive.get_tensor("global_rotation").float()
-    block = rotation[:32, :32].contiguous()
-    if not torch.equal(rotation, torch.block_diag(*([block] * 160))):
-        raise ValueError("Expected repeated block32 Engram rotation")
-    if args.fast_engram:
-        from orinfer_build.models.deepseek_v41.export_engram import validate_hadamard32
-
-        validate_hadamard32(block.numpy())
     kernels, ranks = {}, []
     for rank in range(8):
         builder = Builder(
@@ -1874,14 +1851,12 @@ def main():
                 vector_prefix=args.vector_prefix,
                 packed_attention=args.packed_attention,
                 batched_hc=args.batched_hc,
-                fast_engram=args.fast_engram,
                 compact_attention=args.compact_attention,
                 batched_rope=args.batched_rope,
                 active_expert_rows=args.active_expert_rows,
             ),
             args.model_dir,
         )
-        builder.asset("rotation", block.numpy().astype("<f4"), "f32")
         packets = [builder.packet(1), builder.packet(args.prefill_capacity, dynamic=True)]
         ranks.append({"rank": rank, "buffers": builder.buffers, "packets": packets})
         print(

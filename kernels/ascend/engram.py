@@ -7,111 +7,31 @@ import tilelang.language as T
 from kernels.ascend.vector_math import rsqrt_fp32
 
 
-def rotate_blocks(rows, width, block=128):
-    if width % block or block % 32:
-        raise ValueError("Engram rotation requires H%block=0 and block%32=0")
-    groups = width // block
-    tiles = block // 32
-
-    @T.prim_func
-    def main(
-        hidden: T.Tensor((rows, 4, width), "bfloat16"),
-        rotation: T.Tensor((block, block), "float32"),
-        out: T.Tensor((rows, 4, width), "float32"),
-    ):
-        with T.Kernel(T.ceildiv(rows * 4 * groups * tiles, 2), is_npu=True) as (cid, vid):
-            xb = T.alloc_ub((1, block), "bfloat16")
-            x = T.alloc_ub((1, block), "float32")
-            w = T.alloc_ub((32, block), "float32")
-            product = T.alloc_ub((32, block), "float32")
-            total = T.alloc_ub((32, 1), "float32")
-            index = cid * 2 + vid
-            tile = index % tiles
-            group = index // tiles % groups
-            path = index // (tiles * groups) % 4
-            row = index // (tiles * groups * 4)
-            if row < rows:
-                T.copy(hidden[row, path, group * block : (group + 1) * block], xb)
-                T.copy(rotation[tile * 32 : (tile + 1) * 32, :], w)
-                T.tile.cast(x, xb, "CAST_NONE", block)
-                T.tile.broadcast(product, x)
-                T.tile.mul(product, product, w)
-                T.reduce_sum(product, total, dim=1)
-                T.copy(
-                    total,
-                    out[row, path, group * block + tile * 32 : group * block + (tile + 1) * 32],
-                )
-
-    return main
-
-
-def hadamard32(rows, width, tile_groups=64):
-    """Signed Walsh block32 rotation, validated against the bank offline.
-
-    Multiply BF16 inputs by the bank's original FP32 magnitude before the
-    butterfly. Output signs come from the first column of that same bank.
-    """
-    count = tile_groups * 32
-    if tile_groups not in (16, 32, 64) or (4 * width) % (tile_groups * 32):
-        raise ValueError("Hadamard32 requires complete aligned group tiles")
-    tiles = 4 * width // count
+def cast_fp32(rows, width, tile=2048):
+    """Persistent BF16->FP32 cast for unrotated Engram basis restoration."""
+    if (4 * width) % tile or tile % 32:
+        raise ValueError("Engram cast requires aligned tiles dividing 4 * width")
+    tiles_per_row = (4 * width) // tile
 
     @T.prim_func
     def main(
         hidden: T.Tensor((rows * 4 * width,), "bfloat16"),
-        rotation: T.Tensor((1024,), "float32"),
         out: T.Tensor((rows * 4 * width,), "float32"),
     ):
-        with T.Kernel(T.ceildiv(rows * tiles, 2), is_npu=True) as (cid, vid):
-            xb = T.alloc_ub((count,), "bfloat16")
-            p = T.alloc_ub((count,), "float32")
-            even = T.alloc_ub((count // 2,), "float32")
-            odd = T.alloc_ub((count // 2,), "float32")
-            left = T.alloc_ub((count // 2,), "float32")
-            right = T.alloc_ub((count // 2,), "float32")
-            w = T.alloc_ub((1024,), "float32")
-            lane = T.alloc_ub((count,), "float32")
-            group = T.alloc_ub((count,), "float32")
-            floor_i = T.alloc_ub((count,), "int32")
-            offsets = T.alloc_ub((count,), "uint32")
-            sign_offsets = T.alloc_ub((count,), "uint32")
-            signs = T.alloc_ub((count,), "float32")
-            result = T.alloc_ub((count,), "float32")
-            tile = cid * 2 + vid
-            if tile < rows * tiles:
-                T.copy(hidden[tile * count : (tile + 1) * count], xb)
-                T.copy(rotation, w)
-                T.tile.cast(p, xb, "CAST_NONE", count)
-                T.tile.mul(p, p, w[0])
-                for stage in T.serial(5):
-                    T.tile.gather_mask(even, p, "P0101")
-                    T.tile.gather_mask(odd, p, "P1010")
-                    T.tile.add(left, even, odd)
-                    T.tile.sub(right, even, odd)
-                    T.copy(left, p[: count // 2])
-                    T.copy(right, p[count // 2 :])
-                T.tile.createvecindex(lane, 0.0)
-                T.tile.mul(group, lane, 0.03125)
-                T.tile.cast(floor_i, group, "CAST_FLOOR", count)
-                T.tile.cast(group, floor_i, "CAST_NONE", count)
-                T.tile.mul(result, group, 32.0)
-                T.tile.sub(lane, lane, result)
-                # group-major output from Walsh-major butterfly storage.
-                T.tile.mul(result, lane, float(tile_groups))
-                T.tile.add(result, result, group)
-                T.tile.mul(result, result, 4.0)
-                T.tile.cast(floor_i, result, "CAST_RINT", count)
-                T.reinterpretcast(offsets, floor_i, "uint32_t")
-                T.tile.gather(result, p, offsets, 0)
-                T.tile.mul(lane, lane, 128.0)
-                T.tile.cast(floor_i, lane, "CAST_RINT", count)
-                T.reinterpretcast(sign_offsets, floor_i, "uint32_t")
-                T.tile.gather(signs, w, sign_offsets, 0)
-                T.tile.div(signs, signs, w[0])
-                T.tile.mul(result, result, signs)
-                T.copy(result, out[tile * count : (tile + 1) * count])
-                T.set_flag("MTE3", "V", 7)
-                T.wait_flag("MTE3", "V", 7)
+        with T.Kernel(20, is_npu=True) as (cid, vid):
+            xb = T.alloc_ub((tile,), "bfloat16")
+            xf = T.alloc_ub((tile,), "float32")
+            aiv = cid * 2 + vid
+            total = rows * tiles_per_row
+            if aiv < total:
+                for step in T.serial(T.ceildiv(total - aiv, 40)):
+                    index = aiv + step * 40
+                    start = index * tile
+                    T.copy(hidden[start : start + tile], xb)
+                    T.tile.cast(xf, xb, "CAST_NONE", tile)
+                    T.copy(xf, out[start : start + tile])
+                    T.set_flag("MTE3", "V", 7)
+                    T.wait_flag("MTE3", "V", 7)
 
     return main
 
