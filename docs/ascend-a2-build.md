@@ -120,7 +120,39 @@ Vision weights live in `vision.safetensors` (matching the Ascend language prepro
 
 ---
 
-## 4. Plan Optimization & Compact Publication
+## 4. Unrotated Native-Grid Quantization (`quantize_norot`)
+
+To eliminate QuaRot32 rotation distortion against the official MXFP4+FP8 power-of-two weight grid, re-quantize directly from `/data/models/DeepSeek-V4.1-Flash-1017` using `orinfer_build.models.deepseek_v41.quantize_norot`:
+
+- **`L00–L37` routed experts**: Per-channel SSZ signed INT4 `[-8, 7]` (`ssz_w4.c`) packed into Ascend Transposed-NZ (`mean NMSE ≈ 0.0047–0.0049`).
+- **`L38–L39` tail routed experts**: Exact-grid lossless INT8 ND with BF16 scales (`0.5 * s_min` power-of-two step), reusing active-row `gather_quantized_active` and `swiglu_packed_quant_active_p20`.
+- **Shared KV-source layers (`L02, L08, L14, L20`)**: BF16 `attn.wq_a` and `attn.wkv` with tuned small-M `row_selections`; the other 36 layers stay unrotated W8A8 with fused `norm_quant`.
+- **Engram basis restoration**: 20-AIC persistent BF16→FP32 cast (`engram.cast_fp32`), replacing legacy rotated Engram kernels.
+- **DSpark draft (`mtp.0/1/2`)**: Exact-grid lossless full W8 routed experts (`--draft-mode full_w8`).
+- **Host Engram tables (`weights/host/`, 206 GiB)** and `weights/dspark/embedding.safetensors` are basis-invariant and hardlinked without copying.
+
+```bash
+# 1. Compile extra AOT kernels (engram.cast_fp32, tuned BF16 wq_a/wkv, draft A8 gather/swiglu)
+bash tools/environments/ascend/run.sh --without-devices python3 \
+  -m orinfer_build.models.deepseek_v41.quantize_norot compile-kernels \
+  --base-package /path/to/base-installed-cache/BASE_DIGEST \
+  --output-dir artifacts/dsv41-norot/kernels --workers 16
+
+# 2. Quantize official checkpoint, export physical shards, and compact RoPE execution package
+OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 uv run --locked python \
+  -m orinfer_build.models.deepseek_v41.quantize_norot export \
+  --official-dir /data/models/DeepSeek-V4.1-Flash-1017 \
+  --base-model /path/to/base-model \
+  --kernels-json artifacts/dsv41-norot/kernels/extra-kernels.json \
+  --work-dir artifacts/dsv41-norot \
+  --w8-layers 38 39 --bf16-qkv kv-sources --draft-mode full_w8 \
+  --compact-engine target/release/orinfer \
+  --workers 32 --export-workers 16
+```
+
+---
+
+## 5. Plan Optimization & Compact Publication
 
 Key offline plan transforms in `python/orinfer_build/models/deepseek_v41/`:
 
@@ -143,7 +175,7 @@ uv run --locked python -m orinfer_build.models.deepseek_v41.publication \
 
 ---
 
-## 5. Benchmarking & Verification
+## 6. Benchmarking & Verification
 
 ```bash
 # Native single-sequence benchmark
