@@ -121,6 +121,190 @@ class SSZQuantizer:
         return q, s, float(err.value / max(energy.value, 1e-30))
 
 
+class GPTQQuantizer:
+    """Hash-cached OpenMP C11 Act-Order Blocked GPTQ + H-optimal scale INT4 [-8, 7] quantizer."""
+
+    def __init__(self, cache_dir: Path, n_threads: int | None = None):
+        source = Path(__file__).with_name("gptq_w4.c")
+        compiler = subprocess.check_output(["cc", "--version"])
+        key = hashlib.sha256(
+            source.read_bytes() + compiler + platform.machine().encode()
+        ).hexdigest()
+        cache = Path(cache_dir)
+        cache.mkdir(parents=True, exist_ok=True)
+        library = cache / f"gptq_w4-{key}.so"
+        if not library.exists():
+            with tempfile.TemporaryDirectory(dir=cache) as temporary:
+                staged = Path(temporary) / "gptq_w4.so"
+                subprocess.run(
+                    [
+                        "cc",
+                        "-O3",
+                        "-std=c11",
+                        "-fopenmp",
+                        "-shared",
+                        "-fPIC",
+                        str(source),
+                        "-lm",
+                        "-o",
+                        str(staged),
+                    ],
+                    check=True,
+                )
+                os.replace(staged, library)
+        self.n_threads = int(n_threads or os.cpu_count() or 1)
+        self.library = ctypes.CDLL(str(library.resolve()))
+        self.hdiag_ssz = self.library.orinfer_hdiag_ssz_scale
+        self.hdiag_ssz.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        self.hdiag_ssz.restype = None
+
+        self.diag_block = self.library.orinfer_gptq_diag_block
+        self.diag_block.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self.diag_block.restype = None
+
+        self.cd_pass = self.library.orinfer_gptq_cd_pass
+        self.cd_pass.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self.cd_pass.restype = None
+
+    @staticmethod
+    def factor_hessian(
+        hessian: np.ndarray, damp_frac: float = 0.05
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Compute act-order permutation and upper Cholesky of damped H^{-1}."""
+        h = np.array(hessian, dtype=np.float64, copy=True)
+        k = h.shape[0]
+        if h.shape != (k, k):
+            raise ValueError("Hessian must be square")
+        dead = np.diag(h) <= 0.0
+        h[dead, dead] = 1.0
+        perm = np.argsort(-np.diag(h)).astype(np.int32)
+        invperm = np.argsort(perm).astype(np.int32)
+        hp = h[np.ix_(perm, perm)]
+        damp = max(damp_frac * float(np.mean(np.diag(hp))), 1e-6)
+        idx = np.arange(k)
+        hinv_ch = None
+        for mult in (1.0, 2.0, 5.0, 10.0, 50.0, 200.0):
+            try:
+                hd = hp.copy()
+                hd[idx, idx] += damp * mult
+                chol = np.linalg.cholesky(hd)
+                inv_chol = np.linalg.solve(chol, np.eye(k, dtype=np.float64))
+                hinv = inv_chol.T @ inv_chol
+                hinv_ch = np.linalg.cholesky(hinv).T
+                break
+            except np.linalg.LinAlgError:
+                continue
+        if hinv_ch is None:
+            hinv_ch = np.diag(1.0 / np.sqrt(np.maximum(np.diag(hp), 1e-6)))
+        h_damped = h.copy()
+        h_damped[idx, idx] += damp
+        return (
+            perm,
+            invperm,
+            np.ascontiguousarray(hinv_ch, dtype=np.float32),
+            np.ascontiguousarray(h_damped, dtype=np.float32),
+        )
+
+    def quantize_cpu(
+        self,
+        weights: np.ndarray,
+        hessian: np.ndarray,
+        *,
+        damp_frac: float = 0.05,
+        block_size: int = 128,
+        cd_iters: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Pure-CPU Act-Order Blocked GPTQ + exact H-optimal scale (+ optional CD refinement)."""
+        w = np.ascontiguousarray(weights, dtype=np.float32)
+        n, k = w.shape
+        perm, invperm, hinv_ch, h_damped = self.factor_hessian(hessian, damp_frac=damp_frac)
+        wp = np.ascontiguousarray(w[:, perm], dtype=np.float32)
+        hd_p = np.ascontiguousarray(np.diag(h_damped)[perm], dtype=np.float32)
+        s = np.empty(n, dtype=np.float32)
+        self.hdiag_ssz(wp.ctypes.data, hd_p.ctypes.data, n, k, self.n_threads, s.ctypes.data)
+
+        qp = np.empty((n, k), dtype=np.int8)
+        for i1 in range(0, k, block_size):
+            i2 = min(i1 + block_size, k)
+            cnt = i2 - i1
+            wb = np.ascontiguousarray(wp[:, i1:i2], dtype=np.float32)
+            hb = np.ascontiguousarray(hinv_ch[i1:i2, i1:i2], dtype=np.float32)
+            qb = np.empty((n, cnt), dtype=np.int8)
+            eb = np.empty((n, cnt), dtype=np.float32)
+            self.diag_block(
+                wb.ctypes.data,
+                hb.ctypes.data,
+                s.ctypes.data,
+                n,
+                cnt,
+                self.n_threads,
+                qb.ctypes.data,
+                eb.ctypes.data,
+            )
+            qp[:, i1:i2] = qb
+            if i2 < k:
+                wp[:, i2:] -= eb @ hinv_ch[i1:i2, i2:]
+
+        q = np.ascontiguousarray(qp[:, invperm], dtype=np.int8)
+        wh = w @ h_damped
+        qf = q.astype(np.float32)
+        qh = qf @ h_damped
+        num = (wh * qf).sum(axis=1)
+        den = np.maximum((qh * qf).sum(axis=1), 1e-30)
+        s = np.maximum(num / den, 1e-30).astype(np.float32)
+
+        if cd_iters > 0:
+            hd_full = np.ascontiguousarray(np.diag(h_damped), dtype=np.float32)
+            for _ in range(cd_iters):
+                r_mat = np.ascontiguousarray(wh - s[:, None] * qh, dtype=np.float32)
+                self.cd_pass(
+                    h_damped.ctypes.data,
+                    hd_full.ctypes.data,
+                    perm.ctypes.data,
+                    s.ctypes.data,
+                    n,
+                    k,
+                    self.n_threads,
+                    q.ctypes.data,
+                    r_mat.ctypes.data,
+                )
+                qf = q.astype(np.float32)
+                qh = qf @ h_damped
+                num = (wh * qf).sum(axis=1)
+                den = np.maximum((qh * qf).sum(axis=1), 1e-30)
+                s = np.maximum(num / den, 1e-30).astype(np.float32)
+
+        err_h = float(((w - s[:, None] * qf) * (wh - s[:, None] * qh)).sum(dtype=np.float64))
+        en_h = max(float((w * wh).sum(dtype=np.float64)), 1e-30)
+        return q, s, max(err_h, 0.0) / en_h
+
+
 def to_bf16_u16(values: np.ndarray) -> np.ndarray:
     """IEEE round-to-nearest-even FP32 -> BF16 stored as little-endian uint16."""
     v = np.ascontiguousarray(values, dtype="<f4")
@@ -379,6 +563,7 @@ class NoRotRelease(TensorRelease):
         bf16_qkv_layers: list[int],
         draft_prep_dir: Path | None,
         draft_mode: str | None,
+        smoothquant_dir: Path | None = None,
         **kwargs,
     ):
         super().__init__(*args, overlay=False, **kwargs)
@@ -390,7 +575,45 @@ class NoRotRelease(TensorRelease):
         self.bf16_qkv_layers = sorted(set(bf16_qkv_layers))
         self.draft_prep_dir = Path(draft_prep_dir) if draft_prep_dir else None
         self.draft_mode = draft_mode
+        self.smoothquant_dir = Path(smoothquant_dir) if smoothquant_dir else None
         self.file_replacements = {}
+
+    def _load_layer_smoothquant(
+        self, layer_id: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Load per-layer calibrated SmoothQuant vectors (s_q, s_attn, s_shw, s_ffn)."""
+        ones_q = np.ones(1280, dtype=np.float32)
+        ones_d = np.ones(5120, dtype=np.float32)
+        ones_sh = np.ones(2304, dtype=np.float32)
+        if not self.smoothquant_dir:
+            return ones_q, ones_d, ones_sh, ones_d
+        path = self.smoothquant_dir / f"L{layer_id:02d}.npz"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing SmoothQuant calibration file: {path}")
+        with np.load(path) as data:
+            s_q = np.asarray(data["s_q"], dtype=np.float32)
+            s_attn = np.asarray(data["s_attn"], dtype=np.float32)
+            s_shw = np.asarray(data["s_shw"], dtype=np.float32)
+            s_ffn = np.asarray(data["s_ffn"], dtype=np.float32)
+        if (
+            s_q.shape != (1280,)
+            or s_attn.shape != (5120,)
+            or s_shw.shape != (2304,)
+            or s_ffn.shape != (5120,)
+        ):
+            raise ValueError(f"Invalid SmoothQuant vector shape in {path}")
+        for name, vec in (("s_q", s_q), ("s_attn", s_attn), ("s_shw", s_shw), ("s_ffn", s_ffn)):
+            if not np.isfinite(vec).all() or np.any(vec <= 0.0):
+                raise ValueError(f"Non-positive or non-finite {name} in {path}")
+        if np.any(s_shw < 1.0 - 1e-6):
+            raise ValueError(f"Shared SwiGLU SmoothQuant s_shw must be >= 1.0 in {path}")
+        if (layer_id in self.bf16_qkv_layers or layer_id in KV_SOURCE_LAYERS) and np.any(
+            s_attn != 1.0
+        ):
+            raise ValueError(f"s_attn must be unity on BF16/KV-source layer {layer_id}")
+        if layer_id in self.w8_layers and np.any(s_ffn != 1.0):
+            raise ValueError(f"s_ffn must be unity on exact-grid W8 layer {layer_id}")
+        return s_q, s_attn, s_shw, s_ffn
 
     @staticmethod
     def _npy_info(path: Path):
@@ -497,21 +720,42 @@ class NoRotRelease(TensorRelease):
                     )
                 del ew
 
+            sq_active = dict(q=0, attn=0, shw=0, ffn=0)
             for L in range(40):
                 pref = f"layers.{L}"
+                s_q, s_attn, s_shw, s_ffn = self._load_layer_smoothquant(L)
+                has_q = bool(np.any(s_q != 1.0))
+                has_attn = bool(np.any(s_attn != 1.0))
+                has_shw = bool(np.any(s_shw != 1.0))
+                has_ffn = bool(np.any(s_ffn != 1.0))
+                sq_active["q"] += int(has_q)
+                sq_active["attn"] += int(has_attn)
+                sq_active["shw"] += int(has_shw)
+                sq_active["ffn"] += int(has_ffn)
+
+                attn_norm_w = ckpt.read(f"{pref}.attn_norm.weight").astype("<f4")
+                if has_attn:
+                    attn_norm_w = attn_norm_w / s_attn
+                ffn_norm_w = ckpt.read(f"{pref}.ffn_norm.weight").astype("<f4")
+                if has_ffn:
+                    ffn_norm_w = ffn_norm_w / s_ffn
+                q_norm_w = ckpt.read(f"{pref}.attn.q_norm.weight").astype("<f4")
+                if has_q:
+                    q_norm_w = q_norm_w / s_q
+
                 replace_shared(
                     f"w.{pref}.attn_norm.weight.0-5120.0-1.f32",
-                    ckpt.read(f"{pref}.attn_norm.weight").reshape(5120, 1).astype("<f4"),
+                    attn_norm_w.reshape(5120, 1).astype("<f4"),
                     "F32",
                 )
                 replace_shared(
                     f"w.{pref}.ffn_norm.weight.0-5120.0-1.f32",
-                    ckpt.read(f"{pref}.ffn_norm.weight").reshape(5120, 1).astype("<f4"),
+                    ffn_norm_w.reshape(5120, 1).astype("<f4"),
                     "F32",
                 )
                 replace_shared(
                     f"w.{pref}.attn.q_norm.weight.0-1280.0-1.f32",
-                    ckpt.read(f"{pref}.attn.q_norm.weight").reshape(1280, 1).astype("<f4"),
+                    q_norm_w.reshape(1280, 1).astype("<f4"),
                     "F32",
                 )
                 replace_shared(
@@ -529,6 +773,8 @@ class NoRotRelease(TensorRelease):
                     )
 
                 gw = ckpt.matrix(f"{pref}.ffn.gate.weight").astype("<f4")
+                if has_ffn:
+                    gw = (gw * s_ffn[None, :]).astype("<f4")
                 replace_shared(f"w.{pref}.ffn.gate.weight.0-384.0-5120.f32", gw, "F32")
                 replace_shared(
                     f"w.{pref}.ffn.gate.weight.0-384.0-5120.bf16", to_bf16_u16(gw), "BF16"
@@ -550,6 +796,9 @@ class NoRotRelease(TensorRelease):
                         suffix=".norot_bf16",
                     )
                 else:
+                    if has_attn:
+                        wqa = wqa * s_attn[None, :]
+                        wkv = wkv * s_attn[None, :]
                     q_wqa, s_wqa = quantize_per_channel_i8_f32(wqa)
                     q_wkv, s_wkv = quantize_per_channel_i8_f32(wkv)
                     replace_shared(f"w.{pref}.attn.wq_a.weight.0-1280.0-5120.i8", q_wqa, "I8")
@@ -586,30 +835,38 @@ class NoRotRelease(TensorRelease):
 
                 if L in (2, 8, 14, 20, 24, 28, 32, 36):
                     iwp = ckpt.matrix(f"{pref}.attn.indexer.weights_proj.weight")
+                    if has_attn:
+                        iwp = iwp * s_attn[None, :]
                     replace_shared(
                         f"w.{pref}.attn.indexer.weights_proj.weight.0-32.0-5120.bf16",
                         to_bf16_u16(iwp),
                         "BF16",
                     )
-                    qi, si = quantize_per_channel_i8_f32(
-                        ckpt.matrix(f"{pref}.attn.indexer.wq_b.weight")
-                    )
+                    idx_wqb = ckpt.matrix(f"{pref}.attn.indexer.wq_b.weight")
+                    if has_q:
+                        idx_wqb = idx_wqb * s_q[None, :]
+                    qi, si = quantize_per_channel_i8_f32(idx_wqb)
                     replace_shared(f"w.{pref}.attn.indexer.wq_b.weight.0-4096.0-1280.i8", qi, "I8")
                     replace_shared(
                         f"w.{pref}.attn.indexer.wq_b.weight_scale.0-4096.0-1.f32", si, "F32"
                     )
 
                 wqb_full = ckpt.matrix(f"{pref}.attn.wq_b.weight")
+                if has_q:
+                    wqb_full = wqb_full * s_q[None, :]
                 wob_full = ckpt.matrix(f"{pref}.attn.wo_b.weight")
-                sh_w1_q, sh_w1_s = quantize_per_channel_i8_f32(
-                    ckpt.matrix(f"{pref}.ffn.shared_experts.w1.weight")
-                )
-                sh_w3_q, sh_w3_s = quantize_per_channel_i8_f32(
-                    ckpt.matrix(f"{pref}.ffn.shared_experts.w3.weight")
-                )
-                sh_w2_q, sh_w2_s = quantize_per_channel_i8_f32(
-                    ckpt.matrix(f"{pref}.ffn.shared_experts.w2.weight")
-                )
+                sh_w1_m = ckpt.matrix(f"{pref}.ffn.shared_experts.w1.weight")
+                sh_w3_m = ckpt.matrix(f"{pref}.ffn.shared_experts.w3.weight")
+                sh_w2_m = ckpt.matrix(f"{pref}.ffn.shared_experts.w2.weight")
+                if has_ffn:
+                    sh_w1_m = sh_w1_m * s_ffn[None, :]
+                    sh_w3_m = sh_w3_m * s_ffn[None, :]
+                if has_shw:
+                    sh_w3_m = sh_w3_m / s_shw[:, None]
+                    sh_w2_m = sh_w2_m * s_shw[None, :]
+                sh_w1_q, sh_w1_s = quantize_per_channel_i8_f32(sh_w1_m)
+                sh_w3_q, sh_w3_s = quantize_per_channel_i8_f32(sh_w3_m)
+                sh_w2_q, sh_w2_s = quantize_per_channel_i8_f32(sh_w2_m)
                 replace_shared(
                     f"w.{pref}.ffn.shared_experts.w2.weight_scale.0-5120.0-1.f32", sh_w2_s, "F32"
                 )
@@ -1224,6 +1481,8 @@ class NoRotRelease(TensorRelease):
                 w8_expert_layers=self.w8_layers,
                 bf16_qkv_layers=self.bf16_qkv_layers,
                 draft_mode=self.draft_mode,
+                smoothquant_calibrated=self.smoothquant_dir is not None,
+                smoothquant_active_layers=sq_active,
                 rewritten_shards=len(self.rewrite_groups),
                 hardlinked_shards=len(self.groups) - len(self.rewrite_groups),
             )
@@ -1535,6 +1794,7 @@ def export_command(args):
         bf16_qkv_layers=bf16_layers,
         draft_prep_dir=draft_prep_dir if draft_mode else None,
         draft_mode=draft_mode,
+        smoothquant_dir=args.smoothquant_dir.resolve() if args.smoothquant_dir else None,
     ).plan().export(workers=args.export_workers)
 
     desc = json.loads((model_out / "cache/model.json").read_text())
@@ -1605,7 +1865,8 @@ def main():
     e.add_argument("--work-dir", type=Path, required=True)
     e.add_argument("--prep-dir", type=Path, default=None)
     e.add_argument("--draft-prep-dir", type=Path, default=None)
-    e.add_argument("--w8-layers", type=int, nargs="*", default=[38, 39])
+    e.add_argument("--smoothquant-dir", type=Path, default=None)
+    e.add_argument("--w8-layers", type=int, nargs="*", default=[15, 39])
     e.add_argument("--bf16-qkv", choices=["all", "kv-sources", "none"], default="kv-sources")
     e.add_argument(
         "--draft-mode", choices=["none", "ssz_w4", "ssz_up_w8_down", "full_w8"], default="full_w8"

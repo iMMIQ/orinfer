@@ -120,12 +120,18 @@ Vision weights live in `vision.safetensors` (matching the Ascend language prepro
 
 ---
 
-## 4. Unrotated Native-Grid Quantization (`quantize_norot`)
+## 4. Unrotated Native-Grid & Activation-Calibrated Quantization (`calibrate_norot` / `quantize_norot`)
 
-To eliminate QuaRot32 rotation distortion against the official MXFP4+FP8 power-of-two weight grid, re-quantize directly from `/data/models/DeepSeek-V4.1-Flash-1017` using `orinfer_build.models.deepseek_v41.quantize_norot`:
+To eliminate QuaRot32 rotation distortion against the official MXFP4+FP8 power-of-two weight grid and maximize quantized fidelity on 8× Ascend 910B without increasing runtime latency, quantize directly from `/data/models/DeepSeek-V4.1-Flash-1017` using `orinfer_build.models.deepseek_v41.calibrate_norot` and `quantize_norot`:
 
-- **`L00–L37` routed experts**: Per-channel SSZ signed INT4 `[-8, 7]` (`ssz_w4.c`) packed into Ascend Transposed-NZ (`mean NMSE ≈ 0.0047–0.0049`).
-- **`L38–L39` tail routed experts**: Exact-grid lossless INT8 ND with BF16 scales (`0.5 * s_min` power-of-two step), reusing active-row `gather_quantized_active` and `swiglu_packed_quant_active_p20`.
+- **Activation-calibrated SmoothQuant (`calibrate_norot`)**: Runs a multi-domain tokenized calibration corpus (e.g. `256 × 1024 = 262,144` tokens strictly disjoint from evaluation splits) layer-by-layer on the exact official MXFP4+FP8 reference trajectory across all 8 NPUs + all host CPU cores (`8 × N` OpenMP/BLAS threads), fitting zero-overhead execution-graph-exact SmoothQuant scales:
+  - `q_norm → wq_b + indexer.wq_b` across all 40 layers.
+  - `attn_norm → wq_a + wkv + indexer.weights_proj` across all 36 non-KV-source W8A8 layers.
+  - `shared_experts` `w3/w2` SwiGLU SmoothQuant evaluated with exact `8 × 288` TP8 per-token A8 and clamp-exact masking (`|u_max| <= 8.5`, preserving `swiglu_limit = 10.0`).
+  - `ffn_norm` W4A8-gated SmoothQuant (only on W4 layers where actual W4A8 MSE drops ≥ 3%).
+- **Routed experts (`L00–L39`)**:
+  - **Optimal exact-grid lossless INT8 ND layers (`L15, L39`)**: Selected by 40-layer out-of-sample residual-impact audit (`L15` is #1 sensitivity by 5×; `L39` protects the final layer) while keeping total device weights at `53.8 GiB/card` so on-device prefix cache stays at full `4.64 GiB` capacity for high-concurrency Mini-Weka serving. Uses BF16 scales (`0.5 * s_min` power-of-two step, 0.0 weight error) and active-row `gather_quantized_active` / `swiglu_packed_quant_active_p20`.
+  - **Remaining 38 W4 layers**: Per-expert clamp-exact gated `w3/w2` SwiGLU SmoothQuant + routing-weight-exact (`wt^2`) Act-Order Blocked Hessian-GPTQ (`gptq_w4.c` OpenMP diagonal block + BLAS/NPU off-diagonal GEMM) + exact H-optimal per-channel scales (plus Gauss-Seidel coordinate-descent refinement on sensitive layers `L00, L02–L05, L07, L37–L38`), packed into Ascend Transposed-NZ. (Data-free fallback uses `ssz_w4.c` when `--prep-dir` / `--smoothquant-dir` are omitted.)
 - **Shared KV-source layers (`L02, L08, L14, L20`)**: BF16 `attn.wq_a` and `attn.wkv` with tuned small-M `row_selections`; the other 36 layers stay unrotated W8A8 with fused `norm_quant`.
 - **Engram basis restoration**: 20-AIC persistent BF16→FP32 cast (`engram.cast_fp32`), replacing legacy rotated Engram kernels.
 - **DSpark draft (`mtp.0/1/2`)**: Exact-grid lossless full W8 routed experts (`--draft-mode full_w8`).
@@ -138,14 +144,26 @@ bash tools/environments/ascend/run.sh --without-devices python3 \
   --base-package /path/to/base-installed-cache/BASE_DIGEST \
   --output-dir artifacts/dsv41-norot/kernels --workers 16
 
-# 2. Quantize official checkpoint, export physical shards, and compact RoPE execution package
+# 2. Run 8-NPU + 192-core activation calibration (8 NPU ranks x 24 1-thread CPU GPTQ workers)
+bash tools/environments/ascend/run.sh \
+  env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  python3 -m orinfer_build.models.deepseek_v41.calibrate_norot \
+  --official-dir /data/models/DeepSeek-V4.1-Flash-1017 \
+  --corpus /path/to/calib-corpus-256x1024.json \
+  --out-dir artifacts/dsv41-norot/calibrated \
+  --w8-layers 15 39 --cd-layers 0 2 3 4 5 7 37 38 \
+  --num-seqs 256 --seq-len 1024 --workers-per-rank 24
+
+# 3. Export physical shards (with calibrated experts + SmoothQuant) and compact RoPE package
 OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 uv run --locked python \
   -m orinfer_build.models.deepseek_v41.quantize_norot export \
   --official-dir /data/models/DeepSeek-V4.1-Flash-1017 \
   --base-model /path/to/base-model \
   --kernels-json artifacts/dsv41-norot/kernels/extra-kernels.json \
   --work-dir artifacts/dsv41-norot \
-  --w8-layers 38 39 --bf16-qkv kv-sources --draft-mode full_w8 \
+  --prep-dir artifacts/dsv41-norot/calibrated/prepared-experts \
+  --smoothquant-dir artifacts/dsv41-norot/calibrated/smoothquant \
+  --w8-layers 15 39 --bf16-qkv kv-sources --draft-mode full_w8 \
   --compact-engine target/release/orinfer \
   --workers 32 --export-workers 16
 ```

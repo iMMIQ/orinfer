@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 
 from orinfer_build.models.deepseek_v41.quantize_norot import (
+    GPTQQuantizer,
     SSZQuantizer,
     pack_w4_nz_bank,
     quantize_exact_w8,
@@ -40,6 +41,67 @@ class NoRotQuantizationTests(unittest.TestCase):
         ssz_err = float(np.square(w - q.astype(np.float32) * s[:, None]).sum())
         self.assertLess(ssz_err, mm_err * 0.75)
         self.assertAlmostEqual(nmse, ssz_err / float(np.square(w).sum()), places=5)
+
+    def test_gptq_w4_beats_ssz_on_correlated_hessian(self):
+        rng = np.random.default_rng(20261002)
+        # Correlated low-rank + diagonal activation distribution where GPTQ error compensation excels
+        basis = rng.standard_normal((512, 24)).astype(np.float32)
+        proj = rng.standard_normal((24, 192)).astype(np.float32)
+        x = basis @ proj + 0.15 * rng.standard_normal((512, 192)).astype(np.float32)
+        x[:, :8] *= 4.0  # Salient input channels
+        h = (x.T @ x).astype(np.float64)
+        w = rng.standard_normal((32, 192)).astype(np.float32)
+        w[0, :] = 0.0  # Zero row safety
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ssz = SSZQuantizer(Path(tmp))
+            gptq = GPTQQuantizer(Path(tmp), n_threads=4)
+            q_ssz, s_ssz, _ = ssz(w)
+            q_gptq, s_gptq, nmse_gptq = gptq.quantize_cpu(w, h, damp_frac=0.02, block_size=64)
+            q_cd, s_cd, nmse_cd = gptq.quantize_cpu(w, h, damp_frac=0.02, block_size=64, cd_iters=1)
+
+        self.assertEqual(q_gptq.dtype, np.int8)
+        self.assertTrue(np.all((q_gptq >= -8) & (q_gptq <= 7)))
+        self.assertTrue(np.all(q_gptq[0] == 0))
+        self.assertGreater(s_gptq[0], 0.0)
+
+        y_ref = x @ w.T
+        err_ssz = float(np.square(x @ (q_ssz.astype(np.float32) * s_ssz[:, None]).T - y_ref).sum())
+        err_gptq = float(
+            np.square(x @ (q_gptq.astype(np.float32) * s_gptq[:, None]).T - y_ref).sum()
+        )
+        err_cd = float(np.square(x @ (q_cd.astype(np.float32) * s_cd[:, None]).T - y_ref).sum())
+        self.assertLess(err_gptq, err_ssz * 0.55)
+        self.assertLessEqual(err_cd, err_gptq * 1.02)
+        self.assertLessEqual(nmse_cd, nmse_gptq + 1e-6)
+
+    def test_smoothquant_and_clamp_safe_swiglu_equivalence(self):
+        rng = np.random.default_rng(20261002)
+        x = rng.standard_normal((64, 128)).astype(np.float32)
+        w1 = rng.standard_normal((96, 128)).astype(np.float32) * 0.2
+        w3 = rng.standard_normal((96, 128)).astype(np.float32) * 0.2
+        w2 = rng.standard_normal((128, 96)).astype(np.float32) * 0.2
+
+        def swiglu(g, u):
+            g_c = np.minimum(g, 10.0)
+            u_c = np.clip(u, -10.0, 10.0)
+            return (g_c / (1.0 + np.exp(-g_c))) * u_c
+
+        # Reference unscaled SwiGLU MLP output
+        u_raw = x @ w3.T
+        self.assertLess(float(np.abs(u_raw).max()), 8.5)
+        y_ref = swiglu(x @ w1.T, u_raw) @ w2.T
+
+        # Apply BOTH input SmoothQuant s_in AND clamp-safe w3/w2 SwiGLU SmoothQuant s_sw >= 1.0
+        s_in = rng.uniform(0.4, 2.5, size=(128,)).astype(np.float32)
+        s_sw = rng.uniform(1.0, 3.5, size=(96,)).astype(np.float32)
+        x_s = x / s_in[None, :]
+        w1_s = w1 * s_in[None, :]
+        w3_s = (w3 * s_in[None, :]) / s_sw[:, None]
+        w2_s = w2 * s_sw[None, :]
+
+        y_sq = swiglu(x_s @ w1_s.T, x_s @ w3_s.T) @ w2_s.T
+        np.testing.assert_allclose(y_sq, y_ref, rtol=1e-5, atol=1e-5)
 
     def test_exact_w8_recovers_mxfp4_grid_losslessly(self):
         rng = np.random.default_rng(20261002)
