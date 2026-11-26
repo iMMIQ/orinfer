@@ -2,13 +2,14 @@
 use super::{Command, Reply};
 use crate::{artifact::Result, error::EngineError};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     sync::mpsc,
     thread::{self, Thread},
     time::{Duration, Instant},
 };
 
 type Response = std::result::Result<Reply, EngineError>;
+type Envelope = std::result::Result<(Reply, bool), EngineError>;
 pub(super) fn command_timeout(raw: Option<&str>) -> Result<Duration> {
     let millis = raw
         .unwrap_or("30000")
@@ -33,15 +34,27 @@ pub(super) fn heavy_command_timeout(raw: Option<&str>, base: Duration) -> Result
 }
 pub(super) struct Peer {
     pub send: mpsc::Sender<Command>,
-    pub receive: mpsc::Receiver<Response>,
+    pub receive: mpsc::Receiver<Envelope>,
 }
 pub(super) struct Replies {
-    send: Option<mpsc::Sender<Response>>,
+    send: Option<mpsc::Sender<Envelope>>,
     owner: Thread,
 }
 impl Replies {
-    pub fn send(&self, value: Response) -> std::result::Result<(), mpsc::SendError<Response>> {
-        let result = self.send.as_ref().unwrap().send(value);
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn send(&self, value: Response) -> std::result::Result<(), mpsc::SendError<Envelope>> {
+        self.send_evicted(value, false)
+    }
+    pub fn send_evicted(
+        &self,
+        value: Response,
+        programs_evicted: bool,
+    ) -> std::result::Result<(), mpsc::SendError<Envelope>> {
+        let result = self
+            .send
+            .as_ref()
+            .unwrap()
+            .send(value.map(|reply| (reply, programs_evicted)));
         self.owner.unpark();
         result
     }
@@ -55,7 +68,7 @@ impl Drop for Replies {
         self.owner.unpark();
     }
 }
-pub(super) fn reply_channel() -> (Replies, mpsc::Receiver<Response>) {
+pub(super) fn reply_channel() -> (Replies, mpsc::Receiver<Envelope>) {
     let (send, receive) = mpsc::channel();
     (
         Replies {
@@ -68,6 +81,7 @@ pub(super) fn reply_channel() -> (Replies, mpsc::Receiver<Response>) {
 pub(super) struct Transport {
     peers: Vec<Peer>,
     failure: RefCell<Option<EngineError>>,
+    programs_evicted: Cell<bool>,
     timeout: Duration,
     heavy_timeout: Duration,
 }
@@ -85,9 +99,13 @@ impl Transport {
         Self {
             peers: vec![],
             failure: RefCell::new(None),
+            programs_evicted: Cell::new(false),
             timeout,
             heavy_timeout: heavy_timeout.max(timeout),
         }
+    }
+    pub fn take_programs_evicted(&self) -> bool {
+        self.programs_evicted.replace(false)
     }
     pub fn has_failed(&self) -> bool {
         self.failure.borrow().is_some()
@@ -140,7 +158,10 @@ impl Transport {
                     continue;
                 }
                 match peer.receive.try_recv() {
-                    Ok(Ok(reply)) => {
+                    Ok(Ok((reply, evicted))) => {
+                        if evicted {
+                            self.programs_evicted.set(true);
+                        }
                         *slot = Some(reply);
                         remaining -= 1;
                     }
@@ -275,6 +296,30 @@ mod tests {
             assert!(error.contains("rank 1"));
             assert!(EngineError::take(error, false).is_fatal());
             assert!(worker.join().is_err());
+        });
+    }
+
+    #[test]
+    fn worker_program_eviction_flag_propagates_across_ranks_until_consumed() {
+        std::thread::scope(|scope| {
+            let mut transport = Transport::new(Duration::from_secs(2));
+            for evicted in [false, true] {
+                let (send, commands) = mpsc::channel();
+                let (reply, receive) = reply_channel();
+                transport.push(Peer { send, receive });
+                scope.spawn(move || {
+                    assert!(matches!(commands.recv().unwrap(), Command::Reset(_)));
+                    reply.send_evicted(Ok(Reply::Ready), evicted).unwrap();
+                    assert!(matches!(commands.recv().unwrap(), Command::Reset(_)));
+                    reply.send_evicted(Ok(Reply::Ready), false).unwrap();
+                });
+            }
+            assert!(!transport.take_programs_evicted());
+            transport.exchange(Command::Reset(vec![])).unwrap();
+            // Flag stays sticky across subsequent clean replies until consumed.
+            transport.exchange(Command::Reset(vec![])).unwrap();
+            assert!(transport.take_programs_evicted());
+            assert!(!transport.take_programs_evicted());
         });
     }
 }

@@ -134,10 +134,11 @@ impl Worker {
             .limit = Some(tokens);
         Ok(())
     }
-    pub(in crate::models::deepseek_v41) fn grow_owner(
+    pub(in crate::models::deepseek_v41) fn grow_owner_protected(
         &mut self,
         id: usize,
         tokens: usize,
+        protected: &ProtectedKeys<'_>,
     ) -> Result<()> {
         let owner = self
             .batch
@@ -156,7 +157,11 @@ impl Worker {
         // Mapping an admitted request converts its held capacity to resident
         // bytes. Existing Graph replay needs no new scratch reservation.
         if owner.limit.is_none() {
-            self.reserve_batch_memory(Requirement::snapshot(additional)?, "KV growth")?;
+            self.reserve_batch_memory_protected(
+                Requirement::snapshot(additional)?,
+                "KV growth",
+                protected,
+            )?;
         }
         let owner = self.batch.as_ref().unwrap().owners.get(&id).unwrap();
         let growth = self
@@ -204,6 +209,13 @@ impl Worker {
         self.session.grow_many(&growth)
     }
     pub(in crate::models::deepseek_v41) fn grow_batch(&mut self, layout: &Layout) -> Result<()> {
+        self.grow_batch_protected(layout, &ProtectedKeys::default())
+    }
+    pub(in crate::models::deepseek_v41) fn grow_batch_protected(
+        &mut self,
+        layout: &Layout,
+        protected: &ProtectedKeys<'_>,
+    ) -> Result<()> {
         if layout.role == super::super::PacketRole::Draft {
             return Ok(());
         }
@@ -220,7 +232,7 @@ impl Worker {
                 .len()
                 .checked_add(segment.tokens)
                 .ok_or("Owner token growth overflow")?;
-            self.grow_owner(segment.slot, tokens)?;
+            self.grow_owner_protected(segment.slot, tokens, protected)?;
         }
         Ok(())
     }

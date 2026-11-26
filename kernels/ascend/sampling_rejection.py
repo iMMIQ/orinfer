@@ -126,6 +126,7 @@ def merge_statistics(rows, vocab, pool_rows):
                     token = proposals[row, 1] - controls[row, 2]
                     if proposals[row, 0] >= 0 and token >= 0 and token < vocab:
                         inverse = T.reinterpret("float32", controls[row, 3])
+                        inverse = T.if_then_else(inverse > 0.0, inverse, 1.0)
                         packet[0, 4] = logits[row, token] * inverse
                         packet[0, 5] = draft[proposals[row, 0], token] * inverse
                     T.copy(packet, out[row : row + 1, :])
@@ -256,8 +257,14 @@ def select(rows, vocab, pool_rows, tile=1024):
                                     q[:, :live],
                                 )
                                 T.tile.mul(q, q, inverse)
-                                T.tile.sub(p, p, normalizers[row, 0])
-                                T.tile.sub(q, q, normalizers[row, 1])
+                                # Load 2D normalizer entries into scalar locals before
+                                # T.tile.add: passing a 2D GlobalTensor element directly
+                                # to T.tile.sub drops the trailing row stride and column
+                                # offset in TileLang-Ascend codegen.
+                                log_z_p = normalizers[row, 0]
+                                log_z_q = normalizers[row, 1]
+                                T.tile.add(p, p, -log_z_p)
+                                T.tile.add(q, q, -log_z_q)
                                 # log(max(p-q,0)), avoiding probability underflow.
                                 T.tile.sub(q, q, p)
                                 T.tile.min(q, q, 0.0)

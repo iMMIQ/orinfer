@@ -1,6 +1,23 @@
 """Maintain A2 Scalar GM cache coherence across native kernel boundaries."""
 
+import math
 import re
+
+
+def check_scalar_strides(source, operands):
+    """Reject TileLang-Ascend 2D+ GlobalTensor scalar tile ops that drop strides."""
+    globals_declared = set(re.findall(r"AscendC::GlobalTensor<[^>]+>\s+(\w+)\s*;", source))
+    for spec in operands:
+        name = spec["name"]
+        shape = spec["shape"]
+        if name not in globals_declared or len(shape) < 2 or math.prod(shape[1:]) <= 1:
+            continue
+        pattern = rf"\bauto\s+{re.escape(name)}_scalar\s*=[^\n]*\b{re.escape(name)}\.GetValue\("
+        if re.search(pattern, source):
+            raise ValueError(
+                f"TileLang-Ascend drops trailing strides for multi-dimensional GlobalTensor "
+                f"scalar tile op on {name} {shape}; load into a scalar local before T.tile.*"
+            )
 
 
 def lower_scalar_cache(source):

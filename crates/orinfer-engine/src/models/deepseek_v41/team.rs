@@ -903,10 +903,14 @@ impl Team {
                                     };
                                     Ok(Reply::SplitCached(states, workspace_fits))
                                 }),
-                            Command::GrowCachedAndBeginVerification(layout, owners) => worker
-                                .grow_batch(&layout)
-                                .and_then(|()| worker.batch_split_cached(&layout))
-                                .and_then(|states| {
+                            Command::GrowCachedAndBeginVerification(layout, owners) => {
+                                worker.layout_protection(&layout).and_then(|(mono, split)| {
+                                    let protected = super::batch::ProtectedKeys::for_layout(
+                                        mono.as_ref(),
+                                        split.as_ref(),
+                                    );
+                                    worker.grow_batch_protected(&layout, &protected)?;
+                                    let states = worker.batch_split_cached(&layout)?;
                                     let workspace_fits = if states.all_graphs() {
                                         true
                                     } else {
@@ -919,12 +923,13 @@ impl Team {
                                     let mut oom = false;
                                     let mut outcome: Result<()> = Ok(());
                                     for (id, rows) in owners {
-                                        match worker.save_mutable(
+                                        match worker.save_mutable_protected(
                                             id,
                                             rows,
                                             journal_pool.remove(&id),
                                             &mut idle_journals,
                                             &mut copies,
+                                            &protected,
                                         ) {
                                             Ok(saved) => {
                                                 journal.insert(id, saved);
@@ -961,7 +966,8 @@ impl Team {
                                             ))
                                         })
                                     }
-                                }),
+                                })
+                            }
                             Command::OwnerRequirement(tokens, shared_tokens, reserve) => worker
                                 .owner_requirement(tokens, shared_tokens, reserve)
                                 .map(Reply::Requirement),
@@ -1024,21 +1030,34 @@ impl Team {
                                 .and_then(|()| worker.forward_batch(&layout, &tokens, &readout))
                                 .map(|values| Reply::Outputs(values, !shared.is_empty())),
                             Command::FastForward(layout, tokens, readout) => worker
-                                .grow_batch(&layout)
-                                .and_then(|()| worker.forward_batch(&layout, &tokens, &readout))
+                                .layout_protection(&layout)
+                                .and_then(|(mono, split)| {
+                                    let protected = super::batch::ProtectedKeys::for_layout(
+                                        mono.as_ref(),
+                                        split.as_ref(),
+                                    );
+                                    worker.grow_batch_protected(&layout, &protected)?;
+                                    worker.forward_batch(&layout, &tokens, &readout)
+                                })
                                 .map(|values| Reply::Outputs(values, false)),
                             Command::FastVerifyForward(layout, owners, tokens, readout) => worker
-                                .grow_batch(&layout)
-                                .and_then(|()| {
+                                .layout_protection(&layout)
+                                .and_then(|(mono, split)| {
+                                    let protected = super::batch::ProtectedKeys::for_layout(
+                                        mono.as_ref(),
+                                        split.as_ref(),
+                                    );
+                                    worker.grow_batch_protected(&layout, &protected)?;
                                     journal.clear();
                                     let mut copies = vec![];
                                     for (id, rows) in owners {
-                                        let saved = worker.save_mutable(
+                                        let saved = worker.save_mutable_protected(
                                             id,
                                             rows,
                                             journal_pool.remove(&id),
                                             &mut idle_journals,
                                             &mut copies,
+                                            &protected,
                                         )?;
                                         journal.insert(id, saved);
                                     }
@@ -1121,7 +1140,8 @@ impl Team {
                         if let Err(error) = &result {
                             eprintln!("A2 rank {index}: {error}");
                         }
-                        if reply.send(result).is_err() || failed {
+                        let evicted = worker.take_programs_evicted();
+                        if reply.send_evicted(result, evicted).is_err() || failed {
                             break;
                         }
                     }
@@ -1137,6 +1157,11 @@ impl Team {
         }
         team.load_s = started.elapsed().as_secs_f64();
         Ok(team)
+    }
+    fn sync_resident_graphs(&self) {
+        if self.peers.take_programs_evicted() {
+            self.resident_graphs.borrow_mut().clear();
+        }
     }
     pub fn exchange(&self, command: Command) -> Result<Vec<Reply>> {
         #[cfg(test)]
@@ -1156,7 +1181,9 @@ impl Team {
             }
             _ => {}
         }
-        exchange(&self.peers, command)
+        let replies = exchange(&self.peers, command)?;
+        self.sync_resident_graphs();
+        Ok(replies)
     }
     pub fn has_fused_small_target(&self) -> bool {
         self.target_domains
@@ -1188,7 +1215,9 @@ impl Team {
         Ok(())
     }
     pub fn exchange_heavy(&self, command: Command) -> Result<Vec<Reply>> {
-        self.peers.exchange_heavy(command)
+        let replies = self.peers.exchange_heavy(command)?;
+        self.sync_resident_graphs();
+        Ok(replies)
     }
     pub fn rank_free_range(&self) -> (usize, usize) {
         self.rank_free_range.get()
@@ -1390,6 +1419,7 @@ impl Team {
         })
     }
     pub fn is_resident(&self, layout: &Layout) -> bool {
+        self.sync_resident_graphs();
         self.resident_key(layout)
             .is_some_and(|key| self.resident_graphs.borrow().contains(&key))
     }
@@ -1454,6 +1484,7 @@ impl Team {
             if plan.any_prepare() {
                 self.peers
                     .exchange_heavy(Command::PrepareParts(layout.clone(), plan))?;
+                self.sync_resident_graphs();
             }
             Ok(true)
         };
@@ -1790,6 +1821,7 @@ impl Team {
             .send(Command::FastForward(layout, tokens, readout))?;
         maintenance();
         let results = self.peers.collect()?;
+        self.sync_resident_graphs();
         collect_forward_outputs(
             results,
             replicated,
@@ -1824,6 +1856,7 @@ impl Team {
         self.peers
             .send(Command::FastVerifyForward(layout, journal, tokens, readout))?;
         let results = self.peers.collect()?;
+        self.sync_resident_graphs();
         collect_forward_outputs(
             results,
             false,
@@ -1844,6 +1877,7 @@ impl Team {
     }
     pub fn begin_forward(&self, layout: &Layout) -> Result<PreparedForward> {
         let prepared = begin_forward(&self.peers, layout)?;
+        self.sync_resident_graphs();
         if prepared.all_graphs()
             && let Some(key) = self.resident_key(layout)
         {
@@ -1885,6 +1919,7 @@ impl Team {
             states,
             workspace_fits,
         };
+        self.sync_resident_graphs();
         if prepared.all_graphs()
             && let Some(key) = self.resident_key(layout)
         {
@@ -1962,7 +1997,9 @@ impl Team {
             maintenance,
             self.graphs_enabled,
         )?;
-        if timing.invalidated || timing.captured || (!timing.replay && timing.setup > 0.) {
+        let evicted = self.peers.take_programs_evicted();
+        if evicted || timing.invalidated || timing.captured || (!timing.replay && timing.setup > 0.)
+        {
             let mut resident = self.resident_graphs.borrow_mut();
             resident.clear();
             if timing.replay

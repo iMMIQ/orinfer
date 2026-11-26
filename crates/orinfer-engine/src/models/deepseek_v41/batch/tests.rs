@@ -72,6 +72,42 @@ fn successful_shape_streaks_are_family_local_and_reset_on_eviction() {
     assert_eq!(runtime.recent.len(), 2);
 }
 #[test]
+fn program_eviction_flag_tracks_direct_removals_and_graph_cap_trims() {
+    let mut runtime = Runtime::new(contract(), 32, &[], &BTreeSet::new());
+    let family = (super::super::PacketRole::Target, false, 1);
+    let make_trunk = |rows| TrunkKey {
+        family,
+        rows,
+        clipped: false,
+        work_rows: vec![],
+    };
+    let dummy = Rc::new(SubProgram {
+        steps: vec![],
+        captured: true,
+        direct_uses: std::cell::Cell::new(0),
+    });
+    for rows in [16, 32, 48] {
+        let k = make_trunk(rows);
+        runtime.trunk_cache.insert(k.clone(), Rc::clone(&dummy));
+        runtime.trunk_lru.push_back(k);
+    }
+    assert!(!runtime.programs_evicted);
+    assert!(!runtime.remove_trunk(&make_trunk(99)));
+    assert!(!runtime.programs_evicted);
+    assert!(runtime.remove_trunk(&make_trunk(16)));
+    assert!(runtime.programs_evicted);
+    runtime.programs_evicted = false;
+    runtime.capacity = 0;
+    let protected = make_trunk(48);
+    runtime.trim_total_programs(&ProtectedKeys {
+        trunk: Some(&protected),
+        ..ProtectedKeys::default()
+    });
+    assert!(runtime.programs_evicted);
+    assert!(runtime.trunk_cache.contains_key(&protected));
+    assert!(!runtime.trunk_cache.contains_key(&make_trunk(32)));
+}
+#[test]
 fn launch_identity_matches_the_compilers_owner_work_extents() {
     let mut contract = contract();
     contract.decoder_replay = Some(

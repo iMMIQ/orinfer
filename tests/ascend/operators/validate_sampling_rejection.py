@@ -100,8 +100,12 @@ def main():
         for phase, n in enumerate([1, 17, 96, cap]):
             # Other shards are synthesized from an independent FP64 reduction;
             # ranks 0 and 7 execute the real device statistics and selection.
-            target = torch.randn(n, ranks * vocab)
-            draft = torch.randn(pool, ranks * vocab)
+            # Apply strong per-row logZ shifts between target and draft so any
+            # missing normalizer stride/column offset fails immediately.
+            target_shift = torch.linspace(-8.0, 8.0, n)[:, None]
+            draft_shift = torch.linspace(9.0, -9.0, pool)[:, None]
+            target = torch.randn(n, ranks * vocab) + target_shift
+            draft = torch.randn(pool, ranks * vocab) + draft_shift
             controls = torch.randint(-(1 << 31), (1 << 31) - 1, (n, 4), dtype=torch.int32)
             inverse = torch.full((n,), 1.0 / (0.7 if phase & 1 else 1.0))
             controls[:, 3] = inverse.view(torch.int32)
@@ -193,15 +197,20 @@ def main():
                 dict(rows=n, reverse_pool=True, tp_ranks=[0, ranks - 1], graph_changed_inputs=True)
             )
 
-        # Statistical law across real selection on every shard. Proposal draws,
-        # acceptance and correction randomness are independent.
+        # Statistical law across real selection on every shard, with a large
+        # asymmetric logZ offset (+9.0 on draft vs -4.0 on target) matching real
+        # 40-layer target vs 3-layer DSpark draft logit offsets.
         n = min(cap, pool)
         choices = [2, vocab + 1, ranks * vocab - 1]
         pvals, qvals = torch.tensor([0.1, 0.3, 0.6]), torch.tensor([0.7, 0.2, 0.1])
-        target = torch.full((n, ranks * vocab), -80.0)
-        draft = torch.full((pool, ranks * vocab), -80.0)
-        target[:, choices] = pvals.log()
-        draft[:, choices] = qvals.log()
+        target = torch.full((n, ranks * vocab), -84.0)
+        draft = torch.full((pool, ranks * vocab), -71.0)
+        target[:, choices] = pvals.log() - 4.0
+        draft[:, choices] = qvals.log() + 9.0
+        # Also include an ultra-rare distractor token where draft is far below
+        # target so missing logZ subtraction wipes out `choices` and picks 30.
+        target[:, 30] = math.log(1e-10) - 4.0
+        draft[:, 30] = math.log(1e-18) + 9.0
         counts = torch.zeros(3, dtype=torch.int64)
         accepted_count = 0
         for batch in range(16):
@@ -295,6 +304,29 @@ def main():
         norm[0].cpu().tolist(),
         output[0].cpu().tolist(),
     )
+    # Greedy (inverse == 0) with a bound proposal must keep statistics and
+    # merge_statistics scale consistent (both fall back to scale=1.0).
+    x[0].fill_(-20.0)
+    x[0, 10] = 5.0
+    q[0].fill_(-20.0)
+    q[0, 10] = 5.0
+    q[0, 20] = 15.0  # logZ_q >> logZ_p; proposal=20 has target prob ~e^-25 << draft prob ~1.
+    ctl[0, 2] = 0
+    ctl[0, 3] = 0
+    proposal[0] = torch.tensor(
+        [0, 20, torch.tensor([-0.5]).view(torch.int32).item(), 0], dtype=torch.int32
+    )
+    first.replay()
+    gathered.zero_()
+    gathered[:, 0, 0] = -20.0
+    gathered[:, 0, 2] = -20.0
+    gathered[:, 0, 4] = -float("inf")
+    gathered[:, 0, 5] = -float("inf")
+    gathered[0, 0].copy_(local[0])
+    second.replay()
+    torch.npu.synchronize()
+    assert norm[0, 2].item() == 0 and norm[0, 3].item() == 0
+    assert int(output[0, 1].item()) == 10
     # Fresh greedy rows neither read stale Q nor consume a rejection draw.
     x[0].zero_()
     x[0, vocab - 1] = 3
@@ -313,6 +345,7 @@ def main():
             identical_laws=True,
             empty_residual_sentinel=True,
             nonfinite_error=True,
+            greedy_proposal_scale_consistent=True,
             fresh_greedy_ignores_stale_pool=True,
         )
     )

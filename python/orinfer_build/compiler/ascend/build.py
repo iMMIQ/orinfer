@@ -26,7 +26,7 @@ from orinfer_build.compiler.ascend.vector_launch import (
     lower_independent_vector,
 )
 from orinfer_build.compiler.ascend.rows import bounded_grid, split_resources
-from orinfer_build.compiler.ascend.scalar_cache import lower_scalar_cache
+from orinfer_build.compiler.ascend.scalar_cache import check_scalar_strides, lower_scalar_cache
 from orinfer_build.compiler.ascend.pipeline import lower_gather_pipeline
 from orinfer_build.compiler.ascend.toolchain import cann_version
 from orinfer_build.compiler.ascend.host_launch import lower_host_arguments
@@ -242,6 +242,7 @@ def compile_kernel(
                 include, include + "\n" + "\n".join(path.read_text() for path in headers), 1
             )
         source = lower_scalar_cache(source)
+        check_scalar_strides(source, operands)
         prototype = re.search(r'extern "C" void call\(([^)]*)\)', source)
         if prototype is None:
             raise ValueError("TileLang did not emit an AOT call wrapper")

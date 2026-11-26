@@ -337,6 +337,20 @@ pub(in crate::models::deepseek_v41) struct ProtectedKeys<'a> {
     pub head: Option<&'a HeadKey>,
     pub keep_idle_owner: bool,
 }
+impl<'a> ProtectedKeys<'a> {
+    pub(in crate::models::deepseek_v41) fn for_layout(
+        mono: Option<&'a Key>,
+        split: Option<&'a SplitKeys>,
+    ) -> Self {
+        Self {
+            mono,
+            trunk: split.map(|s| &s.trunk),
+            tail: split.and_then(|s| s.tail.as_ref()),
+            head: split.and_then(|s| s.head.as_ref()),
+            keep_idle_owner: false,
+        }
+    }
+}
 pub(super) struct Runtime {
     pub contract: Contract,
     pub owners: BTreeMap<usize, Owner>,
@@ -358,6 +372,7 @@ pub(super) struct Runtime {
     families: Vec<(super::PacketRole, bool, usize)>,
     launches: BTreeSet<WorkLaunch>,
     pub(super) bound_tables: Option<BoundTables>,
+    pub(super) programs_evicted: bool,
 }
 struct TableUse {
     max_rows: usize,
@@ -438,6 +453,9 @@ impl Runtime {
     }
     fn remove(&mut self, key: &Key) -> bool {
         let removed = self.cache.remove(key).is_some();
+        if removed {
+            self.programs_evicted = true;
+        }
         if self
             .recent
             .get(&key.family)
@@ -449,6 +467,9 @@ impl Runtime {
     }
     fn remove_trunk(&mut self, key: &TrunkKey) -> bool {
         let removed = self.trunk_cache.remove(key).is_some();
+        if removed {
+            self.programs_evicted = true;
+        }
         if self
             .recent_trunk
             .get(&key.family)
@@ -460,6 +481,9 @@ impl Runtime {
     }
     fn remove_tail(&mut self, key: &TailKey) -> bool {
         let removed = self.tail_cache.remove(key).is_some();
+        if removed {
+            self.programs_evicted = true;
+        }
         if self
             .recent_tail
             .get(&key.family)
@@ -471,6 +495,9 @@ impl Runtime {
     }
     fn remove_head(&mut self, key: &HeadKey) -> bool {
         let removed = self.head_cache.remove(key).is_some();
+        if removed {
+            self.programs_evicted = true;
+        }
         if self
             .recent_head
             .get(&key.family)
@@ -496,19 +523,37 @@ impl Runtime {
             let evicted = Self::evict_oldest_unprotected(
                 &mut self.lru,
                 protected.mono,
-                |k| self.cache.remove(k).is_some(),
+                |k| {
+                    let removed = self.cache.remove(k).is_some();
+                    if removed {
+                        self.programs_evicted = true;
+                    }
+                    removed
+                },
                 &mut self.recent,
                 |k| k.family,
             ) || Self::evict_oldest_unprotected(
                 &mut self.tail_lru,
                 protected.tail,
-                |k| self.tail_cache.remove(k).is_some(),
+                |k| {
+                    let removed = self.tail_cache.remove(k).is_some();
+                    if removed {
+                        self.programs_evicted = true;
+                    }
+                    removed
+                },
                 &mut self.recent_tail,
                 |k| k.family,
             ) || Self::evict_oldest_unprotected(
                 &mut self.trunk_lru,
                 protected.trunk,
-                |k| self.trunk_cache.remove(k).is_some(),
+                |k| {
+                    let removed = self.trunk_cache.remove(k).is_some();
+                    if removed {
+                        self.programs_evicted = true;
+                    }
+                    removed
+                },
                 &mut self.recent_trunk,
                 |k| k.family,
             );
@@ -931,6 +976,7 @@ impl Runtime {
                 .collect(),
             launches: launches.clone(),
             bound_tables: None,
+            programs_evicted: false,
         }
     }
 }
@@ -1718,6 +1764,22 @@ fn work_lengths(
     Ok(out)
 }
 impl Worker {
+    pub(super) fn take_programs_evicted(&mut self) -> bool {
+        self.batch
+            .as_mut()
+            .is_some_and(|runtime| std::mem::replace(&mut runtime.programs_evicted, false))
+    }
+    pub(super) fn layout_protection(
+        &self,
+        layout: &Layout,
+    ) -> Result<(Option<Key>, Option<SplitKeys>)> {
+        let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+        if let Some(split) = runtime.split_keys(layout)? {
+            Ok((None, Some(split)))
+        } else {
+            Ok((Some(runtime.key(layout)?), None))
+        }
+    }
     pub(super) fn batch_split_cached(&self, layout: &Layout) -> Result<SplitStates> {
         let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
         if let Some(split) = runtime.split_keys(layout)? {

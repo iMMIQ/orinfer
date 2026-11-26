@@ -920,6 +920,24 @@ impl Worker {
         idle_journals: &mut Vec<Buffer>,
         copies: &mut Vec<(Buffer, usize, Buffer, usize, usize)>,
     ) -> Result<Journal> {
+        self.save_mutable_protected(
+            id,
+            rows,
+            previous,
+            idle_journals,
+            copies,
+            &super::batch::ProtectedKeys::default(),
+        )
+    }
+    pub(super) fn save_mutable_protected(
+        &mut self,
+        id: usize,
+        rows: usize,
+        previous: Option<Journal>,
+        idle_journals: &mut Vec<Buffer>,
+        copies: &mut Vec<(Buffer, usize, Buffer, usize, usize)>,
+        protected: &super::batch::ProtectedKeys<'_>,
+    ) -> Result<Journal> {
         if !(1..=crate::execution::MAX_MTP_DRAFTS + 1).contains(&rows) {
             return Err("Verification rows exceed the C2 ring capacity".into());
         }
@@ -974,9 +992,10 @@ impl Worker {
         } else if let Some(pos) = idle_journals.iter().position(|b| b.bytes() >= bytes) {
             idle_journals.swap_remove(pos)
         } else {
-            self.reserve_batch_memory(
+            self.reserve_batch_memory_protected(
                 super::memory::Requirement::snapshot(slab)?,
                 "DSpark state journal",
+                protected,
             )?;
             self.session.allocate(slab)?
         };

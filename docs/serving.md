@@ -279,7 +279,7 @@ curl http://127.0.0.1:8088/api/chat -d '{
 | `ORINFER_A2_HEAVY_COMMAND_TIMEOUT_MS` | Ascend | `max(4×base, 120000)` | Timeout for heavy capture/offload/host-restore/vision commands (`1..1800000` ms) |
 | `ORINFER_A2_WORKER_CPUS` | Ascend | unset | Semicolon-separated per-rank CPU affinity lists; keep host cores free for Tokio/Rayon |
 | `ORINFER_A2_DSPARK_COST_MODEL` | Ascend | auto | Explicit offline DSpark cost profile JSON |
-| `ORINFER_A2_DSPARK_SAMPLING` | Ascend | `coupled` | `coupled` (default) or experimental `rejection` |
+| `ORINFER_A2_DSPARK_SAMPLING` | Ascend | `auto` | `auto` (default: uses `rejection` when packaged, else `coupled`), `coupled`, or `rejection` |
 | `ORINFER_A2_SHARED_GRAPH` | Ascend | `0` | Set `1` to enable shared FFN fragment graph cache |
 | `ORINFER_A2_DSPARK_POLICY_TRACE` | Ascend | `0` | Set `1` to log DSpark policy and cost-model trace |
 | `ORINFER_A2_BATCH_PROFILE` | Ascend | `0` | Set `1` to log A2 cold-setup and prefill cost profiles |
