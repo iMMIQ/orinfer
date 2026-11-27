@@ -79,14 +79,14 @@ def run(original):
         for group in [1, 4, 16, 32]:
             kernel = primitive(r.qk_rope, 32768, dynamic_rows=True, head_group=group)
             launch(kernel, ranges, x, qnorm, knorm, cos, sin, *outputs, n)
-            for a, b in zip(outputs, reference_rope()):
+            for a, b in zip(outputs, reference_rope(), strict=True):
                 torch.testing.assert_close(a, b, atol=0.002, rtol=0.002)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 launch(kernel, ranges, x, qnorm, knorm, cos, sin, *outputs, n)
             x.neg_()
             graph.replay()
-            for a, b in zip(outputs, reference_rope()):
+            for a, b in zip(outputs, reference_rope(), strict=True):
                 torch.testing.assert_close(a, b, atol=0.002, rtol=0.002)
             records.append(dict(kind="qk_rms_rope", rows=n, head_group=group, graph=True))
     x = torch.randn(33, 1024, device="cuda", dtype=torch.float16)
@@ -99,9 +99,9 @@ def run(original):
     records.append(dict(kind="last_position_binary_head", max_abs=error, graph=True))
     tokenizer = AutoTokenizer.from_pretrained(original, local_files_only=True)
     body = f"<Instruct>: {INSTRUCTION}\n<Query>: What is the capital of China?\n<Document>: The capital of China is Beijing."
-    tokens = sum(
-        [tokenizer.encode(s, add_special_tokens=False) for s in [PREFIX, body, SUFFIX]], []
-    )
+    tokens = [
+        tok for s in (PREFIX, body, SUFFIX) for tok in tokenizer.encode(s, add_special_tokens=False)
+    ]
     template = (ROOT / "tools/bench/templates/qwen3_reranker.jinja").read_text()
     rendered = tokenizer.apply_chat_template(
         [

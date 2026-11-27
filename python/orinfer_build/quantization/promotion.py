@@ -157,7 +157,7 @@ def upgrade(args, *, configuration, signature, layers, layer_prefix):
                 metadata["contract"] = contract
                 write_shard(out / filename, entries, metadata)
                 names = [e["name"] for e in entries]
-            mapping.update({n: filename for n in names})
+            mapping.update(dict.fromkeys(names, filename))
             hashes[filename] = file_hash(out / filename)
             if filename in shards:
                 shards[filename].update(sha256=hashes[filename], names=names)

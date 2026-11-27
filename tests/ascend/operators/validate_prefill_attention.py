@@ -29,7 +29,7 @@ def main():
     torch.manual_seed(20261002)
     if not args.compile_only:
         torch.npu.set_device(args.device)
-    capacity, context = max(2, max(args.rows)), args.context
+    capacity, context = max(2, *args.rows), args.context
     if context % 256 or not 256 <= context <= 8448 or not 2 <= capacity <= 4096:
         p.error("Require aligned context 256..8448 and row capacity 2..4096")
     if min(args.rows) < 1 or min(args.bases) < 0 or max(args.bases) + capacity > context:

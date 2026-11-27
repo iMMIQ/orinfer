@@ -125,12 +125,10 @@ impl Worker {
         }
         let future = self.future_bytes(owner, tokens)?;
         self.reserve_batch_memory(Requirement::snapshot(future)?, "owner KV reservation")?;
-        self.batch
-            .as_mut()
-            .unwrap()
+        self.batch_runtime_mut()?
             .owners
             .get_mut(&id)
-            .unwrap()
+            .ok_or("Unknown owner")?
             .limit = Some(tokens);
         Ok(())
     }
@@ -141,9 +139,7 @@ impl Worker {
         protected: &ProtectedKeys<'_>,
     ) -> Result<()> {
         let owner = self
-            .batch
-            .as_ref()
-            .ok_or("Missing batch runtime")?
+            .batch_runtime()?
             .owners
             .get(&id)
             .ok_or("Unknown owner")?;
@@ -163,7 +159,11 @@ impl Worker {
                 protected,
             )?;
         }
-        let owner = self.batch.as_ref().unwrap().owners.get(&id).unwrap();
+        let owner = self
+            .batch_runtime()?
+            .owners
+            .get(&id)
+            .ok_or("Unknown owner")?;
         let growth = self
             .growth
             .iter()
@@ -267,49 +267,17 @@ impl Worker {
             runtime.idle_owners.pop();
             return Ok(true);
         }
-        while let Some(pos) = runtime.lru.iter().position(|k| Some(k) != protected.mono) {
-            let key = runtime.lru.remove(pos).unwrap();
-            if runtime.remove(&key) {
-                self.w4.retain(|_, w| w.strong_count() > 0);
-                self.session.synchronize()?;
-                return Ok(true);
-            }
-        }
-        while let Some(pos) = runtime
-            .head_lru
-            .iter()
-            .position(|k| Some(k) != protected.head)
-        {
-            let key = runtime.head_lru.remove(pos).unwrap();
-            if runtime.remove_head(&key) {
-                self.w4.retain(|_, w| w.strong_count() > 0);
-                self.session.synchronize()?;
-                return Ok(true);
-            }
-        }
-        while let Some(pos) = runtime
-            .tail_lru
-            .iter()
-            .position(|k| Some(k) != protected.tail)
-        {
-            let key = runtime.tail_lru.remove(pos).unwrap();
-            if runtime.remove_tail(&key) {
-                self.w4.retain(|_, w| w.strong_count() > 0);
-                self.session.synchronize()?;
-                return Ok(true);
-            }
-        }
-        while let Some(pos) = runtime
-            .trunk_lru
-            .iter()
-            .position(|k| Some(k) != protected.trunk)
-        {
-            let key = runtime.trunk_lru.remove(pos).unwrap();
-            if runtime.remove_trunk(&key) {
-                self.w4.retain(|_, w| w.strong_count() > 0);
-                self.session.synchronize()?;
-                return Ok(true);
-            }
+        let evicted = runtime.cache.evict_oldest_unprotected(protected.mono)
+            || runtime.head_cache.evict_oldest_unprotected(protected.head)
+            || runtime.tail_cache.evict_oldest_unprotected(protected.tail)
+            || runtime
+                .trunk_cache
+                .evict_oldest_unprotected(protected.trunk);
+        if evicted {
+            runtime.programs_evicted = true;
+            self.w4.retain(|_, w| w.strong_count() > 0);
+            self.session.synchronize()?;
+            return Ok(true);
         }
         if self.shared.evict() {
             return Ok(true);
@@ -391,9 +359,9 @@ impl Worker {
                 return Err("Owner capacity exceeded".into());
             }
             if id != 0
-                && let Some(idle) = self.batch.as_mut().unwrap().idle_owners.pop()
+                && let Some(idle) = self.batch_runtime_mut()?.idle_owners.pop()
             {
-                self.batch.as_mut().unwrap().owners.insert(
+                self.batch_runtime_mut()?.owners.insert(
                     id,
                     Owner {
                         bank: Some(idle.bank),
@@ -431,7 +399,7 @@ impl Worker {
                 } else if self.growth.contains_key(name) {
                     self.session.reserve(get(&self.buffers, name)?.bytes())?
                 } else {
-                    bank.as_ref().unwrap().slice(
+                    bank.as_ref().ok_or("Missing owner arena bank")?.slice(
                         base + arena.offsets[name],
                         get(&self.buffers, name)?.bytes(),
                     )?
@@ -439,7 +407,7 @@ impl Worker {
                 buffers.insert(name.clone(), buffer);
             }
             let zeroed = bank.is_some();
-            self.batch.as_mut().unwrap().owners.insert(
+            self.batch_runtime_mut()?.owners.insert(
                 id,
                 Owner {
                     bank,

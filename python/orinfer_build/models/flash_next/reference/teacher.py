@@ -466,7 +466,7 @@ class Teacher:
         weights = self.load_weights("terminal")
         positions = [
             start + len(case["prompt_ids"]) - 1 + position
-            for case, (start, end) in zip(self.cases, self.segments)
+            for case, (start, end) in zip(self.cases, self.segments, strict=True)
             for position in range(len(case["target_ids"]))
         ]
         selected = residual[positions].to(device=self.device)

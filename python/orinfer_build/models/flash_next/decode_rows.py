@@ -1,5 +1,6 @@
 """Publish measured flash_decode row specializations (small-batch projections, fast HC inject, fused HC combine-norm)."""
 
+from itertools import pairwise
 from functools import partial
 
 
@@ -218,7 +219,7 @@ def publish(package, manifest, compiler):
             for op in programs.get(f"flash_decode/layer{layer}/post", [])
             if op["kind"] == "kernel"
         ]
-        for a, b in zip(post_ops, post_ops[1:]):
+        for a, b in pairwise(post_ops):
             if is_combine_norm_pair(a, b) is not None:
                 fuse_pairs.append((a, b))
         if 1 <= layer <= 46 and post_ops:

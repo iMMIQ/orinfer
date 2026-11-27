@@ -20,7 +20,7 @@ from orinfer_build.common.files import file_hash as digest
 class FakeSource:
     def __init__(self, tensors):
         self.tensors = tensors
-        self.weight_map = {name: "original.safetensors" for name in tensors}
+        self.weight_map = dict.fromkeys(tensors, "original.safetensors")
 
     def tensor(self, name):
         return "original.safetensors", 0, self.tensors[name]
@@ -44,7 +44,7 @@ class PublishedFlashWeightsTests(unittest.TestCase):
             }
         )
         records = []
-        for i, (first, count) in enumerate(((0, 2), (2, 3))):
+        for _i, (first, count) in enumerate(((0, 2), (2, 3))):
             weights = np.arange(first * 4, (first + count) * 4, dtype=np.int8).reshape(count, 4)
             scales = np.full(count, 0.25, np.float16)
             records.append(

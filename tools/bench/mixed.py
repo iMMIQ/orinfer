@@ -4,6 +4,7 @@ Usage supplies committed token counts. Arrival gaps measure SSE fragments,
 not token ITL, because UTF-8 decoding and MTP can group several tokens.
 """
 
+from itertools import pairwise
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -13,11 +14,12 @@ import time
 import urllib.request
 
 from tools.bench.concurrency import counter_delta, percentile, request
+import contextlib
 
 
 def overlapping_gaps(row, begin, end):
     times = [row["started_monotonic_s"] + t for t in row["arrivals_s"]]
-    return [b - a for a, b in zip(times, times[1:]) if a < end and b > begin]
+    return [b - a for a, b in pairwise(times) if a < end and b > begin]
 
 
 def run_round(base_url, anchor, cold, count, trigger_chunks):
@@ -47,10 +49,8 @@ def run_round(base_url, anchor, cold, count, trigger_chunks):
 
     def monitor():
         while not stop.is_set():
-            try:
+            with contextlib.suppress(OSError, ValueError):
                 samples.append(health())
-            except (OSError, ValueError):
-                pass
             stop.wait(0.1)
 
     thread = threading.Thread(target=monitor, daemon=True)

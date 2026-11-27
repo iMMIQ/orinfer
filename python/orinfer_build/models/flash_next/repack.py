@@ -23,7 +23,7 @@ def shard_name(name):
         return f"experts-l{first:03d}-l{first + 2:03d}.safetensors"
     if name.startswith("HC13_"):
         return "hc-up-bf16-packed.safetensors"
-    if name.startswith("Q4_output_") or name.startswith("W_output"):
+    if name.startswith(("Q4_output_", "W_output")):
         return "output.safetensors"
     if name.startswith("Q4_"):
         return "projections-q4.safetensors"

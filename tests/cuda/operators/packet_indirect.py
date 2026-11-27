@@ -98,7 +98,7 @@ def main():
         copy_graph.replay()
         assert torch.equal(views[1], source)
         assert torch.equal(views[0], source - 7)
-        for target, fill in zip(targets, [17, 29]):
+        for target, fill in zip(targets, [17, 29], strict=True):
             assert bool((target[:16] == fill).all() and (target[-16:] == fill).all())
         copy_cases.append(dict(width=width, bytes=size))
     write_json(

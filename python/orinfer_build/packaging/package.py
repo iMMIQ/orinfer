@@ -91,7 +91,7 @@ def validate_plan(directory, source, mapping, engine):
         generated_ops = plan["programs"][program]
         if len(original_ops) != len(generated_ops):
             raise ValueError(f"{program}: registered operation count differs")
-        for index, (left, right) in enumerate(zip(original_ops, generated_ops)):
+        for index, (left, right) in enumerate(zip(original_ops, generated_ops, strict=True)):
             if left["kind"] != "kernel":
                 equal = left == right
             else:

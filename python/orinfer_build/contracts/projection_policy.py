@@ -178,7 +178,10 @@ def candidate_scores(profiles, invalid, objective="relative_geomean"):
         else:
             scores.append(
                 math.exp(
-                    sum(math.log(p["times_ms"][i] / best) for p, best in zip(profiles, minima))
+                    sum(
+                        math.log(p["times_ms"][i] / best)
+                        for p, best in zip(profiles, minima, strict=True)
+                    )
                     / len(profiles)
                 )
             )

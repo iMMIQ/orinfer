@@ -3,7 +3,475 @@ use super::*;
 mod policy;
 pub(super) use policy::{Budget, Costs, Feedback, Identity, Policy, Work};
 
+struct DraftRequest<'a, 'r> {
+    requests: &'a [&'r mut Request],
+    baseline_selected: &'a [(usize, usize)],
+    selected: &'a [(usize, usize)],
+    block: usize,
+    owners: usize,
+    rejection_steps: Option<&'a BTreeMap<usize, usize>>,
+    options: &'a scheduler::Options,
+}
+
+struct VerifyReadoutRequest<'a, 'r> {
+    requests: &'a [&'r mut Request],
+    full: bool,
+    selected: &'a [(usize, usize)],
+    draft_tokens: &'a [Vec<u32>],
+    packet_requests: &'a [(usize, usize)],
+    layout: &'a Layout,
+    inputs: &'a [Vec<u32>],
+    rejection_steps: Option<&'a BTreeMap<usize, usize>>,
+}
+
+struct DraftOutcome {
+    proposals: Vec<super::super::team::Output>,
+    timing: super::super::team::Timing,
+    inputs: BTreeMap<usize, Vec<u32>>,
+    draft_tokens: Vec<Vec<u32>>,
+}
+
+struct RoundMetrics<'a> {
+    selected: &'a [(usize, usize)],
+    full: bool,
+    mixed: bool,
+    uniform: bool,
+    block: usize,
+    round_started: Instant,
+    draft_timing: &'a super::super::team::Timing,
+    verify_timing: &'a super::super::team::Timing,
+    sampling_s: f64,
+    restore_s: f64,
+    verified_work: Work,
+    counts: &'a [(usize, usize)],
+    packet_batch: usize,
+    prefill_rows: usize,
+    prefill_requests: usize,
+}
+
 impl Runtime {
+    /// Fill unused verification bucket slack (pad_slot rows) with extra verified
+    /// drafts from the already-computed parallel draft block at zero extra NPU cost.
+    fn expand_verify_bucket_slack(
+        &self,
+        depths: &mut [usize],
+        maxima: &[usize],
+        feedback: &[&Feedback],
+        capacity: usize,
+    ) -> bool {
+        let Some(&max_depth) = depths.iter().max() else {
+            return false;
+        };
+        if max_depth == 0 {
+            return false;
+        }
+        let Some(block) = self
+            .team
+            .draft_blocks
+            .iter()
+            .copied()
+            .find(|&b| b >= max_depth)
+        else {
+            return false;
+        };
+        let mut total: usize = depths.iter().map(|&d| d + 1).sum();
+        let output_cap = self
+            .team
+            .model
+            .batch
+            .as_ref()
+            .map_or(capacity, |c| c.output_capacity());
+        let target = packet::bucket_verify_rows(total)
+            .min(capacity)
+            .min(output_cap);
+        if total > 127 || target <= total {
+            return false;
+        }
+        let owner_rates: Vec<Vec<f64>> = feedback
+            .iter()
+            .map(|f| f.rates(block, &[], block))
+            .collect();
+        let mut expanded = false;
+        while total < target {
+            let best = (0..depths.len())
+                .filter(|&p| depths[p] > 0 && depths[p] < maxima[p].min(block))
+                .max_by(|&a, &b| {
+                    let ra = owner_rates[a].get(depths[a]).copied().unwrap_or(0.0);
+                    let rb = owner_rates[b].get(depths[b]).copied().unwrap_or(0.0);
+                    ra.total_cmp(&rb)
+                        .then_with(|| depths[b].cmp(&depths[a]))
+                        .then_with(|| b.cmp(&a))
+                });
+            let Some(pos) = best else {
+                break;
+            };
+            depths[pos] += 1;
+            total += 1;
+            expanded = true;
+        }
+        expanded
+    }
+
+    fn run_dspark_draft(
+        &mut self,
+        req: DraftRequest<'_, '_>,
+        maintenance: impl FnOnce(),
+    ) -> Result<DraftOutcome> {
+        let DraftRequest {
+            requests,
+            baseline_selected,
+            selected,
+            block,
+            owners,
+            rejection_steps,
+            options,
+        } = req;
+        let mut segments = vec![];
+        let mut inputs = vec![];
+        for &(i, count) in selected {
+            if count == 0 {
+                continue;
+            }
+            let request = &requests[i];
+            segments.push(BatchSegment {
+                slot: request.slot,
+                tokens: block,
+            });
+            let mut values = vec![128799; block];
+            values[0] = *request.history.last().ok_or("Missing DSpark anchor")?;
+            inputs.push(values);
+        }
+        let mut draft = if self.team.strided_draft {
+            let outputs = (0..segments.len()).collect();
+            Layout::new(segments, outputs, false, owners * block, owners)?
+        } else {
+            Layout::verification(segments, owners * block, owners)?
+        };
+        draft.role = super::super::PacketRole::Draft;
+        let depths = selected.iter().copied().collect::<BTreeMap<_, _>>();
+        let mut readout = if self
+            .team
+            .model
+            .sampling
+            .as_ref()
+            .is_some_and(|s| s.coupled_draft)
+        {
+            packet::draft_readout(requests)
+        } else {
+            false.into()
+        };
+        if let Some(rejection_steps) = rejection_steps {
+            readout.store_draft_distributions = true;
+            readout.sampling_steps(rejection_steps);
+            for draw in readout.draws.values_mut() {
+                draw.seed ^= crate::mtp::DRAFT_STREAM;
+            }
+        }
+        let (proposals, timing) = if self.team.is_resident(&draft) {
+            self.team
+                .fast_forward(draft, inputs, readout, maintenance)?
+        } else {
+            let draft_prepared =
+                self.begin_forward_with_workspace(&draft, "Insufficient DSpark graph workspace")?;
+            // Only these owners execute the draft graph. A final prefill window
+            // or a non-speculating tail cannot shorten its reuse forecast.
+            let draft_owners = selected
+                .iter()
+                .copied()
+                .filter(|&(_, depth)| depth > 0)
+                .collect::<Vec<_>>();
+            let (uses, _) =
+                self.capture_context(&draft_owners, requests, Some(&depths), block, options);
+            // Draft preparation still delays every decoder in the packet.
+            let (_, slack) =
+                self.capture_context(baseline_selected, requests, Some(&depths), block, options);
+            let capture =
+                self.speculation_policy
+                    .draft_budget(block, draft_owners.len(), uses, slack);
+            self.team.finish_forward(
+                draft_prepared,
+                draft,
+                inputs,
+                readout,
+                Some(capture),
+                maintenance,
+            )?
+        };
+        let mut target_inputs = BTreeMap::new();
+        let mut draft_tokens = vec![];
+        for &(i, count) in selected {
+            let request = &requests[i];
+            let tokens = proposals
+                .iter()
+                .filter(|v| v.owner == request.slot)
+                .take(count)
+                .map(|v| v.token)
+                .collect::<Vec<_>>();
+            if tokens.len() != count {
+                return Err("Incomplete DSpark proposal pool".into());
+            }
+            let mut values = vec![*request.history.last().ok_or("Missing DSpark anchor")?];
+            values.extend_from_slice(&tokens);
+            target_inputs.insert(i, values);
+            draft_tokens.push(tokens);
+        }
+        Ok(DraftOutcome {
+            proposals,
+            timing,
+            inputs: target_inputs,
+            draft_tokens,
+        })
+    }
+
+    fn build_verification_readout(
+        &mut self,
+        req: VerifyReadoutRequest<'_, '_>,
+    ) -> Result<super::super::team::Readout> {
+        let VerifyReadoutRequest {
+            requests,
+            full,
+            selected,
+            draft_tokens,
+            packet_requests,
+            layout,
+            inputs,
+            rejection_steps,
+        } = req;
+        let proposal_map = selected
+            .iter()
+            .zip(draft_tokens)
+            .map(|(&(i, _), tokens)| (i, tokens.clone()))
+            .collect();
+        let mut readout =
+            packet::target_readout(requests, full, &proposal_map, self.vocab(), packet_requests)?;
+        if let Some(rejection_steps) = rejection_steps {
+            readout.sampling_steps(rejection_steps);
+            let stride = self
+                .team
+                .model
+                .sampling
+                .as_ref()
+                .and_then(|s| s.rejection.as_ref())
+                .ok_or("Missing DSpark rejection contract")?
+                .stride;
+            for (&(i, count), tokens) in selected.iter().zip(draft_tokens) {
+                if count == 0 {
+                    continue;
+                }
+                let request = &requests[i];
+                readout.rejection.insert(
+                    request.slot,
+                    tokens
+                        .iter()
+                        .enumerate()
+                        .map(|(position, &token)| {
+                            crate::backend::ascend::sampling::RejectionProposal {
+                                row: request.slot * stride + position,
+                                token,
+                                log_uniform: crate::sampling::counter_uniform(
+                                    request.sampling.seed,
+                                    crate::mtp::ACCEPT_STREAM,
+                                    (rejection_steps[&request.slot] + position) as u64,
+                                )
+                                .ln() as f32,
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
+        self.prepare_host_inputs(layout, packet_requests, requests, &mut readout);
+        // Overlap Layer 1 Engram random host-RAM gather on verification batches
+        // (both pure decode and mixed) with verification IPC, journal copy, and layer 0.
+        if let Some(first) = readout.first_input.as_deref() {
+            let mut pairs: Vec<(&[u32], &[u32])> = Vec::with_capacity(inputs.len());
+            for (lane, tok) in inputs.iter().enumerate() {
+                if let Some(&(req_idx, _)) = packet_requests.get(lane) {
+                    let req = &requests[req_idx];
+                    let worker_hist = if req.prefilling {
+                        &req.input[..req.offset.min(req.input.len())]
+                    } else {
+                        // Worker owner.history precedes the anchor token at tok[0].
+                        &req.history[..req.history.len().saturating_sub(1)]
+                    };
+                    pairs.push((worker_hist, tok.as_slice()));
+                } else {
+                    pairs.push((&[], tok.as_slice()));
+                }
+            }
+            self.team.prefetch_first_primary(first, &pairs);
+        }
+        Ok(readout)
+    }
+
+    /// Returns `Ok(None)` when a request-scoped sampling failure occurred and
+    /// the request was marked failed + scheduled for zero-commit rollback.
+    fn verify_request_tokens(
+        &mut self,
+        request: &mut Request,
+        draft: &[u32],
+        target: &[&super::super::team::Output],
+    ) -> Result<Option<Vec<u32>>> {
+        if request.host_sampling()
+            && !(request.device_sample() && target.iter().all(|o| o.logits.is_empty()))
+        {
+            let proposals = draft
+                .iter()
+                .map(|&token| {
+                    Ok(crate::mtp::Proposal {
+                        token,
+                        distribution: crate::sampling::Distribution::point_mass(token, 129280)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let logits = target
+                .iter()
+                .flat_map(|v| v.logits.iter().copied())
+                .collect::<Vec<_>>();
+            let core = &mut request.core;
+            match crate::sampling::verify_validated(
+                &proposals,
+                &logits,
+                &core.history,
+                &core.sampling,
+                &mut core.decoder,
+                core.generated,
+                129280,
+            ) {
+                Ok(tokens) => Ok(Some(tokens)),
+                Err(error)
+                    if core.decoder.failure().is_some()
+                        || error == "Rejected proposal has no residual mass" =>
+                {
+                    if core.decoder.failure().is_none() {
+                        core.decoder.fail(error);
+                    }
+                    self.health.sampling_request_failures += 1;
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
+        } else if request.processed_sampling && request.device_sample() {
+            match request.verify_device(draft, target) {
+                Ok(tokens) => Ok(Some(tokens)),
+                Err(_) if request.decoder.failure().is_some() => {
+                    self.health.sampling_request_failures += 1;
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            // Target draws use only their absolute position's randomness.
+            // A deterministic guess or a draft sharing that randomness can
+            // therefore reuse the matching prefix. Earlier decisions never
+            // inspect future draws; the first mismatch is the target draw,
+            // and errors on unaccepted speculative rows are ignored.
+            let mut tokens = Vec::with_capacity(target.len());
+            let mut row_error = None;
+            for (position, output) in target.iter().enumerate() {
+                if let Some(error) = &output.error {
+                    row_error = Some(error.clone());
+                    break;
+                }
+                tokens.push(output.token);
+                if draft.get(position) != Some(&output.token) {
+                    break;
+                }
+            }
+            if let Some(error) = row_error {
+                request.decoder.fail(error);
+                self.health.sampling_request_failures += 1;
+                return Ok(None);
+            }
+            let count = match request.decoder.consume_unconstrained_prefix(&tokens) {
+                Ok(count) => count,
+                Err(_) if request.decoder.failure().is_some() => {
+                    self.health.sampling_request_failures += 1;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            if count == 0 {
+                return Err("Empty unconstrained verification prefix".into());
+            }
+            tokens.truncate(count);
+            Ok(Some(tokens))
+        }
+    }
+
+    fn record_dspark_round_metrics(
+        &mut self,
+        requests: &mut [&mut Request],
+        metrics: RoundMetrics<'_>,
+    ) {
+        let draft_s = metrics.draft_timing.seconds;
+        let verify_s = metrics.verify_timing.seconds;
+        let draft_prepare = metrics.draft_timing.preparation;
+        let verify_prepare = metrics.verify_timing.preparation;
+        let restore_s = metrics.restore_s;
+        self.speculation_policy.observe(
+            metrics.selected.len(),
+            (metrics.full, metrics.mixed, metrics.uniform),
+            Costs {
+                draft_replay: metrics.draft_timing.replay,
+                verify_replay: metrics.verify_timing.replay,
+                shared: [metrics.draft_timing.shared, metrics.verify_timing.shared],
+                shared_setup: [
+                    metrics.draft_timing.shared_setup,
+                    metrics.verify_timing.shared_setup,
+                ],
+                work: metrics.verified_work,
+                setup: [metrics.draft_timing.setup, metrics.verify_timing.setup],
+                wall_s: Some(metrics.round_started.elapsed().as_secs_f64()),
+                stages: [
+                    draft_s + draft_prepare - metrics.draft_timing.setup,
+                    verify_s + metrics.sampling_s + verify_prepare - metrics.verify_timing.setup,
+                    restore_s,
+                    0.,
+                ],
+            },
+            metrics.counts,
+            metrics.block,
+        );
+        self.speculation.rounds += metrics.selected.len();
+        for &(i, _) in metrics.selected {
+            requests[i].mtp.draft_s += draft_s;
+            requests[i].mtp.verification_s += verify_s;
+            requests[i].mtp.restore_s += restore_s;
+        }
+        self.speculation.draft_s += draft_s;
+        self.speculation.verification_s += verify_s;
+        self.speculation.restore_s += restore_s;
+        self.statistics.iterations += 1;
+        self.statistics.speculative_iterations += 1;
+        self.statistics.compute_s += draft_s + verify_s + restore_s;
+        self.statistics.batch_plan_s += draft_prepare + verify_prepare;
+        *self
+            .statistics
+            .batch_histogram
+            .entry(metrics.packet_batch)
+            .or_default() += 1;
+        if metrics.prefill_rows > 0 {
+            self.statistics.mixed_iterations += 1;
+            self.statistics.mixed_speculative_iterations += 1;
+            self.statistics.bounded_prefill_iterations += 1;
+            *self
+                .statistics
+                .prefill_chunk_histogram
+                .entry(metrics.prefill_rows)
+                .or_default() += 1;
+            *self
+                .statistics
+                .prefill_batch_histogram
+                .entry(metrics.prefill_requests)
+                .or_default() += 1;
+            self.statistics.max_bounded_prefill_s = self
+                .statistics
+                .max_bounded_prefill_s
+                .max(draft_s + verify_s + restore_s);
+        }
+    }
+
     pub(super) fn advance_dspark(
         &mut self,
         requests: &mut [&mut Request],
@@ -20,7 +488,13 @@ impl Runtime {
             ..*options
         };
         let options = &bounded_options;
-        let owners = self.team.model.batch.as_ref().unwrap().owners;
+        let batch_contract = self
+            .team
+            .model
+            .batch
+            .as_ref()
+            .ok_or("Missing A2 batch contract")?;
+        let owners = batch_contract.owners;
         let baseline = self
             .select_packet(requests, options, None)?
             .ok_or("Missing DSpark decoder packet")?;
@@ -41,15 +515,17 @@ impl Runtime {
                 requests[i].sampling.device_categorical() && !requests[i].decoder.constrained()
             });
         let rejection_steps = if rejection {
-            indices
-                .iter()
-                .map(|&i| {
-                    let r = &requests[i];
-                    Ok((r.slot, crate::mtp::round_step(r.mtp.rounds, r.generated)?))
-                })
-                .collect::<Result<BTreeMap<_, _>>>()?
+            Some(
+                indices
+                    .iter()
+                    .map(|&i| {
+                        let r = &requests[i];
+                        Ok((r.slot, crate::mtp::round_step(r.mtp.rounds, r.generated)?))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            )
         } else {
-            BTreeMap::new()
+            None
         };
         let uniform = self.draft_limit <= self.team.draft_blocks[0];
         for &i in &indices {
@@ -128,22 +604,33 @@ impl Runtime {
             capacity,
         };
         let ceiling_s = options.prefill_budget_ms / 1000.;
-        let mut budgets = BTreeMap::<(usize, u64), usize>::new();
+        let mut budgets = BTreeMap::<(usize, usize, bool), usize>::new();
         let mut retained_cache = BTreeMap::<Vec<usize>, (Layout, super::super::batch::Key)>::new();
         let mut verification_budget = |rows: &[usize]| {
             let mut sum = 0usize;
-            let mut mask = 0u64;
+            let mut max_decode_context = 0usize;
+            let mut any_needs_logits = false;
             for (idx, &n) in rows.iter().enumerate() {
                 if n > 0 {
                     sum += n;
-                    if idx < 64 {
-                        mask |= 1u64 << idx;
+                    let r = &requests[idx];
+                    if !r.prefilling {
+                        max_decode_context = max_decode_context.max(r.history.len());
+                        any_needs_logits |= r.needs_logits();
                     }
                 }
             }
-            *budgets.entry((sum, mask)).or_insert_with(|| {
-                baseline.verification_budget(requests, rows, keep, &prefill_estimator, ceiling_s)
-            })
+            *budgets
+                .entry((sum, max_decode_context, any_needs_logits))
+                .or_insert_with(|| {
+                    baseline.verification_budget(
+                        requests,
+                        rows,
+                        keep,
+                        &prefill_estimator,
+                        ceiling_s,
+                    )
+                })
         };
         let allocation = self.speculation_policy.select_requests_with_forecast(
             (full, mixed),
@@ -191,31 +678,31 @@ impl Runtime {
                         capacity,
                         owners,
                     )?;
-                    let contract = self.team.model.batch.as_ref().unwrap();
-                    let (retained, retained_key) =
-                        if let Some(cached) = retained_cache.get(reference) {
-                            cached
-                        } else {
-                            for (&i, &depth) in indices.iter().zip(reference) {
-                                decode_rows[i] = depth + 1;
-                            }
-                            let built = baseline.forecast_layout(
-                                requests,
-                                &decode_rows,
-                                verification_budget(&decode_rows),
-                                keep,
-                                capacity,
-                                owners,
-                            )?;
-                            let key = built.bound_work_key(contract, &self.team.work_launches)?;
-                            retained_cache
-                                .entry(reference.to_vec())
-                                .or_insert((built, key))
-                        };
+                    let (retained, retained_key) = if let Some(cached) =
+                        retained_cache.get(reference)
+                    {
+                        cached
+                    } else {
+                        for (&i, &depth) in indices.iter().zip(reference) {
+                            decode_rows[i] = depth + 1;
+                        }
+                        let built = baseline.forecast_layout(
+                            requests,
+                            &decode_rows,
+                            verification_budget(&decode_rows),
+                            keep,
+                            capacity,
+                            owners,
+                        )?;
+                        let key = built.bound_work_key(batch_contract, &self.team.work_launches)?;
+                        retained_cache
+                            .entry(reference.to_vec())
+                            .or_insert((built, key))
+                    };
                     if !target.bound_work_cached(
                         retained,
                         Some(retained_key),
-                        contract,
+                        batch_contract,
                         &self.team.work_launches,
                     )? {
                         return Ok(None);
@@ -239,60 +726,15 @@ impl Runtime {
             },
         )?;
         let mut depths = allocation.depths;
-        let mut expanded_bucket = false;
-        // Fill unused verification bucket slack (pad_slot rows) with extra verified
-        // drafts from the already-computed parallel draft block at zero extra NPU cost.
-        if baseline.prefill_rows == 0 && depths.iter().any(|&d| d > 0) {
-            let max_depth = *depths.iter().max().unwrap();
-            if let Some(block) = self
-                .team
-                .draft_blocks
-                .iter()
-                .copied()
-                .find(|&b| b >= max_depth)
-            {
-                let mut total: usize = depths.iter().map(|&d| d + 1).sum();
-                let output_cap = self
-                    .team
-                    .model
-                    .batch
-                    .as_ref()
-                    .map_or(capacity, |c| c.output_capacity());
-                let target = packet::bucket_verify_rows(total)
-                    .min(capacity)
-                    .min(output_cap);
-                if total <= 127 && target > total {
-                    let owner_rates: Vec<Vec<f64>> = feedback
-                        .iter()
-                        .map(|f| f.rates(block, &[], block))
-                        .collect();
-                    while total < target {
-                        let best = (0..depths.len())
-                            .filter(|&p| depths[p] > 0 && depths[p] < maxima[p].min(block))
-                            .max_by(|&a, &b| {
-                                let ra = owner_rates[a].get(depths[a]).copied().unwrap_or(0.0);
-                                let rb = owner_rates[b].get(depths[b]).copied().unwrap_or(0.0);
-                                ra.total_cmp(&rb)
-                                    .then_with(|| depths[b].cmp(&depths[a]))
-                                    .then_with(|| b.cmp(&a))
-                            });
-                        let Some(pos) = best else {
-                            break;
-                        };
-                        depths[pos] += 1;
-                        total += 1;
-                        expanded_bucket = true;
-                    }
-                }
-            }
-        }
+        let expanded_bucket = baseline.prefill_rows == 0
+            && self.expand_verify_bucket_slack(&mut depths, &maxima, &feedback, capacity);
         for (&i, &depth) in indices.iter().zip(&depths) {
             decode_rows[i] = depth + 1;
         }
         let packet_budget = verification_budget(&decode_rows);
         let retained_work =
             if let Some(reference) = allocation.reference.filter(|_| !expanded_bucket) {
-                if std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some() {
+                if super::super::diag().dspark_policy_trace {
                     super::super::log_async(format!(
                         "DSPARK_ALLOCATION {}",
                         serde_json::json!({
@@ -321,12 +763,13 @@ impl Runtime {
         self.statistics.mtp_budget_calls += 1;
         self.statistics.mtp_budget_s += budget_started.elapsed().as_secs_f64();
         let selected = indices.into_iter().zip(depths).collect::<Vec<_>>();
+        let maximum = selected.iter().map(|(_, count)| *count).max().unwrap_or(0);
         *self
             .statistics
             .mtp_depth_histogram
-            .entry(selected.iter().map(|(_, count)| *count).max().unwrap_or(0))
+            .entry(maximum)
             .or_default() += 1;
-        if selected.iter().all(|(_, k)| *k == 0) {
+        if maximum == 0 {
             // Execute the packet whose ordinary price was requested. A second
             // selection can change its admissions and invalidate calibration.
             let speculative_baseline =
@@ -339,7 +782,6 @@ impl Runtime {
                 maintenance,
             );
         }
-        let maximum = selected.iter().map(|(_, count)| *count).max().unwrap();
         self.speculation_policy.begin_round(
             selected.iter().map(|&(i, _)| requests[i].slot).collect(),
             full,
@@ -354,98 +796,25 @@ impl Runtime {
             .copied()
             .find(|&block| block >= maximum)
             .ok_or("Missing DSpark block capacity")?;
-        let mut segments = vec![];
-        let mut inputs = vec![];
-        for &(i, count) in &selected {
-            if count == 0 {
-                continue;
-            }
-            let request = &requests[i];
-            segments.push(BatchSegment {
-                slot: request.slot,
-                tokens: block,
-            });
-            let mut values = vec![128799; block];
-            values[0] = *request.history.last().ok_or("Missing DSpark anchor")?;
-            inputs.push(values);
-        }
-        let mut draft = if self.team.strided_draft {
-            let outputs = (0..segments.len()).collect();
-            Layout::new(segments, outputs, false, owners * block, owners)?
-        } else {
-            Layout::verification(segments, owners * block, owners)?
-        };
-        draft.role = super::super::PacketRole::Draft;
         let depths = selected.iter().copied().collect::<BTreeMap<_, _>>();
-        let mut readout = if self
-            .team
-            .model
-            .sampling
-            .as_ref()
-            .is_some_and(|s| s.coupled_draft)
-        {
-            packet::draft_readout(requests)
-        } else {
-            false.into()
-        };
-        if rejection {
-            readout.store_draft_distributions = true;
-            readout.sampling_steps(&rejection_steps);
-            for draw in readout.draws.values_mut() {
-                draw.seed ^= crate::mtp::DRAFT_STREAM;
-            }
-        }
-        let (proposals, draft_timing) = if self.team.is_resident(&draft) {
-            self.team
-                .fast_forward(draft, inputs, readout, maintenance)?
-        } else {
-            let draft_prepared =
-                self.begin_forward_with_workspace(&draft, "Insufficient DSpark graph workspace")?;
-            // Only these owners execute the draft graph. A final prefill window
-            // or a non-speculating tail cannot shorten its reuse forecast.
-            let draft_owners = selected
-                .iter()
-                .copied()
-                .filter(|&(_, depth)| depth > 0)
-                .collect::<Vec<_>>();
-            let (uses, _) =
-                self.capture_context(&draft_owners, requests, Some(&depths), block, options);
-            // Draft preparation still delays every decoder in the packet.
-            let (_, slack) =
-                self.capture_context(&baseline.selected, requests, Some(&depths), block, options);
-            let capture =
-                self.speculation_policy
-                    .draft_budget(block, draft_owners.len(), uses, slack);
-            self.team.finish_forward(
-                draft_prepared,
-                draft,
-                inputs,
-                readout,
-                Some(capture),
-                maintenance,
-            )?
-        };
+        let DraftOutcome {
+            proposals,
+            timing: draft_timing,
+            inputs,
+            draft_tokens,
+        } = self.run_dspark_draft(
+            DraftRequest {
+                requests,
+                baseline_selected: &baseline.selected,
+                selected: &selected,
+                block,
+                owners,
+                rejection_steps: rejection_steps.as_ref(),
+                options,
+            },
+            maintenance,
+        )?;
         draft_timing.record(&mut self.statistics.batch_execution);
-        let draft_s = draft_timing.seconds;
-        let draft_prepare = draft_timing.preparation;
-        let mut inputs = BTreeMap::new();
-        let mut draft_tokens = vec![];
-        for &(i, count) in &selected {
-            let request = &requests[i];
-            let tokens = proposals
-                .iter()
-                .filter(|v| v.owner == request.slot)
-                .take(count)
-                .map(|v| v.token)
-                .collect::<Vec<_>>();
-            if tokens.len() != count {
-                return Err("Incomplete DSpark proposal pool".into());
-            }
-            let mut values = vec![*request.history.last().unwrap()];
-            values.extend_from_slice(&tokens);
-            inputs.insert(i, values);
-            draft_tokens.push(tokens);
-        }
         let journal = selected
             .iter()
             .filter(|(_, n)| *n > 0)
@@ -463,7 +832,11 @@ impl Runtime {
         if let Some(reference) = retained_work
             && !verification.layout.bound_work(
                 &reference,
-                self.team.model.batch.as_ref().unwrap(),
+                self.team
+                    .model
+                    .batch
+                    .as_ref()
+                    .ok_or("Missing A2 batch contract")?,
                 &self.team.work_launches,
             )?
         {
@@ -510,79 +883,15 @@ impl Runtime {
             uses,
             slack,
         );
-        let proposal_map = selected
-            .iter()
-            .zip(&draft_tokens)
-            .map(|(&(i, _), tokens)| (i, tokens.clone()))
-            .collect();
-        let readout_result = packet::target_readout(
+        let readout_result = self.build_verification_readout(VerifyReadoutRequest {
             requests,
-            full || packet_full,
-            &proposal_map,
-            self.vocab(),
-            &packet_requests,
-        );
-        let readout_result = readout_result.map(|mut readout| {
-            if rejection {
-                readout.sampling_steps(&rejection_steps);
-                let stride = self
-                    .team
-                    .model
-                    .sampling
-                    .as_ref()
-                    .unwrap()
-                    .rejection
-                    .as_ref()
-                    .unwrap()
-                    .stride;
-                for (&(i, count), tokens) in selected.iter().zip(&draft_tokens) {
-                    if count == 0 {
-                        continue;
-                    }
-                    let request = &requests[i];
-                    readout.rejection.insert(
-                        request.slot,
-                        tokens
-                            .iter()
-                            .enumerate()
-                            .map(|(position, &token)| {
-                                crate::backend::ascend::sampling::RejectionProposal {
-                                    row: request.slot * stride + position,
-                                    token,
-                                    log_uniform: crate::sampling::counter_uniform(
-                                        request.sampling.seed,
-                                        crate::mtp::ACCEPT_STREAM,
-                                        (rejection_steps[&request.slot] + position) as u64,
-                                    )
-                                    .ln() as f32,
-                                }
-                            })
-                            .collect(),
-                    );
-                }
-            }
-            self.prepare_host_inputs(&layout, &packet_requests, requests, &mut readout);
-            // Overlap Layer 1 Engram random host-RAM gather on verification batches
-            // (both pure decode and mixed) with verification IPC, journal copy, and layer 0.
-            if let Some(first) = readout.first_input.as_deref() {
-                let mut pairs: Vec<(&[u32], &[u32])> = Vec::with_capacity(inputs.len());
-                for (lane, tok) in inputs.iter().enumerate() {
-                    if let Some(&(req_idx, _)) = packet_requests.get(lane) {
-                        let req = &requests[req_idx];
-                        let worker_hist = if req.prefilling {
-                            &req.input[..req.offset.min(req.input.len())]
-                        } else {
-                            // Worker owner.history precedes the anchor token at tok[0].
-                            &req.history[..req.history.len().saturating_sub(1)]
-                        };
-                        pairs.push((worker_hist, tok.as_slice()));
-                    } else {
-                        pairs.push((&[], tok.as_slice()));
-                    }
-                }
-                self.team.prefetch_first_primary(first, &pairs);
-            }
-            readout
+            full: full || packet_full,
+            selected: &selected,
+            draft_tokens: &draft_tokens,
+            packet_requests: &packet_requests,
+            layout: &layout,
+            inputs: &inputs,
+            rejection_steps: rejection_steps.as_ref(),
         });
         let (verified, verify_timing, save_s) = if let Some(started) = slow_started {
             let (first_prepared, first_journal_ready) =
@@ -623,140 +932,52 @@ impl Runtime {
         };
         verify_timing.record(&mut self.statistics.batch_execution);
         self.observe_prefill(prefill_work, &verify_timing);
-        let verify_s = verify_timing.seconds;
         self.statistics.sampling_mask_rows += verify_timing.mask_rows;
         self.statistics.sampling_report_rows += verify_timing.report_rows;
         self.statistics.sampling_prepare_s += verify_timing.mask_prepare_s;
-        let verify_prepare = verify_timing.preparation;
         let started = Instant::now();
         let mut counts = vec![];
         let mut steps = vec![];
         let mut rollback = vec![];
         for (&(i, count), draft) in selected.iter().zip(draft_tokens) {
-            let request = &mut requests[i];
+            let slot = requests[i].slot;
             let target = verified
                 .iter()
-                .filter(|v| v.owner == request.slot)
+                .filter(|v| v.owner == slot)
                 .collect::<Vec<_>>();
             if target.len() != count + 1 {
                 return Err("Incomplete DSpark verification rows".into());
             }
             #[cfg(test)]
-            if std::env::var_os("ORINFER_A2_DSPARK_TRACE").is_some() && self.speculation.rounds < 8
-            {
+            if super::super::diag().dspark_trace && self.speculation.rounds < 8 {
                 eprintln!(
                     "DSPARK_TRACE {}",
                     serde_json::json!({
-                        "owner":request.slot,"position":request.history.len()-1,
-                        "anchor":request.history.last(),"draft":draft,
+                        "owner":slot,"position":requests[i].history.len()-1,
+                        "anchor":requests[i].history.last(),"draft":draft,
                         "target":target.iter().map(|v|v.token).collect::<Vec<_>>(),
-                        "confidence":proposals.iter().filter(|v|v.owner==request.slot).map(|v|v.value).collect::<Vec<_>>()
+                        "confidence":proposals.iter().filter(|v|v.owner==slot).map(|v|v.value).collect::<Vec<_>>()
                     })
                 );
             }
-            let committed = if request.host_sampling()
-                && !(request.device_sample() && target.iter().all(|o| o.logits.is_empty()))
-            {
-                let proposals = draft
-                    .iter()
-                    .map(|&token| {
-                        Ok(crate::mtp::Proposal {
-                            token,
-                            distribution: crate::sampling::Distribution::point_mass(token, 129280)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let logits = target
-                    .iter()
-                    .flat_map(|v| v.logits.iter().copied())
-                    .collect::<Vec<_>>();
-                let core = &mut request.core;
-                match crate::sampling::verify_validated(
-                    &proposals,
-                    &logits,
-                    &core.history,
-                    &core.sampling,
-                    &mut core.decoder,
-                    core.generated,
-                    129280,
-                ) {
-                    Ok(tokens) => tokens,
-                    Err(error)
-                        if core.decoder.failure().is_some()
-                            || error == "Rejected proposal has no residual mass" =>
-                    {
-                        if core.decoder.failure().is_none() {
-                            core.decoder.fail(error);
-                        }
-                        self.health.sampling_request_failures += 1;
-                        rollback.push((request.slot, 0));
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else if request.processed_sampling && request.device_sample() {
-                match request.verify_device(&draft, &target) {
-                    Ok(tokens) => tokens,
-                    Err(error) if request.decoder.failure().is_some() => {
-                        let _ = error;
-                        self.health.sampling_request_failures += 1;
-                        rollback.push((request.slot, 0));
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                // Target draws use only their absolute position's randomness.
-                // A deterministic guess or a draft sharing that randomness can
-                // therefore reuse the matching prefix. Earlier decisions never
-                // inspect future draws; the first mismatch is the target draw,
-                // and errors on unaccepted speculative rows are ignored.
-                let mut tokens = Vec::with_capacity(target.len());
-                let mut row_error = None;
-                for (position, output) in target.iter().enumerate() {
-                    if let Some(error) = &output.error {
-                        row_error = Some(error.clone());
-                        break;
-                    }
-                    tokens.push(output.token);
-                    if draft.get(position) != Some(&output.token) {
-                        break;
-                    }
-                }
-                if let Some(error) = row_error {
-                    request.decoder.fail(error);
-                    self.health.sampling_request_failures += 1;
-                    rollback.push((request.slot, 0));
-                    continue;
-                }
-                let count = match request.decoder.consume_unconstrained_prefix(&tokens) {
-                    Ok(count) => count,
-                    Err(_) if request.decoder.failure().is_some() => {
-                        self.health.sampling_request_failures += 1;
-                        rollback.push((request.slot, 0));
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                if count == 0 {
-                    return Err("Empty unconstrained verification prefix".into());
-                }
-                tokens.truncate(count);
-                tokens
+            let Some(committed) = self.verify_request_tokens(requests[i], &draft, &target)? else {
+                rollback.push((slot, 0));
+                continue;
             };
+            let request = &mut requests[i];
             // The last output stays pending. Keep confirmed writes, restore
             // overwritten live slots, and shorten the logical history.
             if committed.len() < count + 1 {
-                rollback.push((request.slot, committed.len()));
+                rollback.push((slot, committed.len()));
             }
             if count > 0 {
                 let confidence = proposals
                     .iter()
-                    .filter(|p| p.owner == request.slot)
+                    .filter(|p| p.owner == slot)
                     .map(|p| p.value as f64)
                     .collect::<Vec<_>>();
                 self.speculation_policy.observe_feedback(
-                    request.slot,
+                    slot,
                     &mut request.draft_feedback,
                     &confidence,
                     (count, committed.len() - 1),
@@ -791,69 +1012,31 @@ impl Runtime {
         let started = Instant::now();
         self.team.finish_verification(rollback, &journal)?;
         let restore_s = started.elapsed().as_secs_f64() + save_s;
-        self.speculation_policy.observe(
-            selected.len(),
-            (full, mixed, uniform),
-            Costs {
-                draft_replay: draft_timing.replay,
-                verify_replay: verify_timing.replay,
-                shared: [draft_timing.shared, verify_timing.shared],
-                shared_setup: [draft_timing.shared_setup, verify_timing.shared_setup],
-                work: verified_work,
-                setup: [draft_timing.setup, verify_timing.setup],
-                wall_s: Some(round_started.elapsed().as_secs_f64()),
-                stages: [
-                    draft_s + draft_prepare - draft_timing.setup,
-                    verify_s + sampling_s + verify_prepare - verify_timing.setup,
-                    restore_s,
-                    0.,
-                ],
-            },
-            &counts,
-            block,
-        );
-        self.speculation.rounds += selected.len();
-        for &(i, _) in &selected {
-            requests[i].mtp.draft_s += draft_s;
-            requests[i].mtp.verification_s += verify_s;
-            requests[i].mtp.restore_s += restore_s;
-        }
-        self.speculation.draft_s += draft_s;
-        self.speculation.verification_s += verify_s;
-        self.speculation.restore_s += restore_s;
         let prefill = packet_requests
             .into_iter()
             .filter(|&(i, _)| requests[i].prefilling)
             .collect();
         steps.extend(self.commit_packet(requests, prefill, &verified)?);
-        self.statistics.iterations += 1;
-        self.statistics.speculative_iterations += 1;
-        self.statistics.compute_s += draft_s + verify_s + restore_s;
-        self.statistics.batch_plan_s += draft_prepare + verify_prepare;
-        *self
-            .statistics
-            .batch_histogram
-            .entry(packet_batch)
-            .or_default() += 1;
-        if prefill_rows > 0 {
-            self.statistics.mixed_iterations += 1;
-            self.statistics.mixed_speculative_iterations += 1;
-            self.statistics.bounded_prefill_iterations += 1;
-            *self
-                .statistics
-                .prefill_chunk_histogram
-                .entry(prefill_rows)
-                .or_default() += 1;
-            *self
-                .statistics
-                .prefill_batch_histogram
-                .entry(prefill_requests)
-                .or_default() += 1;
-            self.statistics.max_bounded_prefill_s = self
-                .statistics
-                .max_bounded_prefill_s
-                .max(draft_s + verify_s + restore_s);
-        }
+        self.record_dspark_round_metrics(
+            requests,
+            RoundMetrics {
+                selected: &selected,
+                full,
+                mixed,
+                uniform,
+                block,
+                round_started,
+                draft_timing: &draft_timing,
+                verify_timing: &verify_timing,
+                sampling_s,
+                restore_s,
+                verified_work,
+                counts: &counts,
+                packet_batch,
+                prefill_rows,
+                prefill_requests,
+            },
+        );
         steps.extend(cached_outputs(requests)?);
         Ok(steps)
     }

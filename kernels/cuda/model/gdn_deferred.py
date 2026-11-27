@@ -21,7 +21,7 @@ def validate_geometry(capacity, hk, hv, vt, threads):
         raise ValueError("Invalid deferred GDN geometry")
 
 
-def pending_updates(capacity, hk, hv, vt, threads):
+def pending_updates(capacity, hk, hv, vt):
     update = rank_one(vt, staged=True)
 
     @T.macro
@@ -56,7 +56,7 @@ def recurrent(capacity, *, key_heads=16, value_heads=48, value_tile=16, threads=
     HK, HV, DK, DV = key_heads, value_heads, 128, 128
     vt = value_tile
     validate_geometry(capacity, HK, HV, vt, threads)
-    replay = pending_updates(capacity, HK, HV, vt, threads)
+    replay = pending_updates(capacity, HK, HV, vt)
     prediction = predict(vt)
     advance = update_readout(vt, 128**-0.5, saved_delta=True)
 
@@ -117,7 +117,7 @@ def materialize(capacity, *, key_heads=16, value_heads=48, value_tile=16, thread
     HK, HV, vt = key_heads, value_heads, value_tile
     validate_geometry(capacity, HK, HV, vt, threads)
 
-    replay = pending_updates(capacity, HK, HV, vt, threads)
+    replay = pending_updates(capacity, HK, HV, vt)
 
     @T.prim_func
     def main(
@@ -162,7 +162,7 @@ def verification(capacity, *, key_heads=16, value_heads=48, tokens=8, value_tile
         ]
     ]
     logk, logd, logg, count = logs
-    replay = pending_updates(capacity, hk, hv, vt, threads)
+    replay = pending_updates(capacity, hk, hv, vt)
 
     @T.macro
     def initialize(state, Base, h, bv):
@@ -190,7 +190,7 @@ def commit(capacity, *, key_heads=16, value_heads=48, tokens=8, value_tile=16, t
     """Append an exact accepted prefix; canonicalize only when its log fills."""
     hk, hv, vt = key_heads, value_heads, value_tile
     validate_geometry(capacity, hk, hv, vt, threads)
-    pending = pending_updates(capacity, hk, hv, vt, threads)
+    pending = pending_updates(capacity, hk, hv, vt)
     advance = rank_one(vt, staged=True)
 
     @T.prim_func

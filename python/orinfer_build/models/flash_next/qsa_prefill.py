@@ -1,5 +1,6 @@
 """Publish Flash Next native prefill QSA selections and FP16 KV staging."""
 
+from itertools import pairwise
 from functools import partial
 
 
@@ -99,7 +100,7 @@ def publish(data, package, manifest, compiler):
     for plan in manifest["prefill_plans"]:
         rows = plan["chunk_tokens"]
         operations = manifest["programs"][plan["prefill_program"]]
-        for op, following in zip(operations, operations[1:]):
+        for op, following in pairwise(operations):
             if op["kind"] != "kernel":
                 continue
             name = op["name"]

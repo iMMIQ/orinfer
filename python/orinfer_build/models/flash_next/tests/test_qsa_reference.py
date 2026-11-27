@@ -14,7 +14,7 @@ class QsaTests(unittest.TestCase):
         q, k = index(qk, torch.zeros(128), torch.zeros(128))
         positions = [0, 1, 3, 2047, 2048, 2051, 2052]
         chosen = select(q[positions], k, positions)
-        for row, pos in zip(chosen, positions):
+        for row, pos in zip(chosen, positions, strict=True):
             valid = row[row >= 0]
             self.assertEqual(len(valid), min(512, (pos + 1) // 4) * 4 + (pos + 1) % 4)
             self.assertEqual(len(valid.unique()), len(valid))

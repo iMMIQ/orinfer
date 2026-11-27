@@ -4,6 +4,7 @@ Fusion changes are registered by the Rust adapter. This tool only constructs
 checked operand bindings; it never publishes Python execution plans.
 """
 
+from itertools import pairwise
 from orinfer_build.common.paths import work_path
 
 
@@ -312,7 +313,7 @@ def publish_qsa_prefill(package, manifest, compiler, *, attention_only=False):
     for plan in manifest["prefill_plans"]:
         rows = plan["chunk_tokens"]
         operations = manifest["programs"][plan["prefill_program"]]
-        for previous, current in zip(operations, operations[1:]):
+        for previous, current in pairwise(operations):
             selector = originals.get(current.get("name"))
             if selector is not None and selector["grid"] == [rows, 2, 8]:
                 operands = compiler.pointers(selector)
@@ -408,7 +409,7 @@ def publish_qsa_sort_prefill(package, manifest, compiler):
     for plan in manifest["prefill_plans"]:
         rows = plan["chunk_tokens"]
         operations = manifest["programs"][plan["prefill_program"]]
-        for previous, op in zip(operations, operations[1:]):
+        for previous, op in pairwise(operations):
             old = originals.get(op.get("name"))
             if old is None or old["symbol"] != "qsa_select_merge_kernel":
                 continue
@@ -453,7 +454,7 @@ def publish_expert_input_prefill(package, manifest, compiler):
     for plan in manifest["prefill_plans"]:
         rows = plan["chunk_tokens"]
         ops = manifest["programs"][plan["prefill_program"]]
-        for previous, current in zip(ops, ops[1:]):
+        for previous, current in pairwise(ops):
             old = originals.get(previous.get("name"))
             split = originals.get(current.get("name"))
             if old is None or split is None or split["symbol"] != "pack_exact_a8_kernel":

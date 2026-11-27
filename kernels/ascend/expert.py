@@ -33,6 +33,49 @@ def split_row(x, packed, row, reduction):
     T.copy(low_bytes, packed[row * 2 + 1, :])
 
 
+@T.macro
+def _dequant_swiglu_row(
+    raw,
+    bias,
+    token_scale,
+    row,
+    width,
+    ri0,
+    ri1,
+    high,
+    low,
+    projected,
+    gb,
+    ub,
+    gate,
+    up,
+    exponential,
+    gated,
+):
+    T.copy(raw[row * 2 : row * 2 + 1, :], ri0)
+    T.copy(raw[row * 2 + 1 : row * 2 + 2, :], ri1)
+    T.tile.cast(high, ri0, "CAST_NONE", width * 2)
+    T.tile.cast(low, ri1, "CAST_NONE", width * 2)
+    T.tile.mul(high, high, 16.0)
+    T.tile.add(high, high, low)
+    T.tile.add(high, high, bias)
+    T.tile.mul(high, high, token_scale[row])
+    T.tile.cast(projected, high, "CAST_RINT", width * 2)
+    T.copy(projected[:, :width], gb)
+    T.copy(projected[:, width:], ub)
+    T.tile.cast(gate, gb, "CAST_NONE", width)
+    T.tile.cast(up, ub, "CAST_NONE", width)
+    T.tile.min(gate, gate, 10.0)
+    T.tile.min(up, up, 10.0)
+    T.tile.max(up, up, -10.0)
+    T.tile.mul(exponential, gate, -1.0)
+    T.tile.exp(exponential, exponential)
+    T.tile.add(exponential, exponential, 1.0)
+    T.tile.div(gate, gate, exponential)
+    T.tile.mul(up, up, gate)
+    T.tile.cast(gated, up, "CAST_RINT", width)
+
+
 def gather_split(rows, table_rows, width, experts, table_stride=0, slots=20):
     """Gather live rows directly into paired signed INT4 planes and counts.
 
@@ -162,28 +205,24 @@ def finish(rows, width, experts, tile_n=256, slots=20):
                         T.copy(assist[expert : expert + 1, :], bias)
                     for item in T.serial(items):
                         row = start + first + item * lanes
-                        T.copy(raw[row * 2 : row * 2 + 1, :], ri0)
-                        T.copy(raw[row * 2 + 1 : row * 2 + 2, :], ri1)
-                        T.tile.cast(high, ri0, "CAST_NONE", width * 2)
-                        T.tile.cast(low, ri1, "CAST_NONE", width * 2)
-                        T.tile.mul(high, high, 16.0)
-                        T.tile.add(high, high, low)
-                        T.tile.add(high, high, bias)
-                        T.tile.mul(high, high, token_scale[row])
-                        T.tile.cast(projected, high, "CAST_RINT", width * 2)
-                        T.copy(projected[:, :width], gb)
-                        T.copy(projected[:, width:], ub)
-                        T.tile.cast(gate, gb, "CAST_NONE", width)
-                        T.tile.cast(up, ub, "CAST_NONE", width)
-                        T.tile.min(gate, gate, 10.0)
-                        T.tile.min(up, up, 10.0)
-                        T.tile.max(up, up, -10.0)
-                        T.tile.mul(exponential, gate, -1.0)
-                        T.tile.exp(exponential, exponential)
-                        T.tile.add(exponential, exponential, 1.0)
-                        T.tile.div(gate, gate, exponential)
-                        T.tile.mul(up, up, gate)
-                        T.tile.cast(gated, up, "CAST_RINT", width)
+                        _dequant_swiglu_row(
+                            raw,
+                            bias,
+                            token_scale,
+                            row,
+                            width,
+                            ri0,
+                            ri1,
+                            high,
+                            low,
+                            projected,
+                            gb,
+                            ub,
+                            gate,
+                            up,
+                            exponential,
+                            gated,
+                        )
                         quantize_bf16_row(gated, out, scales, row, width)
                     prefix[0] = start + count
 
@@ -348,28 +387,24 @@ def finish_split(rows, width, experts, slots=20):
                         T.copy(assist[expert_idx : expert_idx + 1, :], bias)
                     for item in T.serial(items):
                         row = start + first + item * lanes
-                        T.copy(raw[row * 2 : row * 2 + 1, :], ri0)
-                        T.copy(raw[row * 2 + 1 : row * 2 + 2, :], ri1)
-                        T.tile.cast(high, ri0, "CAST_NONE", width * 2)
-                        T.tile.cast(low, ri1, "CAST_NONE", width * 2)
-                        T.tile.mul(high, high, 16.0)
-                        T.tile.add(high, high, low)
-                        T.tile.add(high, high, bias)
-                        T.tile.mul(high, high, token_scale[row])
-                        T.tile.cast(projected, high, "CAST_RINT", width * 2)
-                        T.copy(projected[:, :width], gb)
-                        T.copy(projected[:, width:], ub)
-                        T.tile.cast(gate, gb, "CAST_NONE", width)
-                        T.tile.cast(up, ub, "CAST_NONE", width)
-                        T.tile.min(gate, gate, 10.0)
-                        T.tile.min(up, up, 10.0)
-                        T.tile.max(up, up, -10.0)
-                        T.tile.mul(exponential, gate, -1.0)
-                        T.tile.exp(exponential, exponential)
-                        T.tile.add(exponential, exponential, 1.0)
-                        T.tile.div(gate, gate, exponential)
-                        T.tile.mul(up, up, gate)
-                        T.tile.cast(gated, up, "CAST_RINT", width)
+                        _dequant_swiglu_row(
+                            raw,
+                            bias,
+                            token_scale,
+                            row,
+                            width,
+                            ri0,
+                            ri1,
+                            high,
+                            low,
+                            projected,
+                            gb,
+                            ub,
+                            gate,
+                            up,
+                            exponential,
+                            gated,
+                        )
                         T.tile.cast(a, gated, "CAST_NONE", width)
                         T.tile.abs(absolute, a)
                         T.reduce_max(absolute, maximum, dim=1)

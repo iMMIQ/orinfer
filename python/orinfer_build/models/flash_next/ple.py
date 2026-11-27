@@ -45,7 +45,7 @@ class PleLookup:
                 raise ValueError("Invalid native PLE width")
             self.starts.append(self.total)
             self.total += shape[0]
-        if any(o < 0 or o + s > self.total for o, s in zip(self.offsets, self.sizes)):
+        if any(o < 0 or o + s > self.total for o, s in zip(self.offsets, self.sizes, strict=True)):
             raise ValueError("N-gram head outside PLE table")
 
     def row_ids(self, tokens, history):

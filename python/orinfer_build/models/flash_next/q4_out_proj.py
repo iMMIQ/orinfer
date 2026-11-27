@@ -1,5 +1,6 @@
 """Convert Flash Next ssm_out (36L) and attn_output (12L) projections from W8 to single-resident row-Q4."""
 
+from itertools import pairwise
 from functools import partial
 import hashlib
 import json
@@ -269,7 +270,7 @@ def publish(data, package, manifest, compiler, *, weights_dir: Path, row_specs=N
         ):
             continue
         kops = [op["name"] for op in ops if op["kind"] == "kernel"]
-        for prev_name, cur_name in zip(kops, kops[1:]):
+        for prev_name, cur_name in pairwise(kops):
             cur = kernels[cur_name]
             matched = None
             for a in cur["args"]:

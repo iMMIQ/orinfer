@@ -51,22 +51,42 @@ use load::upload;
 use plan::validate_dispatch;
 use plan::{bounded_rows, gather_element, load_spec, validate_row_ranges, w4_plan_rows};
 
-/// Non-blocking bounded stderr logger for hot-path A2 diagnostic telemetry.
-/// Keeps profiling logs off the NPU/sampling critical path.
-pub(in crate::models::deepseek_v41) fn log_async(line: String) {
-    static LOGGER: OnceLock<std::sync::mpsc::SyncSender<String>> = OnceLock::new();
-    let tx = LOGGER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(8192);
-        let _ = std::thread::Builder::new()
-            .name("orinfer-a2-log".into())
-            .spawn(move || {
-                while let Ok(msg) = rx.recv() {
-                    eprintln!("{msg}");
-                }
-            });
-        tx
-    });
-    let _ = tx.try_send(line);
+pub(in crate::models::deepseek_v41) use crate::logging::log_async;
+
+/// Cached process-lifetime diagnostic environment knobs for Ascend A2 execution.
+pub(in crate::models::deepseek_v41) struct DiagFlags {
+    pub batch_profile: bool,
+    pub batch_trace: Option<PathBuf>,
+    pub batch_trace_all_ranks: bool,
+    pub dspark_policy_trace: bool,
+    #[cfg(test)]
+    pub dspark_trace: bool,
+    pub vision_profile: bool,
+    pub sync_profile: bool,
+    pub step_fences: bool,
+    pub no_prewarm: bool,
+    pub w4_no_capture: bool,
+    pub logits_dir: Option<PathBuf>,
+    pub shared_graph: bool,
+}
+
+pub(in crate::models::deepseek_v41) fn diag() -> &'static DiagFlags {
+    static FLAGS: OnceLock<DiagFlags> = OnceLock::new();
+    FLAGS.get_or_init(|| DiagFlags {
+        batch_profile: std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some(),
+        batch_trace: std::env::var_os("ORINFER_A2_BATCH_TRACE").map(PathBuf::from),
+        batch_trace_all_ranks: std::env::var_os("ORINFER_A2_BATCH_TRACE_ALL_RANKS").is_some(),
+        dspark_policy_trace: std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some(),
+        #[cfg(test)]
+        dspark_trace: std::env::var_os("ORINFER_A2_DSPARK_TRACE").is_some(),
+        vision_profile: std::env::var_os("ORINFER_A2_VISION_PROFILE").is_some(),
+        sync_profile: std::env::var_os("ORINFER_A2_SYNC_PROFILE").is_some(),
+        step_fences: std::env::var_os("ORINFER_A2_STEP_FENCES").is_some(),
+        no_prewarm: std::env::var_os("ORINFER_A2_NO_PREWARM").is_some(),
+        w4_no_capture: std::env::var_os("ORINFER_A2_W4_NO_CAPTURE").is_some(),
+        logits_dir: std::env::var_os("ORINFER_A2_LOGITS_DIR").map(PathBuf::from),
+        shared_graph: std::env::var("ORINFER_A2_SHARED_GRAPH").is_ok_and(|v| v == "1"),
+    })
 }
 
 pub use batch_benchmark::run as run_batch;
@@ -1124,7 +1144,7 @@ impl Worker {
                     Some(name) => Some(self.row_buffer(name, active_rows)?),
                     None => None,
                 };
-                let capture_w4 = std::env::var_os("ORINFER_A2_W4_NO_CAPTURE").is_none();
+                let capture_w4 = !diag().w4_no_capture;
                 let shared_workspace = self.row_buffer(workspace, active_rows)?;
                 let key = W4Key {
                     name: name.clone(),

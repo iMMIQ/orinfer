@@ -39,7 +39,7 @@ def pointer_bindings(kernel, host, *, allow_scalars=False):
     if len(kernel["args"]) != len(host["ordered_arguments"]):
         raise ValueError("Original host ABI differs from the native package")
     pointers = {}
-    for actual, argument in zip(kernel["args"], host["ordered_arguments"]):
+    for actual, argument in zip(kernel["args"], host["ordered_arguments"], strict=True):
         value = argument["value"]
         if allow_scalars and argument["ctype"] == "ctypes.c_int32" and actual["kind"] == "i32":
             continue

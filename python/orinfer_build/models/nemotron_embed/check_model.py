@@ -23,6 +23,7 @@ def native(args, name, request, graph):
         [str(args.engine), "embed-model", str(args.model), str(path), "--cuda-graph", graph],
         capture_output=True,
         text=True,
+        check=False,
     )
     (args.output / f"{name}-{graph}.stderr").write_text(result.stderr)
     result.check_returncode()

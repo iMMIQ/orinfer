@@ -15,7 +15,9 @@ def read(path):
 
 
 def sample():
-    power = subprocess.run(["/usr/sbin/nvpmodel", "-q"], capture_output=True, text=True)
+    power = subprocess.run(
+        ["/usr/sbin/nvpmodel", "-q"], capture_output=True, text=True, check=False
+    )
     return {
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "platform": platform.platform(),

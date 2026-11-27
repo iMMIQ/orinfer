@@ -88,7 +88,7 @@ def live_index_replay():
         graph.replay()
         torch.cuda.synchronize()
         expected = select(query, cache, range(start, start + m))
-        for actual, reference in zip(selected, expected):
+        for actual, reference in zip(selected, expected, strict=True):
             assert torch.equal(
                 actual[actual >= 0].sort().values, reference[reference >= 0].sort().values
             ), start
@@ -183,7 +183,7 @@ def main():
         run_selection()
         torch.cuda.synchronize()
         expect = select(iq, ck, positions)
-        for actual, reference in zip(selected, expect):
+        for actual, reference in zip(selected, expect, strict=True):
             assert torch.equal(
                 actual[actual >= 0].sort().values, reference[reference >= 0].sort().values
             ), (capacity, actual, reference)
@@ -239,7 +239,7 @@ def main():
         g.replay()
         torch.cuda.synchronize()
         expected = select(iq, ck, list(range(first - 1, first - 1 + m)))
-        for actual, reference in zip(selected, expected):
+        for actual, reference in zip(selected, expected, strict=True):
             assert torch.equal(
                 actual[actual >= 0].sort().values, reference[reference >= 0].sort().values
             )

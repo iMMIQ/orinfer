@@ -255,9 +255,13 @@ def main():
             HF_DATASETS_OFFLINE="1",
             AIPERF_DATASET_WEKA_PARALLEL_WORKERS="16",
         )
-        # Reuse the original harness's cache locations without changing its code.
-        environment.setdefault("HF_HOME", "/data/research/huggingface")
-        environment.setdefault("AIPERF_DATASET_MMAP_CACHE_DIR", "/data/research/agentx-mmap-cache")
+        # Reuse the original harness's cache locations when present on the host.
+        for key, default in (
+            ("HF_HOME", "/data/research/huggingface"),
+            ("AIPERF_DATASET_MMAP_CACHE_DIR", "/data/research/agentx-mmap-cache"),
+        ):
+            if Path(default).exists():
+                environment.setdefault(key, default)
         # Leave room for ZMQ's IPC suffix under the 107-byte sun_path limit.
         temporary = tempfile.TemporaryDirectory(prefix="ori-mini-", dir="/tmp")
         environment["TMPDIR"] = temporary.name

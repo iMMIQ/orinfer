@@ -9,33 +9,24 @@ import json
 import os
 from pathlib import Path
 import platform
-import subprocess
 import tempfile
 import time
 
 import numpy as np
 
 from orinfer_build.common.files import atomic_json
+from orinfer_build.common.native_c import load_shared_c
 from orinfer_build.weights.local import LocalSource
 
 
 class Transpose:
     def __init__(self, cache):
-        source = Path(__file__).with_name("transpose.c")
-        stat = source.stat()
-        key = f"{platform.machine()}-{stat.st_size}-{stat.st_mtime_ns}"
-        cache = Path(cache)
-        cache.mkdir(parents=True, exist_ok=True)
-        library = cache / f"transpose-{key}.so"
-        if not library.exists():
-            with tempfile.TemporaryDirectory(dir=cache) as temporary:
-                stage = Path(temporary) / "transpose.so"
-                subprocess.run(
-                    ["cc", "-O3", "-std=c11", "-shared", "-fPIC", str(source), "-o", str(stage)],
-                    check=True,
-                )
-                os.replace(stage, library)
-        self.library = ctypes.CDLL(str(library.resolve()))
+        self.library = load_shared_c(
+            Path(__file__).with_name("transpose.c"),
+            Path(cache),
+            prefix="transpose",
+            openmp=False,
+        )
         self.call = self.library.orinfer_transpose_u8
         self.call.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_size_t] * 3
         self.call.restype = None

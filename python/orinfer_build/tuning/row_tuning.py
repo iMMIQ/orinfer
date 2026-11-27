@@ -598,7 +598,8 @@ class RowTuner:
                     for value in expected
                 ]
                 actual = [
-                    s[: v.numel()].view(shape) for s, v, shape in zip(storage, expected, shapes)
+                    s[: v.numel()].view(shape)
+                    for s, v, shape in zip(storage, expected, shapes, strict=True)
                 ]
 
                 def run():
@@ -606,7 +607,7 @@ class RowTuner:
 
                 def check():
                     launch(reference, x, w, history, length, position, *expected)
-                    for value, wanted, allocated in zip(actual, expected, storage):
+                    for value, wanted, allocated in zip(actual, expected, storage, strict=True):
                         assert torch.equal(value, wanted), "Convolution tile changed output/history"
                         assert bool(torch.all(allocated[value.numel() :] == 91))
 

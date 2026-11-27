@@ -41,7 +41,13 @@ def main():
             live = tile_count.item()
             assert live == len(expected) <= capacity
             assert (
-                list(zip(tile_expert[:live].cpu().tolist(), tile_row[:live].cpu().tolist()))
+                list(
+                    zip(
+                        tile_expert[:live].cpu().tolist(),
+                        tile_row[:live].cpu().tolist(),
+                        strict=True,
+                    )
+                )
                 == expected
             )
             expected_offsets, cursor = [], 0

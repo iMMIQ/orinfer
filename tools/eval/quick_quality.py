@@ -87,9 +87,11 @@ def analyze(rows):
             selected_in_baseline_top3=selected in base_ids,
             top3_overlap=len(base_ids & {x["token_id"] for x in b}) / 3,
             mean_abs_probability_error=statistics.mean(
-                abs(math.exp(x["logprob"]) - math.exp(v)) for x, v in zip(a, vals)
+                abs(math.exp(x["logprob"]) - math.exp(v)) for x, v in zip(a, vals, strict=True)
             ),
-            mean_abs_logprob_error=statistics.mean(abs(x["logprob"] - v) for x, v in zip(a, vals)),
+            mean_abs_logprob_error=statistics.mean(
+                abs(x["logprob"] - v) for x, v in zip(a, vals, strict=True)
+            ),
             delta_target_nll=base_lp - candidate_lp,
             high_confidence=math.exp(a[0]["logprob"]) >= 0.8,
             low_margin=math.exp(a[0]["logprob"]) - math.exp(a[1]["logprob"]) <= 0.01,

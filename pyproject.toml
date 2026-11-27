@@ -44,6 +44,31 @@ line-length = 100
 extend-exclude = ["artifacts", "target", ".venv"]
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "PLW0127"]
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "B007",
+    "B008",
+    "B019",
+    "B020",
+    "B904",
+    "B905",
+    "C401",
+    "C405",
+    "C417",
+    "C420",
+    "PERF102",
+    "PIE810",
+    "PLW0127",
+    "PLW1510",
+    "PLW3301",
+    "RET502",
+    "RET503",
+    "RUF012",
+    "RUF017",
+    "SIM105",
+]
 # TileLang tensor names follow the mathematical notation in the operator ABI.
 ignore = ["E741"]

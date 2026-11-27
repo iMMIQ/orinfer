@@ -95,7 +95,7 @@ def convolution_checks():
             launch(compact, x, w, history, lengths, positions, *actual[:3], actual[-1])
 
         def check():
-            for left, right in zip(actual[:3], expected[:3]):
+            for left, right in zip(actual[:3], expected[:3], strict=True):
                 torch.testing.assert_close(left, right, rtol=0, atol=0)
             torch.testing.assert_close(history, expected[3], rtol=0, atol=0)
             torch.testing.assert_close(actual[-1], expected[-1], rtol=0, atol=0)

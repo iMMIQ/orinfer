@@ -33,7 +33,7 @@ def repetition(ids):
         # Bound work even for one-token loops. Earliest occurrences expose the
         # beginning of a sustained cycle; later ones diagnose a repeated tail.
         selected = sorted(set(starts[:8] + starts[-8:]))
-        for a, b, c in zip(selected, selected[1:], selected[2:]):
+        for a, b, c in zip(selected, selected[1:], selected[2:], strict=False):
             period = b - a
             if c - b != period or len(ids) - a < 3 * period:
                 continue

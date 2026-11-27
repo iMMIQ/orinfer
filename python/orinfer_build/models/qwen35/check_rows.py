@@ -168,7 +168,7 @@ def residual_rotation_checks():
             def check():
                 launch(reference, x, r, w, ey, er)
                 launch(rotation, ey, signs, eq, es, rows)
-                for out, expected in zip((y, ro, q, scale), (ey, er, eq, es)):
+                for out, expected in zip((y, ro, q, scale), (ey, er, eq, es), strict=True):
                     torch.testing.assert_close(out, expected, rtol=0, atol=0)
                 assert all(bool(torch.all(v[rows:] == 91)) for v in storage)
 
@@ -260,7 +260,7 @@ def kv_loader_checks():
                     stream=torch.cuda.current_stream().cuda_stream,
                 )
                 torch.cuda.synchronize()
-                for c, scale, out in zip(codes, scales, storage):
+                for c, scale, out in zip(codes, scales, storage, strict=True):
                     expected = (
                         (
                             c.float().reshape(bn, dimension // 64, 64)

@@ -1210,7 +1210,7 @@ class Builder:
         )
         write_json(self.root / "cache/model.json", data)
         result = subprocess.run(
-            [str(engine), "plan-model", str(self.root)], capture_output=True, text=True
+            [str(engine), "plan-model", str(self.root)], capture_output=True, text=True, check=False
         )
         if result.returncode:
             raise ValueError(f"Native plan validation failed: {result.stderr.strip()}")

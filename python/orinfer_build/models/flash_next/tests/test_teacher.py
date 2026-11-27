@@ -161,9 +161,9 @@ class TeacherTests(unittest.TestCase):
             {"id": "b", "prompt_ids": [6, 7], "target_ids": [8]},
         ]
         combined = self.run_reference(source, cases)
-        isolated = sum((self.run_reference(source, [case]) for case in cases), [])
+        isolated = [row for case in cases for row in self.run_reference(source, [case])]
         self.assertEqual(len(combined), 3)
-        for actual, expected in zip(combined, isolated):
+        for actual, expected in zip(combined, isolated, strict=True):
             self.assertEqual(actual["context_sha256"], expected["context_sha256"])
             self.assertEqual(
                 [v["token_id"] for v in actual["top3"]], [v["token_id"] for v in expected["top3"]]

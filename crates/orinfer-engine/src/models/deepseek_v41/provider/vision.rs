@@ -195,7 +195,7 @@ impl Runtime {
                 self.vision_cursor = (start + 1) % requests.len();
             }
         }
-        let profiling = std::env::var_os("ORINFER_A2_VISION_PROFILE").is_some();
+        let profiling = crate::models::deepseek_v41::diag().vision_profile;
         let mut timings = profiling.then(Vec::new);
         let mut count = 0;
         let mut wave_wall_s = None;

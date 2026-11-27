@@ -51,11 +51,12 @@ class SpeculationTests(unittest.TestCase):
             role("mtp.layers.1.self_attn.q_proj.weight")
 
         class Source:
-            weight_map = {
-                "mtp.fc_hidden.weight": "x",
-                "model.language_model.norm.weight": "x",
-                "lm_head.weight": "x",
-            }
+            def __init__(self):
+                self.weight_map = {
+                    "mtp.fc_hidden.weight": "x",
+                    "model.language_model.norm.weight": "x",
+                    "lm_head.weight": "x",
+                }
 
             def tensor(self, name):
                 return "x", 0, {"shape": [128, 128], "dtype": "BF16"}

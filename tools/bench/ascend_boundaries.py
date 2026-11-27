@@ -1,5 +1,6 @@
 """Check adjacent prompt lengths using complete native A2 request measurements."""
 
+from itertools import pairwise
 import argparse
 from collections import defaultdict
 import json
@@ -82,7 +83,7 @@ def summarize(inputs, report, maximum_regression=0.10, minimum_samples=5):
             )
         )
     boundaries = []
-    for before, after in zip(points, points[1:]):
+    for before, after in pairwise(points):
         a, b = before["length"], after["length"]
         if b != a + 1:
             continue

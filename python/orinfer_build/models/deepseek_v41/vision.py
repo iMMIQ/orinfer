@@ -410,7 +410,7 @@ def attach(plan, vision, output, workers):
         output / "attach-result.json",
         dict(
             compiled_templates=len(tasks),
-            vision_operators=len(set(op["manifest"] for op in program["body"])),
+            vision_operators=len({op["manifest"] for op in program["body"]}),
             layers=model["layers"],
         ),
     )

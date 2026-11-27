@@ -1016,8 +1016,8 @@ def main():
         output_slots = [
             i for i, operand in enumerate(operands) if operand["access"] in ("write", "read_write")
         ]
-        by_input = dict(zip(input_slots, initial))
-        by_output = dict(zip(output_slots, expected))
+        by_input = dict(zip(input_slots, initial, strict=True))
+        by_output = dict(zip(output_slots, expected, strict=True))
         types = {
             "bf16": torch.bfloat16,
             "f16": torch.float16,
@@ -1077,7 +1077,7 @@ def main():
                         else torch.full_like(inputs[2], -2)
                     )
             expected = reference(kind, inputs, params)
-            for dst, src in zip(device_inputs, inputs):
+            for dst, src in zip(device_inputs, inputs, strict=True):
                 dst.copy_(src)
             for slot in output_slots:
                 if operands[slot]["access"] == "write":
@@ -1089,10 +1089,10 @@ def main():
             saved_inputs = []
             saved_outputs = []
             errors = []
-            for slot, t in zip(input_slots, inputs):
+            for slot, t in zip(input_slots, inputs, strict=True):
                 identity = write_tensor(args.output / f"{kind}-pass{p}-in{slot}.bin", t)
                 saved_inputs.append({"slot": slot, "data": identity})
-            for j, (actual, wanted) in enumerate(zip(device_outputs, expected)):
+            for j, (actual, wanted) in enumerate(zip(device_outputs, expected, strict=True)):
                 atol, rtol = (
                     (0.0, 0.0)
                     if not wanted.is_floating_point() or kind in EXACT_OPS

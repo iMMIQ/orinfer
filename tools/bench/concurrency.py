@@ -5,6 +5,7 @@ UTF-8 decoding can put multiple tokens into a single event. Aggregate throughput
 uses the whole round's wall time and must not be reported as GPU-only decode TPS.
 """
 
+from itertools import pairwise
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -16,6 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import contextlib
 
 
 class RequestError(ValueError):
@@ -108,7 +110,7 @@ def request(
                 finish = choice.get("finish_reason") or finish
     if not done or not usage or not finish:
         raise ValueError("Incomplete stream or missing usage")
-    gaps = [b - a for a, b in zip(arrivals, arrivals[1:])]
+    gaps = [b - a for a, b in pairwise(arrivals)]
     result = dict(
         usage=usage,
         finish_reason=finish,
@@ -144,7 +146,7 @@ def counter_delta(before, after):
         if isinstance(b, dict):
             out[key] = counter_delta(a if isinstance(a, dict) else {}, b)
         elif isinstance(a, (int, float)) and isinstance(b, (int, float)):
-            if key.startswith("peak_") or key.startswith("max_"):
+            if key.startswith(("peak_", "max_")):
                 continue  # Cumulative maxima cannot be subtracted per round.
             if b < a:
                 raise ValueError("Service counters reset during the benchmark")
@@ -198,10 +200,8 @@ def run_round(base_url, cases, count):
 
     def monitor():
         while not stop.is_set():
-            try:
+            with contextlib.suppress(OSError, ValueError):
                 samples.append(dict(health(), observed_at_s=time.perf_counter()))
-            except (OSError, ValueError):
-                pass
             stop.wait(0.1)
 
     thread = threading.Thread(target=monitor, daemon=True)

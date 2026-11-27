@@ -26,7 +26,8 @@ void orinfer_hdiag_ssz_scale(
     int n_threads,
     float *s_out
 ) {
-#pragma omp parallel for num_threads(n_threads) schedule(static)
+    int threads = n_threads > 0 ? n_threads : 1;
+#pragma omp parallel for num_threads(threads) schedule(static)
     for (size_t r = 0; r < n; ++r) {
         const float *row = w + r * k;
         float amax = 0.0f;
@@ -114,7 +115,8 @@ void orinfer_gptq_diag_block(
     int8_t *q_blk,
     float *err_blk
 ) {
-#pragma omp parallel for num_threads(n_threads) schedule(static)
+    int threads = n_threads > 0 ? n_threads : 1;
+#pragma omp parallel for num_threads(threads) schedule(static)
     for (size_t r = 0; r < n; ++r) {
         float *wr = w_blk + r * b;
         int8_t *qr = q_blk + r * b;
@@ -127,7 +129,8 @@ void orinfer_gptq_diag_block(
             float qf = clamp_i4_f(wv * inv_s);
             qr[j] = (int8_t)qf;
             const float *hrow = hinv_b + j * b;
-            float e = (wv - qf * s) / hrow[j];
+            float diag = hrow[j];
+            float e = (fabsf(diag) > 1e-30f) ? ((wv - qf * s) / diag) : 0.0f;
             er[j] = e;
             for (size_t c = j + 1; c < b; ++c) {
                 wr[c] -= e * hrow[c];
@@ -148,7 +151,8 @@ void orinfer_gptq_cd_pass(
     int8_t *q_io,
     float *r_io
 ) {
-#pragma omp parallel for num_threads(n_threads) schedule(static)
+    int threads = n_threads > 0 ? n_threads : 1;
+#pragma omp parallel for num_threads(threads) schedule(static)
     for (size_t row = 0; row < n; ++row) {
         int8_t *q = q_io + row * k;
         float *r = r_io + row * k;
@@ -156,7 +160,9 @@ void orinfer_gptq_cd_pass(
         if (s < 1e-30f) continue;
         float inv_s = 1.0f / s;
         for (size_t pi = 0; pi < k; ++pi) {
-            size_t j = (size_t)perm[pi];
+            int32_t pj = perm[pi];
+            if (pj < 0 || (size_t)pj >= k) continue;
+            size_t j = (size_t)pj;
             float hd = h_diag[j];
             if (hd <= 1e-30f) continue;
             float q_old = (float)q[j];

@@ -50,7 +50,7 @@ from orinfer_build.models.deepseek_v41.quantize_norot import (
     GPTQQuantizer,
     KV_SOURCE_LAYERS,
     SSZQuantizer,
-    pack_w4_nz_bank,
+    save_expert_bank,
 )
 from orinfer_build.weights.safetensors_source import local_header
 
@@ -121,37 +121,14 @@ def _cpu_factor_and_gptq(w_np: np.ndarray, h_np: np.ndarray, damp_frac: float):
     hd_full = (np.diag(h) + damp).astype(np.float32)
     hd_p = np.ascontiguousarray(hd_full[perm], dtype=np.float32)
 
-    n = w_np.shape[0]
-    wp = np.ascontiguousarray(w_np[:, perm], dtype=np.float32)
-    s = np.empty(n, dtype=np.float32)
-    _CPU_GPTQ.hdiag_ssz(wp.ctypes.data, hd_p.ctypes.data, n, k, 1, s.ctypes.data)
-
-    block = 128
-    qp = np.empty((n, k), dtype=np.int8)
-    wp_t = torch.from_numpy(wp)
     hinv_t = torch.from_numpy(hinv_ch)
-    for i1 in range(0, k, block):
-        i2 = min(i1 + block, k)
-        cnt = i2 - i1
-        wb = np.ascontiguousarray(wp[:, i1:i2], dtype=np.float32)
-        hb = np.ascontiguousarray(hinv_ch[i1:i2, i1:i2], dtype=np.float32)
-        qb = np.empty((n, cnt), dtype=np.int8)
-        eb = np.empty((n, cnt), dtype=np.float32)
-        _CPU_GPTQ.diag_block(
-            wb.ctypes.data,
-            hb.ctypes.data,
-            s.ctypes.data,
-            n,
-            cnt,
-            1,
-            qb.ctypes.data,
-            eb.ctypes.data,
-        )
-        qp[:, i1:i2] = qb
-        if i2 < k:
-            wp_t[:, i2:].addmm_(torch.from_numpy(eb), hinv_t[i1:i2, i2:], alpha=-1.0)
 
-    q = np.ascontiguousarray(qp[:, invperm], dtype=np.int8)
+    def _torch_update(wp, eb, i1, i2):
+        torch.from_numpy(wp)[:, i2:].addmm_(torch.from_numpy(eb), hinv_t[i1:i2, i2:], alpha=-1.0)
+
+    q, s = _CPU_GPTQ.blocked_gptq(
+        w_np, hinv_ch, perm, invperm, hd_p, block_size=128, update_fn=_torch_update
+    )
     return q, s, perm, float(damp)
 
 
@@ -402,40 +379,10 @@ def quantize_activation_npu(x, group: int = 32, fp4: bool = False, e4m3_scale: b
 
 
 def sparse_attn_npu(q, kv, sink, indices, softmax_scale):
-    """Exact 64-key online BF16-prob accumulation matching reference.sparse_attn."""
-    import torch
+    """Exact 64-key online BF16-prob accumulation via shared reference.sparse_attn."""
+    from orinfer_build.models.deepseek_v41 import reference as ref_mod
 
-    batches, tokens, heads, dimension = q.shape
-    output = torch.empty_like(q)
-    for batch in range(batches):
-        for first in range(0, tokens, 64):
-            end = min(first + 64, tokens)
-            query = q[batch, first:end].float()
-            maximum = torch.full(
-                (end - first, heads, 1), -1e30, dtype=torch.float32, device=q.device
-            )
-            denominator = torch.zeros_like(maximum)
-            accumulator = torch.zeros(
-                end - first, heads, dimension, dtype=torch.float32, device=q.device
-            )
-            for start in range(0, indices.shape[-1], 64):
-                selected = indices[batch, first:end, start : start + 64].to(
-                    device=q.device, dtype=torch.long
-                )
-                values = kv[batch][selected.clamp_min(0)].float()
-                scores = torch.einsum("shd,skd->shk", query, values) * softmax_scale
-                scores.masked_fill_(selected[:, None, :] < 0, -torch.inf)
-                updated = torch.maximum(maximum, scores.amax(-1, keepdim=True))
-                alpha = (maximum - updated).exp()
-                probabilities = (scores - updated).exp()
-                denominator = denominator * alpha + probabilities.sum(-1, keepdim=True)
-                accumulator = accumulator * alpha + torch.einsum(
-                    "shk,skd->shd", probabilities.bfloat16().float(), values
-                )
-                maximum = updated
-            denominator += (sink[None, :, None] - maximum).exp()
-            output[batch, first:end] = (accumulator / denominator).to(q.dtype)
-    return output
+    return ref_mod.sparse_attn(q, kv, sink, indices, softmax_scale, query_chunk=64)
 
 
 def load_official_module(official_dir: Path):
@@ -695,6 +642,225 @@ def fit_expert_swiglu_sq(mid_probe, w2, ch_max_m, u_unclamped_max):
     return best_s, best_a, gain
 
 
+def _apply_engram_layer(
+    ckpt,
+    read_t,
+    cfg,
+    dev: str,
+    prefix: str,
+    engram_hashes,
+    h_list,
+    l_idx: int,
+    n_loc_seqs: int,
+    seq_len: int,
+    n_cpu_workers: int,
+) -> float:
+    import torch
+
+    te0 = time.monotonic()
+    idx_list = [engram_hashes[b][0, :, l_idx, :].numpy() for b in range(n_loc_seqs)]
+    eng_rows = fast_engram_rows(
+        ckpt, f"{prefix}.engram.embed.weight", idx_list, n_threads=n_cpu_workers
+    )
+    ewkv = read_t(f"{prefix}.engram.wkv.weight", torch.bfloat16)
+    ew_prod = read_t(f"{prefix}.engram.q_weight", torch.float32) * read_t(
+        f"{prefix}.engram.k_weight", torch.float32
+    )
+    for b in range(n_loc_seqs):
+        flat = (
+            torch.from_numpy(eng_rows[b])
+            .view(torch.bfloat16)
+            .to(device=dev)
+            .reshape(1, seq_len, -1)
+        )
+        kv = linear_official(flat, ewkv, quantized=True)
+        key, val = kv.split([cfg.hc_mult * cfg.dim, cfg.dim], dim=-1)
+        key = key.float().unflatten(-1, (cfg.hc_mult, cfg.dim))
+        hb = h_list[b].to(dev).float()
+        rstd = torch.rsqrt(hb.square().mean(-1) + cfg.norm_eps) * torch.rsqrt(
+            key.square().mean(-1) + cfg.norm_eps
+        )
+        dot = (hb * ew_prod * key).sum(-1) * rstd * (cfg.dim**-0.5)
+        mag = dot.abs().clamp_min(1e-6).sqrt()
+        gate = torch.sigmoid(torch.where(dot < 0, -mag, mag))
+        h_list[b] = (hb + gate.unsqueeze(-1) * val.float().unsqueeze(-2)).to(torch.bfloat16).cpu()
+    return time.monotonic() - te0
+
+
+def _load_layer_weights(read_t, prefix: str, *, ratio: int, is_kv_src: bool, is_idx_src: bool):
+    import torch
+
+    ld = {
+        "hc_attn_fn": read_t(f"{prefix}.hc_attn_fn", torch.float32),
+        "hc_attn_scale": read_t(f"{prefix}.hc_attn_scale", torch.float32),
+        "hc_attn_base": read_t(f"{prefix}.hc_attn_base", torch.float32),
+        "hc_ffn_fn": read_t(f"{prefix}.hc_ffn_fn", torch.float32),
+        "hc_ffn_scale": read_t(f"{prefix}.hc_ffn_scale", torch.float32),
+        "hc_ffn_base": read_t(f"{prefix}.hc_ffn_base", torch.float32),
+        "attn_norm": read_t(f"{prefix}.attn_norm.weight", torch.bfloat16),
+        "ffn_norm": read_t(f"{prefix}.ffn_norm.weight", torch.bfloat16),
+        "wq_a": read_t(f"{prefix}.attn.wq_a.weight", torch.bfloat16),
+        "q_norm": read_t(f"{prefix}.attn.q_norm.weight", torch.bfloat16),
+        "wq_b": read_t(f"{prefix}.attn.wq_b.weight", torch.bfloat16),
+        "wkv": read_t(f"{prefix}.attn.wkv.weight", torch.bfloat16),
+        "kv_norm": read_t(f"{prefix}.attn.kv_norm.weight", torch.bfloat16),
+        "attn_sink": read_t(f"{prefix}.attn.attn_sink", torch.float32),
+        "wo_a": read_t(f"{prefix}.attn.wo_a.weight", torch.bfloat16),
+        "wo_b": read_t(f"{prefix}.attn.wo_b.weight", torch.bfloat16),
+        "gate_w": read_t(f"{prefix}.ffn.gate.weight", torch.float32),
+        "gate_b": read_t(f"{prefix}.ffn.gate.bias", torch.float32),
+        "sh_w1": read_t(f"{prefix}.ffn.shared_experts.w1.weight", torch.bfloat16),
+        "sh_w2": read_t(f"{prefix}.ffn.shared_experts.w2.weight", torch.bfloat16),
+        "sh_w3": read_t(f"{prefix}.ffn.shared_experts.w3.weight", torch.bfloat16),
+    }
+    if is_kv_src:
+        ld["comp_norm"] = read_t(f"{prefix}.attn.compressor.norm.weight", torch.bfloat16)
+        ld["comp_wkv"] = read_t(
+            f"{prefix}.attn.compressor.wkv.weight",
+            torch.float32 if ratio > 1 else torch.bfloat16,
+        )
+        if ratio > 1:
+            ld["comp_wgate"] = read_t(f"{prefix}.attn.compressor.wgate.weight", torch.float32)
+        ld["idx_wk"] = read_t(f"{prefix}.attn.indexer.wk.weight", torch.bfloat16)
+        ld["idx_k_norm"] = read_t(f"{prefix}.attn.indexer.k_norm.weight", torch.bfloat16)
+    if is_idx_src:
+        ld["idx_wqb"] = read_t(f"{prefix}.attn.indexer.wq_b.weight", torch.bfloat16)
+        ld["idx_wp"] = read_t(f"{prefix}.attn.indexer.weights_proj.weight", torch.bfloat16)
+    return ld
+
+
+def _fit_and_save_layer_smoothquant(
+    *,
+    sq_dir: Path,
+    sq_path: Path,
+    already_quantized: bool,
+    layer_id: int,
+    prefix: str,
+    dev: str,
+    ld: dict,
+    is_idx_src: bool,
+    is_w8: bool,
+    kv_src_set: set[int],
+    read_t,
+    probe_xa,
+    probe_qr,
+    probe_xf,
+    probe_shm,
+    xa_max_c,
+    qr_max_c,
+    xf_max_c,
+    shm_max_c,
+    shu_max_c,
+):
+    import torch
+
+    sq_dir.mkdir(parents=True, exist_ok=True)
+    if already_quantized and sq_path.exists():
+        return torch.from_numpy(np.load(sq_path)["s_ffn"].astype(np.float32))
+
+    pxa = torch.cat(probe_xa, dim=0).to(dev)
+    pqr = torch.cat(probe_qr, dim=0).to(dev)
+    pxf = torch.cat(probe_xf, dim=0).to(dev)
+    pshm = torch.cat(probe_shm, dim=0).to(dev)
+
+    q_wlist = [ld["wq_b"]] + ([ld["idx_wqb"]] if is_idx_src else [])
+    s_q, a_q, r_q, e_q, g_q = fit_smoothquant_scale(pqr, qr_max_c.to(dev), q_wlist)
+
+    if layer_id in kv_src_set:
+        s_attn, a_attn, r_attn, e_attn, g_attn = torch.ones(5120, device=dev), 0.0, 0.0, 0.0, 0.0
+    else:
+        s_attn, a_attn, r_attn, e_attn, g_attn = fit_smoothquant_scale(
+            pxa, xa_max_c.to(dev), [ld["wkv"], ld["wq_a"]]
+        )
+
+    s_shw, a_shw, r_shw, e_shw, g_shw = fit_shared_swiglu_sq(
+        pshm, shm_max_c.to(dev), shu_max_c.to(dev), ld["sh_w2"]
+    )
+
+    if is_w8:
+        s_ffn, a_ffn, g_ffn = torch.ones(5120, device=dev), 0.0, 0.0
+    else:
+        w4_samps = []
+        for se in (0, 96, 192, 288):
+            w4_samps.append(read_t(f"{prefix}.ffn.experts.{se}.w1.weight", torch.bfloat16))
+            w4_samps.append(read_t(f"{prefix}.ffn.experts.{se}.w3.weight", torch.bfloat16))
+        s_ffn, a_ffn, g_ffn = fit_ffn_w4a8_sq(
+            pxf, xf_max_c.to(dev), w4_samps, [ld["sh_w1"], ld["sh_w3"]]
+        )
+    s_ffn_vec = s_ffn.cpu()
+
+    np.savez(
+        sq_path,
+        s_q=s_q.cpu().numpy().astype(np.float32),
+        s_attn=s_attn.cpu().numpy().astype(np.float32),
+        s_shw=s_shw.cpu().numpy().astype(np.float32),
+        s_ffn=s_ffn_vec.numpy().astype(np.float32),
+        meta=json.dumps(
+            dict(
+                layer=layer_id,
+                q=dict(a=a_q, raw=round(r_q, 6), sq=round(e_q, 6), gain=round(g_q, 1)),
+                attn=dict(
+                    a=a_attn, raw=round(r_attn, 6), sq=round(e_attn, 6), gain=round(g_attn, 1)
+                ),
+                shw=dict(
+                    a=a_shw,
+                    raw=round(r_shw, 6),
+                    sq=round(e_shw, 6),
+                    gain=round(g_shw, 1),
+                    safe_ch=int((shu_max_c <= SWIGLU_SAFE_U_MAX).sum().item()),
+                ),
+                ffn=dict(a=a_ffn, gain=round(g_ffn, 1)),
+            )
+        ),
+    )
+    return s_ffn_vec
+
+
+def _reduce_and_update_hidden(
+    *,
+    y_loc,
+    shared_out_loc,
+    ffn_res_loc,
+    ffn_post_loc,
+    ffn_comb_loc,
+    h_list,
+    rank: int,
+    world_size: int,
+    n_loc_seqs: int,
+    n_loc_tok: int,
+    seq_len: int,
+    dim: int,
+    dev: str,
+):
+    import torch
+    import torch.distributed as dist
+
+    y_loc_cpu = y_loc.cpu()
+    y_routed_mine_t = None
+    for dst in range(world_size):
+        sl = y_loc_cpu[dst * n_loc_tok : (dst + 1) * n_loc_tok].contiguous()
+        dist.reduce(sl, dst=dst, op=dist.ReduceOp.SUM)
+        if dst == rank:
+            y_routed_mine_t = sl
+
+    y_shared_mine = torch.cat(shared_out_loc, dim=0)
+    y_tot_mine = (
+        (y_routed_mine_t + y_shared_mine).to(torch.bfloat16).reshape(n_loc_seqs, seq_len, dim)
+    )
+
+    for b in range(n_loc_seqs):
+        yb = y_tot_mine[b : b + 1].to(dev)
+        res = ffn_res_loc[b].to(dev)
+        h_list[b] = (
+            (
+                ffn_post_loc[b].to(dev).unsqueeze(-1) * yb.unsqueeze(-2)
+                + torch.sum(ffn_comb_loc[b].to(dev).unsqueeze(-1) * res.unsqueeze(-2), dim=2)
+            )
+            .to(torch.bfloat16)
+            .cpu()
+        )
+
+
 def _worker_fn(rank: int, world_size: int, args_dict: dict, shm_names: dict):
     import torch
     import torch.distributed as dist
@@ -836,40 +1002,19 @@ def _worker_fn(rank: int, world_size: int, args_dict: dict, shm_names: dict):
 
                 t_eng = 0.0
                 if layer_id in engram_layout.layer_ids:
-                    te0 = time.monotonic()
-                    l_idx = engram_layout.layer_ids.index(layer_id)
-                    idx_list = [engram_hashes[b][0, :, l_idx, :].numpy() for b in range(n_loc_seqs)]
-                    eng_rows = fast_engram_rows(
-                        ckpt, f"{prefix}.engram.embed.weight", idx_list, n_threads=n_cpu_workers
+                    t_eng = _apply_engram_layer(
+                        ckpt,
+                        read_t,
+                        cfg,
+                        dev,
+                        prefix,
+                        engram_hashes,
+                        h_list,
+                        engram_layout.layer_ids.index(layer_id),
+                        n_loc_seqs,
+                        seq_len,
+                        n_cpu_workers,
                     )
-                    ewkv = read_t(f"{prefix}.engram.wkv.weight", torch.bfloat16)
-                    ew_prod = read_t(f"{prefix}.engram.q_weight", torch.float32) * read_t(
-                        f"{prefix}.engram.k_weight", torch.float32
-                    )
-                    for b in range(n_loc_seqs):
-                        flat = (
-                            torch.from_numpy(eng_rows[b])
-                            .view(torch.bfloat16)
-                            .to(device=dev)
-                            .reshape(1, seq_len, -1)
-                        )
-                        kv = linear_official(flat, ewkv, quantized=True)
-                        key, val = kv.split([cfg.hc_mult * cfg.dim, cfg.dim], dim=-1)
-                        key = key.float().unflatten(-1, (cfg.hc_mult, cfg.dim))
-                        hb = h_list[b].to(dev).float()
-                        rstd = torch.rsqrt(hb.square().mean(-1) + cfg.norm_eps) * torch.rsqrt(
-                            key.square().mean(-1) + cfg.norm_eps
-                        )
-                        dot = (hb * ew_prod * key).sum(-1) * rstd * (cfg.dim**-0.5)
-                        mag = dot.abs().clamp_min(1e-6).sqrt()
-                        gate = torch.sigmoid(torch.where(dot < 0, -mag, mag))
-                        h_list[b] = (
-                            (hb + gate.unsqueeze(-1) * val.float().unsqueeze(-2))
-                            .to(torch.bfloat16)
-                            .cpu()
-                        )
-                    del ewkv, ew_prod, eng_rows
-                    t_eng = time.monotonic() - te0
 
                 ratio = cfg.compress_ratios[layer_id]
                 is_kv_src = layer_id in cfg.kv_source_layers
@@ -877,50 +1022,9 @@ def _worker_fn(rank: int, world_size: int, args_dict: dict, shm_names: dict):
                 is_cand_src = layer_id == cfg.candidate_source_layer
                 uses_cand = 0 <= cfg.candidate_source_layer < layer_id
 
-                ld = {
-                    "hc_attn_fn": read_t(f"{prefix}.hc_attn_fn", torch.float32),
-                    "hc_attn_scale": read_t(f"{prefix}.hc_attn_scale", torch.float32),
-                    "hc_attn_base": read_t(f"{prefix}.hc_attn_base", torch.float32),
-                    "hc_ffn_fn": read_t(f"{prefix}.hc_ffn_fn", torch.float32),
-                    "hc_ffn_scale": read_t(f"{prefix}.hc_ffn_scale", torch.float32),
-                    "hc_ffn_base": read_t(f"{prefix}.hc_ffn_base", torch.float32),
-                    "attn_norm": read_t(f"{prefix}.attn_norm.weight", torch.bfloat16),
-                    "ffn_norm": read_t(f"{prefix}.ffn_norm.weight", torch.bfloat16),
-                    "wq_a": read_t(f"{prefix}.attn.wq_a.weight", torch.bfloat16),
-                    "q_norm": read_t(f"{prefix}.attn.q_norm.weight", torch.bfloat16),
-                    "wq_b": read_t(f"{prefix}.attn.wq_b.weight", torch.bfloat16),
-                    "wkv": read_t(f"{prefix}.attn.wkv.weight", torch.bfloat16),
-                    "kv_norm": read_t(f"{prefix}.attn.kv_norm.weight", torch.bfloat16),
-                    "attn_sink": read_t(f"{prefix}.attn.attn_sink", torch.float32),
-                    "wo_a": read_t(f"{prefix}.attn.wo_a.weight", torch.bfloat16),
-                    "wo_b": read_t(f"{prefix}.attn.wo_b.weight", torch.bfloat16),
-                    "gate_w": read_t(f"{prefix}.ffn.gate.weight", torch.float32),
-                    "gate_b": read_t(f"{prefix}.ffn.gate.bias", torch.float32),
-                    "sh_w1": read_t(f"{prefix}.ffn.shared_experts.w1.weight", torch.bfloat16),
-                    "sh_w2": read_t(f"{prefix}.ffn.shared_experts.w2.weight", torch.bfloat16),
-                    "sh_w3": read_t(f"{prefix}.ffn.shared_experts.w3.weight", torch.bfloat16),
-                }
-                if is_kv_src:
-                    ld["comp_norm"] = read_t(
-                        f"{prefix}.attn.compressor.norm.weight", torch.bfloat16
-                    )
-                    ld["comp_wkv"] = read_t(
-                        f"{prefix}.attn.compressor.wkv.weight",
-                        torch.float32 if ratio > 1 else torch.bfloat16,
-                    )
-                    if ratio > 1:
-                        ld["comp_wgate"] = read_t(
-                            f"{prefix}.attn.compressor.wgate.weight", torch.float32
-                        )
-                    ld["idx_wk"] = read_t(f"{prefix}.attn.indexer.wk.weight", torch.bfloat16)
-                    ld["idx_k_norm"] = read_t(
-                        f"{prefix}.attn.indexer.k_norm.weight", torch.bfloat16
-                    )
-                if is_idx_src:
-                    ld["idx_wqb"] = read_t(f"{prefix}.attn.indexer.wq_b.weight", torch.bfloat16)
-                    ld["idx_wp"] = read_t(
-                        f"{prefix}.attn.indexer.weights_proj.weight", torch.bfloat16
-                    )
+                ld = _load_layer_weights(
+                    read_t, prefix, ratio=ratio, is_kv_src=is_kv_src, is_idx_src=is_idx_src
+                )
 
                 freqs = freqs_comp if ratio else freqs_plain
                 rd = cfg.rope_head_dim
@@ -1154,87 +1258,28 @@ def _worker_fn(rank: int, world_size: int, args_dict: dict, shm_names: dict):
                 already_quantized = marker.exists()
 
                 if rank == 0:
-                    sq_dir.mkdir(parents=True, exist_ok=True)
-                    if already_quantized and sq_path.exists():
-                        s_ffn_vec = torch.from_numpy(np.load(sq_path)["s_ffn"].astype(np.float32))
-                    else:
-                        pxa = torch.cat(probe_xa, dim=0).to(dev)
-                        pqr = torch.cat(probe_qr, dim=0).to(dev)
-                        pxf = torch.cat(probe_xf, dim=0).to(dev)
-                        pshm = torch.cat(probe_shm, dim=0).to(dev)
-
-                        q_wlist = [ld["wq_b"]] + ([ld["idx_wqb"]] if is_idx_src else [])
-                        s_q, a_q, r_q, e_q, g_q = fit_smoothquant_scale(
-                            pqr, qr_max_c.to(dev), q_wlist
-                        )
-
-                        if layer_id in kv_src_set:
-                            s_attn, a_attn, r_attn, e_attn, g_attn = (
-                                torch.ones(5120, device=dev),
-                                0.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                            )
-                        else:
-                            s_attn, a_attn, r_attn, e_attn, g_attn = fit_smoothquant_scale(
-                                pxa, xa_max_c.to(dev), [ld["wkv"], ld["wq_a"]]
-                            )
-
-                        s_shw, a_shw, r_shw, e_shw, g_shw = fit_shared_swiglu_sq(
-                            pshm, shm_max_c.to(dev), shu_max_c.to(dev), ld["sh_w2"]
-                        )
-
-                        if is_w8:
-                            s_ffn, a_ffn, g_ffn = torch.ones(5120, device=dev), 0.0, 0.0
-                        else:
-                            w4_samps = []
-                            for se in (0, 96, 192, 288):
-                                w4_samps.append(
-                                    read_t(f"{prefix}.ffn.experts.{se}.w1.weight", torch.bfloat16)
-                                )
-                                w4_samps.append(
-                                    read_t(f"{prefix}.ffn.experts.{se}.w3.weight", torch.bfloat16)
-                                )
-                            s_ffn, a_ffn, g_ffn = fit_ffn_w4a8_sq(
-                                pxf, xf_max_c.to(dev), w4_samps, [ld["sh_w1"], ld["sh_w3"]]
-                            )
-                            del w4_samps
-                        s_ffn_vec = s_ffn.cpu()
-
-                        np.savez(
-                            sq_path,
-                            s_q=s_q.cpu().numpy().astype(np.float32),
-                            s_attn=s_attn.cpu().numpy().astype(np.float32),
-                            s_shw=s_shw.cpu().numpy().astype(np.float32),
-                            s_ffn=s_ffn_vec.numpy().astype(np.float32),
-                            meta=json.dumps(
-                                dict(
-                                    layer=layer_id,
-                                    q=dict(
-                                        a=a_q,
-                                        raw=round(r_q, 6),
-                                        sq=round(e_q, 6),
-                                        gain=round(g_q, 1),
-                                    ),
-                                    attn=dict(
-                                        a=a_attn,
-                                        raw=round(r_attn, 6),
-                                        sq=round(e_attn, 6),
-                                        gain=round(g_attn, 1),
-                                    ),
-                                    shw=dict(
-                                        a=a_shw,
-                                        raw=round(r_shw, 6),
-                                        sq=round(e_shw, 6),
-                                        gain=round(g_shw, 1),
-                                        safe_ch=int((shu_max_c <= SWIGLU_SAFE_U_MAX).sum().item()),
-                                    ),
-                                    ffn=dict(a=a_ffn, gain=round(g_ffn, 1)),
-                                )
-                            ),
-                        )
-                        del pxa, pqr, pxf, pshm
+                    s_ffn_vec = _fit_and_save_layer_smoothquant(
+                        sq_dir=sq_dir,
+                        sq_path=sq_path,
+                        already_quantized=already_quantized,
+                        layer_id=layer_id,
+                        prefix=prefix,
+                        dev=dev,
+                        ld=ld,
+                        is_idx_src=is_idx_src,
+                        is_w8=is_w8,
+                        kv_src_set=kv_src_set,
+                        read_t=read_t,
+                        probe_xa=probe_xa,
+                        probe_qr=probe_qr,
+                        probe_xf=probe_xf,
+                        probe_shm=probe_shm,
+                        xa_max_c=xa_max_c,
+                        qr_max_c=qr_max_c,
+                        xf_max_c=xf_max_c,
+                        shm_max_c=shm_max_c,
+                        shu_max_c=shu_max_c,
+                    )
 
                 dist.broadcast(s_ffn_vec, src=0)
                 s_ffn_np = s_ffn_vec.numpy().astype(np.float32)
@@ -1506,21 +1551,7 @@ def _worker_fn(rank: int, world_size: int, args_dict: dict, shm_names: dict):
                         dn_qs[local_e], dn_ss[local_e], nmse_dn_list[local_e] = q_d, s_d, nm_d
 
                 if not already_quantized:
-                    dest.mkdir(parents=True, exist_ok=True)
-                    if is_w8:
-                        np.save(dest / "up_w8.npy", np.stack(up_qs, axis=0))
-                        np.save(dest / "up_scale_bf16.npy", np.stack(up_ss, axis=0))
-                        np.save(dest / "down_w8.npy", np.stack(dn_qs, axis=0))
-                        np.save(dest / "down_scale_bf16.npy", np.stack(dn_ss, axis=0))
-                    else:
-                        nz, sc, ast = pack_w4_nz_bank(up_qs, up_ss)
-                        np.save(dest / "up_nz.npy", nz)
-                        np.save(dest / "up_scale.npy", sc)
-                        np.save(dest / "up_assist.npy", ast)
-                        nz, sc, ast = pack_w4_nz_bank(dn_qs, dn_ss)
-                        np.save(dest / "down_nz.npy", nz)
-                        np.save(dest / "down_scale.npy", sc)
-                        np.save(dest / "down_assist.npy", ast)
+                    save_expert_bank(dest, up_qs, up_ss, dn_qs, dn_ss, up_w8=is_w8, dn_w8=is_w8)
                     rec = dict(
                         layer=layer_id,
                         rank=rank,
@@ -1533,37 +1564,22 @@ def _worker_fn(rank: int, world_size: int, args_dict: dict, shm_names: dict):
                 else:
                     rec = json.loads(marker.read_text())
 
-                y_loc_cpu = y_loc.cpu()
-                del y_loc
-                y_routed_mine_t = None
-                for dst in range(world_size):
-                    sl = y_loc_cpu[dst * n_loc_tok : (dst + 1) * n_loc_tok].contiguous()
-                    dist.reduce(sl, dst=dst, op=dist.ReduceOp.SUM)
-                    if dst == rank:
-                        y_routed_mine_t = sl
-                del y_loc_cpu
-
-                y_shared_mine = torch.cat(shared_out_loc, dim=0)
-                y_tot_mine = (
-                    (y_routed_mine_t + y_shared_mine)
-                    .to(torch.bfloat16)
-                    .reshape(n_loc_seqs, seq_len, cfg.dim)
+                _reduce_and_update_hidden(
+                    y_loc=y_loc,
+                    shared_out_loc=shared_out_loc,
+                    ffn_res_loc=ffn_res_loc,
+                    ffn_post_loc=ffn_post_loc,
+                    ffn_comb_loc=ffn_comb_loc,
+                    h_list=h_list,
+                    rank=rank,
+                    world_size=world_size,
+                    n_loc_seqs=n_loc_seqs,
+                    n_loc_tok=n_loc_tok,
+                    seq_len=seq_len,
+                    dim=cfg.dim,
+                    dev=dev,
                 )
-                del y_routed_mine_t, y_shared_mine
-
-                for b in range(n_loc_seqs):
-                    yb = y_tot_mine[b : b + 1].to(dev)
-                    res = ffn_res_loc[b].to(dev)
-                    h_list[b] = (
-                        (
-                            ffn_post_loc[b].to(dev).unsqueeze(-1) * yb.unsqueeze(-2)
-                            + torch.sum(
-                                ffn_comb_loc[b].to(dev).unsqueeze(-1) * res.unsqueeze(-2), dim=2
-                            )
-                        )
-                        .to(torch.bfloat16)
-                        .cpu()
-                    )
+                del y_loc
 
                 dist.barrier()
                 if rank == 0:
@@ -1638,7 +1654,7 @@ def main():
             try:
                 s.close()
                 s.unlink()
-            except Exception:
+            except (FileNotFoundError, OSError):
                 pass
         shutil.rmtree(out_dir / "ipc", ignore_errors=True)
 

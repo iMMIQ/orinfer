@@ -453,7 +453,7 @@ impl Team {
             .map(|p| (p.batch_decode, p.min_rows, p.max_rows.unwrap_or(p.rows)))
             .collect();
         let ranks = std::mem::take(&mut model.ranks);
-        let snapshots = std::env::var_os("ORINFER_A2_BATCH_TRACE").is_some();
+        let snapshots = super::diag().batch_trace.is_some();
         let cpus = affinity::from_env(ranks.len())?;
         let host_cpus = affinity::host_cpus(cpus.as_deref())?;
         affinity::configure_host_pool(host_cpus.as_deref());
@@ -1234,7 +1234,7 @@ impl Team {
             }
         }
         if let Some(reason) = skipped {
-            if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+            if super::diag().batch_profile {
                 eprintln!("A2 offload skipped for snapshot {id}: {reason}");
             }
             return Ok(false);
@@ -1428,7 +1428,7 @@ impl Team {
     /// shapes) before `/health` reports ready, removing cold ACLNN/TileLang
     /// initialization and on-path capture pauses from the serving window.
     pub fn prewarm_graphs(&self) -> Result<()> {
-        if !self.graphs_enabled || std::env::var_os("ORINFER_A2_NO_PREWARM").is_some() {
+        if !self.graphs_enabled || super::diag().no_prewarm {
             return Ok(());
         }
         let Some(contract) = self.model.batch.as_ref() else {
@@ -1814,7 +1814,7 @@ impl Team {
         let readout = readout.into();
         let replicated = layout.role == super::PacketRole::Draft;
         let sampled = !readout.draws.is_empty();
-        let readout_rejection_empty = readout.rejection.is_empty();
+        let has_rejection = !readout.rejection.is_empty();
         let parameters = Arc::clone(&readout.parameters);
         let first_input = readout.first_input.clone();
         self.peers
@@ -1824,20 +1824,22 @@ impl Team {
         self.sync_resident_graphs();
         collect_forward_outputs(
             results,
-            replicated,
-            false,
-            sampled,
-            readout_rejection_empty,
-            parameters,
-            first_input,
-            started,
-            0.,
-            true,
-            false,
-            false,
-            false,
-            0.,
-            0.,
+            ForwardOutcome {
+                replicated,
+                shared_mode: false,
+                sampled,
+                has_rejection,
+                parameters,
+                first_input,
+                started,
+                prepare_s: 0.,
+                capture: true,
+                any_captured: false,
+                invalidate: false,
+                partial_trunk_graph: false,
+                shared_setup: 0.,
+                setup: 0.,
+            },
         )
     }
     pub fn fast_verify_forward(
@@ -1850,7 +1852,7 @@ impl Team {
         let started = Instant::now();
         let readout = readout.into();
         let sampled = !readout.draws.is_empty();
-        let readout_rejection_empty = readout.rejection.is_empty();
+        let has_rejection = !readout.rejection.is_empty();
         let parameters = Arc::clone(&readout.parameters);
         let first_input = readout.first_input.clone();
         self.peers
@@ -1859,20 +1861,22 @@ impl Team {
         self.sync_resident_graphs();
         collect_forward_outputs(
             results,
-            false,
-            false,
-            sampled,
-            readout_rejection_empty,
-            parameters,
-            first_input,
-            started,
-            0.,
-            true,
-            false,
-            false,
-            false,
-            0.,
-            0.,
+            ForwardOutcome {
+                replicated: false,
+                shared_mode: false,
+                sampled,
+                has_rejection,
+                parameters,
+                first_input,
+                started,
+                prepare_s: 0.,
+                capture: true,
+                any_captured: false,
+                invalidate: false,
+                partial_trunk_graph: false,
+                shared_setup: 0.,
+                setup: 0.,
+            },
         )
     }
     pub fn begin_forward(&self, layout: &Layout) -> Result<PreparedForward> {
@@ -1989,11 +1993,13 @@ impl Team {
         let key = self.resident_key(&layout);
         let (outputs, timing) = finish_forward(
             &self.peers,
-            prepared,
-            layout,
-            tokens,
-            readout.into(),
-            budget,
+            ForwardDispatch {
+                prepared,
+                layout,
+                tokens,
+                readout: readout.into(),
+                budget,
+            },
             maintenance,
             self.graphs_enabled,
         )?;
@@ -2271,7 +2277,7 @@ fn try_combine_allocations_with(
         Reply::SaveSkipped(reason) => Some(reason.as_str()),
         _ => None,
     }) {
-        if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+        if super::diag().batch_profile {
             eprintln!("A2 prefix save skipped for snapshot {snapshot}: {reason}");
         }
         peers.exchange(Command::RollbackSave { owner, snapshot })?;
@@ -2375,6 +2381,47 @@ fn part_action(plan: &preparation::Plan) -> PartAction {
     }
 }
 
+struct ForwardDispatch {
+    prepared: PreparedForward,
+    layout: Layout,
+    tokens: Vec<Vec<u32>>,
+    readout: Readout,
+    budget: Option<CaptureBudget>,
+}
+
+struct PlannedSplit {
+    split_packet: bool,
+    trunk_plan: preparation::Plan,
+    tail_plan: Option<preparation::Plan>,
+    head_plan: Option<preparation::Plan>,
+    split_plan: SplitPlan,
+    invalidate: bool,
+    capture: bool,
+    any_captured: bool,
+    cached_prepare: bool,
+}
+
+struct ForwardOutcome {
+    replicated: bool,
+    shared_mode: bool,
+    sampled: bool,
+    has_rejection: bool,
+    parameters: Arc<
+        crate::sampling::Prepared<
+            BTreeMap<usize, Vec<crate::backend::ascend::sampling::Parameters>>,
+        >,
+    >,
+    first_input: Option<Arc<super::host_inputs::First>>,
+    started: Instant,
+    prepare_s: f64,
+    capture: bool,
+    any_captured: bool,
+    invalidate: bool,
+    partial_trunk_graph: bool,
+    shared_setup: f64,
+    setup: f64,
+}
+
 fn forward_with(
     peers: &Transport,
     layout: Layout,
@@ -2387,31 +2434,24 @@ fn forward_with(
     let prepared = begin_forward(peers, &layout)?;
     finish_forward(
         peers,
-        prepared,
-        layout,
-        tokens,
-        readout,
-        budget,
+        ForwardDispatch {
+            prepared,
+            layout,
+            tokens,
+            readout,
+            budget,
+        },
         maintenance,
         graphs_enabled,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finish_forward(
-    peers: &Transport,
-    prepared: PreparedForward,
-    layout: Layout,
-    tokens: Vec<Vec<u32>>,
-    readout: Readout,
-    mut budget: Option<CaptureBudget>,
-    maintenance: impl FnOnce(),
+fn plan_split_execution(
+    layout: &Layout,
+    states: &[SplitStates],
+    budget: Option<CaptureBudget>,
     graphs_enabled: bool,
-) -> Result<(Vec<Output>, Timing)> {
-    let mut maintenance = Some(maintenance);
-    let PreparedForward {
-        started, states, ..
-    } = prepared;
+) -> Result<PlannedSplit> {
     let repeated = layout.decode
         || layout.bucketed
         || layout.role == super::PacketRole::Draft
@@ -2420,9 +2460,6 @@ fn finish_forward(
                 .decoder_roles
                 .iter()
                 .all(|r| *r == super::replay::Role::Continue);
-    if let Some(budget) = &mut budget {
-        budget.slack_s -= started.elapsed().as_secs_f64();
-    }
     let trunk_states: Vec<CacheState> = states.iter().map(|s| s.trunk).collect();
     let has_tail = states.first().is_some_and(|s| s.tail.is_some());
     let has_head = states.first().is_some_and(|s| s.head.is_some());
@@ -2501,7 +2538,10 @@ fn finish_forward(
                     > b.slack_s
         });
     let tail_plan = if has_tail {
-        let tail_states: Vec<CacheState> = states.iter().map(|s| s.tail.unwrap()).collect();
+        let tail_states: Vec<CacheState> = states
+            .iter()
+            .map(|s| s.tail.ok_or("Missing tail cache state"))
+            .collect::<std::result::Result<_, _>>()?;
         let tail_scale = if trunk_plan.mode == preparation::Mode::Replay {
             0.45
         } else {
@@ -2517,7 +2557,10 @@ fn finish_forward(
         None
     };
     let head_plan = if has_head {
-        let head_states: Vec<CacheState> = states.iter().map(|s| s.head.unwrap()).collect();
+        let head_states: Vec<CacheState> = states
+            .iter()
+            .map(|s| s.head.ok_or("Missing head cache state"))
+            .collect::<std::result::Result<_, _>>()?;
         let head_scale = if trunk_plan.mode == preparation::Mode::Replay
             && tail_plan
                 .as_ref()
@@ -2557,6 +2600,51 @@ fn finish_forward(
             .as_ref()
             .is_some_and(|p| p.mode == preparation::Mode::CaptureReplay);
     let cached_prepare = !invalidate && !split_plan.any_prepare();
+    Ok(PlannedSplit {
+        split_packet,
+        trunk_plan,
+        tail_plan,
+        head_plan,
+        split_plan,
+        invalidate,
+        capture,
+        any_captured,
+        cached_prepare,
+    })
+}
+
+fn finish_forward(
+    peers: &Transport,
+    dispatch: ForwardDispatch,
+    maintenance: impl FnOnce(),
+    graphs_enabled: bool,
+) -> Result<(Vec<Output>, Timing)> {
+    let ForwardDispatch {
+        prepared,
+        layout,
+        tokens,
+        readout,
+        mut budget,
+    } = dispatch;
+    let mut maintenance = Some(maintenance);
+    let PreparedForward {
+        started, states, ..
+    } = prepared;
+    if let Some(budget) = &mut budget {
+        budget.slack_s -= started.elapsed().as_secs_f64();
+    }
+    let planned = plan_split_execution(&layout, &states, budget, graphs_enabled)?;
+    let PlannedSplit {
+        split_packet,
+        trunk_plan,
+        tail_plan,
+        head_plan,
+        split_plan,
+        invalidate,
+        capture,
+        any_captured,
+        cached_prepare,
+    } = planned;
     if budget.is_some_and(|b| b.trace) {
         super::log_async(format!(
             "A2_EXECUTION_PLAN {}",
@@ -2620,17 +2708,14 @@ fn finish_forward(
     let replicated = layout.role == super::PacketRole::Draft;
     let shared_mode = !shared.is_empty();
     let partial_trunk_graph = split_packet && trunk_plan.capture() && !capture;
-    if shared_mode
-        && (budget.is_some_and(|b| b.trace)
-            || std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some())
-    {
+    if shared_mode && (budget.is_some_and(|b| b.trace) || super::diag().batch_profile) {
         super::log_async(format!(
             "A2_SHARED_PLAN {}",
             serde_json::json!({"rows":layout.rows.total,"pieces":shared.len(),"setup_s":shared_setup})
         ));
     }
     let sampled = !readout.draws.is_empty();
-    let readout_rejection_empty = readout.rejection.is_empty();
+    let has_rejection = !readout.rejection.is_empty();
     let parameters = Arc::clone(&readout.parameters);
     let first_input = readout.first_input.clone();
     let command = Command::Forward(layout, tokens, readout, shared);
@@ -2641,10 +2726,38 @@ fn finish_forward(
     let results = peers.collect()?;
     collect_forward_outputs(
         results,
+        ForwardOutcome {
+            replicated,
+            shared_mode,
+            sampled,
+            has_rejection,
+            parameters,
+            first_input,
+            started,
+            prepare_s,
+            capture,
+            any_captured,
+            invalidate,
+            partial_trunk_graph,
+            shared_setup,
+            setup: if cached_prepare {
+                shared_setup
+            } else {
+                prepare_s
+            },
+        },
+    )
+}
+
+fn collect_forward_outputs(
+    results: Vec<Reply>,
+    outcome: ForwardOutcome,
+) -> Result<(Vec<Output>, Timing)> {
+    let ForwardOutcome {
         replicated,
         shared_mode,
         sampled,
-        readout_rejection_empty,
+        has_rejection,
         parameters,
         first_input,
         started,
@@ -2654,37 +2767,9 @@ fn finish_forward(
         invalidate,
         partial_trunk_graph,
         shared_setup,
-        if cached_prepare {
-            shared_setup
-        } else {
-            prepare_s
-        },
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_forward_outputs(
-    results: Vec<Reply>,
-    replicated: bool,
-    shared_mode: bool,
-    sampled: bool,
-    readout_rejection_empty: bool,
-    parameters: Arc<
-        crate::sampling::Prepared<
-            BTreeMap<usize, Vec<crate::backend::ascend::sampling::Parameters>>,
-        >,
-    >,
-    first_input: Option<Arc<super::host_inputs::First>>,
-    started: Instant,
-    prepare_s: f64,
-    capture: bool,
-    any_captured: bool,
-    invalidate: bool,
-    partial_trunk_graph: bool,
-    shared_setup: f64,
-    setup: f64,
-) -> Result<(Vec<Output>, Timing)> {
-    if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some()
+        setup,
+    } = outcome;
+    if super::diag().batch_profile
         && let Some(first) = first_input
         && first.prepared.seconds() > 0.
         && let Ok(data) = first.prepared.get()
@@ -2769,7 +2854,7 @@ fn collect_forward_outputs(
         }
         if sampled && !output.value.is_finite() {
             output.error = Some("Grammar permits no tokens".into());
-        } else if !readout_rejection_empty && output.value == f32::MIN {
+        } else if has_rejection && output.value == f32::MIN {
             output.error = Some("Rejected proposal has no residual mass".into());
         }
         output.summary = None;

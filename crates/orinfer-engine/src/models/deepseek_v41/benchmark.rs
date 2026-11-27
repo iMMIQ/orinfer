@@ -263,7 +263,7 @@ pub fn run(
                 tensor_parallel: 8,
                 capacity: model.capacity,
                 load_s,
-                logits_dump: std::env::var_os("ORINFER_A2_LOGITS_DIR").is_some(),
+                logits_dump: super::diag().logits_dir.is_some(),
                 worker_cpus,
                 requests,
                 preparations,

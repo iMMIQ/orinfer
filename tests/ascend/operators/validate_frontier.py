@@ -360,7 +360,7 @@ def main():
                     if raw_token < 0 or raw_token in layout["barriers"]:
                         break
                     window[shift] = layout["token_map"][raw_token]
-                for layer_index, layer in enumerate(layout["layers"]):
+                for layer_index, _layer in enumerate(layout["layers"]):
                     rolling = (window[0] * int(multipliers_cpu[layer_index, 0])) & ((1 << 64) - 1)
                     for order in range(1, 4):
                         rolling ^= (window[order] * int(multipliers_cpu[layer_index, order])) & (

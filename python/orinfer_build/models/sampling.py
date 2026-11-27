@@ -229,7 +229,7 @@ def main():
 
         engine = os.environ.get("ORINFER_ENGINE", str(ROOT / "target/release/orinfer"))
         completed = subprocess.run(
-            [engine, "plan-model", str(staging)], capture_output=True, text=True
+            [engine, "plan-model", str(staging)], capture_output=True, text=True, check=False
         )
         if completed.returncode:
             raise ValueError("Native sampling plan validation failed: " + completed.stderr.strip())

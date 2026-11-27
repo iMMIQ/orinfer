@@ -166,7 +166,7 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             curves: BTreeMap::new(),
-            trace: std::env::var_os("ORINFER_A2_DSPARK_POLICY_TRACE").is_some(),
+            trace: crate::models::deepseek_v41::diag().dspark_policy_trace,
             costs: Model::default(),
             ledger: adaptive::Budget::default(),
             pending: None,

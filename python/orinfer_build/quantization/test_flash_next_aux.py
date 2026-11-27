@@ -47,7 +47,7 @@ class AuxiliaryQuantizationTests(unittest.TestCase):
         self.assertEqual(sorted(source.seen), [0, 1])
         self.assertEqual(
             [raw for _, (raw, _) in prefetch(Reader(), queue)],
-            list(map(lambda i: bytes([i]), range(5))),
+            [bytes([i]) for i in range(5)],
         )
         for workers in (0, 3, True):
             with self.assertRaises(ValueError):
@@ -84,7 +84,7 @@ class AuxiliaryQuantizationTests(unittest.TestCase):
             shapes = [(3,), (2, 128), (2, 160)]
             header = {}
             payload = bytearray()
-            for name, shape in zip(names, shapes):
+            for name, shape in zip(names, shapes, strict=True):
                 value = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) / 64 - 0.5
                 raw = (value.view(np.uint32) >> 16).astype("<u2").tobytes()
                 first = len(payload)
@@ -99,9 +99,7 @@ class AuxiliaryQuantizationTests(unittest.TestCase):
                 struct.pack("<Q", len(encoded)) + encoded + payload
             )
             index = root / "index.json"
-            index.write_text(
-                json.dumps({"weight_map": {name: "source.safetensors" for name in names}})
-            )
+            index.write_text(json.dumps({"weight_map": dict.fromkeys(names, "source.safetensors")}))
             source = Source(index, directory=root)
             for name in names:
                 source.tensor(name)

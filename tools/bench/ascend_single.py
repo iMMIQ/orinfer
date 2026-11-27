@@ -135,9 +135,9 @@ def main():
             with request_json(args.base_url + "/models", timeout=5) as response:
                 json.load(response)
             break
-        except (OSError, urllib.error.URLError):
+        except (OSError, urllib.error.URLError) as error:
             if time.monotonic() >= deadline:
-                raise TimeoutError("vLLM readiness timeout")
+                raise TimeoutError("vLLM readiness timeout") from error
             time.sleep(5)
     inputs = json.loads(args.inputs.read_text())["cases"]
     results = []

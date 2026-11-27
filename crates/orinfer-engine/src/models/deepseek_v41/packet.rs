@@ -7,6 +7,13 @@ use safetensors::Dtype;
 use serde::Deserialize;
 use std::{fs, path::Path, rc::Rc, sync::Arc, time::Instant};
 
+struct LookupTarget<'a> {
+    layer: usize,
+    values: &'a Buffer,
+    scales: &'a Buffer,
+    mask: &'a Buffer,
+}
+
 pub(super) struct Inputs<'a> {
     pub tokens: &'a [u32],
     pub hashes: &'a [i64],
@@ -328,9 +335,10 @@ impl Worker {
         self.hasher
             .hash_into(history, tokens, &mut hashes, &mut valid)?;
         let hash = t.elapsed().as_secs_f64();
+        let diag = super::diag();
         let batched = trace.is_none()
-            && std::env::var_os("ORINFER_A2_SYNC_PROFILE").is_none()
-            && std::env::var_os("ORINFER_A2_STEP_FENCES").is_none()
+            && !diag.sync_profile
+            && !diag.step_fences
             && !execution
                 .body_steps()
                 .chain(execution.head_steps())
@@ -370,7 +378,7 @@ impl Worker {
         let download = t.elapsed().as_secs_f64();
         let value = f32::from_le_bytes(raw_value.try_into().unwrap());
         let local = i32::from_le_bytes(raw_index.try_into().unwrap());
-        if let Some(directory) = std::env::var_os("ORINFER_A2_LOGITS_DIR") {
+        if let Some(directory) = &super::diag().logits_dir {
             let name = execution
                 .packet
                 .logits
@@ -380,7 +388,6 @@ impl Worker {
             if buffer.bytes() != 16160 * 4 {
                 return Err("Diagnostic logits must contain one FP32 vocabulary shard".into());
             }
-            let directory = Path::new(&directory);
             fs::create_dir_all(directory).map_err(|e| e.to_string())?;
             let values = self.session.download(&buffer, 0, buffer.bytes())?;
             fs::write(
@@ -583,13 +590,15 @@ impl Worker {
                                 mask,
                             } => {
                                 self.upload_lookup(
-                                    *layer,
+                                    LookupTarget {
+                                        layer: *layer,
+                                        values,
+                                        scales,
+                                        mask,
+                                    },
                                     tokens.len(),
                                     hashes,
                                     valid,
-                                    values,
-                                    scales,
-                                    mask,
                                     first,
                                 )?;
                                 lookup_cursor += 1;
@@ -610,20 +619,14 @@ impl Worker {
             )
         }
     }
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn trace_packet(
         &mut self,
         execution: &Execution,
-        tokens: &[u32],
-        hashes: &[i64],
-        valid: &[bool],
+        inputs: Inputs<'_>,
         head: bool,
         path: &Path,
-        visual_rows: &[super::vision::Overlay],
     ) -> Result<()> {
-        let trace = (self.rank == 0
-            || std::env::var_os("ORINFER_A2_BATCH_TRACE_ALL_RANKS").is_some())
-        .then_some(path);
+        let trace = (self.rank == 0 || super::diag().batch_trace_all_ranks).then_some(path);
         for step in execution
             .body_steps()
             .chain(if head { execution.head_steps() } else { &[] })
@@ -635,13 +638,13 @@ impl Worker {
                 columns,
             } = step
             {
-                let mut data = self.embedding(tensor, tokens, *first_column, *columns)?;
-                for overlay in visual_rows {
+                let mut data = self.embedding(tensor, inputs.tokens, *first_column, *columns)?;
+                for overlay in inputs.visual_rows {
                     overlay.apply(*first_column, *columns, &mut data)?;
                 }
                 upload(&self.session, &destination.slice(0, data.len())?, &data)?;
             } else {
-                self.step(step, tokens, hashes, valid, 0, trace)?;
+                self.step(step, inputs.tokens, inputs.hashes, inputs.valid, 0, trace)?;
             }
         }
         self.session.synchronize()
@@ -698,7 +701,7 @@ impl Worker {
     ) -> Result<()> {
         // Synchronized profiling isolates device execution per step type by
         // fencing after every submission; it changes timing, not values.
-        if std::env::var_os("ORINFER_A2_SYNC_PROFILE").is_some() {
+        if super::diag().sync_profile {
             let t = Instant::now();
             let submission = match step {
                 Step::Graph(program) => program.enqueue(&self.session).map(|_| ()),
@@ -861,8 +864,17 @@ impl Worker {
                 scales,
                 mask,
             } => {
-                let inputs =
-                    self.lookup_inputs(*layer, tokens.len(), hashes, valid, values, scales, mask)?;
+                let inputs = self.lookup_inputs(
+                    LookupTarget {
+                        layer: *layer,
+                        values,
+                        scales,
+                        mask,
+                    },
+                    tokens.len(),
+                    hashes,
+                    valid,
+                )?;
                 self.session.upload_inputs(&inputs)?;
             }
             Step::Snapshot { name, buffer } => {
@@ -932,18 +944,20 @@ impl Worker {
         }
         Ok(ids)
     }
-    #[allow(clippy::too_many_arguments)]
     fn upload_lookup(
         &self,
-        layer: usize,
+        target: LookupTarget<'_>,
         rows: usize,
         hashes: &[i64],
         valid: &[bool],
-        values: &Buffer,
-        scales: &Buffer,
-        mask: &Buffer,
         first: Option<&super::host_inputs::First>,
     ) -> Result<Ticket> {
+        let LookupTarget {
+            layer,
+            values,
+            scales,
+            mask,
+        } = target;
         if let Some(first) = first.filter(|f| f.handles_layer(layer)) {
             let table = self.tables.get(&layer).ok_or("Engram table missing")?;
             let data = first.get(
@@ -970,17 +984,19 @@ impl Worker {
         ];
         self.session.upload_regions(&regions)
     }
-    #[allow(clippy::too_many_arguments)]
     fn lookup_inputs(
         &self,
-        layer: usize,
+        target: LookupTarget<'_>,
         rows: usize,
         hashes: &[i64],
         valid: &[bool],
-        values: &Buffer,
-        scales: &Buffer,
-        mask: &Buffer,
     ) -> Result<Vec<(Buffer, Vec<u8>)>> {
+        let LookupTarget {
+            layer,
+            values,
+            scales,
+            mask,
+        } = target;
         let ids = self.lookup_ids(layer, rows, hashes, valid)?;
         let table = self.tables.get(&layer).ok_or("Engram table missing")?;
         let planes = table.gather_split(&ids, rows * 24 * 288)?;

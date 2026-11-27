@@ -6,12 +6,15 @@ import unittest
 
 import numpy as np
 
+from orinfer_build.common.native_c import load_shared_c
 from orinfer_build.models.deepseek_v41.quantize_norot import (
     GPTQQuantizer,
+    NoRotRelease,
     SSZQuantizer,
     pack_w4_nz_bank,
     quantize_exact_w8,
     quantize_per_channel_i8_f32,
+    save_expert_bank,
     to_bf16_u16,
 )
 from orinfer_build.models.deepseek_v41.weight_layout import restore_nd
@@ -171,6 +174,103 @@ class NoRotQuantizationTests(unittest.TestCase):
         self.assertEqual(q.dtype, np.int8)
         self.assertEqual(s.shape, (2, 1))
         np.testing.assert_allclose(q.astype(np.float32) * s, w, atol=1e-2)
+
+    def test_gptq_c11_guards_degenerate_diag_invalid_perm_and_zero_threads(self):
+        rng = np.random.default_rng(20261002)
+        n, k = 8, 16
+        w = rng.standard_normal((n, k)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            gptq = GPTQQuantizer(Path(tmp), n_threads=0)
+            self.assertEqual(gptq.n_threads, 1)
+
+            # Degenerate zero diagonal in hinv_b must stay finite (no NaN/Inf propagation)
+            wb = np.ascontiguousarray(w.copy(), dtype=np.float32)
+            hb = np.zeros((k, k), dtype=np.float32)
+            scales = np.full(n, 0.25, dtype=np.float32)
+            qb = np.empty((n, k), dtype=np.int8)
+            eb = np.empty((n, k), dtype=np.float32)
+            gptq.diag_block(
+                wb.ctypes.data,
+                hb.ctypes.data,
+                scales.ctypes.data,
+                n,
+                k,
+                0,
+                qb.ctypes.data,
+                eb.ctypes.data,
+            )
+            self.assertTrue(np.isfinite(eb).all())
+            self.assertTrue(np.all((qb >= -8) & (qb <= 7)))
+
+            # Out-of-range perm entries in cd_pass must be skipped safely
+            h_mat = np.eye(k, dtype=np.float32)
+            h_diag = np.ones(k, dtype=np.float32)
+            bad_perm = np.array([-1, k, k + 99] + list(range(k - 3)), dtype=np.int32)
+            q_io = np.zeros((n, k), dtype=np.int8)
+            r_io = np.ones((n, k), dtype=np.float32)
+            gptq.cd_pass(
+                h_mat.ctypes.data,
+                h_diag.ctypes.data,
+                bad_perm.ctypes.data,
+                scales.ctypes.data,
+                n,
+                k,
+                0,
+                q_io.ctypes.data,
+                r_io.ctypes.data,
+            )
+            self.assertTrue(np.isfinite(r_io).all())
+
+            # Shared native C loader caches compiled .so on disk by content hash
+            src = Path(__file__).with_name("ssz_w4.c")
+            load_shared_c(src, Path(tmp), prefix="ssz_test", openmp=True, math_lib=True)
+            so_files = list(Path(tmp).glob("ssz_test-*.so"))
+            self.assertEqual(len(so_files), 1)
+            load_shared_c(src, Path(tmp), prefix="ssz_test", openmp=True, math_lib=True)
+            self.assertEqual(len(list(Path(tmp).glob("ssz_test-*.so"))), 1)
+
+    def test_save_expert_bank_and_smoothquant_loader(self):
+        rng = np.random.default_rng(20261002)
+        up_qs = [rng.integers(-8, 8, size=(32, 128), dtype=np.int8) for _ in range(2)]
+        up_ss = [rng.uniform(0.01, 0.2, size=(32,)).astype(np.float32) for _ in range(2)]
+        dn_qs = [rng.integers(-127, 128, size=(128, 32), dtype=np.int8) for _ in range(2)]
+        dn_ss = [rng.integers(1, 1000, size=(32,), dtype=np.uint16) for _ in range(2)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "bank"
+            save_expert_bank(dest, up_qs, up_ss, dn_qs, dn_ss, up_w8=False, dn_w8=True)
+            self.assertTrue((dest / "up_nz.npy").exists())
+            self.assertTrue((dest / "up_scale.npy").exists())
+            self.assertTrue((dest / "up_assist.npy").exists())
+            self.assertTrue((dest / "down_w8.npy").exists())
+            self.assertTrue((dest / "down_scale_bf16.npy").exists())
+
+            rel = NoRotRelease.__new__(NoRotRelease)
+            rel.smoothquant_dir = None
+            rel.bf16_qkv_layers = []
+            rel.w8_layers = []
+            s_q, s_attn, s_shw, s_ffn = rel._load_layer_smoothquant(0)
+            self.assertEqual(
+                (s_q.shape, s_attn.shape, s_shw.shape, s_ffn.shape),
+                ((1280,), (5120,), (2304,), (5120,)),
+            )
+            self.assertTrue(np.all(s_q == 1.0))
+
+            sq_dir = Path(tmp) / "sq"
+            sq_dir.mkdir()
+            np.savez(
+                sq_dir / "L03.npz",
+                s_q=np.full(1280, 1.5, dtype=np.float32),
+                s_attn=np.full(5120, 2.0, dtype=np.float32),
+                s_shw=np.full(2304, 1.25, dtype=np.float32),
+                s_ffn=np.full(5120, 0.75, dtype=np.float32),
+            )
+            rel.smoothquant_dir = sq_dir
+            s_q, s_attn, s_shw, s_ffn = rel._load_layer_smoothquant(3)
+            self.assertAlmostEqual(float(s_q[0]), 1.5)
+            self.assertAlmostEqual(float(s_attn[0]), 2.0)
+            self.assertAlmostEqual(float(s_shw[0]), 1.25)
+            self.assertAlmostEqual(float(s_ffn[0]), 0.75)
 
 
 if __name__ == "__main__":

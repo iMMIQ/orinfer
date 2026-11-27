@@ -21,7 +21,7 @@ def primitive(source, kernel, host, buffers):
         raise ValueError("Retained CUDA, host and native parameter counts differ")
     params, buffer_map, values, scalars, casts, helper_parameters = [], {}, [], {}, [], []
     for i, (decl, actual, argument) in enumerate(
-        zip(declarations, kernel["args"], host["ordered_arguments"])
+        zip(declarations, kernel["args"], host["ordered_arguments"], strict=True)
     ):
         parsed = re.fullmatch(r"\s*(.*?)\b([A-Za-z_]\w*)\s*", decl)
         if parsed is None:

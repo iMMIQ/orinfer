@@ -198,10 +198,10 @@ def build(b, attention=None, recurrent=None):
             else ["prepare", "attention", "attention_merge"]
         )
         for role, suffix, config in [
-            (role, suffix, config)
-            for role in names
+            (name, suffix, config)
+            for name in names
             for suffix, config in (
-                b.row_choices(recurrent, LANES) if role == "recurrent" else [("", None)]
+                b.row_choices(recurrent, LANES) if name == "recurrent" else [("", None)]
             )
         ]:
             old = kernels[f"qwen_rows/layer{layer}/private/{role}"]

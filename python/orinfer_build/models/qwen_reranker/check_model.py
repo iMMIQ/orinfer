@@ -18,6 +18,7 @@ def native(a, name, request, graph="full"):
         [str(a.engine), "rerank-model", str(a.model), str(path), "--cuda-graph", graph],
         text=True,
         capture_output=True,
+        check=False,
     )
     (a.output / f"{name}-{graph}.stderr").write_text(result.stderr)
     result.check_returncode()

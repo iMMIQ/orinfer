@@ -9,7 +9,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from tools.eval import quick_quality
 from tools.eval.quick_quality import analyze
+from orinfer_build.validation import scoring_common
 from orinfer_build.validation.scoring_common import (
     SEED,
     execution_identity,
@@ -21,11 +23,12 @@ from orinfer_build.validation.scoring_common import (
 
 
 def client_identity():
-    directory = Path(__file__).resolve().parent
-    return {
-        name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-        for name in ["run_quality.py", "scoring_common.py", "quick_quality.py"]
+    sources = {
+        "run_quality.py": Path(__file__).resolve(),
+        "scoring_common.py": Path(scoring_common.__file__).resolve(),
+        "quick_quality.py": Path(quick_quality.__file__).resolve(),
     }
+    return {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in sources.items()}
 
 
 def post(url, endpoint, payload):

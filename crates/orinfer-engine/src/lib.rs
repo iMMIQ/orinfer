@@ -12,6 +12,7 @@ pub mod error;
 pub mod execution;
 pub mod host_rows;
 mod loader;
+pub mod logging;
 pub mod model;
 pub mod models;
 pub mod mtp;

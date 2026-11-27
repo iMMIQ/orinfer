@@ -45,7 +45,7 @@ def render_trace(item, tokenizer, model):
         return tokenizer.decode(tokens[:length], skip_special_tokens=False)
 
     requests = []
-    for turn, (event, parent) in enumerate(zip(events, parents, strict=True)):
+    for _turn, (event, parent) in enumerate(zip(events, parents, strict=True)):
         hashes = event["hash_ids"]
         if parent is None:
             system_blocks = item["system_tokens"] // item["block_size"]

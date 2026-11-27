@@ -865,7 +865,7 @@ impl Runtime {
         self.statistics.request_start_s += started.elapsed().as_secs_f64();
         self.statistics.prefix_restore_s += prefix.restore_s;
         self.statistics.peak_active = self.statistics.peak_active.max(self.active.len());
-        if std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+        if super::diag().batch_profile {
             super::log_async(format!(
                 "A2 request start {}",
                 serde_json::json!({

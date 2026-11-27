@@ -50,26 +50,26 @@ fn successful_shape_streaks_are_family_local_and_reset_on_eviction() {
     let b = key(&layout(&[17], &[7]).unwrap());
     let mut draft = a.clone();
     draft.family.0 = super::super::PacketRole::Draft;
-    assert_eq!(runtime.consecutive_uses(&a), 0);
-    runtime.record_use(a.clone());
-    runtime.record_use(draft.clone());
-    assert_eq!(runtime.consecutive_uses(&a), 1);
-    runtime.record_use(a.clone());
-    assert_eq!(runtime.consecutive_uses(&a), 2);
-    assert_eq!(runtime.consecutive_uses(&draft), 1);
-    runtime.record_use(b.clone());
-    assert_eq!(runtime.consecutive_uses(&a), 0);
-    runtime.record_use(a.clone());
-    runtime.remove(&b);
-    assert_eq!(runtime.consecutive_uses(&a), 1);
-    runtime.remove(&a);
-    assert_eq!(runtime.consecutive_uses(&a), 0);
-    assert_eq!(runtime.consecutive_uses(&draft), 1);
+    assert_eq!(runtime.cache.consecutive_uses(&a), 0);
+    runtime.cache.record_use(a.clone());
+    runtime.cache.record_use(draft.clone());
+    assert_eq!(runtime.cache.consecutive_uses(&a), 1);
+    runtime.cache.record_use(a.clone());
+    assert_eq!(runtime.cache.consecutive_uses(&a), 2);
+    assert_eq!(runtime.cache.consecutive_uses(&draft), 1);
+    runtime.cache.record_use(b.clone());
+    assert_eq!(runtime.cache.consecutive_uses(&a), 0);
+    runtime.cache.record_use(a.clone());
+    runtime.cache.remove(&b);
+    assert_eq!(runtime.cache.consecutive_uses(&a), 1);
+    runtime.cache.remove(&a);
+    assert_eq!(runtime.cache.consecutive_uses(&a), 0);
+    assert_eq!(runtime.cache.consecutive_uses(&draft), 1);
     for _ in 0..300 {
-        runtime.record_use(a.clone());
+        runtime.cache.record_use(a.clone());
     }
-    assert_eq!(runtime.consecutive_uses(&a), u8::MAX);
-    assert_eq!(runtime.recent.len(), 2);
+    assert_eq!(runtime.cache.consecutive_uses(&a), u8::MAX);
+    assert_eq!(runtime.cache.recent_len(), 2);
 }
 #[test]
 fn program_eviction_flag_tracks_direct_removals_and_graph_cap_trims() {
@@ -89,12 +89,14 @@ fn program_eviction_flag_tracks_direct_removals_and_graph_cap_trims() {
     for rows in [16, 32, 48] {
         let k = make_trunk(rows);
         runtime.trunk_cache.insert(k.clone(), Rc::clone(&dummy));
-        runtime.trunk_lru.push_back(k);
+        runtime.trunk_cache.touch(k);
     }
     assert!(!runtime.programs_evicted);
-    assert!(!runtime.remove_trunk(&make_trunk(99)));
+    assert!(!runtime.trunk_cache.remove(&make_trunk(99)));
     assert!(!runtime.programs_evicted);
-    assert!(runtime.remove_trunk(&make_trunk(16)));
+    if runtime.trunk_cache.remove(&make_trunk(16)) {
+        runtime.programs_evicted = true;
+    }
     assert!(runtime.programs_evicted);
     runtime.programs_evicted = false;
     runtime.capacity = 0;
@@ -886,36 +888,29 @@ fn bucketed_work_capacity_collapses_owner_count_variations() {
 
 #[test]
 fn unprotected_eviction_preserves_active_keys_and_cleans_recent_family() {
-    let mut lru = VecDeque::from([1u32, 2, 3]);
-    let mut cache = BTreeMap::from([(1u32, "a"), (2u32, "b"), (3u32, "c")]);
-    let mut recent = BTreeMap::from([(0u8, (2u32, 4u8))]);
+    let family = (super::super::PacketRole::Target, false, 1);
+    let make = |rows| TrunkKey {
+        family,
+        rows,
+        clipped: false,
+        work_rows: vec![],
+    };
+    let (k1, k2, k3) = (make(1), make(2), make(3));
+    let mut cache = ProgramCache::<TrunkKey, &str>::new();
+    for (k, v) in [(k1.clone(), "a"), (k2.clone(), "b"), (k3.clone(), "c")] {
+        cache.insert(k.clone(), Rc::new(v));
+        cache.touch(k);
+    }
+    cache.record_use(k2.clone());
     // Key 1 is protected even though it is at the front of the LRU queue.
-    assert!(Runtime::evict_oldest_unprotected(
-        &mut lru,
-        Some(&1),
-        |k| cache.remove(k).is_some(),
-        &mut recent,
-        |_| 0u8,
-    ));
-    assert!(cache.contains_key(&1));
-    assert!(!cache.contains_key(&2));
-    assert!(!recent.contains_key(&0));
-    assert!(Runtime::evict_oldest_unprotected(
-        &mut lru,
-        Some(&1),
-        |k| cache.remove(k).is_some(),
-        &mut recent,
-        |_| 0u8,
-    ));
-    assert!(cache.contains_key(&1));
-    assert!(!cache.contains_key(&3));
+    assert!(cache.evict_oldest_unprotected(Some(&k1)));
+    assert!(cache.contains_key(&k1));
+    assert!(!cache.contains_key(&k2));
+    assert_eq!(cache.consecutive_uses(&k2), 0);
+    assert!(cache.evict_oldest_unprotected(Some(&k1)));
+    assert!(cache.contains_key(&k1));
+    assert!(!cache.contains_key(&k3));
     // Once only the protected key remains, eviction returns false cleanly.
-    assert!(!Runtime::evict_oldest_unprotected(
-        &mut lru,
-        Some(&1),
-        |k| cache.remove(k).is_some(),
-        &mut recent,
-        |_| 0u8,
-    ));
-    assert!(cache.contains_key(&1));
+    assert!(!cache.evict_oldest_unprotected(Some(&k1)));
+    assert!(cache.contains_key(&k1));
 }

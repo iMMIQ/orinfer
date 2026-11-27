@@ -376,7 +376,7 @@ def validate_rows(model, base, *, model_dir=None):
         verification = contract.get("verification_capacity")
         if verification is not None:
             capacity = min(
-                min(
+                *(
                     max(
                         p["rows"]
                         for p in r["packets"]

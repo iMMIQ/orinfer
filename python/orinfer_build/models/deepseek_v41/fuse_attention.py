@@ -558,7 +558,7 @@ def main():
                 )
             )
         )
-        return
+        return None
     return build(
         args.plan,
         args.output,

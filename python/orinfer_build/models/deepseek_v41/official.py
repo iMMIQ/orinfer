@@ -1,16 +1,12 @@
 """Bounded reads of the official FP4-expert / FP8-backbone checkpoint."""
 
 import ctypes
-import hashlib
 import json
-import os
 from pathlib import Path
-import platform
-import subprocess
-import tempfile
 
 import numpy as np
 
+from orinfer_build.common.native_c import load_shared_c
 from orinfer_build.weights.local import LocalSource
 
 
@@ -43,33 +39,12 @@ class Decoder:
     """Bounded offline CPU decoder, with exact FP32 scale multiplication."""
 
     def __init__(self, cache):
-        source = Path(__file__).with_name("official_decode.c")
-        compiler = subprocess.check_output(["cc", "--version"])
-        key = hashlib.sha256(
-            source.read_bytes() + compiler + platform.machine().encode()
-        ).hexdigest()
-        cache = Path(cache)
-        cache.mkdir(parents=True, exist_ok=True)
-        library = cache / f"official-{key}.so"
-        if not library.exists():
-            with tempfile.TemporaryDirectory(dir=cache) as temporary:
-                staged = Path(temporary) / "decoder.so"
-                subprocess.run(
-                    [
-                        "cc",
-                        "-O3",
-                        "-std=c11",
-                        "-fopenmp",
-                        "-shared",
-                        "-fPIC",
-                        str(source),
-                        "-o",
-                        str(staged),
-                    ],
-                    check=True,
-                )
-                os.replace(staged, library)
-        self.library = ctypes.CDLL(str(library.resolve()))
+        self.library = load_shared_c(
+            Path(__file__).with_name("official_decode.c"),
+            Path(cache),
+            prefix="official",
+            openmp=True,
+        )
         self.call = self.library.orinfer_official_fp4
         self.call.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_size_t] * 2
         self.call.restype = None

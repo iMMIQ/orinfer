@@ -29,7 +29,7 @@ def index(qk, qweight, kweight):
 def select(query, cache, positions):
     """Exact score order; stable lower-index ties, all causal incomplete tails."""
     results = []
-    for q, position in zip(query, positions):
+    for q, position in zip(query, positions, strict=True):
         n = (int(position) + 1) // 4
         if n <= 512:
             ids = torch.arange(n, device=q.device)
@@ -49,7 +49,7 @@ def select(query, cache, positions):
 
 def attention(query, key, value, gate, selected, *, rounded_gate=False):
     out = []
-    for q, g, ids in zip(query, gate, selected):
+    for q, g, ids in zip(query, gate, selected, strict=True):
         ids = ids[ids >= 0].long()
         k = key[ids].repeat_interleave(12, 1).float()
         v = value[ids].repeat_interleave(12, 1).float()

@@ -15,7 +15,7 @@ class EngramMetadataTests(unittest.TestCase):
         result = layers(text, 99092)
         self.assertEqual([sum(layer["primes"]) for layer in result], text["engram_num_embeddings"])
         self.assertNotEqual(result[0]["multipliers"], result[1]["multipliers"])
-        self.assertEqual(len(set(p for layer in result for p in layer["primes"])), 48)
+        self.assertEqual(len({p for layer in result for p in layer["primes"]}), 48)
         self.assertTrue(all(m % 2 == 1 for layer in result for m in layer["multipliers"]))
         text["engram_num_embeddings"][0] += 1
         with self.assertRaises(ValueError):

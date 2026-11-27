@@ -167,7 +167,7 @@ def build(b, *, attention=None, conv=None):
                         ).items()
                     }
                 )
-            modes, pointers = private.bind(fn, pointers, extents={v: 8 for v in variables})
+            modes, pointers = private.bind(fn, pointers, extents=dict.fromkeys(variables, 8))
             entries.append((layer, emitted, fn, variables, modes, pointers))
     offsets, cursor, columns = private.layout()
     b.weights.buffers[SCRATCH]["shape"][0] = max(b.weights.buffers[SCRATCH]["shape"][0], cursor)

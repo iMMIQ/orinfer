@@ -715,7 +715,7 @@ class TensorRelease(Export):
         for group in self.groups:
             name, record = self.write_shard(group)
             self.manifest["files"][name] = record
-        self.finish()
+        return self.finish()
 
 
 def verify_release(output, workers=4, execution_output=None):

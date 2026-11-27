@@ -3,7 +3,6 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from functools import cache
 import hashlib
 import json
 from pathlib import Path
@@ -65,13 +64,17 @@ def check(root=ROOT):
 class Registry:
     def __init__(self, directory):
         self.directory = directory
+        self._cache = {}
         directory.mkdir(parents=True, exist_ok=True)
 
-    @cache
     def raw(self, url):
+        if url in self._cache:
+            return self._cache[url]
         path = self.directory / hashlib.sha256(url.encode()).hexdigest()
         if path.exists() and time.time() - path.stat().st_mtime < 86400:
-            return path.read_bytes()
+            data = path.read_bytes()
+            self._cache[url] = data
+            return data
         for attempt in range(4):
             try:
                 request = Request(
@@ -91,6 +94,7 @@ class Registry:
             temporary = Path(stream.name)
             stream.write(data)
         temporary.replace(path)
+        self._cache[url] = data
         return data
 
     def json(self, url):

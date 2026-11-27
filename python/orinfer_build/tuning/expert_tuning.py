@@ -555,9 +555,9 @@ class MoeTuner(RowTuner):
 
                     def check():
                         run_reference()
-                        assert all(torch.equal(a, b) for a, b in zip(actual, expected)), (
-                            "Routed pipeline changed integer projection outputs"
-                        )
+                        assert all(
+                            torch.equal(a, b) for a, b in zip(actual, expected, strict=True)
+                        ), "Routed pipeline changed integer projection outputs"
                         assert all(bool(torch.all(value[-1] == 91)) for value in storage)
 
                     def change():

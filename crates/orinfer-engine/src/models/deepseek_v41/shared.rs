@@ -3,7 +3,7 @@ use super::*;
 use std::{cell::RefCell, ops::Range};
 
 pub(super) fn enabled() -> bool {
-    std::env::var("ORINFER_A2_SHARED_GRAPH").is_ok_and(|v| v == "1")
+    super::diag().shared_graph
 }
 
 pub(super) fn eligible(layout: &batch::Layout) -> bool {

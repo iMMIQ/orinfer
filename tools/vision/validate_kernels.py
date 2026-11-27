@@ -22,7 +22,7 @@ def main():
     def check(name, kernel, inputs, outputs, reference, tolerance=0.003, atol=0.004):
         kernel.adapter.func(*inputs, *outputs, stream=torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()
-        errors = [error(a, b) for a, b in zip(outputs, reference)]
+        errors = [error(a, b) for a, b in zip(outputs, reference, strict=True)]
         assert all(
             e["finite"] and e["relative_l2"] < tolerance and e["max_abs"] < atol for e in errors
         ), (name, errors)
@@ -35,11 +35,11 @@ def main():
         inputs[0].mul_(0.5)
         graph.replay()
         torch.cuda.synchronize()
-        assert any(not torch.equal(o, s) for o, s in zip(outputs, saved)), name
+        assert any(not torch.equal(o, s) for o, s in zip(outputs, saved, strict=True)), name
         inputs[0].copy_(original)
         graph.replay()
         torch.cuda.synchronize()
-        assert all(torch.equal(o, s) for o, s in zip(outputs, saved)), name
+        assert all(torch.equal(o, s) for o, s in zip(outputs, saved, strict=True)), name
         report.append({"kernel": name, "error": errors, "changed_input_graph_replay": True})
         print(name, errors, flush=True)
 

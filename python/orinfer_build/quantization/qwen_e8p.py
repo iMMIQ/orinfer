@@ -433,7 +433,7 @@ def encode(args):
     common["orinfer.e8p_q4.basis"] = basis()
     save_file(common, str(out / "quantization.safetensors"))
     mapping = {n: f for f, r in state["shards"].items() for n in r["names"]}
-    mapping.update({n: "quantization.safetensors" for n in common})
+    mapping.update(dict.fromkeys(common, "quantization.safetensors"))
     hashes = {f: r["sha256"] for f, r in state["shards"].items()}
     hashes["quantization.safetensors"] = file_hash(out / "quantization.safetensors")
     sizes = sum((out / f).stat().st_size - local_header(out / f)[0] for f in hashes)

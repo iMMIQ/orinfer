@@ -80,14 +80,14 @@ def hc_split_sinkhorn(mixes, scale, base, hc_mult=4, sinkhorn_iters=20, eps=1e-6
     return pre, post, comb
 
 
-def sparse_attn(q, kv, sink, indices, softmax_scale):
+def sparse_attn(q, kv, sink, indices, softmax_scale, *, query_chunk=16):
     # Match the official 64-key online update and BF16 unnormalized probability
     # boundary. Chunk query rows only to bound temporary reference storage.
     batches, tokens, heads, dimension = q.shape
     output = torch.empty_like(q)
     for batch in range(batches):
-        for first in range(0, tokens, 16):
-            end = min(first + 16, tokens)
+        for first in range(0, tokens, query_chunk):
+            end = min(first + query_chunk, tokens)
             query = q[batch, first:end].float()
             maximum = torch.full(
                 (end - first, heads, 1), -1e30, dtype=torch.float32, device=q.device
@@ -97,7 +97,9 @@ def sparse_attn(q, kv, sink, indices, softmax_scale):
                 end - first, heads, dimension, dtype=torch.float32, device=q.device
             )
             for start in range(0, indices.shape[-1], 64):
-                selected = indices[batch, first:end, start : start + 64].long()
+                selected = indices[batch, first:end, start : start + 64].to(
+                    device=q.device, dtype=torch.long
+                )
                 values = kv[batch][selected.clamp_min(0)].float()
                 scores = torch.einsum("shd,skd->shk", query, values) * softmax_scale
                 scores.masked_fill_(selected[:, None, :] < 0, -torch.inf)

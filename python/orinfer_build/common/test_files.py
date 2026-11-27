@@ -63,6 +63,7 @@ class BuildFilesTests(unittest.TestCase):
                             str(path),
                         ],
                         capture_output=True,
+                        check=False,
                     ).returncode
                     == 0
                 )

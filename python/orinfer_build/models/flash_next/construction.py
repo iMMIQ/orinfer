@@ -97,7 +97,7 @@ def projection(kernel, host, pointers, buffers, dynamic, fixed):
         raise ValueError("Invalid integer matrix geometry")
     scalar = {
         a["value"]: b["value"]
-        for a, b in zip(host["ordered_arguments"], kernel["args"])
+        for a, b in zip(host["ordered_arguments"], kernel["args"], strict=True)
         if a["ctype"].endswith("c_int32") and a["value"] in ("m", "rows")
     }
     symbolic = bool(scalar)

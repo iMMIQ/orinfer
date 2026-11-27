@@ -49,10 +49,10 @@ def summarize(directory, manifest_path):
     roots = {base: nodes for base, nodes in roots.items() if len(nodes) in expected_counts}
     assert len(roots) == len(phases)
     identities = {}
-    for (_, nodes), phase in zip(sorted(roots.items()), phases):
+    for (_, nodes), phase in zip(sorted(roots.items()), phases, strict=True):
         ops = model["programs"][phase]
         assert len(nodes) == len(ops), (phase, len(nodes), len(ops))
-        for node, index in zip(sorted(nodes), range(len(ops))):
+        for node, index in zip(sorted(nodes), range(len(ops)), strict=True):
             identities[node] = (phase, index)
     kernels = {k["name"]: k for k in model["kernels"]}
     launches = collections.defaultdict(list)
@@ -108,7 +108,7 @@ def summarize(directory, manifest_path):
         )
     cursor = 0
     summaries = []
-    for request, measured in zip(requests, report["requests"]):
+    for request, measured in zip(requests, report["requests"], strict=True):
         assert request["id"] == measured["id"]
         chunk = measured.get("prefill_chunk_tokens", model["chunk_tokens"])
         prefill_program = measured.get("prefill_program", "prefill")

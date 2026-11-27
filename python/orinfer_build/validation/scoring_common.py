@@ -148,7 +148,7 @@ def pair_probes(baseline, candidate):
     if len(baseline) != len(candidate):
         raise ValueError("Probe count mismatch")
     rows = []
-    for a, b in zip(baseline, candidate):
+    for a, b in zip(baseline, candidate, strict=True):
         keys = [
             "case_id",
             "execution_mode",

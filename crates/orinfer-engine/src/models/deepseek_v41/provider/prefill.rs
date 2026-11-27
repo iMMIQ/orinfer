@@ -211,7 +211,7 @@ impl Runtime {
         } else {
             Path::Direct
         };
-        let before = (work.tokens > 0 && std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some())
+        let before = (work.tokens > 0 && super::super::diag().batch_profile)
             .then(|| self.prefill_costs.estimate(work));
         self.prefill_costs.observe(
             work,

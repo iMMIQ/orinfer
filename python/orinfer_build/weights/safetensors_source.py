@@ -156,6 +156,7 @@ class Source:
                 if attempt == 4:
                     raise
                 time.sleep(min(2**attempt, 8))
+        raise RuntimeError("Unreachable HTTP retry loop")
 
     def header(self, filename):
         if filename in self.headers:

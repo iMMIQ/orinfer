@@ -77,7 +77,7 @@ def build(b):
             constants.update(
                 (host["value"], arg["value"])
                 for arg, host in zip(
-                    kernel["args"], b.aot.compiler.host(kernel)["ordered_arguments"]
+                    kernel["args"], b.aot.compiler.host(kernel)["ordered_arguments"], strict=True
                 )
                 if arg["kind"] == "i32" and host["value"] not in ("m", "M", "rows", "batch")
             )
@@ -317,7 +317,9 @@ def compile_package(data, package, manifest, origin, operator, output, cache, la
                 (
                     arg["value"]
                     for arg, host in zip(
-                        kernel["args"], b.aot.compiler.host(kernel)["ordered_arguments"]
+                        kernel["args"],
+                        b.aot.compiler.host(kernel)["ordered_arguments"],
+                        strict=True,
                     )
                     if arg["kind"] == "i32" and host["value"] in ("m", "M", "rows", "batch")
                 ),

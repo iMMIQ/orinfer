@@ -22,7 +22,7 @@ class ExpertTilePolicyTests(unittest.TestCase):
         }
         policy = projection_policies(buffers)["W_blk.0.attn_qkv.weight_weight"]
         self.assertEqual(policy.signs, "Q4_blk.0.attn_gate_signs")
-        for rows in (1, 2, 4, 8, 16, 128, 512, 4096):
+        for _rows in (1, 2, 4, 8, 16, 128, 512, 4096):
             self.assertEqual(policy.packed, "Q4_blk.0.attn_qkv_packed")
             self.assertEqual((policy.outputs, policy.inputs), (10240, 2560))
         del buffers[policy.signs]

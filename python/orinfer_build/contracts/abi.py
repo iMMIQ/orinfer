@@ -71,7 +71,8 @@ def parse_host(source):
                     "symbol": kernel.slice.value,
                     "launch_expressions": dict(launch),
                     "ordered_arguments": [
-                        {"value": value, "ctype": kind} for value, kind in zip(values, types)
+                        {"value": value, "ctype": kind}
+                        for value, kind in zip(values, types, strict=True)
                     ],
                 }
             )

@@ -6,6 +6,7 @@ Rust adapter removes the now-redundant norm operation when it registers the
 fused symbol; this tool only constructs checked operand bindings.
 """
 
+from itertools import pairwise
 from orinfer_build.common.files import write_json
 
 H = 2560
@@ -22,7 +23,7 @@ def decode_pairs(manifest, package, compiler):
     contracts = {k["name"]: k for k in package["kernels"]}
     pairs = []
     operations = manifest["programs"].get("decode", [])
-    for first, second in zip(operations, operations[1:]):
+    for first, second in pairwise(operations):
         if first["kind"] != "kernel" or second["kind"] != "kernel":
             continue
         combine = contracts.get(first["name"])

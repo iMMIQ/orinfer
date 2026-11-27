@@ -135,14 +135,14 @@ def run():
 
     kernel = primitive(e.vision_rope, 32768, dynamic_rows=True)
     launch(kernel, x, grid, *outputs, 60)
-    for actual, expected in zip(outputs, reference_rope()):
+    for actual, expected in zip(outputs, reference_rope(), strict=True):
         torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.002)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch(kernel, x, grid, *outputs, 60)
     x.neg_()
     graph.replay()
-    for actual, expected in zip(outputs, reference_rope()):
+    for actual, expected in zip(outputs, reference_rope(), strict=True):
         torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.002)
     records.append(dict(kind="pixtral_axial_rope", graph=True))
     from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
@@ -178,14 +178,14 @@ def run():
         for group in [1, 4, 8]:
             kernel = primitive(e.text_rope, n, dynamic_rows=True, head_group=group)
             launch(kernel, ranges, x, cos, sin, scale, *output, n)
-            for actual, expected in zip(output, expected_text_rope()):
+            for actual, expected in zip(output, expected_text_rope(), strict=True):
                 torch.testing.assert_close(actual, expected, atol=0.0005, rtol=0.002)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 launch(kernel, ranges, x, cos, sin, scale, *output, n)
             x.neg_()
             graph.replay()
-            for actual, expected in zip(output, expected_text_rope()):
+            for actual, expected in zip(output, expected_text_rope(), strict=True):
                 torch.testing.assert_close(actual, expected, atol=0.0005, rtol=0.002)
             records.append(
                 dict(kind="text_yarn_and_attention_scale", rows=n, head_group=group, graph=True)

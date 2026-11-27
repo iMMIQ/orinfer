@@ -213,7 +213,7 @@ def main():
         draft[:, 30] = math.log(1e-18) + 9.0
         counts = torch.zeros(3, dtype=torch.int64)
         accepted_count = 0
-        for batch in range(16):
+        for _batch in range(16):
             controls = torch.randint(-(1 << 31), (1 << 31) - 1, (n, 4), dtype=torch.int32)
             controls[:, 3] = torch.ones(n).view(torch.int32)
             proposals = torch.zeros((n, 4), dtype=torch.int32)

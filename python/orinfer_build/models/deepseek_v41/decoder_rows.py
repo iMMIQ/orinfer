@@ -131,7 +131,7 @@ def build(plan, output, keep=128, workers=4, final_prompt_only=False, source_kv_
             )
             coordinates = packet["coordinates"]
             replacements = {}
-            for key, name in coordinates.items():
+            for name in coordinates.values():
                 if not isinstance(name, str):
                     continue
                 old = definitions[name]

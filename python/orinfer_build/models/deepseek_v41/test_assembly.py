@@ -364,7 +364,7 @@ class DeviceEmbeddingTests(unittest.TestCase):
             for destination in range(8):
                 first = destination * local
                 received = [peer[first : first + local] for peer in source]
-                restored = [sum((peer[row] for peer in received), []) for row in range(local)]
+                restored = [[v for peer in received for v in peer[row]] for row in range(local)]
                 expected = [
                     list(range(row * 16, row * 16 + 16)) if row < rows else [0] * 16
                     for row in range(first, first + local)

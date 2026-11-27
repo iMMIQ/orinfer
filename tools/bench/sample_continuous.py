@@ -58,10 +58,13 @@ def main():
     start = dict(
         time_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
         power_mode=subprocess.run(
-            ["/usr/sbin/nvpmodel", "-q"], capture_output=True, text=True
+            ["/usr/sbin/nvpmodel", "-q"], capture_output=True, text=True, check=False
         ).stdout,
         background_containers=subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}} {{.Image}}"], capture_output=True, text=True
+            ["docker", "ps", "--format", "{{.Names}} {{.Image}}"],
+            capture_output=True,
+            text=True,
+            check=False,
         ).stdout.splitlines(),
     )
     args.output.with_suffix(".start.json").write_text(json.dumps(start, indent=2))

@@ -69,7 +69,7 @@ def profile(paths):
     if identity is None or not groups:
         raise ValueError("No identified DSpark cost observations")
     points = []
-    for key, observations in sorted(groups.items()):
+    for _key, observations in sorted(groups.items()):
         shared = [
             p.get("shared_setup_s", 0.0) for p in observations if p.get("shared_setup_s", 0.0) > 0
         ]

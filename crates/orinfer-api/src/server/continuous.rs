@@ -1,32 +1,11 @@
 //! Continuous worker and bounded, nonblocking per-client output mailboxes.
 use super::*;
 use orinfer_engine::{
+    logging::log_async,
     model::{AdmissionInput, GenerationInput, RequestState},
     scheduler,
 };
-use std::{
-    collections::VecDeque,
-    sync::{OnceLock, atomic::AtomicUsize, mpsc as std_mpsc},
-};
-
-/// Non-blocking bounded stderr logger for the continuous batching hot loop.
-/// A stalled log pipe drops excess per-request telemetry lines instead of
-/// blocking `orinfer-gpu`.
-fn log_async(line: String) {
-    static LOGGER: OnceLock<std_mpsc::SyncSender<String>> = OnceLock::new();
-    let tx = LOGGER.get_or_init(|| {
-        let (tx, rx) = std_mpsc::sync_channel::<String>(2048);
-        let _ = std::thread::Builder::new()
-            .name("orinfer-log".into())
-            .spawn(move || {
-                while let Ok(msg) = rx.recv() {
-                    eprintln!("{msg}");
-                }
-            });
-        tx
-    });
-    let _ = tx.try_send(line);
-}
+use std::{collections::VecDeque, sync::atomic::AtomicUsize};
 
 const MAX_COMPLETED_MAILBOXES: usize = 512;
 

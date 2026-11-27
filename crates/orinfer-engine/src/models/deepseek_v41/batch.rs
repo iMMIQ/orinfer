@@ -1,13 +1,15 @@
 //! Owner-private state and shared token rows for native A2 packets.
+mod cache;
 mod memory;
 use super::{Buffer, Execution, Instruction, SubProgram, Worker, get};
 use crate::artifact::Result;
+use cache::{FamilyKey, ProgramCache};
 use orinfer_model_sdk::{
     architecture::BatchSegment, operators::dynamic::RowExpression, packet::Rows,
 };
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
 
@@ -293,6 +295,26 @@ pub(super) struct HeadKey {
     decoder_rows: Option<usize>,
     outputs: usize,
 }
+impl FamilyKey for Key {
+    fn family(&self) -> (super::PacketRole, bool, usize) {
+        self.family
+    }
+}
+impl FamilyKey for TrunkKey {
+    fn family(&self) -> (super::PacketRole, bool, usize) {
+        self.family
+    }
+}
+impl FamilyKey for TailKey {
+    fn family(&self) -> (super::PacketRole, bool, usize) {
+        self.family
+    }
+}
+impl FamilyKey for HeadKey {
+    fn family(&self) -> (super::PacketRole, bool, usize) {
+        self.family
+    }
+}
 pub(super) struct SplitKeys {
     pub family: (super::PacketRole, bool, usize),
     pub trunk: TrunkKey,
@@ -355,18 +377,10 @@ pub(super) struct Runtime {
     pub contract: Contract,
     pub owners: BTreeMap<usize, Owner>,
     pub(super) idle_owners: Vec<IdleOwner>,
-    pub(super) cache: BTreeMap<Key, Rc<Execution>>,
-    recent: BTreeMap<(super::PacketRole, bool, usize), (Key, u8)>,
-    lru: VecDeque<Key>,
-    pub(super) trunk_cache: BTreeMap<TrunkKey, Rc<SubProgram>>,
-    recent_trunk: BTreeMap<(super::PacketRole, bool, usize), (TrunkKey, u8)>,
-    trunk_lru: VecDeque<TrunkKey>,
-    pub(super) tail_cache: BTreeMap<TailKey, Rc<SubProgram>>,
-    recent_tail: BTreeMap<(super::PacketRole, bool, usize), (TailKey, u8)>,
-    tail_lru: VecDeque<TailKey>,
-    pub(super) head_cache: BTreeMap<HeadKey, Rc<SubProgram>>,
-    recent_head: BTreeMap<(super::PacketRole, bool, usize), (HeadKey, u8)>,
-    head_lru: VecDeque<HeadKey>,
+    pub(super) cache: ProgramCache<Key, Execution>,
+    pub(super) trunk_cache: ProgramCache<TrunkKey, SubProgram>,
+    pub(super) tail_cache: ProgramCache<TailKey, SubProgram>,
+    pub(super) head_cache: ProgramCache<HeadKey, SubProgram>,
     capacity: usize,
     tables: BTreeMap<(super::PacketRole, bool, usize), TableUse>,
     families: Vec<(super::PacketRole, bool, usize)>,
@@ -395,118 +409,6 @@ struct TableUse {
     tail_columns: Vec<bool>,
 }
 impl Runtime {
-    pub(super) fn touch_shared_packet(&mut self, key: Key) {
-        self.lru.retain(|k| k != &key);
-        self.lru.push_back(key);
-    }
-    fn touch_trunk(&mut self, key: TrunkKey) {
-        self.trunk_lru.retain(|k| k != &key);
-        self.trunk_lru.push_back(key);
-    }
-    fn touch_tail(&mut self, key: TailKey) {
-        self.tail_lru.retain(|k| k != &key);
-        self.tail_lru.push_back(key);
-    }
-    fn touch_head(&mut self, key: HeadKey) {
-        self.head_lru.retain(|k| k != &key);
-        self.head_lru.push_back(key);
-    }
-    fn consecutive_uses(&self, key: &Key) -> u8 {
-        self.recent
-            .get(&key.family)
-            .filter(|(previous, _)| previous == key)
-            .map_or(0, |(_, uses)| *uses)
-    }
-    fn record_use(&mut self, key: Key) {
-        let uses = self.consecutive_uses(&key).saturating_add(1);
-        self.recent.insert(key.family, (key, uses));
-    }
-    fn consecutive_trunk(&self, key: &TrunkKey) -> u8 {
-        self.recent_trunk
-            .get(&key.family)
-            .filter(|(previous, _)| previous == key)
-            .map_or(0, |(_, uses)| *uses)
-    }
-    fn record_trunk_use(&mut self, key: TrunkKey) {
-        let uses = self.consecutive_trunk(&key).saturating_add(1);
-        self.recent_trunk.insert(key.family, (key, uses));
-    }
-    fn consecutive_tail(&self, key: &TailKey) -> u8 {
-        self.recent_tail
-            .get(&key.family)
-            .filter(|(previous, _)| previous == key)
-            .map_or(0, |(_, uses)| *uses)
-    }
-    fn record_tail_use(&mut self, key: TailKey) {
-        let uses = self.consecutive_tail(&key).saturating_add(1);
-        self.recent_tail.insert(key.family, (key, uses));
-    }
-    fn consecutive_head(&self, key: &HeadKey) -> u8 {
-        self.recent_head
-            .get(&key.family)
-            .filter(|(previous, _)| previous == key)
-            .map_or(0, |(_, uses)| *uses)
-    }
-    fn record_head_use(&mut self, key: HeadKey) {
-        let uses = self.consecutive_head(&key).saturating_add(1);
-        self.recent_head.insert(key.family, (key, uses));
-    }
-    fn remove(&mut self, key: &Key) -> bool {
-        let removed = self.cache.remove(key).is_some();
-        if removed {
-            self.programs_evicted = true;
-        }
-        if self
-            .recent
-            .get(&key.family)
-            .is_some_and(|(last, _)| last == key)
-        {
-            self.recent.remove(&key.family);
-        }
-        removed
-    }
-    fn remove_trunk(&mut self, key: &TrunkKey) -> bool {
-        let removed = self.trunk_cache.remove(key).is_some();
-        if removed {
-            self.programs_evicted = true;
-        }
-        if self
-            .recent_trunk
-            .get(&key.family)
-            .is_some_and(|(last, _)| last == key)
-        {
-            self.recent_trunk.remove(&key.family);
-        }
-        removed
-    }
-    fn remove_tail(&mut self, key: &TailKey) -> bool {
-        let removed = self.tail_cache.remove(key).is_some();
-        if removed {
-            self.programs_evicted = true;
-        }
-        if self
-            .recent_tail
-            .get(&key.family)
-            .is_some_and(|(last, _)| last == key)
-        {
-            self.recent_tail.remove(&key.family);
-        }
-        removed
-    }
-    fn remove_head(&mut self, key: &HeadKey) -> bool {
-        let removed = self.head_cache.remove(key).is_some();
-        if removed {
-            self.programs_evicted = true;
-        }
-        if self
-            .recent_head
-            .get(&key.family)
-            .is_some_and(|(last, _)| last == key)
-        {
-            self.recent_head.remove(&key.family);
-        }
-        removed
-    }
     /// Cap captured heavy graphs across monolithic, trunk, and tail caches so
     /// 910B hardware stream/event/model quotas stay bounded. Uncaptured direct
     /// entries hold no ACL Graph resources, and tiny 1-kernel heads stay
@@ -514,72 +416,20 @@ impl Runtime {
     fn trim_total_programs(&mut self, protected: &ProtectedKeys<'_>) {
         let graph_cap = self.capacity.saturating_add(self.capacity / 2).max(1);
         loop {
-            let captured = self.cache.values().filter(|e| e.all_captured()).count()
-                + self.trunk_cache.values().filter(|e| e.captured).count()
-                + self.tail_cache.values().filter(|e| e.captured).count();
+            let captured = self.cache.count_where(Execution::all_captured)
+                + self.trunk_cache.count_where(|e| e.captured)
+                + self.tail_cache.count_where(|e| e.captured);
             if captured <= graph_cap {
                 break;
             }
-            let evicted = Self::evict_oldest_unprotected(
-                &mut self.lru,
-                protected.mono,
-                |k| {
-                    let removed = self.cache.remove(k).is_some();
-                    if removed {
-                        self.programs_evicted = true;
-                    }
-                    removed
-                },
-                &mut self.recent,
-                |k| k.family,
-            ) || Self::evict_oldest_unprotected(
-                &mut self.tail_lru,
-                protected.tail,
-                |k| {
-                    let removed = self.tail_cache.remove(k).is_some();
-                    if removed {
-                        self.programs_evicted = true;
-                    }
-                    removed
-                },
-                &mut self.recent_tail,
-                |k| k.family,
-            ) || Self::evict_oldest_unprotected(
-                &mut self.trunk_lru,
-                protected.trunk,
-                |k| {
-                    let removed = self.trunk_cache.remove(k).is_some();
-                    if removed {
-                        self.programs_evicted = true;
-                    }
-                    removed
-                },
-                &mut self.recent_trunk,
-                |k| k.family,
-            );
+            let evicted = self.cache.evict_oldest_unprotected(protected.mono)
+                || self.tail_cache.evict_oldest_unprotected(protected.tail)
+                || self.trunk_cache.evict_oldest_unprotected(protected.trunk);
             if !evicted {
                 break;
             }
+            self.programs_evicted = true;
         }
-    }
-    fn evict_oldest_unprotected<K: PartialEq, F: Ord>(
-        lru: &mut VecDeque<K>,
-        protected: Option<&K>,
-        mut remove_entry: impl FnMut(&K) -> bool,
-        recent: &mut BTreeMap<F, (K, u8)>,
-        family: impl Fn(&K) -> F,
-    ) -> bool {
-        while let Some(pos) = lru.iter().position(|k| Some(k) != protected) {
-            let key = lru.remove(pos).unwrap();
-            if remove_entry(&key) {
-                let fam = family(&key);
-                if recent.get(&fam).is_some_and(|(last, _)| last == &key) {
-                    recent.remove(&fam);
-                }
-                return true;
-            }
-        }
-        false
     }
     fn resolve_family(&self, layout: &Layout) -> Result<(super::PacketRole, bool, usize)> {
         self.families
@@ -943,12 +793,8 @@ impl Runtime {
                         }
                         _ => false,
                     });
-                if select_sources_ready {
-                    tables
-                        .get_mut(&tk)
-                        .unwrap()
-                        .tail_downgrade_targets
-                        .insert(ck);
+                if select_sources_ready && let Some(entry) = tables.get_mut(&tk) {
+                    entry.tail_downgrade_targets.insert(ck);
                 }
             }
         }
@@ -956,18 +802,10 @@ impl Runtime {
             contract,
             owners: BTreeMap::new(),
             idle_owners: Vec::new(),
-            cache: BTreeMap::new(),
-            recent: BTreeMap::new(),
-            lru: VecDeque::new(),
-            trunk_cache: BTreeMap::new(),
-            recent_trunk: BTreeMap::new(),
-            trunk_lru: VecDeque::new(),
-            tail_cache: BTreeMap::new(),
-            recent_tail: BTreeMap::new(),
-            tail_lru: VecDeque::new(),
-            head_cache: BTreeMap::new(),
-            recent_head: BTreeMap::new(),
-            head_lru: VecDeque::new(),
+            cache: ProgramCache::new(),
+            trunk_cache: ProgramCache::new(),
+            tail_cache: ProgramCache::new(),
+            head_cache: ProgramCache::new(),
             capacity,
             tables,
             families: packets
@@ -1764,6 +1602,16 @@ fn work_lengths(
     Ok(out)
 }
 impl Worker {
+    pub(super) fn batch_runtime(&self) -> Result<&Runtime> {
+        self.batch
+            .as_ref()
+            .ok_or_else(|| "Missing batch runtime".into())
+    }
+    pub(super) fn batch_runtime_mut(&mut self) -> Result<&mut Runtime> {
+        self.batch
+            .as_mut()
+            .ok_or_else(|| "Missing batch runtime".into())
+    }
     pub(super) fn take_programs_evicted(&mut self) -> bool {
         self.batch
             .as_mut()
@@ -1773,7 +1621,7 @@ impl Worker {
         &self,
         layout: &Layout,
     ) -> Result<(Option<Key>, Option<SplitKeys>)> {
-        let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+        let runtime = self.batch_runtime()?;
         if let Some(split) = runtime.split_keys(layout)? {
             Ok((None, Some(split)))
         } else {
@@ -1781,7 +1629,7 @@ impl Worker {
         }
     }
     pub(super) fn batch_split_cached(&self, layout: &Layout) -> Result<SplitStates> {
-        let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+        let runtime = self.batch_runtime()?;
         if let Some(split) = runtime.split_keys(layout)? {
             let state = |sub: Option<&Rc<SubProgram>>, consecutive: u8| {
                 sub.map_or(CacheState::Missing, |e| {
@@ -1797,16 +1645,20 @@ impl Worker {
             };
             let trunk = state(
                 runtime.trunk_cache.get(&split.trunk),
-                runtime.consecutive_trunk(&split.trunk),
+                runtime.trunk_cache.consecutive_uses(&split.trunk),
             );
-            let tail = split
-                .tail
-                .as_ref()
-                .map(|k| state(runtime.tail_cache.get(k), runtime.consecutive_tail(k)));
-            let head = split
-                .head
-                .as_ref()
-                .map(|k| state(runtime.head_cache.get(k), runtime.consecutive_head(k)));
+            let tail = split.tail.as_ref().map(|k| {
+                state(
+                    runtime.tail_cache.get(k),
+                    runtime.tail_cache.consecutive_uses(k),
+                )
+            });
+            let head = split.head.as_ref().map(|k| {
+                state(
+                    runtime.head_cache.get(k),
+                    runtime.head_cache.consecutive_uses(k),
+                )
+            });
             return Ok(SplitStates { trunk, tail, head });
         }
         let key = runtime.key(layout)?;
@@ -1816,7 +1668,7 @@ impl Worker {
             } else {
                 CacheState::Direct {
                     uses: e.trunk.direct_uses.get(),
-                    consecutive: runtime.consecutive_uses(&key),
+                    consecutive: runtime.cache.consecutive_uses(&key),
                 }
             }
         });
@@ -1839,26 +1691,28 @@ impl Worker {
     ) -> Result<()> {
         self.session.synchronize()?;
         let (split_keys, mono_key) = {
-            let runtime = self.batch.as_mut().ok_or("Missing batch runtime")?;
+            let runtime = self.batch_runtime_mut()?;
             if let Some(split) = runtime.split_keys(layout)? {
-                if trunk {
-                    runtime.remove_trunk(&split.trunk);
-                    runtime.trunk_lru.retain(|k| k != &split.trunk);
+                if trunk && runtime.trunk_cache.remove_with_lru(&split.trunk) {
+                    runtime.programs_evicted = true;
                 }
-                if tail && let Some(k) = &split.tail {
-                    runtime.remove_tail(k);
-                    runtime.tail_lru.retain(|x| x != k);
+                if tail
+                    && let Some(k) = &split.tail
+                    && runtime.tail_cache.remove_with_lru(k)
+                {
+                    runtime.programs_evicted = true;
                 }
-                if head && let Some(k) = &split.head {
-                    runtime.remove_head(k);
-                    runtime.head_lru.retain(|x| x != k);
+                if head
+                    && let Some(k) = &split.head
+                    && runtime.head_cache.remove_with_lru(k)
+                {
+                    runtime.programs_evicted = true;
                 }
                 (Some(split), None)
             } else {
                 let key = runtime.key(layout)?;
-                if trunk {
-                    runtime.remove(&key);
-                    runtime.lru.retain(|k| k != &key);
+                if trunk && runtime.cache.remove_with_lru(&key) {
+                    runtime.programs_evicted = true;
                 }
                 (None, Some(key))
             }
@@ -1904,21 +1758,13 @@ impl Worker {
         )
     }
     pub(super) fn prepare_parts(&mut self, layout: &Layout, plan: SplitPlan) -> Result<()> {
-        let split = self
-            .batch
-            .as_ref()
-            .ok_or("Missing batch runtime")?
-            .split_keys(layout)?;
+        let split = self.batch_runtime()?.split_keys(layout)?;
         if let Some(split) = split {
             return self.prepare_split_parts(layout, split, plan);
         }
         let capture = plan.trunk.prepare.unwrap_or(false);
-        let key = self
-            .batch
-            .as_ref()
-            .ok_or("Missing batch runtime")?
-            .key(layout)?;
-        let previous = self.batch.as_ref().unwrap().cache.get(&key).cloned();
+        let key = self.batch_runtime()?.key(layout)?;
+        let previous = self.batch_runtime()?.cache.get(&key).cloned();
         if previous
             .as_ref()
             .is_none_or(|e| capture && !e.all_captured())
@@ -1965,7 +1811,7 @@ impl Worker {
                 // Capturing a new shape cannot overwrite live KV or C2 rings.
                 super::upload(
                     &self.session,
-                    &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
+                    &get(&self.buffers, &self.batch_runtime()?.contract.active)?,
                     &0i32.to_le_bytes(),
                 )?;
                 let tables_started = std::time::Instant::now();
@@ -2007,11 +1853,12 @@ impl Worker {
                 (body, head)
             };
             let compile_s = compile_started.elapsed().as_secs_f64();
-            self.batch.as_mut().unwrap().cache.insert(
+            self.batch_runtime_mut()?.cache.insert(
                 key.clone(),
                 Rc::new(Execution::monolithic(packet, body, head, capture)),
             );
-            if self.rank == 0 && std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+            if self.rank == 0 && super::diag().batch_profile {
+                let consecutive = self.batch_runtime()?.cache.consecutive_uses(&key);
                 super::log_async(format!(
                     "A2 packet prepare {}",
                     serde_json::json!({
@@ -2019,7 +1866,7 @@ impl Worker {
                         "promotion": previous.is_some(),
                         "family": format!("{:?}", key.family),
                         "direct_uses": previous.as_ref().map_or(0, |e| e.trunk.direct_uses.get()),
-                        "consecutive_uses": self.batch.as_ref().unwrap().consecutive_uses(&key),
+                        "consecutive_uses": consecutive,
                         "owner_lengths": layout.segments.iter().map(|s| s.tokens).collect::<Vec<_>>(),
                         "decoder_rows": key.decoder_rows, "outputs": key.outputs,
                         "work_rows": key.work_rows, "wall_s": started.elapsed().as_secs_f64(),
@@ -2041,18 +1888,14 @@ impl Worker {
                 ));
             }
         }
-        let runtime = self.batch.as_mut().unwrap();
+        let runtime = self.batch_runtime_mut()?;
         let protected = ProtectedKeys {
             mono: Some(&key),
             ..ProtectedKeys::default()
         };
-        runtime.lru.retain(|k| k != &key);
-        runtime.lru.push_back(key.clone());
-        while runtime.cache.len() > runtime.capacity {
-            let Some(old) = runtime.lru.pop_front() else {
-                break;
-            };
-            runtime.remove(&old);
+        runtime.cache.touch(key.clone());
+        if runtime.cache.trim_to(runtime.capacity) {
+            runtime.programs_evicted = true;
         }
         runtime.trim_total_programs(&protected);
         self.w4.retain(|_, w| w.strong_count() > 0);
@@ -2064,34 +1907,26 @@ impl Worker {
         split: SplitKeys,
         plan: SplitPlan,
     ) -> Result<()> {
-        let need_trunk = plan.trunk.prepare.filter(|&cap| {
-            self.batch
-                .as_ref()
-                .unwrap()
-                .trunk_cache
-                .get(&split.trunk)
-                .is_none_or(|e| cap && !e.captured)
-        });
-        let need_tail = split.tail.as_ref().and_then(|k| {
-            plan.tail.and_then(|a| a.prepare).filter(|&cap| {
-                self.batch
-                    .as_ref()
-                    .unwrap()
-                    .tail_cache
-                    .get(k)
+        let (need_trunk, need_tail, need_head) = {
+            let runtime = self.batch_runtime()?;
+            let need_trunk = plan.trunk.prepare.filter(|&cap| {
+                runtime
+                    .trunk_cache
+                    .get(&split.trunk)
                     .is_none_or(|e| cap && !e.captured)
-            })
-        });
-        let need_head = split.head.as_ref().and_then(|k| {
-            plan.head.and_then(|a| a.prepare).filter(|&cap| {
-                self.batch
-                    .as_ref()
-                    .unwrap()
-                    .head_cache
-                    .get(k)
-                    .is_none_or(|e| cap && !e.captured)
-            })
-        });
+            });
+            let need_tail = split.tail.as_ref().and_then(|k| {
+                plan.tail
+                    .and_then(|a| a.prepare)
+                    .filter(|&cap| runtime.tail_cache.get(k).is_none_or(|e| cap && !e.captured))
+            });
+            let need_head = split.head.as_ref().and_then(|k| {
+                plan.head
+                    .and_then(|a| a.prepare)
+                    .filter(|&cap| runtime.head_cache.get(k).is_none_or(|e| cap && !e.captured))
+            });
+            (need_trunk, need_tail, need_head)
+        };
         if need_trunk.is_some() || need_tail.is_some() || need_head.is_some() {
             let started = std::time::Instant::now();
             let any_capture =
@@ -2139,12 +1974,12 @@ impl Worker {
             if any_capture {
                 super::upload(
                     &self.session,
-                    &get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
+                    &get(&self.buffers, &self.batch_runtime()?.contract.active)?,
                     &0i32.to_le_bytes(),
                 )?;
                 self.update_batch_tables(layout, &packet, tail_packet.as_deref())?;
             }
-            let trunk_used = &self.batch.as_ref().unwrap().tables[&split.family];
+            let trunk_used = &self.batch_runtime()?.tables[&split.family];
             let split_idx = trunk_used
                 .decoder_split
                 .ok_or("Missing decoder split index")?;
@@ -2153,13 +1988,7 @@ impl Worker {
                 .ok_or("Missing decoder boundary index")?;
             let base = self.package.clone();
             if let Some(capture) = need_trunk {
-                let prev = self
-                    .batch
-                    .as_ref()
-                    .unwrap()
-                    .trunk_cache
-                    .get(&split.trunk)
-                    .cloned();
+                let prev = self.batch_runtime()?.trunk_cache.get(&split.trunk).cloned();
                 let steps = if let Some(prev) = prev {
                     self.capture_steps(&prev.steps)?
                 } else {
@@ -2172,7 +2001,7 @@ impl Worker {
                         capture,
                     )?
                 };
-                self.batch.as_mut().unwrap().trunk_cache.insert(
+                self.batch_runtime_mut()?.trunk_cache.insert(
                     split.trunk.clone(),
                     Rc::new(SubProgram {
                         steps,
@@ -2182,17 +2011,11 @@ impl Worker {
                 );
             }
             if let (Some(tail_key), Some(capture)) = (&split.tail, need_tail) {
-                let prev = self
-                    .batch
-                    .as_ref()
-                    .unwrap()
-                    .tail_cache
-                    .get(tail_key)
-                    .cloned();
+                let prev = self.batch_runtime()?.tail_cache.get(tail_key).cloned();
                 let steps = if let Some(prev) = prev {
                     self.capture_steps(&prev.steps)?
                 } else if let Some(tp) = &tail_packet {
-                    let tail_boundary = self.batch.as_ref().unwrap().tables[&tail_key.family]
+                    let tail_boundary = self.batch_runtime()?.tables[&tail_key.family]
                         .decoder_boundary
                         .ok_or("Missing tail decoder boundary index")?;
                     let prepare_len = trunk_boundary - split_idx;
@@ -2223,7 +2046,7 @@ impl Worker {
                         capture,
                     )?
                 };
-                self.batch.as_mut().unwrap().tail_cache.insert(
+                self.batch_runtime_mut()?.tail_cache.insert(
                     tail_key.clone(),
                     Rc::new(SubProgram {
                         steps,
@@ -2233,13 +2056,7 @@ impl Worker {
                 );
             }
             if let (Some(head_key), Some(capture)) = (&split.head, need_head) {
-                let prev = self
-                    .batch
-                    .as_ref()
-                    .unwrap()
-                    .head_cache
-                    .get(head_key)
-                    .cloned();
+                let prev = self.batch_runtime()?.head_cache.get(head_key).cloned();
                 let steps = if let Some(prev) = prev {
                     self.capture_steps(&prev.steps)?
                 } else {
@@ -2252,7 +2069,7 @@ impl Worker {
                         capture,
                     )?
                 };
-                self.batch.as_mut().unwrap().head_cache.insert(
+                self.batch_runtime_mut()?.head_cache.insert(
                     head_key.clone(),
                     Rc::new(SubProgram {
                         steps,
@@ -2261,7 +2078,7 @@ impl Worker {
                     }),
                 );
             }
-            if self.rank == 0 && std::env::var_os("ORINFER_A2_BATCH_PROFILE").is_some() {
+            if self.rank == 0 && super::diag().batch_profile {
                 super::log_async(format!(
                     "A2 split prepare {}",
                     serde_json::json!({
@@ -2275,32 +2092,17 @@ impl Worker {
                 ));
             }
         }
-        let runtime = self.batch.as_mut().unwrap();
+        let runtime = self.batch_runtime_mut()?;
         let cap = runtime.capacity;
-        runtime.touch_trunk(split.trunk.clone());
-        while runtime.trunk_cache.len() > cap {
-            let Some(old) = runtime.trunk_lru.pop_front() else {
-                break;
-            };
-            runtime.remove_trunk(&old);
-        }
+        runtime.trunk_cache.touch(split.trunk.clone());
+        runtime.programs_evicted |= runtime.trunk_cache.trim_to(cap);
         if let Some(k) = &split.tail {
-            runtime.touch_tail(k.clone());
-            while runtime.tail_cache.len() > cap {
-                let Some(old) = runtime.tail_lru.pop_front() else {
-                    break;
-                };
-                runtime.remove_tail(&old);
-            }
+            runtime.tail_cache.touch(k.clone());
+            runtime.programs_evicted |= runtime.tail_cache.trim_to(cap);
         }
         if let Some(k) = &split.head {
-            runtime.touch_head(k.clone());
-            while runtime.head_cache.len() > cap {
-                let Some(old) = runtime.head_lru.pop_front() else {
-                    break;
-                };
-                runtime.remove_head(&old);
-            }
+            runtime.head_cache.touch(k.clone());
+            runtime.programs_evicted |= runtime.head_cache.trim_to(cap);
         }
         runtime.trim_total_programs(&ProtectedKeys {
             mono: None,
@@ -2518,7 +2320,7 @@ impl Worker {
         // completion retains the slab and destinations through DMA completion.
         self.session.upload_inputs(&inputs)?;
         self.phases.table_upload_s += upload_started.elapsed().as_secs_f64();
-        self.batch.as_mut().unwrap().bound_tables = Some(BoundTables {
+        self.batch_runtime_mut()?.bound_tables = Some(BoundTables {
             key,
             retained: retained.clone(),
         });
@@ -2529,7 +2331,7 @@ impl Worker {
             return Ok(());
         }
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
-        for (id, owner) in &self.batch.as_ref().unwrap().owners {
+        for (id, owner) in &self.batch_runtime()?.owners {
             for (name, b) in &owner.buffers {
                 if name.starts_with("cache.ring.") {
                     let data = self.session.download(b, 0, b.bytes())?;
@@ -2558,7 +2360,7 @@ impl Worker {
             return Err("Batch input differs from row layout".into());
         }
         let (split_keys, mono_key, execution) = {
-            let runtime = self.batch.as_ref().ok_or("Missing batch runtime")?;
+            let runtime = self.batch_runtime()?;
             let split = runtime.split_keys(layout)?;
             let mono = if split.is_none() {
                 Some(runtime.key(layout)?)
@@ -2571,17 +2373,17 @@ impl Worker {
             (split, mono, execution)
         };
         {
-            let runtime = self.batch.as_mut().unwrap();
+            let runtime = self.batch_runtime_mut()?;
             if let Some(split) = &split_keys {
-                runtime.touch_trunk(split.trunk.clone());
+                runtime.trunk_cache.touch(split.trunk.clone());
                 if let Some(k) = &split.tail {
-                    runtime.touch_tail(k.clone());
+                    runtime.tail_cache.touch(k.clone());
                 }
                 if let Some(k) = &split.head {
-                    runtime.touch_head(k.clone());
+                    runtime.head_cache.touch(k.clone());
                 }
             } else if let Some(k) = &mono_key {
-                runtime.touch_shared_packet(k.clone());
+                runtime.cache.touch(k.clone());
             }
             for segment in &layout.segments {
                 if let Some(owner) = runtime.owners.get_mut(&segment.slot) {
@@ -2591,7 +2393,7 @@ impl Worker {
         }
         let retained =
             self.update_batch_tables(layout, &execution.packet, execution.tail_packet.as_deref())?;
-        let device_input = if std::env::var_os("ORINFER_A2_BATCH_TRACE").is_none() {
+        let device_input = if super::diag().batch_trace.is_none() {
             if let Some(mut runtime) = self.device_inputs.take() {
                 let result = runtime.prepare(self, &execution.packet, layout, tokens, readout);
                 self.device_inputs = Some(runtime);
@@ -2662,9 +2464,7 @@ impl Worker {
             .as_ref()
             .map(|_| -> Result<_> {
                 let replay = self
-                    .batch
-                    .as_ref()
-                    .unwrap()
+                    .batch_runtime()?
                     .contract
                     .decoder_replay
                     .as_ref()
@@ -2706,8 +2506,13 @@ impl Worker {
                 inputs.push((get(&self.buffers, lengths)?.slice(0, bytes.len())?, bytes));
             }
         }
+        let runtime = self.batch_runtime()?;
         for (i, (segment, input)) in layout.segments.iter().zip(tokens).enumerate() {
-            let history = &self.batch.as_ref().unwrap().owners[&segment.slot].history;
+            let owner = runtime
+                .owners
+                .get(&segment.slot)
+                .ok_or("Unknown batch owner")?;
+            let history = &owner.history;
             if !device_coordinates {
                 inputs.extend(self.coordinate_inputs(
                     &execution.packet.coordinates,
@@ -2721,13 +2526,14 @@ impl Worker {
                 super::vision::write_mask(
                     data,
                     layout.rows.starts[i],
-                    &self.batch.as_ref().unwrap().owners[&segment.slot].vision,
+                    &owner.vision,
                     history.len(),
                     segment.tokens,
                 )?;
             }
             if let Some(names) = &execution.packet.decoder_coordinates {
-                let (suffix, keep, final_prompt_only) = decoder.as_ref().unwrap();
+                let (suffix, keep, final_prompt_only) =
+                    decoder.as_ref().ok_or("Missing decoder layout")?;
                 let (keep, final_prompt_only) = (*keep, *final_prompt_only);
                 let count = suffix.segments[i].tokens;
                 let skipped = segment.tokens - count;
@@ -2746,7 +2552,7 @@ impl Worker {
                         super::vision::write_mask(
                             data,
                             suffix.rows.starts[i],
-                            &self.batch.as_ref().unwrap().owners[&segment.slot].vision,
+                            &owner.vision,
                             history.len() + skipped,
                             count,
                         )?;
@@ -2780,10 +2586,7 @@ impl Worker {
                 valid.extend(owner_valid);
             }
             if layout.role == super::PacketRole::Target {
-                for span in self.batch.as_ref().unwrap().owners[&segment.slot]
-                    .vision
-                    .iter()
-                {
+                for span in owner.vision.iter() {
                     let start = history.len().max(span.start);
                     let end = (history.len() + input.len()).min(span.end());
                     if start < end {
@@ -2801,7 +2604,7 @@ impl Worker {
         inputs.extend(source_images);
         inputs.extend(decoder_images);
         inputs.push((
-            get(&self.buffers, &self.batch.as_ref().unwrap().contract.active)?,
+            get(&self.buffers, &self.batch_runtime()?.contract.active)?,
             1i32.to_le_bytes().to_vec(),
         ));
         if let Some(name) = &execution.packet.coordinates.input_ids
@@ -2814,30 +2617,29 @@ impl Worker {
             inputs.push((get(&self.buffers, name)?.slice(0, bytes.len())?, bytes));
         }
         self.session.upload_inputs(&inputs)?;
-        let sampled = if let Some(trace) = std::env::var_os("ORINFER_A2_BATCH_TRACE") {
+        let sampled = if let Some(trace) = &super::diag().batch_trace {
+            let owners = &self.batch_runtime()?.owners;
             let name = layout
                 .segments
                 .iter()
-                .map(|s| {
-                    format!(
-                        "{}-{}-{}",
-                        s.slot,
-                        self.batch.as_ref().unwrap().owners[&s.slot].history.len(),
-                        s.tokens
-                    )
-                })
+                .map(|s| format!("{}-{}-{}", s.slot, owners[&s.slot].history.len(), s.tokens))
                 .collect::<Vec<_>>()
                 .join("_");
-            let path = std::path::PathBuf::from(trace).join(name);
+            let path = trace.join(name);
             self.trace_rings(&path, "before")?;
             self.trace_packet(
                 &execution,
-                &joined,
-                &hashes,
-                &valid,
+                super::packet::Inputs {
+                    tokens: &joined,
+                    hashes: &hashes,
+                    valid: &valid,
+                    visual_rows: &visual_rows,
+                    device: None,
+                    first: None,
+                    next: &[],
+                },
                 !layout.outputs.is_empty(),
                 &path,
-                &visual_rows,
             )?;
             self.trace_rings(&path, "after")?;
             self.sample_batch(&execution, layout, readout)?
@@ -3030,15 +2832,14 @@ impl Worker {
                 });
             }
         }
+        let runtime = self.batch_runtime_mut()?;
         for (segment, input) in layout.segments.iter().zip(tokens).filter(|(s, _)| {
             layout.role == super::PacketRole::Target && layout.pad_slot != Some(s.slot)
         }) {
-            self.batch
-                .as_mut()
-                .unwrap()
+            runtime
                 .owners
                 .get_mut(&segment.slot)
-                .unwrap()
+                .ok_or("Unknown batch owner")?
                 .history
                 .extend_from_slice(input);
         }
@@ -3049,21 +2850,20 @@ impl Worker {
                     .direct_uses
                     .set(execution.trunk.direct_uses.get().saturating_add(1));
             }
-            let runtime = self.batch.as_mut().unwrap();
-            runtime.record_trunk_use(split.trunk);
+            runtime.trunk_cache.record_use(split.trunk);
             if let (Some(tail_key), Some(tail)) = (split.tail, &execution.tail) {
                 if !tail.captured {
                     tail.direct_uses
                         .set(tail.direct_uses.get().saturating_add(1));
                 }
-                runtime.record_tail_use(tail_key);
+                runtime.tail_cache.record_use(tail_key);
             }
             if let (Some(head_key), Some(head)) = (split.head, &execution.head) {
                 if !head.captured {
                     head.direct_uses
                         .set(head.direct_uses.get().saturating_add(1));
                 }
-                runtime.record_head_use(head_key);
+                runtime.head_cache.record_use(head_key);
             }
         } else if let Some(key) = mono_key {
             if !execution.all_captured() {
@@ -3072,7 +2872,7 @@ impl Worker {
                     .direct_uses
                     .set(execution.trunk.direct_uses.get().saturating_add(1));
             }
-            self.batch.as_mut().unwrap().record_use(key);
+            runtime.cache.record_use(key);
         }
         Ok(output)
     }
@@ -3117,7 +2917,8 @@ impl Worker {
                 return Err("Probability rejection does not accept processed rows".into());
             }
             let (controls, proposals) = readout.rejection_rows(layout)?;
-            return Ok(Some(self.sampling.as_mut().unwrap().sample_rejection(
+            let sampling = self.sampling.as_mut().ok_or("Missing device sampler")?;
+            return Ok(Some(sampling.sample_rejection(
                 &self.session,
                 &self.comm,
                 &source,
@@ -3126,14 +2927,18 @@ impl Worker {
                 execution.all_captured(),
             )?));
         }
-        let sampled = self.sampling.as_mut().unwrap().enqueue_sample(
-            &self.session,
-            &source,
-            execution.packet.vocab_first,
-            &readout.controls(layout)?,
-            &readout.row_parameters(layout)?,
-            execution.all_captured(),
-        )?;
+        let sampled = self
+            .sampling
+            .as_mut()
+            .ok_or("Missing device sampler")?
+            .enqueue_sample(
+                &self.session,
+                &source,
+                execution.packet.vocab_first,
+                &readout.controls(layout)?,
+                &readout.row_parameters(layout)?,
+                execution.all_captured(),
+            )?;
         // Return the already-produced local samples while device continuation
         // preparation proceeds on the same stream after this readback fence.
         let pending = sampled
@@ -3141,21 +2946,25 @@ impl Worker {
             .then(|| {
                 self.sampling
                     .as_ref()
-                    .unwrap()
+                    .ok_or("Missing device sampler")?
                     .begin_read_samples(&self.session, layout.outputs.len())
             })
             .transpose()?;
         if let Some(mut runtime) = self.device_inputs.take() {
-            let result =
-                if sampled.is_none() && std::env::var_os("ORINFER_A2_BATCH_TRACE").is_none() {
-                    let samples = self.sampling.as_ref().unwrap().output().clone();
-                    runtime.commit(self, layout, &samples, readout)
-                } else {
-                    layout
-                        .segments
-                        .iter()
-                        .try_for_each(|s| runtime.invalidate(s.slot))
-                };
+            let result = if sampled.is_none() && super::diag().batch_trace.is_none() {
+                let samples = self
+                    .sampling
+                    .as_ref()
+                    .ok_or("Missing device sampler")?
+                    .output()
+                    .clone();
+                runtime.commit(self, layout, &samples, readout)
+            } else {
+                layout
+                    .segments
+                    .iter()
+                    .try_for_each(|s| runtime.invalidate(s.slot))
+            };
             self.device_inputs = Some(runtime);
             result?;
         }
@@ -3164,8 +2973,11 @@ impl Worker {
             None => self
                 .sampling
                 .as_ref()
-                .unwrap()
-                .finish_read_samples(&self.session, pending.unwrap())?,
+                .ok_or("Missing device sampler")?
+                .finish_read_samples(
+                    &self.session,
+                    pending.ok_or("Missing pending sample readback")?,
+                )?,
         }))
     }
 }

@@ -10,7 +10,7 @@
     "crates/orinfer-engine/Cargo.toml": "9f3606a059a3d6a6cc6877bc9b3d8f222d814649c192c27a091dac8ccaa8ffa9",
     "crates/orinfer-model-sdk/Cargo.toml": "7f5602c15a3f48bc4dc327b3595dfad668d0509bb9c3277bdd56b92df803f107",
     "crates/orinfer-models/Cargo.toml": "96198c5006d99269c1b34ec7e0e384853edfc18b731665803fd72b04300c7145",
-    "pyproject.toml": "3bcd66470dae20b73bf3205c915c9316ba281eb888f84f84d94e0c7526e4b2f1",
+    "pyproject.toml": "68990c48d3f67709570e261f6e92c7191babee6ed99e6bc1cd6ef0f66e1b6573",
     "rust-toolchain.toml": "7553618f800829444096beea3dce84c3d07585efda504c19adb6787369bbd9e8",
     "tools/build/jetson_wheels.json": "435e70191f25563446812566da873e69200bd0471958b0adaa021026fc5ab4b4",
     "tools/environments/ascend/Dockerfile": "bd7f5808824f17306b0bfc3752bd658610fce22126aa8ee151c44952a131b5ca",

@@ -103,7 +103,9 @@ def contract(kernel, host, capacity=128, row_multiplier=1, constants=None):
     if len(kernel["args"]) != len(host["ordered_arguments"]):
         raise ValueError("Host argument count differs")
     args = []
-    for index, (bound, exported) in enumerate(zip(kernel["args"], host["ordered_arguments"])):
+    for index, (bound, exported) in enumerate(
+        zip(kernel["args"], host["ordered_arguments"], strict=True)
+    ):
         if exported["ctype"] in ("ctypes.c_int32", "c_int32"):
             if bound != dict(kind="i32", value=evaluate(exported["value"], dimensions)):
                 raise ValueError("Host scalar differs from capacity binding")

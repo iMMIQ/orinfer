@@ -395,7 +395,7 @@ class ProjectionTuner:
             # The native tuner has validated its profiling inputs; validate
             # additional runtime tails and replay using the selected geometry.
             checked = []
-            for live in sorted(set([sample, 1, 5, 7, 9, 33, 127, rows])) if dynamic else [rows]:
+            for live in sorted({sample, 1, 5, 7, 9, 33, 127, rows}) if dynamic else [rows]:
                 if live > rows:
                     continue
                 self._validate(kernel, spec, record["config"], live, weights)

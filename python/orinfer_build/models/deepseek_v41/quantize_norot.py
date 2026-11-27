@@ -25,21 +25,18 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 import ctypes
-import hashlib
 import json
 import multiprocessing
 import os
 from pathlib import Path
-import platform
 import re
 import shutil
-import subprocess
-import tempfile
 import time
 
 import numpy as np
 
 from orinfer_build.common.files import atomic_json
+from orinfer_build.common.native_c import load_shared_c
 from orinfer_build.common.shared_json import decode
 from orinfer_build.models.deepseek_v41.export_release import TensorRelease
 from orinfer_build.models.deepseek_v41.floating import bf16_parts
@@ -60,34 +57,13 @@ class SSZQuantizer:
     """Hash-cached OpenMP C11 per-channel SSZ signed INT4 [-8, 7] quantizer."""
 
     def __init__(self, cache_dir: Path):
-        source = Path(__file__).with_name("ssz_w4.c")
-        compiler = subprocess.check_output(["cc", "--version"])
-        key = hashlib.sha256(
-            source.read_bytes() + compiler + platform.machine().encode()
-        ).hexdigest()
-        cache = Path(cache_dir)
-        cache.mkdir(parents=True, exist_ok=True)
-        library = cache / f"ssz_w4-{key}.so"
-        if not library.exists():
-            with tempfile.TemporaryDirectory(dir=cache) as temporary:
-                staged = Path(temporary) / "ssz_w4.so"
-                subprocess.run(
-                    [
-                        "cc",
-                        "-O3",
-                        "-std=c11",
-                        "-fopenmp",
-                        "-shared",
-                        "-fPIC",
-                        str(source),
-                        "-lm",
-                        "-o",
-                        str(staged),
-                    ],
-                    check=True,
-                )
-                os.replace(staged, library)
-        self.library = ctypes.CDLL(str(library.resolve()))
+        self.library = load_shared_c(
+            Path(__file__).with_name("ssz_w4.c"),
+            Path(cache_dir),
+            prefix="ssz_w4",
+            openmp=True,
+            math_lib=True,
+        )
         self.call = self.library.orinfer_ssz_w4_rows
         self.call.argtypes = [
             ctypes.c_void_p,
@@ -125,35 +101,14 @@ class GPTQQuantizer:
     """Hash-cached OpenMP C11 Act-Order Blocked GPTQ + H-optimal scale INT4 [-8, 7] quantizer."""
 
     def __init__(self, cache_dir: Path, n_threads: int | None = None):
-        source = Path(__file__).with_name("gptq_w4.c")
-        compiler = subprocess.check_output(["cc", "--version"])
-        key = hashlib.sha256(
-            source.read_bytes() + compiler + platform.machine().encode()
-        ).hexdigest()
-        cache = Path(cache_dir)
-        cache.mkdir(parents=True, exist_ok=True)
-        library = cache / f"gptq_w4-{key}.so"
-        if not library.exists():
-            with tempfile.TemporaryDirectory(dir=cache) as temporary:
-                staged = Path(temporary) / "gptq_w4.so"
-                subprocess.run(
-                    [
-                        "cc",
-                        "-O3",
-                        "-std=c11",
-                        "-fopenmp",
-                        "-shared",
-                        "-fPIC",
-                        str(source),
-                        "-lm",
-                        "-o",
-                        str(staged),
-                    ],
-                    check=True,
-                )
-                os.replace(staged, library)
-        self.n_threads = int(n_threads or os.cpu_count() or 1)
-        self.library = ctypes.CDLL(str(library.resolve()))
+        self.n_threads = max(1, int(os.cpu_count() or 1) if n_threads is None else int(n_threads))
+        self.library = load_shared_c(
+            Path(__file__).with_name("gptq_w4.c"),
+            Path(cache_dir),
+            prefix="gptq_w4",
+            openmp=True,
+            math_lib=True,
+        )
         self.hdiag_ssz = self.library.orinfer_hdiag_ssz_scale
         self.hdiag_ssz.argtypes = [
             ctypes.c_void_p,
@@ -231,21 +186,23 @@ class GPTQQuantizer:
             np.ascontiguousarray(h_damped, dtype=np.float32),
         )
 
-    def quantize_cpu(
+    def blocked_gptq(
         self,
         weights: np.ndarray,
-        hessian: np.ndarray,
+        hinv_ch: np.ndarray,
+        perm: np.ndarray,
+        invperm: np.ndarray,
+        hd_p: np.ndarray,
         *,
-        damp_frac: float = 0.05,
         block_size: int = 128,
-        cd_iters: int = 0,
-    ) -> tuple[np.ndarray, np.ndarray, float]:
-        """Pure-CPU Act-Order Blocked GPTQ + exact H-optimal scale (+ optional CD refinement)."""
+        update_fn=None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run C11 Hessian-diagonal SSZ init + blocked Act-Order GPTQ elimination."""
         w = np.ascontiguousarray(weights, dtype=np.float32)
         n, k = w.shape
-        perm, invperm, hinv_ch, h_damped = self.factor_hessian(hessian, damp_frac=damp_frac)
         wp = np.ascontiguousarray(w[:, perm], dtype=np.float32)
-        hd_p = np.ascontiguousarray(np.diag(h_damped)[perm], dtype=np.float32)
+        hd_p = np.ascontiguousarray(hd_p, dtype=np.float32)
+        hinv_ch = np.ascontiguousarray(hinv_ch, dtype=np.float32)
         s = np.empty(n, dtype=np.float32)
         self.hdiag_ssz(wp.ctypes.data, hd_p.ctypes.data, n, k, self.n_threads, s.ctypes.data)
 
@@ -269,9 +226,29 @@ class GPTQQuantizer:
             )
             qp[:, i1:i2] = qb
             if i2 < k:
-                wp[:, i2:] -= eb @ hinv_ch[i1:i2, i2:]
+                if update_fn is not None:
+                    update_fn(wp, eb, i1, i2)
+                else:
+                    wp[:, i2:] -= eb @ hinv_ch[i1:i2, i2:]
 
-        q = np.ascontiguousarray(qp[:, invperm], dtype=np.int8)
+        return np.ascontiguousarray(qp[:, invperm], dtype=np.int8), s
+
+    def quantize_cpu(
+        self,
+        weights: np.ndarray,
+        hessian: np.ndarray,
+        *,
+        damp_frac: float = 0.05,
+        block_size: int = 128,
+        cd_iters: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Pure-CPU Act-Order Blocked GPTQ + exact H-optimal scale (+ optional CD refinement)."""
+        w = np.ascontiguousarray(weights, dtype=np.float32)
+        n, k = w.shape
+        perm, invperm, hinv_ch, h_damped = self.factor_hessian(hessian, damp_frac=damp_frac)
+        hd_p = np.ascontiguousarray(np.diag(h_damped)[perm], dtype=np.float32)
+        q, s = self.blocked_gptq(w, hinv_ch, perm, invperm, hd_p, block_size=block_size)
+
         wh = w @ h_damped
         qf = q.astype(np.float32)
         qh = qf @ h_damped
@@ -398,6 +375,69 @@ def pack_w4_nz_bank(
     return packed_nz.view(np.int8), scale_u64, assist
 
 
+def save_expert_bank(
+    dest: Path,
+    up_qs: list[np.ndarray],
+    up_ss: list[np.ndarray],
+    dn_qs: list[np.ndarray],
+    dn_ss: list[np.ndarray],
+    *,
+    up_w8: bool,
+    dn_w8: bool,
+) -> None:
+    """Persist quantized routed-expert up/down banks in W8 ND or W4 Transposed-NZ layout."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for stem, qs, ss, is_w8 in (("up", up_qs, up_ss, up_w8), ("down", dn_qs, dn_ss, dn_w8)):
+        if is_w8:
+            np.save(dest / f"{stem}_w8.npy", np.stack(qs, axis=0))
+            np.save(dest / f"{stem}_scale_bf16.npy", np.stack(ss, axis=0))
+        else:
+            nz, sc, ast = pack_w4_nz_bank(qs, ss)
+            np.save(dest / f"{stem}_nz.npy", nz)
+            np.save(dest / f"{stem}_scale.npy", sc)
+            np.save(dest / f"{stem}_assist.npy", ast)
+
+
+def _prepare_expert_group(
+    ckpt: Checkpoint,
+    ssz: SSZQuantizer | None,
+    prefixes: list[str],
+    *,
+    up_w8: bool,
+    dn_w8: bool,
+):
+    up_qs, up_ss, dn_qs, dn_ss = [], [], [], []
+    nmse_up, nmse_dn = [], []
+    for pref in prefixes:
+        w_up = np.concatenate(
+            [ckpt.matrix(f"{pref}.w1.weight"), ckpt.matrix(f"{pref}.w3.weight")], axis=0
+        )
+        if up_w8:
+            s_up = np.concatenate(
+                [ckpt.read(f"{pref}.w1.scale"), ckpt.read(f"{pref}.w3.scale")], axis=0
+            )
+            q, enc, nmse = quantize_exact_w8(w_up, s_up)
+            up_qs.append(np.ascontiguousarray(q.T))
+            up_ss.append(enc)
+        else:
+            q, sc, nmse = ssz(w_up)
+            up_qs.append(q)
+            up_ss.append(sc)
+        nmse_up.append(nmse)
+
+        w2 = ckpt.matrix(f"{pref}.w2.weight")
+        if dn_w8:
+            q, enc, nmse = quantize_exact_w8(w2, ckpt.read(f"{pref}.w2.scale"))
+            dn_qs.append(np.ascontiguousarray(q.T))
+            dn_ss.append(enc)
+        else:
+            q, sc, nmse = ssz(w2)
+            dn_qs.append(q)
+            dn_ss.append(sc)
+        nmse_dn.append(nmse)
+    return up_qs, up_ss, dn_qs, dn_ss, float(np.mean(nmse_up)), float(np.mean(nmse_dn))
+
+
 def _prepare_target_bank(task):
     official_dir, layer, rank, is_w8, prep_dir, cache_dir = task
     dest = Path(prep_dir) / f"L{layer:02d}_r{rank}"
@@ -406,64 +446,21 @@ def _prepare_target_bank(task):
         rec = json.loads(marker.read_text())
         if rec.get("is_w8") == is_w8:
             return rec
-    dest.mkdir(parents=True, exist_ok=True)
 
     ckpt = Checkpoint(Path(official_dir), Decoder(Path(cache_dir)))
     ssz = None if is_w8 else SSZQuantizer(Path(cache_dir))
     try:
-        up_qs, up_ss, dn_qs, dn_ss = [], [], [], []
-        nmse_up, nmse_dn = [], []
-        for local in range(48):
-            e = rank * 48 + local
-            pref = f"layers.{layer}.ffn.experts.{e}"
-            w_up = np.concatenate(
-                [ckpt.matrix(f"{pref}.w1.weight"), ckpt.matrix(f"{pref}.w3.weight")], axis=0
-            )
-            if is_w8:
-                s_up = np.concatenate(
-                    [ckpt.read(f"{pref}.w1.scale"), ckpt.read(f"{pref}.w3.scale")], axis=0
-                )
-                q, enc, nmse = quantize_exact_w8(w_up, s_up)
-                up_qs.append(np.ascontiguousarray(q.T))
-                up_ss.append(enc)
-            else:
-                q, sc, nmse = ssz(w_up)
-                up_qs.append(q)
-                up_ss.append(sc)
-            nmse_up.append(nmse)
-
-            w2 = ckpt.matrix(f"{pref}.w2.weight")
-            if is_w8:
-                q, enc, nmse = quantize_exact_w8(w2, ckpt.read(f"{pref}.w2.scale"))
-                dn_qs.append(np.ascontiguousarray(q.T))
-                dn_ss.append(enc)
-            else:
-                q, sc, nmse = ssz(w2)
-                dn_qs.append(q)
-                dn_ss.append(sc)
-            nmse_dn.append(nmse)
-
-        if is_w8:
-            np.save(dest / "up_w8.npy", np.stack(up_qs, axis=0))
-            np.save(dest / "up_scale_bf16.npy", np.stack(up_ss, axis=0))
-            np.save(dest / "down_w8.npy", np.stack(dn_qs, axis=0))
-            np.save(dest / "down_scale_bf16.npy", np.stack(dn_ss, axis=0))
-        else:
-            nz, sc, ast = pack_w4_nz_bank(up_qs, up_ss)
-            np.save(dest / "up_nz.npy", nz)
-            np.save(dest / "up_scale.npy", sc)
-            np.save(dest / "up_assist.npy", ast)
-            nz, sc, ast = pack_w4_nz_bank(dn_qs, dn_ss)
-            np.save(dest / "down_nz.npy", nz)
-            np.save(dest / "down_scale.npy", sc)
-            np.save(dest / "down_assist.npy", ast)
-
+        prefixes = [f"layers.{layer}.ffn.experts.{rank * 48 + local}" for local in range(48)]
+        up_qs, up_ss, dn_qs, dn_ss, mean_up, mean_dn = _prepare_expert_group(
+            ckpt, ssz, prefixes, up_w8=is_w8, dn_w8=is_w8
+        )
+        save_expert_bank(dest, up_qs, up_ss, dn_qs, dn_ss, up_w8=is_w8, dn_w8=is_w8)
         rec = dict(
             layer=layer,
             rank=rank,
             is_w8=is_w8,
-            mean_nmse_up=float(np.mean(nmse_up)),
-            mean_nmse_down=float(np.mean(nmse_dn)),
+            mean_nmse_up=mean_up,
+            mean_nmse_down=mean_dn,
         )
         atomic_json(marker, rec)
         return rec
@@ -480,68 +477,22 @@ def _prepare_draft_bank(task):
         rec = json.loads(marker.read_text())
         if rec.get("up_w8") == up_w8 and rec.get("dn_w8") == dn_w8:
             return rec
-    dest.mkdir(parents=True, exist_ok=True)
 
     ckpt = Checkpoint(Path(official_dir), Decoder(Path(cache_dir)))
     ssz = None if (up_w8 and dn_w8) else SSZQuantizer(Path(cache_dir))
     try:
-        up_qs, up_ss, dn_qs, dn_ss = [], [], [], []
-        nmse_up, nmse_dn = [], []
-        for local in range(16):
-            e = rank * 16 + local
-            pref = f"mtp.{draft_idx}.ffn.experts.{e}"
-            w_up = np.concatenate(
-                [ckpt.matrix(f"{pref}.w1.weight"), ckpt.matrix(f"{pref}.w3.weight")], axis=0
-            )
-            if up_w8:
-                s_up = np.concatenate(
-                    [ckpt.read(f"{pref}.w1.scale"), ckpt.read(f"{pref}.w3.scale")], axis=0
-                )
-                q, enc, nmse = quantize_exact_w8(w_up, s_up)
-                up_qs.append(np.ascontiguousarray(q.T))
-                up_ss.append(enc)
-            else:
-                q, sc, nmse = ssz(w_up)
-                up_qs.append(q)
-                up_ss.append(sc)
-            nmse_up.append(nmse)
-
-            w2 = ckpt.matrix(f"{pref}.w2.weight")
-            if dn_w8:
-                q, enc, nmse = quantize_exact_w8(w2, ckpt.read(f"{pref}.w2.scale"))
-                dn_qs.append(np.ascontiguousarray(q.T))
-                dn_ss.append(enc)
-            else:
-                q, sc, nmse = ssz(w2)
-                dn_qs.append(q)
-                dn_ss.append(sc)
-            nmse_dn.append(nmse)
-
-        if up_w8:
-            np.save(dest / "up_w8.npy", np.stack(up_qs, axis=0))
-            np.save(dest / "up_scale_bf16.npy", np.stack(up_ss, axis=0))
-        else:
-            nz, sc, ast = pack_w4_nz_bank(up_qs, up_ss)
-            np.save(dest / "up_nz.npy", nz)
-            np.save(dest / "up_scale.npy", sc)
-            np.save(dest / "up_assist.npy", ast)
-
-        if dn_w8:
-            np.save(dest / "down_w8.npy", np.stack(dn_qs, axis=0))
-            np.save(dest / "down_scale_bf16.npy", np.stack(dn_ss, axis=0))
-        else:
-            nz, sc, ast = pack_w4_nz_bank(dn_qs, dn_ss)
-            np.save(dest / "down_nz.npy", nz)
-            np.save(dest / "down_scale.npy", sc)
-            np.save(dest / "down_assist.npy", ast)
-
+        prefixes = [f"mtp.{draft_idx}.ffn.experts.{rank * 16 + local}" for local in range(16)]
+        up_qs, up_ss, dn_qs, dn_ss, mean_up, mean_dn = _prepare_expert_group(
+            ckpt, ssz, prefixes, up_w8=up_w8, dn_w8=dn_w8
+        )
+        save_expert_bank(dest, up_qs, up_ss, dn_qs, dn_ss, up_w8=up_w8, dn_w8=dn_w8)
         rec = dict(
             layer=dl,
             rank=rank,
             up_w8=up_w8,
             dn_w8=dn_w8,
-            mean_nmse_up=float(np.mean(nmse_up)),
-            mean_nmse_down=float(np.mean(nmse_dn)),
+            mean_nmse_up=mean_up,
+            mean_nmse_down=mean_dn,
         )
         atomic_json(marker, rec)
         return rec
@@ -649,832 +600,774 @@ class NoRotRelease(TensorRelease):
             prepared_tensor=dict(name=replacement, dtype=dtype, shape=shape),
         )
 
+    def _replace_shared(self, rank_defs, buf_name, values, dtype, suffix=".norot"):
+        common_grp = "weights/shared/model-common.safetensors"
+        for ri in range(8):
+            self.replace_tensor(
+                rank_defs[ri][buf_name],
+                values,
+                suffix=suffix,
+                dtype=dtype,
+                group=common_grp,
+            )
+
+    def _replace_expert_bank(
+        self,
+        rdefs,
+        folder: Path,
+        prefix: str,
+        stem: str,
+        *,
+        is_w8: bool,
+        group: str,
+        w8_packed_suffix: str,
+        w8_scale_suffix: str,
+        w4_suffix: str,
+    ):
+        if is_w8:
+            self.replace_from_npy(
+                rdefs[prefix + ".packed"],
+                folder / f"{stem}_w8.npy",
+                suffix=w8_packed_suffix,
+                dtype="I8",
+                group=group,
+            )
+            self.replace_from_npy(
+                rdefs[prefix + ".scale"],
+                folder / f"{stem}_scale_bf16.npy",
+                suffix=w8_scale_suffix,
+                dtype="BF16",
+                group=group,
+            )
+        else:
+            self.replace_from_npy(
+                rdefs[prefix + ".packed"],
+                folder / f"{stem}_nz.npy",
+                suffix=w4_suffix,
+                dtype="I8",
+                group=group,
+            )
+            self.replace_from_npy(
+                rdefs[prefix + ".scale"],
+                folder / f"{stem}_scale.npy",
+                suffix=w4_suffix,
+                dtype="U64",
+                group=group,
+            )
+            self.replace_from_npy(
+                rdefs[prefix + ".assist"],
+                folder / f"{stem}_assist.npy",
+                suffix=w4_suffix,
+                dtype="F32",
+                group=group,
+            )
+
+    def _plan_shared_backbone(self, ckpt, ranks, rank_defs):
+        common_grp = "weights/shared/model-common.safetensors"
+        for count, bname in ((256, "norot.ones256"), (1280, "norot.ones1280")):
+            tname = "native." + bname
+            self.add_tensor(tname, np.ones(count, dtype="<f4"), dtype="F32", group=common_grp)
+            for ri in range(8):
+                d = dict(
+                    name=bname,
+                    bytes=count * 4,
+                    prepared_tensor=dict(name=tname, dtype="F32", shape=[count]),
+                )
+                ranks[ri]["buffers"].append(d)
+                rank_defs[ri][bname] = d
+
+        if "rotation" in rank_defs[0]:
+            self._replace_shared(rank_defs, "rotation", np.eye(32, dtype="<f4"), "F32")
+        self._replace_shared(
+            rank_defs,
+            "w.norm.weight.0-5120.0-1.f32",
+            ckpt.read("norm.weight").reshape(5120, 1).astype("<f4"),
+            "F32",
+        )
+        self._replace_shared(
+            rank_defs,
+            "dspark.warm_decode.w.mtp.0.main_proj.weight.0-5120.0-15360.bf16",
+            to_bf16_u16(ckpt.matrix("mtp.0.main_proj.weight")),
+            "BF16",
+        )
+
+        emb_off = to_bf16_u16(ckpt.matrix("embed.weight"))
+        self.transforms["embed.weight"] = "embed.weight"
+        self.payloads["embed.weight"] = emb_off
+        self.payload_dtypes["embed.weight"] = "BF16"
+        self.override_groups["embed.weight"] = "weights/shared/embedding.safetensors"
+
+        head_full = ckpt.matrix("head.weight")
+        for ri in range(8):
+            h_parts = bf16_parts(head_full[ri * 16160 : (ri + 1) * 16160]).astype("<u2")
+            bname = f"w.head.weight.{ri * 16160}-16160.0-5120.f32"
+            grp = f"weights/gpu/rank-{ri:02}/layers-36-39.safetensors"
+            self.replace_tensor(
+                rank_defs[ri][bname], h_parts, suffix=".norot", dtype="BF16", group=grp
+            )
+        del head_full
+
+        for el in (1, 14):
+            ew = ckpt.matrix(f"layers.{el}.engram.wkv.weight")
+            first = el // 4 * 4
+            for ri in range(8):
+                sl = to_bf16_u16(ew[ri * 3200 : (ri + 1) * 3200])
+                bname = f"w.layers.{el}.engram.wkv.weight.{ri * 3200}-3200.0-6144.bf16"
+                grp = f"weights/gpu/rank-{ri:02}/layers-{first:02}-{first + 3:02}.safetensors"
+                self.replace_tensor(
+                    rank_defs[ri][bname], sl, suffix=".norot", dtype="BF16", group=grp
+                )
+            del ew
+
+    def _plan_layer_weights(self, ckpt, layer: int, rank_defs, sq_active: dict):
+        pref = f"layers.{layer}"
+        s_q, s_attn, s_shw, s_ffn = self._load_layer_smoothquant(layer)
+        has_q = bool(np.any(s_q != 1.0))
+        has_attn = bool(np.any(s_attn != 1.0))
+        has_shw = bool(np.any(s_shw != 1.0))
+        has_ffn = bool(np.any(s_ffn != 1.0))
+        sq_active["q"] += int(has_q)
+        sq_active["attn"] += int(has_attn)
+        sq_active["shw"] += int(has_shw)
+        sq_active["ffn"] += int(has_ffn)
+
+        attn_norm_w = ckpt.read(f"{pref}.attn_norm.weight").astype("<f4")
+        if has_attn:
+            attn_norm_w = attn_norm_w / s_attn
+        ffn_norm_w = ckpt.read(f"{pref}.ffn_norm.weight").astype("<f4")
+        if has_ffn:
+            ffn_norm_w = ffn_norm_w / s_ffn
+        q_norm_w = ckpt.read(f"{pref}.attn.q_norm.weight").astype("<f4")
+        if has_q:
+            q_norm_w = q_norm_w / s_q
+
+        self._replace_shared(
+            rank_defs,
+            f"w.{pref}.attn_norm.weight.0-5120.0-1.f32",
+            attn_norm_w.reshape(5120, 1).astype("<f4"),
+            "F32",
+        )
+        self._replace_shared(
+            rank_defs,
+            f"w.{pref}.ffn_norm.weight.0-5120.0-1.f32",
+            ffn_norm_w.reshape(5120, 1).astype("<f4"),
+            "F32",
+        )
+        self._replace_shared(
+            rank_defs,
+            f"w.{pref}.attn.q_norm.weight.0-1280.0-1.f32",
+            q_norm_w.reshape(1280, 1).astype("<f4"),
+            "F32",
+        )
+        self._replace_shared(
+            rank_defs,
+            f"w.{pref}.attn.kv_norm.weight.0-512.0-1.f32",
+            ckpt.read(f"{pref}.attn.kv_norm.weight").reshape(512, 1).astype("<f4"),
+            "F32",
+        )
+
+        for hc_name in ("hc_attn_fn", "hc_ffn_fn"):
+            padded = np.zeros((32, 20480), dtype="<f4")
+            padded[:24] = ckpt.read(f"{pref}.{hc_name}").astype("<f4")
+            self._replace_shared(rank_defs, f"w.{pref}.{hc_name}", padded.reshape(-1), "F32")
+            self._replace_shared(
+                rank_defs,
+                f"parts.w.{pref}.{hc_name}",
+                bf16_parts(padded).astype("<u2"),
+                "BF16",
+            )
+
+        gw = ckpt.matrix(f"{pref}.ffn.gate.weight").astype("<f4")
+        if has_ffn:
+            gw = (gw * s_ffn[None, :]).astype("<f4")
+        self._replace_shared(rank_defs, f"w.{pref}.ffn.gate.weight.0-384.0-5120.f32", gw, "F32")
+        self._replace_shared(
+            rank_defs, f"w.{pref}.ffn.gate.weight.0-384.0-5120.bf16", to_bf16_u16(gw), "BF16"
+        )
+
+        wqa = ckpt.matrix(f"{pref}.attn.wq_a.weight")
+        wkv = ckpt.matrix(f"{pref}.attn.wkv.weight")
+        if layer in self.bf16_qkv_layers:
+            self._replace_shared(
+                rank_defs,
+                f"w.{pref}.attn.wq_a.weight.0-1280.0-5120.i8",
+                to_bf16_u16(wqa),
+                "BF16",
+                suffix=".norot_bf16",
+            )
+            self._replace_shared(
+                rank_defs,
+                f"w.{pref}.attn.wkv.weight.0-512.0-5120.i8",
+                to_bf16_u16(wkv),
+                "BF16",
+                suffix=".norot_bf16",
+            )
+        else:
+            if has_attn:
+                wqa = wqa * s_attn[None, :]
+                wkv = wkv * s_attn[None, :]
+            q_wqa, s_wqa = quantize_per_channel_i8_f32(wqa)
+            q_wkv, s_wkv = quantize_per_channel_i8_f32(wkv)
+            self._replace_shared(
+                rank_defs, f"w.{pref}.attn.wq_a.weight.0-1280.0-5120.i8", q_wqa, "I8"
+            )
+            self._replace_shared(
+                rank_defs, f"w.{pref}.attn.wq_a.weight_scale.0-1280.0-1.f32", s_wqa, "F32"
+            )
+            self._replace_shared(
+                rank_defs, f"w.{pref}.attn.wkv.weight.0-512.0-5120.i8", q_wkv, "I8"
+            )
+            self._replace_shared(
+                rank_defs, f"w.{pref}.attn.wkv.weight_scale.0-512.0-1.f32", s_wkv, "F32"
+            )
+
+        if layer in (2, 8, 14):
+            cwkv = ckpt.matrix(f"{pref}.attn.compressor.wkv.weight").astype("<f4")
+            cwgate = ckpt.matrix(f"{pref}.attn.compressor.wgate.weight").astype("<f4")
+            self._replace_shared(
+                rank_defs, f"w.{pref}.attn.compressor.wkv.weight.0-512.0-5120.f32", cwkv, "F32"
+            )
+            self._replace_shared(
+                rank_defs,
+                f"parts.w.{pref}.attn.compressor.wkv.weight.0-512.0-5120.f32",
+                bf16_parts(cwkv).astype("<u2"),
+                "BF16",
+            )
+            self._replace_shared(
+                rank_defs, f"w.{pref}.attn.compressor.wgate.weight.0-512.0-5120.f32", cwgate, "F32"
+            )
+            self._replace_shared(
+                rank_defs,
+                f"parts.w.{pref}.attn.compressor.wgate.weight.0-512.0-5120.f32",
+                bf16_parts(cwgate).astype("<u2"),
+                "BF16",
+            )
+        elif layer == 20:
+            cwkv = ckpt.matrix(f"{pref}.attn.compressor.wkv.weight")
+            self._replace_shared(
+                rank_defs,
+                f"w.{pref}.attn.compressor.wkv.weight.0-512.0-5120.bf16",
+                to_bf16_u16(cwkv),
+                "BF16",
+            )
+
+        if layer in (2, 8, 14, 20, 24, 28, 32, 36):
+            iwp = ckpt.matrix(f"{pref}.attn.indexer.weights_proj.weight")
+            if has_attn:
+                iwp = iwp * s_attn[None, :]
+            self._replace_shared(
+                rank_defs,
+                f"w.{pref}.attn.indexer.weights_proj.weight.0-32.0-5120.bf16",
+                to_bf16_u16(iwp),
+                "BF16",
+            )
+            idx_wqb = ckpt.matrix(f"{pref}.attn.indexer.wq_b.weight")
+            if has_q:
+                idx_wqb = idx_wqb * s_q[None, :]
+            qi, si = quantize_per_channel_i8_f32(idx_wqb)
+            self._replace_shared(
+                rank_defs, f"w.{pref}.attn.indexer.wq_b.weight.0-4096.0-1280.i8", qi, "I8"
+            )
+            self._replace_shared(
+                rank_defs, f"w.{pref}.attn.indexer.wq_b.weight_scale.0-4096.0-1.f32", si, "F32"
+            )
+
+        wqb_full = ckpt.matrix(f"{pref}.attn.wq_b.weight")
+        if has_q:
+            wqb_full = wqb_full * s_q[None, :]
+        wob_full = ckpt.matrix(f"{pref}.attn.wo_b.weight")
+        sh_w1_m = ckpt.matrix(f"{pref}.ffn.shared_experts.w1.weight")
+        sh_w3_m = ckpt.matrix(f"{pref}.ffn.shared_experts.w3.weight")
+        sh_w2_m = ckpt.matrix(f"{pref}.ffn.shared_experts.w2.weight")
+        if has_ffn:
+            sh_w1_m = sh_w1_m * s_ffn[None, :]
+            sh_w3_m = sh_w3_m * s_ffn[None, :]
+        if has_shw:
+            sh_w3_m = sh_w3_m / s_shw[:, None]
+            sh_w2_m = sh_w2_m * s_shw[None, :]
+        sh_w1_q, sh_w1_s = quantize_per_channel_i8_f32(sh_w1_m)
+        sh_w3_q, sh_w3_s = quantize_per_channel_i8_f32(sh_w3_m)
+        sh_w2_q, sh_w2_s = quantize_per_channel_i8_f32(sh_w2_m)
+        self._replace_shared(
+            rank_defs,
+            f"w.{pref}.ffn.shared_experts.w2.weight_scale.0-5120.0-1.f32",
+            sh_w2_s,
+            "F32",
+        )
+
+        first = layer // 4 * 4
+        is_w8 = layer in self.w8_layers
+        for ri in range(8):
+            grp = f"weights/gpu/rank-{ri:02}/layers-{first:02}-{first + 3:02}.safetensors"
+            exp_grp = f"weights/gpu/rank-{ri:02}/layer-{layer:02}-w8.safetensors" if is_w8 else grp
+
+            q_wqb, s_wqb = quantize_per_channel_i8_f32(wqb_full[ri * 4096 : (ri + 1) * 4096])
+            self.replace_tensor(
+                rank_defs[ri][f"w.{pref}.attn.wq_b.weight.{ri * 4096}-4096.0-1280.i8"],
+                q_wqb,
+                suffix=".norot",
+                dtype="I8",
+                group=grp,
+            )
+            self.replace_tensor(
+                rank_defs[ri][f"w.{pref}.attn.wq_b.weight_scale.{ri * 4096}-4096.0-1.f32"],
+                s_wqb,
+                suffix=".norot",
+                dtype="F32",
+                group=grp,
+            )
+            self.replace_tensor(
+                rank_defs[ri][f"w.{pref}.attn.wo_b.weight.0-5120.{ri * 1024}-1024.bf16"],
+                to_bf16_u16(wob_full[:, ri * 1024 : (ri + 1) * 1024]),
+                suffix=".norot",
+                dtype="BF16",
+                group=grp,
+            )
+            sh_up = np.concatenate(
+                [sh_w1_q[ri * 288 : (ri + 1) * 288], sh_w3_q[ri * 288 : (ri + 1) * 288]],
+                axis=0,
+            )
+            sh_sc = np.concatenate(
+                [
+                    sh_w1_s[ri * 288 : (ri + 1) * 288, 0],
+                    sh_w3_s[ri * 288 : (ri + 1) * 288, 0],
+                ],
+                axis=0,
+            )
+            sh_dn = np.ascontiguousarray(sh_w2_q[:, ri * 288 : (ri + 1) * 288])
+            self.replace_tensor(
+                rank_defs[ri][f"w.shared.{layer}.{ri}.up"],
+                sh_up,
+                suffix=".norot",
+                dtype="I8",
+                group=grp,
+            )
+            self.replace_tensor(
+                rank_defs[ri][f"w.shared.{layer}.{ri}.scale"],
+                sh_sc,
+                suffix=".norot",
+                dtype="F32",
+                group=grp,
+            )
+            self.replace_tensor(
+                rank_defs[ri][f"w.shared.{layer}.{ri}.down"],
+                sh_dn,
+                suffix=".norot",
+                dtype="I8",
+                group=grp,
+            )
+
+            edir = self.prep_dir / f"L{layer:02d}_r{ri}"
+            self._replace_expert_bank(
+                rank_defs[ri],
+                edir,
+                f"w.L{layer}.['w1', 'w3']",
+                "up",
+                is_w8=is_w8,
+                group=exp_grp,
+                w8_packed_suffix=".norot_w8",
+                w8_scale_suffix=".norot_w8",
+                w4_suffix=".norot_ssz",
+            )
+            self._replace_expert_bank(
+                rank_defs[ri],
+                edir,
+                f"w.L{layer}.['w2']",
+                "down",
+                is_w8=is_w8,
+                group=exp_grp,
+                w8_packed_suffix=".norot_w8",
+                w8_scale_suffix=".norot_w8",
+                w4_suffix=".norot_ssz",
+            )
+
+    def _plan_vision_and_draft_weights(self, ckpt, ranks, rank_defs):
+        vis_grp = "vision.safetensors"
+        for vname in (
+            "aligner.w2.weight",
+            "aligner.w2.bias",
+            "image_start",
+            "image_end",
+            "image_newline",
+        ):
+            val = ckpt.matrix(vname) if vname.endswith(".weight") else ckpt.read(vname)
+            self.transforms[vname] = vname
+            self.payloads[vname] = to_bf16_u16(val)
+            self.payload_dtypes[vname] = "BF16"
+            self.override_groups[vname] = vis_grp
+
+        if not (self.draft_prep_dir and self.draft_mode):
+            return
+        up_w8 = self.draft_mode == "full_w8"
+        dn_w8 = self.draft_mode in ("ssz_up_w8_down", "full_w8")
+        for ri in range(8):
+            dgrp = f"weights/dspark/rank-{ri:02}-layers-40-42.safetensors"
+            if up_w8:
+                up_out_name = "dspark.draft.batch.prefill.m512.expert.up.output"
+                if up_out_name not in rank_defs[ri]:
+                    bdef = dict(name=up_out_name, bytes=1536 * 4608 * 2)
+                    ranks[ri]["buffers"].append(bdef)
+                    rank_defs[ri][up_out_name] = bdef
+            for dl in (40, 41, 42):
+                folder = self.draft_prep_dir / f"L{dl}_r{ri}"
+                self._replace_expert_bank(
+                    rank_defs[ri],
+                    folder,
+                    f"dspark.draft.w.L{dl}.['w1', 'w3']",
+                    "up",
+                    is_w8=up_w8,
+                    group=dgrp,
+                    w8_packed_suffix=".w8_nd",
+                    w8_scale_suffix=".w8_bf16",
+                    w4_suffix=".ssz_w4",
+                )
+                self._replace_expert_bank(
+                    rank_defs[ri],
+                    folder,
+                    f"dspark.draft.w.L{dl}.['w2']",
+                    "down",
+                    is_w8=dn_w8,
+                    group=dgrp,
+                    w8_packed_suffix=".w8_nd",
+                    w8_scale_suffix=".w8_bf16",
+                    w4_suffix=".ssz_w4",
+                )
+
+    def _rewrite_packet_graphs(self, ranks):
+        specs = {}
+
+        def get_spec(manifest):
+            if manifest not in specs:
+                specs[manifest] = json.loads((self.package / manifest).read_text())
+            return specs[manifest]
+
+        bf16_set = set(self.bf16_qkv_layers)
+        w8_set = set(self.w8_layers)
+
+        for rank in ranks:
+            p1 = rank["packets"][1]
+            p1_a8_by_layer = {}
+            for i, s in enumerate(p1["body"]):
+                m_up = re.search(r"\.L(\d+)\.up$", s.get("name", ""))
+                if m_up and int(m_up[1]) in w8_set:
+                    layer = int(m_up[1])
+                    p1_a8_by_layer[layer] = deepcopy(p1["body"][i - 1 : i + 5])
+
+            for pi, packet in enumerate(rank["packets"]):
+                body = packet["body"]
+                role = packet.get("role", "target")
+
+                if role == "draft":
+                    if self.draft_mode:
+                        self._rewrite_draft_packet(body)
+                    continue
+
+                self._rewrite_target_packet(packet, pi, get_spec, bf16_set, w8_set, p1_a8_by_layer)
+
+        if self.remap:
+            self._apply_manifest_remap(ranks)
+
+        if bf16_set:
+            rs = self.model.setdefault("row_selections", {})
+            for tag in ("wqa", "wkv"):
+                rs[self.kernels[f"bf16_{tag}_2048"]] = [
+                    dict(
+                        min_rows=lo,
+                        max_rows=hi,
+                        multiple_of=1,
+                        kernels=[self.kernels[f"bf16_{tag}_2048_m{hi}"]],
+                    )
+                    for lo, hi in ((1, 16), (17, 32), (33, 64), (65, 127))
+                ]
+                rs[self.kernels[f"bf16_{tag}_256"]] = [
+                    dict(
+                        min_rows=1,
+                        max_rows=64,
+                        multiple_of=1,
+                        kernels=[self.kernels[f"bf16_{tag}_256_m64"]],
+                    ),
+                ]
+
+        used_manifests = {
+            step["manifest"]
+            for rank in ranks
+            for packet in rank["packets"]
+            for step in packet["body"] + packet["head"]
+            if step["op"] == "kernel"
+        }
+        if "row_selections" in self.model:
+            self.model["row_selections"] = {
+                k: v for k, v in self.model["row_selections"].items() if k in used_manifests
+            }
+
+    def _rewrite_draft_packet(self, body):
+        up_w8 = self.draft_mode == "full_w8"
+        dn_w8 = self.draft_mode in ("ssz_up_w8_down", "full_w8")
+        for i, step in enumerate(body):
+            sname = step.get("name", "")
+            if dn_w8 and step["op"] == "w4" and re.search(r"\.L4[0-2]\.down$", sname):
+                step["op"] = "w8"
+                step["weight_layout"] = "nd"
+                step.pop("expected_expert_rows", None)
+            elif up_w8 and step["op"] == "w4_a4" and re.search(r"\.L4[0-2]\.up$", sname):
+                dl = int(re.search(r"\.L(4[0-2])\.up$", sname)[1])
+                g_s, f_s = body[i - 1], body[i + 1]
+                body[i - 1] = dict(
+                    op="kernel",
+                    manifest=self.kernels["draft_gather"],
+                    buffers=[
+                        g_s["buffers"][0],
+                        g_s["buffers"][1],
+                        g_s["buffers"][2],
+                        g_s["buffers"][4],
+                        g_s["buffers"][5],
+                        g_s["buffers"][6],
+                    ],
+                )
+                body[i] = dict(
+                    op="w8",
+                    name=sname,
+                    rows=1536,
+                    input=5120,
+                    output=4608,
+                    experts=16,
+                    workspace=step["workspace"],
+                    groups=f"dspark.draft.batch.prefill.m512.L{dl}.counts",
+                    weight_layout="nd",
+                    buffers=[
+                        "dspark.draft.batch.prefill.m512.expert.input",
+                        step["buffers"][1],
+                        step["buffers"][2],
+                        step["buffers"][3],
+                        "dspark.draft.batch.prefill.m512.expert.input.scale",
+                        "dspark.draft.batch.prefill.m512.expert.up.output",
+                    ],
+                )
+                body[i + 1] = dict(
+                    op="kernel",
+                    manifest=self.kernels["draft_swiglu"],
+                    buffers=[
+                        "dspark.draft.batch.prefill.m512.expert.up.output",
+                        f_s["buffers"][4],
+                        f_s["buffers"][5],
+                    ],
+                )
+
+    def _rewrite_target_packet(self, packet, pi, get_spec, bf16_set, w8_set, p1_a8_by_layer):
+        body = packet["body"]
+        for step in body:
+            if step["op"] == "kernel":
+                sp = get_spec(step["manifest"])
+                if sp["op"] in ("engram.hadamard32", "engram.rotate_blocks", "engram.cast_fp32"):
+                    cap = sp["parameters"]["_row_capacity"]
+                    step["manifest"] = self.kernels[f"engram_cast_{cap}"]
+                    if len(step["buffers"]) == 3:
+                        step["buffers"] = [step["buffers"][0], step["buffers"][2]]
+
+        norm5120_template = None
+        for st in body:
+            if st["op"] == "kernel":
+                sp = get_spec(st["manifest"])
+                if sp["op"] == "model_ops.norm" and any(
+                    "layers.2.attn_norm" in b for b in st["buffers"]
+                ):
+                    norm5120_template = (st["manifest"], st["buffers"][2], st["buffers"][3])
+                    break
+
+        quant_producers = {}
+        qkv_rewritten_layers = set()
+        obsolete_quant_indices = set()
+        for idx, step in enumerate(body):
+            if step["op"] != "kernel":
+                continue
+            sp = get_spec(step["manifest"])
+            if sp["op"] == "vector.quantize":
+                quant_producers[step["buffers"][1]] = ("quantize", step["buffers"][0], idx)
+            elif sp["op"] == "model_ops.norm_quant" and any(
+                ".attn_norm." in b for b in step["buffers"]
+            ):
+                quant_producers[step["buffers"][2]] = ("norm_quant", norm5120_template[1], idx)
+            elif sp["op"] == "dense.projection":
+                m_qkv = re.fullmatch(
+                    r"w\.layers\.(\d+)\.attn\.(wq_a|wkv)\.weight\.0-(\d+)\.0-5120\.i8",
+                    step["buffers"][1],
+                )
+                if not m_qkv:
+                    continue
+                layer, part, out_n = int(m_qkv[1]), m_qkv[2], int(m_qkv[3])
+                if layer not in bf16_set:
+                    continue
+                kind, norm_buf, q_idx = quant_producers[step["buffers"][0]]
+                cap = sp["parameters"]["_row_capacity"]
+                k_key = f"bf16_{'wqa' if part == 'wq_a' else 'wkv'}_{cap}"
+                tok_ones = {32: "batch.decode.ones1", 2048: "ones2048", 256: "norot.ones256"}[cap]
+                ch_ones = "norot.ones1280" if out_n == 1280 else "ones512"
+                step["manifest"] = self.kernels[k_key]
+                step["buffers"] = [
+                    norm_buf,
+                    step["buffers"][1],
+                    tok_ones,
+                    ch_ones,
+                    step["buffers"][4],
+                    step["buffers"][5],
+                ]
+                qkv_rewritten_layers.add((layer, part))
+                if (layer, "wq_a") in qkv_rewritten_layers and (
+                    layer,
+                    "wkv",
+                ) in qkv_rewritten_layers:
+                    if kind == "quantize":
+                        obsolete_quant_indices.add(q_idx)
+                    else:
+                        qstep = body[q_idx]
+                        qstep["manifest"] = norm5120_template[0]
+                        qstep["buffers"] = [
+                            qstep["buffers"][0],
+                            qstep["buffers"][1],
+                            norm5120_template[1],
+                            norm5120_template[2],
+                        ]
+
+        if obsolete_quant_indices:
+            body = [s for idx, s in enumerate(body) if idx not in obsolete_quant_indices]
+            packet["body"] = body
+
+        if pi in (0, 1):
+            for step in body:
+                m_ex = re.search(r"\.L(\d+)\.(up|down)$", step.get("name", ""))
+                if step["op"] == "w4" and m_ex and int(m_ex[1]) in w8_set:
+                    step["op"] = "w8"
+                    step["weight_layout"] = "nd"
+                    step.pop("expected_expert_rows", None)
+        elif pi in (2, 3):
+            i = 0
+            while i < len(body):
+                step = body[i]
+                m_up = re.search(r"\.L(\d+)\.up$", step.get("name", ""))
+                if step["op"] == "w4_a4" and m_up and int(m_up[1]) in w8_set:
+                    layer = int(m_up[1])
+                    rep = deepcopy(p1_a8_by_layer[layer])
+                    for rs in rep:
+                        if rs["op"] == "w4":
+                            rs["op"] = "w8"
+                            rs["weight_layout"] = "nd"
+                            rs.pop("expected_expert_rows", None)
+                    body[i - 1 : i + 5] = rep
+                    i += 5
+                else:
+                    i += 1
+
+    def _apply_manifest_remap(self, ranks):
+        for rank in ranks:
+            for packet in rank["packets"]:
+                for step in packet["body"] + packet["head"]:
+                    if step["op"] == "kernel":
+                        if step["manifest"] in self.remap:
+                            step["manifest"] = self.remap[step["manifest"]]
+                        if step.get("uncompacted_manifest") in self.remap:
+                            step["uncompacted_manifest"] = self.remap[step["uncompacted_manifest"]]
+        if "row_selections" in self.model:
+            new_rs = {}
+            for k, choices in self.model["row_selections"].items():
+                nk = self.remap.get(k, k)
+                new_rs[nk] = [
+                    {**ch, "kernels": [self.remap.get(x, x) for x in ch["kernels"]]}
+                    for ch in choices
+                ]
+            self.model["row_selections"] = new_rs
+
+    def _assemble_shard_groups(self):
+        extra_shards_entries = {}
+        for group, record in self.old_records.items():
+            path = self.source / group
+            start, header = local_header(path)
+            for name in sorted(record["tensors"], key=lambda n: header[n]["data_offsets"][0]):
+                spec = header[name]
+                entry = dict(
+                    dtype=spec["dtype"],
+                    shape=spec["shape"],
+                    bytes=spec["data_offsets"][1] - spec["data_offsets"][0],
+                    source=dict(file=str(path), offset=start + spec["data_offsets"][0]),
+                )
+                if name in self.transforms:
+                    replacement = self.transforms[name]
+                    if replacement in self.file_replacements:
+                        fr = self.file_replacements[replacement]
+                        target_grp = fr["group"]
+                        if replacement != name:
+                            self.index["weight_map"].pop(name, None)
+                        self.index["weight_map"][replacement] = target_grp
+                        new_entry = dict(
+                            dtype=fr["dtype"],
+                            shape=fr["shape"],
+                            bytes=fr["bytes"],
+                            source=dict(file=fr["file"], offset=fr["offset"]),
+                        )
+                        self.rewrite_groups.add(group)
+                        if target_grp == group:
+                            self.groups[group].append((replacement, new_entry))
+                        else:
+                            extra_shards_entries.setdefault(target_grp, []).append(
+                                (replacement, new_entry)
+                            )
+                            self.rewrite_groups.add(target_grp)
+                        continue
+                    values = self.payloads[replacement]
+                    if replacement != name:
+                        self.index["weight_map"].pop(name, None)
+                    self.index["weight_map"][replacement] = group
+                    entry.update(
+                        dtype=self.payload_dtypes[replacement],
+                        shape=list(values.shape),
+                        bytes=values.nbytes,
+                        source=dict(replacement=replacement),
+                    )
+                    name = replacement
+                    self.rewrite_groups.add(group)
+                self.groups[group].append((name, entry))
+
+        for tgt_grp, items in extra_shards_entries.items():
+            self.groups[tgt_grp].extend(items)
+            self.rewrite_groups.add(tgt_grp)
+
+        for name, values in self.payloads.items():
+            if name in self.index["weight_map"]:
+                continue
+            grp = self.override_groups[name]
+            self.index["weight_map"][name] = grp
+            self.groups[grp].append(
+                (
+                    name,
+                    dict(
+                        dtype=self.payload_dtypes[name],
+                        shape=list(values.shape),
+                        bytes=values.nbytes,
+                        source=dict(replacement=name),
+                    ),
+                )
+            )
+            self.rewrite_groups.add(grp)
+
+        for grp, items in self.groups.items():
+            sz = sum(e["bytes"] for _, e in items)
+            if sz >= 4 << 30:
+                raise ValueError(f"Shard {grp} exceeds 4 GiB: {sz / (1 << 30):.2f} GiB")
+
     def plan(self):
         ckpt = Checkpoint(self.official_dir)
         t0 = time.monotonic()
         try:
             ranks = self.model["ranks"]
             rank_defs = [{b["name"]: b for b in r["buffers"]} for r in ranks]
-            common_grp = "weights/shared/model-common.safetensors"
-
-            def replace_shared(buf_name, values, dtype, suffix=".norot"):
-                for ri in range(8):
-                    self.replace_tensor(
-                        rank_defs[ri][buf_name],
-                        values,
-                        suffix=suffix,
-                        dtype=dtype,
-                        group=common_grp,
-                    )
-
-            for count, bname in ((256, "norot.ones256"), (1280, "norot.ones1280")):
-                tname = "native." + bname
-                self.add_tensor(tname, np.ones(count, dtype="<f4"), dtype="F32", group=common_grp)
-                for ri in range(8):
-                    d = dict(
-                        name=bname,
-                        bytes=count * 4,
-                        prepared_tensor=dict(name=tname, dtype="F32", shape=[count]),
-                    )
-                    ranks[ri]["buffers"].append(d)
-                    rank_defs[ri][bname] = d
-
-            if "rotation" in rank_defs[0]:
-                replace_shared("rotation", np.eye(32, dtype="<f4"), "F32")
-            replace_shared(
-                "w.norm.weight.0-5120.0-1.f32",
-                ckpt.read("norm.weight").reshape(5120, 1).astype("<f4"),
-                "F32",
-            )
-            replace_shared(
-                "dspark.warm_decode.w.mtp.0.main_proj.weight.0-5120.0-15360.bf16",
-                to_bf16_u16(ckpt.matrix("mtp.0.main_proj.weight")),
-                "BF16",
-            )
-
-            emb_off = to_bf16_u16(ckpt.matrix("embed.weight"))
-            self.transforms["embed.weight"] = "embed.weight"
-            self.payloads["embed.weight"] = emb_off
-            self.payload_dtypes["embed.weight"] = "BF16"
-            self.override_groups["embed.weight"] = "weights/shared/embedding.safetensors"
-
-            head_full = ckpt.matrix("head.weight")
-            for ri in range(8):
-                h_parts = bf16_parts(head_full[ri * 16160 : (ri + 1) * 16160]).astype("<u2")
-                bname = f"w.head.weight.{ri * 16160}-16160.0-5120.f32"
-                grp = f"weights/gpu/rank-{ri:02}/layers-36-39.safetensors"
-                self.replace_tensor(
-                    rank_defs[ri][bname], h_parts, suffix=".norot", dtype="BF16", group=grp
-                )
-            del head_full
-
-            for el in (1, 14):
-                ew = ckpt.matrix(f"layers.{el}.engram.wkv.weight")
-                first = el // 4 * 4
-                for ri in range(8):
-                    sl = to_bf16_u16(ew[ri * 3200 : (ri + 1) * 3200])
-                    bname = f"w.layers.{el}.engram.wkv.weight.{ri * 3200}-3200.0-6144.bf16"
-                    grp = f"weights/gpu/rank-{ri:02}/layers-{first:02}-{first + 3:02}.safetensors"
-                    self.replace_tensor(
-                        rank_defs[ri][bname], sl, suffix=".norot", dtype="BF16", group=grp
-                    )
-                del ew
+            self._plan_shared_backbone(ckpt, ranks, rank_defs)
 
             sq_active = dict(q=0, attn=0, shw=0, ffn=0)
-            for L in range(40):
-                pref = f"layers.{L}"
-                s_q, s_attn, s_shw, s_ffn = self._load_layer_smoothquant(L)
-                has_q = bool(np.any(s_q != 1.0))
-                has_attn = bool(np.any(s_attn != 1.0))
-                has_shw = bool(np.any(s_shw != 1.0))
-                has_ffn = bool(np.any(s_ffn != 1.0))
-                sq_active["q"] += int(has_q)
-                sq_active["attn"] += int(has_attn)
-                sq_active["shw"] += int(has_shw)
-                sq_active["ffn"] += int(has_ffn)
+            for layer in range(40):
+                self._plan_layer_weights(ckpt, layer, rank_defs, sq_active)
 
-                attn_norm_w = ckpt.read(f"{pref}.attn_norm.weight").astype("<f4")
-                if has_attn:
-                    attn_norm_w = attn_norm_w / s_attn
-                ffn_norm_w = ckpt.read(f"{pref}.ffn_norm.weight").astype("<f4")
-                if has_ffn:
-                    ffn_norm_w = ffn_norm_w / s_ffn
-                q_norm_w = ckpt.read(f"{pref}.attn.q_norm.weight").astype("<f4")
-                if has_q:
-                    q_norm_w = q_norm_w / s_q
-
-                replace_shared(
-                    f"w.{pref}.attn_norm.weight.0-5120.0-1.f32",
-                    attn_norm_w.reshape(5120, 1).astype("<f4"),
-                    "F32",
-                )
-                replace_shared(
-                    f"w.{pref}.ffn_norm.weight.0-5120.0-1.f32",
-                    ffn_norm_w.reshape(5120, 1).astype("<f4"),
-                    "F32",
-                )
-                replace_shared(
-                    f"w.{pref}.attn.q_norm.weight.0-1280.0-1.f32",
-                    q_norm_w.reshape(1280, 1).astype("<f4"),
-                    "F32",
-                )
-                replace_shared(
-                    f"w.{pref}.attn.kv_norm.weight.0-512.0-1.f32",
-                    ckpt.read(f"{pref}.attn.kv_norm.weight").reshape(512, 1).astype("<f4"),
-                    "F32",
-                )
-
-                for hc_name in ("hc_attn_fn", "hc_ffn_fn"):
-                    padded = np.zeros((32, 20480), dtype="<f4")
-                    padded[:24] = ckpt.read(f"{pref}.{hc_name}").astype("<f4")
-                    replace_shared(f"w.{pref}.{hc_name}", padded.reshape(-1), "F32")
-                    replace_shared(
-                        f"parts.w.{pref}.{hc_name}", bf16_parts(padded).astype("<u2"), "BF16"
-                    )
-
-                gw = ckpt.matrix(f"{pref}.ffn.gate.weight").astype("<f4")
-                if has_ffn:
-                    gw = (gw * s_ffn[None, :]).astype("<f4")
-                replace_shared(f"w.{pref}.ffn.gate.weight.0-384.0-5120.f32", gw, "F32")
-                replace_shared(
-                    f"w.{pref}.ffn.gate.weight.0-384.0-5120.bf16", to_bf16_u16(gw), "BF16"
-                )
-
-                wqa = ckpt.matrix(f"{pref}.attn.wq_a.weight")
-                wkv = ckpt.matrix(f"{pref}.attn.wkv.weight")
-                if L in self.bf16_qkv_layers:
-                    replace_shared(
-                        f"w.{pref}.attn.wq_a.weight.0-1280.0-5120.i8",
-                        to_bf16_u16(wqa),
-                        "BF16",
-                        suffix=".norot_bf16",
-                    )
-                    replace_shared(
-                        f"w.{pref}.attn.wkv.weight.0-512.0-5120.i8",
-                        to_bf16_u16(wkv),
-                        "BF16",
-                        suffix=".norot_bf16",
-                    )
-                else:
-                    if has_attn:
-                        wqa = wqa * s_attn[None, :]
-                        wkv = wkv * s_attn[None, :]
-                    q_wqa, s_wqa = quantize_per_channel_i8_f32(wqa)
-                    q_wkv, s_wkv = quantize_per_channel_i8_f32(wkv)
-                    replace_shared(f"w.{pref}.attn.wq_a.weight.0-1280.0-5120.i8", q_wqa, "I8")
-                    replace_shared(f"w.{pref}.attn.wq_a.weight_scale.0-1280.0-1.f32", s_wqa, "F32")
-                    replace_shared(f"w.{pref}.attn.wkv.weight.0-512.0-5120.i8", q_wkv, "I8")
-                    replace_shared(f"w.{pref}.attn.wkv.weight_scale.0-512.0-1.f32", s_wkv, "F32")
-
-                if L in (2, 8, 14):
-                    cwkv = ckpt.matrix(f"{pref}.attn.compressor.wkv.weight").astype("<f4")
-                    cwgate = ckpt.matrix(f"{pref}.attn.compressor.wgate.weight").astype("<f4")
-                    replace_shared(
-                        f"w.{pref}.attn.compressor.wkv.weight.0-512.0-5120.f32", cwkv, "F32"
-                    )
-                    replace_shared(
-                        f"parts.w.{pref}.attn.compressor.wkv.weight.0-512.0-5120.f32",
-                        bf16_parts(cwkv).astype("<u2"),
-                        "BF16",
-                    )
-                    replace_shared(
-                        f"w.{pref}.attn.compressor.wgate.weight.0-512.0-5120.f32", cwgate, "F32"
-                    )
-                    replace_shared(
-                        f"parts.w.{pref}.attn.compressor.wgate.weight.0-512.0-5120.f32",
-                        bf16_parts(cwgate).astype("<u2"),
-                        "BF16",
-                    )
-                elif L == 20:
-                    cwkv = ckpt.matrix(f"{pref}.attn.compressor.wkv.weight")
-                    replace_shared(
-                        f"w.{pref}.attn.compressor.wkv.weight.0-512.0-5120.bf16",
-                        to_bf16_u16(cwkv),
-                        "BF16",
-                    )
-
-                if L in (2, 8, 14, 20, 24, 28, 32, 36):
-                    iwp = ckpt.matrix(f"{pref}.attn.indexer.weights_proj.weight")
-                    if has_attn:
-                        iwp = iwp * s_attn[None, :]
-                    replace_shared(
-                        f"w.{pref}.attn.indexer.weights_proj.weight.0-32.0-5120.bf16",
-                        to_bf16_u16(iwp),
-                        "BF16",
-                    )
-                    idx_wqb = ckpt.matrix(f"{pref}.attn.indexer.wq_b.weight")
-                    if has_q:
-                        idx_wqb = idx_wqb * s_q[None, :]
-                    qi, si = quantize_per_channel_i8_f32(idx_wqb)
-                    replace_shared(f"w.{pref}.attn.indexer.wq_b.weight.0-4096.0-1280.i8", qi, "I8")
-                    replace_shared(
-                        f"w.{pref}.attn.indexer.wq_b.weight_scale.0-4096.0-1.f32", si, "F32"
-                    )
-
-                wqb_full = ckpt.matrix(f"{pref}.attn.wq_b.weight")
-                if has_q:
-                    wqb_full = wqb_full * s_q[None, :]
-                wob_full = ckpt.matrix(f"{pref}.attn.wo_b.weight")
-                sh_w1_m = ckpt.matrix(f"{pref}.ffn.shared_experts.w1.weight")
-                sh_w3_m = ckpt.matrix(f"{pref}.ffn.shared_experts.w3.weight")
-                sh_w2_m = ckpt.matrix(f"{pref}.ffn.shared_experts.w2.weight")
-                if has_ffn:
-                    sh_w1_m = sh_w1_m * s_ffn[None, :]
-                    sh_w3_m = sh_w3_m * s_ffn[None, :]
-                if has_shw:
-                    sh_w3_m = sh_w3_m / s_shw[:, None]
-                    sh_w2_m = sh_w2_m * s_shw[None, :]
-                sh_w1_q, sh_w1_s = quantize_per_channel_i8_f32(sh_w1_m)
-                sh_w3_q, sh_w3_s = quantize_per_channel_i8_f32(sh_w3_m)
-                sh_w2_q, sh_w2_s = quantize_per_channel_i8_f32(sh_w2_m)
-                replace_shared(
-                    f"w.{pref}.ffn.shared_experts.w2.weight_scale.0-5120.0-1.f32", sh_w2_s, "F32"
-                )
-
-                first = L // 4 * 4
-                is_w8 = L in self.w8_layers
-                for ri in range(8):
-                    grp = f"weights/gpu/rank-{ri:02}/layers-{first:02}-{first + 3:02}.safetensors"
-                    exp_grp = (
-                        f"weights/gpu/rank-{ri:02}/layer-{L:02}-w8.safetensors" if is_w8 else grp
-                    )
-
-                    q_wqb, s_wqb = quantize_per_channel_i8_f32(
-                        wqb_full[ri * 4096 : (ri + 1) * 4096]
-                    )
-                    self.replace_tensor(
-                        rank_defs[ri][f"w.{pref}.attn.wq_b.weight.{ri * 4096}-4096.0-1280.i8"],
-                        q_wqb,
-                        suffix=".norot",
-                        dtype="I8",
-                        group=grp,
-                    )
-                    self.replace_tensor(
-                        rank_defs[ri][f"w.{pref}.attn.wq_b.weight_scale.{ri * 4096}-4096.0-1.f32"],
-                        s_wqb,
-                        suffix=".norot",
-                        dtype="F32",
-                        group=grp,
-                    )
-                    self.replace_tensor(
-                        rank_defs[ri][f"w.{pref}.attn.wo_b.weight.0-5120.{ri * 1024}-1024.bf16"],
-                        to_bf16_u16(wob_full[:, ri * 1024 : (ri + 1) * 1024]),
-                        suffix=".norot",
-                        dtype="BF16",
-                        group=grp,
-                    )
-                    sh_up = np.concatenate(
-                        [sh_w1_q[ri * 288 : (ri + 1) * 288], sh_w3_q[ri * 288 : (ri + 1) * 288]],
-                        axis=0,
-                    )
-                    sh_sc = np.concatenate(
-                        [
-                            sh_w1_s[ri * 288 : (ri + 1) * 288, 0],
-                            sh_w3_s[ri * 288 : (ri + 1) * 288, 0],
-                        ],
-                        axis=0,
-                    )
-                    sh_dn = np.ascontiguousarray(sh_w2_q[:, ri * 288 : (ri + 1) * 288])
-                    self.replace_tensor(
-                        rank_defs[ri][f"w.shared.{L}.{ri}.up"],
-                        sh_up,
-                        suffix=".norot",
-                        dtype="I8",
-                        group=grp,
-                    )
-                    self.replace_tensor(
-                        rank_defs[ri][f"w.shared.{L}.{ri}.scale"],
-                        sh_sc,
-                        suffix=".norot",
-                        dtype="F32",
-                        group=grp,
-                    )
-                    self.replace_tensor(
-                        rank_defs[ri][f"w.shared.{L}.{ri}.down"],
-                        sh_dn,
-                        suffix=".norot",
-                        dtype="I8",
-                        group=grp,
-                    )
-
-                    edir = self.prep_dir / f"L{L:02d}_r{ri}"
-                    up_p = f"w.L{L}.['w1', 'w3']"
-                    dn_p = f"w.L{L}.['w2']"
-                    if is_w8:
-                        self.replace_from_npy(
-                            rank_defs[ri][up_p + ".packed"],
-                            edir / "up_w8.npy",
-                            suffix=".norot_w8",
-                            dtype="I8",
-                            group=exp_grp,
-                        )
-                        self.replace_from_npy(
-                            rank_defs[ri][up_p + ".scale"],
-                            edir / "up_scale_bf16.npy",
-                            suffix=".norot_w8",
-                            dtype="BF16",
-                            group=exp_grp,
-                        )
-                        self.replace_from_npy(
-                            rank_defs[ri][dn_p + ".packed"],
-                            edir / "down_w8.npy",
-                            suffix=".norot_w8",
-                            dtype="I8",
-                            group=exp_grp,
-                        )
-                        self.replace_from_npy(
-                            rank_defs[ri][dn_p + ".scale"],
-                            edir / "down_scale_bf16.npy",
-                            suffix=".norot_w8",
-                            dtype="BF16",
-                            group=exp_grp,
-                        )
-                    else:
-                        self.replace_from_npy(
-                            rank_defs[ri][up_p + ".packed"],
-                            edir / "up_nz.npy",
-                            suffix=".norot_ssz",
-                            dtype="I8",
-                            group=grp,
-                        )
-                        self.replace_from_npy(
-                            rank_defs[ri][up_p + ".scale"],
-                            edir / "up_scale.npy",
-                            suffix=".norot_ssz",
-                            dtype="U64",
-                            group=grp,
-                        )
-                        self.replace_from_npy(
-                            rank_defs[ri][up_p + ".assist"],
-                            edir / "up_assist.npy",
-                            suffix=".norot_ssz",
-                            dtype="F32",
-                            group=grp,
-                        )
-                        self.replace_from_npy(
-                            rank_defs[ri][dn_p + ".packed"],
-                            edir / "down_nz.npy",
-                            suffix=".norot_ssz",
-                            dtype="I8",
-                            group=grp,
-                        )
-                        self.replace_from_npy(
-                            rank_defs[ri][dn_p + ".scale"],
-                            edir / "down_scale.npy",
-                            suffix=".norot_ssz",
-                            dtype="U64",
-                            group=grp,
-                        )
-                        self.replace_from_npy(
-                            rank_defs[ri][dn_p + ".assist"],
-                            edir / "down_assist.npy",
-                            suffix=".norot_ssz",
-                            dtype="F32",
-                            group=grp,
-                        )
-
-            vis_grp = "vision.safetensors"
-            for vname in (
-                "aligner.w2.weight",
-                "aligner.w2.bias",
-                "image_start",
-                "image_end",
-                "image_newline",
-            ):
-                val = ckpt.matrix(vname) if vname.endswith(".weight") else ckpt.read(vname)
-                self.transforms[vname] = vname
-                self.payloads[vname] = to_bf16_u16(val)
-                self.payload_dtypes[vname] = "BF16"
-                self.override_groups[vname] = vis_grp
-
-            if self.draft_prep_dir and self.draft_mode:
-                up_w8 = self.draft_mode == "full_w8"
-                dn_w8 = self.draft_mode in ("ssz_up_w8_down", "full_w8")
-                for ri in range(8):
-                    dgrp = f"weights/dspark/rank-{ri:02}-layers-40-42.safetensors"
-                    if up_w8:
-                        up_out_name = "dspark.draft.batch.prefill.m512.expert.up.output"
-                        if up_out_name not in rank_defs[ri]:
-                            bdef = dict(name=up_out_name, bytes=1536 * 4608 * 2)
-                            ranks[ri]["buffers"].append(bdef)
-                            rank_defs[ri][up_out_name] = bdef
-                    for dl in (40, 41, 42):
-                        folder = self.draft_prep_dir / f"L{dl}_r{ri}"
-                        up_p = f"dspark.draft.w.L{dl}.['w1', 'w3']"
-                        dn_p = f"dspark.draft.w.L{dl}.['w2']"
-                        if up_w8:
-                            self.replace_from_npy(
-                                rank_defs[ri][up_p + ".packed"],
-                                folder / "up_w8.npy",
-                                suffix=".w8_nd",
-                                dtype="I8",
-                                group=dgrp,
-                            )
-                            self.replace_from_npy(
-                                rank_defs[ri][up_p + ".scale"],
-                                folder / "up_scale_bf16.npy",
-                                suffix=".w8_bf16",
-                                dtype="BF16",
-                                group=dgrp,
-                            )
-                        else:
-                            self.replace_from_npy(
-                                rank_defs[ri][up_p + ".packed"],
-                                folder / "up_nz.npy",
-                                suffix=".ssz_w4",
-                                dtype="I8",
-                                group=dgrp,
-                            )
-                            self.replace_from_npy(
-                                rank_defs[ri][up_p + ".scale"],
-                                folder / "up_scale.npy",
-                                suffix=".ssz_w4",
-                                dtype="U64",
-                                group=dgrp,
-                            )
-                            self.replace_from_npy(
-                                rank_defs[ri][up_p + ".assist"],
-                                folder / "up_assist.npy",
-                                suffix=".ssz_w4",
-                                dtype="F32",
-                                group=dgrp,
-                            )
-                        if dn_w8:
-                            self.replace_from_npy(
-                                rank_defs[ri][dn_p + ".packed"],
-                                folder / "down_w8.npy",
-                                suffix=".w8_nd",
-                                dtype="I8",
-                                group=dgrp,
-                            )
-                            self.replace_from_npy(
-                                rank_defs[ri][dn_p + ".scale"],
-                                folder / "down_scale_bf16.npy",
-                                suffix=".w8_bf16",
-                                dtype="BF16",
-                                group=dgrp,
-                            )
-                        else:
-                            self.replace_from_npy(
-                                rank_defs[ri][dn_p + ".packed"],
-                                folder / "down_nz.npy",
-                                suffix=".ssz_w4",
-                                dtype="I8",
-                                group=dgrp,
-                            )
-                            self.replace_from_npy(
-                                rank_defs[ri][dn_p + ".scale"],
-                                folder / "down_scale.npy",
-                                suffix=".ssz_w4",
-                                dtype="U64",
-                                group=dgrp,
-                            )
-                            self.replace_from_npy(
-                                rank_defs[ri][dn_p + ".assist"],
-                                folder / "down_assist.npy",
-                                suffix=".ssz_w4",
-                                dtype="F32",
-                                group=dgrp,
-                            )
-
-            specs = {}
-
-            def get_spec(manifest):
-                if manifest not in specs:
-                    specs[manifest] = json.loads((self.package / manifest).read_text())
-                return specs[manifest]
-
-            bf16_set = set(self.bf16_qkv_layers)
-            w8_set = set(self.w8_layers)
-
-            for rank in ranks:
-                p1 = rank["packets"][1]
-                p1_a8_by_layer = {}
-                for i, s in enumerate(p1["body"]):
-                    m_up = re.search(r"\.L(\d+)\.up$", s.get("name", ""))
-                    if m_up and int(m_up[1]) in w8_set:
-                        L = int(m_up[1])
-                        p1_a8_by_layer[L] = deepcopy(p1["body"][i - 1 : i + 5])
-
-                for pi, packet in enumerate(rank["packets"]):
-                    body = packet["body"]
-                    role = packet.get("role", "target")
-
-                    if role == "draft":
-                        if self.draft_mode:
-                            up_w8 = self.draft_mode == "full_w8"
-                            dn_w8 = self.draft_mode in ("ssz_up_w8_down", "full_w8")
-                            for i, step in enumerate(body):
-                                sname = step.get("name", "")
-                                if (
-                                    dn_w8
-                                    and step["op"] == "w4"
-                                    and re.search(r"\.L4[0-2]\.down$", sname)
-                                ):
-                                    step["op"] = "w8"
-                                    step["weight_layout"] = "nd"
-                                    step.pop("expected_expert_rows", None)
-                                elif (
-                                    up_w8
-                                    and step["op"] == "w4_a4"
-                                    and re.search(r"\.L4[0-2]\.up$", sname)
-                                ):
-                                    dl = int(re.search(r"\.L(4[0-2])\.up$", sname)[1])
-                                    g_s, f_s = body[i - 1], body[i + 1]
-                                    body[i - 1] = dict(
-                                        op="kernel",
-                                        manifest=self.kernels["draft_gather"],
-                                        buffers=[
-                                            g_s["buffers"][0],
-                                            g_s["buffers"][1],
-                                            g_s["buffers"][2],
-                                            g_s["buffers"][4],
-                                            g_s["buffers"][5],
-                                            g_s["buffers"][6],
-                                        ],
-                                    )
-                                    body[i] = dict(
-                                        op="w8",
-                                        name=sname,
-                                        rows=1536,
-                                        input=5120,
-                                        output=4608,
-                                        experts=16,
-                                        workspace=step["workspace"],
-                                        groups=f"dspark.draft.batch.prefill.m512.L{dl}.counts",
-                                        weight_layout="nd",
-                                        buffers=[
-                                            "dspark.draft.batch.prefill.m512.expert.input",
-                                            step["buffers"][1],
-                                            step["buffers"][2],
-                                            step["buffers"][3],
-                                            "dspark.draft.batch.prefill.m512.expert.input.scale",
-                                            "dspark.draft.batch.prefill.m512.expert.up.output",
-                                        ],
-                                    )
-                                    body[i + 1] = dict(
-                                        op="kernel",
-                                        manifest=self.kernels["draft_swiglu"],
-                                        buffers=[
-                                            "dspark.draft.batch.prefill.m512.expert.up.output",
-                                            f_s["buffers"][4],
-                                            f_s["buffers"][5],
-                                        ],
-                                    )
-                        continue
-
-                    for step in body:
-                        if step["op"] == "kernel":
-                            sp = get_spec(step["manifest"])
-                            if sp["op"] in (
-                                "engram.hadamard32",
-                                "engram.rotate_blocks",
-                                "engram.cast_fp32",
-                            ):
-                                cap = sp["parameters"]["_row_capacity"]
-                                step["manifest"] = self.kernels[f"engram_cast_{cap}"]
-                                if len(step["buffers"]) == 3:
-                                    step["buffers"] = [step["buffers"][0], step["buffers"][2]]
-
-                    norm5120_template = None
-                    for st in body:
-                        if st["op"] == "kernel":
-                            sp = get_spec(st["manifest"])
-                            if sp["op"] == "model_ops.norm" and any(
-                                "layers.2.attn_norm" in b for b in st["buffers"]
-                            ):
-                                norm5120_template = (
-                                    st["manifest"],
-                                    st["buffers"][2],
-                                    st["buffers"][3],
-                                )
-                                break
-
-                    quant_producers = {}
-                    qkv_rewritten_layers = set()
-                    obsolete_quant_indices = set()
-                    for idx, step in enumerate(body):
-                        if step["op"] != "kernel":
-                            continue
-                        sp = get_spec(step["manifest"])
-                        if sp["op"] == "vector.quantize":
-                            quant_producers[step["buffers"][1]] = (
-                                "quantize",
-                                step["buffers"][0],
-                                idx,
-                            )
-                        elif sp["op"] == "model_ops.norm_quant" and any(
-                            ".attn_norm." in b for b in step["buffers"]
-                        ):
-                            quant_producers[step["buffers"][2]] = (
-                                "norm_quant",
-                                norm5120_template[1],
-                                idx,
-                            )
-                        elif sp["op"] == "dense.projection":
-                            m_qkv = re.fullmatch(
-                                r"w\.layers\.(\d+)\.attn\.(wq_a|wkv)\.weight\.0-(\d+)\.0-5120\.i8",
-                                step["buffers"][1],
-                            )
-                            if not m_qkv:
-                                continue
-                            L, part, out_n = int(m_qkv[1]), m_qkv[2], int(m_qkv[3])
-                            if L not in bf16_set:
-                                continue
-                            kind, norm_buf, q_idx = quant_producers[step["buffers"][0]]
-                            cap = sp["parameters"]["_row_capacity"]
-                            k_key = f"bf16_{'wqa' if part == 'wq_a' else 'wkv'}_{cap}"
-                            tok_ones = {
-                                32: "batch.decode.ones1",
-                                2048: "ones2048",
-                                256: "norot.ones256",
-                            }[cap]
-                            ch_ones = "norot.ones1280" if out_n == 1280 else "ones512"
-                            step["manifest"] = self.kernels[k_key]
-                            step["buffers"] = [
-                                norm_buf,
-                                step["buffers"][1],
-                                tok_ones,
-                                ch_ones,
-                                step["buffers"][4],
-                                step["buffers"][5],
-                            ]
-                            qkv_rewritten_layers.add((L, part))
-                            if (L, "wq_a") in qkv_rewritten_layers and (
-                                L,
-                                "wkv",
-                            ) in qkv_rewritten_layers:
-                                if kind == "quantize":
-                                    obsolete_quant_indices.add(q_idx)
-                                else:
-                                    qstep = body[q_idx]
-                                    qstep["manifest"] = norm5120_template[0]
-                                    qstep["buffers"] = [
-                                        qstep["buffers"][0],
-                                        qstep["buffers"][1],
-                                        norm5120_template[1],
-                                        norm5120_template[2],
-                                    ]
-
-                    if obsolete_quant_indices:
-                        body = [
-                            s for idx, s in enumerate(body) if idx not in obsolete_quant_indices
-                        ]
-                        packet["body"] = body
-
-                    if pi in (0, 1):
-                        for step in body:
-                            m_ex = re.search(r"\.L(\d+)\.(up|down)$", step.get("name", ""))
-                            if step["op"] == "w4" and m_ex and int(m_ex[1]) in w8_set:
-                                step["op"] = "w8"
-                                step["weight_layout"] = "nd"
-                                step.pop("expected_expert_rows", None)
-                    elif pi in (2, 3):
-                        i = 0
-                        while i < len(body):
-                            step = body[i]
-                            m_up = re.search(r"\.L(\d+)\.up$", step.get("name", ""))
-                            if step["op"] == "w4_a4" and m_up and int(m_up[1]) in w8_set:
-                                L = int(m_up[1])
-                                rep = deepcopy(p1_a8_by_layer[L])
-                                for rs in rep:
-                                    if rs["op"] == "w4":
-                                        rs["op"] = "w8"
-                                        rs["weight_layout"] = "nd"
-                                        rs.pop("expected_expert_rows", None)
-                                body[i - 1 : i + 5] = rep
-                                i += 5
-                            else:
-                                i += 1
-
-            if self.remap:
-                for rank in ranks:
-                    for packet in rank["packets"]:
-                        for step in packet["body"] + packet["head"]:
-                            if step["op"] == "kernel":
-                                if step["manifest"] in self.remap:
-                                    step["manifest"] = self.remap[step["manifest"]]
-                                if step.get("uncompacted_manifest") in self.remap:
-                                    step["uncompacted_manifest"] = self.remap[
-                                        step["uncompacted_manifest"]
-                                    ]
-                if "row_selections" in self.model:
-                    new_rs = {}
-                    for k, choices in self.model["row_selections"].items():
-                        nk = self.remap.get(k, k)
-                        new_choices = []
-                        for ch in choices:
-                            nc = dict(ch)
-                            nc["kernels"] = [self.remap.get(x, x) for x in ch["kernels"]]
-                            new_choices.append(nc)
-                        new_rs[nk] = new_choices
-                    self.model["row_selections"] = new_rs
-
-            if bf16_set:
-                rs = self.model.setdefault("row_selections", {})
-                for tag in ("wqa", "wkv"):
-                    rs[self.kernels[f"bf16_{tag}_2048"]] = [
-                        dict(
-                            min_rows=1,
-                            max_rows=16,
-                            multiple_of=1,
-                            kernels=[self.kernels[f"bf16_{tag}_2048_m16"]],
-                        ),
-                        dict(
-                            min_rows=17,
-                            max_rows=32,
-                            multiple_of=1,
-                            kernels=[self.kernels[f"bf16_{tag}_2048_m32"]],
-                        ),
-                        dict(
-                            min_rows=33,
-                            max_rows=64,
-                            multiple_of=1,
-                            kernels=[self.kernels[f"bf16_{tag}_2048_m64"]],
-                        ),
-                        dict(
-                            min_rows=65,
-                            max_rows=127,
-                            multiple_of=1,
-                            kernels=[self.kernels[f"bf16_{tag}_2048_m127"]],
-                        ),
-                    ]
-                    rs[self.kernels[f"bf16_{tag}_256"]] = [
-                        dict(
-                            min_rows=1,
-                            max_rows=64,
-                            multiple_of=1,
-                            kernels=[self.kernels[f"bf16_{tag}_256_m64"]],
-                        ),
-                    ]
-
-            used_manifests = {
-                step["manifest"]
-                for rank in ranks
-                for packet in rank["packets"]
-                for step in packet["body"] + packet["head"]
-                if step["op"] == "kernel"
-            }
-            if "row_selections" in self.model:
-                self.model["row_selections"] = {
-                    k: v for k, v in self.model["row_selections"].items() if k in used_manifests
-                }
-
-            extra_shards_entries = {}
-            for group, record in self.old_records.items():
-                path = self.source / group
-                start, header = local_header(path)
-                for name in sorted(record["tensors"], key=lambda n: header[n]["data_offsets"][0]):
-                    spec = header[name]
-                    entry = dict(
-                        dtype=spec["dtype"],
-                        shape=spec["shape"],
-                        bytes=spec["data_offsets"][1] - spec["data_offsets"][0],
-                        source=dict(file=str(path), offset=start + spec["data_offsets"][0]),
-                    )
-                    if name in self.transforms:
-                        replacement = self.transforms[name]
-                        if replacement in self.file_replacements:
-                            fr = self.file_replacements[replacement]
-                            target_grp = fr["group"]
-                            if replacement != name:
-                                self.index["weight_map"].pop(name, None)
-                            self.index["weight_map"][replacement] = target_grp
-                            new_entry = dict(
-                                dtype=fr["dtype"],
-                                shape=fr["shape"],
-                                bytes=fr["bytes"],
-                                source=dict(file=fr["file"], offset=fr["offset"]),
-                            )
-                            self.rewrite_groups.add(group)
-                            if target_grp == group:
-                                self.groups[group].append((replacement, new_entry))
-                            else:
-                                extra_shards_entries.setdefault(target_grp, []).append(
-                                    (replacement, new_entry)
-                                )
-                                self.rewrite_groups.add(target_grp)
-                            continue
-                        values = self.payloads[replacement]
-                        if replacement != name:
-                            self.index["weight_map"].pop(name, None)
-                        self.index["weight_map"][replacement] = group
-                        entry.update(
-                            dtype=self.payload_dtypes[replacement],
-                            shape=list(values.shape),
-                            bytes=values.nbytes,
-                            source=dict(replacement=replacement),
-                        )
-                        name = replacement
-                        self.rewrite_groups.add(group)
-                    self.groups[group].append((name, entry))
-
-            for tgt_grp, items in extra_shards_entries.items():
-                self.groups[tgt_grp].extend(items)
-                self.rewrite_groups.add(tgt_grp)
-
-            for name, values in self.payloads.items():
-                if name in self.index["weight_map"]:
-                    continue
-                grp = self.override_groups[name]
-                self.index["weight_map"][name] = grp
-                self.groups[grp].append(
-                    (
-                        name,
-                        dict(
-                            dtype=self.payload_dtypes[name],
-                            shape=list(values.shape),
-                            bytes=values.nbytes,
-                            source=dict(replacement=name),
-                        ),
-                    )
-                )
-                self.rewrite_groups.add(grp)
-
-            for grp, items in self.groups.items():
-                sz = sum(e["bytes"] for _, e in items)
-                if sz >= 4 << 30:
-                    raise ValueError(f"Shard {grp} exceeds 4 GiB: {sz / (1 << 30):.2f} GiB")
+            self._plan_vision_and_draft_weights(ckpt, ranks, rank_defs)
+            self._rewrite_packet_graphs(ranks)
+            self._assemble_shard_groups()
 
             self.manifest["norot_upgrade"] = dict(
                 basis="unrotated-official-native-grid",

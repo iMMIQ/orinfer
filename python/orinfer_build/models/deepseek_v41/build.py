@@ -77,13 +77,13 @@ class PrefillOptions:
 
 
 class Builder:
-    def __init__(self, output, rank, capacity, kernels, prefill=PrefillOptions(), model_dir=None):
+    def __init__(self, output, rank, capacity, kernels, prefill=None, model_dir=None):
         self.output, self.rank, self.capacity = output, rank, capacity
         self.kernels = kernels
         self.buffers, self.by_name, self.types = [], {}, {}
         self.prefix = ""
         self.steps = []
-        self.prefill = prefill
+        self.prefill = PrefillOptions() if prefill is None else prefill
         self.ready_collapsed = None
         self.dynamic = False
         self.model_dir = model_dir

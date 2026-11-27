@@ -88,7 +88,7 @@ class BuildTests(unittest.TestCase):
                     json.dumps(
                         dict(
                             metadata={"orinfer.sha256": {shard.name: file_hash(shard)}},
-                            weight_map={n: shard.name for n in values},
+                            weight_map=dict.fromkeys(values, shard.name),
                         )
                     )
                 )
@@ -327,7 +327,7 @@ class BuildTests(unittest.TestCase):
             "integer_experts",
             "moe_combine",
         )
-        kernels = SimpleNamespace(**{name: quantize for name in names})
+        kernels = SimpleNamespace(**dict.fromkeys(names, quantize))
         builder = SimpleNamespace(
             weights=SimpleNamespace(combined=lambda name, weights: name),
             text=dict(num_experts=256, num_experts_per_tok=8),
@@ -760,7 +760,7 @@ class BuildTests(unittest.TestCase):
             source_sha = file_hash(shard)
             index = dict(
                 metadata={"orinfer.sha256": {shard.name: source_sha}},
-                weight_map={name: shard.name for name in values},
+                weight_map=dict.fromkeys(values, shard.name),
             )
             (source / "model.safetensors.index.json").write_text(json.dumps(index))
             for packed_k in (64, 128):

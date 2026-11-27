@@ -164,7 +164,7 @@ def build(
                 return define(label, size, dict(view=view))
             return define(label, size)
 
-        def binding(name, shape, dtype, *, family, source_rows, head=False, alignment=1):
+        def binding(name, shape, dtype, *, family, alignment=1):
             size = math.prod(shape) * SIZES[dtype]
             if alignment > 1:
                 packet_cap = owners if family == "decode" else rows
@@ -307,14 +307,9 @@ def build(
                         shape,
                         dtype,
                         family=family,
-                        source_rows=old_rows,
-                        head=head,
                         alignment=alignment if (old_operand["access"] == "scratch") else 1,
                     )
                 )
-            indirect_op = module_name.startswith(
-                ("attention", "indexer", "compressor", "kv_int8")
-            ) or (module_name == "memory" and name == "scatter_rows")
             task = dict(
                 module=module.__name__,
                 name=name,
@@ -331,7 +326,7 @@ def build(
             if indirect_op:
                 indices, accesses, aliases = {}, [], {}
                 column_mapping = []
-                for port, op, buffer, (first, last, alignment) in zip(
+                for port, op, buffer, (_first, last, alignment) in zip(
                     tensor_params, operands, bound, local_shapes, strict=True
                 ):
                     definition = definitions[buffer]
