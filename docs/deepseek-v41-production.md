@@ -1,6 +1,6 @@
 # DSv4.1 Ascend 910B Production Deployment
 
-This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 910B (TP8)** with Orinfer **v0.4.4**.
+This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 910B (TP8)** with Orinfer **v0.4.6**.
 
 ---
 
@@ -9,7 +9,7 @@ This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 91
 - **OS & Runtime**: Linux `aarch64`, `glibc >= 2.34`, **CANN 9.2**, 8 dedicated Ascend 910B NPUs (TP8).
 - **Recommended Host**: ≥96 CPU cores and ≥1 TB host RAM when keeping Engram tables resident (~207 GiB) alongside 256 GiB CPU prefix cache offload.
 - **Supported Features**: OpenAI HTTP/SSE, continuous batching, DSpark speculative decoding (auto up to 5 drafts by default), device + CPU tiered prefix cache, DSML tool calling, thinking history, and single/multi-image vision (when paired with `vision.safetensors` and a vision-enabled execution package).
-- **Package Digest (A2 W4A8)**: `3b3961a745cbabff0523fafe1224571b3582a534d744e1fecb3b9b6371d50ca7` (compact `shared-json-v1` + `rope_f32_v1` A2 package shipped with v0.4.4).
+- **Package Digest (A2 W4A8)**: `0a6c09f4722dfa655bdd2ae34acfa1301e70ff85ee933a6ac93009ac363af234` (compact `shared-json-v1` + `rope_f32_v1` A2 package shipped with v0.4.6, using unrotated `engram.cast_fp32`).
 
 ---
 
@@ -18,28 +18,31 @@ This guide covers deploying **DeepSeek-V4.1 Flash-1017 W4A8** on **8× Ascend 91
 ### Install Engine & Execution Package
 
 ```bash
-tar -xf orinfer-v0.4.4-linux-aarch64.tar.xz
+tar -xf orinfer-v0.4.6-linux-aarch64.tar.xz
 bin/orinfer --version
 
 bin/orinfer package install \
-  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.4.4.tar.xz \
+  orinfer-exec-deepseek-v41-flash-1017-w4a8-ascend910b-v0.4.6.tar.xz \
   --cache /srv/orinfer/execution-cache
 ```
 
-### Update Model Frontend Metadata (Existing Deployments)
+### Download or Upgrade Model Weights (Unrotated v0.4.6 Format)
 
-Weights from v0.3.1+ remain unchanged. Create a new model directory (using hardlinks on the same filesystem so the previous directory stays intact for rollback) and pull the matching v0.4.4 metadata:
+Orinfer **v0.4.6** replaces the legacy rotated Engram kernels with `engram.cast_fp32` and requires the matching unrotated, activation-calibrated weights (`SmoothQuant + 262K Act-Order Hessian-GPTQ + L15/L39 W8`) published on `immiq/DeepSeek-V4.1-Flash-1017-Orinfer-A2-W4A8` (`main`). Legacy rotated weights (`v0.3.1`–`v0.4.4`) are not compatible with the `v0.4.6` execution package.
+
+For existing deployments, the 96 host Engram table shards (`weights/host/*`, ~206 GiB) and `weights/dspark/embedding.safetensors` remain byte-identical and can be hardlinked into a new directory before pulling the updated GPU/shared/vision/draft shards and metadata:
 
 ```bash
-uv run --locked python -m orinfer_build.models.deepseek_v41.service --frontend-only \
-  --model-dir /data/model/current --output /data/model/dsv41-v0.4.4
+mkdir -p /data/model/dsv41-v0.4.6/weights/dspark
+cp -al /data/model/current/weights/host /data/model/dsv41-v0.4.6/weights/host
+cp -al /data/model/current/weights/dspark/embedding.safetensors \
+  /data/model/dsv41-v0.4.6/weights/dspark/embedding.safetensors
 
 hf download immiq/DeepSeek-V4.1-Flash-1017-Orinfer-A2-W4A8 \
-  cache/model.json README.md publication.json SHA256SUMS \
-  --revision v0.4.4 --local-dir /data/model/dsv41-v0.4.4
+  --local-dir /data/model/dsv41-v0.4.6
 ```
 
-Run `bin/orinfer validate-model /data/model/dsv41-v0.4.4` to verify frontend, execution package, and weight integrity.
+Run `bin/orinfer validate-model /data/model/dsv41-v0.4.6` to verify frontend, execution package (`0a6c09f4...`), and weight integrity.
 
 ---
 
@@ -57,7 +60,7 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_NPU_SOCKET_PORT_RANGE=auto
 export HCCL_EXEC_TIMEOUT=120
 
-bin/orinfer serve /data/model/dsv41-v0.4.4 \
+bin/orinfer serve /data/model/dsv41-v0.4.6 \
   --model deepseek-v4.1 \
   --listen 127.0.0.1:8088 \
   --mtp-drafts auto \

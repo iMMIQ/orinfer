@@ -100,7 +100,7 @@ For speech recognition (Qwen3-ASR-1.7B vs. vLLM FP8), see [Audio Guide](audio.md
 | Single 2,049 tokens (2048 chunk) | 4,498.2 | **6,353.1** | +41.2% |
 | Batch 32 × 17 tokens | 3,358.0 | 3,269.8 | −2.6% |
 
-### Frozen 240s Mini-Weka Replay (`tools.bench.agentx_mini`, 2026-11-25)
+### Frozen 240s Mini-Weka Replay (`tools.bench.agentx_mini`, 2026-11-26)
 
 8× Ascend 910B3 TP8, CANN 9.2, `--graph full`, `--mtp-drafts auto`, `--prefix-cache-mib 8192`, `--kv-offload-mib 262144`, `concurrency=16`, `wall_limit=240 s`, fixed `--sampling-seed 20261002` (paired quiet-host runs):
 
@@ -110,9 +110,11 @@ For speech recognition (Qwen3-ASR-1.7B vs. vLLM FP8), see [Audio Guide](audio.md
 | **Pre-v0.4.2 (`4968364`)** | 92–93 | 124.28 | 0 | Engram/scheduler + 1-wave/Cube wave |
 | **v0.4.2** (`8f58245c`) | 101 / 101 *(+38.4%)* | 117.88 / 117.68 | 0 | FastForward IPC, mixed-packet/bucketed graph reuse, async Layer-14 Engram prefetch, 20-slot 1-wave & Cube upgrades |
 | **v0.4.3** (`67099303`) | 108 *(+47.9%)* | 107.33 | 0 | 20-AIC persistent dense/vector/fused indexer kernels, canonical ACL Graph prewarm, admission Engram prefetch, non-Rayon prefetch deadlock fix |
-| **v0.4.4** (`3b3961a7`) | **122** *(+67.1%)* | **105.35** | 0 | `overlap_qk` fused decode attention, `small_regroup` single-UB MoE regroup, `FastVerifyForward`, Layer-1 Engram prefetch, auto TP rejection sampling, uniform cross-rank bucketed graph reuse, expanded prewarm & decode/mixed buckets (`24`/`384`), bucket-slack draft fill |
+| **v0.4.4** (`3b3961a7`) | 122 *(+67.1%)* | 105.35 | 0 | `overlap_qk` fused decode attention, `small_regroup` single-UB MoE regroup, `FastVerifyForward`, Layer-1 Engram prefetch, auto TP rejection sampling, uniform cross-rank bucketed graph reuse, expanded prewarm & decode/mixed buckets (`24`/`384`), bucket-slack draft fill |
+| **Pre-v0.4.6** (`377bd367`) | 129 *(+76.7%)* | 99.80 | 0 | Cross-row pipelined `selected_int8` attention (`rows_per_cta=13`), lossless W4A4 MoE `down_proj` fusion, 20-AIC persistent routing/sampling/model_ops, device-side `SpanCopier`, single-graph TP rejection sampling, fine low-load decode/verify buckets, rejection normalizer stride fix, and `Team::resident_graphs` eviction sync |
+| **v0.4.6** (`0a6c09f4`) | **130** *(+78.1%)* | **99.44** | 0 | Persistent 20-AIC `engram.cast_fp32` replacing rotated Engram kernels, paired with activation-calibrated unrotated weights (execution-graph-exact SmoothQuant + 262K routing-weighted Act-Order Hessian-GPTQ + L15/L39 lossless W8 + BF16 KV-source + full W8 DSpark draft); preserves 4.64 GiB device prefix cache (`7.35 GiB`/card free HBM, 99.5% ACL Graph hit rate) |
 
-- **DSv4.1 Production Acceptance**: Use `tools.bench.agentx_mini` (paired cold/warm Mini-Weka replay with fixed `--sampling-seed 20261002` and provenance) as the final end-to-end gate. Held-out 1,556-position teacher-forced NLL (`HCCL_DETERMINISTIC=strict`) on v0.4.4 (`3b3961a7`): `mean_nll = 1.665464` (`ΔNLL = -0.005690` vs. BF16, 95% CI `[-0.01030, -0.00237]`, bitwise identical to v0.4.3).
+- **DSv4.1 Production Acceptance**: Use `tools.bench.agentx_mini` (paired cold/warm Mini-Weka replay with fixed `--sampling-seed 20261002` and provenance) as the final end-to-end gate. Held-out 1,556-position teacher-forced evaluation against official MXFP4+FP8 on **v0.4.6** (`0a6c09f4`): `mean KL(Official || Model) = 0.01992` (**−35.2%** vs. legacy rotated `0.03075`, 95% CI `[-0.01333, -0.00832]`), `median KL = 0.00533`, `p95 KL = 0.07837`, `argmax_match = 95.76%`, `top3_cover = 99.55%`; DSpark 256-window acceptance `69.84%` (`4.492 committed/round`, `+0.137/round` vs. legacy rotated; held-out `test` split `81.56%` / `5.078 committed/round`).
 
 ---
 
